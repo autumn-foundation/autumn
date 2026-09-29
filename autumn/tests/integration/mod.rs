@@ -56,11 +56,24 @@ mod chaos_state_loom;
 mod circuit_breaker_integration;
 mod clock_integration;
 mod cluster_two_node;
+#[cfg(all(feature = "db", feature = "collab"))]
+mod collab_model;
+#[cfg(all(feature = "collab", feature = "offline-sync"))]
+mod collab_offline_merge;
+#[cfg(all(feature = "collab", feature = "presence"))]
+mod collab_session;
 #[cfg(feature = "db")]
 mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
 mod compression_middleware;
+#[cfg(feature = "db")]
+mod confidential_model;
+#[cfg(feature = "db")]
+mod confidential_red_team;
+mod confidential_sealing;
+#[cfg(feature = "db")]
+mod confidential_threat_model;
 mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
@@ -78,6 +91,7 @@ mod directory_shard_router;
 mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
+mod edge_conformance_ci_coverage;
 // The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
 // concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
 // of the parity claim lives in the example crate's conformance suite, which
@@ -157,6 +171,7 @@ mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
 mod job_recorder_integration;
+mod job_tenant_scope;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
@@ -190,9 +205,13 @@ mod mcp_schema_derive;
 #[cfg(feature = "mcp")]
 mod mcp_secured_guard;
 #[cfg(feature = "mcp")]
+mod mcp_step_up_guard;
+#[cfg(feature = "mcp")]
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
+#[cfg(feature = "mcp")]
+mod mcp_throttle_guard;
 mod middleware_introspection;
 mod middleware_pipeline;
 mod middleware_stack_depth;
@@ -207,6 +226,8 @@ mod model_derivation;
 mod model_field_attrs;
 #[cfg(feature = "db")]
 mod model_votable;
+#[cfg(feature = "db")]
+mod money_ledger_postgres;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -247,6 +268,10 @@ mod preload_scoping;
 mod problem_details;
 #[cfg(feature = "redis")]
 mod process_role_worker_gating;
+#[cfg(feature = "maud")]
+mod profile_conditional_surfaces;
+#[cfg(feature = "db")]
+mod repository_column_order;
 // The capability-sandboxed plugin lane (#1609). Gated on `plugin-sandbox` (the
 // runtime) and `test-support` (the shared WAT escape corpus), neither of which
 // the Docker sweep's feature set enables — so the ignored timing benchmark in
@@ -275,6 +300,14 @@ mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+// ci.yml names the `--lib` Redis job-admin Docker tests by prefix filter; this
+// fails when one of them stops matching (#1186). No feature gate: it only reads
+// job.rs and ci.yml as text.
+mod redis_job_admin_ci_coverage;
+// ci.yml names the `--lib` Postgres relative-delay Docker tests by full test
+// path; this fails if either is renamed (#2111 follow-up). No feature gate:
+// it only reads job.rs and ci.yml as text.
+mod pg_relative_delay_ci_coverage;
 // Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
 // The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
@@ -298,6 +331,8 @@ mod repository_dependent_destroy;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
 // (after the fix) the batched `dependent_delete_all` replacement.
+#[cfg(feature = "tls")]
+mod mtls_support;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy_leaf_batch_profile;
 #[cfg(feature = "db")]
@@ -347,19 +382,38 @@ mod sharding_commit_hooks;
 mod sharding_integration;
 mod signed_webhooks;
 mod sim_advance_to;
+mod sim_ambient_clock;
+mod sim_ambient_modules;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_clock_drain;
+#[cfg(feature = "collab")]
+mod sim_collab_convergence;
+mod sim_crash_at;
+mod sim_default_entropy;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
+mod sim_drain_stall;
 mod sim_fault_plan;
 mod sim_fault_plan_pg;
+mod sim_interleave;
 mod sim_job_clock;
+mod sim_liveness_watchdog;
 mod sim_llm_stub;
 mod sim_monotonic_clock;
+#[cfg(feature = "http-client")]
+mod sim_net;
 mod sim_rate_limit_clock;
 mod sim_retry_storm;
+mod sim_scheduled_ticks;
+#[cfg(feature = "sla")]
+mod sim_sla;
+#[cfg(feature = "sla")]
+mod sim_sla_replicas;
 mod sim_strict_wall_clock;
 mod sim_test_smoke;
+mod sim_testapp_jobs;
+#[cfg(feature = "sla")]
+mod sla_obligation_macro;
 mod sqlite_ci_coverage;
 #[cfg(feature = "db")]
 mod sqlite_replication;
@@ -388,6 +442,8 @@ mod throttle_route;
 mod time_zone_integration;
 #[cfg(feature = "tls")]
 mod tls_app_surface;
+#[cfg(feature = "tls")]
+mod tls_client_auth;
 #[cfg(feature = "tls")]
 mod tls_serving;
 #[cfg(feature = "tls")]

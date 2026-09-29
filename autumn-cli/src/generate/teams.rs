@@ -51,14 +51,18 @@
 //!   `maud` matters even on non-`--api` projects, which already have it, but
 //!   is required for `--api` projects, whose starter strips it), and ensures
 //!   the generated code's own direct dependencies (`diesel`, `diesel-async`,
-//!   `pq-sys`, `chrono`, `serde`, `serde_json`, `validator`, `maud`) are
-//!   present. Requires the Postgres backend — see `sqlite_teams_unsupported_error`.
+//!   `chrono`, `serde`, `serde_json`, `validator`, `maud`, plus `pq-sys` on
+//!   Postgres or `libsqlite3-sys` on `SQLite`) are
+//!   present. Works on either backend: the migration DDL is emitted in the
+//!   app's own dialect (issue #1927).
 //!
 //! Warns (does not auto-edit `autumn.toml` — too many possible existing
 //! shapes/profiles to safely text-patch) that `[tenancy]` needs
 //! `session_key = "organization_id"`.
 
 use std::path::{Path, PathBuf};
+
+use autumn_web::config::DatabaseBackend;
 
 use super::emit::{Plan, Revert};
 use super::model::ensure_cargo_dependencies;
@@ -83,6 +87,9 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 /// `models.rs`) needs it unconditionally. `diesel_migrations` is omitted:
 /// already in every project's template `Cargo.toml` via
 /// `TEMPLATE_SHIPPED_CARGO_DEPS`.
+///
+/// Postgres only — [`TEAMS_DEPS_SQLITE`] is the `SQLite` set and
+/// [`teams_deps`] picks between them (issue #1927).
 const TEAMS_DEPS: &[(&str, &str)] = &[
     ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
     (
@@ -113,6 +120,52 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
 ];
 
+/// [`TEAMS_DEPS`] for a `SQLite` app (issue #1927).
+///
+/// Same shape, different backend, mirroring `model.rs`'s `MODEL_DEPS_SQLITE`:
+/// diesel on its `sqlite` feature with the bundled `libsqlite3-sys`,
+/// `diesel-async` on the sync-connection wrapper `autumn-web`'s `sqlite`
+/// feature runs its pool through, and no `pq-sys` — a `SQLite` app has no
+/// reason to name libpq.
+///
+/// `returning_clauses_for_sqlite_3_35` is load-bearing rather than tidy: the
+/// generated route handlers insert with `.returning(...).get_result(conn)`,
+/// which does not compile against diesel's `SQLite` backend without it. It
+/// matches what `autumn-web`'s own `sqlite` feature enables, so the app and the
+/// framework never disagree about `RETURNING` support.
+const TEAMS_DEPS_SQLITE: &[(&str, &str)] = &[
+    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
+    (
+        "diesel",
+        "{ version = \"2\", features = [\"sqlite\", \"chrono\", \"serde_json\", \
+         \"returning_clauses_for_sqlite_3_35\"] }",
+    ),
+    (
+        "diesel-async",
+        "{ version = \"0.9\", features = [\"sync-connection-wrapper\"] }",
+    ),
+    (
+        "libsqlite3-sys",
+        "{ version = \"0.38\", features = [\"bundled\"] }",
+    ),
+    ("serde", "{ version = \"1\", features = [\"derive\"] }"),
+    ("serde_json", "\"1\""),
+    (
+        "validator",
+        "{ version = \"0.20\", features = [\"derive\"] }",
+    ),
+    ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
+];
+
+/// The direct dependencies the generated `src/teams/*` code needs on `backend`
+/// (issue #1927). Mirrors `model.rs`'s `model_deps`.
+const fn teams_deps(backend: DatabaseBackend) -> &'static [(&'static str, &'static str)] {
+    match backend {
+        DatabaseBackend::Postgres => TEAMS_DEPS,
+        DatabaseBackend::Sqlite => TEAMS_DEPS_SQLITE,
+    }
+}
+
 /// Compute the file actions for `autumn generate teams`.
 ///
 /// `timestamp` is the 14-digit migration-directory prefix (see
@@ -120,11 +173,13 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
 /// injectable/deterministic in tests, mirroring
 /// [`super::migration::plan_migration_with_options`].
 ///
-/// `for_destroy` mirrors [`super::policy::plan_policy`]'s parameter for
+/// `_for_destroy` mirrors [`super::policy::plan_policy`]'s parameter for
 /// signature symmetry with the other generators' generate/destroy split, but
 /// `teams` has no existence guard to skip on the destroy path (unlike
 /// `policy`, which requires a target model) — the plan built here is
-/// identical either way.
+/// identical either way. It was also the escape hatch for the old
+/// `SQLite`-rejection guard; the migration is backend-aware now (issue #1927),
+/// so there is no generate-only rejection left to suppress on the revert path.
 ///
 /// # Errors
 /// Returns [`GenerateError::NotInProject`] outside an Autumn project, or
@@ -132,22 +187,17 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
 pub fn plan_teams(
     project_root: &Path,
     timestamp: &str,
-    for_destroy: bool,
+    _for_destroy: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    // `teams`' migration and model/repository templates are fixed Postgres
-    // DDL/Diesel code with no SQLite-aware rendering path (see
-    // `sqlite_teams_unsupported_error`'s doc comment) — reject up front
-    // rather than emit a migration `autumn migrate` would fail to apply.
-    // Skipped on the destroy path so a project that somehow already has
-    // `teams` generated (e.g. from before this backend check existed) can
-    // still be cleaned up.
-    if !for_destroy
-        && super::detect_backend(project_root) == autumn_web::config::DatabaseBackend::Sqlite
-    {
-        return Err(super::sqlite_teams_unsupported_error());
-    }
+    // The emitted DDL is backend-aware (issue #1927), resolved the same way
+    // `autumn migrate` resolves the database URL (env vars, then the
+    // profile-merged `autumn.toml` / `.env`); Postgres is the default when
+    // nothing is configured. Everything else this generator emits is already
+    // backend-neutral: `#[repository]` binds `::autumn_web::RuntimeConnection`,
+    // and `schema.rs` uses only sql-types both diesel backends carry.
+    let backend = super::detect_backend(project_root);
 
     let mut plan = Plan::new(project_root);
 
@@ -200,7 +250,7 @@ pub fn plan_teams(
             .join("migrations")
             .join(format!("{timestamp}_create_teams"))
     });
-    plan.create(migration_dir.join("up.sql"), MIGRATION_UP.to_owned());
+    plan.create(migration_dir.join("up.sql"), render_migration_up(backend));
     plan.create(migration_dir.join("down.sql"), MIGRATION_DOWN.to_owned());
 
     // ── src/main.rs: mod teams; + routes![...] ──────────────────────────
@@ -219,7 +269,7 @@ pub fn plan_teams(
         entries: route_entries,
     });
 
-    plan_teams_cargo_toml(&mut plan, project_root, teams_dir);
+    plan_teams_cargo_toml(&mut plan, project_root, teams_dir, backend);
 
     // ── [tenancy] config reminder ────────────────────────────────────────
     // Never auto-edited (too many possible existing shapes/profiles to
@@ -248,7 +298,12 @@ pub fn plan_teams(
 /// Ensures `Cargo.toml` has the `mail`/`maud` autumn-web features and the
 /// generated code's direct dependencies (see [`TEAMS_DEPS`]), and pushes
 /// their matching `autumn destroy` reverts.
-fn plan_teams_cargo_toml(plan: &mut Plan, project_root: &Path, teams_dir: PathBuf) {
+fn plan_teams_cargo_toml(
+    plan: &mut Plan,
+    project_root: &Path,
+    teams_dir: PathBuf,
+    backend: DatabaseBackend,
+) {
     // All edits land in a single `plan.modify()` call: `ensure_*` helpers
     // are pure string transforms over an in-memory `String`, not aware of
     // each other's pending edits, so chaining them here (rather than
@@ -260,19 +315,31 @@ fn plan_teams_cargo_toml(plan: &mut Plan, project_root: &Path, teams_dir: PathBu
     // a default `autumn new` project already has it: an `--api` project's
     // starter strips both the direct `maud` dependency and autumn-web's
     // `maud` feature (see `TEAMS_DEPS`'s doc comment on the `maud` entry).
-    const AUTUMN_WEB_FEATURES: &[&str] = &["mail", "maud"];
+    //
+    // A `SQLite` app needs autumn-web's `sqlite` feature on top (issue #1927).
+    // It is what flips `RuntimeConnection` to the `SQLite` connection, which
+    // every `#[repository]` in `src/teams/` binds. Without it the generated app
+    // still compiles and `autumn migrate` still applies the migration, but the
+    // app refuses its own `sqlite://` URL at pool-build (boot) time with
+    // `PoolError::UnsupportedBackend` — see `autumn-web`'s `build_pool`. Same
+    // conditional `model.rs`/`scaffold.rs` already apply.
+    let autumn_web_features: &[&str] = match backend {
+        DatabaseBackend::Postgres => &["mail", "maud"],
+        DatabaseBackend::Sqlite => &["mail", "maud", "sqlite"],
+    };
 
     let cargo_path = project_root.join("Cargo.toml");
     let cargo_existing = read_or_empty(&cargo_path);
     let mut updated_cargo = cargo_existing.clone();
-    for feature in AUTUMN_WEB_FEATURES {
+    for feature in autumn_web_features {
         updated_cargo = ensure_autumn_web_feature(&updated_cargo, feature);
     }
-    updated_cargo = ensure_cargo_dependencies(&updated_cargo, TEAMS_DEPS);
+    let deps = teams_deps(backend);
+    updated_cargo = ensure_cargo_dependencies(&updated_cargo, deps);
     if updated_cargo != cargo_existing {
         plan.modify(cargo_path.clone(), updated_cargo);
     }
-    for feature in AUTUMN_WEB_FEATURES {
+    for feature in autumn_web_features {
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path.clone(),
             feature: (*feature).to_owned(),
@@ -295,7 +362,7 @@ fn plan_teams_cargo_toml(plan: &mut Plan, project_root: &Path, teams_dir: PathBu
     // `TEAMS_DEPS`'s doc comment on the `maud` entry) — excluding it the
     // same way `autumn-web` is excluded would wrongly treat it as always
     // pre-existing.
-    let dep_names: Vec<String> = TEAMS_DEPS
+    let dep_names: Vec<String> = deps
         .iter()
         .map(|(name, _)| *name)
         .filter(|name| *name != "autumn-web" && *name != "diesel_migrations")
@@ -1202,9 +1269,7 @@ pub async fn remove_all_memberships_on_conn(
         let org_id: i64 = tenant_id.parse().map_err(|_| {
             AutumnError::internal_server_error_msg("Corrupt organization id in membership")
         })?;
-        organizations::table
-            .find(org_id)
-            .for_update()
+        ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
             .select(Organization::as_select())
             .first(conn)
             .await
@@ -1216,14 +1281,15 @@ pub async fn remove_all_memberships_on_conn(
         // this user in this organization, or — the scenario the widened
         // scan above exists for — a concurrent sibling deletion may have
         // just *promoted* this user to Owner here as its own successor).
-        let Some(own_membership) = memberships::table
-            .filter(memberships::tenant_id.eq(tenant_id))
-            .filter(memberships::user_id.eq(user_id))
-            .select(Membership::as_select())
-            .for_update()
-            .first(conn)
-            .await
-            .optional()?
+        let Some(own_membership) = ::autumn_web::maybe_for_update!(
+            memberships::table
+                .filter(memberships::tenant_id.eq(tenant_id))
+                .filter(memberships::user_id.eq(user_id))
+                .select(Membership::as_select())
+        )
+        .first(conn)
+        .await
+        .optional()?
         else {
             continue;
         };
@@ -1234,36 +1300,39 @@ pub async fn remove_all_memberships_on_conn(
         // doesn't need transferring, and promoting anyone here would grant
         // an unrequested second Owner (Codex review finding).
         if own_membership.role == Role::Owner.as_str() {
-            let other_owner: Option<Membership> = memberships::table
-                .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
-                .filter(memberships::user_id.ne(user_id))
-                .filter(memberships::role.eq(Role::Owner.as_str()))
-                .select(Membership::as_select())
-                .for_update()
+            let other_owner: Option<Membership> = ::autumn_web::maybe_for_update!(
+                memberships::table
+                    .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
+                    .filter(memberships::user_id.ne(user_id))
+                    .filter(memberships::role.eq(Role::Owner.as_str()))
+                    .select(Membership::as_select())
+            )
+            .first(conn)
+            .await
+            .optional()?;
+            if other_owner.is_none() {
+                let mut successor: Option<Membership> = ::autumn_web::maybe_for_update!(
+                    memberships::table
+                        .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
+                        .filter(memberships::user_id.ne(user_id))
+                        .filter(memberships::role.eq(Role::Admin.as_str()))
+                        .select(Membership::as_select())
+                        .order(memberships::id.asc())
+                )
                 .first(conn)
                 .await
                 .optional()?;
-            if other_owner.is_none() {
-                let mut successor: Option<Membership> = memberships::table
-                    .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
-                    .filter(memberships::user_id.ne(user_id))
-                    .filter(memberships::role.eq(Role::Admin.as_str()))
-                    .select(Membership::as_select())
-                    .order(memberships::id.asc())
-                    .for_update()
+                if successor.is_none() {
+                    successor = ::autumn_web::maybe_for_update!(
+                        memberships::table
+                            .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
+                            .filter(memberships::user_id.ne(user_id))
+                            .select(Membership::as_select())
+                            .order(memberships::id.asc())
+                    )
                     .first(conn)
                     .await
                     .optional()?;
-                if successor.is_none() {
-                    successor = memberships::table
-                        .filter(memberships::tenant_id.eq(&own_membership.tenant_id))
-                        .filter(memberships::user_id.ne(user_id))
-                        .select(Membership::as_select())
-                        .order(memberships::id.asc())
-                        .for_update()
-                        .first(conn)
-                        .await
-                        .optional()?;
                 }
                 if let Some(successor) = successor {
                     diesel::update(memberships::table.filter(memberships::id.eq(successor.id)))
@@ -1544,9 +1613,7 @@ pub async fn create_invitation(
             // never saw — accepting that token later repopulates the
             // organization without an Owner, recreating the exact
             // invariant cleanup exists to prevent (Codex review finding).
-            organizations::table
-                .find(org_id)
-                .for_update()
+            ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
                 .select(Organization::as_select())
                 .first(conn)
                 .await
@@ -1558,14 +1625,15 @@ pub async fn create_invitation(
             // removal, or this same user's account being deleted) may have
             // committed while this request waited for the lock above
             // (Codex review finding).
-            let inviter_membership: Option<Membership> = memberships::table
-                .filter(memberships::tenant_id.eq(&tenant_id))
-                .filter(memberships::user_id.eq(inviter_id))
-                .select(Membership::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .optional()?;
+            let inviter_membership: Option<Membership> = ::autumn_web::maybe_for_update!(
+                memberships::table
+                    .filter(memberships::tenant_id.eq(&tenant_id))
+                    .filter(memberships::user_id.eq(inviter_id))
+                    .select(Membership::as_select())
+            )
+            .first(conn)
+            .await
+            .optional()?;
             let Some(inviter_membership) = inviter_membership else {
                 return Err(AutumnError::unauthorized_msg("no active organization"));
             };
@@ -1629,7 +1697,7 @@ pub async fn create_invitation(
         // already serialize concurrent `create_invitation` calls for this
         // organization, so this should be unreachable in practice.
         // `idx_invitations_pending_email` (a partial unique index on
-        // `(tenant_id, email) WHERE status = 'pending'`, see MIGRATION_UP)
+        // `(tenant_id, email) WHERE status = 'pending'`, see render_migration_up)
         // stays as defense in depth: any INSERT that still slips past the
         // check above fails closed instead of leaving two live pending
         // tokens for the same invitee.
@@ -1858,13 +1926,14 @@ pub async fn accept_invitation(
                 // same order on both sides, closes that gap: whichever
                 // transaction reaches it first now runs to completion
                 // before the other proceeds at all.
-                let live_caller_email: Option<String> = caller_users::table
-                    .filter(caller_users::id.eq(user_id))
-                    .select(caller_users::email)
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()?;
+                let live_caller_email: Option<String> = ::autumn_web::maybe_for_update!(
+                    caller_users::table
+                        .filter(caller_users::id.eq(user_id))
+                        .select(caller_users::email)
+                )
+                .first(conn)
+                .await
+                .optional()?;
                 let Some(live_caller_email) = live_caller_email else {
                     return Err(AutumnError::unauthorized_msg(
                         "log in or sign up first, then revisit this invitation link",
@@ -1894,9 +1963,7 @@ pub async fn accept_invitation(
                 let org_id: i64 = tenant_id.parse().map_err(|_| {
                     AutumnError::internal_server_error_msg("Corrupt organization id in invitation")
                 })?;
-                organizations::table
-                    .find(org_id)
-                    .for_update()
+                ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
                     .select(Organization::as_select())
                     .first(conn)
                     .await
@@ -1904,12 +1971,12 @@ pub async fn accept_invitation(
 
                 // Lock the invitation row so two concurrent accepts serialize
                 // rather than race past the pending/expiry check together.
-                let invitation: Invitation = invitations::table
-                    .filter(invitations::id.eq(invitation_id))
-                    .for_update()
-                    .select(Invitation::as_select())
-                    .first(conn)
-                    .await?;
+                let invitation: Invitation = ::autumn_web::maybe_for_update!(
+                    invitations::table.filter(invitations::id.eq(invitation_id))
+                )
+                .select(Invitation::as_select())
+                .first(conn)
+                .await?;
 
                 // Reject a revoked, or expired-while-still-pending, token
                 // up front — before the existing-membership shortcut below.
@@ -2034,14 +2101,15 @@ pub async fn revoke_invitation(
             // transaction, instead of trusting the pre-transaction
             // `require_role` result — see `create_invitation`'s identical
             // fix for the full rationale (Codex review finding).
-            let caller_membership: Option<Membership> = memberships::table
-                .filter(memberships::tenant_id.eq(&tenant_id))
-                .filter(memberships::user_id.eq(caller_id))
-                .select(Membership::as_select())
-                .for_update()
-                .first(conn)
-                .await
-                .optional()?;
+            let caller_membership: Option<Membership> = ::autumn_web::maybe_for_update!(
+                memberships::table
+                    .filter(memberships::tenant_id.eq(&tenant_id))
+                    .filter(memberships::user_id.eq(caller_id))
+                    .select(Membership::as_select())
+            )
+            .first(conn)
+            .await
+            .optional()?;
             let Some(caller_membership) = caller_membership else {
                 return Err(AutumnError::unauthorized_msg("no active organization"));
             };
@@ -2061,12 +2129,12 @@ pub async fn revoke_invitation(
             // reports "revoked" instead of following the accepted-token
             // idempotency path, corrupting the invitation's audit trail
             // (Codex review finding).
-            let current: Invitation = invitations::table
-                .filter(invitations::id.eq(invitation_id))
-                .for_update()
-                .select(Invitation::as_select())
-                .first(conn)
-                .await?;
+            let current: Invitation = ::autumn_web::maybe_for_update!(
+                invitations::table.filter(invitations::id.eq(invitation_id))
+            )
+            .select(Invitation::as_select())
+            .first(conn)
+            .await?;
             if current.status != "pending" {
                 return Err(AutumnError::conflict_msg(
                     "This invitation is no longer pending",
@@ -2131,9 +2199,7 @@ pub async fn resend_invitation(
                 let org_id: i64 = tenant_id.parse().map_err(|_| {
                     AutumnError::internal_server_error_msg("Corrupt organization id in invitation")
                 })?;
-                organizations::table
-                    .find(org_id)
-                    .for_update()
+                ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
                     .select(Organization::as_select())
                     .first(conn)
                     .await
@@ -2143,14 +2209,15 @@ pub async fn resend_invitation(
                 // organization lock is held — see `create_invitation`'s
                 // identical fix for the full rationale (Codex review
                 // finding).
-                let inviter_membership: Option<Membership> = memberships::table
-                    .filter(memberships::tenant_id.eq(&tenant_id))
-                    .filter(memberships::user_id.eq(inviter_id))
-                    .select(Membership::as_select())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()?;
+                let inviter_membership: Option<Membership> = ::autumn_web::maybe_for_update!(
+                    memberships::table
+                        .filter(memberships::tenant_id.eq(&tenant_id))
+                        .filter(memberships::user_id.eq(inviter_id))
+                        .select(Membership::as_select())
+                )
+                .first(conn)
+                .await
+                .optional()?;
                 let Some(inviter_membership) = inviter_membership else {
                     return Err(AutumnError::unauthorized_msg("no active organization"));
                 };
@@ -2167,12 +2234,12 @@ pub async fn resend_invitation(
                 // transaction and each mint their own replacement, which
                 // would leave two live pending invitations instead of the
                 // single refreshed one this endpoint promises.
-                let current: Invitation = invitations::table
-                    .filter(invitations::id.eq(invitation_id))
-                    .for_update()
-                    .select(Invitation::as_select())
-                    .first(conn)
-                    .await?;
+                let current: Invitation = ::autumn_web::maybe_for_update!(
+                    invitations::table.filter(invitations::id.eq(invitation_id))
+                )
+                .select(Invitation::as_select())
+                .first(conn)
+                .await?;
                 if current.status != "pending" {
                     return Err(AutumnError::conflict_msg(
                         "This invitation is no longer pending",
@@ -2424,20 +2491,18 @@ pub async fn change_role(
             let org_id: i64 = tenant_id.parse().map_err(|_| {
                 AutumnError::internal_server_error_msg("Corrupt organization id in session")
             })?;
-            organizations::table
-                .find(org_id)
-                .for_update()
+            ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
                 .select(Organization::as_select())
                 .first(conn)
                 .await
                 .optional()?;
 
-            let memberships: Vec<Membership> = memberships::table
-                .filter(memberships::tenant_id.eq(&tenant_id))
-                .for_update()
-                .select(Membership::as_select())
-                .load(conn)
-                .await?;
+            let memberships: Vec<Membership> = ::autumn_web::maybe_for_update!(
+                memberships::table.filter(memberships::tenant_id.eq(&tenant_id))
+            )
+            .select(Membership::as_select())
+            .load(conn)
+            .await?;
 
             // Revalidate the caller's own role from this same locked
             // snapshot instead of the `require_role` result computed
@@ -2527,20 +2592,18 @@ pub async fn remove_member(
             let org_id: i64 = tenant_id.parse().map_err(|_| {
                 AutumnError::internal_server_error_msg("Corrupt organization id in session")
             })?;
-            organizations::table
-                .find(org_id)
-                .for_update()
+            ::autumn_web::maybe_for_update!(organizations::table.find(org_id))
                 .select(Organization::as_select())
                 .first(conn)
                 .await
                 .optional()?;
 
-            let memberships: Vec<Membership> = memberships::table
-                .filter(memberships::tenant_id.eq(&tenant_id))
-                .for_update()
-                .select(Membership::as_select())
-                .load(conn)
-                .await?;
+            let memberships: Vec<Membership> = ::autumn_web::maybe_for_update!(
+                memberships::table.filter(memberships::tenant_id.eq(&tenant_id))
+            )
+            .select(Membership::as_select())
+            .load(conn)
+            .await?;
 
             // Revalidate the caller's own role from this same locked
             // snapshot instead of the `require_role` result computed
@@ -2586,26 +2649,70 @@ pub async fn remove_member(
 "#;
 
 // ── Migration SQL ────────────────────────────────────────────────────────
-//
-// Postgres DDL only, mirroring `examples/teams`'s migration byte-for-byte
-// (minus its `users` table — a generated app already has its own from
-// `autumn generate auth`). Unlike the `model`/`scaffold`/`migration`
-// generators, `teams` has no `SQLite`-dialect variant (issue #1614's
-// backend-aware DDL work did not extend to this generator).
 
-const MIGRATION_UP: &str = r"-- Organizations, memberships, and invitations for team membership (issue
+/// Backend-specific column fragments for the hand-written `teams` migration
+/// DDL (issue #1927).
+///
+/// The three tables are one `CREATE TABLE` literal each, so only the column
+/// TYPES differ between backends: `SQLite` has no `BIGSERIAL`, no `NOW()`, and
+/// no dedicated timestamp type. Everything else is portable and stays shared —
+/// `TEXT`, the `role`/`status` `CHECK` enums, the `UNIQUE` constraints, the
+/// indexes, and the partial unique index (`SQLite` has had partial indexes
+/// since 3.8.0). Mirrors `auth.rs`'s `AuthDdl`.
+///
+/// Each fragment renders into the fixed-width column the Postgres DDL already
+/// aligns to, so its SQL is unchanged by the fork.
+#[derive(Clone, Copy)]
+struct TeamsDdl {
+    /// Auto-increment primary-key definition (the SQL after `id `).
+    pk: &'static str,
+    /// The type of a `user_id` / `invited_by_user_id` integer column.
+    int: &'static str,
+    /// The type of a timestamp column.
+    ts: &'static str,
+    /// The `DEFAULT` expression for a row's creation time.
+    now: &'static str,
+}
+
+impl TeamsDdl {
+    const fn for_backend(backend: DatabaseBackend) -> Self {
+        match backend {
+            DatabaseBackend::Postgres => Self {
+                pk: "BIGSERIAL PRIMARY KEY",
+                int: "BIGINT",
+                ts: "TIMESTAMP",
+                now: "NOW()",
+            },
+            DatabaseBackend::Sqlite => Self {
+                pk: "INTEGER PRIMARY KEY AUTOINCREMENT",
+                int: "INTEGER",
+                ts: "TEXT",
+                now: "CURRENT_TIMESTAMP",
+            },
+        }
+    }
+}
+
+/// The `teams` `up.sql` in the app's own dialect (issue #1927).
+///
+/// Mirrors `examples/teams`'s migration — minus its `users` table, which a
+/// generated app already has from `autumn generate auth`.
+fn render_migration_up(backend: DatabaseBackend) -> String {
+    let d = TeamsDdl::for_backend(backend);
+    format!(
+        r"-- Organizations, memberships, and invitations for team membership (issue
 -- #1261). Deliberately does NOT create (or reference via REFERENCES) a
 -- `users` table — your app already has its own from `autumn generate auth`;
--- `memberships.user_id` / `invitations.invited_by_user_id` are bare BIGINT
--- with no FK, so this migration has no ordering dependency on when your
--- users table was created.
+-- `memberships.user_id` / `invitations.invited_by_user_id` are bare integer
+-- columns with no FK, so this migration has no ordering dependency on when
+-- your users table was created.
 
 -- An organization (tenant). Creating one makes the creator an `owner`
 -- member (see `src/teams/routes/organizations.rs`).
 CREATE TABLE organizations (
-    id         BIGSERIAL PRIMARY KEY,
+    id         {pk},
     name       TEXT      NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    created_at {ts:<9} NOT NULL DEFAULT {now}
 );
 
 -- The user <-> organization join row, carrying the closed `role` enum
@@ -2621,11 +2728,11 @@ CREATE TABLE organizations (
 -- accept: a second INSERT for the same (tenant_id, user_id) pair fails
 -- closed instead of creating a duplicate membership.
 CREATE TABLE memberships (
-    id         BIGSERIAL PRIMARY KEY,
+    id         {pk},
     tenant_id  TEXT      NOT NULL,
-    user_id    BIGINT    NOT NULL,
+    user_id    {int:<9} NOT NULL,
     role       TEXT      NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at {ts:<9} NOT NULL DEFAULT {now},
     UNIQUE (tenant_id, user_id)
 );
 CREATE INDEX idx_memberships_tenant ON memberships (tenant_id);
@@ -2636,7 +2743,7 @@ CREATE INDEX idx_memberships_user ON memberships (user_id);
 -- raw token — so a database leak cannot be replayed as an accept link.
 -- `status` starts `pending`; accepting sets it to `accepted`, revoking sets
 -- it to `revoked`. Both are terminal: the accept handler checks
--- `status = 'pending'` AND `expires_at > now()` before creating a
+-- `status = 'pending'` AND an unexpired `expires_at` before creating a
 -- membership, so an expired/revoked/already-accepted token renders a clear
 -- error instead of a second membership row or a panic. The partial unique
 -- index below is the concurrency backstop for `create_invitation`: two
@@ -2646,20 +2753,26 @@ CREATE INDEX idx_memberships_user ON memberships (user_id);
 -- second transaction's INSERT fails closed against this index instead of
 -- leaving two live pending tokens for the same invitee.
 CREATE TABLE invitations (
-    id                 BIGSERIAL PRIMARY KEY,
+    id                 {pk},
     tenant_id          TEXT      NOT NULL,
     email              TEXT      NOT NULL,
     role               TEXT      NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
     token_hash         TEXT      NOT NULL UNIQUE,
     status             TEXT      NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'revoked')),
-    invited_by_user_id BIGINT    NOT NULL,
-    expires_at         TIMESTAMP NOT NULL,
-    created_at         TIMESTAMP NOT NULL DEFAULT NOW()
+    invited_by_user_id {int:<9} NOT NULL,
+    expires_at         {ts:<9} NOT NULL,
+    created_at         {ts:<9} NOT NULL DEFAULT {now}
 );
 CREATE INDEX idx_invitations_tenant ON invitations (tenant_id);
 CREATE INDEX idx_invitations_email ON invitations (email);
 CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';
-";
+",
+        pk = d.pk,
+        int = d.int,
+        ts = d.ts,
+        now = d.now,
+    )
+}
 
 const MIGRATION_DOWN: &str = "DROP TABLE IF EXISTS invitations;\nDROP TABLE IF EXISTS memberships;\nDROP TABLE IF EXISTS organizations;\n";
 
@@ -2958,8 +3071,82 @@ async fn main() {
     /// `SQLite`-aware rendering path — a `SQLite`-backed project must be
     /// rejected at generate time with an actionable error, not emit a
     /// migration `autumn migrate` would fail to apply (Codex review finding).
+    /// The Postgres `up.sql` exactly as it read before the `SQLite` dialect
+    /// fork (issue #1927). A verbatim copy, deliberately not shared with the
+    /// renderer: a snapshot the code under test builds is no snapshot.
+    const PRE_FORK_POSTGRES_MIGRATION_UP: &str = r"-- Organizations, memberships, and invitations for team membership (issue
+-- #1261). Deliberately does NOT create (or reference via REFERENCES) a
+-- `users` table — your app already has its own from `autumn generate auth`;
+-- `memberships.user_id` / `invitations.invited_by_user_id` are bare BIGINT
+-- with no FK, so this migration has no ordering dependency on when your
+-- users table was created.
+
+-- An organization (tenant). Creating one makes the creator an `owner`
+-- member (see `src/teams/routes/organizations.rs`).
+CREATE TABLE organizations (
+    id         BIGSERIAL PRIMARY KEY,
+    name       TEXT      NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- The user <-> organization join row, carrying the closed `role` enum
+-- (`owner` | `admin` | `member`, see `src/teams/role.rs`). `tenant_scoped`
+-- on `#[repository(Membership, ...)]` filters every read/write by the
+-- active organization at the SQL level (issue #695's row-level
+-- multi-tenancy seam, not a second isolation mechanism) — but the macro's
+-- generated queries unconditionally filter on a column literally named
+-- `tenant_id` (`TEXT`), so this holds the organization's id in its string
+-- form rather than a typed FK; application code parses it back to `i64`
+-- where it needs to look up the `Organization` row itself. The UNIQUE
+-- constraint is the idempotency backstop for a double-clicked invitation
+-- accept: a second INSERT for the same (tenant_id, user_id) pair fails
+-- closed instead of creating a duplicate membership.
+CREATE TABLE memberships (
+    id         BIGSERIAL PRIMARY KEY,
+    tenant_id  TEXT      NOT NULL,
+    user_id    BIGINT    NOT NULL,
+    role       TEXT      NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, user_id)
+);
+CREATE INDEX idx_memberships_tenant ON memberships (tenant_id);
+CREATE INDEX idx_memberships_user ON memberships (user_id);
+
+-- A single-use, expiring, cryptographically-random email invitation. Only
+-- the SHA-256 hash of the token is stored (`hash_api_token`) — never the
+-- raw token — so a database leak cannot be replayed as an accept link.
+-- `status` starts `pending`; accepting sets it to `accepted`, revoking sets
+-- it to `revoked`. Both are terminal: the accept handler checks
+-- `status = 'pending'` AND `expires_at > now()` before creating a
+-- membership, so an expired/revoked/already-accepted token renders a clear
+-- error instead of a second membership row or a panic. The partial unique
+-- index below is the concurrency backstop for `create_invitation`: two
+-- concurrent requests for the same (tenant_id, email) each revoke-then-insert
+-- in their own transaction, so a `SELECT ... WHERE status = 'pending'` alone
+-- cannot serialize them (no prior row to lock when none exists yet) — the
+-- second transaction's INSERT fails closed against this index instead of
+-- leaving two live pending tokens for the same invitee.
+CREATE TABLE invitations (
+    id                 BIGSERIAL PRIMARY KEY,
+    tenant_id          TEXT      NOT NULL,
+    email              TEXT      NOT NULL,
+    role               TEXT      NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+    token_hash         TEXT      NOT NULL UNIQUE,
+    status             TEXT      NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'revoked')),
+    invited_by_user_id BIGINT    NOT NULL,
+    expires_at         TIMESTAMP NOT NULL,
+    created_at         TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_invitations_tenant ON invitations (tenant_id);
+CREATE INDEX idx_invitations_email ON invitations (email);
+CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';
+";
+
+    /// Backend-aware DDL (issue #1927): `generate teams` on a `SQLite` app
+    /// scaffolds its migration in `SQLite` dialect instead of being rejected,
+    /// and leaks no Postgres-only spelling.
     #[test]
-    fn plan_rejects_sqlite_backend() {
+    fn plan_teams_emits_sqlite_ddl() {
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -2974,19 +3161,286 @@ async fn main() {
                 )
                 .unwrap();
 
-                let err = plan_teams(tmp.path(), "20260101000000", false).unwrap_err();
-                assert!(matches!(err, GenerateError::Config(_)), "{err:?}");
-                assert!(err.to_string().contains("Postgres"), "{err}");
-                assert!(!tmp.path().join("src/teams").exists());
+                plan_teams(tmp.path(), "20260101000000", false)
+                    .expect("generate teams must scaffold on a SQLite app")
+                    .execute(Flags::default())
+                    .unwrap();
+
+                let up = fs::read_to_string(
+                    tmp.path()
+                        .join("migrations/20260101000000_create_teams/up.sql"),
+                )
+                .unwrap();
+
+                // Every auto-increment id uses the SQLite spelling.
+                assert_eq!(
+                    up.matches("id         INTEGER PRIMARY KEY AUTOINCREMENT")
+                        .count()
+                        + up.matches("id                 INTEGER PRIMARY KEY AUTOINCREMENT")
+                            .count(),
+                    3,
+                    "all three tables need a SQLite auto-increment id: {up}"
+                );
+                // Foreign-key and timestamp columns are SQLite-typed.
+                assert!(
+                    up.contains("user_id    INTEGER   NOT NULL"),
+                    "FK columns must be INTEGER on SQLite: {up}"
+                );
+                assert!(
+                    up.contains("created_at TEXT      NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+                    "created_at must default to CURRENT_TIMESTAMP on SQLite: {up}"
+                );
+                for leak in ["BIGSERIAL", "BIGINT", "NOW()", "TIMESTAMP "] {
+                    assert!(
+                        !up.contains(leak),
+                        "SQLite up.sql leaked Postgres-only `{leak}`: {up}"
+                    );
+                }
             },
         );
     }
 
-    /// The `SQLite` rejection must not block `autumn destroy teams` cleaning
-    /// up a project that somehow already has `teams` generated (e.g. from
-    /// before this backend check existed).
+    /// The `SQLite` migration is tested by RUNNING it, not by matching strings:
+    /// `up.sql` applies to a real in-memory `SQLite`, a row survives a write/read
+    /// cycle through each table, every constraint the DDL exists for still bites,
+    /// and `down.sql` rolls the whole thing back.
     #[test]
-    fn destroy_is_not_blocked_by_sqlite_rejection() {
+    fn teams_sqlite_migration_applies_and_round_trips() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        /// One `organizations` row, read back through the diesel sql-types
+        /// `src/teams/schema.rs` declares for it.
+        #[derive(QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            id: i64,
+            #[diesel(sql_type = diesel::sql_types::Timestamp)]
+            created_at: chrono::NaiveDateTime,
+        }
+
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        let up = render_migration_up(DatabaseBackend::Sqlite);
+        conn.batch_execute(&up)
+            .expect("the SQLite up.sql must be valid SQLite DDL");
+
+        let run = |conn: &mut diesel::SqliteConnection, sql: &str| {
+            diesel::sql_query(sql.to_owned()).execute(conn)
+        };
+
+        // A row round-trips through each table, with the id auto-assigned and
+        // `created_at` defaulted by SQLite rather than by the app.
+        run(
+            &mut conn,
+            "INSERT INTO organizations (name) VALUES ('Acme')",
+        )
+        .expect("insert an organization");
+        let orgs: Vec<Row> = diesel::sql_query("SELECT id, created_at FROM organizations")
+            .load(&mut conn)
+            .expect("an organization row must load back through diesel's sql types");
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].id, 1, "id must be auto-assigned");
+        assert!(
+            orgs[0].created_at.and_utc().timestamp() > 0,
+            "created_at must be defaulted to a parseable timestamp by SQLite"
+        );
+
+        run(
+            &mut conn,
+            "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('1', 7, 'owner')",
+        )
+        .expect("insert a membership");
+        run(
+            &mut conn,
+            "INSERT INTO invitations (tenant_id, email, role, token_hash, invited_by_user_id, \
+             expires_at) VALUES ('1', 'a@b.test', 'member', 'h1', 7, '2030-01-01 00:00:00')",
+        )
+        .expect("insert an invitation");
+
+        assert_sqlite_constraints_bite(&mut conn);
+
+        // `down.sql` is dialect-neutral, but it has to actually undo this.
+        conn.batch_execute(MIGRATION_DOWN)
+            .expect("down.sql must roll the SQLite migration back");
+        assert!(
+            run(&mut conn, "SELECT 1 FROM organizations").is_err(),
+            "down.sql must drop the tables"
+        );
+    }
+
+    /// Every constraint the `teams` DDL carries must actually bite on `SQLite`,
+    /// not merely parse. Split out of the round-trip test to keep it readable.
+    fn assert_sqlite_constraints_bite(conn: &mut diesel::SqliteConnection) {
+        use diesel::prelude::*;
+
+        let run = |conn: &mut diesel::SqliteConnection, sql: &str| {
+            diesel::sql_query(sql.to_owned()).execute(conn)
+        };
+
+        // The `role` CHECK is enforced, not decorative.
+        assert!(
+            run(
+                conn,
+                "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('1', 8, 'wizard')",
+            )
+            .is_err(),
+            "the role CHECK must reject an out-of-enum role on SQLite"
+        );
+        // The `status` CHECK likewise.
+        assert!(
+            run(
+                conn,
+                "INSERT INTO invitations (tenant_id, email, role, token_hash, status, \
+                 invited_by_user_id, expires_at) VALUES ('1', 'c@b.test', 'member', 'h9', \
+                 'mailed', 7, '2030-01-01 00:00:00')",
+            )
+            .is_err(),
+            "the status CHECK must reject an out-of-enum status on SQLite"
+        );
+        // `token_hash … UNIQUE` is what stops an invitation token being
+        // replayed onto a second row.
+        assert!(
+            run(
+                conn,
+                "INSERT INTO invitations (tenant_id, email, role, token_hash, \
+                 invited_by_user_id, expires_at) VALUES ('2', 'd@b.test', 'member', 'h1', 7, \
+                 '2030-01-01 00:00:00')",
+            )
+            .is_err(),
+            "the token_hash UNIQUE must reject a reused token, even in another tenant"
+        );
+        // The double-click idempotency backstop on (tenant_id, user_id).
+        assert!(
+            run(
+                conn,
+                "INSERT INTO memberships (tenant_id, user_id, role) VALUES ('1', 7, 'member')",
+            )
+            .is_err(),
+            "the memberships UNIQUE must reject a duplicate (tenant_id, user_id)"
+        );
+        // The PARTIAL unique index is the concurrency backstop for two
+        // simultaneous invitations to the same invitee — SQLite has to honor
+        // both the uniqueness AND the `WHERE status = 'pending'` predicate.
+        assert!(
+            run(
+                conn,
+                "INSERT INTO invitations (tenant_id, email, role, token_hash, \
+                 invited_by_user_id, expires_at) VALUES ('1', 'a@b.test', 'member', 'h2', 7, \
+                 '2030-01-01 00:00:00')",
+            )
+            .is_err(),
+            "the partial unique index must reject a second PENDING invite for one invitee"
+        );
+        run(
+            conn,
+            "UPDATE invitations SET status = 'revoked' WHERE token_hash = 'h1'",
+        )
+        .expect("revoke the first invitation");
+        run(
+            conn,
+            "INSERT INTO invitations (tenant_id, email, role, token_hash, invited_by_user_id, \
+             expires_at) VALUES ('1', 'a@b.test', 'member', 'h3', 7, '2030-01-01 00:00:00')",
+        )
+        .expect("once the first invite is revoked the partial index must let a new one in");
+    }
+
+    /// The Postgres SQL is unchanged by the `SQLite` fork (issue #1927):
+    /// existing projects, and `examples/teams` which this DDL mirrors, must see
+    /// the same statements as before.
+    ///
+    /// Compared statement-by-statement rather than over the whole file: two
+    /// `--` comment lines were reworded, because they named `BIGINT` and
+    /// `now()` and the `SQLite` output uses neither. Every line of SQL must
+    /// still match the pre-fork text exactly.
+    #[test]
+    fn teams_postgres_migration_sql_is_unchanged() {
+        fn statements(sql: &str) -> Vec<&str> {
+            sql.lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect()
+        }
+        assert_eq!(
+            statements(&render_migration_up(DatabaseBackend::Postgres)),
+            statements(PRE_FORK_POSTGRES_MIGRATION_UP),
+            "the Postgres DDL must not drift when the SQLite dialect is added"
+        );
+    }
+
+    /// The `autumn-web` dependency entry from a generated `Cargo.toml`.
+    ///
+    /// Just the one line the generator writes — `ensure_autumn_web_feature`
+    /// keeps the single-line inline-table shape for the entry `project()`
+    /// declares — so a feature assertion cannot be satisfied by an unrelated
+    /// dependency elsewhere in the file.
+    fn autumn_web_entry(cargo: &str) -> &str {
+        cargo
+            .lines()
+            .find(|line| line.trim_start().starts_with("autumn-web"))
+            .unwrap_or_else(|| panic!("no autumn-web dependency in:\n{cargo}"))
+    }
+
+    /// The Cargo dependency set is backend-aware too (issue #1927).
+    ///
+    /// DDL is not the only place the unconditional-Postgres pattern hides. A
+    /// `SQLite` app handed `diesel = { features = ["postgres"] }` and a direct
+    /// `pq-sys` gets libpq it never links, and — the load-bearing part — no
+    /// `returning_clauses_for_sqlite_3_35`, without which the generated
+    /// handlers' `.returning(...).get_result(conn)` inserts do not compile.
+    #[test]
+    fn plan_teams_writes_the_sqlite_dependency_set() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
+                fs::write(
+                    tmp.path().join("autumn.toml"),
+                    "[database]\nprimary_url = \"sqlite://app.db\"\n",
+                )
+                .unwrap();
+
+                plan_teams(tmp.path(), "20260101000000", false)
+                    .unwrap()
+                    .execute(Flags::default())
+                    .unwrap();
+
+                let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+                assert!(
+                    cargo.contains("returning_clauses_for_sqlite_3_35"),
+                    "the generated inserts need RETURNING on SQLite: {cargo}"
+                );
+                assert!(cargo.contains("libsqlite3-sys"), "{cargo}");
+                assert!(
+                    cargo.contains("sync-connection-wrapper"),
+                    "diesel-async must ride the sync wrapper on SQLite: {cargo}"
+                );
+                assert!(
+                    !cargo.contains("pq-sys"),
+                    "a SQLite app has no reason to name libpq: {cargo}"
+                );
+                assert!(
+                    !cargo.contains("\"postgres\""),
+                    "no dependency may pin the postgres feature on a SQLite app: {cargo}"
+                );
+                // Without autumn-web's `sqlite` feature, `RuntimeConnection`
+                // stays the Postgres connection and the app refuses its own
+                // `sqlite://` URL at boot (`PoolError::UnsupportedBackend`).
+                // Read from autumn-web's OWN entry: matching `"sqlite"` anywhere
+                // in the file would pass on `libsqlite3-sys` alone.
+                assert!(
+                    autumn_web_entry(&cargo).contains("sqlite"),
+                    "a SQLite app needs autumn-web's `sqlite` feature: {cargo}"
+                );
+            },
+        );
+    }
+
+    /// The Postgres dependency set is unchanged by that fork.
+    #[test]
+    fn plan_teams_writes_the_postgres_dependency_set_by_default() {
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -3000,17 +3454,78 @@ async fn main() {
                     .execute(Flags::default())
                     .unwrap();
 
+                let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+                assert!(cargo.contains("pq-sys"), "{cargo}");
+                assert!(cargo.contains("\"postgres\""), "{cargo}");
+                assert!(!cargo.contains("libsqlite3-sys"), "{cargo}");
+                assert!(
+                    !autumn_web_entry(&cargo).contains("sqlite"),
+                    "a Postgres app must not get autumn-web's `sqlite` feature: {cargo}"
+                );
+
+                // And the migration itself: without this, `plan_teams` could
+                // stop consulting `detect_backend` altogether — hard-coding
+                // `Sqlite` — and every other test would still pass, handing
+                // every Postgres app SQLite DDL.
+                let up = fs::read_to_string(
+                    tmp.path()
+                        .join("migrations/20260101000000_create_teams/up.sql"),
+                )
+                .unwrap();
+                assert!(up.contains("id         BIGSERIAL PRIMARY KEY"), "{up}");
+                assert!(
+                    up.contains("created_at TIMESTAMP NOT NULL DEFAULT NOW()"),
+                    "{up}"
+                );
+                assert!(
+                    !up.contains("AUTOINCREMENT") && !up.contains("CURRENT_TIMESTAMP"),
+                    "a Postgres app must not get SQLite DDL: {up}"
+                );
+            },
+        );
+    }
+
+    /// `autumn destroy teams` round-trips a `SQLite` project (issue #1927).
+    ///
+    /// Generate and destroy under the SAME backend, which is the whole
+    /// lifecycle now that `generate` no longer refuses `SQLite`. Flipping the
+    /// backend BETWEEN the two is a different case, and one `destroy` refuses
+    /// without `--force` for every backend-aware generator alike: the
+    /// provenance invocation carries a backend fingerprint, so a plan
+    /// recomputed under the other backend is not the plan that wrote the file.
+    #[test]
+    fn destroy_round_trips_on_a_sqlite_app() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project();
                 fs::write(
                     tmp.path().join("autumn.toml"),
                     "[database]\nprimary_url = \"sqlite://app.db\"\n",
                 )
                 .unwrap();
 
+                plan_teams(tmp.path(), "20260101000000", false)
+                    .unwrap()
+                    .execute(Flags::default())
+                    .unwrap();
+                assert!(tmp.path().join("src/teams").exists());
+
                 plan_teams(tmp.path(), "20260101000000", true)
                     .unwrap()
                     .revert(Flags::default())
                     .unwrap();
                 assert!(!tmp.path().join("src/teams").exists());
+                assert!(
+                    !tmp.path()
+                        .join("migrations/20260101000000_create_teams")
+                        .exists(),
+                    "destroy must take the SQLite migration back out too"
+                );
             },
         );
     }
@@ -3154,7 +3669,10 @@ async fn main() {
 
         let invitations =
             fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
-        assert!(invitations.contains(".for_update()"), "{invitations}");
+        assert!(
+            invitations.contains("::autumn_web::maybe_for_update!("),
+            "{invitations}"
+        );
         assert!(
             invitations.contains("This invitation is no longer pending"),
             "{invitations}"
@@ -3405,14 +3923,20 @@ async fn main() {
     /// and the generated handler must translate that constraint's
     /// violation into a friendly conflict rather than a raw 500 (Codex
     /// review finding).
+    ///
+    /// Asserted on BOTH dialects: the index is portable, so the `SQLite` fork
+    /// (issue #1927) must not have dropped it.
     #[test]
     fn migration_has_partial_unique_index_for_pending_invitation_email() {
-        assert!(
-            MIGRATION_UP.contains(
-                "CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';"
-            ),
-            "{MIGRATION_UP}"
-        );
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            let up = render_migration_up(backend);
+            assert!(
+                up.contains(
+                    "CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, email) WHERE status = 'pending';"
+                ),
+                "{backend:?}: {up}"
+            );
+        }
     }
 
     #[test]
@@ -3523,7 +4047,7 @@ async fn main() {
         let organizations =
             fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
         let other_owner_pos = organizations
-            .find("let other_owner: Option<Membership> = memberships::table")
+            .find("let other_owner: Option<Membership> = ::autumn_web::maybe_for_update!(")
             .unwrap_or_else(|| panic!("missing other-owner guard: {organizations}"));
         assert!(
             organizations.contains("if other_owner.is_none() {"),
@@ -3642,10 +4166,10 @@ async fn main() {
         let invitations =
             fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
         let accept_org_lock_pos = invitations
-            .find("organizations::table\n                    .find(org_id)\n                    .for_update()")
+            .find("::autumn_web::maybe_for_update!(organizations::table.find(org_id))")
             .unwrap_or_else(|| panic!("missing org-row lock in accept_invitation: {invitations}"));
         let accept_invitation_lock_pos = invitations
-            .find("let invitation: Invitation = invitations::table\n                    .filter(invitations::id.eq(invitation_id))\n                    .for_update()")
+            .find("let invitation: Invitation = ::autumn_web::maybe_for_update!(\n                    invitations::table.filter(invitations::id.eq(invitation_id))\n                )")
             .unwrap_or_else(|| panic!("missing invitation-row lock: {invitations}"));
         assert!(
             accept_org_lock_pos < accept_invitation_lock_pos,
@@ -3655,12 +4179,12 @@ async fn main() {
         let organizations =
             fs::read_to_string(tmp.path().join("src/teams/routes/organizations.rs")).unwrap();
         let cleanup_org_lock_pos = organizations
-            .find("organizations::table\n            .find(org_id)\n            .for_update()")
+            .find("::autumn_web::maybe_for_update!(organizations::table.find(org_id))")
             .unwrap_or_else(|| {
                 panic!("missing org-row lock in remove_all_memberships_on_conn: {organizations}")
             });
         let cleanup_other_owner_pos = organizations
-            .find("let other_owner: Option<Membership> = memberships::table")
+            .find("let other_owner: Option<Membership> = ::autumn_web::maybe_for_update!(")
             .unwrap();
         assert!(
             cleanup_org_lock_pos < cleanup_other_owner_pos,
@@ -3695,10 +4219,10 @@ async fn main() {
         // The user's own membership row for each organization must be
         // re-locked only after the organization lock.
         let org_lock_pos = organizations
-            .find("organizations::table\n            .find(org_id)\n            .for_update()")
+            .find("::autumn_web::maybe_for_update!(organizations::table.find(org_id))")
             .unwrap();
         let own_row_relock_pos = organizations
-            .find("let Some(own_membership) = memberships::table")
+            .find("let Some(own_membership) = ::autumn_web::maybe_for_update!(")
             .unwrap();
         assert!(org_lock_pos < own_row_relock_pos);
     }
@@ -3724,7 +4248,7 @@ async fn main() {
             fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
 
         let create_org_lock_pos = invitations
-            .find("organizations::table\n                .find(org_id)\n                .for_update()")
+            .find("::autumn_web::maybe_for_update!(organizations::table.find(org_id))")
             .unwrap_or_else(|| panic!("missing org-row lock in create_invitation: {invitations}"));
         let create_insert_pos = invitations
             .find("diesel::insert_into(invitations::table)")
@@ -3735,7 +4259,7 @@ async fn main() {
         );
 
         let resend_org_lock_pos = invitations
-            .find("organizations::table\n                    .find(org_id)\n                    .for_update()")
+            .find("::autumn_web::maybe_for_update!(organizations::table.find(org_id))")
             .unwrap_or_else(|| panic!("missing org-row lock in resend_invitation: {invitations}"));
         let resend_status_check_pos = invitations
             .find("if current.status != \"pending\"")
@@ -3779,7 +4303,7 @@ async fn main() {
         assert_eq!(
             members
                 .matches(
-                    ".filter(memberships::tenant_id.eq(&tenant_id))\n                .for_update()"
+                    "::autumn_web::maybe_for_update!(\n                memberships::table.filter(memberships::tenant_id.eq(&tenant_id))\n            )"
                 )
                 .count(),
             2,
@@ -3830,7 +4354,9 @@ async fn main() {
             fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
         assert_eq!(
             invitations
-                .matches("let inviter_membership: Option<Membership> = memberships::table")
+                .matches(
+                    "let inviter_membership: Option<Membership> = ::autumn_web::maybe_for_update!("
+                )
                 .count(),
             2,
             "both create_invitation and resend_invitation must re-lock and revalidate the \
@@ -3840,10 +4366,10 @@ async fn main() {
         // In create_invitation specifically, the revalidated role (not the
         // stale pre-transaction one) must gate granting Owner.
         let create_org_lock_pos = invitations
-            .find("organizations::table\n                .find(org_id)\n                .for_update()")
+            .find("::autumn_web::maybe_for_update!(organizations::table.find(org_id))")
             .unwrap();
         let create_revalidate_pos = invitations
-            .find("let inviter_membership: Option<Membership> = memberships::table")
+            .find("let inviter_membership: Option<Membership> = ::autumn_web::maybe_for_update!(")
             .unwrap();
         let create_owner_grant_check_pos = invitations
             .find("if role == Role::Owner && current_caller_role != Role::Owner")
@@ -3871,13 +4397,18 @@ async fn main() {
 
         let invitations =
             fs::read_to_string(tmp.path().join("src/teams/routes/invitations.rs")).unwrap();
-        let account_relock_pos = invitations
-            .find("let live_caller_email: Option<String> = caller_users::table")
-            .unwrap_or_else(|| panic!("missing account-row relock: {invitations}"));
-        let org_lock_pos = invitations
-            .find("organizations::table\n                    .find(org_id)\n                    .for_update()")
+        let accept_body = invitations
+            .split("pub async fn accept_invitation(")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn revoke_invitation(").next())
+            .unwrap_or_else(|| panic!("missing accept_invitation: {invitations}"));
+        let account_relock_pos = accept_body
+            .find("let live_caller_email: Option<String> = ::autumn_web::maybe_for_update!(")
+            .unwrap_or_else(|| panic!("missing account-row relock: {accept_body}"));
+        let org_lock_pos = accept_body
+            .find("::autumn_web::maybe_for_update!(organizations::table.find(org_id))")
             .unwrap();
-        let insert_pos = invitations
+        let insert_pos = accept_body
             .find("let membership: Membership = diesel::insert_into(memberships::table)")
             .unwrap();
         assert!(
@@ -3891,7 +4422,7 @@ async fn main() {
         );
         assert!(
             invitations.contains(
-                ".filter(caller_users::id.eq(user_id))\n                    .select(caller_users::email)\n                    .for_update()"
+                "caller_users::table\n                        .filter(caller_users::id.eq(user_id))\n                        .select(caller_users::email)"
             ),
             "{invitations}"
         );
@@ -4022,7 +4553,9 @@ async fn main() {
             .unwrap_or_else(|| panic!("missing revoke_invitation: {invitations}"));
         assert!(revoke_body.contains("db.tx(move |conn| {"), "{revoke_body}");
         assert!(
-            revoke_body.contains("let caller_membership: Option<Membership> = memberships::table"),
+            revoke_body.contains(
+                "let caller_membership: Option<Membership> = ::autumn_web::maybe_for_update!("
+            ),
             "{revoke_body}"
         );
         assert!(
@@ -4054,7 +4587,7 @@ async fn main() {
             .unwrap_or_else(|| panic!("missing revoke_invitation: {invitations}"));
         assert!(
             revoke_body.contains(
-                "let current: Invitation = invitations::table\n                .filter(invitations::id.eq(invitation_id))\n                .for_update()"
+                "let current: Invitation = ::autumn_web::maybe_for_update!(\n                invitations::table.filter(invitations::id.eq(invitation_id))\n            )"
             ),
             "{revoke_body}"
         );

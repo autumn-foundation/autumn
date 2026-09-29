@@ -4,11 +4,20 @@
 //! pre-rendered HTML files from the `dist/` directory if they exist. It acts as a
 //! lightning-fast cache layer in front of your dynamic routes.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use super::StaticManifest;
 use super::isr_coordinator::{IsrCoordinator, LocalIsrCoordinator, isr_window_key};
@@ -501,8 +510,8 @@ fn build_isr_state(manifest: &StaticManifest) -> HashMap<String, IsrRouteState> 
 /// desync this check exists to prevent. `charset` is the one exception: RFC 2046
 /// §4.1.2 defines its values as case-insensitive.
 ///
-/// Quoted values are unquoted so `boundary="x"` and `boundary=x` agree, and `;`
-/// inside quotes does not split a parameter.
+/// Quoted values are unquoted (decoding quoted-pairs, so `boundary="a\b"` and
+/// `boundary=ab` agree), and `;` inside quotes does not split a parameter.
 fn content_type_equivalent(a: &str, b: &str) -> bool {
     normalize_content_type(a) == normalize_content_type(b)
 }
@@ -529,9 +538,46 @@ fn split_unquoted_semicolons(value: &str) -> Vec<&str> {
     parts
 }
 
+/// Decode quoted-pairs inside a quoted MIME parameter value (RFC 9110 §5.6.4).
+///
+/// Inside a quoted-string, `\` followed by any character denotes that
+/// character alone, so `boundary="a\b"` and `boundary="ab"` are the *same*
+/// value. Decoding here keeps the normalizer from letting the escape
+/// backslash make two spellings of one value compare unequal — an ISR
+/// freeze on a route whose header was merely reserialized between
+/// `autumn build` and regeneration.
+///
+/// Only quoted values are touched; an unquoted value is returned as-is so a
+/// backslash that is genuinely part of a token never gets rewritten. A lone
+/// trailing `\` escapes nothing and is dropped; it must neither panic nor
+/// discard the rest of the value.
+fn decode_quoted_pairs(raw_value: &str) -> Cow<'_, str> {
+    let Some(inner) = raw_value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+    else {
+        return Cow::Borrowed(raw_value);
+    };
+    if !inner.contains('\\') {
+        return Cow::Borrowed(inner);
+    }
+    let mut decoded = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(escaped) = chars.next() {
+                decoded.push(escaped);
+            }
+        } else {
+            decoded.push(c);
+        }
+    }
+    Cow::Owned(decoded)
+}
+
 /// Canonical form of a `Content-Type` for comparison: the lowercased media type
 /// followed by its parameters as sorted `name=value` pairs, names lowercased and
-/// values left alone (see [`content_type_equivalent`]).
+/// values left alone apart from unquoting (see [`content_type_equivalent`]).
 fn normalize_content_type(value: &str) -> Vec<String> {
     let mut segments = split_unquoted_semicolons(value).into_iter();
     let media_type = segments.next().unwrap_or("").trim().to_ascii_lowercase();
@@ -551,10 +597,9 @@ fn normalize_content_type(value: &str) -> Vec<String> {
             };
             let name = name.trim().to_ascii_lowercase();
             let raw_value = raw_value.trim();
-            let unquoted = raw_value
-                .strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-                .unwrap_or(raw_value);
+            // Unquote quoted values, decoding quoted-pairs so e.g.
+            // `boundary="a\b"` and `boundary="ab"` normalize the same.
+            let unquoted = decode_quoted_pairs(raw_value);
             if name == "charset" {
                 format!("{name}={}", unquoted.to_ascii_lowercase())
             } else {
@@ -656,6 +701,10 @@ async fn regenerate_page(
 
 /// Get the age of a file in seconds based on its modification time.
 /// Returns `None` if the file doesn't exist or metadata can't be read.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the OS stamps the file mtime with real time, so compare it with real time"
+)]
 fn file_mtime_age_secs(path: &Path) -> Option<u64> {
     let metadata = std::fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
@@ -665,10 +714,7 @@ fn file_mtime_age_secs(path: &Path) -> Option<u64> {
 
 /// Current Unix timestamp in seconds.
 fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    crate::time::clock_unix_secs(&crate::time::AmbientClock)
 }
 
 #[cfg(test)]
@@ -1280,6 +1326,41 @@ mod tests {
         assert!(content_type_equivalent("text/html; FOO", "text/html; foo"));
     }
 
+    /// Quoted-pairs decode when a parameter value is unquoted (RFC 9110 §5.6.4),
+    /// so a header that merely gets reserialized — `boundary="a\b"` becoming
+    /// `boundary="ab"` — between `autumn build` and ISR regeneration does not
+    /// make `regenerate_page` refuse the refresh. The decoder only removes
+    /// escape backslashes: it must not fold case or interior spacing, which
+    /// `content_type_equivalent_preserves_parameter_value_case_and_spacing`
+    /// covers.
+    #[test]
+    fn content_type_equivalent_decodes_quoted_pairs_in_parameter_values() {
+        // `\"` and `\b` inside quotes denote the character alone, so `"a\b"`
+        // is the same value as `ab`.
+        assert!(content_type_equivalent(
+            r#"multipart/mixed; boundary="a\b""#,
+            "multipart/mixed; boundary=ab"
+        ));
+        // An escaped quote is really a quote: it must not make the value
+        // compare equal to one without it.
+        assert!(!content_type_equivalent(
+            r#"multipart/mixed; boundary="a\"b""#,
+            "multipart/mixed; boundary=ab"
+        ));
+        // An escaped backslash is a literal backslash, so `boundary="a\\b"` is
+        // the value `a\b`, not `ab`.
+        assert!(!content_type_equivalent(
+            r#"multipart/mixed; boundary="a\\b""#,
+            "multipart/mixed; boundary=ab"
+        ));
+        // A trailing lone `\` escapes nothing: it is dropped without panicking
+        // and without discarding the rest of the value.
+        assert!(content_type_equivalent(
+            r#"multipart/mixed; boundary="abc\""#,
+            "multipart/mixed; boundary=abc"
+        ));
+    }
+
     /// A manifest whose recorded type the serve path refuses to honour must not
     /// become the ISR expectation: the handler's perfectly good type could never
     /// match it, so every regeneration would be refused forever and the route
@@ -1711,10 +1792,11 @@ mod tests {
     /// page actually refreshes, so such a divergence fails CI instead of
     /// freezing ISR in production.
     ///
-    /// (Note the known asymmetry it does *not* cover: `autumn build` renders
-    /// through the app's custom Tower layers while ISR regeneration
-    /// deliberately does not. An app whose own layer rewrites `Content-Type`
-    /// will see refusals; the error names the route and both types.)
+    /// (The asymmetry this note used to document — `autumn build` rendering
+    /// through the app's custom Tower layers while ISR regeneration did not —
+    /// is closed by #2405: the build renders through the pre-layer router too.
+    /// `isr_accepts_regeneration_when_a_user_layer_rewrites_content_type`
+    /// covers the rewriting-layer shape directly.)
     #[tokio::test]
     async fn isr_regenerates_page_built_by_render_static_routes() {
         let router = axum::Router::new().route(
@@ -1763,6 +1845,127 @@ mod tests {
             "<h1>fresh</h1>",
             "a page built by render_static_routes must still be regenerable by ISR — \
              a build/ISR disagreement on the recorded Content-Type would freeze it"
+        );
+    }
+
+    /// #2405: `autumn build` used to render through the app's custom Tower
+    /// layers while ISR regeneration deliberately did not. For an app with a
+    /// `Content-Type`-rewriting layer the build recorded the post-layer type,
+    /// ISR saw the pre-layer one, and the #2400 guard refused every refresh —
+    /// freezing the route until the next build.
+    ///
+    /// The build now renders through the pre-layer router (user layers drained
+    /// in `run_build_mode` via
+    /// [`crate::router::partition_custom_layers_for_static_render`], the same
+    /// partition the SSG serve path applies), so the manifest records the
+    /// handler's type and the body on disk is the handler's body. This drives
+    /// the real `render_static_routes` into the real `regenerate_page` with a
+    /// rewriting layer in the picture and asserts the refresh is accepted —
+    /// the exact shape that used to freeze.
+    #[tokio::test]
+    async fn isr_accepts_regeneration_when_a_user_layer_rewrites_content_type() {
+        use axum::http::header::{CONTENT_TYPE, HeaderValue};
+
+        // The offending shape: a user layer that rewrites Content-Type on the
+        // way out.
+        let rewrite = axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let mut response = next.run(req).await;
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/x-rewritten"),
+                );
+                response
+            },
+        );
+        let registration = crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<()>(),
+            type_name: "content_type_rewrite",
+            layer: tower::util::BoxCloneSyncServiceLayer::new(rewrite.clone()),
+        };
+
+        // What `run_build_mode` does before rendering: drain the user layers.
+        let (pre_layer, drained) =
+            crate::router::partition_custom_layers_for_static_render(vec![registration]);
+        assert!(
+            pre_layer.is_empty(),
+            "a plain user layer must not survive the build-time drain"
+        );
+        assert_eq!(
+            drained.len(),
+            1,
+            "the drained set carries the rewriting layer"
+        );
+
+        let base = axum::Router::new().route(
+            "/page",
+            axum::routing::get(|| async { axum::response::Html("<h1>v1</h1>") }),
+        );
+        // The old build composition, for contrast: the layer applied at
+        // render time.
+        let layered = base.clone().layer(rewrite);
+
+        let meta = || crate::static_gen::StaticRouteMeta {
+            path: "/page",
+            name: "page",
+            revalidate: Some(1),
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+        };
+
+        // Old behavior: the build records the post-layer type ...
+        let tmp_old = tempfile::tempdir().expect("tempdir");
+        let dist_old = tmp_old.path().join("dist");
+        crate::static_gen::render_static_routes(layered, &[meta()], &dist_old)
+            .await
+            .expect("static build");
+        let manifest_old = StaticManifest::load(&dist_old.join("manifest.json")).expect("manifest");
+        assert_eq!(
+            manifest_old.routes["/page"].content_type.as_deref(),
+            Some("application/x-rewritten"),
+            "rendering through the layer records the rewritten type"
+        );
+        // ... which ISR (pre-layer view) then refuses: the freeze.
+        let refused = regenerate_page(
+            &base,
+            "/page",
+            &dist_old.join("page/index.html"),
+            manifest_old.routes["/page"].content_type.as_deref(),
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "the old build/ISR asymmetry must refuse the refresh — this is the freeze #2405 fixes"
+        );
+
+        // New behavior: the build renders through the pre-layer router, so
+        // the manifest records the handler's type ...
+        let tmp_new = tempfile::tempdir().expect("tempdir");
+        let dist_new = tmp_new.path().join("dist");
+        crate::static_gen::render_static_routes(base.clone(), &[meta()], &dist_new)
+            .await
+            .expect("static build");
+        let manifest_new = StaticManifest::load(&dist_new.join("manifest.json")).expect("manifest");
+        assert_eq!(
+            manifest_new.routes["/page"].content_type.as_deref(),
+            Some("text/html; charset=utf-8"),
+            "the build must record the handler's pre-layer type, not the layer's rewrite"
+        );
+        // ... and ISR accepts the refresh, writing the handler's body.
+        let page_new = dist_new.join("page/index.html");
+        std::fs::write(&page_new, "<h1>stale</h1>").expect("write stale");
+        regenerate_page(
+            &base,
+            "/page",
+            &page_new,
+            manifest_new.routes["/page"].content_type.as_deref(),
+        )
+        .await
+        .expect("ISR regeneration must accept the pre-layer recording");
+        assert_eq!(
+            std::fs::read_to_string(&page_new).unwrap(),
+            "<h1>v1</h1>",
+            "the regenerated body is the handler's output"
         );
     }
 }

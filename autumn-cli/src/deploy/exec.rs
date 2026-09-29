@@ -1000,11 +1000,14 @@ pub fn cutover_ops(
     //
     // The live upstream re-registered on a change is the release serving right now,
     // targeted at the derived live-slot port (`plan.live_port`). That derived port is
-    // correct here because the redeploy path refuses a concurrent `server.port` change at
-    // pre-flight (#2073, `refuse_concurrent_public_port_change`), so the public port is
-    // unchanged and the derived live port necessarily equals the port the live release
-    // binds; a live-safe port change is future work. The candidate and flip below use the
-    // new derived candidate port, which the new release genuinely binds.
+    // correct here because `plan.public_port` is always the port the live release was
+    // ACTUALLY deployed under: on a redeploy carrying a concurrent `server.port` change
+    // (#2073, `PublicPortMove`), the caller builds `plan` from the OLD installed port, not
+    // the new requested one, so this refresh call sees no port change and stays a no-op
+    // through phase 3. The move to the new public port is a separate, later phase
+    // (`execute_public_port_rebind`), run only after the candidate is live and the old
+    // release has drained. The candidate and flip below use the new derived candidate
+    // port, which the new release genuinely binds.
     //
     // The re-register carries `reregister_options` — the old release's own TLS and host,
     // recovered from the `shared/proxy-options` marker (#2074) — not the new config's, so
@@ -1211,6 +1214,14 @@ pub fn candidate_teardown_ops(
 /// This must NOT be used for a redeploy: the redeploy teardown deliberately
 /// leaves the old release's `current`/live-slot markers intact because that old
 /// release is still serving.
+///
+/// Builds ONLY the app-teardown chain — never the proxy route. The fleet
+/// compensation case (issue #2270) removes the route as its OWN, separate step
+/// after this succeeds; see
+/// [`compensate_teardown`](crate::deploy::compensate_teardown) for why: folding
+/// it in here would let a transport failure on the route step (which carries no
+/// op label at all) masquerade as an ordinary op failure earlier in this chain,
+/// when in truth every op here would already have succeeded.
 #[must_use]
 pub fn first_deploy_teardown_ops(
     cfg: &ResolvedDeployConfig,
@@ -1692,6 +1703,9 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     // deploy paths precedes `migrate`.
     "upload",
     "stage-local-file",
+    // The driver puts the live-slot marker repair ahead of every builder op, like
+    // `install-proxy`.
+    LIVE_SLOT_REPAIR_LABEL,
 ];
 
 /// Whether a host that failed at `failed_step` had already run its migration.
@@ -2266,23 +2280,42 @@ fn parse_proxy_options(section: &str) -> ProxyOptionsMarker {
 
 /// The `--http-port` state of the currently-installed kamal-proxy systemd unit,
 /// captured in the same deploy-start probe round-trip (#2073). The redeploy path
-/// uses it to REFUSE a concurrent `server.port` change before touching the proxy:
-/// the reboot-durability restart-refresh (#2070) re-execs `kamal-proxy run` and
-/// re-registers the still-live upstream at its DERIVED port, which is only correct
-/// when the public port is unchanged — so a mismatch must fail the pre-flight
-/// rather than strand `:80` mid-cutover. Supporting a live-safe port change is
-/// tracked separately (Option C).
+/// compares it against the requested `server.port` to detect a concurrent public-
+/// port change BEFORE touching the proxy: the reboot-durability restart-refresh
+/// (#2070) re-execs `kamal-proxy run` and re-registers the still-live upstream at
+/// its DERIVED port, which is only correct when computed from the port the proxy
+/// is ACTUALLY installed on. A detected change resolves to a [`PublicPortMove`]
+/// (Option C) — the OLD port drives every op through the drain of the old release,
+/// and the move to the NEW port is deferred to its own post-cutover phase
+/// ([`execute_public_port_rebind`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstalledProxyPort {
     /// No proxy unit file on disk (a first-deploy shape — the durability refresh
-    /// writes it fresh). The refuse guard treats this as "nothing to conflict with".
+    /// writes it fresh). Nothing to compare against, so no move is detected.
     Absent,
     /// The unit file is present but its `run --http-port {N}` value could not be
     /// read/parsed (missing flag, non-numeric, out of range, or ambiguous). The
-    /// refuse guard FAILS CLOSED here — derived correctness can't be guaranteed.
+    /// redeploy path FAILS CLOSED here — a move can't be proven safe without
+    /// knowing the actual installed port.
     Unreadable,
     /// The port the installed unit's `ExecStart … run --http-port {N}` binds.
     Port(u16),
+}
+
+/// A `server.port` change detected between the installed kamal-proxy unit and the
+/// requested config, on the redeploy path (issue #2073, Option C).
+///
+/// Every op through the drain of the old release (phases 1-3: standing the
+/// candidate up on the OLD port's non-colliding slot, the health-gated flip, and
+/// draining the old release) runs as if `server.port` were still `old_port` — the
+/// public port itself does not move until [`execute_public_port_rebind`]'s own,
+/// separate failure boundary (phase 4), which rolls back to `old_port` on failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicPortMove {
+    /// The port the installed kamal-proxy unit actually binds right now.
+    pub old_port: u16,
+    /// The port the config requests.
+    pub new_port: u16,
 }
 
 /// Delimiter appended by the deploy-start probe between the first-vs-redeploy
@@ -2310,8 +2343,8 @@ const NO_PROXY_UNIT_SENTINEL: &str = "---autumn-no-proxy-unit---";
 /// refuse guard never fires on synthetic input).
 const PROXY_OPTIONS_DELIM: &str = "---autumn-kamal-proxy-options---";
 
-/// Delimiter appended after the `shared/proxy-options` marker, before
-/// `readlink -f {app_dir}/current` (issue #1621, AC-6), so all five sections ride
+/// Delimiter appended after the `shared/proxy-options` marker, before the
+/// checked `current` target (issue #1621, AC-6), so all five sections ride
 /// in ONE round-trip. Its ABSENCE (a host deployed before this feature, older
 /// recorded output, or a scripted test) leaves an empty section →
 /// [`DeployProbe::current_release_dir`] `None` — "unknown", never a guessed id.
@@ -2335,7 +2368,7 @@ pub fn release_id_from_dir(dir: &str) -> Option<&str> {
 /// the raw `kamal-proxy list` output, AND the installed proxy unit's `--http-port`
 /// state — all captured in the SAME remote round-trip, so a drifted live-slot
 /// marker can be reconciled against the live proxy and a concurrent `server.port`
-/// change refused, both without a second probe.
+/// change detected, both without a second probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeployProbe {
     /// First-vs-redeploy decision (parsed exactly as before from the marker).
@@ -2344,7 +2377,8 @@ pub struct DeployProbe {
     /// the reconcile then falls back to the marker, fail-safe).
     pub proxy_list: String,
     /// The installed kamal-proxy unit's `--http-port` (#2073), used by the redeploy
-    /// path to refuse a concurrent `server.port` change before touching the proxy.
+    /// path to detect a concurrent `server.port` change before touching the proxy
+    /// and resolve it to a [`PublicPortMove`].
     pub installed_proxy_port: InstalledProxyPort,
     /// The proxy TLS/host options the last forward deploy recorded (#2074), used by
     /// the redeploy path to PRESERVE the old release's options on the durability
@@ -2353,9 +2387,10 @@ pub struct DeployProbe {
     /// The release dir the host's `current` symlink resolves to (#1621, AC-6); its
     /// basename is the deployed release id ([`release_id_from_dir`]).
     ///
-    /// `None` when the symlink is absent, dangling, or the probe output predates
-    /// this section — reported as "unknown", never guessed. `deploy status` and the
-    /// fleet `maintenance` fan-out read it; the rollout path ignores it.
+    /// `None` if the symlink is absent or dangling, if its target is not a
+    /// directory directly in `releases/` (#2277), or if the probe output has no
+    /// such section. `None` means "unknown". The CLI never guesses the release.
+    /// Only `deploy status` reads it.
     pub current_release_dir: Option<String>,
 }
 
@@ -2442,6 +2477,9 @@ pub fn probe_deploy_state(
     cfg: &ResolvedDeployConfig,
     exec: &impl DeployExecutor,
 ) -> Result<DeployProbe, DeployExecError> {
+    // The last section prints the target of `current` only if the target is a
+    // directory directly in `releases/`. GNU `readlink -f` also resolves a
+    // dangling link (#2277). Thus the shell must check the result.
     let shell = format!(
         "if [ -L {current} ]; then printf 'redeploy:'; cat {marker} 2>/dev/null || printf '{blue}'; \
          else printf 'first'; fi; \
@@ -2453,8 +2491,10 @@ pub fn probe_deploy_state(
          printf '\\n{opts_delim}\\n'; \
          cat {opts_marker} 2>/dev/null || true; \
          printf '\\n{current_delim}\\n'; \
-         readlink -f {current} 2>/dev/null || true",
+         d=$(readlink -f {current} 2>/dev/null) && r=$(readlink -f {releases} 2>/dev/null) \
+         && [ -d \"$d\" ] && [ \"${{d%/*}}\" = \"$r\" ] && printf '%s' \"$d\" || true",
         current = shell_quote(&cfg.current_symlink()),
+        releases = shell_quote(&cfg.releases_dir()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
         delim = PROXY_LIST_DELIM,
@@ -2482,7 +2522,7 @@ pub fn probe_deploy_state(
                     .split_once(PROXY_OPTIONS_DELIM)
                     .unwrap_or((after_unit, ""));
                 // …and the options section further splits into the marker `cat` and the
-                // `readlink -f current` result (#1621). A missing delimiter (a host
+                // checked `current` target (#1621). A missing delimiter (a host
                 // deployed before this feature, or a scripted test) leaves an empty
                 // current section → `None` = "release unknown", never a guessed id.
                 let (opts_section, current_section) = after_opts
@@ -2509,9 +2549,11 @@ pub fn probe_deploy_state(
             // The live-slot marker is `{slot}\t{port}` (older markers are slot-only);
             // the slot is the FIRST tab-separated field either way. The persisted port
             // (SECOND field, when present) is not read here — the cutover re-register
-            // uses the DERIVED port, which the pre-flight refuse guard (#2073) proves
-            // equals the actual live port by rejecting any concurrent `server.port`
-            // change. The marker keeps persisting the port for forward-compatibility.
+            // uses the DERIVED port, computed from the EFFECTIVE public port (the
+            // installed proxy's OLD port across a detected `server.port` change, #2073
+            // `PublicPortMove`), which the caller threads through so the derived port
+            // always equals the actual live port. The marker keeps persisting the port
+            // for forward-compatibility.
             let live_slot = canonical_slot(marker.split('\t').next().unwrap_or(SLOT_BLUE));
             DeployMode::Redeploy { live_slot }
         });
@@ -2524,10 +2566,10 @@ pub fn probe_deploy_state(
     })
 }
 
-/// Parse the probe's `readlink -f {app_dir}/current` section (#1621, AC-6).
+/// Parse the probe's checked `current` target section (#1621, AC-6).
 ///
-/// Empty (absent/dangling symlink, or a probe capture predating this section) →
-/// `None`. Anything else is the resolved release DIR, trimmed of surrounding
+/// Empty (no release dir behind `current`, see [`probe_deploy_state`], or a
+/// probe capture predating this section) → `None`. Anything else is the resolved release DIR, trimmed of surrounding
 /// whitespace/newlines. Deliberately NOT fail-closed: this section is read-only
 /// reporting, and refusing to report a status because a symlink is unreadable would
 /// make `deploy status` useless on exactly the drifted host it exists to surface.
@@ -2902,6 +2944,69 @@ pub fn probe_rollback_target_dir(
     probe_dir_state("probe-rollback-target", release_dir, exec)
 }
 
+/// Sentinel [`retry_drain_old`] prints when the old slot unit is stopped and
+/// disabled.
+const OLD_SLOT_STOPPED: &str = "stopped";
+
+/// Sentinel [`retry_drain_old`] prints for all other unit states.
+const OLD_SLOT_NOT_STOPPED: &str = "not-stopped";
+
+/// The state of the old slot unit after [`retry_drain_old`] (issue #2279).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OldSlotState {
+    /// The unit is loaded, `inactive` or `failed`, and `disabled`. No old process
+    /// runs, and none starts at boot.
+    Stopped,
+    /// The unit can run now or at boot (`active`, `deactivating`, `enabled`, …).
+    NotStopped,
+    /// The output is not a known sentinel. This proves nothing.
+    Unreadable,
+}
+
+/// Retry a failed `drain-old` one time, then read the old slot unit (issue
+/// #2279).
+///
+/// The old slot runs job workers and the scheduler. If it runs, work runs two
+/// times. The check reads each property with its own `systemctl show`, because
+/// one call does not keep the order of the properties:
+///
+/// - `LoadState=loaded`: a unit that is not found also shows `inactive`.
+/// - `ActiveState` is `inactive` or `failed`: `is-active` is false while the
+///   unit is `deactivating`.
+/// - `UnitFileState=disabled`: an enabled unit starts again at boot.
+///
+/// # Errors
+///
+/// Returns the executor's error if the command cannot run.
+pub fn retry_drain_old(
+    cfg: &ResolvedDeployConfig,
+    live_slot: &str,
+    exec: &impl DeployExecutor,
+) -> Result<OldSlotState, DeployExecError> {
+    let unit = shell_quote(&format!(
+        "{}.service",
+        slot_unit_name(&cfg.service_name, live_slot)
+    ));
+    let shell = format!(
+        "unit={unit}; \
+         systemctl disable --now \"$unit\" >/dev/null 2>&1; \
+         state=\"$(systemctl show --property=LoadState \"$unit\" 2>/dev/null) \
+         $(systemctl show --property=ActiveState \"$unit\" 2>/dev/null) \
+         $(systemctl show --property=UnitFileState \"$unit\" 2>/dev/null)\"; \
+         case \"$state\" in \
+         'LoadState=loaded ActiveState=inactive UnitFileState=disabled'|\
+         'LoadState=loaded ActiveState=failed UnitFileState=disabled') \
+         printf '%s' '{OLD_SLOT_STOPPED}' ;; \
+         *) printf '%s' '{OLD_SLOT_NOT_STOPPED}' ;; esac"
+    );
+    let out = exec.run(&RemoteCommand::new("drain-old-retry", shell))?;
+    Ok(match out.stdout.trim() {
+        OLD_SLOT_STOPPED => OldSlotState::Stopped,
+        OLD_SLOT_NOT_STOPPED => OldSlotState::NotStopped,
+        _ => OldSlotState::Unreadable,
+    })
+}
+
 /// The shared read-only `[ -d … ]` directory probe behind [`probe_release_dir`] and
 /// [`probe_rollback_target_dir`]: two printf sentinels, nothing else, and any other
 /// capture fails closed to [`ReleaseDirState::Unreadable`] (an empty capture is the
@@ -3215,12 +3320,17 @@ pub fn live_slot_marker_repair_op(
     public_port: u16,
 ) -> DeployOp {
     let slot = canonical_slot(slot);
-    DeployOp::Run(record_live_slot(
-        cfg,
-        slot,
-        slot_app_port(public_port, slot),
-    ))
+    let mut repair = record_live_slot(cfg, slot, slot_app_port(public_port, slot));
+    repair.label = LIVE_SLOT_REPAIR_LABEL;
+    DeployOp::Run(repair)
 }
+
+/// The label of [`live_slot_marker_repair_op`].
+///
+/// It is not `record-live-slot`, the label of the same marker write after
+/// `migrate`: the repair always runs before `migrate`, and a failure there must
+/// not read as a moved schema (#2276).
+pub const LIVE_SLOT_REPAIR_LABEL: &str = "repair-live-slot";
 
 /// Build the bounded remote readiness-poll shell line: loop on
 /// `curl -fsS localhost:{port}/ready` until it succeeds or `timeout_secs`
@@ -3361,6 +3471,147 @@ pub fn execute_rollback(
         TeardownKind::RollbackFailed,
         exec,
     )
+}
+
+/// Per-deploy scratch path for [`execute_public_port_rebind`]'s content-hash
+/// snapshot (Option C, issue #2073) — distinct from [`proxy_unit_snapshot_path`]
+/// so the phase-4 rebind never shares a scratch file with the cutover's own
+/// durability-refresh snapshot, even though both run sequentially in one deploy.
+fn public_port_rebind_snapshot_path(release_id: &str) -> String {
+    format!("/tmp/autumn-kamal-proxy-portmove-{release_id}.sha256")
+}
+
+/// Build the ops that (re)bind kamal-proxy's public HTTP listener to
+/// `target_public_port` and re-register the now-live release at `live_port`
+/// (Option C phase 4, issue #2073).
+///
+/// Reuses [`ProxyController::refresh_installed_ops`] — the same content-hash-gated
+/// restart-and-reregister the reboot-durability upgrade (#2070) uses — since
+/// moving `--http-port` is just another unit content change from that
+/// mechanism's point of view. [`execute_public_port_rebind`] calls this TWICE:
+/// once forward, to the new public port, and — only on failure — again, to the
+/// old public port, to roll back.
+#[must_use]
+pub fn public_port_rebind_ops(
+    cfg: &ResolvedDeployConfig,
+    proxy: &impl ProxyController,
+    release_id: &str,
+    live_port: u16,
+    reregister_options: &ProxyServiceOptions,
+    target_public_port: u16,
+) -> Vec<DeployOp> {
+    proxy.refresh_installed_ops(
+        target_public_port,
+        &cfg.service_name,
+        &loopback_upstream(live_port),
+        &public_port_rebind_snapshot_path(release_id),
+        reregister_options,
+    )
+}
+
+/// How [`execute_public_port_rebind`] (Option C phase 4, issue #2073) ended when
+/// moving the public port did not simply succeed.
+///
+/// Distinct from [`DeployExecError`] because this phase runs strictly AFTER a
+/// successful [`execute_redeploy`]: the release has already gone live, so a
+/// failure here can never mean "never served" the way most `DeployExecError`
+/// variants do. Both variants carry the OLD and NEW port so an operator-facing
+/// message never has to re-derive which is which.
+#[derive(Debug, thiserror::Error)]
+pub enum PublicPortRebindError {
+    /// The move to `new_port` failed and rolling back to `old_port` succeeded —
+    /// the release is still live, reachable at `old_port`. The public port did
+    /// not move; retry the change alone in a separate deploy.
+    #[error(
+        "server.port could not be moved from {old_port} to {new_port} (`{failed_step}` \
+         failed: {source}) — rolled back, and the release is still live and reachable at \
+         {old_port}. Retry the port change alone in a separate deploy."
+    )]
+    RolledBack {
+        /// The port the release is still reachable at.
+        old_port: u16,
+        /// The port the move to which failed.
+        new_port: u16,
+        /// Label of the step that failed.
+        failed_step: &'static str,
+        /// The underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<DeployExecError>,
+    },
+    /// The move to `new_port` failed AND rolling back to `old_port` also failed.
+    /// The proxy's public bind on this host is now unknown — this needs a human,
+    /// not a retry.
+    #[error(
+        "server.port move from {old_port} to {new_port} failed (`{failed_step}`: {source}) \
+         AND the rollback to {old_port} ALSO failed ({rollback_source}) — the proxy's public \
+         bind on this host is now UNKNOWN. Check `systemctl status kamal-proxy` and \
+         `kamal-proxy list` on the host by hand before retrying."
+    )]
+    RollbackFailed {
+        /// The port the rollback tried, and failed, to restore.
+        old_port: u16,
+        /// The port the original move tried to reach.
+        new_port: u16,
+        /// Label of the step that failed.
+        failed_step: &'static str,
+        /// The move's underlying failure (its `Display` is already redacted).
+        #[source]
+        source: Box<DeployExecError>,
+        /// The rollback attempt's own underlying failure.
+        rollback_source: Box<DeployExecError>,
+    },
+}
+
+/// Execute Option C's phase 4 (issue #2073): move kamal-proxy's public listener
+/// from `old_port` to `new_port`, run strictly AFTER [`execute_redeploy`] has
+/// already put the new release live on `old_port` — phases 1-3 (standing the
+/// candidate up on a non-colliding loopback port, the health-gated flip, and
+/// draining the old release) are unchanged and already committed by the time this
+/// runs.
+///
+/// This is its own failure boundary, deliberately separate from
+/// [`execute_with_teardown`]'s: the release is ALREADY live, so nothing here is
+/// ever torn down. A step failure instead rolls the proxy back to `old_port`
+/// (`rollback`) and reports which of the two outcomes landed — see
+/// [`PublicPortRebindError`].
+///
+/// # Errors
+///
+/// Returns [`PublicPortRebindError::RolledBack`] when the move failed and the
+/// rollback to `old_port` succeeded, or [`PublicPortRebindError::RollbackFailed`]
+/// when the rollback itself failed too.
+pub fn execute_public_port_rebind(
+    ops: &[DeployOp],
+    rollback: &[DeployOp],
+    old_port: u16,
+    new_port: u16,
+    exec: &impl DeployExecutor,
+) -> Result<(), PublicPortRebindError> {
+    for op in ops {
+        if let Err(source) = run_one(op, exec) {
+            let failed_step = op.label();
+            eprintln!(
+                "  \u{2717} {failed_step} failed \u{2014} rolling the public port back to \
+                 {old_port}\u{2026}"
+            );
+            return match run_ops(rollback, exec) {
+                Ok(()) => Err(PublicPortRebindError::RolledBack {
+                    old_port,
+                    new_port,
+                    failed_step,
+                    source: Box::new(source),
+                }),
+                Err(rollback_source) => Err(PublicPortRebindError::RollbackFailed {
+                    old_port,
+                    new_port,
+                    failed_step,
+                    source: Box::new(source),
+                    rollback_source: Box::new(rollback_source),
+                }),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Shared driver for the deploy entrypoints: gate on preflight, then run `ops`
@@ -3626,14 +3877,17 @@ pub(crate) mod test_support {
     /// rollout — the structure cross-host ordering assertions read.
     pub(crate) type FleetTape = Rc<RefCell<Vec<(String, RecordedCall)>>>;
 
-    /// Command labels whose **stdout is parsed** by the caller, i.e. the read-only
-    /// probes. An unscripted probe is the single most dangerous silent hole in this
+    /// Command labels whose **stdout is parsed** by the caller: the read-only
+    /// probes, and `drain-old-retry`, which also mutates. Do not use this list as
+    /// a read-only allowlist.
+    ///
+    /// An unscripted probe is the single most dangerous silent hole in this
     /// fake: `run` returns `Ok` with EMPTY stdout for anything unscripted, and
     /// [`super::probe_deploy_state`] reads an empty section as
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
     /// host N's probe would therefore exercise the first-deploy branch and still
     /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
-    pub(crate) const PROBE_LABELS: [&str; 7] = [
+    pub(crate) const PROBE_LABELS: [&str; 8] = [
         "proxy-compat-probe",
         "detect-current",
         "probe-release-dir",
@@ -3644,6 +3898,8 @@ pub(crate) mod test_support {
         // the running unit polls. Unscripted, it reads as "the unit could not be
         // read" and the fan-out would fail closed for the wrong reason.
         "detect-maintenance-flag",
+        // #2279: the fleet parses this one to decide if the old slot stopped.
+        "drain-old-retry",
     ];
 
     /// One recorded executor call. Uploads carry no local path: op building is
@@ -3692,6 +3948,11 @@ pub(crate) mod test_support {
         /// failure (fail closed) where a `CommandFailed` on the same step might be
         /// mere housekeeping.
         transport_fail_labels: Vec<&'static str>,
+        /// Labels whose `run` should fail on one SPECIFIC 1-indexed occurrence only
+        /// — for a label that runs more than once in a sequence (Option C's phase-4
+        /// rebind reuses the SAME labels for its forward attempt and its rollback),
+        /// which `fail_labels` (every occurrence) cannot express.
+        fail_on_occurrence: Vec<(&'static str, usize)>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
         /// #1621: remote-path fragments whose `upload` should fail. Uploads carry
@@ -3730,6 +3991,17 @@ pub(crate) mod test_support {
         /// than one label (a fleet script needs per-host failure injection).
         pub(crate) fn failing(mut self, label: &'static str) -> Self {
             self.fail_labels.push(label);
+            self
+        }
+
+        /// Chainable: fail `label`'s `occurrence`-th call only (1-indexed), leaving
+        /// every other call to that label — earlier or later — scripted to succeed.
+        pub(crate) fn failing_on_occurrence(
+            mut self,
+            label: &'static str,
+            occurrence: usize,
+        ) -> Self {
+            self.fail_on_occurrence.push((label, occurrence));
             self
         }
 
@@ -3815,6 +4087,16 @@ pub(crate) mod test_support {
 
     impl DeployExecutor for RecordingExecutor {
         fn run(&self, cmd: &RemoteCommand) -> Result<CommandOutput, DeployExecError> {
+            // 1-indexed: how many times `cmd.label` has already run, BEFORE this call
+            // is recorded below — so `failing_on_occurrence(label, 1)` means "the
+            // first call to this label", not "the second".
+            let occurrence = self
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| c.run_label() == Some(cmd.label))
+                .count()
+                + 1;
             self.record(RecordedCall::Run {
                 label: cmd.label,
                 shell: cmd.shell.clone(),
@@ -3825,7 +4107,9 @@ pub(crate) mod test_support {
                     source: std::io::Error::other("scripted transport failure"),
                 });
             }
-            if self.fail_labels.contains(&cmd.label) {
+            if self.fail_labels.contains(&cmd.label)
+                || self.fail_on_occurrence.contains(&(cmd.label, occurrence))
+            {
                 return Err(DeployExecError::CommandFailed {
                     label: cmd.label,
                     message: "scripted failure".to_owned(),
@@ -3960,8 +4244,10 @@ mod tests {
     /// Redeploy cutover ops: the live release is on blue, so the candidate takes
     /// green (loopback 3002). The cutover re-registers the still-live OLD release at
     /// the DERIVED live-slot port (`plan.live_port`, blue = 3001) — correct because
-    /// the redeploy path refuses a concurrent `server.port` change at pre-flight
-    /// (#2073), so the public port is unchanged and derived == actual.
+    /// `plan.public_port` here IS the port the live release was actually deployed
+    /// under (#2073's `PublicPortMove` is the caller's job to resolve BEFORE
+    /// building this `plan`; this helper builds it already-resolved, as if
+    /// unchanged), so derived == actual.
     fn sample_cutover_ops(env: Secret) -> Vec<DeployOp> {
         sample_cutover_ops_with(env, MigrateStep::Run)
     }
@@ -5305,6 +5591,183 @@ mod tests {
         );
     }
 
+    // --- Option C phase 4: live public-port rebind (issue #2073) --------------
+
+    #[test]
+    fn public_port_rebind_ops_threads_the_target_port_live_loopback_and_release_id() {
+        // A thin wrapper over `refresh_installed_ops` — the exact mechanism the
+        // reboot-durability upgrade (#2070) uses to restart the proxy on a changed
+        // unit — bound to the phase-4 target port and the now-live release's
+        // loopback port instead of the cutover's own `plan` fields.
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        assert_eq!(ops.len(), 4, "snapshot + write-unit + install + restart");
+
+        let DeployOp::Run(snapshot) = &ops[0] else {
+            panic!("op 0 must be the snapshot Run op");
+        };
+        assert!(
+            snapshot
+                .shell
+                .contains(&format!("autumn-kamal-proxy-portmove-{RELEASE_ID}.sha256")),
+            "the snapshot path is keyed on release_id, in its OWN scratch namespace \
+             (distinct from the cutover's own durability-refresh snapshot): {}",
+            snapshot.shell,
+        );
+
+        let DeployOp::WriteFile {
+            contents: FileContents::Plain(unit),
+            ..
+        } = &ops[1]
+        else {
+            panic!("op 1 must re-write the proxy unit");
+        };
+        assert!(
+            unit.contains("--http-port 8080\n"),
+            "the rewritten unit binds the TARGET public port: {unit}"
+        );
+
+        let DeployOp::Run(restart) = &ops[3] else {
+            panic!("op 3 must be proxy-restart-if-changed");
+        };
+        assert!(
+            restart.shell.contains("--target '127.0.0.1:3002'"),
+            "the re-register targets the NOW-LIVE release's loopback port: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn public_port_rebind_ops_threads_tls_and_host_through_the_reregister() {
+        // The phase-4 rebind must carry the now-live release's OWN TLS/host, exactly
+        // as `refresh_installed_ops` does for any other re-register (#2074's own TLS
+        // tests exhaustively cover the underlying mechanism; this only confirms the
+        // wrapper forwards `reregister_options` unchanged).
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: true,
+            host: Some("app.example.com".to_owned()),
+        };
+        let controller = super::super::proxy::KamalProxyController::new(60)
+            .with_tls_host(Some("app.example.com".to_owned()));
+        let ops = public_port_rebind_ops(&cfg, &controller, RELEASE_ID, 3002, &options, 8080);
+        let DeployOp::Run(restart) = &ops[3] else {
+            panic!("op 3 must be proxy-restart-if-changed");
+        };
+        assert!(
+            restart.shell.contains("--host 'app.example.com' --tls"),
+            "the phase-4 re-register carries the release's own TLS/host: {}",
+            restart.shell,
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_succeeds_without_touching_rollback() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        let exec = RecordingExecutor::new();
+
+        execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect("a healthy rebind succeeds");
+
+        assert_eq!(
+            exec.run_labels(),
+            vec![
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed"
+            ],
+            "a healthy rebind runs only the forward ops, never the rollback"
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_rolls_back_to_the_old_port_on_failure() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        // The forward attempt's restart fails once; the rollback's own restart (the
+        // SAME op label) is left unscripted, so it succeeds on its turn — the new
+        // port could not bind, but the old one still can.
+        let exec = RecordingExecutor::new().failing_on_occurrence("proxy-restart-if-changed", 1);
+
+        let err = execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect_err("a failed rebind must roll back");
+        match err {
+            PublicPortRebindError::RolledBack {
+                old_port,
+                new_port,
+                failed_step,
+                ..
+            } => {
+                assert_eq!(old_port, 80);
+                assert_eq!(new_port, 8080);
+                assert_eq!(failed_step, "proxy-restart-if-changed");
+            }
+            other @ PublicPortRebindError::RollbackFailed { .. } => {
+                panic!("expected RolledBack, got {other:?}")
+            }
+        }
+        // Both the forward attempt AND the rollback ran their full sequence.
+        assert_eq!(
+            exec.run_labels(),
+            vec![
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed",
+                "proxy-snapshot-unit",
+                "proxy-install",
+                "proxy-restart-if-changed",
+            ],
+            "a rolled-back rebind runs the forward attempt then the full rollback"
+        );
+    }
+
+    #[test]
+    fn execute_public_port_rebind_reports_when_the_rollback_itself_fails() {
+        let cfg = resolved();
+        let options = ProxyServiceOptions {
+            tls: false,
+            host: None,
+        };
+        let ops = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 8080);
+        let rollback = public_port_rebind_ops(&cfg, &proxy(), RELEASE_ID, 3002, &options, 80);
+        // BOTH the forward restart and the rollback's restart fail — the proxy's
+        // public bind is now genuinely unknown.
+        let exec = RecordingExecutor::failing_on("proxy-restart-if-changed");
+
+        let err = execute_public_port_rebind(&ops, &rollback, 80, 8080, &exec)
+            .expect_err("a doubly-failed rebind must report RollbackFailed");
+        match err {
+            PublicPortRebindError::RollbackFailed {
+                old_port,
+                new_port,
+                failed_step,
+                ..
+            } => {
+                assert_eq!(old_port, 80);
+                assert_eq!(new_port, 8080);
+                assert_eq!(failed_step, "proxy-restart-if-changed");
+            }
+            other @ PublicPortRebindError::RolledBack { .. } => {
+                panic!("expected RollbackFailed, got {other:?}")
+            }
+        }
+    }
+
     #[test]
     fn resolve_rollback_target_reads_the_marker_not_the_mtime_newest_dir() {
         // Codex P1: resolution must come from the explicit previous-release MARKER,
@@ -5530,6 +5993,21 @@ mod tests {
             rm_markers.contains("/srv/autumn/myapp/shared/live-slot")
                 && rm_markers.contains("/srv/autumn/myapp/shared/previous-release"),
             "teardown removes the live-slot and previous-release markers: {rm_markers}"
+        );
+    }
+
+    #[test]
+    fn first_deploy_teardown_never_touches_the_proxy_route() {
+        // Issue #2270: the proxy route is removed as its OWN separate step by
+        // the fleet driver (`compensate_teardown`), never folded into this app-
+        // only chain — see the function's own doc comment for why.
+        let cfg = resolved();
+        let plan = SlotPlan::first(3000);
+        let teardown = first_deploy_teardown_ops(&cfg, RELEASE_ID, &plan);
+        let labels: Vec<&str> = teardown.iter().map(DeployOp::label).collect();
+        assert!(
+            !labels.iter().any(|l| l.contains("proxy")),
+            "this chain must never run a proxy op: {labels:?}"
         );
     }
 
@@ -6046,6 +6524,54 @@ mod tests {
     }
 
     #[test]
+    fn retry_drain_old_retries_once_and_reads_the_old_unit_state() {
+        // #2279: after a failed `drain-old`, try the stop again one time. Then
+        // read the old unit. Only a known sentinel shows the state.
+        let cfg = resolved();
+        let stopped = RecordingExecutor::new().with_stdout("drain-old-retry", "stopped\n");
+        assert_eq!(
+            retry_drain_old(&cfg, SLOT_BLUE, &stopped).unwrap(),
+            OldSlotState::Stopped,
+        );
+        let shell = stopped.shell_for("drain-old-retry").expect("retry ran");
+        assert_eq!(
+            shell,
+            "unit='myapp-blue.service'; \
+             systemctl disable --now \"$unit\" >/dev/null 2>&1; \
+             state=\"$(systemctl show --property=LoadState \"$unit\" 2>/dev/null) \
+             $(systemctl show --property=ActiveState \"$unit\" 2>/dev/null) \
+             $(systemctl show --property=UnitFileState \"$unit\" 2>/dev/null)\"; \
+             case \"$state\" in \
+             'LoadState=loaded ActiveState=inactive UnitFileState=disabled'|\
+             'LoadState=loaded ActiveState=failed UnitFileState=disabled') \
+             printf '%s' 'stopped' ;; \
+             *) printf '%s' 'not-stopped' ;; esac",
+            "retry the same stop, then read each property on its own line. \
+             `is-active` is false while the unit is `deactivating`. An enabled unit \
+             starts again at boot. A unit that is not found proves nothing.",
+        );
+        assert_eq!(stopped.run_labels(), vec!["drain-old-retry"]);
+
+        let not_stopped = RecordingExecutor::new().with_stdout("drain-old-retry", "not-stopped");
+        assert_eq!(
+            retry_drain_old(&cfg, SLOT_BLUE, &not_stopped).unwrap(),
+            OldSlotState::NotStopped,
+        );
+        for garbled in ["", "bash: -c: line 0", "stopped extra"] {
+            let exec = RecordingExecutor::new().with_stdout("drain-old-retry", garbled);
+            assert_eq!(
+                retry_drain_old(&cfg, SLOT_BLUE, &exec).unwrap(),
+                OldSlotState::Unreadable,
+                "output {garbled:?} proves nothing, so it must not read as stopped",
+            );
+        }
+        assert!(
+            test_support::PROBE_LABELS.contains(&"drain-old-retry"),
+            "the caller parses its stdout, so a strict fake must require a script"
+        );
+    }
+
+    #[test]
     fn strict_recording_executor_refuses_to_fake_an_unscripted_probe() {
         // #1621 (plan §9.2): the fake returns Ok+EMPTY stdout for anything
         // unscripted, and every probe parser reads empty as "absent / first
@@ -6432,6 +6958,170 @@ mod tests {
             probe.current_release_dir.is_none(),
             "an empty current section is unknown, not an empty release id"
         );
+    }
+
+    // Linux-only, with the two tests below: they run the probe shell with GNU
+    // `readlink -f` and make symlinks with `std::os::unix::fs`. The deploy target
+    // is Ubuntu.
+
+    /// Runs the real `detect-current` shell on a local `app_dir`. Returns the
+    /// parsed probe (#2277).
+    #[cfg(target_os = "linux")]
+    fn probe_local_app_dir(app_dir: &Path) -> (ResolvedDeployConfig, DeployProbe) {
+        let mut cfg = resolved();
+        cfg.app_dir = app_dir.to_str().expect("utf-8 temp dir").to_owned();
+        let render = RecordingExecutor::new();
+        probe_deploy_state(&cfg, &render).expect("probe renders");
+        let shell = render.shell_for("detect-current").expect("probe ran");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&shell)
+            .output()
+            .expect("run probe shell");
+        assert!(
+            out.status.success(),
+            "probe shell must not fail: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+        let replay = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &replay).expect("probe parses");
+        (cfg, probe)
+    }
+
+    /// Makes `{root}/{name}` with the directories `releases/r1/sub` and
+    /// `releases2/r1`, and the file `releases/file`. Links `current` to `target`.
+    #[cfg(target_os = "linux")]
+    fn app_dir_with_current(root: &Path, name: &str, target: &Path) -> std::path::PathBuf {
+        let app = root.join(name);
+        std::fs::create_dir_all(app.join("releases/r1/sub")).expect("mk release");
+        std::fs::create_dir_all(app.join("releases2/r1")).expect("mk sibling");
+        std::fs::write(app.join("releases/file"), b"").expect("mk file");
+        std::os::unix::fs::symlink(target, app.join("current")).expect("link current");
+        app
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probe_names_a_release_only_when_current_resolves_to_a_release_dir() {
+        // #2277: `readlink -f` resolves a dangling link, so the probe named a
+        // release that is not installed. Only a directory directly in `releases/`
+        // is a release. Mode detection must not change.
+        let tree = tempfile::tempdir().expect("temp dir");
+        let root = tree.path();
+        let outside = root.join("outside/r9");
+        std::fs::create_dir_all(&outside).expect("mk outside dir");
+
+        let rows: [(&str, &Path, Option<&str>); 7] = [
+            ("relative", Path::new("releases/r1"), Some("r1")),
+            ("dangling", Path::new("releases/gone"), None),
+            ("outside", &outside, None),
+            ("file", Path::new("releases/file"), None),
+            ("releases-root", Path::new("releases"), None),
+            ("deep", Path::new("releases/r1/sub"), None),
+            ("sibling", Path::new("releases2/r1"), None),
+        ];
+        for (name, target, want) in rows {
+            let (_, probe) = probe_local_app_dir(&app_dir_with_current(root, name, target));
+            assert!(
+                matches!(probe.mode, DeployMode::Redeploy { .. }),
+                "{name}: `[ -L current ]` still decides the mode"
+            );
+            assert_eq!(
+                probe
+                    .current_release_dir
+                    .as_deref()
+                    .and_then(release_id_from_dir),
+                want,
+                "{name}: {:?}",
+                probe.current_release_dir
+            );
+        }
+
+        // An absolute link into the tree resolves.
+        let abs = root.join("absolute");
+        let (_, probe) = probe_local_app_dir(&app_dir_with_current(
+            root,
+            "absolute",
+            &abs.join("releases/r1"),
+        ));
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r1")
+        );
+
+        // A symlinked `app_dir` is not drift. The shell resolves both paths the
+        // same way.
+        let real = app_dir_with_current(root, "real", Path::new("releases/r1"));
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("link app dir");
+        let (_, probe) = probe_local_app_dir(&alias);
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r1"),
+            "a symlinked app dir still names its release"
+        );
+
+        // A symlinked `releases/` directory is not drift.
+        let store = root.join("store");
+        std::fs::create_dir_all(store.join("r2")).expect("mk store release");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).expect("mk app dir");
+        std::os::unix::fs::symlink(&store, linked.join("releases")).expect("link releases");
+        std::os::unix::fs::symlink("releases/r2", linked.join("current")).expect("link current");
+        let (_, probe) = probe_local_app_dir(&linked);
+        assert_eq!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir),
+            Some("r2"),
+            "a symlinked releases dir still names its release"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dangling_current_is_state_drift_end_to_end() {
+        // #2277: probe shell → `HostStatus` → `fleet_drift`. A dangling `current`
+        // must give `DRIFT_RELEASE_UNREADABLE`. Then `deploy status --strict` fails.
+        use super::super::fleet::{DRIFT_RELEASE_UNREADABLE, HostStatus, ReleaseId, fleet_drift};
+
+        let tree = tempfile::tempdir().expect("temp dir");
+        let app = app_dir_with_current(tree.path(), "app", Path::new("releases/gone"));
+        let (cfg, deploy) = probe_local_app_dir(&app);
+        let probe = HostStatusProbe {
+            deploy,
+            ready_code: Some(200),
+            shared_maintenance_flag: false,
+            maintenance: MaintenanceStatus::Off,
+            maintenance_flag_source: MaintenanceFlagSource::Shared,
+            last_deploy: None,
+        };
+        let status = HostStatus::from_probe(&cfg, 3000, &probe);
+        assert_eq!(
+            status.release,
+            ReleaseId::Unknown,
+            "the status names no release"
+        );
+
+        // `contains`, not equality: the shell also reads this machine's proxy unit,
+        // which can add other drift rows.
+        let report = fleet_drift(&[status]);
+        assert!(
+            report
+                .state_drift
+                .contains(&("203.0.113.10".to_owned(), DRIFT_RELEASE_UNREADABLE)),
+            "{:?}",
+            report.state_drift
+        );
+        assert!(report.drifted(), "`--strict` must exit non-zero");
     }
 
     /// Full five-section `detect-current` stdout for a redeploy host on `release`.
@@ -6937,7 +7627,9 @@ mod tests {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
          --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
-         --force\n"
+         --force\n\
+         ---autumn-kamal-proxy-remove-help---\
+         Usage:\n  kamal-proxy remove SERVICE [flags]\n"
     }
 
     #[test]
@@ -6954,6 +7646,9 @@ mod tests {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
             fn flip_op(&self, _service: &str, _new_upstream: &str) -> DeployOp {
+                DeployOp::Run(RemoteCommand::new("noop", "true"))
+            }
+            fn deregister_op(&self, _service: &str) -> DeployOp {
                 DeployOp::Run(RemoteCommand::new("noop", "true"))
             }
             // compat_probe() and binary_install_ops() use the trait defaults → None.
@@ -7026,9 +7721,10 @@ mod tests {
                 );
             }
         }
-        // The driver splices host preparation ahead of everything (#1607), so it is
-        // pre-migrate too even though no builder emits it.
+        // The driver splices host preparation (#1607) and the marker repair ahead of
+        // everything, so both are pre-migrate even though no builder emits them.
         assert!(failed_before_migrating("install-proxy"));
+        assert!(failed_before_migrating(LIVE_SLOT_REPAIR_LABEL));
         // Anything unrecognised errs toward "the schema may have moved".
         assert!(!failed_before_migrating("readiness-gate"));
         assert!(!failed_before_migrating("some-future-op"));
@@ -7119,6 +7815,9 @@ mod tests {
             fn flip_op(&self, service: &str, new_upstream: &str) -> DeployOp {
                 self.0.flip_op(service, new_upstream)
             }
+            fn deregister_op(&self, service: &str) -> DeployOp {
+                self.0.deregister_op(service)
+            }
             fn compat_probe(&self) -> Option<super::super::proxy::ProxyCompatProbe> {
                 self.0.compat_probe()
             }
@@ -7160,7 +7859,7 @@ mod tests {
         let op = live_slot_marker_repair_op(&cfg, decision.live_slot, 3000);
         match op {
             DeployOp::Run(cmd) => {
-                assert_eq!(cmd.label, "record-live-slot");
+                assert_eq!(cmd.label, LIVE_SLOT_REPAIR_LABEL);
                 assert!(
                     cmd.shell.contains(SLOT_BLUE) && cmd.shell.contains("3001"),
                     "repair op writes the proxy slot+port: {}",

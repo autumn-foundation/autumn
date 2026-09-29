@@ -256,7 +256,15 @@
 #   scripts/check-docs-cli.sh              # gate the corpus
 #   scripts/check-docs-cli.sh --list       # print the parsed command surface
 #   scripts/check-docs-cli.sh --list-options  # …with each command's options
+#   scripts/check-docs-cli.sh --list-hidden   # …only the `hide = true` ones
+#   scripts/check-docs-cli.sh --list-aliases  # alias -> canonical spelling
+#   scripts/check-docs-cli.sh --corpus     # the reader-facing pages it reads
+#   scripts/check-docs-cli.sh --resolved   # which command each line names
 #   scripts/check-docs-cli.sh --self-test  # synthetic-corpus tests
+#
+# The last three exist for `scripts/check-docs-scope.sh` and
+# `scripts/check-docs-cli-coverage.sh`, which ask this gate for its corpus,
+# its surface and its reading of a line rather than respelling any of them.
 
 set -euo pipefail
 
@@ -268,6 +276,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # scripts/check-plugin-freshness.sh and scripts/check-docs-links.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
+import tomllib
 import os, re, shlex, subprocess, sys, pathlib, collections, tempfile
 
 MODE = sys.argv[1]
@@ -649,14 +658,27 @@ def build_surface(sources):
                 if not re.match(r'^[A-Z]', name):
                     continue
                 rename = re.search(r'\bname\s*=\s*"([^"]+)"', attrs)
-                spellings = {rename.group(1) if rename else kebab(name)}
+                # The spelling clap shows in `--help`. The aliases below are
+                # additional ways to TYPE this same command, not commands of
+                # their own, so consumers that ask "which command is this?"
+                # need to be able to collapse them back onto this one.
+                canonical = rename.group(1) if rename else kebab(name)
+                spellings = {canonical}
                 for a in re.findall(r'\b(?:visible_)?alias\s*=\s*"([^"]+)"', attrs):
                     spellings.add(a)
                 for group in re.findall(r'\b(?:visible_)?aliases\s*=\s*\[([^\]]*)\]', attrs):
                     spellings.update(re.findall(r'"([^"]+)"', group))
-                node = {'children': {}, 'positionals': False, 'options': {},
+                node = {'children': {}, 'canonical': canonical,
+                        'positionals': False, 'options': {},
                         'requires_sub': False, 'required_args': 0,
-                        'trailing': False, 'hyphen_slots': []}
+                        'trailing': False, 'hyphen_slots': [],
+                        # `#[command(hide = true)]`: clap keeps the command
+                        # runnable but leaves it out of `--help`, which is the
+                        # author saying it is not a reader's to find.
+                        # `check-docs-cli-coverage.sh` reads this so that
+                        # hiding a command exempts it from the coverage gate
+                        # with no edit to that gate's backlog.
+                        'hidden': bool(re.search(r'\bhide\s*=\s*true', attrs))}
                 if kind == 'tuple':
                     inner = re.search(r'\(\s*(?:pub\s+)?([A-Za-z0-9_:]+)', payload)
                     if inner:
@@ -697,23 +719,29 @@ def build_surface(sources):
 
     tree = build('Commands')
 
-    def flatten(t, prefix=''):
+    def flatten(t, prefix='', canon_prefix=''):
         flat = {}
         for k, v in t.items():
             key = (prefix + ' ' + k).strip()
+            # Built segment by segment, so an alias at ANY level collapses:
+            # `autumn c` and a hypothetical `autumn c <sub>` both canonicalise
+            # through `console`, which a whole-path table would miss.
+            canon = (canon_prefix + ' ' + v['canonical']).strip()
             # clap gives every command `--help`/`-h`, and the root's
             # `#[command(version)]` gives `--version`/`-V`. They are declared
             # nowhere in the derive input, so without this they read as drift.
             opts = dict(BUILTIN_OPTIONS)
             opts.update(v['options'])
             flat[key] = {'children': set(v['children']),
+                         'canonical': canon,
+                         'hidden': v['hidden'],
                          'positionals': v['positionals'],
                          'options': opts,
                          'requires_sub': v['requires_sub'],
                          'required_args': v['required_args'],
                          'trailing': v['trailing'],
                          'hyphen_slots': v['hyphen_slots']}
-            flat.update(flatten(v['children'], key))
+            flat.update(flatten(v['children'], key, canon))
         return flat
 
     def root_node():
@@ -732,9 +760,10 @@ def build_surface(sources):
             opts.update({'--version': False, '-V': False})
         if 'Cli' in structs:                    # any real `#[arg]` on the root
             opts.update(_options(structs['Cli'], structs))
-        return {'children': set(), 'positionals': False, 'options': opts,
-                'requires_sub': True, 'required_args': 0, 'trailing': False,
-                'hyphen_slots': []}
+        return {'children': set(), 'canonical': '', 'hidden': False,
+                'positionals': False,
+                'options': opts, 'requires_sub': True, 'required_args': 0,
+                'trailing': False, 'hyphen_slots': []}
 
     flat = flatten(tree)
     if flat:                                    # only alongside a real surface
@@ -2416,7 +2445,19 @@ FLAG_WAIVER = re.compile(
     r'<!--\s*cli-surface-allow:\s*autumn\s+(?:([a-z0-9][a-z0-9 -]*?)\s+)?'
     r'(-\S*)\s*(?:—|:)\s*(\S.*?)-->')
 
-INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/')
+# `.claude/skills/` is a SECOND skill tree, not a copy of `skills/`: the agent
+# machinery loads a `SKILL.md` there by name, which is why
+# `check-docs-orphans.sh` seeds both trees as reader entry surfaces and why
+# `check-docs-routes.sh` reads both for `/actuator/…` paths. `run-autumn` lives
+# only here, and its SKILL.md is copy-and-run text end to end — `autumn seed
+# --package`, `autumn routes --bin`, `AUTUMN_SERVER__PORT`,
+# `AUTUMN_DATABASE__URL`, `-p autumn-web`. It already carries
+# `route-surface-allow` waivers for the routes gate, so the tree was reader-
+# facing to one gate and invisible to this one: exactly the split the note
+# above says these definitions exist to prevent. Corpus 198 -> 199 here, and
+# this gate stays green over it.
+INCLUDE_DIRS = ('docs/guide/', 'docs/migrations/', 'skills/', 'agents/',
+                '.claude/skills/')
 # `docs/plugins.md` is a live product guide sitting at the `docs/` root rather
 # than under `docs/guide/`, linked from seven corpus pages as *the* plugin
 # guide. It joined the sibling `check-docs-config.sh` list in the same commit:
@@ -2440,12 +2481,187 @@ def in_scope(path):
                 and pathlib.PurePath(path).name == 'README.md'))
 
 
+# `readme = "…"` in a crate manifest names that crate's crates.io landing page.
+# It is reader-facing by PUBLICATION rather than by where it sits in the tree,
+# which is why a directory-shaped rule cannot reach it — `check-docs-routes.sh`
+# reads the manifests for exactly this reason, and its argument carries here
+# unchanged: these pages carry `autumn_web::…` paths and `AUTUMN_*` variables
+# the same way they carry `/actuator/…` URLs.
+# TOML has two string forms and a manifest may use either, so both are read. The
+# double-quote-only spelling missed `readme = 'README.md'` — valid TOML that
+# every gate sharing this parser would have skipped in step, which an agreement
+# check between them cannot see.
+#
+# Cargo's IMPLICIT discovery (no `readme` key, a `README.md` beside the
+# manifest) is deliberately not modelled: `scripts/check-crate-metadata.sh`
+# lists `readme` among REQUIRED_FIELDS for every publishable crate, so a
+# published landing page always has an explicit key to find. The crates that
+# rely on discovery here are the `examples/*`, all `publish = false` and so not
+# published at all, and their READMEs are already corpus by directory.
+README_CANDIDATES = ('README.md', 'README.txt', 'README')
+
+
+def tracked_files(root):
+    """Every tracked path, for the published READMEs the markdown glob misses."""
+    out = subprocess.run(
+        ['git', 'ls-files', '-z'],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout
+    return {f for f in out.split('\0') if f}
+
+
+def _inherited(value):
+    """Whether a manifest value defers to `[workspace.package]`."""
+    return isinstance(value, dict) and value.get('workspace') is True
+
+
+def _published(pkg, workspace):
+    """Cargo's `publish`: absent means yes, `false` and `[]` mean no."""
+    value = pkg.get('publish')
+    if _inherited(value):
+        value = workspace.get('publish')
+    if value is None:
+        return True
+    if value is False:
+        return False
+    if isinstance(value, list):
+        return bool(value)
+    return True
+
+
+def _workspace_of(rel, tracked, parsed):
+    """The manifest whose `[workspace.package]` this one inherits from.
+
+    Cargo walks UP from the package directory to the nearest ancestor manifest
+    carrying a `[workspace]` table, and `package.workspace = "…"` names one
+    explicitly. A manifest with its own `[workspace]` table is its own root,
+    which is how five standalone workspaces sit inside this repository without
+    belonging to the root one: `fuzz/`, `examples/island-flock/`,
+    `examples/reddit-clone/src-tauri/` and the two benchmark harnesses.
+
+    Always reading the repository-root manifest instead would resolve an
+    inherited value from a workspace the package is not in — the right answer
+    only by coincidence, and only for packages in the root workspace.
+    """
+    data = parsed(rel)
+    named = (data.get('package') or {}).get('workspace')
+    if isinstance(named, str):
+        here = str(pathlib.PurePosixPath(rel).parent)
+        for suffix in (named, os.path.join(named, 'Cargo.toml')):
+            cand = os.path.normpath(os.path.join(here, suffix))
+            cand = cand.replace(os.sep, '/')
+            if cand in tracked and 'workspace' in parsed(cand):
+                return cand
+    if 'workspace' in data:
+        return rel
+    parts = rel.split('/')[:-1]
+    while parts:
+        parts.pop()
+        cand = '/'.join(parts + ['Cargo.toml'])
+        if cand in tracked and 'workspace' in parsed(cand):
+            return cand
+    return None
+
+
+def package_readmes(root):
+    """Every file a `Cargo.toml` publishes as its crate's README.
+
+    PARSED AS TOML, not matched with a regex, and that is the point. Review
+    found four ways a hand-rolled matcher misread a manifest: it took only
+    double-quoted values, then only explicit keys, then ignored `publish`, then
+    missed the inline-table spelling of the inheritance it did match. Each fix
+    was correct and each left the next corner of the same grammar uncovered,
+    because the thing being approximated is a TOML parser. `tomllib` is
+    standard library and already used by `check-docs-toml.sh` and by
+    `check-example-bin-names.sh`, the latter on `Cargo.toml` exactly like this.
+
+    `cargo metadata` would be more authoritative still, and is deliberately not
+    used: every docs gate shares a CI job that carries no Rust toolchain and no
+    cache, on purpose, so that it reports in seconds and cannot be blocked by a
+    compile failure elsewhere. Reading the manifests keeps that property.
+
+    What Cargo does, and so does this: `readme = false` means none; a string is
+    a path relative to the manifest; `workspace = true` takes the
+    `[workspace.package]` value of the package's OWN workspace, relative to
+    that workspace's root; and an ABSENT key discovers `README.md`,
+    `README.txt` or `README` beside the manifest, in that order. A package that
+    does not publish is skipped — it has no landing page to keep true, and
+    enrolling its working notes made the drift gates fail on the illustrative
+    commands such a page may contain.
+    """
+    tracked = tracked_files(root)
+    root_path = pathlib.Path(root)
+    cache = {}
+
+    def parsed(rel):
+        if rel not in cache:
+            cache[rel] = tomllib.loads(
+                (root_path / rel).read_text(encoding='utf-8'))
+        return cache[rel]
+
+    out = set()
+    for rel in sorted(f for f in tracked
+                      if f == 'Cargo.toml' or f.endswith('/Cargo.toml')):
+        manifest = pathlib.PurePosixPath(rel)
+        parent = str(manifest.parent)
+        parent = '' if parent == '.' else parent + '/'
+        pkg = parsed(rel).get('package')
+        if not isinstance(pkg, dict):
+            continue
+
+        ws_manifest = _workspace_of(rel, tracked, parsed)
+        workspace, ws_dir = {}, ''
+        if ws_manifest:
+            workspace = parsed(ws_manifest).get('workspace', {}).get(
+                'package', {})
+            ws_dir = str(pathlib.PurePosixPath(ws_manifest).parent)
+            ws_dir = '' if ws_dir == '.' else ws_dir
+
+        if not _published(pkg, workspace):
+            continue
+
+        named = pkg.get('readme')
+        if _inherited(named):
+            # An inherited path is relative to ITS workspace's root.
+            named = workspace.get('readme')
+            if isinstance(named, str):
+                resolved = os.path.normpath(os.path.join(ws_dir, named))
+                out.add(resolved.replace(os.sep, '/'))
+            continue
+        if named is False:
+            continue
+        if isinstance(named, str):
+            # `readme = "../README.md"` points at the workspace root's page.
+            resolved = os.path.normpath(str(manifest.parent / named))
+            out.add(resolved.replace(os.sep, '/'))
+            continue
+        for candidate in README_CANDIDATES:
+            if parent + candidate in tracked:
+                out.add(parent + candidate)
+                break
+    return out
+
+
 def corpus(root):
     # NUL-delimited so a path containing whitespace is not split into
     # fragments, and so git does not quote unusual paths.
-    out = subprocess.run(['git', 'ls-files', '-z', '*.md'], cwd=root,
+    out = subprocess.run(['git', 'ls-files', '-z', '*.md', '*.md.tmpl'], cwd=root,
                          capture_output=True, text=True).stdout
-    return [f for f in out.split('\0') if f and in_scope(f)]
+    published = package_readmes(root)
+    files = [f for f in out.split('\0')
+             if f and (in_scope(f) or f.endswith('.md.tmpl')
+                       or f in published)]
+    # A published landing page is corpus whatever it is NAMED. Using
+    # `published` only to filter the markdown glob meant a crate that names a
+    # `README.rst` or `README.txt` — valid, and unrestricted by
+    # `check-crate-metadata.sh` — resolved to a path the glob never produced, so
+    # the clause above could not add it and the page had no owner in any gate.
+    # All four filtered identically, so they agreed and the scope gate stayed
+    # green over it. Unioned in instead, and only when tracked.
+    seen = set(files)
+    tracked = tracked_files(root)
+    return files + sorted(p for p in published
+                          if p in tracked and p not in seen)
 
 
 def invocations(text):
@@ -3322,7 +3538,8 @@ def _classify_option(tok, node):
     return 'unknown', 1 if attached else 0
 
 
-def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
+def _scan_options_only(tokens, i, node, path, flags, surface, runnable,
+                       reached=None):
     """Judge the OPTIONS in `tokens[i:]`, resolving no NEW command defects.
 
     Reached once a positional has been met on a node that also has subcommands,
@@ -3351,8 +3568,10 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
                 # ordinary walk can take over again — including its
                 # `requires_sub` and required-argument checks, which this
                 # options-only mode does not have and must not reimplement.
+                if reached is not None:
+                    reached[0] = path + ' ' + tok
                 return _walk(tokens, i + 1, path + ' ' + tok,
-                             surface, runnable, flags)
+                             surface, runnable, flags, reached)
             filled += 1                         # a value, or another positional
             i += 1
             continue
@@ -3384,7 +3603,7 @@ def _scan_options_only(tokens, i, node, path, flags, surface, runnable):
     return None
 
 
-def resolve(tokens, surface, runnable=False, flags=None):
+def resolve(tokens, surface, runnable=False, flags=None, reached=None):
     """Return the drifted command path, or None when the command resolves.
 
     `flags`, when given, collects `(command path, option)` for every option a
@@ -3436,10 +3655,12 @@ def resolve(tokens, surface, runnable=False, flags=None):
         return None
     if tokens[0] not in surface:
         return 'autumn ' + tokens[0]
-    return _walk(tokens, 1, tokens[0], surface, runnable, flags)
+    if reached is not None:
+        reached[0] = tokens[0]
+    return _walk(tokens, 1, tokens[0], surface, runnable, flags, reached)
 
 
-def _walk(tokens, i, path, surface, runnable, flags):
+def _walk(tokens, i, path, surface, runnable, flags, reached=None):
     """The token walk proper, entered at `tokens[i]` with `path` resolved.
 
     Split out so that `_scan_options_only` can hand control BACK to it once a
@@ -3570,6 +3791,8 @@ def _walk(tokens, i, path, surface, runnable, flags):
             continue
         if tok in node['children']:             # always TOKEN-shaped, so first
             path = path + ' ' + tok
+            if reached is not None:
+                reached[0] = path
             i += 1
             continue
         # The positional check comes BEFORE the `TOKEN` bail, because the
@@ -3591,7 +3814,7 @@ def _walk(tokens, i, path, surface, runnable, flags):
             # be another positional value, or the value of an option, and no
             # further subcommand resolution is attempted.
             return _scan_options_only(tokens, i, node, path, flags,
-                                      surface, runnable)
+                                      surface, runnable, reached)
         if not TOKEN.match(tok):
             return None
         return 'autumn ' + path + ' ' + tok
@@ -6438,6 +6661,30 @@ def main():
               file=sys.stderr)
         return 1
 
+    if MODE == '--list-aliases':
+        # `alias<TAB>canonical`, for every spelling that is not the canonical
+        # one. An alias is another way to TYPE a command, not another command:
+        # `autumn c` and `autumn console` are one thing, and a consumer that
+        # compares spellings rather than commands counts them as two.
+        for path in sorted(p for p in surface if p):
+            canon = surface[path]['canonical']
+            if canon and canon != path:
+                print(f'{path}\t{canon}')
+        return 0
+
+    if MODE == '--list-hidden':
+        # A command whose subtree is hidden is hidden: clap leaves the whole
+        # branch out of `--help`, so a child of a hidden parent is no more
+        # reachable than its parent.
+        hidden = sorted(p for p in surface if p and (
+            surface[p]['hidden']
+            or any(surface[a]['hidden']
+                   for a in surface
+                   if a and p.startswith(a + ' '))))
+        for path in hidden:
+            print(path)
+        return 0
+
     if MODE in ('--list', '--list-options'):
         show_opts = MODE == '--list-options'
         for path in sorted(p for p in surface if p):
@@ -6515,7 +6762,56 @@ def main():
     return 0
 
 
-sys.exit(self_test() if MODE == '--self-test' else main())
+
+def print_corpus():
+    """Print this gate's resolved corpus, one path per line.
+
+    `scripts/check-docs-scope.sh` compares these lists across the four gates
+    that share a reader-facing corpus. It asks each gate what it reads rather
+    than re-deriving it from this file's source, because a corpus is widened in
+    several places at once — the `git ls-files` globs, the scope tuples, the
+    `.md.tmpl` clause, the crate `readme =` manifests — and a checker that
+    models some of those rules reports agreement over the rest. Asking cannot
+    drift from the answer; modelling can, and did.
+    """
+    for f in sorted(corpus(ROOT)):
+        print(f)
+    return 0
+
+
+def print_resolved():
+    """Print every command path the corpus names: `file<TAB>line<TAB>path`.
+
+    `scripts/check-docs-cli-coverage.sh` runs the surface against the corpus in
+    the OPPOSITE direction to this gate — "is what we shipped written down
+    anywhere?" rather than "is what we wrote still true?" — and it needs the
+    same answer to "which command does this line name?" that the drift half
+    already computes.
+
+    It asks for that answer instead of re-deriving it. A coverage checker that
+    matches command paths against page text with its own regex gets the
+    shallow cases right and the deep ones wrong: `autumn openapi export`
+    satisfying the top-level `export`, `autumn db pull posts` reading its
+    positional as a subcommand, an alias spelling counting for the canonical
+    name. Every one of those is a question `resolve()` already answers, off the
+    clap derive input, with 866 self-tests behind it.
+    """
+    surface = build_surface(cli_sources(ROOT))
+    for f in sorted(corpus(ROOT)):
+        text = (ROOT / f).read_text(errors='replace')
+        for lineno, _display, argv, where in invocations(text):
+            reached = ['']
+            resolve(argv, surface, runnable=where == FENCED_COMMAND,
+                    reached=reached)
+            if reached[0]:
+                print(f'{f}\t{lineno}\t{reached[0]}')
+    return 0
+
+
+sys.exit(self_test() if MODE == '--self-test'
+         else print_corpus() if MODE == '--corpus'
+         else print_resolved() if MODE == '--resolved'
+         else main())
 PYEOF
 }
 
@@ -6523,8 +6819,12 @@ mode="${1:-}"
 case "$mode" in
   --self-test)    run_py --self-test "$root" ;;
   --list)         run_py --list "$root" ;;
+  --corpus)       run_py --corpus "$root" ;;
+  --resolved)     run_py --resolved "$root" ;;
+  --list-hidden)  run_py --list-hidden "$root" ;;
+  --list-aliases) run_py --list-aliases "$root" ;;
   --list-options) run_py --list-options "$root" ;;
   "")             echo "Checking CLI invocations across the reader-facing docs..."
                   run_py --check "$root" ;;
-  *)              echo "usage: $0 [--list|--list-options|--self-test]" >&2; exit 2 ;;
+  *)              echo "usage: $0 [--list|--list-options|--list-hidden|--list-aliases|--corpus|--resolved|--self-test]" >&2; exit 2 ;;
 esac

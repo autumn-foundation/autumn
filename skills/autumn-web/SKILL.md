@@ -33,6 +33,12 @@ defaults into a convention-over-configuration stack with proc-macro ergonomics.
 This file is the quick operating guide. Load the adjacent reference files only
 when their details matter:
 
+- `docs/guide/index.md` - the complete guide catalog: every page under
+  `docs/guide/`, grouped by task, each entry naming the question that page
+  answers. Start here when the topic you need is not covered by this file or
+  the references below, rather than guessing a filename — the index is gated
+  by `scripts/check-docs-guide-index.sh`, so it lists every guide page that
+  exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
 - `references/examples.md` - official 0.7.0 example patterns for minimal apps,
@@ -53,7 +59,35 @@ when their details matter:
   attributes. Treat `autumn a11y verify` as an advisory/best-effort CI net, not
   a guarantee — the typed primitives are the compile-time proof (0.6.0,
   #1706). See `skills/autumn-web/references/api-reference.md` for the full
-  setter surface.
+  setter surface. To check rendered HTML from a test, shell out to `autumn
+  check --a11y --html "<markup>"` and assert on the exit code (0 = no
+  Critical/Serious violation); there is no library import for the checker.
+  Pass a whole DOCUMENT: `html-has-lang`, `bypass` and `landmark-one-main`
+  run on every input, so a bare fragment fails on the missing page shell.
+  Wrapping it as `<html lang="en"><body><main>…</main></body></html>` settles
+  all three (a `<main>` first in `<body>` needs no skip link). `--html`
+  carries the markup in argv, which the OS caps (~128 KiB per argument on
+  Linux, ~32 KiB per command line on Windows), so check a large page with
+  `--url` against a served app instead — past the limit the checker never
+  starts and no audit runs.
+
+## Never write `use autumn_cli::…`
+
+`autumn-cli` ships a **binary target only** — no `src/lib.rs`, no `[lib]`, so
+`cargo metadata` reports `bin` plus tests and nothing else. `pub` inside it is
+visible only within that binary, and no path into it resolves from another
+crate however it is spelled. `cargo add autumn-cli` still succeeds, because the
+crate does publish a binary, which is what makes this worth stating: every
+other signal says the import is fine.
+
+So anything the CLI does is reached by RUNNING it (`std::process::Command`, or
+a shell step in CI), never by importing it. The library crates to import from
+are `autumn-web` and the plugin crates (`autumn-billing`, `autumn-storage-s3`,
+`autumn-cache-redis`, `autumn-search`, `autumn-admin-plugin`,
+`autumn-media-plugin`, `autumn-edge`, `autumn-schema-core`, `autumn-macros`).
+
+`scripts/check-docs-symbols.sh` fails any reader-facing page that writes such a
+path, so a generated snippet carrying one will not land.
 
 ## Prefer framework idioms over raw Diesel/Axum
 
@@ -77,6 +111,7 @@ the framework almost certainly already generates or ships it:
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.7.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0) |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
+| `Db` taken before a body extractor (`Form`/`Json`/`Multipart`) in the same handler — pins a pooled connection for as long as the client takes to send the body | `LazyDb` in the same argument spot; call `.checkout().await?` after the body extractor runs — for `Form`/`Json` that means right at handler entry, but `Multipart` doesn't buffer anything during extraction, so checkout must wait until every field this handler needs has been read from the `next_field()` loop, not before it (issue #2264) |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
 | Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (0.6.0) |
 | Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (0.6.0) |
@@ -89,6 +124,7 @@ the framework almost certainly already generates or ships it:
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
+| A `#[sim_test]` that calls a real downstream service, hopes for a timing race, or reads `Utc::now()` / `Instant::now()` in code with no clock in scope | `Sim::net(SimNet::new().host("payments", router).latency(..).drop_rate(..))` serves outbound `http_client` calls in-process with seeded latency, drops and `partition`/`heal`; `Sim::interleave` / `Sim::spawn` reorder ready work from the seed; `sim::crash_at(i, op)` drops an op at any await; `time::ambient_now()` / `ambient_instant()` follow the running `Sim`. See `docs/guide/simulation-testing.md` (#2967) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
@@ -109,6 +145,7 @@ after checking this table and `docs/guide/`.
 | S3 storage plugin crate | `autumn-storage-s3` |
 | Redis cache plugin crate | `autumn-cache-redis` |
 | Search plugin crate | `autumn-search` |
+| Billing plugin crate | `autumn-billing` |
 | Main entry macro | `#[autumn_web::main]`, not `#[autumn::main]` |
 
 The name `autumn` is the CLI binary, not the framework crate. In code, import
@@ -210,6 +247,9 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `mail` | Transactional email, mailer macros, previews, deferred delivery |
 | `seed` | `SeedContext` for seed binaries |
 | `system-info` | Optional system information in actuator surfaces |
+| `presence` | Per-topic membership tracking with join/leave events; implies `ws` |
+| `offline-sync` | Offline-first local `SQLite` store plus a background sync engine |
+| `collab` | `#[collaborative]` text fields merged by an in-tree CRDT, with live sessions over the channel/presence seams — see [collaboration](../../docs/guide/collaboration.md) |
 
 For S3 storage add `autumn-storage-s3 = "0.7"`; `storage-s3` is no longer an
 `autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.7"`.
@@ -728,8 +768,9 @@ probe IS the referential check: an unknown/soft-deleted/foreign-tenant parent
 is `404`, a `reply_to` on a different record or past `max_depth` is `422`, and
 `comment_count` moves via the counter-cache primitive in the **same
 transaction**. `delete_comment` is idempotent and decrements by the rows it
-actually removed. **Like `react()`, these take their own pooled connection —
-never hold a `Db` extractor across the call.**
+actually removed. With `soft_delete = false` it refuses (`422`) a subtree that
+has a reply on another record. **Like `react()`, these take their own pooled
+connection — never hold a `Db` extractor across the call.**
 
 Mount the routes ONCE for the whole app; the registry dispatches on the type
 segment, so a third commentable model needs no route:
@@ -1109,6 +1150,89 @@ db.tx_with(opts, |conn| async move { /* &mut AsyncPgConnection */ }.scope_boxed(
 `TxOptions::default()` is identical to `Db::tx`. See
 `docs/guide/transactions.md` and `docs/guide/hooks-and-transactions.md`.
 
+## Money and the double-entry ledger (unreleased, issue #1837)
+
+Do **not** hand-roll a money type or a ledger. `autumn_web::money` has both.
+Not to be confused with `autumn_web::ledger` (`ledgered = true` above), which
+records the history of a row; this one records money.
+
+`Money<C>` is an amount in one currency, held as an `i64` count of minor units.
+The currency is a type parameter, so `Money<Usd>` and `Money<Eur>` do not add.
+**Never use `f64` for money**, and never reach for `+`/`-` here — there are no
+operator impls, because an operator cannot report an overflow:
+
+```rust
+use autumn_web::money::{Money, Rounding, Usd};
+
+let fee = Money::<Usd>::from_minor(250);      // $2.50
+let tip = Money::<Usd>::from_major(1)?;       // $1.00
+let total = fee.checked_add(tip)?;            // checked_sub/neg/abs/mul, try_sum
+
+// Rounding is always named; `from_decimal_exact` refuses to round at all.
+let price = Money::<Usd>::from_decimal(decimal, Rounding::HalfEven)?;
+
+// Splits lose nothing: the parts always sum back to the whole.
+let parts = total.split(3)?;                  // or .allocate(&[70, 20, 10])
+```
+
+`AnyMoney` is the runtime-tagged form for a stored row, and rejects a currency
+mismatch at run time. Render with `number_to_currency(m.to_decimal())`.
+
+The ledger is append-only and double-entry. A transaction is a set of postings;
+a **debit is positive**, a **credit is negative**, and a balance is the sum of
+an account's postings:
+
+```rust
+use autumn_web::money::ledger::{self, Account, IdempotencyKey, Posting, Transaction};
+
+// Once, at boot. `disallow_negative()` is the one policy flag.
+ledger::ensure_account(conn, Account::new("platform:cash", Usd::currency())).await?;
+
+let postings = vec![
+    Posting::debit("platform:cash", amount),
+    Posting::credit("platform:revenue", amount),
+];
+// Idempotent by construction: the key is the money, so a retry collapses.
+let key = IdempotencyKey::derive("order:9911", &postings);
+let outcome = db.tx(|conn| async move {
+    // ... the application rows this charge justifies ...
+    ledger::post(conn, &Transaction::new(key, postings)).await.map_err(AutumnError::from)
+}.scope_boxed()).await?;
+outcome.is_replayed();   // true when the money had already moved
+```
+
+Rules that matter:
+
+- **`post` must run inside `Db::tx`.** A bare connection is refused with
+  `LedgerError::NotInTransaction`; the locks and the balance check mean nothing
+  outside one, and the tables are append-only so a partial write cannot be
+  repaired. Posting twice in one transaction needs `Db::tx_with` (deadlock
+  retry).
+- `post` refuses an unbalanced transaction **before its first `INSERT`**, plus
+  mixed currencies, a one-sided transaction, a zero line, a negative amount, a
+  currency the account does not hold, and a balance that would leave `i64`.
+- The same key for *different* money is `LedgerError::KeyReuse` (409), never a
+  silent replay of the wrong result.
+- `ledger::balance(conn, id)` sums an account. `ledger::trial_balance(conn)`
+  returns every currency's total, each of which must be zero — run it from a
+  scheduled job or a health check.
+- The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
+  **control** database. Nothing to add to the app's `migrations/`. They are
+  append-only by trigger — `UPDATE`, `DELETE`, `TRUNCATE` and an SQLite
+  `INSERT OR REPLACE` all abort. An account's currency is fixed the same way;
+  only `allow_negative` stays editable. The SQLite half uses
+  `BEFORE INSERT` guards on the row keys, because SQLite skips `DELETE`
+  triggers for the row a `REPLACE` removes and the pragma that changes that
+  would alter every application trigger's recursion semantics.
+- A cancelled `post` never half-writes: it writes the postings before their
+  transaction row behind a deferred foreign key, so the ledger ends up with
+  nothing or one complete transaction. Which one is not knowable from the
+  cancellation, so re-post the same idempotency key to settle it. Simpler still:
+  do not race `post` against a timeout.
+
+Out of scope in this slice: FX conversion, provider reconciliation, and a
+payment-provider client. See `docs/guide/money.md`.
+
 ## Security and auth
 
 ```rust
@@ -1459,7 +1583,15 @@ this is *provider-reported* failure.
   store. `with_mail_suppression_store` takes a store *by value* and wraps it in
   a fresh handle internally, so build **one** `InMemorySuppressionStore` and
   hand out `.clone()`s of it — the clone shares the same `Arc<Mutex<…>>` state
-  (inbound handlers are plain `fn` pointers, so stash a handle in a `OnceLock`):
+  (inbound handlers are plain `fn` pointers, so stash a handle in a `OnceLock`).
+
+  The receiving half needs the non-default `inbound-mail` feature on top of
+  `mail` — `record_inbound` and `InboundMailRouter` are both behind it, while
+  the store and `with_mail_suppression_store` above are not:
+
+  ```toml
+  autumn-web = { version = "0.7", features = ["mail", "inbound-mail"] }
+  ```
 
   ```rust
   use std::sync::OnceLock;
@@ -1770,10 +1902,21 @@ autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
 autumn plugin add autumn-cache-redis --dry-run
 ```
 
-`list` covers the five first-party crates (`autumn-admin-plugin`,
-`autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
-`autumn-storage-s3`) plus community crates found on crates.io under the
-documented `autumn-plugin-<name>` convention.
+`list` reads the curated plugin index first (issue #1625), then crates.io.
+The index lists the six first-party crates (`autumn-admin-plugin`,
+`autumn-billing`, `autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
+`autumn-storage-s3`) and reviewed community crates. Each listing shows its
+trust class (`full trust: native code`, or a sandboxed capability manifest),
+its #1601 tier (`[EXPERIMENTAL API]` when it uses experimental surface), and
+its last `autumn plugin-check` result. A crates.io `autumn-plugin-<name>`
+result with no listing is shown under "Unlisted" and marked
+`[unlisted: not verified]`. `add` prints the same trust review before it
+changes a file. It installs a listed community crate at its verified version,
+pinned with `=`, so `--offline` works. It refuses a listing flagged by
+re-verification. For a sandboxed listing it changes no file and exits 2 with
+manual steps. Advise users to prefer a listed plugin. An unlisted one has no
+verified range and no conformance result.
+Authors submit a listing by pull request: `autumn-cli/plugin-index/README.md`.
 
 Four behaviours worth knowing before advising on it:
 
@@ -2009,6 +2152,60 @@ line items in one submit — use `autumn_web::nested_form` (0.6.0, #1915) instea
 decode the flat submission back into parent + children with
 `decode_nested_urlencoded`, so the parent and its children validate and persist
 as one transaction.
+
+## Service-to-service wire contracts (unreleased, issue #1755)
+
+Don't hand-write an HTTP client to call another Autumn service in the same
+workspace, and don't keep a schema alongside it. The callee's handler
+signatures are the contract.
+
+Callee:
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item { pub id: String, pub name: String }
+
+#[endpoint(service = "catalog")]   // MUST sit above the route attribute
+#[get("/items/{id}")]
+#[public]
+pub async fn get_item(id: Path<String>) -> AutumnResult<Json<Item>> { … }
+```
+
+Caller:
+
+```rust
+wire_client! {
+    name = CatalogClient,
+    endpoints = [catalog::get_item_endpoint(id)],   // (…) lists path params
+}
+
+#[contract_checked(client = CatalogClient)]
+#[get("/items/{id}")]
+#[public]
+async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
+    let catalog = CatalogClient::new(catalog_url(), http);
+    let item = catalog.get_item(&*id, NoBody).await?;   // NoBody = no request body
+    Ok(html! { h1 { (item.name) } })
+}
+```
+
+- `#[endpoint]` emits `get_item_endpoint` plus a JSON descriptor under
+  `target/autumn-contracts/`. It reads the request/response types off the
+  signature and the method/path off the route attribute below it.
+- `wire_client!` generates one method per endpoint, typed with the callee's own
+  types. A body-less endpoint takes `NoBody`.
+- `#[contract_checked]` fails the build at the call site when a response field
+  the function reads is no longer produced, a request field it sets is no longer
+  accepted, or a `..Default::default()` request omits a newly-required field.
+  It refuses a client it cannot find a value for, so it never passes vacuously.
+- `?` on a failed call produces 502, not 500: the dependency failed, not the
+  caller's client.
+- `#[derive(WireShape)]` refuses generics, enums, tuple structs,
+  `#[serde(flatten)]` and split renames rather than describing them wrongly.
+
+First slice: one workspace, sync request/response, JSON over HTTP. Guide:
+`docs/guide/wire-contracts.md`; example: `examples/mesh-catalog` +
+`examples/mesh-storefront`.
 
 ## Resumable SSE streams (0.6.0, issue #1356)
 
@@ -2328,6 +2525,17 @@ Published 0.5.0 behavior:
   (prelude re-export).
 - `actuator.prometheus` exposes the Prometheus scrape endpoint independently
   of sensitive actuator mode.
+- Verbosity and shape are `[log] level` / `[log] format` (or
+  `AUTUMN_LOG__LEVEL` / `AUTUMN_LOG__FORMAT`). `level` takes the full
+  `tracing` filter syntax, so `"info,my_app::orders=debug"` raises one target
+  without raising the floor; `format` is `Auto` (pretty unless the profile is
+  production, then JSON), `Pretty` or `Json`. The profile sets both outright
+  before those defaults apply: `dev` is `debug`/`Pretty`, `prod` is
+  `info`/`Json`, any other profile falls back to `info`/`Auto`. Both are read
+  once, at
+  startup — see "Runtime log levels" below for changing one on a running
+  process. Every `[log]` knob, the access log and the PII scrubber included,
+  is documented on one page: `docs/guide/logging-pii.md`.
 
 ### Runtime log levels (0.6.0)
 
@@ -2349,8 +2557,13 @@ The response now carries `"applied": true` and `"status":"ok"` only when the
 change actually reached a reload-capable subscriber; otherwise it reports
 `"status":"recorded"` / `"applied": false` rather than a false-positive `ok`.
 Overrides stay ephemeral — a restart resets to the configured `log.level`.
-Invalid levels still return `400`. `GET /actuator/loggers` keeps reporting
-`current_level` + overrides, now matching real emission.
+Invalid levels still return `400` — as does a target name carrying an
+`EnvFilter` metacharacter (`=`, `,`, `[`, `]`, `{`, `}`, whitespace), so a
+malformed directive never reaches the subscriber. `GET /actuator/loggers`
+keeps reporting `current_level` + overrides, now matching real emission. The
+reader-facing version of this, with the full request/response shapes, is
+"Change log levels at runtime, without a restart" in
+`docs/guide/logging-pii.md` — point a user there rather than restating it.
 
 ### Build & git provenance on `/actuator/info` (0.6.0)
 
@@ -2841,7 +3054,12 @@ user pins 0.5.x:
 
 ```bash
 autumn serve --daemon            # non-watch local daemon; also: serve stop|status|restart
+                                 # native on Windows too (#1639): TCP transport,
+                                 # file-requested graceful drain, same serve.addr
 autumn serve --bundled-pg        # managed local Postgres (managed-pg-bundled feature)
+autumn serve install-service     # Windows only, elevated: register as a boot-start,
+                                 # crash-restarting service; uninstall-service removes it
+                                 # (flags go BEFORE the subcommand: serve --bundled-pg install-service)
 autumn destroy scaffold Post title:String   # cleanly reverses generate; --dry-run supported
 autumn generate scaffold Post title:String 'status:enum{draft,published}' 'price:decimal{10,2}' author:references email:String:unique
 autumn generate scaffold Post title:String --live --live-validation
@@ -2867,6 +3085,8 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+autumn migrate new add_widget_archived_at   # collision-free migration dir: prefer this (or `generate migration`) over hand-creating one — see "Migration version collisions" below
+autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
 autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (unreleased, issue #1615)
 autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
 autumn sbom --verify sbom.cdx.json --expect-version 0.8.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
@@ -3074,7 +3294,39 @@ legacy migrations applied before the checksum feature existed; use
 `autumn migrate baseline --force <version>` only when a deliberate edit
 is intended and the fork risk is accepted.
 
-### `autumn test` — isolated test DB (0.6.0, issue #1056)
+### Migration version collisions (unreleased — trunk-dev)
+
+Diesel records applied migrations **by version** (the leading
+`YYYYMMDDHHMMSS` directory prefix). If two differently-named migrations
+share a version, a fresh database silently applies only one of them and
+records the version as done — the other is skipped forever, with no error.
+This is the failure mode a hand-typed round timestamp (`...T00:00:00`, the
+top of an hour) invites: two authors reaching for midnight collide, while
+two authors reaching for the actual current second essentially never do.
+
+**Prefer `autumn migrate new <name>` (or `autumn generate migration
+<name>`) over hand-creating a migration directory** — never invent a
+`YYYYMMDDHHMMSS` stamp yourself. `autumn migrate new` picks a version
+guaranteed free across the working tree, every local/remote git branch this
+checkout has fetched, and the framework's own migrations, and creates
+`migrations/<version>_<name>/{up,down}.sql` (empty, with WHY/LOCKING
+guidance comments — same DDL-writing rules as any other migration). Run
+`autumn migrate check-collisions` before pushing (or rely on the CI gate) if
+a collision might have appeared on another branch since.
+
+If a user reports "my migration didn't run" and their app has more than one
+migration source (an installed plugin, a second `AppBuilder::migrations(…)`
+call), a version collision alone is not the cause: the framework
+auto-resolves it (`compute_migration_disambiguation` inside
+`autumn_web::migrate`) by giving the losing migration a deterministic
+substitute version, so both still apply — logged at `INFO`
+("Migration version collision resolved automatically"), not an error. Check
+that log line, or `autumn migrate check-collisions`, if you suspect a
+collision; only a narrow ambiguous-history case on `SQLite` (adopting a
+pre-fork database whose applied history can't be safely rewritten) is
+rejected as a hard error.
+
+### `autumn test` — isolated test DB (unreleased — trunk-dev, issue #1056)
 
 `autumn test` resolves the test DB URL with the same precedence as
 `autumn migrate` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
@@ -3506,10 +3758,10 @@ failed after `migrate` but before its cutover and tore its own candidate down �
 `no host is serving the new release, but the migration that already ran was NOT
 rolled back …`. A rollout that died BEFORE its migration (a failed host
 preparation or upload) prints none of them. **A failed SINGLE-host deploy prints
-no summary and so warns about none of this** (known gap, #2276) — if a user's
-one-host `deploy up` failed, tell them to check `autumn migrate status` before
-assuming nothing was applied. That now includes a failed FIRST deploy, which
-migrates before it starts the release.
+no summary.** If it failed at or after `migrate` and before the cutover, its
+error has one more line (#2276). A redeploy prints `… The previous release now
+runs on the migrated schema …`. A FIRST deploy prints `… No release is serving
+…`. A failure before `migrate` or after the cutover adds no line.
 `--only <HOST>` (repeatable, `up` and `rollback`) is a repair lever
 that warns about a mixed fleet; `--no-rollback` halts and freezes instead.
 `--only` narrowed to ONE host takes the single-host path: `deploy rollback --only
@@ -3540,6 +3792,22 @@ Fleet-unsafe topologies fail closed in the prologue, before any remote command:
 TLS at the load balancer instead). `[database] auto_migrate` on a fleet is a loud
 warning, not a refusal.
 
+On a SINGLE host, `[media.mediamtx] enabled = true` provisions MediaMTX as its
+own systemd unit, after the app cutover commits. Six fail-closed preflight
+checks run first. Two are pure config and need no host: the listener ports must
+be distinct, and each `*_port` must match the app-side `[media.mediamtx] *_base`
+URL that calls it. Tell users that customizing a port means updating its base
+URL — a mismatch blocks the deploy when the base addresses loopback, a proxied
+or CDN-fronted base is skipped (its public port is its own), and an unset base
+only warns, because the app may take it from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`
+(unreleased, issue #1974). `deploy up` creates the config parent and
+`recordings_dir` (mode `0750`); an absent recordings dir under a writable parent
+passes, so a fresh host is not blocked. Installing the `mediamtx` binary stays a
+host-bootstrap step the deploy only preflights. Mesh rooms hold a seat by
+`POST {api_prefix}/rooms/{room_id}/heartbeat` or a roster poll, on any interval
+under the idle TTL (default 15 min); a client that does neither is reaped from
+signaling, though its live WebRTC path survives and it can re-join.
+
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
 one row per host (mode, release from the `current` symlink, live slot, `/ready`
 code, maintenance flag, proxy port, last deploy result, drift reasons) plus
@@ -3552,6 +3820,11 @@ exits non-zero under `--strict`.
 / `torn down` + the host's UTC time, `?` when unreadable) — a deploy that failed before cutover
 never rewrites it, so it is never a verdict on the last rollout, and it is
 reported, not drift.
+
+A halted `deploy up` and drift found by `deploy status --strict` each raise a
+`ScheduledTaskFailure` operator alert through the same outbound-HTTP `[alerts]`
+channel used by the offsite-upload alert above — email is not notified, same
+rule as issue #1743 (issue #2267).
 
 The **maintenance cell is three-valued** — `maintenance ON` / `maintenance off` /
 `maintenance ?` — and reports the flag file the host's RUNNING slot unit polls,
@@ -3711,9 +3984,16 @@ tests live in consolidated binaries (`autumn` → `integration_tests`,
 a `mod` line in `tests/integration/mod.rs`, not new `[[test]]` targets.
 
 CI also runs a feature-combination compile gate (35 `autumn-web` feature
-combos via `cargo hack`), a generator-conformance gate, and a plugin
+combos via `cargo hack`), a generator-conformance gate, a plugin
 freshness gate (`scripts/check-plugin-freshness.sh` — user-facing changelog
-entries must ship matching Claude-plugin updates).
+entries must ship matching Claude-plugin updates), and a changelog fragment
+gate (`scripts/check-changelog-fragments.sh`).
+
+Do not edit `CHANGELOG.md` in a PR. A release note goes in its own file,
+`changelog.d/<slug>.md`, holding the markdown the `## [Unreleased]` section
+holds: a `### <Kind>` heading and its bullets. Every PR used to write to the
+top of that section, so every PR conflicted with every other PR. See
+`changelog.d/README.md`.
 
 For docs or generated-app changes, also run the docs smoke procedure in
 `docs/guide/docs-smoke.md`. For public API changes, run doctests for the
@@ -3737,6 +4017,7 @@ touched crate so examples compile from an external-consumer perspective.
 - `CHANGELOG.md`
 - `RELEASE_NOTES.md`
 - `STABILITY.md`
+- `changelog.d/README.md` (where an unreleased note is written)
 - `docs/migrations/README.md` (per-release upgrade guides; `next.md` is the
   rolling draft for unreleased breaking changes)
 - `docs/release-checklist.md`

@@ -74,7 +74,7 @@ use crate::state::AppState;
 /// ```
 #[must_use]
 pub fn app() -> AppBuilder {
-    AppBuilder {
+    let builder = AppBuilder {
         routes: Vec::new(),
         api_versions: Vec::new(),
         route_sources: Vec::new(),
@@ -162,6 +162,105 @@ pub fn app() -> AppBuilder {
         health_indicators: Vec::new(),
         #[cfg(feature = "inbound-mail")]
         inbound_mail_router: None,
+    };
+    // Strip the edge lane's internal fallthrough-sentinel header from every
+    // outbound response, for every app — not only apps that call
+    // `with_edge_kv`. `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) sets
+    // this header on its 500 so the EDGE CAPSULE runtime knows to fall
+    // through to the origin; the same handler code also runs at the origin,
+    // and a `#[edge(needs(kv))]` route with no `with_edge_kv` call — a wiring
+    // bug — hits that same 500 at the origin. Without this layer the internal
+    // header would leak straight to a real HTTP client. See
+    // `StripEdgeFallthroughSentinelLayer` below.
+    #[cfg(feature = "edge")]
+    let builder = builder.layer(StripEdgeFallthroughSentinelLayer);
+    builder
+}
+
+/// Removes [`autumn_edge::FALLTHROUGH_SENTINEL`] from an outbound response.
+///
+/// `autumn-edge` is substrate-agnostic on purpose: `extract.rs` cannot tell
+/// whether it is running at the edge or at the origin, so it always sets the
+/// sentinel on an `EdgeCacheUnavailable` response. Only the origin knows it is
+/// the origin, so only the origin strips the header before a real client ever
+/// sees it. The response body's actionable message is left untouched — only
+/// the internal signaling header is removed.
+///
+/// A bespoke `tower::Layer`, not `axum::middleware::from_fn`: this type's
+/// `TypeId` is what `router::is_idempotency_transparent_app_layer` matches
+/// on to recognize this one framework-owned registration without forcing
+/// fail-closed idempotency on every app built with the `edge` feature. A
+/// name (even a function's) is not unique enough for that — a user's own
+/// `from_fn` middleware could share it by coincidence; a crate-private type
+/// cannot.
+#[cfg(feature = "edge")]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StripEdgeFallthroughSentinelLayer;
+
+#[cfg(feature = "edge")]
+impl<S> tower::Layer<S> for StripEdgeFallthroughSentinelLayer {
+    type Service = StripEdgeFallthroughSentinelService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StripEdgeFallthroughSentinelService { inner }
+    }
+}
+
+/// `true` for a `custom_layers` registration that [`app()`] installs itself
+/// rather than a user calling [`AppBuilder::layer`] — [`get_layer_types`](AppBuilder::get_layer_types)
+/// filters these out to keep its documented "user-installed only" contract,
+/// even though they share the same underlying `custom_layers` vector as a
+/// real user layer (needed so the router-build step applies them the same
+/// way, in the same registration-order pass).
+#[cfg(feature = "edge")]
+fn is_framework_owned_layer(type_id: TypeId) -> bool {
+    type_id == TypeId::of::<StripEdgeFallthroughSentinelLayer>()
+}
+
+#[cfg(not(feature = "edge"))]
+const fn is_framework_owned_layer(_type_id: TypeId) -> bool {
+    false
+}
+
+/// Tower [`Service`](tower::Service) produced by
+/// [`StripEdgeFallthroughSentinelLayer`].
+#[cfg(feature = "edge")]
+#[derive(Clone, Debug)]
+pub(crate) struct StripEdgeFallthroughSentinelService<S> {
+    inner: S,
+}
+
+#[cfg(feature = "edge")]
+impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>>
+    for StripEdgeFallthroughSentinelService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::response::Response>
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        let response = self.inner.call(req);
+        Box::pin(async move {
+            let mut response = response.await?;
+            response
+                .headers_mut()
+                .remove(autumn_edge::FALLTHROUGH_SENTINEL);
+            Ok(response)
+        })
     }
 }
 
@@ -321,7 +420,7 @@ pub struct AppBuilder {
     /// Non-None while a plugin's `build()` is executing; routes and scoped
     /// groups added during that window are attributed to this plugin.
     current_plugin: Option<String>,
-    tasks: Vec<crate::task::TaskInfo>,
+    pub(crate) tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
     pub(crate) jobs: Vec<crate::job::JobInfo>,
     /// Registered event listeners; durable ones are synthesized into jobs at
@@ -1231,12 +1330,16 @@ impl AppBuilder {
     /// Returns the registered custom layer types in registration order.
     ///
     /// This includes only user-installed layers from
-    /// [`AppBuilder::layer`], not framework-managed middleware.
+    /// [`AppBuilder::layer`], not framework-managed middleware — even one
+    /// installed through this same `custom_layers` vector internally, such
+    /// as the `edge` feature's own sentinel-strip layer, which this filters
+    /// back out.
     #[must_use]
     pub fn get_layer_types(&self) -> Vec<TypeId> {
         self.custom_layers
             .iter()
             .map(|registered| registered.type_id)
+            .filter(|type_id| !is_framework_owned_layer(*type_id))
             .collect()
     }
 
@@ -3925,7 +4028,7 @@ impl AppBuilder {
             let interval = std::time::Duration::from_millis(500);
             loop {
                 let poll_path = path.clone();
-                let load_res = tokio::task::spawn_blocking(move || {
+                let load_res = crate::time::spawn_blocking(move || {
                     crate::maintenance::MaintenanceState::load_from_file(&poll_path)
                 })
                 .await;
@@ -4001,6 +4104,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -4068,7 +4181,7 @@ impl AppBuilder {
             // read from it, so a test that freezes time moves them all (#1797).
             let clock = state.clock_arc();
 
-            let built = tokio::task::spawn_blocking(move || {
+            let built = crate::time::spawn_blocking(move || {
                 crate::replication::build(
                     &replication_config,
                     &database_url,
@@ -4584,12 +4697,23 @@ impl AppBuilder {
         // background reload task spawned once `server_shutdown` exists.
         #[cfg(feature = "tls")]
         let mut tls_reload_state: Option<crate::tls::CertReloader> = None;
+        // The mTLS trust-store reloader (#1640), when
+        // `[server.tls.client_auth]` is active. Spawned beside the certificate
+        // reloader below so a CA rotation lands without a restart.
+        #[cfg(feature = "tls")]
+        let mut client_trust_reload: Option<crate::tls::client_auth::ClientTrustReloader> = None;
 
         // Carries the ACME challenge listener + renewal task wiring from the TLS
         // bind path to the sibling tasks spawned once `server_shutdown` exists.
         #[cfg(feature = "acme")]
         let mut acme_bind_state: Option<AcmeBindState> = None;
 
+        // Where the app actually bound, as the readiness protocol spells it
+        // (`<transport> <address>`) — distinct from `bound_desc`, which is a
+        // human-facing log line carrying a scheme and any TLS note. The
+        // supervisor reads this to write its address-discovery file, so it must
+        // be the resolved address, not the configured one.
+        let bound_endpoint: String;
         let (bound_listener, bound_desc, unix_socket_cleanup): (
             BoundListener,
             String,
@@ -4659,6 +4783,7 @@ impl AppBuilder {
                     use std::os::unix::fs::MetadataExt;
                     std::fs::metadata(path).map_or((0, 0), |m| (m.dev(), m.ino()))
                 };
+                bound_endpoint = format!("unix {socket_path}");
                 (
                     BoundListener::Unix(listener),
                     format!("unix:{socket_path}"),
@@ -4701,6 +4826,7 @@ impl AppBuilder {
             let addr = listener
                 .local_addr()
                 .map_or(configured_addr, |bound| bound.to_string());
+            bound_endpoint = format!("tcp {}", dialable_endpoint(&addr));
             // When `[server.tls]` is set (and the `tls` feature is built in),
             // wrap the just-bound TCP listener in a rustls acceptor so the same
             // host:port serves HTTPS. Fail fast on any cert/key problem — the
@@ -4745,8 +4871,9 @@ impl AppBuilder {
                         }
                     } else {
                         match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
-                            Ok((tls_listener, reload)) => {
+                            Ok((tls_listener, reload, client_reload)) => {
                                 tls_reload_state = Some(reload);
+                                client_trust_reload = client_reload;
                                 (
                                     BoundListener::Tls(tls_listener),
                                     format!("https://{addr}"),
@@ -4763,8 +4890,9 @@ impl AppBuilder {
                     }
                     #[cfg(not(feature = "acme"))]
                     match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
-                        Ok((tls_listener, reload)) => {
+                        Ok((tls_listener, reload, client_reload)) => {
                             tls_reload_state = Some(reload);
+                            client_trust_reload = client_reload;
                             (
                                 BoundListener::Tls(tls_listener),
                                 format!("https://{addr}"),
@@ -4990,6 +5118,18 @@ impl AppBuilder {
             });
         }
 
+        // mTLS trust-store hot reload (#1640): poll the client-CA bundle and
+        // CRL and swap the verifier when either changes, so a CA rotation — or
+        // a newly published revocation — lands without a restart and without
+        // dropping established connections.
+        #[cfg(feature = "tls")]
+        if let Some(reload) = client_trust_reload.take() {
+            let reload_shutdown = server_shutdown.child_token();
+            tokio::spawn(async move {
+                reload.run(reload_shutdown).await;
+            });
+        }
+
         // ACME (issue #1608): bind the `:80` HTTP-01 challenge + HTTP→HTTPS
         // redirect listener and spawn the renewal loop, each a child of
         // `server_shutdown` so they tear down with the main server. The renewal
@@ -5005,9 +5145,21 @@ impl AppBuilder {
                 https_port,
                 dns01,
                 custom_domains,
+                client_trust_reload: acme_client_trust_reload,
             } = bind_state;
             // Read before `custom_domains` is moved into the spawn below.
             let custom_domains_enabled = custom_domains.is_some();
+            // The mTLS trust store rotates on this arm too (#1640). Spawned
+            // HERE, not hoisted into the slot the static-cert arm fills: that
+            // slot is drained above this block, so an assignment to it would
+            // never be read and the ACME arm's reloader would never run.
+            #[cfg(feature = "tls")]
+            if let Some(reload) = acme_client_trust_reload {
+                let reload_shutdown = server_shutdown.child_token();
+                tokio::spawn(async move {
+                    reload.run(reload_shutdown).await;
+                });
+            }
 
             // The `:80` challenge/redirect listener, bound dual-stack so the CA
             // can validate HTTP-01 over IPv4 and IPv6 — an AAAA-only host is
@@ -5199,28 +5351,55 @@ impl AppBuilder {
         // A duplicate of the listening socket is kept aside so a `SIGUSR2`
         // in-place upgrade (#1674) can hand it to a successor while this process
         // keeps serving through the original. Only a plain TCP listener can be
-        // handed over in this release.
+        // handed over in this release. This runs up front, before the match
+        // consumes `bound_listener` to build the (not yet spawned) accept-loop
+        // future below.
         #[cfg(unix)]
         let mut handoff_socket: Option<crate::upgrade::HandoffSocket> = None;
+        #[cfg(unix)]
+        if let BoundListener::Tcp(listener) = &bound_listener {
+            match crate::upgrade::HandoffSocket::from_listener(listener) {
+                Ok(socket) => handoff_socket = Some(socket),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not duplicate the listening socket; in-place upgrade \
+                     (SIGUSR2) will be refused for this process"
+                ),
+            }
+        }
 
-        let server_task = match bound_listener {
+        // Build the accept-loop future per transport; when it goes live
+        // depends on how this process started (see below). The arms differ
+        // only in the connect-info type baked into the
+        // make-service (`SocketAddr` for TCP, `UdsConnectInfo` for Unix
+        // sockets); the shutdown wiring and the resulting `io::Result<()>` are
+        // identical. Handlers extracting `ConnectInfo<SocketAddr>` are
+        // unsupported under a Unix socket — daemon mode is local and
+        // loopback-equivalent.
+        //
+        // The deferred half of #2368: adopting the inherited fd still happens
+        // up front (so a failure to adopt aborts early, as today), but during
+        // an in-place upgrade the successor must not compete for connections
+        // before it can actually serve them: every connection it wins in that
+        // window is answered by the startup barrier with a 503 while the
+        // predecessor is right there, healthy. The predecessor keeps serving
+        // for the whole window; the successor's accept loop goes live once
+        // `run_startup_hooks` has returned `Ok`.
+        //
+        // The deferral applies ONLY to an upgrade successor
+        // (`handoff_requested()`): a cold start spawns its accept loop
+        // immediately, as before, so `/live` and `/startup` stay reachable
+        // behind the startup barrier while the hooks run — a hook that
+        // outlasts a probe threshold must not read as a dead pod.
+        let server_future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
+        > = match bound_listener {
             BoundListener::Tcp(listener) => {
-                #[cfg(unix)]
-                {
-                    match crate::upgrade::HandoffSocket::from_listener(&listener) {
-                        Ok(socket) => handoff_socket = Some(socket),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "could not duplicate the listening socket; in-place upgrade \
-                             (SIGUSR2) will be refused for this process"
-                        ),
-                    }
-                }
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         std::net::SocketAddr,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5242,7 +5421,7 @@ impl AppBuilder {
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         UdsConnectInfo,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5250,23 +5429,35 @@ impl AppBuilder {
                         .await
                 })
             }
-            // HTTPS arm: mirrors the TCP arm. The peer is a real TCP
-            // `SocketAddr`, so the same `ConnectInfo<SocketAddr>`,
-            // `TrustedProxiesLayer`/`ClientAddr` resolution, SSE and wss
-            // streaming, and shutdown wiring apply unchanged; only the rustls
-            // handshake inside the listener's `accept` differs. The no-op `tap_io`
-            // wrapper lets axum's blanket `Connected<IncomingStream<TapIo<L, F>>>
-            // for L::Addr` supply the peer `SocketAddr`, because the concrete
-            // `SocketAddr: Connected` impl exists only for `tokio::net::TcpListener`.
+            // HTTPS arm: mirrors the TCP arm. The connect info is
+            // `TlsConnectInfo` rather than a bare `SocketAddr` so the verified
+            // mTLS client identity (#1640) rides along with the peer address;
+            // `ClientIdentityLayer` immediately re-stamps
+            // `ConnectInfo<SocketAddr>` from it, so `TrustedProxiesLayer` /
+            // `ClientAddr` resolution, SSE and wss streaming, rate limiting and
+            // shutdown wiring all behave exactly as on plain TCP. Only the
+            // rustls handshake inside the listener's `accept` differs.
             #[cfg(feature = "tls")]
             BoundListener::Tls(listener) => {
-                use axum::serve::ListenerExt as _;
-                let listener = listener.tap_io(|_io| {});
+                // Applied inside the connect-info layer (which
+                // `into_make_service_with_connect_info` installs outermost), so
+                // this sees `ConnectInfo<TlsConnectInfo>` and everything below
+                // it sees `ConnectInfo<SocketAddr>` plus the identity.
+                //
+                // The route-level mTLS requirement (#1640) is deliberately NOT
+                // applied here. It lives inside the router
+                // (`build_client_cert_requirement_layer`), so the MCP dispatch
+                // clone traverses it and a rejection flows through the rest of
+                // the response stack. Only the identity plumbing belongs at
+                // this boundary, because `ConnectInfo<TlsConnectInfo>` exists
+                // nowhere else.
+                let service =
+                    tower::Layer::layer(&crate::tls::client_auth::ClientIdentityLayer, service);
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                        std::net::SocketAddr,
+                        crate::tls::TlsConnectInfo,
                     >(service);
-                tokio::spawn(async move {
+                Box::pin(async move {
                     axum::serve(listener, make_service)
                         .with_graceful_shutdown(async move {
                             server_shutdown_wait.cancelled().await;
@@ -5275,6 +5466,26 @@ impl AppBuilder {
                 })
             }
         };
+
+        // Whether this process is the successor half of an in-place upgrade
+        // (#1674). Only a successor shares its listening socket with a live
+        // predecessor, so only a successor defers its accept loop past the
+        // startup hooks (#2368). A cold start spawns immediately, exactly as
+        // before this change.
+        let defer_accept_loop = crate::upgrade::handoff_requested();
+        // The accept-loop future while it is not yet live; `None` once it has
+        // been taken to spawn `server_task`.
+        let mut pending_accept: Option<
+            std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
+            >,
+        > = None;
+        let mut server_task: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
+        if defer_accept_loop {
+            pending_accept = Some(server_future);
+        } else {
+            server_task = Some(tokio::spawn(server_future));
+        }
 
         // Cancelled by the in-place upgrade watcher once a successor has taken
         // over the listening socket; the drain below then runs without the
@@ -5457,13 +5668,37 @@ impl AppBuilder {
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
+            // A cold start already spawned the accept loop above, so stop it.
+            // An upgrade successor (#2368) never spawned one, so there is
+            // nothing to abort: the predecessor simply keeps serving through
+            // the adopted socket while this process exits, and no user ever
+            // sees a 503.
+            if let Some(task) = server_task.take() {
+                task.abort();
+            }
             server_shutdown.cancel();
-            server_task.abort();
             // `process::exit` skips `on_shutdown`; stop any managed Postgres.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
+
+        // Go live on the accept loop. An upgrade successor (#2368) deferred it
+        // past the hooks; they have now succeeded, so it can serve the
+        // connections it wins on the shared socket — the predecessor has been
+        // serving them until now. A cold start spawned the loop up front, so
+        // `/live` and `/startup` stayed reachable behind the startup barrier
+        // while the hooks ran.
+        let server_task: tokio::task::JoinHandle<std::io::Result<()>> =
+            match (server_task.take(), pending_accept.take()) {
+                (Some(task), _) => task,
+                (None, Some(future)) => tokio::spawn(future),
+                // Unreachable: `pending_accept` is `None` only once it has
+                // been taken to spawn `server_task` on the cold-start path.
+                (None, None) => {
+                    unreachable!("accept-loop future consumed without spawning its task")
+                }
+            };
 
         if !state.probes().is_shutting_down() {
             // Web role runs no cron scheduler (workers/combined only). Skipping
@@ -5532,6 +5767,7 @@ impl AppBuilder {
                     .server
                     .prestop_grace_secs
                     .saturating_add(config.server.shutdown_timeout_secs),
+                &bound_endpoint,
             );
         }
 
@@ -5940,6 +6176,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -6008,6 +6254,22 @@ impl AppBuilder {
         let custom_layers =
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
+        // #2405: render through the pre-layer router — the same layer
+        // composition the ISR regeneration path uses
+        // (`partition_custom_layers_for_static_render`, shared with the SSG
+        // serve path) — so the recorded Content-Type and the body on disk are
+        // the handler's own, not the app layer stack's post-layer output. The
+        // serve path applies the drained layers to the cached response at
+        // request time, outside the static-first middleware, so recording the
+        // post-layer output both double-applies the layers (once at
+        // generation, once per request) and — because ISR's type guard sees
+        // the pre-layer response — refuses every regeneration for an app with
+        // a Content-Type-rewriting layer, freezing the route until the next
+        // build. The drained set is dropped: this process exits after the
+        // render; serving is a separate invocation.
+        let (custom_layers, _drained) =
+            crate::router::partition_custom_layers_for_static_render(custom_layers);
+
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
         // routes the server path serves.
@@ -6025,13 +6287,18 @@ impl AppBuilder {
             .collect();
         finalize_event_bus(sync_listeners, &mut Vec::new(), &state);
 
-        // Build the full router (same as production). Use the inner builder
+        // Build the router for static rendering. Use the inner builder
         // so the custom session store installed via with_session_store(...)
         // is honored during static generation — apps that swap in a custom
         // store specifically to avoid Redis/external backends at build time
         // would otherwise silently fall back to the config-driven backend.
-        // Custom Tower layers registered via .layer(...) are likewise
-        // applied so static output matches the production response pipeline.
+        // Custom Tower layers registered via .layer(...) are deliberately
+        // NOT applied here (#2405): they were drained above, so the render
+        // sees the handler's own response — the same pre-layer composition
+        // ISR regeneration uses. The serve path applies those layers to the
+        // cached response at request time, which is what makes the recorded
+        // Content-Type and the body on disk mean "what the handler declared"
+        // rather than "what the layer stack happened to produce".
         #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
         let mut merge_routers: Vec<axum::Router<AppState>> = Vec::new();
         #[cfg(feature = "storage")]
@@ -6725,7 +6992,7 @@ impl AppBuilder {
 
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
-        let applied_total = tokio::task::spawn_blocking(move || {
+        let applied_total = crate::time::spawn_blocking(move || {
             let mut total = 0_usize;
             if let Some(url) = &control_url {
                 // SQLite single-writer control target (issue #1614, PR3): apply with
@@ -7299,6 +7566,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -8402,7 +8679,7 @@ fn start_task_scheduler(
 
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
-fn start_task_scheduler_with_config(
+pub(crate) fn start_task_scheduler_with_config(
     tasks: Vec<crate::task::TaskInfo>,
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -8530,6 +8807,8 @@ async fn execute_task_result(
     name: &str,
     schedule: &'static str,
 ) -> Result<u64, (u64, String)> {
+    // A tick is work a sim drain must see (issue #2967).
+    crate::sim::note_drain_progress();
     // A fresh span per run so OTLP-enabled deployments see each invocation
     // as its own trace rather than inheriting whatever was current on the
     // scheduler thread.
@@ -9208,7 +9487,14 @@ fn build_tls_listener(
     tcp: tokio::net::TcpListener,
     cfg: &crate::config::TlsConfig,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(crate::tls::TlsListener, crate::tls::CertReloader), crate::tls::TlsError> {
+) -> Result<
+    (
+        crate::tls::TlsListener,
+        crate::tls::CertReloader,
+        Option<crate::tls::client_auth::ClientTrustReloader>,
+    ),
+    crate::tls::TlsError,
+> {
     let provider = crate::tls::crypto_provider();
     // The pre-bind `TlsConfig::validate()` guarantees both paths are set in
     // static-cert mode (the only mode that reaches this function; ACME mode is
@@ -9233,15 +9519,62 @@ fn build_tls_listener(
         // A zero interval would busy-loop; clamp to at least one second.
         std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
     )?;
-    let server_config = crate::tls::build_server_config(
+    let (client_verifier, client_reload) = build_client_auth(cfg, &provider)?;
+    let server_config = crate::tls::build_server_config_with_client_auth(
         std::sync::Arc::clone(&provider),
-        std::sync::Arc::clone(&resolver),
+        std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
+        client_verifier,
     )?;
     // A zero handshake timeout would drop every connection instantly; clamp to
     // at least one second, mirroring the reload-interval clamp above.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
-    Ok((listener, reload))
+    Ok((listener, reload, client_reload))
+}
+
+/// The mTLS wiring `build_client_auth` hands back: the verifier the listener
+/// enforces, and the reloader that rotates its trust store. Both `None` when
+/// client auth is off.
+#[cfg(feature = "tls")]
+type ClientAuthWiring = (
+    Option<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    Option<crate::tls::client_auth::ClientTrustReloader>,
+);
+
+/// Build the mTLS client-certificate verifier and its trust-store reloader from
+/// `[server.tls.client_auth]` (issue #1640).
+///
+/// `(None, None)` — the identical #1603 server-only path — whenever the section
+/// is absent or `mode = "off"`. Any problem with the bundle or CRL is returned
+/// so the caller fails fast at boot with the path in the message.
+#[cfg(feature = "tls")]
+fn build_client_auth(
+    cfg: &crate::config::TlsConfig,
+    provider: &std::sync::Arc<rustls::crypto::CryptoProvider>,
+) -> Result<ClientAuthWiring, crate::tls::TlsError> {
+    if !cfg.client_auth_active() {
+        return Ok((None, None));
+    }
+    // `client_auth_active()` is true only for a present section with a mode
+    // other than `off`, and `ClientAuthConfig::validate()` (run pre-bind)
+    // guarantees such a section names a bundle.
+    let client_auth = cfg
+        .client_auth
+        .as_ref()
+        .expect("validated: an active client_auth section is present");
+    let bundle = client_auth
+        .ca_bundle_path
+        .clone()
+        .expect("validated: an active client_auth section sets ca_bundle_path");
+    let (verifier, reloader) = crate::tls::client_auth::ClientTrustReloader::load(
+        bundle,
+        client_auth.crl_path.clone(),
+        client_auth.mode,
+        std::sync::Arc::clone(provider),
+        // A zero interval would busy-loop; clamp to at least one second.
+        std::time::Duration::from_secs(client_auth.reload_interval_secs.max(1)),
+    )?;
+    Ok((Some(verifier), Some(reloader)))
 }
 
 /// Carries the ACME challenge-listener + renewal-task wiring from the bind path
@@ -9259,6 +9592,10 @@ struct AcmeBindState {
     /// The tenant custom-domain wiring (#1635), present exactly when
     /// `[server.tls.acme.custom_domains] enabled = true`.
     custom_domains: Option<CustomDomainBindState>,
+    /// The mTLS trust-store reloader (#1640), present exactly when
+    /// `[server.tls.client_auth]` is active. Spawned beside the ACME renewal
+    /// task, so a CA rotation lands without a restart on this arm too.
+    client_trust_reload: Option<crate::tls::client_auth::ClientTrustReloader>,
 }
 
 /// Everything the custom-domain orchestrator needs, built at bind time so the
@@ -9434,9 +9771,17 @@ async fn build_acme_tls_listener(
                 )
             },
         );
-    let server_config = crate::tls::build_server_config_with_resolver(
+    // Client auth is orthogonal to how the SERVER's certificate is provisioned
+    // (#1640), so the ACME arm wires the same verifier the static-cert arm does.
+    // Without this a `[server.tls.client_auth] mode = "required"` deployment on
+    // ACME would boot, report healthy, and never request a certificate — the
+    // one misconfiguration that fails OPEN.
+    let (client_verifier, client_reload) =
+        build_client_auth(tls_cfg, &provider).map_err(|e| e.to_string())?;
+    let server_config = crate::tls::build_server_config_with_client_auth(
         std::sync::Arc::clone(&provider),
         cert_resolver,
+        client_verifier,
     )
     .map_err(|e| e.to_string())?;
     let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
@@ -9475,6 +9820,7 @@ async fn build_acme_tls_listener(
             https_port,
             dns01: acme_cfg.dns.is_some(),
             custom_domains,
+            client_trust_reload: client_reload,
         },
     ))
 }
@@ -9693,7 +10039,10 @@ fn spawn_custom_domain_task(
         cache,
         certs: std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
         provider,
-        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier),
+        // `validate` already refused an unparseable entry at boot.
+        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier::new(
+            config.resolver_addrs().unwrap_or_default(),
+        )),
         issuer,
         limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
             config.issuance_per_domain_per_day,
@@ -9826,17 +10175,24 @@ async fn stamp_loopback_connect_info(
 /// middleware (the startup barrier, maintenance mode, rate limiting, or custom
 /// health paths, which an HTTP readiness probe would all have to thread).
 ///
-/// The file's contents are the app's *resolved* graceful-drain budget in seconds
+/// Line one is the app's *resolved* graceful-drain budget in seconds
 /// (`prestop_grace_secs + shutdown_timeout_secs`). The supervisor records this so
 /// `autumn serve stop` waits for the budget the app will actually drain for —
 /// even when a custom `with_config_loader` set it — instead of reconstructing it
 /// from TOML/env and risking a premature `SIGKILL`.
 ///
+/// Line two is where the app *actually* bound, as `<transport> <address>`. The
+/// supervisor cannot derive this: `server.port = 0` resolves in the kernel, a
+/// socket adopted from a predecessor keeps that process's port, and a custom
+/// `with_config_loader` can put the app anywhere. Reporting it is what lets
+/// `autumn serve --daemon` write an address-discovery file on Windows, where
+/// there is no Unix socket path to hand the app in advance.
+///
 /// Best-effort: a write failure only delays readiness detection until the
 /// supervisor's timeout, and a non-daemon run leaves the variable unset (no-op).
 ///
 /// [`mark_startup_complete`]: crate::probe::ProbeState::mark_startup_complete
-fn signal_serve_ready(drain_budget_secs: u64) {
+fn signal_serve_ready(drain_budget_secs: u64, bound_endpoint: &str) {
     let Some(path) = std::env::var_os("AUTUMN_SERVE_READY_FILE") else {
         return;
     };
@@ -9850,13 +10206,62 @@ fn signal_serve_ready(drain_budget_secs: u64) {
     // contents. A plain `write` would make the path exist before the bytes land.
     let mut tmp = path.clone();
     tmp.as_mut_os_string().push(".tmp");
-    if let Err(e) = std::fs::write(&tmp, drain_budget_secs.to_string())
+    if let Err(e) = std::fs::write(&tmp, serve_ready_payload(drain_budget_secs, bound_endpoint))
         .and_then(|()| std::fs::rename(&tmp, &path))
     {
         let _ = std::fs::remove_file(&tmp);
         tracing::warn!(error = %e, path = %path.display(),
             "could not write serve readiness file");
     }
+}
+
+/// Turn a bound address into one a client can actually dial.
+///
+/// A wildcard bind is a *bind*, never a dial address — the same rule
+/// `[cluster] advertise_addr` already enforces, for the same reason: handing a
+/// peer `0.0.0.0` gives it something nothing can reach, and the failure then
+/// looks like a network fault rather than the address it is. The production
+/// smart default binds `0.0.0.0`, so without this a `--release` daemon publishes
+/// an undialable `serve.addr` while reporting a successful start.
+///
+/// Only the *host* is rewritten, to loopback of the matching family; the
+/// resolved port is what the supervisor could not have known and is preserved
+/// exactly. An address that is already specific passes through untouched, and so
+/// does one that will not parse — better to publish what we bound than to invent
+/// something.
+fn dialable_endpoint(addr: &str) -> String {
+    let Ok(parsed) = addr.parse::<std::net::SocketAddr>() else {
+        return addr.to_owned();
+    };
+    if !parsed.ip().is_unspecified() {
+        return addr.to_owned();
+    }
+    match parsed {
+        std::net::SocketAddr::V4(_) => format!("127.0.0.1:{}", parsed.port()),
+        std::net::SocketAddr::V6(_) => format!("[::1]:{}", parsed.port()),
+    }
+}
+
+/// The readiness file's contents: the drain budget, then the bound endpoint.
+///
+/// Two lines rather than one structured value so the first line stays exactly
+/// what it has always been — a bare integer — and the endpoint is additive. The
+/// endpoint is `<transport> <address>` split on the FIRST space only, so a Unix
+/// socket path containing spaces survives the round trip. An empty endpoint
+/// emits no second line at all, rather than a blank one a reader could mistake
+/// for an address.
+///
+/// Public because it *is* the wire format between the app and its supervisor:
+/// `autumn-cli`'s `parse_ready_payload` round-trips against this exact function,
+/// so the two cannot drift into disagreement the way two hand-written parsers
+/// would.
+#[must_use]
+pub fn serve_ready_payload(drain_budget_secs: u64, bound_endpoint: &str) -> String {
+    let endpoint = bound_endpoint.trim();
+    if endpoint.is_empty() {
+        return drain_budget_secs.to_string();
+    }
+    format!("{drain_budget_secs}\n{endpoint}")
 }
 
 /// Prepare a Unix-socket path for binding: remove a *stale* socket left by a
@@ -11569,7 +11974,7 @@ async fn run_startup_migrations(
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
     #[cfg(feature = "sqlite")]
     let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
-    let migration_result = tokio::task::spawn_blocking(move || {
+    let migration_result = crate::time::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (#1614, PR3): apply the
         // registered migrations to a `sqlite://` control target with no advisory
         // lock. Sharding — directory, shard-map, per-shard fan-out — is
@@ -13106,6 +13511,12 @@ fn build_state(
         crate::channels::Channels::with_shared_backend,
     );
 
+    // One tracker, shared with the collaboration hub: a hub built on a second
+    // `Presence` would report a participant list that disagrees with
+    // `state.presence()` (#1806).
+    #[cfg(feature = "presence")]
+    let presence = crate::presence::Presence::new(channels.clone());
+
     let state = AppState {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
@@ -13129,8 +13540,10 @@ fn build_state(
         config_props: crate::actuator::ConfigProperties::from_config(config),
         metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
         health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+        #[cfg(all(feature = "collab", feature = "presence"))]
+        collab: crate::collab::CollabHub::new(channels.clone(), presence.clone()),
         #[cfg(feature = "presence")]
-        presence: crate::presence::Presence::new(channels.clone()),
+        presence,
         #[cfg(feature = "ws")]
         channels,
         #[cfg(feature = "ws")]
@@ -13522,7 +13935,50 @@ async fn shutdown_signal(upgrade_cutover: tokio_util::sync::CancellationToken) -
         tracing::info!("Received SIGTERM, starting graceful shutdown");
     };
 
-    #[cfg(not(unix))]
+    // Windows has no `SIGTERM`. What a supervisor, a service host, or the OS
+    // itself actually delivers is a console control event, and every one of them
+    // means the same thing `SIGTERM` means: this process is going away, drain
+    // now. Handling them is what makes a supervisor-stopped Windows server run
+    // its readiness flip, prestop grace, in-flight drain and `on_shutdown` hooks
+    // instead of dying mid-request (#1639).
+    //
+    // How much time each event actually buys differs, and the difference
+    // matters enough to be exact about:
+    //
+    // * `CTRL_C` and `CTRL_BREAK` do not terminate the process at all. The drain
+    //   runs to completion.
+    // * `CTRL_CLOSE`, `CTRL_LOGOFF` and `CTRL_SHUTDOWN` are told-not-asked: the
+    //   OS-imposed budget is how long the *handler routine* may run, and tokio's
+    //   handler returns immediately (which is what lets this future wake), so
+    //   the drain then races process termination. It is best-effort, and on a
+    //   long budget it will lose.
+    //
+    // That is why a supervisor should stop an Autumn app through
+    // `autumn serve stop` or the Service Control Manager, both of which wait for
+    // the app's own recorded budget. `docs/guide/daemon.md` says so where an
+    // operator will read it. These arms are still worth having: they turn the
+    // common console cases into a real drain, and cost nothing in the rest.
+    #[cfg(windows)]
+    let terminate = async {
+        use tokio::signal::windows;
+        let mut close = windows::ctrl_close().expect("Failed to install CTRL_CLOSE handler");
+        let mut logoff = windows::ctrl_logoff().expect("Failed to install CTRL_LOGOFF handler");
+        let mut shutdown =
+            windows::ctrl_shutdown().expect("Failed to install CTRL_SHUTDOWN handler");
+        let mut brk = windows::ctrl_break().expect("Failed to install CTRL_BREAK handler");
+        let event = tokio::select! {
+            _ = close.recv() => "CTRL_CLOSE",
+            _ = logoff.recv() => "CTRL_LOGOFF",
+            _ = shutdown.recv() => "CTRL_SHUTDOWN",
+            _ = brk.recv() => "CTRL_BREAK",
+        };
+        tracing::info!(
+            event,
+            "Received a console control event, starting graceful shutdown"
+        );
+    };
+
+    #[cfg(not(any(unix, windows)))]
     let terminate = std::future::pending::<()>();
 
     let canary_rollback = async {
@@ -14172,6 +14628,76 @@ mod tests {
             ..AppState::test_default()
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    // ── Serve readiness payload (#1639) ────────────────────────────────────
+    //
+    // The supervisor learns two things from this file: how long the app will
+    // drain for, and where it actually bound. The second is what lets
+    // `autumn serve --daemon` write an address-discovery file on a platform
+    // with no Unix socket to name in advance.
+
+    #[test]
+    fn a_wildcard_bind_is_published_as_a_dialable_loopback_address() {
+        // The production smart default binds `0.0.0.0`, and `local_addr()`
+        // faithfully reports it. Publishing that in `serve.addr` would hand a
+        // thin client an address nothing can dial while the start reported
+        // success — the same trap `[cluster] advertise_addr` already rejects.
+        assert_eq!(dialable_endpoint("0.0.0.0:3000"), "127.0.0.1:3000");
+        assert_eq!(dialable_endpoint("[::]:3000"), "[::1]:3000");
+    }
+
+    #[test]
+    fn a_specific_bind_is_published_exactly_as_bound() {
+        // Rewriting one would be worse than the bug: the supervisor would
+        // advertise an interface the app is not on.
+        assert_eq!(dialable_endpoint("192.168.1.10:3000"), "192.168.1.10:3000");
+        assert_eq!(dialable_endpoint("127.0.0.1:8080"), "127.0.0.1:8080");
+        assert_eq!(dialable_endpoint("[::1]:8080"), "[::1]:8080");
+    }
+
+    #[test]
+    fn the_resolved_port_survives_the_rewrite() {
+        // The port is the half the supervisor could not have known — `port = 0`
+        // resolves in the kernel — so losing it would defeat the whole report.
+        assert_eq!(dialable_endpoint("0.0.0.0:49152"), "127.0.0.1:49152");
+    }
+
+    #[test]
+    fn an_unparseable_address_is_published_unchanged() {
+        // Better to publish what was bound than to invent something.
+        assert_eq!(dialable_endpoint("not-an-address"), "not-an-address");
+    }
+
+    #[test]
+    fn serve_ready_payload_leads_with_the_drain_budget() {
+        // Line one stays a bare integer so a supervisor that predates the
+        // address line still reads the budget it always read.
+        let payload = serve_ready_payload(35, "tcp 127.0.0.1:3000");
+        assert_eq!(payload.lines().next(), Some("35"));
+    }
+
+    #[test]
+    fn serve_ready_payload_carries_the_bound_endpoint_on_line_two() {
+        let payload = serve_ready_payload(35, "tcp 127.0.0.1:3000");
+        assert_eq!(payload.lines().nth(1), Some("tcp 127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn serve_ready_payload_survives_a_socket_path_containing_spaces() {
+        // A Unix socket under a directory with a space is legal, so the format
+        // has to split on the FIRST separator only, never on every one.
+        let payload = serve_ready_payload(1, "unix /home/a b/serve.sock");
+        let line = payload.lines().nth(1).expect("endpoint line");
+        assert_eq!(line.split_once(' '), Some(("unix", "/home/a b/serve.sock")));
+    }
+
+    #[test]
+    fn serve_ready_payload_never_emits_a_bare_newline_for_an_unknown_endpoint() {
+        // An empty endpoint must not leave a blank second line a reader could
+        // mistake for an address.
+        let payload = serve_ready_payload(7, "");
+        assert_eq!(payload.lines().count(), 1, "{payload:?}");
     }
 
     // ── Cooperative external shutdown (#1616) ──────────────────────────────
@@ -15014,6 +15540,81 @@ mod tests {
                  and hooks ({hooks:?}) would spend more"
             );
         }
+    }
+
+    /// The accept loop must go live only after the startup hooks succeed —
+    /// but only for an in-place-upgrade successor.
+    ///
+    /// During an in-place upgrade (#1674) the successor adopts the
+    /// predecessor's listening socket up front, so both processes are
+    /// accepting on the same socket and the kernel hands new connections to
+    /// either — and every connection the successor wins before it can serve is
+    /// answered by the startup barrier with a 503 while the predecessor is
+    /// right there, healthy. Spawning the accept loop only once
+    /// `run_startup_hooks` has returned `Ok` keeps the predecessor serving for
+    /// the whole window, so a slow or failing successor can no longer 503 real
+    /// users (#2368).
+    ///
+    /// The deferral must NOT apply to a cold start: nothing accepts until the
+    /// loop is polled, so holding it back would leave `/live` and `/startup`
+    /// unreachable behind the startup barrier for the whole hook window, and a
+    /// hook that outlasts a probe threshold would read as a dead pod. Source-
+    /// order test in the house style: the ordering is a property of this
+    /// function, and a two-process upgrade test with fd handoff cannot run in
+    /// CI.
+    #[test]
+    fn accept_loop_defers_only_for_upgrade_successor() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let bound = server_source
+            .find("let server_future:")
+            .expect("the accept-loop future must be built from the bound listener");
+        // The deferral is gated on this process being an upgrade successor —
+        // the one shape where the socket is shared with a live predecessor.
+        let gate = server_source
+            .find("let defer_accept_loop = crate::upgrade::handoff_requested();")
+            .expect("the deferral must be gated on the upgrade handoff");
+        let cold_spawn = server_source
+            .find("server_task = Some(tokio::spawn(server_future));")
+            .expect("a cold start must spawn the accept loop up front, as before");
+        let hooks = server_source
+            .find("run_startup_hooks(&startup_hooks, state.clone())")
+            .expect("startup hooks must run on the normal server path");
+        let deferred_spawn = server_source
+            .find("tokio::spawn(future)")
+            .expect("an upgrade successor must spawn its deferred accept loop after the hooks");
+
+        assert!(
+            bound < gate && gate < cold_spawn && cold_spawn < hooks && hooks < deferred_spawn,
+            "ordering must be: bound listener -> deferral gate -> cold-start spawn \
+             -> startup hooks -> successor's deferred spawn \
+             (bound={bound}, gate={gate}, cold_spawn={cold_spawn}, hooks={hooks}, \
+             deferred_spawn={deferred_spawn})"
+        );
+        // A cold start that already spawned must still abort its loop when a
+        // hook fails; a successor has nothing to abort.
+        assert!(
+            server_source.contains("if let Some(task) = server_task.take()"),
+            "the hook-failure path must abort the cold-start accept loop"
+        );
+        // The old shapes must not come back.
+        assert!(
+            !server_source.contains("let server_task = match bound_listener"),
+            "the accept loop must not be spawned from the bound-listener match"
+        );
+        assert!(
+            !server_source.contains("let server_task = tokio::spawn(server_future);"),
+            "the accept loop must not be unconditionally deferred past the hooks"
+        );
     }
 
     #[test]
@@ -16424,6 +17025,186 @@ mod tests {
                 "Accept-Language: {accept_language}"
             );
         }
+    }
+
+    // ── The origin never leaks the edge lane's internal sentinel (issue
+    //    #2244, item 4) ────────────────────────────────────────────────────
+    //
+    // `EdgeCacheUnavailable` (autumn-edge's `extract.rs`) answers with the
+    // fallthrough sentinel header so the EDGE CAPSULE runtime knows to fall
+    // through to the origin. The same handler code also runs at the origin —
+    // `extract.rs` cannot special-case which substrate it is on — so an app
+    // that forgets to call `with_edge_kv` (a wiring bug) hits this same 500
+    // at the origin, and a real HTTP client must never see the internal
+    // header.
+    #[cfg(feature = "edge")]
+    #[tokio::test]
+    async fn an_uninjected_edge_seam_never_leaks_the_fallthrough_sentinel_to_a_real_client() {
+        async fn note(_cache: autumn_edge::EdgeCache) -> &'static str {
+            "never reached: extraction fails first"
+        }
+
+        // The real `app()` entry point, `with_edge_kv` NEVER called — the
+        // wiring bug this test is about.
+        let custom_layers = app().custom_layers;
+
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/edge/note",
+                handler: axum::routing::get(note),
+                name: "note",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/edge/note",
+                    operation_id: "note",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+                idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
+                seo: crate::seo::SeoRouteDefaults::EMPTY,
+                api_version: None,
+                sunset_opt_out: false,
+            }],
+            &AutumnConfig::default(),
+            AppState::for_test(),
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
+                custom_layers,
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+
+        let request = axum::http::Request::builder()
+            .uri("/edge/note")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router.oneshot(request).await.expect("response");
+
+        // Existing behavior, unchanged: still a 500 with an actionable body.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // The fix: the internal sentinel never reaches a real client.
+        assert!(
+            !response
+                .headers()
+                .contains_key(autumn_edge::FALLTHROUGH_SENTINEL),
+            "the origin must strip the internal fallthrough sentinel: {:?}",
+            response.headers()
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("with_edge_kv"),
+            "the actionable message must survive: {body}"
+        );
+    }
+
+    /// `app()` registers the sentinel-strip layer through the ordinary
+    /// `AppBuilder::layer` path, which the idempotency machinery otherwise
+    /// treats as "opaque" (forcing fail-closed replay) for any custom layer
+    /// it does not specifically recognize — see
+    /// `router::is_idempotency_transparent_app_layer`. Without that
+    /// recognition, every app built with the `edge` feature on would force
+    /// fail-closed idempotency, whether or not it ever calls `with_edge_kv`.
+    /// This pins the real registration's `type_name` against the substring
+    /// that recognizer matches on, so the two sides cannot drift apart.
+    #[cfg(feature = "edge")]
+    #[test]
+    fn the_sentinel_strip_layer_is_recognized_as_idempotency_transparent() {
+        let registration = &app().custom_layers[0];
+        assert_eq!(
+            registration.type_id,
+            std::any::TypeId::of::<StripEdgeFallthroughSentinelLayer>(),
+            "the real registration's type_id no longer matches what \
+             router::is_idempotency_transparent_app_layer looks for"
+        );
+    }
+
+    /// `get_layer_types()` documents "only user-installed layers", but the
+    /// sentinel-strip layer above shares its underlying storage
+    /// (`custom_layers`) with real `AppBuilder::layer` calls so the
+    /// router-build step applies both the same way. Without filtering it
+    /// back out, a plugin (or a test like
+    /// `middleware_introspection::get_layer_types_returns_registration_order`)
+    /// asserting an exact layer list sees this internal registration leak in
+    /// as an unexpected leading entry (Codex review on #2739, round 6, P1).
+    #[cfg(feature = "edge")]
+    #[test]
+    fn get_layer_types_excludes_the_framework_owned_sentinel_strip_layer() {
+        #[derive(Clone, Copy)]
+        struct UserLayer;
+        impl<S> tower::Layer<S> for UserLayer {
+            type Service = S;
+            fn layer(&self, inner: S) -> S {
+                inner
+            }
+        }
+
+        let builder = app().layer(UserLayer);
+        assert_eq!(
+            builder.get_layer_types(),
+            vec![std::any::TypeId::of::<UserLayer>()],
+            "the framework's own sentinel-strip registration must not appear \
+             in the user-facing layer list"
+        );
+    }
+
+    /// The header-stripping behavior itself, independent of the router-level
+    /// idempotency classification test above.
+    #[cfg(feature = "edge")]
+    #[tokio::test]
+    async fn the_sentinel_strip_service_removes_the_header_and_keeps_the_body() {
+        use axum::response::IntoResponse as _;
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let inner = tower::service_fn(|_req: axum::extract::Request| async move {
+            Ok::<_, std::convert::Infallible>(
+                (
+                    [(autumn_edge::FALLTHROUGH_SENTINEL, "missing_capability")],
+                    "actionable message",
+                )
+                    .into_response(),
+            )
+        });
+        let mut service = StripEdgeFallthroughSentinelLayer.layer(inner);
+        let request = axum::extract::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response: axum::response::Response = service
+            .ready()
+            .await
+            .expect("ready")
+            .call(request)
+            .await
+            .expect("infallible");
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(autumn_edge::FALLTHROUGH_SENTINEL)
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, b"actionable message".as_slice());
     }
 
     #[cfg(feature = "i18n")]

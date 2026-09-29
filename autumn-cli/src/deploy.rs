@@ -32,10 +32,13 @@ pub mod proxy;
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_web::alerts::{Alert, AlertChannel, AlertCondition};
 use autumn_web::config::{AutumnConfig, DeployConfig, Env};
 use proxy::ProxyController;
+use serde::Deserialize;
 
 /// Bounded timeout for the SSH-reachability preflight probe. Kept short so the
 /// check fails fast on an unreachable host instead of hanging on a dropped SYN.
@@ -187,8 +190,27 @@ pub struct FleetHalt {
     /// debris (an unwritten `shared/proxy-options` marker in particular) outlives
     /// the rollback and fails the NEXT deploy closed.
     pub degraded: Vec<(String, &'static str)>,
+    /// Hosts whose first deploy was torn down, but whose proxy route removal
+    /// failed (issue #2270), with the step label. Also present in `torn_down`
+    /// (the app really is gone), but named here TOO so an API caller or an
+    /// alert built from this struct — not just the console table — can tell a
+    /// clean compensation apart from one whose public port may still answer
+    /// 502 until it is redeployed or the route is removed by hand.
+    pub route_removal_failed: Vec<(String, &'static str)>,
     /// Hosts the fleet deliberately did NOT roll back, with the reason.
     pub manual: Vec<(String, &'static str)>,
+}
+
+impl FleetHalt {
+    /// The risk that the failed step leaves, when the step label alone does not
+    /// name it (issue #2279). A `drain-old` halt has a risk only while the host
+    /// is still on the new release. A rollback leaves one slot running.
+    #[must_use]
+    pub fn risk(&self) -> Option<&'static str> {
+        (self.failed_step == fleet::DRAIN_OLD_LABEL
+            && self.still_on_new.contains(&self.failed_host))
+        .then_some(fleet::OLD_SLOT_MAY_RUN_NOTE)
+    }
 }
 
 /// Which `autumn deploy` subcommand to run.
@@ -1776,13 +1798,13 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         // deploy profile — not the operator's ambient/dev config. Reload here.
         // `check`/`rollback` deliberately do NOT load the media config.
         DeployAction::Check => run_check(
-            &load_runtime_config(&resolved)?,
+            &load_runtime_config(&resolved.profile)?,
             &resolved,
             &targets,
             host_list.len(),
         ),
         DeployAction::Rollback => run_rollback(
-            &load_runtime_config(&resolved)?,
+            &load_runtime_config(&resolved.profile)?,
             &resolved,
             &targets,
             host_list.len(),
@@ -1799,7 +1821,13 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
             // production setting must not take it offline mid-incident. See
             // `status_public_port`.
             let port = status_public_port(&resolved)?;
-            run_status(&port, &resolved.profile, &fleet, options)
+            run_status(
+                &port,
+                &resolved.app_name,
+                &resolved.profile,
+                &fleet,
+                options,
+            )
         }
         DeployAction::MaintenanceOn | DeployAction::MaintenanceOff => {
             let fleet = ResolvedFleet::resolve(&deploy_cfg, &resolve_project_name())
@@ -1826,7 +1854,7 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
         DeployAction::Up => {
             let (media_cfg, ffmpeg_bin) = load_media_host_config(&resolved)?;
             run_up(
-                &load_runtime_config(&resolved)?,
+                &load_runtime_config(&resolved.profile)?,
                 &resolved,
                 &targets,
                 host_list.len(),
@@ -2075,7 +2103,10 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 ///
 /// The chicken-and-egg here: the ambient load in [`run`] learns the deploy
 /// profile (`resolved.profile`), and this reload then resolves the full config
-/// under it. The `.env.<profile>` overlay is selected via
+/// under it. Takes the RAW profile string rather than the whole
+/// [`ResolvedDeployConfig`] — that field is all this needs, and issue #2267's
+/// alert path reloads by profile alone, with no `ResolvedDeployConfig` at
+/// hand. The `.env.<profile>` overlay is selected via
 /// [`autumn_web::dotenv::os_env_with_dotenv_for_profile_using`], fed a
 /// [`ForcedProfileEnv`] gating base that reports `AUTUMN_DOTENV=1` so a non-dev
 /// deploy profile still loads `.env.<profile>` (dotenv auto-load is otherwise
@@ -2083,14 +2114,14 @@ impl<E: Env> Env for ForcedProfileEnv<E> {
 /// profile ([`canonicalize_deploy_profile`]) so a `[deploy] profile` alias like
 /// `production` still reads `.env.prod` (matching `AutumnConfig::load()`), not
 /// `.env.production`. A second [`ForcedProfileEnv`] wrapper forces `AUTUMN_ENV`
-/// to the RAW `resolved.profile` so the loader layers `[profile.<profile>]` /
+/// to the RAW profile so the loader layers `[profile.<profile>]` /
 /// `autumn-<profile>.toml` on top with the operator's exact spelling. Real OS
 /// env vars still win over `.env` (the
 /// overlay only fills gaps), and the dotenv profile-selector-key exclusion still
 /// strips `AUTUMN_ENV`/`AUTUMN_PROFILE`/`AUTUMN_IS_DEBUG` from any `.env` file,
 /// matching `AutumnConfig::load()`.
-fn load_runtime_config(resolved: &ResolvedDeployConfig) -> Result<AutumnConfig, DeployError> {
-    let forced = deploy_profile_env_overlay(&resolved.profile)?;
+fn load_runtime_config(profile: &str) -> Result<AutumnConfig, DeployError> {
+    let forced = deploy_profile_env_overlay(profile)?;
     // Lenient unknown top-level roots (#2063): keep strict validation of the
     // core sections the CLI knows while accepting plugin-owned roots (e.g.
     // `[media]`) as opaque — app boot stays the authoritative strict gate.
@@ -2135,7 +2166,7 @@ struct StatusPort {
 /// upload runtime VALUES (the signing secret, the DB URL), so an invalid config
 /// must stop them. `plan` never loads the runtime config at all.
 fn status_public_port(resolved: &ResolvedDeployConfig) -> Result<StatusPort, DeployError> {
-    let loaded = load_runtime_config(resolved);
+    let loaded = load_runtime_config(&resolved.profile);
     status_public_port_with(&manifest_project_dirs(), &resolved.profile, loaded)
 }
 
@@ -2818,6 +2849,20 @@ fn report_preflight(checks: &[PreflightCheck]) -> usize {
     failed
 }
 
+/// Refuse the rollout if any preflight check failed (issue #1621, AC-7).
+///
+/// `run_up` calls this right after `collect_fleet_preflight`, before it
+/// builds any executor. A failing host stops the rollout before it
+/// touches a server. Split into its own function so a test can drive
+/// this exact decision with no disk and no network (issue #2269).
+fn refuse_if_preflight_failed(checks: &[PreflightCheck]) -> Result<(), DeployError> {
+    let failed = report_preflight(checks);
+    if failed > 0 {
+        return Err(DeployError::PreflightFailed(failed));
+    }
+    Ok(())
+}
+
 /// Run the preflight over EVERY configured host and report it (issue #1621, AC-7).
 ///
 /// `hosts` is the ordered target list from [`deploy_host_list`]. With more than one
@@ -2921,8 +2966,9 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
         println!("  {}. [{}]", i + 1, op.label());
     }
     println!(
-        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}, {}, {}",
+        "\nMediaMTX doctor checks at `deploy up`: {}, {}, {}, {}, {}, {}",
         media::CHECK_MEDIAMTX_PORTS_DISTINCT,
+        media::CHECK_MEDIAMTX_PORTS_MATCH_BASES,
         media::CHECK_FFMPEG_PREFLIGHT,
         media::CHECK_MEDIAMTX_BINARY,
         media::CHECK_RECORDINGS_DIR_WRITABLE,
@@ -2936,8 +2982,9 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
 }
 
 /// Grade the media host with the fail-closed, **non-mutating** doctor checks
-/// (`FFmpeg` preflight, `MediaMTX` binary, recordings dir writable, ports
-/// distinct/available) and abort the deploy on any **blocking** failure — so a
+/// (`FFmpeg` preflight, `MediaMTX` binary, recordings dir writable/creatable,
+/// ports distinct/available, ports matching the app's base URLs) and abort the
+/// deploy on any **blocking** failure — so a
 /// host that cannot serve media fails fast BEFORE the app deploy touches
 /// anything. A **deferred** check (an env/interpolation-indirected
 /// `[media.ffmpeg] bin` the deployed service resolves from its own runtime
@@ -3332,68 +3379,65 @@ fn validate_public_port(public_port: u16) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a concurrent `server.port` change on the **redeploy** path, BEFORE any op
-/// runs — so the live release keeps serving (#2073).
+/// Detect a concurrent `server.port` change on the **redeploy** path, BEFORE any op
+/// runs (issue #2073, Option C).
 ///
 /// The reboot-durability upgrade (#2070) makes every redeploy refresh the shared
 /// kamal-proxy unit and, when that unit changed, restart `kamal-proxy run` and
 /// re-register the still-live upstream. Both the restart's public bind and the
-/// re-register's DERIVED loopback target are correct ONLY when the public port is
-/// unchanged: if the operator changed `server.port` since the live release was
-/// deployed, the restart would rebind a different public port and the re-register
-/// would aim at a port nothing listens on, stranding `:80` mid-cutover. Rather than
-/// try to sequence a live-safe port move here (Option C, #2073), refuse the deploy
-/// at pre-flight with an actionable message.
+/// re-register's DERIVED loopback target are correct ONLY when computed from the
+/// port the live release was ACTUALLY deployed under — so a detected change must
+/// resolve to a [`exec::PublicPortMove`] the caller threads through every op
+/// (phases 1-3 run against `old_port`, never `new_port`) rather than a value that
+/// silently drifts mid-cutover.
 ///
 /// The comparison is sourced from the INSTALLED proxy unit's `--http-port` (captured
 /// by [`exec::probe_deploy_state`]), which is the ground truth of what the running
 /// proxy actually binds:
 ///
 ///   - [`exec::InstalledProxyPort::Absent`] → no installed unit, i.e. a first-deploy
-///     shape (the durability refresh writes it fresh). Nothing to conflict with →
-///     allowed. (This branch only runs when `current` is a symlink, so this is the
-///     rare shape where the proxy unit is missing but a release symlink exists.)
+///     shape (the durability refresh writes it fresh at the requested port).
+///     Nothing to move → `Ok(None)`. (This branch only runs when `current` is a
+///     symlink, so this is the rare shape where the proxy unit is missing but a
+///     release symlink exists.)
 ///   - [`exec::InstalledProxyPort::Port`] equal to the requested port → unchanged
-///     redeploy (the common durability-upgrade path) → allowed.
-///   - [`exec::InstalledProxyPort::Port`] DIFFERENT from the requested port → refuse,
-///     naming old vs new port and the two-deploy operator sequence.
+///     redeploy (the common durability-upgrade path) → `Ok(None)`.
+///   - [`exec::InstalledProxyPort::Port`] DIFFERENT from the requested port →
+///     `Ok(Some(PublicPortMove { old_port, new_port }))`.
 ///   - [`exec::InstalledProxyPort::Unreadable`] → the unit is present but its
-///     `--http-port` couldn't be read/parsed, so we can't prove the port is unchanged
-///     → **fail closed** (refuse) rather than risk a mid-cutover bind failure.
-fn refuse_concurrent_public_port_change(
+///     `--http-port` couldn't be read/parsed, so we can't prove which port (if any)
+///     needs moving → **fail closed** (refuse) rather than risk a mid-cutover bind
+///     failure.
+fn resolve_public_port_move(
     installed: &exec::InstalledProxyPort,
     new_public_port: u16,
-) -> Result<(), String> {
+) -> Result<Option<exec::PublicPortMove>, String> {
     match installed {
         // No installed proxy unit — first-deploy shape; the durability refresh writes
-        // it fresh at the requested port, so there is nothing to conflict with.
-        exec::InstalledProxyPort::Absent => Ok(()),
+        // it fresh at the requested port, so there is nothing to move.
+        exec::InstalledProxyPort::Absent => Ok(None),
         // Unchanged public port — the common redeploy / durability-upgrade path.
-        exec::InstalledProxyPort::Port(current) if *current == new_public_port => Ok(()),
-        exec::InstalledProxyPort::Port(current) => Err(format!(
-            "Changing server.port on an existing deployment isn't supported here yet \
-             (the installed kamal-proxy is on port {current}, config requests \
-             {new_public_port}): first redeploy with server.port unchanged (adopts the \
-             reboot-durability upgrade), then change the port in a separate deploy. \
-             Tracked in #2073."
-        )),
+        exec::InstalledProxyPort::Port(current) if *current == new_public_port => Ok(None),
+        exec::InstalledProxyPort::Port(old_port) => Ok(Some(exec::PublicPortMove {
+            old_port: *old_port,
+            new_port: new_public_port,
+        })),
         // Fail closed: the unit is present but its --http-port is unreadable, so we
-        // cannot prove the public port is unchanged — refuse rather than risk the
-        // durability restart rebinding a different port and stranding `:80`.
+        // cannot prove whether the public port needs moving — refuse rather than risk
+        // the durability restart rebinding the wrong port and stranding `:80`.
         exec::InstalledProxyPort::Unreadable => Err(format!(
             "Cannot verify the installed kamal-proxy's HTTP port before a redeploy \
              (its systemd unit is present but its `--http-port` could not be read), so \
              a concurrent server.port change (config requests {new_public_port}) cannot \
              be ruled out and is refused to avoid stranding public traffic mid-cutover. \
-             Re-provision the host (or repair the kamal-proxy unit) and retry. Live-safe \
-             server.port changes are tracked in #2073."
+             Re-provision the host (or repair the kamal-proxy unit) and retry."
         )),
     }
 }
 
 /// Pre-flight refuse for an UNPROVABLE `shared/proxy-options` marker on the redeploy
-/// path (issue #2074), mirroring [`refuse_concurrent_public_port_change`]'s
-/// `Unreadable` fail-closed arm.
+/// path (issue #2074), mirroring [`resolve_public_port_move`]'s `Unreadable`
+/// fail-closed arm.
 ///
 /// The durability-refresh re-register (#2070/#2071) re-registers the still-live OLD
 /// release; #2074 preserves that release's own TLS/host by reading them back from the
@@ -3647,10 +3691,7 @@ fn run_up(
     // host is graded here, so an unreachable host in position 3 is reported before
     // host 1 is touched.
     let checks = collect_fleet_preflight(config, &fleet, configured_host_count);
-    let failed = report_preflight(&checks);
-    if failed > 0 {
-        return Err(DeployError::PreflightFailed(failed));
-    }
+    refuse_if_preflight_failed(&checks)?;
 
     let binary = resolve_release_binary(resolved)?;
     let env_file = build_env_file(config, resolved);
@@ -3678,6 +3719,8 @@ fn run_up(
 
     run_up_with(
         &FleetUpInput {
+            app_name: &resolved.app_name,
+            profile: &resolved.profile,
             fleet: &fleet,
             proxy: &proxy,
             checks: &checks,
@@ -3744,6 +3787,14 @@ struct FleetDatabaseFacts {
 /// is what makes the loop testable: nothing here reads the clock, the filesystem,
 /// or a socket.
 struct FleetUpInput<'a, P: ProxyController> {
+    /// The app's stable name (e.g. `"myapp"`, from `Cargo.toml`). A halt
+    /// alert's dedup key includes this (issue #2267), so two different apps
+    /// sharing one alert destination never fold into one incident.
+    app_name: &'a str,
+    /// The TARGET deploy profile (e.g. `"prod"`). A halt reloads `[alerts]`
+    /// under this profile (issue #2267), never the operator's ambient shell
+    /// profile.
+    profile: &'a str,
     /// The rollout targets, in order. Never empty.
     fleet: &'a ResolvedFleet,
     /// The proxy controller. kamal-proxy is PER HOST (it binds that host's public
@@ -3816,6 +3867,9 @@ struct HostProbeState {
     /// Whether this host has no usable reverse-proxy binary and this deploy must
     /// install one as the FIRST op of that host's turn (issue #1607, AC-1).
     needs_proxy_install: bool,
+    /// A concurrent `server.port` change to apply AFTER the cutover (issue #2073,
+    /// Option C phase 4) — `None` on a first deploy or an unchanged redeploy port.
+    port_move: Option<exec::PublicPortMove>,
 }
 
 /// Whether this host's deploy may prepare the target by installing a missing proxy
@@ -3923,21 +3977,22 @@ where
             reregister_options: input.proxy.proxy_service_options(),
             banner: "first deploy".to_owned(),
             needs_proxy_install,
+            // No installed proxy at all — nothing to move.
+            port_move: None,
         }),
         exec::DeployMode::Redeploy { live_slot } => {
-            // Pre-flight refuse (#2073): the reboot-durability restart-refresh (#2070)
-            // re-execs `kamal-proxy run` on the public port and re-registers the
-            // still-live upstream at its derived loopback port — both correct only while
-            // the public port is unchanged. If the operator changed `server.port` since
-            // the live release was deployed, that restart would rebind a different public
-            // port and the re-register would aim at a dead loopback port, stranding `:80`
-            // mid-cutover with no auto-recovery. Refuse here, before any op runs, sourced
-            // from the installed proxy unit's `--http-port` captured in the deploy-start
-            // probe, so the live release keeps serving. A live-safe port change is future
-            // work. No installed unit means a first deploy and is allowed; an unreadable
-            // unit fails closed.
-            refuse_concurrent_public_port_change(&probe.installed_proxy_port, input.public_port)
-                .map_err(|message| DeployError::Config(scoped(message)))?;
+            // Detect a concurrent `server.port` change (#2073, Option C) BEFORE any op
+            // runs, sourced from the installed proxy unit's `--http-port` captured in
+            // the deploy-start probe. When present, every op through the drain of the
+            // old release plans against `port_move.old_port` — the port the live
+            // release was ACTUALLY deployed under — never the newly requested one; the
+            // move itself is a separate, later phase (see `run_up_with`). No installed
+            // unit means a first-deploy shape and resolves to `None`; an unreadable
+            // unit fails closed (a move can't be proven safe).
+            let port_move =
+                resolve_public_port_move(&probe.installed_proxy_port, input.public_port)
+                    .map_err(|message| DeployError::Config(scoped(message)))?;
+            let effective_public_port = port_move.map_or(input.public_port, |m| m.old_port);
             // Pre-flight refuse (#2074): if the `shared/proxy-options` marker is present
             // but unreadable, we cannot prove the OLD release's TLS/host, so a concurrent
             // `deploy.tls.host` change can't be safely preserved across the durability
@@ -3956,17 +4011,19 @@ where
                 exec::ProxyOptionsMarker::Options(old) => old.clone(),
                 _ => input.proxy.proxy_service_options(),
             };
-            // Reconcile the (possibly stale) live-slot marker against the live
-            // proxy before choosing the candidate slot. On an UNAMBIGUOUS
-            // proxy-vs-marker disagreement the proxy is authoritative (so the
-            // candidate takes the genuinely-idle slot and never restarts the live
-            // one); on any absent/unclear proxy signal this is exactly the
-            // marker-based behavior as before (#1938, fail-safe).
+            // Reconcile the (possibly stale) live-slot marker against the live proxy
+            // before choosing the candidate slot — against `effective_public_port`,
+            // the port the proxy is ACTUALLY installed on, so a concurrent
+            // `server.port` change never makes this look for a slot the proxy never
+            // registered. On an UNAMBIGUOUS proxy-vs-marker disagreement the proxy is
+            // authoritative (so the candidate takes the genuinely-idle slot and never
+            // restarts the live one); on any absent/unclear proxy signal this is
+            // exactly the marker-based behavior as before (#1938, fail-safe).
             let reconcile = exec::reconcile_live_slot(
                 live_slot,
                 &probe.proxy_list,
                 &cfg.service_name,
-                input.public_port,
+                effective_public_port,
             );
             if let Some(warn) = &reconcile.warn {
                 // Loud + observable: drift is surfaced, not silently papered over.
@@ -3974,11 +4031,17 @@ where
                 // reports operator-facing state via eprintln! throughout.)
                 eprintln!("\u{26A0}\u{FE0F}  {}", scoped(warn.clone()));
             }
-            let slots = exec::SlotPlan::redeploy(input.public_port, reconcile.live_slot);
-            let banner = format!(
+            let slots = exec::SlotPlan::redeploy(effective_public_port, reconcile.live_slot);
+            let mut banner = format!(
                 "zero-downtime redeploy ({} \u{2192} {})",
                 slots.live_slot, slots.candidate_slot
             );
+            if let Some(mv) = port_move {
+                banner = format!(
+                    "{banner}, then moving server.port {} \u{2192} {}",
+                    mv.old_port, mv.new_port
+                );
+            }
             Ok(HostProbeState {
                 mode: fleet::HostMode::from_deploy_mode(&probe.mode),
                 slots,
@@ -3986,6 +4049,7 @@ where
                 reregister_options,
                 banner,
                 needs_proxy_install,
+                port_move,
             })
         }
     }
@@ -4014,16 +4078,19 @@ where
 ///   binaries only; a migration that already ran is never undone. The one exception
 ///   is a post-boundary HOUSEKEEPING failure (`record-proxy-options`, `drain-old`,
 ///   `prune`): the host is live and healthy on the new release, so the rollout
-///   warns, marks it degraded, and CONTINUES. A rollout whose only failures are
-///   housekeeping therefore succeeds (`Ok`) with degraded hosts named in the state
-///   table — rolling a whole fleet back because an `rm -rf` of old release dirs
-///   failed would be a self-inflicted outage.
+///   warns, marks it degraded, and CONTINUES. For a failed `drain-old`, the
+///   driver retries one time. It continues only when the old slot stopped
+///   (#2279). A rollout whose only failures are housekeeping therefore succeeds
+///   (`Ok`) with degraded hosts named in the state table — rolling a whole fleet
+///   back because an `rm -rf` of old release dirs failed would be a
+///   self-inflicted outage.
 ///
 /// **N = 1 is exempt from all of it.** A single-host config takes the pre-#1621
 /// path verbatim: the raw executor error, no fleet vocabulary, no state table, no
 /// compensation (there is no other host to converge with, and its own boundary
 /// teardown already ran). That is AC-1, and it is why the `single` branches below
-/// are not cosmetic.
+/// are not cosmetic. One exception (#2276): when the binaries went back after
+/// `migrate`, the error gets one schema note ([`fleet::single_host_schema_note`]).
 #[allow(clippy::too_many_lines)]
 fn run_up_with<E, P, F>(input: &FleetUpInput<'_, P>, make_executor: F) -> Result<(), DeployError>
 where
@@ -4162,11 +4229,20 @@ where
         // already cut over is left behind.
         // Repair the drifted marker as an early op — before the cutover's
         // record-previous-release reads it — so the on-disk marker matches the proxy
-        // truth even if the rest of the deploy is interrupted.
+        // truth even if the rest of the deploy is interrupted. Uses `state.slots
+        // .public_port` — the EFFECTIVE public port `probe_host_for_up` planned this
+        // host's slots from (the OLD port across a detected `server.port` move,
+        // #2073) — never `input.public_port` (the newly requested one): the repair
+        // must persist the port the live release ACTUALLY binds, not one derived
+        // from a port that has not taken effect yet.
         if state.repair {
             ops.insert(
                 0,
-                exec::live_slot_marker_repair_op(cfg, state.slots.live_slot, input.public_port),
+                exec::live_slot_marker_repair_op(
+                    cfg,
+                    state.slots.live_slot,
+                    state.slots.public_port,
+                ),
             );
         }
         // Host preparation goes in AFTER the repair insert so it ends up ahead of
@@ -4191,6 +4267,9 @@ where
         // leaves them behind and the next `deploy up` wrongly takes the redeploy
         // path with nothing serving.
         let teardown = match host_plan.mode {
+            // This is the pre-go-live path — its failure boundary IS the health-
+            // gated `proxy-route` op, so a failure here means the route was never
+            // established. There is nothing to deregister (issue #2270).
             fleet::HostMode::First => {
                 exec::first_deploy_teardown_ops(cfg, input.release_id, &state.slots)
             }
@@ -4225,6 +4304,84 @@ where
 
         match result {
             Ok(()) => {
+                // Option C phase 4 (#2073): the cutover just landed on the OLD public
+                // port (phases 1-3 planned against it deliberately), so a detected
+                // `server.port` change moves the proxy's public listener now, AFTER
+                // the release is live and the old one has drained — its own failure
+                // boundary, with its own rollback to `old_port` on failure.
+                if let Some(mv) = state.port_move {
+                    let options = input.proxy.proxy_service_options();
+                    let rebind_ops = exec::public_port_rebind_ops(
+                        cfg,
+                        input.proxy,
+                        input.release_id,
+                        state.slots.candidate_port,
+                        &options,
+                        mv.new_port,
+                    );
+                    let rollback_ops = exec::public_port_rebind_ops(
+                        cfg,
+                        input.proxy,
+                        input.release_id,
+                        state.slots.candidate_port,
+                        &options,
+                        mv.old_port,
+                    );
+                    if let Err(rebind_err) = exec::execute_public_port_rebind(
+                        &rebind_ops,
+                        &rollback_ops,
+                        mv.old_port,
+                        mv.new_port,
+                        executor,
+                    ) {
+                        if single {
+                            return Err(DeployError::Exec(rebind_err.to_string()));
+                        }
+                        match rebind_err {
+                            // The release is live and reachable at the OLD port — a
+                            // recoverable, traffic-healthy degradation (exactly what
+                            // `Degraded` means elsewhere), so the rollout continues
+                            // past it like every other post-cutover housekeeping
+                            // failure.
+                            exec::PublicPortRebindError::RolledBack { .. } => {
+                                outcomes[index] = fleet::HostOutcome::Degraded {
+                                    label: "public-port-rebind",
+                                };
+                                degraded.push((host_plan.host.clone(), "public-port-rebind"));
+                                eprintln!(
+                                    "\u{26A0}\u{FE0F}  [{}/{total} {}] serving {} \u{2014} \
+                                     {rebind_err}\n",
+                                    index + 1,
+                                    host_plan.host,
+                                    input.release_id,
+                                );
+                                continue;
+                            }
+                            // The proxy's public bind is now unknown — unlike a
+                            // `Degraded` host this one may NOT be reachable, so it
+                            // must never be reported as "traffic is fine" (that is
+                            // `Degraded`'s fixed summary text) and must never be
+                            // auto-compensated by an ordinary proxy-flip rollback,
+                            // which could target a proxy that is not even listening.
+                            // `Manual` is the existing "needs a human, do not touch"
+                            // outcome (mirrors `AmbiguousMarkers`) — halt rather than
+                            // roll forward.
+                            exec::PublicPortRebindError::RollbackFailed { .. } => {
+                                outcomes[index] = fleet::HostOutcome::Manual {
+                                    reason: fleet::MANUAL_PUBLIC_PORT_UNKNOWN,
+                                };
+                                eprintln!(
+                                    "\n\u{274C} rollout halted at {} (`public-port-rebind`) \
+                                     \u{2014} the remaining hosts were not touched \u{2014} \
+                                     {rebind_err}\n",
+                                    host_plan.host,
+                                );
+                                halt = Some((host_plan.host.clone(), "public-port-rebind"));
+                                break;
+                            }
+                        }
+                    }
+                }
                 outcomes[index] = fleet::HostOutcome::Serving;
                 if !single {
                     if host_plan.migrate == exec::MigrateStep::Run {
@@ -4239,28 +4396,69 @@ where
                 }
             }
             Err(err) => {
-                // A one-host fleet keeps today's error verbatim: the per-host
-                // executor already told the whole story, and inventing a fleet
-                // vocabulary for one host would change pre-#1621 output. This
-                // returns BEFORE any classification, degrade-and-continue or
-                // compensation, so N = 1 is byte-identical on every failure shape,
-                // post-boundary ones included.
+                // A one-host fleet keeps today's error: no fleet vocabulary, no
+                // degrade-and-continue, no compensation. One exception (#2276): if
+                // the binaries went back after `migrate`, add the schema note. The
+                // fleet classifier decides this, so the two paths cannot diverge.
+                outcomes[index] = fleet::classify_host_outcome(&err);
                 if single {
-                    return Err(DeployError::Exec(err.to_string()));
+                    let message = fleet::single_host_schema_note(&plan, &outcomes).map_or_else(
+                        || err.to_string(),
+                        |note| format!("{err}\n\u{26A0}\u{FE0F}  {note}"),
+                    );
+                    return Err(DeployError::Exec(message));
                 }
                 let failed_step = fleet::failed_step_label(&err);
-                outcomes[index] = fleet::classify_host_outcome(&err);
+                // #2279: a live old slot runs workers and the scheduler, so work
+                // runs two times. Retry one time. Continue only on a proven stop.
+                if matches!(
+                    outcomes[index],
+                    fleet::HostOutcome::Degraded { label } if label == fleet::DRAIN_OLD_LABEL
+                ) {
+                    let prefix = format!("[{}/{total} {}]", index + 1, host_plan.host);
+                    let old_slot = match exec::retry_drain_old(cfg, state.slots.live_slot, executor)
+                    {
+                        Ok(old_slot) => old_slot,
+                        Err(retry_err) => {
+                            eprintln!("\u{26A0}\u{FE0F}  {prefix} the retry failed: {retry_err}");
+                            exec::OldSlotState::Unreadable
+                        }
+                    };
+                    outcomes[index] = fleet::drain_old_outcome(old_slot);
+                    if old_slot == exec::OldSlotState::Stopped {
+                        eprintln!(
+                            "\u{26A0}\u{FE0F}  {prefix} `{}` failed, but the retry stopped and \
+                             disabled the old slot.",
+                            fleet::DRAIN_OLD_LABEL,
+                        );
+                    } else {
+                        eprintln!(
+                            "\u{26A0}\u{FE0F}  {prefix} serving {} \u{2014} but `{}` failed \
+                             AFTER the cutover: {}.",
+                            input.release_id,
+                            fleet::DRAIN_OLD_LABEL,
+                            fleet::OLD_SLOT_MAY_RUN_NOTE,
+                        );
+                    }
+                }
                 // Post-boundary housekeeping: the proxy is already serving the new
                 // release on this host and only bookkeeping failed. Warn, record the
                 // debris, and keep rolling — the alternative is an outage caused by
                 // a failed `rm -rf` (#1621, §4.6).
                 if let fleet::HostOutcome::Degraded { label } = outcomes[index] {
                     degraded.push((host_plan.host.clone(), label));
+                    // Only a missing `shared/proxy-options` marker makes the next
+                    // deploy refuse this host.
+                    let refusal = if label == "record-proxy-options" {
+                        ", which will refuse it"
+                    } else {
+                        ""
+                    };
                     eprintln!(
                         "\u{26A0}\u{FE0F}  [{}/{total} {}] serving {} \u{2014} but `{label}` \
                          failed AFTER the cutover. Traffic is healthy, so the rollout \
                          continues; repair this host (a redeploy does) before the next \
-                         deploy, which will refuse it.\n",
+                         deploy{refusal}.\n",
                         index + 1,
                         host_plan.host,
                         input.release_id,
@@ -4289,13 +4487,13 @@ where
         for line in fleet::fleet_summary_lines(&plan, &outcomes, input.release_id) {
             eprintln!("{line}");
         }
-        return Err(fleet_halted(
-            &plan,
-            &outcomes,
-            &degraded,
-            failed_host,
-            failed_step,
-        ));
+        let error = fleet_halted(&plan, &outcomes, &degraded, failed_host, failed_step);
+        // #2267: send a #1610 alert for the halt. This is best-effort. It
+        // does not change `error` below.
+        if let DeployError::FleetHalted(ref halt) = error {
+            emit_fleet_halted_alert(halt, input.app_name, input.profile);
+        }
+        return Err(error);
     }
 
     // App deploy is committed on every host here: the cutovers succeeded and there
@@ -4475,19 +4673,29 @@ where
 /// Remove ONE host's just-completed FIRST deploy (issue #1621, §4.7).
 ///
 /// A first deploy has no `shared/previous-release` marker, so there is nothing to
-/// roll back to: the honest compensation is the first-deploy teardown, which stops
-/// the slot unit, removes this run's release dir, and clears the `current` symlink
-/// and slot markers — leaving the host in the nothing-installed state that makes
-/// the next `deploy up` correctly take the First path again.
+/// roll back to. The honest compensation is the first-deploy teardown: stop the
+/// slot unit, remove this run's release dir, clear the `current` symlink and
+/// slot markers, and record `torn down` — [`exec::first_deploy_teardown_ops`],
+/// unchanged since #1621. This leaves the host in the nothing-installed state
+/// that makes the next `deploy up` correctly take the First path again.
 ///
 /// Driven through [`exec::run_ops`], not `run_teardown`: at fleet scale a silently
 /// swallowed cleanup failure is how a host ends up half-removed with nobody told.
 ///
-/// **Known residue:** [`ProxyController`] has no deregister op, so this host's
-/// kamal-proxy still holds a route for the service pointing at the stopped slot —
-/// its public port answers 502 rather than refusing the connection until it is
-/// deployed again. Removing the route needs a new controller method (and its own
-/// exact-vector tests); the state table names the host so this is never a surprise.
+/// The proxy route is removed as its OWN, SEPARATE step, only once the app
+/// teardown above has fully SUCCEEDED (issue #2270), so its public port refuses
+/// connections instead of answering 502. Splitting it out like this — rather
+/// than folding it into the same op list — is deliberate: a transport failure
+/// (the local `ssh` launch itself dying) carries NO op label at all, so if the
+/// route removal shared a list with the app teardown, that shape of failure
+/// could never be told apart from one on an EARLIER, not-yet-attempted step.
+/// Run alone, ANY failure here — a real remote error or a labelless transport
+/// one — can only mean one thing: the app is confirmed gone (the first call
+/// already returned `Ok`) and only the route is in question. That is reported
+/// as its own outcome, [`fleet::HostOutcome::CompensatedTeardownRouteFailed`],
+/// never the generic [`fleet::HostOutcome::CompensationFailed`] ("still on the
+/// new release, roll it back" — untrue here, and impossible: a first deploy has
+/// no previous release to roll back to).
 fn compensate_teardown<E, P>(
     cfg: &ResolvedDeployConfig,
     input: &FleetUpInput<'_, P>,
@@ -4498,18 +4706,30 @@ where
     E: exec::DeployExecutor,
     P: ProxyController,
 {
-    let ops = exec::first_deploy_teardown_ops(cfg, input.release_id, slots);
-    match exec::run_ops(&ops, executor) {
+    let app_ops = exec::first_deploy_teardown_ops(cfg, input.release_id, slots);
+    if let Err(err) = exec::run_ops(&app_ops, executor) {
+        let failed_step = fleet::failed_step_label(&err);
+        eprintln!(
+            "\u{274C} [{}] removing the first deploy FAILED at `{failed_step}` \u{2014} this \
+             host is still on {}. The remaining hosts are still compensated.",
+            cfg.host.as_deref().unwrap_or_default(),
+            input.release_id,
+        );
+        return fleet::HostOutcome::CompensationFailed { failed_step };
+    }
+
+    let deregister = input.proxy.deregister_op(&cfg.service_name);
+    match exec::run_ops(&[deregister], executor) {
         Ok(()) => fleet::HostOutcome::CompensatedTeardown,
         Err(err) => {
             let failed_step = fleet::failed_step_label(&err);
             eprintln!(
-                "\u{274C} [{}] removing the first deploy FAILED at `{failed_step}` \u{2014} this \
-                 host is still on {}. The remaining hosts are still compensated.",
+                "\u{26A0}\u{FE0F}  [{}] removed the first deploy, but its proxy route removal \
+                 FAILED at `{failed_step}` \u{2014} its public port may still answer 502 until it \
+                 is redeployed or the route is removed by hand.",
                 cfg.host.as_deref().unwrap_or_default(),
-                input.release_id,
             );
-            fleet::HostOutcome::CompensationFailed { failed_step }
+            fleet::HostOutcome::CompensatedTeardownRouteFailed { failed_step }
         }
     }
 }
@@ -4521,6 +4741,357 @@ fn manual_outcome(cfg: &ResolvedDeployConfig, reason: &'static str) -> fleet::Ho
         eprintln!("{line}");
     }
     fleet::HostOutcome::Manual { reason }
+}
+
+// ── #2267: send a #1610 alert on a halted rollout or on drift ───────────────
+//
+// AC-6 of #1621 asks for this. Do not make the operator poll a non-zero exit
+// code for it. Follow the `db::backup` pattern from issue #1743: load the
+// config, build the same channels `autumn alert test` uses, and deliver
+// directly. This is best-effort. It never changes the command's exit code.
+
+/// Build alert channels from `alerts`/`http`, already resolved.
+///
+/// Check `[alerts] enabled` first, the master switch (review finding on
+/// #2267: a disabled config with transport credentials left in place must
+/// send nothing). `is_active()` checks `enabled` AND a set destination.
+/// Return an empty list when either check fails. An empty list is a no-op
+/// downstream.
+fn alert_channels_for(
+    alerts: &autumn_web::alerts::AlertConfig,
+    http: &autumn_web::config::HttpConfig,
+) -> Vec<Arc<dyn AlertChannel>> {
+    if !alerts.is_active() {
+        return Vec::new();
+    }
+    let client = autumn_web::http::Client::from_config(&http.client);
+    crate::alert::configured_http_channels(alerts, &client)
+}
+
+/// Read `[alerts]` and `[http]` from the raw project TOML layers alone — no
+/// env-var overlay yet (the caller applies one — see
+/// [`apply_alert_env_overrides`]), no full [`AutumnConfig`] deserialize.
+/// Mirrors [`declared_server_port_in`]'s own merge of base `autumn.toml` ←
+/// inline `[profile.<name>]` ← `autumn-<profile>.toml`.
+///
+/// Review finding on #2267: [`load_runtime_config`] can fail on a section
+/// this command does not even use (a bad `[scheduler]`/`[database]` value),
+/// the exact case [`status_public_port`] already degrades gracefully for
+/// the port. Without this, that same failure would ALSO silence a valid
+/// `[alerts]` destination — exactly the incident an operator most needs to
+/// hear about. Deserializing only `alerts`/`http` out of the merged TOML
+/// ignores every other top-level key, so a bad value there can not break
+/// this the way it breaks the full `AutumnConfig` deserialize.
+fn declared_alert_config_in(
+    dirs: &[PathBuf],
+    profile_raw: &str,
+) -> Option<(
+    autumn_web::alerts::AlertConfig,
+    autumn_web::config::HttpConfig,
+)> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct AlertsHttpTomlRoot {
+        alerts: autumn_web::alerts::AlertConfig,
+        http: autumn_web::config::HttpConfig,
+    }
+
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    let base_toml: Option<toml::Value> = first_dir_with_file(dirs, "autumn.toml")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
+    let canonical = canonicalize_deploy_profile(profile_raw);
+    if let Some(base) = &base_toml {
+        deep_merge_toml(&mut merged, base.clone());
+        for name in profile_inline_lookup_names(&canonical) {
+            if let Some(section) = profile_section_from_base_toml(base, name) {
+                deep_merge_toml(&mut merged, section);
+            }
+        }
+    }
+    for name in autumn_web::config::profile_override_file_lookup_names(&canonical, profile_raw) {
+        let Some(path) = first_dir_with_file(dirs, &format!("autumn-{name}.toml")) else {
+            continue;
+        };
+        // Review finding on #2267: an unreadable or malformed override file
+        // must fail this whole read, not be silently skipped in favor of
+        // the base/inline config. A `[profile.prod]` override exists to
+        // CHANGE or disable a destination — silently falling back to a
+        // lower-priority layer could page using a destination the override
+        // was meant to replace.
+        let text = std::fs::read_to_string(&path).ok()?;
+        let overlay: toml::Value = toml::from_str(&text).ok()?;
+        deep_merge_toml(&mut merged, overlay);
+        break;
+    }
+
+    // Review finding on #2267: `strict_config` hard-fails `load_runtime_config`
+    // on a typo'd key inside `[alerts]`/`[http]` (e.g. `enabeld` for
+    // `enabled`) — the exact scenario landing here. Plain deserialize
+    // ignores an unrecognized field silently, which would default a
+    // mistyped `enabled` switch back to `true`. Reject it instead, using
+    // the SAME schema the primary path checks against.
+    if merged_alerts_or_http_has_unknown_key(&merged) {
+        return None;
+    }
+
+    let root: AlertsHttpTomlRoot = merged.try_into().ok()?;
+    Some((root.alerts, root.http))
+}
+
+/// Whether `merged` has an unrecognized key under `alerts` or `http`.
+///
+/// Reuses [`AutumnConfig::validate_toml`]/[`AutumnConfig::get_schema_keys`]
+/// — the same schema check `strict_config` runs on the primary path —
+/// filtered to `alerts`/`http` paths only, so an unrelated unknown
+/// top-level root (a plugin-owned table) is never mistaken for our own
+/// error.
+fn merged_alerts_or_http_has_unknown_key(merged: &toml::Value) -> bool {
+    let Ok(toml_str) = toml::to_string(merged) else {
+        return false;
+    };
+    let schema = AutumnConfig::get_schema_keys();
+    AutumnConfig::validate_toml(&toml_str, &schema)
+        .iter()
+        .any(|(path, _)| {
+            path == "alerts"
+                || path.starts_with("alerts.")
+                || path == "http"
+                || path.starts_with("http.")
+        })
+}
+
+/// Load `[alerts]` under the TARGET deploy profile. Build its channels.
+///
+/// Review finding on #2267: the ambient ("ambient" means the operator's
+/// shell) profile can differ from the deploy profile, so a plain
+/// `AutumnConfig::load()` can miss a production-only destination or send a
+/// production incident to a dev one. Use [`load_runtime_config`] instead —
+/// the same forced-profile load `run` uses for `check`/`rollback`/`up`. On
+/// failure, fall back to [`declared_alert_config_in`] rather than giving up:
+/// see its own doc for why and its narrower limitation.
+fn deploy_alert_channels_for_profile(profile: &str) -> Vec<Arc<dyn AlertChannel>> {
+    if let Ok(config) = load_runtime_config(profile) {
+        return alert_channels_for(&config.alerts, &config.http);
+    }
+    let Some((alerts, http)) = declared_alert_config_in(&manifest_project_dirs(), profile) else {
+        eprintln!("  \u{26A0} alert skipped: could not load configuration for profile {profile}");
+        return Vec::new();
+    };
+    // Review finding on #2267: the TOML-only fallback above must still see
+    // `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides, or a destination
+    // set only via env var (the documented, recommended way to supply a
+    // secret) gets nothing here, and an `AUTUMN_ALERTS__ENABLED=false`
+    // meant to silence a TOML-configured destination is ignored.
+    //
+    // If the `.env.<profile>` overlay itself fails to build (unreadable or
+    // malformed), fall back to bare OS env rather than skipping the env
+    // layer outright (review finding on #2267): real OS env vars are the
+    // HIGHEST-priority layer regardless of `.env.<profile>`, so an
+    // `AUTUMN_ALERTS__ENABLED=false` set directly in the process
+    // environment must still apply even when the dotenv file can not be
+    // read. Only the lower-priority `.env.<profile>` layer is lost here.
+    let (alerts, http) = match deploy_profile_env_overlay(profile) {
+        Ok(env) => apply_alert_env_overrides(alerts, http, &env),
+        Err(_) => apply_alert_env_overrides(alerts, http, &autumn_web::config::OsEnv),
+    };
+    alert_channels_for(&alerts, &http)
+}
+
+/// Apply the same `AUTUMN_ALERTS__*`/`AUTUMN_HTTP__*` env overrides the
+/// primary [`load_runtime_config`] path applies (issue #2267 review).
+///
+/// Reuses [`AutumnConfig::apply_env_overrides_with_env`] verbatim on a
+/// scratch value — the exact method `AutumnConfig::load_with_env` itself
+/// calls — so this can never drift from the primary path's env semantics.
+/// Every OTHER section of the scratch value is a throwaway default; only
+/// `alerts`/`http` are read back out.
+fn apply_alert_env_overrides(
+    alerts: autumn_web::alerts::AlertConfig,
+    http: autumn_web::config::HttpConfig,
+    env: &dyn Env,
+) -> (
+    autumn_web::alerts::AlertConfig,
+    autumn_web::config::HttpConfig,
+) {
+    let mut scratch = AutumnConfig {
+        alerts: Box::new(alerts),
+        http,
+        ..AutumnConfig::default()
+    };
+    scratch.apply_env_overrides_with_env(env);
+    (*scratch.alerts, scratch.http)
+}
+
+/// Send `alert` to every channel in `channels`.
+///
+/// Use a short-lived runtime, like `autumn alert test` does. Log a failed
+/// delivery. Do not stop for it. This must never change the command's exit
+/// code. Do nothing when `channels` is empty. This happens when `[alerts]`
+/// has no channel set.
+fn deliver_alert(channels: &[Arc<dyn AlertChannel>], alert: &Alert) {
+    if channels.is_empty() {
+        return;
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("  \u{26A0} alert not sent: could not start async runtime: {e}");
+            return;
+        }
+    };
+    runtime.block_on(async {
+        for channel in channels {
+            if let Err(error) = channel.deliver(alert).await {
+                eprintln!(
+                    "  \u{26A0} alert not delivered via {}: {error}",
+                    channel.name()
+                );
+            }
+        }
+    });
+}
+
+/// Join host names into one alert-detail value. Return an empty string for
+/// an empty list — for example, when no host was torn down.
+fn join_hosts(hosts: &[String]) -> String {
+    hosts.join(", ")
+}
+
+/// Join `(host, reason)` pairs into one alert-detail value.
+fn join_host_reasons(pairs: &[(String, &'static str)]) -> String {
+    pairs
+        .iter()
+        .map(|(host, reason)| format!("{host}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Build the alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
+///
+/// This is a pure function. It does no I/O. So a test can call it directly.
+/// It reuses the `ScheduledTaskFailure` condition. It does not add a new
+/// `AlertCondition` variant. Issue #1743 made the same choice for a failed
+/// backup upload. A halted rollout is also a task the framework runs, and
+/// it did not finish.
+///
+/// Every field on `halt` is a host name or a fixed operation label (see
+/// [`FleetHalt`]). So this alert can never carry a shell line or a raw
+/// driver error.
+///
+/// Its dedup key includes `app_name` and `profile`, so a halt on staging
+/// and a halt on production never merge into one incident, and neither do
+/// two different apps' `prod` halts, even when they share a `PagerDuty`
+/// routing key (review findings on #2267 — matches [`build_drift_alert`]'s
+/// existing scoping, extended with the app name).
+///
+/// Sets its own `where_to_look` (review finding on #2267): the
+/// `ScheduledTaskFailure` default is `/actuator/tasks`, an app runtime
+/// endpoint with no fleet or rollout data. `autumn deploy status` is the
+/// command that shows the fleet's actual state.
+fn build_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) -> Alert {
+    let alert = Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        format!("scheduled_task_failure:deploy-fleet-halted:{app_name}:{profile}"),
+    )
+    .title("Fleet rollout halted")
+    .summary(halt.to_string())
+    .where_to_look("autumn deploy status")
+    .detail("app_name", app_name)
+    .detail("profile", profile)
+    .detail("failed_host", halt.failed_host.clone())
+    .detail("failed_step", halt.failed_step)
+    .detail("rolled_back", join_hosts(&halt.rolled_back))
+    .detail("torn_down", join_hosts(&halt.torn_down))
+    .detail("still_on_new", join_hosts(&halt.still_on_new))
+    .detail("degraded", join_host_reasons(&halt.degraded))
+    .detail(
+        "route_removal_failed",
+        join_host_reasons(&halt.route_removal_failed),
+    )
+    .detail("manual", join_host_reasons(&halt.manual));
+    match halt.risk() {
+        Some(risk) => alert.detail("risk", risk),
+        None => alert,
+    }
+    .build()
+}
+
+/// Send an alert for a halted fleet rollout (issue #2267, AC-6 of #1621).
+///
+/// Loads `[alerts]` under `profile`, the TARGET deploy profile — not the
+/// operator's ambient shell profile. This runs on any halt, if `[alerts]`
+/// names a channel there. If no channel is set, this does nothing. So an
+/// operator with no alert channel sees the same behavior as before. They
+/// see a message and a non-zero exit.
+fn emit_fleet_halted_alert(halt: &FleetHalt, app_name: &str, profile: &str) {
+    let channels = deploy_alert_channels_for_profile(profile);
+    deliver_alert(
+        &channels,
+        &build_fleet_halted_alert(halt, app_name, profile),
+    );
+}
+
+/// Write a one-line summary of a [`fleet::DriftReport`] for an alert.
+fn drift_alert_summary(report: &fleet::DriftReport) -> String {
+    let mut parts = Vec::new();
+    if report.version_drift {
+        parts.push(format!(
+            "{} known release(s) are live at once",
+            report.known_releases().len()
+        ));
+    }
+    if !report.state_drift.is_empty() {
+        parts.push(format!(
+            "{} host(s) have state drift",
+            report.state_drift.len()
+        ));
+    }
+    parts.join("; ")
+}
+
+/// Build the alert for drift found by `deploy status --strict` (issue #2267,
+/// AC-6 of #1621).
+///
+/// This is a pure function. It does no I/O. Its dedup key includes
+/// `app_name` and `profile`, so drift on staging and drift on production
+/// never merge into one alert, and neither do two different apps' `prod`
+/// drift (review finding on #2267).
+///
+/// It carries the same reason strings `fleet::fleet_drift` already prints —
+/// never a raw driver error. So it needs no secrets check beyond what
+/// `DriftReport` already gives.
+///
+/// Sets its own `where_to_look`, same reason as [`build_fleet_halted_alert`]
+/// (review finding on #2267).
+fn build_drift_alert(report: &fleet::DriftReport, app_name: &str, profile: &str) -> Alert {
+    Alert::trigger(
+        AlertCondition::ScheduledTaskFailure,
+        format!("scheduled_task_failure:deploy-drift:{app_name}:{profile}"),
+    )
+    .title("Fleet drift detected")
+    .summary(drift_alert_summary(report))
+    .where_to_look("autumn deploy status")
+    .detail("app_name", app_name)
+    .detail("profile", profile)
+    .detail("version_drift", report.version_drift.to_string())
+    .detail("state_drift", join_host_reasons(&report.state_drift))
+    .build()
+}
+
+/// Send an alert for drift found by `deploy status --strict` (issue #2267,
+/// AC-6 of #1621). This is the cron path in `docs/guide/fleet-deploys.md`.
+///
+/// Loads `[alerts]` under `profile`, the TARGET deploy profile — not the
+/// operator's ambient shell profile. This does nothing if `[alerts]` has no
+/// channel set there. The caller must call this only in `--strict` mode. A
+/// plain `deploy status` check must never page anyone.
+fn emit_drift_alert(report: &fleet::DriftReport, app_name: &str, profile: &str) {
+    let channels = deploy_alert_channels_for_profile(profile);
+    deliver_alert(&channels, &build_drift_alert(report, app_name, profile));
 }
 
 /// Build the typed halt error from the recorded per-host outcomes (issue #1621,
@@ -4565,13 +5136,26 @@ fn fleet_halted(
         torn_down: named(|o| {
             matches!(
                 o,
-                fleet::HostOutcome::TornDown { .. } | fleet::HostOutcome::CompensatedTeardown
+                fleet::HostOutcome::TornDown { .. }
+                    | fleet::HostOutcome::CompensatedTeardown
+                    | fleet::HostOutcome::CompensatedTeardownRouteFailed { .. }
             )
         }),
         // Shared with the summary table's own list, so the halt error and the state
         // table can never disagree about which hosts are still forward.
         still_on_new: named(fleet::HostOutcome::on_new_release),
         degraded: degraded.to_vec(),
+        route_removal_failed: plan
+            .hosts
+            .iter()
+            .zip(outcomes)
+            .filter_map(|(host, outcome)| match outcome {
+                fleet::HostOutcome::CompensatedTeardownRouteFailed { failed_step } => {
+                    Some((host.host.clone(), *failed_step))
+                }
+                _ => None,
+            })
+            .collect(),
         manual: plan
             .hosts
             .iter()
@@ -5087,6 +5671,7 @@ fn warn_degraded_port(port: &StatusPort, profile: &str, continues: &str) {
 
 fn run_status(
     port: &StatusPort,
+    app_name: &str,
     profile: &str,
     fleet: &ResolvedFleet,
     options: &DeployOptions,
@@ -5123,6 +5708,10 @@ fn run_status(
         }
     }
     if options.strict && report.drifted() {
+        // #2267: send a #1610 alert for the drift. This runs only in
+        // `--strict` mode. An interactive `deploy status` must not page
+        // anyone.
+        emit_drift_alert(&report, app_name, profile);
         return Err(DeployError::DriftDetected);
     }
     Ok(())
@@ -5319,10 +5908,30 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
     };
 
     let mut ops: Vec<exec::DeployOp> = Vec::new();
-    if on {
+    // The index the shared write lands at: a failure at or before it means the
+    // host was NOT changed (fail closed); a failure after it means the shared
+    // flag landed but the running unit's own file did not.
+    let shared_index = if on {
         // Shared (authoritative) flag first: a #1621 unit reacts within 500 ms of
         // this single write, so the window starts closing even if the write below
         // fails (amendment A2).
+        //
+        // #2280: the shared flag's parent (`{app_dir}/shared`) only comes into
+        // existence during `prepare-dirs` on a deploy, so a host that has NEVER
+        // been deployed has no shared dir yet — and scp does not create
+        // destination parents, so the write fails and the
+        // `AppliedSharedOnly` success path (keyed on exactly this host shape) is
+        // unreachable. mkdir -p ahead of the write, mirroring
+        // `maintenance-prepare-live-flag-dir` below. It goes AHEAD of the write,
+        // not in its place, to keep the amendment-A2 ordering: the shared flag is
+        // still written first.
+        if let Some(parent) = remote_parent_dir(&shared) {
+            ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
+                "maintenance-prepare-shared-flag-dir",
+                format!("mkdir -p {}", exec::shell_quote(parent)),
+            )));
+        }
+        let shared_index = ops.len();
         ops.push(exec::DeployOp::WriteFile {
             label: "maintenance-write-shared",
             contents: exec::FileContents::Plain(body.to_owned()),
@@ -5352,31 +5961,35 @@ fn maintenance_one_host<E: exec::DeployExecutor>(
                 mode: Some(0o600),
             });
         }
+        shared_index
     } else {
         // `rm -f` both paths in one op: absent files are the NORMAL case for at
         // least one of them (a host has either the new unit or the old), so a
-        // missing file must never fail the `off`.
+        // missing file must never fail the `off`. No mkdir needed: `rm -f` does
+        // not care that the parent does not exist.
         let mut paths = exec::shell_quote(&shared);
         if let Some(path) = &live_path {
             paths.push(' ');
             paths.push_str(&exec::shell_quote(path));
         }
+        let shared_index = ops.len();
         ops.push(exec::DeployOp::Run(exec::RemoteCommand::new(
             "maintenance-clear",
             format!("rm -f {paths}"),
         )));
-    }
+        shared_index
+    };
 
     for (index, op) in ops.iter().enumerate() {
         if exec::run_ops(std::slice::from_ref(op), executor).is_err() {
             // The op label is known HERE regardless of the error's shape (an
             // upload failure carries no label), so the report can always name the
             // step without quoting the error.
+            // A failure at or before the shared write leaves the host genuinely
+            // UNCHANGED; failing anything after it means the shared flag landed
+            // but the running unit's own file did not.
             let failed_step = op.label();
-            // Op 0 is the shared path in both directions, so failing it leaves the
-            // host genuinely UNCHANGED; failing anything after it means the shared
-            // flag landed but the running unit's own file did not.
-            return if index == 0 {
+            return if index <= shared_index {
                 fleet::MaintenanceOutcome::Failed { failed_step }
             } else {
                 fleet::MaintenanceOutcome::LiveUnitUnchanged { failed_step }
@@ -5594,63 +6207,229 @@ mod tests {
     }
 
     #[test]
-    fn redeploy_refuses_a_concurrent_server_port_change() {
-        // #2073 pre-flight refuse. The installed proxy unit binds port 80; the operator
-        // now redeploys with `server.port = 8080` — a concurrent public-port change the
-        // durability restart-refresh (#2070) can't perform live-safely, so it is refused
-        // BEFORE any op runs, naming old vs new port and the two-deploy sequence.
-        let err = refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(80), 8080)
-            .expect_err("a changed server.port must be refused on the redeploy path");
-        assert!(
-            err.contains("80") && err.contains("8080"),
-            "the refuse message must name the installed (80) and requested (8080) ports: {err}",
-        );
-        assert!(
-            err.contains("server.port unchanged") && err.contains("#2073"),
-            "the refuse message must spell out the operator sequence and reference the \
-             tracking issue: {err}",
-        );
+    fn redeploy_detects_a_concurrent_server_port_change() {
+        // #2073 Option C. The installed proxy unit binds port 80; the operator now
+        // redeploys with `server.port = 8080` — resolved to a `PublicPortMove` rather
+        // than refused, naming old vs new port for the caller's later phase-4 rebind.
+        let mv = resolve_public_port_move(&exec::InstalledProxyPort::Port(80), 8080)
+            .expect("a changed server.port must resolve, not error")
+            .expect("a changed server.port must be detected as a move");
+        assert_eq!(mv.old_port, 80);
+        assert_eq!(mv.new_port, 8080);
     }
 
     #[test]
     fn redeploy_allows_an_unchanged_server_port() {
         // The common durability-upgrade path: the installed unit's `--http-port` equals
-        // the requested port, so the redeploy proceeds (the restart re-execs on the SAME
+        // the requested port, so there is no move (the restart re-execs on the SAME
         // port, no collision, derived == actual live port).
-        assert!(
-            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(80), 80).is_ok(),
-            "an unchanged-port redeploy must be allowed",
+        assert_eq!(
+            resolve_public_port_move(&exec::InstalledProxyPort::Port(80), 80),
+            Ok(None),
+            "an unchanged-port redeploy must resolve to no move",
         );
         // And with a non-default port that also happens to match.
-        assert!(
-            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Port(3000), 3000)
-                .is_ok(),
-            "an unchanged non-default port must also be allowed",
+        assert_eq!(
+            resolve_public_port_move(&exec::InstalledProxyPort::Port(3000), 3000),
+            Ok(None),
+            "an unchanged non-default port must also resolve to no move",
         );
     }
 
     #[test]
     fn redeploy_fails_closed_on_an_unreadable_installed_port() {
         // The installed unit is present but its `--http-port` couldn't be read/parsed,
-        // so we cannot prove the public port is unchanged — refuse (fail closed) rather
-        // than risk the durability restart rebinding a different port and stranding `:80`.
-        let err = refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Unreadable, 80)
+        // so we cannot prove which port (if any) needs moving — refuse (fail closed)
+        // rather than risk the durability restart rebinding the wrong port and
+        // stranding `:80`.
+        let err = resolve_public_port_move(&exec::InstalledProxyPort::Unreadable, 80)
             .expect_err("an unreadable installed proxy port must fail closed");
         assert!(
-            err.contains("could not be read") && err.contains("#2073"),
-            "the fail-closed message must explain the unreadable unit and reference the \
-             tracking issue: {err}",
+            err.contains("could not be read"),
+            "the fail-closed message must explain the unreadable unit: {err}",
         );
     }
 
     #[test]
     fn redeploy_allows_when_no_proxy_unit_is_installed() {
         // No installed proxy unit at all is a first-deploy shape (the durability refresh
-        // writes it fresh at the requested port) — nothing to conflict with, so the
-        // refuse guard passes regardless of the requested port.
+        // writes it fresh at the requested port) — nothing to move, regardless of the
+        // requested port.
+        assert_eq!(
+            resolve_public_port_move(&exec::InstalledProxyPort::Absent, 8080),
+            Ok(None),
+            "an absent installed proxy unit must resolve to no move",
+        );
+    }
+
+    #[test]
+    fn redeploy_moves_the_public_port_after_the_cutover_drains_the_old_release() {
+        // #2073 Option C end-to-end: the installed proxy binds port 80, the config
+        // requests `FLEET_PUBLIC_PORT` (3000). The cutover itself must plan entirely
+        // against the OLD port 80 (live slot blue = 81, candidate slot green = 82 —
+        // no collision with the still-live release), and the public-port move must
+        // land strictly AFTER the old release drains.
+        let fleet = fleet_of(&["web-a"]);
+        let probe = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe)
+            .script("web-a", "probe-release-dir", "absent");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a redeploy with a changed server.port succeeds (Option C)");
+
+        let labels = recorder.run_labels_for("web-a");
+        let drain = labels
+            .iter()
+            .position(|l| *l == "drain-old")
+            .expect("the cutover drains the old release");
+        // "proxy-restart-if-changed" runs TWICE: once as the cutover's OWN
+        // durability-refresh call (a no-op through the unchanged OLD port), and once
+        // as the phase-4 rebind. Both are unconditionally-present ops — the op
+        // itself always runs; only its INNER shell script decides whether to
+        // actually restart.
+        let restarts: Vec<usize> = labels
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == "proxy-restart-if-changed")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            restarts.len(),
+            2,
+            "one restart-if-changed from the cutover's own durability refresh, one \
+             from the phase-4 public-port rebind: {labels:?}"
+        );
         assert!(
-            refuse_concurrent_public_port_change(&exec::InstalledProxyPort::Absent, 8080).is_ok(),
-            "an absent installed proxy unit must not trigger the refuse",
+            restarts[0] < drain,
+            "the durability-refresh restart-if-changed runs at the HEAD of the \
+             cutover, before the old release ever drains: {labels:?}"
+        );
+        assert!(
+            restarts[1] > drain,
+            "the public-port move must run strictly AFTER the old release drains: \
+             {labels:?}"
+        );
+
+        // The phase-4 re-register targets loopback 82 — the candidate's OWN port,
+        // derived from the OLD public port (80 + green's +2) — now under the NEW
+        // public port.
+        let restart_shells: Vec<String> = recorder
+            .calls_for("web-a")
+            .iter()
+            .filter_map(|c| match c {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "proxy-restart-if-changed" =>
+                {
+                    Some(shell.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restart_shells.len(), 2);
+        assert!(
+            restart_shells[1].contains("--target '127.0.0.1:82'"),
+            "phase 4 re-registers the candidate's OWN loopback port: {}",
+            restart_shells[1],
+        );
+    }
+
+    #[test]
+    fn a_public_port_rebind_failure_degrades_the_host_and_continues_the_rollout() {
+        // #2073 Option C, fleet path: web-a's phase-4 rebind fails once (its FORWARD
+        // restart, the label's 2nd occurrence — the 1st is the cutover's own
+        // durability-refresh call, an unrelated no-op) but the rollback to the old
+        // port succeeds. Traffic stays healthy at the old port, so the rollout
+        // continues past web-a onto web-b.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let probe_a = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe_a)
+            .script("web-a", "probe-release-dir", "absent")
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 2);
+        let recorder = script_redeploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect("a rolled-back port move degrades a host but never halts the rollout");
+
+        let labels_a = recorder.run_labels_for("web-a");
+        assert_eq!(
+            labels_a
+                .iter()
+                .filter(|l| **l == "proxy-restart-if-changed")
+                .count(),
+            3,
+            "one no-op from the cutover's own durability refresh, one FAILING phase-4 \
+             forward attempt, one SUCCEEDING phase-4 rollback attempt: {labels_a:?}"
+        );
+        // The rollout continued past web-a's degradation onto web-b.
+        assert!(
+            recorder.run_labels_for("web-b").contains(&"drain-old"),
+            "web-b must still be deployed after web-a degrades: {:?}",
+            recorder.run_labels_for("web-b")
+        );
+    }
+
+    #[test]
+    fn a_public_port_rebind_double_failure_halts_the_rollout_as_manual() {
+        // #2073 Option C, fleet path: web-a's phase-4 rebind fails AND its own
+        // rollback ALSO fails (occurrences 2 and 3 of the label — occurrence 1, the
+        // cutover's own durability-refresh call, still succeeds so the cutover
+        // itself lands normally). The proxy's public bind on web-a is now unknown,
+        // so the rollout halts rather than rolling forward onto web-b, and web-a is
+        // reported `Manual` — never `Degraded` (which would falsely claim "traffic
+        // is fine").
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let probe_a = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe_a)
+            .script("web-a", "probe-release-dir", "absent")
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 2)
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 3);
+        let recorder = script_redeploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a doubly-failed port move must halt the rollout");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-a");
+        assert_eq!(halt.failed_step, "public-port-rebind");
+        assert_eq!(
+            halt.manual,
+            vec![("web-a".to_owned(), fleet::MANUAL_PUBLIC_PORT_UNKNOWN)],
+            "web-a must be reported Manual (needs a human), never Degraded, which \
+             would falsely claim traffic is fine"
+        );
+        assert!(
+            halt.degraded.is_empty(),
+            "web-a's unknown public bind must not be counted as a healthy degradation: \
+             {:?}",
+            halt.degraded,
+        );
+        // web-b was graded (the fleet-wide probe phase runs before any host is
+        // mutated) but never MUTATED — the halt happened at the first host.
+        assert!(
+            recorder
+                .run_labels_for("web-b")
+                .iter()
+                .all(|l| READ_ONLY_PROBES.contains(l)),
+            "web-b must not be mutated once the rollout halts at web-a: {:?}",
+            recorder.run_labels_for("web-b")
         );
     }
 
@@ -8731,7 +9510,9 @@ mod tests {
         "Usage:\n  kamal-proxy deploy SERVICE [flags]\n\nFlags:\n  \
          --target host:port\n  --health-check-path string\n  --host strings\n  \
          --tls\n  --deploy-timeout duration\n  --drain-timeout duration\n  \
-         --force\n"
+         --force\n\
+         ---autumn-kamal-proxy-remove-help---\
+         Usage:\n  kamal-proxy remove SERVICE [flags]\n"
     }
 
     fn fleet_manifests() -> Vec<exec::ManifestUpload> {
@@ -8866,7 +9647,7 @@ mod tests {
             .expect("a bare host is prepared");
         let repair = labels
             .iter()
-            .position(|l| *l == "record-live-slot")
+            .position(|l| *l == exec::LIVE_SLOT_REPAIR_LABEL)
             .expect("a drifted marker is repaired");
         assert!(
             install < repair,
@@ -9046,6 +9827,8 @@ mod tests {
             fleet: &'a ResolvedFleet,
         ) -> FleetUpInput<'a, proxy::KamalProxyController> {
             FleetUpInput {
+                profile: "prod",
+                app_name: "myapp",
                 fleet,
                 proxy: &self.proxy,
                 checks: &[],
@@ -9075,6 +9858,8 @@ mod tests {
             fleet: &'a ResolvedFleet,
         ) -> FleetUpInput<'a, proxy::KamalProxyController> {
             FleetUpInput {
+                profile: "prod",
+                app_name: "myapp",
                 auto_rollback: false,
                 ..self.input(fleet)
             }
@@ -9196,6 +9981,367 @@ mod tests {
                 "FleetHalted must never carry `{secret}`: {rendered}"
             );
         }
+    }
+
+    // ── #2267: a halted rollout or drift sends a #1610 operator alert ───────
+
+    #[derive(Default)]
+    struct CapturingChannel {
+        received: Arc<std::sync::Mutex<Vec<Alert>>>,
+    }
+
+    impl AlertChannel for CapturingChannel {
+        fn name(&self) -> &'static str {
+            "capturing"
+        }
+        fn deliver<'a>(&'a self, alert: &'a Alert) -> autumn_web::alerts::AlertDeliveryFuture<'a> {
+            let received = Arc::clone(&self.received);
+            let cloned = alert.clone();
+            Box::pin(async move {
+                received.lock().expect("lock").push(cloned);
+                Ok(())
+            })
+        }
+    }
+
+    fn sample_halt() -> FleetHalt {
+        FleetHalt {
+            failed_host: "web-b".to_owned(),
+            failed_step: "migrate",
+            rolled_back: vec!["web-a".to_owned()],
+            torn_down: vec![],
+            still_on_new: vec![],
+            degraded: vec![("web-a".to_owned(), "prune")],
+            route_removal_failed: vec![],
+            manual: vec![("web-c".to_owned(), fleet::MANUAL_AMBIGUOUS_MARKERS)],
+        }
+    }
+
+    #[test]
+    fn alert_channels_for_respects_the_enabled_master_switch() {
+        // Review finding on #2267: `[alerts] enabled = false` must silence a
+        // deploy alert, even when a transport is still configured.
+        let alerts = autumn_web::alerts::AlertConfig {
+            enabled: false,
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+
+        assert!(
+            alert_channels_for(&alerts, &http).is_empty(),
+            "a disabled [alerts] config must build no channel"
+        );
+    }
+
+    #[test]
+    fn alert_channels_for_builds_channels_when_active() {
+        let alerts = autumn_web::alerts::AlertConfig {
+            enabled: true,
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+
+        assert_eq!(
+            alert_channels_for(&alerts, &http).len(),
+            1,
+            "an enabled [alerts] config with a destination must build a channel"
+        );
+    }
+
+    #[test]
+    fn deploy_alert_channels_for_profile_is_empty_without_a_configured_destination() {
+        // No fixture project directory is set up for this test, so the
+        // profile load resolves to defaults (or fails) either way — this
+        // must never panic, and with no [alerts] destination it must
+        // deliver nothing.
+        assert!(deploy_alert_channels_for_profile("prod").is_empty());
+    }
+
+    #[test]
+    fn declared_alert_config_in_reads_the_target_profile_section() {
+        // Review finding on #2267: this fallback must resolve the SAME
+        // target-profile layering `load_runtime_config` would, so a
+        // production-only destination is still found on this path too.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [profile.prod.alerts]\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        let (alerts, _http) = declared_alert_config_in(&[dir.path().to_path_buf()], "prod")
+            .expect("the merged [alerts] subtree deserializes");
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R0123"));
+    }
+
+    #[test]
+    fn declared_alert_config_in_ignores_an_unrelated_bad_section() {
+        // The exact failure this fallback exists for: a malformed OTHER
+        // section must not stop `[alerts]` from being read.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [scheduler]\nbackend = 12345\n\n\
+             [alerts]\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        let (alerts, _http) = declared_alert_config_in(&[dir.path().to_path_buf()], "prod")
+            .expect("a bad [scheduler] value must not break the [alerts] read");
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R0123"));
+    }
+
+    #[test]
+    fn declared_alert_config_in_fails_closed_on_an_unreadable_profile_override() {
+        // Review finding on #2267: a malformed `autumn-prod.toml` must fail
+        // this whole read, not be silently skipped in favor of the
+        // base/inline config -- that could page using a destination the
+        // profile override was meant to change or disable.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [alerts]\npagerduty_routing_key = \"base-key\"\n",
+        )
+        .expect("write autumn.toml");
+        std::fs::write(dir.path().join("autumn-prod.toml"), "not valid toml")
+            .expect("write autumn-prod.toml");
+
+        assert!(
+            declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
+            "a malformed profile override file must fail closed, not fall back to base config"
+        );
+    }
+
+    #[test]
+    fn declared_alert_config_in_fails_closed_on_an_unknown_alerts_key() {
+        // Review finding on #2267: `strict_config` would hard-fail
+        // `load_runtime_config` on a typo'd `[alerts]` key (`enabeld` for
+        // `enabled`), landing here. Plain deserialize would silently drop
+        // it and default the switch back to `true` -- exactly the
+        // operator's mistyped attempt to turn it off.
+        let dir = tempfile::TempDir::new().expect("temp project dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[deploy]\nhost = \"deploy.example.test\"\n\n\
+             [alerts]\nenabeld = false\npagerduty_routing_key = \"R0123\"\n",
+        )
+        .expect("write autumn.toml");
+
+        assert!(
+            declared_alert_config_in(&[dir.path().to_path_buf()], "prod").is_none(),
+            "a typo'd [alerts] key must fail closed, not silently default enabled back to true"
+        );
+    }
+
+    #[test]
+    fn apply_alert_env_overrides_reads_autumn_alerts_env_vars() {
+        // Review finding on #2267: a destination set ONLY via env var (the
+        // documented, recommended way to supply a secret) must still fire
+        // on the TOML-only degraded-status fallback.
+        use autumn_web::config::MockEnv;
+        let alerts = autumn_web::alerts::AlertConfig::default();
+        let http = autumn_web::config::HttpConfig::default();
+        let env = MockEnv::new().with("AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY", "R9999");
+
+        let (alerts, _http) = apply_alert_env_overrides(alerts, http, &env);
+
+        assert_eq!(alerts.pagerduty_routing_key.as_deref(), Some("R9999"));
+    }
+
+    #[test]
+    fn apply_alert_env_overrides_can_disable_a_toml_configured_destination() {
+        // The other half of the same finding: AUTUMN_ALERTS__ENABLED=false
+        // must still silence a destination the TOML-only read already found.
+        use autumn_web::config::MockEnv;
+        let alerts = autumn_web::alerts::AlertConfig {
+            pagerduty_routing_key: Some("R0123".to_owned()),
+            ..Default::default()
+        };
+        let http = autumn_web::config::HttpConfig::default();
+        let env = MockEnv::new().with("AUTUMN_ALERTS__ENABLED", "false");
+
+        let (alerts, _http) = apply_alert_env_overrides(alerts, http, &env);
+
+        assert!(!alerts.is_active());
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scheduled_task_failure() {
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Fleet rollout halted");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:deploy-fleet-halted:myapp:production"
+        );
+        assert!(
+            alert.summary.contains("web-b") && alert.summary.contains("migrate"),
+            "the alert must name the failing host and step: {}",
+            alert.summary
+        );
+        assert_eq!(
+            alert.where_to_look, "autumn deploy status",
+            "review finding on #2267: must not point at the /actuator/tasks default"
+        );
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scoped_to_profile_for_dedup() {
+        // Review finding on #2267: a halt on staging and a halt on
+        // production must never merge into one incident, even sharing one
+        // PagerDuty routing key.
+        let staging = build_fleet_halted_alert(&sample_halt(), "myapp", "staging");
+        let production = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+
+        assert_ne!(staging.dedup_key, production.dedup_key);
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_is_scoped_to_app_name_for_dedup() {
+        // Review finding on #2267: two different apps sharing one alert
+        // destination must never fold their `prod` halts into one incident.
+        let app_one = build_fleet_halted_alert(&sample_halt(), "app-one", "production");
+        let app_two = build_fleet_halted_alert(&sample_halt(), "app-two", "production");
+
+        assert_ne!(app_one.dedup_key, app_two.dedup_key);
+    }
+
+    #[test]
+    fn build_fleet_halted_alert_carries_only_host_names_and_static_labels() {
+        // This check matches `FleetHalted`'s own secrets check. This
+        // alert comes only from its fields, so it can carry no more.
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+        let rendered = format!("{alert:?}");
+        for secret in [
+            "postgres://",
+            "topsecret",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "systemd-run",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "a fleet-halted alert must never carry `{secret}`: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn deliver_fleet_halted_alert_reaches_configured_channel() {
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+
+        deliver_alert(
+            &channels,
+            &build_fleet_halted_alert(&sample_halt(), "myapp", "production"),
+        );
+
+        let delivered = capture.lock().expect("lock").clone();
+        assert_eq!(delivered.len(), 1, "exactly one alert must be delivered");
+        assert_eq!(delivered[0].condition, AlertCondition::ScheduledTaskFailure);
+    }
+
+    #[test]
+    fn deliver_alert_is_noop_without_channels() {
+        // No `[alerts]` set means no channels. This must not panic. It
+        // must deliver nothing and change no behavior.
+        deliver_alert(
+            &[],
+            &build_fleet_halted_alert(&sample_halt(), "myapp", "production"),
+        );
+    }
+
+    #[test]
+    fn build_drift_alert_is_scheduled_task_failure_scoped_to_profile() {
+        let report = fleet::DriftReport {
+            releases: vec![
+                ("web-a".to_owned(), fleet::ReleaseId::Known("r1".to_owned())),
+                ("web-b".to_owned(), fleet::ReleaseId::Known("r2".to_owned())),
+            ],
+            version_drift: true,
+            state_drift: vec![("web-b".to_owned(), fleet::DRIFT_HOST_NOT_DEPLOYED)],
+        };
+
+        let alert = build_drift_alert(&report, "myapp", "production");
+
+        assert_eq!(alert.condition, AlertCondition::ScheduledTaskFailure);
+        assert_eq!(alert.title, "Fleet drift detected");
+        assert_eq!(
+            alert.dedup_key,
+            "scheduled_task_failure:deploy-drift:myapp:production"
+        );
+        assert!(
+            alert.summary.contains("release"),
+            "version drift must be named in the summary: {}",
+            alert.summary
+        );
+        assert_eq!(
+            alert.where_to_look, "autumn deploy status",
+            "review finding on #2267: must not point at the /actuator/tasks default"
+        );
+    }
+
+    #[test]
+    fn build_drift_alert_is_scoped_to_profile_for_dedup() {
+        // Drift on staging and drift on production must stay two alerts.
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        let staging = build_drift_alert(&report, "myapp", "staging");
+        let production = build_drift_alert(&report, "myapp", "production");
+
+        assert_ne!(staging.dedup_key, production.dedup_key);
+    }
+
+    #[test]
+    fn build_drift_alert_is_scoped_to_app_name_for_dedup() {
+        // Review finding on #2267: two different apps sharing one alert
+        // destination must never fold their `prod` drift into one incident.
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        let app_one = build_drift_alert(&report, "app-one", "production");
+        let app_two = build_drift_alert(&report, "app-two", "production");
+
+        assert_ne!(app_one.dedup_key, app_two.dedup_key);
+    }
+
+    #[test]
+    fn deliver_drift_alert_reaches_configured_channel() {
+        let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let channel = Arc::new(CapturingChannel {
+            received: Arc::clone(&capture),
+        });
+        let channels: Vec<Arc<dyn AlertChannel>> = vec![channel];
+        let report = fleet::DriftReport {
+            releases: vec![],
+            version_drift: false,
+            state_drift: vec![("web-a".to_owned(), fleet::DRIFT_LIVE_SLOT_MARKER)],
+        };
+
+        deliver_alert(&channels, &build_drift_alert(&report, "myapp", "staging"));
+
+        let delivered = capture.lock().expect("lock").clone();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(
+            delivered[0].dedup_key,
+            "scheduled_task_failure:deploy-drift:myapp:staging"
+        );
     }
 
     #[test]
@@ -9632,6 +10778,9 @@ mod tests {
             "teardown-candidate-dir",
             "teardown-current-symlink",
             "teardown-slot-markers",
+            // Issue #2270: the proxy route must go too, or the public port keeps
+            // answering 502 with nothing live behind it.
+            "proxy-deregister",
         ] {
             assert!(
                 web_a.contains(&teardown),
@@ -9658,6 +10807,160 @@ mod tests {
         assert!(
             halt.still_on_new.is_empty(),
             "nothing may be left on the new release"
+        );
+    }
+
+    #[test]
+    fn a_completed_first_deploy_compensation_removes_the_proxy_route() {
+        // Issue #2270: a completed first deploy that the fleet compensates has a
+        // LIVE proxy route (unlike the pre-go-live path, which never reaches
+        // `proxy-route`). The compensating teardown must remove it, socket-pinned
+        // like every other kamal-proxy invocation — as its OWN step, AFTER the
+        // app teardown (including the advisory `teardown-last-deploy` write) has
+        // fully succeeded, so a transport failure on the route step alone can
+        // never be confused with one on an earlier, not-yet-attempted step.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let calls = recorder.calls_for("web-a");
+        let labels: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, .. } => Some(*label),
+                exec::test_support::RecordedCall::Upload { .. } => None,
+            })
+            .collect();
+        let deregister_at = labels
+            .iter()
+            .position(|l| *l == "proxy-deregister")
+            .expect("the compensated first deploy must deregister the proxy route");
+        let last_deploy_at = labels
+            .iter()
+            .position(|l| *l == "teardown-last-deploy")
+            .expect("the teardown must still record its result");
+        assert!(
+            last_deploy_at < deregister_at,
+            "the app teardown, marker write included, must fully finish BEFORE the \
+             separate route-removal step starts: {labels:?}"
+        );
+
+        let shell = calls
+            .iter()
+            .find_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "proxy-deregister" =>
+                {
+                    Some(shell.as_str())
+                }
+                _ => None,
+            })
+            .expect("proxy-deregister ran");
+        assert_eq!(shell, "env -u XDG_RUNTIME_DIR kamal-proxy remove 'myapp'");
+    }
+
+    #[test]
+    fn a_failed_deregister_reports_its_own_outcome_not_a_generic_compensation_failure() {
+        // Issue #2270: when the proxy-deregister op itself fails, every op before
+        // it in `first_deploy_teardown_ops` already ran — the app is genuinely
+        // gone, only the route is stuck. This must NOT read as
+        // `CompensationFailed` ("still serving, roll it back"): that is both
+        // untrue (nothing is serving) and impossible (a first deploy has no
+        // previous release `autumn deploy rollback` could target).
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_first_deploy(recorder, "web-a").fail("web-a", "proxy-deregister");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.torn_down,
+            vec!["web-a".to_owned()],
+            "the app is gone, so this host is torn down, not still forward"
+        );
+        assert!(
+            !halt.still_on_new.contains(&"web-a".to_owned()),
+            "a failed deregister must never be told to `rollback` a host with \
+             nothing installed: {:?}",
+            halt.still_on_new
+        );
+        assert!(
+            !halt.manual.iter().any(|(host, _)| host == "web-a"),
+            "this is not a declined-automatically case: {:?}",
+            halt.manual
+        );
+        // Codex review: this must be named in its OWN field too, not just the
+        // console table, so an alert built from `FleetHalt` can tell a clean
+        // compensation apart from one whose route may still 502.
+        assert_eq!(
+            halt.route_removal_failed,
+            vec![("web-a".to_owned(), "proxy-deregister")],
+            "the route-removal failure must be preserved in a dedicated field: {:?}",
+            halt.route_removal_failed
+        );
+
+        // The marker write is part of the (separate, already-run) app-teardown
+        // call, so it lands regardless of the later deregister failure — no
+        // special-casing needed here, unlike the earlier design this replaced.
+        let calls = recorder.calls_for("web-a");
+        let last_deploy_writes: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Run { label, shell }
+                    if *label == "teardown-last-deploy" =>
+                {
+                    Some(shell.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let last = *last_deploy_writes
+            .last()
+            .expect("the marker must still be recorded despite the deregister failure");
+        assert!(
+            last.contains("'torn down'") && !last.contains("'deployed'"),
+            "a fully torn-down host must not report a successful deploy: {last}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_transport_on_deregister_still_reads_as_torn_down() {
+        // Issue #2270 (Codex review): a transport failure (the local `ssh`
+        // launch itself dying) carries NO op label — `failed_step_label` always
+        // reports it as `"ssh-transport"`, never `"proxy-deregister"`. Splitting
+        // the route removal into its OWN call (rather than string-matching a
+        // label inside one shared op list) means this still can only mean "the
+        // app teardown already succeeded and the separate route call failed",
+        // whatever shape that failure takes.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder =
+            script_first_deploy(recorder, "web-a").transport_fail("web-a", "proxy-deregister");
+        recorder = script_redeploy(recorder, "web-b").fail("web-b", "readiness-gate");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a mid-rollout failure must halt the rollout");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(
+            halt.torn_down,
+            vec!["web-a".to_owned()],
+            "a dropped transport on the route step alone must not read as still forward"
+        );
+        assert!(
+            !halt.still_on_new.contains(&"web-a".to_owned()),
+            "must never suggest `rollback` a host with nothing installed: {:?}",
+            halt.still_on_new
         );
     }
 
@@ -9991,6 +11294,213 @@ mod tests {
         );
     }
 
+    /// How the `drain-old-retry` probe on `web-b` answers in the #2279 tests.
+    enum DrainRetry {
+        Stdout(&'static str),
+        CommandFails,
+        TransportFails,
+    }
+
+    /// A three-host rollout where `web-b`'s `drain-old` fails and its retry
+    /// answers `retry`. Every host can be compensated, unless `frozen`.
+    fn drain_old_failure_run(
+        retry: &DrainRetry,
+        frozen: bool,
+    ) -> (fleet::test_support::FleetRecorder, Result<(), DeployError>) {
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_compensation(script_redeploy(recorder, host), host, "present");
+        }
+        recorder = recorder.fail("web-b", "drain-old");
+        recorder = match retry {
+            DrainRetry::Stdout(stdout) => recorder.script("web-b", "drain-old-retry", *stdout),
+            DrainRetry::CommandFails => recorder.fail("web-b", "drain-old-retry"),
+            DrainRetry::TransportFails => recorder.transport_fail("web-b", "drain-old-retry"),
+        };
+        let fixture = FleetFixture::new();
+        let input = if frozen {
+            fixture.input_frozen(&fleet)
+        } else {
+            fixture.input(&fleet)
+        };
+        let result = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)));
+        (recorder, result)
+    }
+
+    /// Check that `web-b` ran exactly one retry, right after the failed
+    /// `drain-old`, against the same unit.
+    fn assert_one_retry_of_the_drained_unit(recorder: &fleet::test_support::FleetRecorder) {
+        let web_b = recorder.run_labels_for("web-b");
+        assert_eq!(
+            web_b.iter().filter(|l| **l == "drain-old-retry").count(),
+            1,
+            "retry one time only: {web_b:?}"
+        );
+        assert!(
+            web_b
+                .windows(2)
+                .any(|w| w == ["drain-old", "drain-old-retry"]),
+            "the retry runs right after the failed drain: {web_b:?}"
+        );
+        let shell_of = |label: &str| {
+            recorder
+                .calls_for("web-b")
+                .into_iter()
+                .find_map(|call| match call {
+                    exec::test_support::RecordedCall::Run { label: l, shell } if l == label => {
+                        Some(shell)
+                    }
+                    _ => None,
+                })
+                .expect("the op ran")
+        };
+        let drained = shell_of("drain-old");
+        let unit = drained.rsplit(' ').next().expect("drain-old names a unit");
+        assert!(
+            shell_of("drain-old-retry").contains(&format!("unit='{unit}'")),
+            "the retry must target the old slot `{unit}`, never the new one"
+        );
+    }
+
+    #[test]
+    fn a_drain_old_failure_whose_old_slot_may_still_run_halts_the_rollout() {
+        // #2279: the old slot runs job workers and the scheduler. If it can run,
+        // scheduled tasks and jobs run two times. The rollout must not report
+        // success.
+        for retry in [
+            DrainRetry::Stdout("not-stopped"),
+            DrainRetry::Stdout("bash: -c: line 0"),
+            DrainRetry::CommandFails,
+            DrainRetry::TransportFails,
+        ] {
+            let (recorder, result) = drain_old_failure_run(&retry, false);
+            let err = result.expect_err("an old slot that may still run must halt the rollout");
+
+            assert_one_retry_of_the_drained_unit(&recorder);
+            assert!(
+                !recorder.run_labels_for("web-b").contains(&"prune"),
+                "nothing more of the deploy runs on the halted host"
+            );
+            assert_eq!(
+                recorder.run_labels_for("web-c"),
+                READ_ONLY_PROBES.to_vec(),
+                "the host after the halt must not be touched"
+            );
+
+            let halt = fleet_halt_of(&err);
+            assert_eq!(halt.failed_host, "web-b");
+            assert_eq!(halt.failed_step, "drain-old");
+            assert_eq!(
+                halt.rolled_back,
+                vec!["web-a".to_owned(), "web-b".to_owned()],
+                "both cut-over hosts are compensated, so each runs ONE slot again"
+            );
+            assert!(halt.still_on_new.is_empty(), "{:?}", halt.still_on_new);
+            assert!(
+                halt.degraded.is_empty(),
+                "a live old slot is not housekeeping debris: {:?}",
+                halt.degraded
+            );
+            assert_eq!(
+                halt.risk(),
+                None,
+                "compensation left one slot running, so the risk is gone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frozen_drain_old_halt_leaves_the_hosts_and_names_the_risk() {
+        // #2279 with `--no-rollback`: nothing is compensated, so the old slot may
+        // still run at exit. The halt and its alert must name that risk.
+        let (recorder, result) = drain_old_failure_run(&DrainRetry::Stdout("not-stopped"), true);
+        let err = result.expect_err("a frozen halt is still a failure");
+
+        assert!(
+            recorder.positions_of("resolve-previous").is_empty(),
+            "a frozen halt compensates nothing"
+        );
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_step, "drain-old");
+        assert!(halt.rolled_back.is_empty(), "{:?}", halt.rolled_back);
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-a".to_owned(), "web-b".to_owned()]
+        );
+        assert_eq!(halt.risk(), Some(fleet::OLD_SLOT_MAY_RUN_NOTE));
+        let alert = build_fleet_halted_alert(halt, "myapp", "prod");
+        assert_eq!(
+            alert.details.get("risk").map(String::as_str),
+            Some(fleet::OLD_SLOT_MAY_RUN_NOTE),
+            "the alert must name the risk, not only the step"
+        );
+    }
+
+    #[test]
+    fn a_drain_old_failure_whose_old_slot_is_proven_stopped_still_degrades() {
+        // #2279: a transient failure that the retry clears is housekeeping. The
+        // rollout continues, as it did before.
+        let (recorder, result) = drain_old_failure_run(&DrainRetry::Stdout("stopped"), false);
+        result.expect("a proven-stopped old slot must not fail the rollout");
+
+        assert_one_retry_of_the_drained_unit(&recorder);
+        assert!(
+            !recorder
+                .run_labels_for("web-b")
+                .contains(&"restart-previous"),
+            "the host stays on the new release"
+        );
+        assert_eq!(
+            recorder.run_labels_for("web-c"),
+            READ_ONLY_PROBES
+                .iter()
+                .copied()
+                .chain(
+                    REDEPLOY_RUN_LABELS
+                        .iter()
+                        .copied()
+                        .filter(|label| *label != "migrate")
+                )
+                .collect::<Vec<_>>(),
+            "the rollout must continue past the degraded host"
+        );
+        assert!(
+            recorder.positions_of("resolve-previous").is_empty(),
+            "nothing is compensated"
+        );
+    }
+
+    #[test]
+    fn a_single_host_drain_old_failure_keeps_todays_error_and_does_not_retry() {
+        // #2279 keeps AC-1: N = 1 already fails the deploy, so it gets no retry.
+        let fleet = fleet_of(&["203.0.113.10"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "203.0.113.10")
+            .fail("203.0.113.10", "drain-old");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a single-host drain failure must fail the deploy");
+
+        assert!(matches!(err, DeployError::Exec(_)), "{err:?}");
+        assert_eq!(
+            recorder.run_labels_for("203.0.113.10").last(),
+            Some(&"drain-old"),
+            "N = 1 stops at the failed drain and does not retry"
+        );
+    }
+
+    #[test]
+    fn only_a_drain_old_halt_carries_a_risk() {
+        assert_eq!(sample_halt().risk(), None, "a `migrate` halt adds no risk");
+        let alert = build_fleet_halted_alert(&sample_halt(), "myapp", "production");
+        assert!(
+            !alert.details.contains_key("risk"),
+            "other halts keep today's alert details"
+        );
+    }
+
     #[test]
     fn compensation_never_touches_the_schema() {
         // #1621 (AC-3, T1.12). Auto-rollback is BINARY-ONLY. `rollback_ops` and
@@ -10038,13 +11548,160 @@ mod tests {
         );
     }
 
+    /// The `DeployError::Exec` message of a failed single-host deploy.
+    fn single_host_exec_message(err: &DeployError) -> &str {
+        match err {
+            DeployError::Exec(message) => message,
+            other => panic!("N = 1 must never produce fleet vocabulary, got: {other:?}"),
+        }
+    }
+
+    /// The executor error a one-host deploy returns when `failed_step` fails
+    /// before the cutover.
+    fn pre_cutover_error(mode: fleet::HostMode, failed_step: &'static str) -> String {
+        let source = Box::new(exec::DeployExecError::CommandFailed {
+            label: failed_step,
+            message: "scripted failure".to_owned(),
+        });
+        match mode {
+            fleet::HostMode::Redeploy => exec::DeployExecError::CandidateRolledBack {
+                failed_step,
+                source,
+            },
+            fleet::HostMode::First => exec::DeployExecError::FirstDeployTornDown {
+                failed_step,
+                source,
+            },
+        }
+        .to_string()
+    }
+
+    /// Run a one-host deploy in `mode` that fails at `failed_step`. Returns the
+    /// error message and the labels the host ran.
+    fn failed_single_host_deploy(
+        mode: fleet::HostMode,
+        failed_step: &'static str,
+    ) -> (String, Vec<&'static str>) {
+        let host = "203.0.113.10";
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let recorder = match mode {
+            fleet::HostMode::Redeploy => script_redeploy(recorder, host),
+            fleet::HostMode::First => script_first_deploy(recorder, host),
+        }
+        .fail(host, failed_step);
+        let fleet = fleet_of(&[host]);
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("the scripted failure must fail the deploy");
+        (
+            single_host_exec_message(&err).to_owned(),
+            recorder.run_labels_for(host),
+        )
+    }
+
+    #[test]
+    fn a_single_host_redeploy_rolled_back_after_migrate_names_the_schema() {
+        // #2276: the candidate is torn down and the previous release serves, but the
+        // migration stays applied. The error must say so.
+        let (message, labels) =
+            failed_single_host_deploy(fleet::HostMode::Redeploy, "readiness-gate");
+
+        assert_eq!(
+            message,
+            format!(
+                "{}\n\u{26A0}\u{FE0F}  {}",
+                pre_cutover_error(fleet::HostMode::Redeploy, "readiness-gate"),
+                fleet::SINGLE_HOST_SCHEMA_AHEAD_NOTE
+            ),
+            "the executor error stays first; the schema note follows it"
+        );
+        assert!(
+            labels.contains(&"migrate") && !labels.contains(&"proxy-flip"),
+            "the deploy must migrate, then stop at the gate: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_host_marker_repair_failure_keeps_todays_error() {
+        // #2276: the live-slot marker repair runs before `migrate`. If it fails,
+        // the schema did not move, so the error gets no schema note.
+        let host = "203.0.113.10";
+        // The marker says blue (3001), but the proxy serves green (3002).
+        let drifted = "redeploy:blue\t3001\n\
+             ---autumn-kamal-proxy-list---\n\
+             Service   Host          Target            State    TLS\n\
+             myapp     example.com   127.0.0.1:3002   running  no\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script(host, "proxy-compat-probe", compatible_deploy_help())
+            .script(host, "detect-current", drifted)
+            .script(host, "probe-release-dir", "absent")
+            .fail_on_occurrence(host, exec::LIVE_SLOT_REPAIR_LABEL, 1);
+        let fleet = fleet_of(&[host]);
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("the failed repair must fail the deploy");
+
+        let labels = recorder.run_labels_for(host);
+        assert!(
+            !labels.contains(&"migrate"),
+            "the repair runs before `migrate`: {labels:?}"
+        );
+        assert_eq!(
+            single_host_exec_message(&err),
+            pre_cutover_error(fleet::HostMode::Redeploy, exec::LIVE_SLOT_REPAIR_LABEL),
+        );
+    }
+
+    #[test]
+    fn a_single_host_first_deploy_torn_down_after_migrate_names_the_schema() {
+        // #2276: a first deploy migrates, then fails its gate. Nothing serves. The
+        // note must not claim a previous release.
+        let (message, labels) = failed_single_host_deploy(fleet::HostMode::First, "readiness-gate");
+
+        assert_eq!(
+            message,
+            format!(
+                "{}\n\u{26A0}\u{FE0F}  {}",
+                pre_cutover_error(fleet::HostMode::First, "readiness-gate"),
+                fleet::SINGLE_HOST_FIRST_DEPLOY_SCHEMA_NOTE
+            ),
+        );
+        assert!(
+            labels.contains(&"migrate"),
+            "the first deploy must migrate before the gate: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_host_failure_before_migrate_keeps_todays_error() {
+        // #2276: the deploy stopped before `migrate`, so the schema did not move.
+        for mode in [fleet::HostMode::Redeploy, fleet::HostMode::First] {
+            let (message, labels) = failed_single_host_deploy(mode, "daemon-reload");
+
+            assert_eq!(
+                message,
+                pre_cutover_error(mode, "daemon-reload"),
+                "{mode:?}: a failure before `migrate` keeps today's error verbatim"
+            );
+            assert!(
+                !labels.contains(&"migrate"),
+                "{mode:?}: the scripted failure must land before `migrate`: {labels:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_single_host_failure_keeps_todays_error_and_compensates_nothing() {
         // #1621 (AC-1). N = 1 is exempt from the whole fleet vocabulary: a
         // single-host deploy that fails must return the pre-#1621 error verbatim —
-        // no classification, no degrade-and-continue, no compensation, no state
-        // table. `prune` is the sharpest case: in a FLEET it degrades and the deploy
-        // succeeds, while for one host it must stay exactly today's failure.
+        // no degrade-and-continue, no compensation, no state table. `prune` is the
+        // sharpest case: in a FLEET it degrades and the deploy succeeds, while for
+        // one host it must stay exactly today's failure. (The #2276 note is only
+        // for a host whose binaries went back.)
         let fleet = fleet_of(&["203.0.113.10"]);
         let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "203.0.113.10")
             .fail("203.0.113.10", "prune");
@@ -10171,6 +11828,8 @@ mod tests {
         let recorder = fleet::test_support::FleetRecorder::new();
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             db: FleetDatabaseFacts {
                 sqlite: true,
                 ..FleetDatabaseFacts::default()
@@ -10254,6 +11913,85 @@ mod tests {
     }
 
     #[test]
+    fn up_refuses_the_whole_fleet_when_one_host_fails_preflight() {
+        // #2269 (#1621 AC-7 follow-up). `run_up_with` assumes checks are
+        // already graded; it never re-checks them. The real gate is
+        // `refuse_if_preflight_failed`, called by `run_up` before any
+        // executor is built. This test drives that gate directly, then
+        // calls `run_up_with` only on success. Mirrors
+        // `preflight_failure_aborts_before_any_executor_call` (exec.rs) one
+        // level up.
+        //
+        // This alone cannot prove `run_up` still calls the gate before the
+        // hand-off — `and_then` short-circuits regardless. See
+        // `up_calls_the_preflight_gate_before_handing_off_to_run_up_with`
+        // right below, which asserts that ordering in `run_up`'s own source.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let checks = vec![
+            PreflightCheck::pass("signing_secret", "ok"),
+            PreflightCheck::fail("ssh_reachability", "unreachable", "check the network")
+                .scoped(Some("web-b".to_owned())),
+        ];
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let fixture = FleetFixture::new();
+        let executor_builds = std::cell::Cell::new(0_usize);
+
+        let err = refuse_if_preflight_failed(&checks)
+            .and_then(|()| {
+                run_up_with(&fixture.input(&fleet), |cfg| {
+                    executor_builds.set(executor_builds.get() + 1);
+                    Ok(recorder.executor(cfg))
+                })
+            })
+            .expect_err("a failing host must refuse the whole rollout");
+
+        assert!(
+            matches!(err, DeployError::PreflightFailed(1)),
+            "expected PreflightFailed(1), got {err:?}"
+        );
+        assert_eq!(
+            executor_builds.get(),
+            0,
+            "no executor may be built for any host when preflight fails"
+        );
+        assert!(
+            recorder.mutating(&[]).is_empty(),
+            "a refused fleet must run NO remote command at all, probes included: {:?}",
+            recorder.mutating(&[])
+        );
+    }
+
+    #[test]
+    fn up_calls_the_preflight_gate_before_handing_off_to_run_up_with() {
+        // #2269. The test above proves the GATE refuses correctly, but it
+        // composes `refuse_if_preflight_failed` and `run_up_with` by hand — it
+        // cannot prove `run_up` itself still calls them in that order. This
+        // checks the SOURCE order inside `run_up`, mirroring
+        // `media_provisioning_is_deferred_past_app_cutover_in_up`: a refactor
+        // that moved the gate after the `run_up_with` hand-off, or dropped it,
+        // fails this test even though the gate function still works on its
+        // own.
+        let src = include_str!("deploy.rs");
+        let up_body = src
+            .split("fn run_up(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn run_rollback(").next())
+            .expect("run_up body present");
+
+        let gate_at = up_body
+            .find("refuse_if_preflight_failed(&checks)")
+            .expect("the preflight gate call present on the up path");
+        let handoff_at = up_body
+            .find("run_up_with(")
+            .expect("the run_up_with hand-off present on the up path");
+
+        assert!(
+            gate_at < handoff_at,
+            "run_up must call the preflight gate BEFORE handing off to run_up_with",
+        );
+    }
+
+    #[test]
     fn the_refusals_grade_the_configured_topology_not_the_narrowed_rollout() {
         // #1621 (§4.8). `--only` narrows which hosts a run TOUCHES; it does not
         // change the topology. A three-host sqlite fleet is just as broken when one
@@ -10263,6 +12001,8 @@ mod tests {
         let recorder = fleet::test_support::FleetRecorder::new();
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             db: FleetDatabaseFacts {
                 sqlite: true,
@@ -10428,6 +12168,8 @@ mod tests {
         let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-b");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&fleet)
         };
@@ -10465,6 +12207,8 @@ mod tests {
             .fail("web-b", "readiness-gate");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&fleet)
         };
@@ -10492,6 +12236,8 @@ mod tests {
             .script("web-b", "probe-release-dir", "present");
         let fixture = FleetFixture::new();
         let input = FleetUpInput {
+            profile: "prod",
+            app_name: "myapp",
             configured_host_count: 3,
             ..fixture.input(&narrowed)
         };
@@ -10881,6 +12627,32 @@ mod tests {
     }
 
     #[test]
+    fn status_never_renders_a_green_marker_for_an_unready_host() {
+        // #2273, end to end from the probe: curl's `000` (no answer) and a 503
+        // both render `⚠️`, and neither is drift.
+        let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        recorder = script_status(recorder, "web-a", "r1", "200", false);
+        recorder = script_status(recorder, "web-b", "r1", "503", false);
+        recorder = script_status(recorder, "web-c", "r1", "000", false);
+
+        let statuses = drive_status(&fleet, &recorder).expect("status reports");
+        let report = fleet::fleet_drift(&statuses);
+        assert!(!report.drifted(), "{:?}", report.state_drift);
+        let rendered = fleet::fleet_status_lines(&statuses, &report).join("\n");
+        let row = |host: &str| {
+            rendered
+                .lines()
+                .find(|line| line.contains(host))
+                .expect("every host has a row")
+        };
+        assert!(row("web-a").starts_with("  \u{2705}"), "{rendered}");
+        for host in ["web-b", "web-c"] {
+            assert!(row(host).starts_with("  \u{26A0}"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn fleet_status_json_shape_is_stable_and_carries_no_secret() {
         // The repo's own skills are a first-class consumer of `--json`, so the field
         // names are a contract. Nothing here is derived from a shell line or a driver
@@ -11129,6 +12901,64 @@ mod tests {
                 .run_labels_for("web-a")
                 .contains(&"maintenance-prepare-live-flag-dir"),
             "no running unit means no second flag dir to prepare"
+        );
+    }
+
+    #[test]
+    fn fleet_maintenance_on_prepares_the_shared_flag_dir_before_uploading() {
+        // #2280: `prepare-dirs` (which creates `{app_dir}/shared`) only runs during
+        // a deploy, so on a never-deployed host the shared flag's parent does not
+        // exist — and scp does not create destination parents, so the very first
+        // `maintenance on` failed and the `AppliedSharedOnly` success path keyed on
+        // exactly this host shape was unreachable. The dir is created up front,
+        // BEFORE the shared write (amendment A2: the shared flag is still written
+        // first, so a #1621 unit reacts within 500 ms of the write itself).
+        let fleet = fleet_of(&["web-a"]);
+        let recorder = fleet::test_support::FleetRecorder::new().script(
+            "web-a",
+            "detect-current",
+            "first\n---autumn-kamal-proxy-list---\n",
+        );
+
+        drive_maintenance(
+            &fleet,
+            &recorder,
+            DeployAction::MaintenanceOn,
+            Some(&MaintenanceOnArgs::default()),
+        )
+        .expect("a shared-only write is a success, not a failure");
+
+        let calls = recorder.calls_for("web-a");
+        let mkdir_pos = calls
+            .iter()
+            .position(|call| {
+                matches!(
+                    call,
+                    exec::test_support::RecordedCall::Run { label, shell }
+                        if *label == "maintenance-prepare-shared-flag-dir"
+                            && shell.contains("mkdir -p")
+                            && shell.contains("/srv/autumn/myapp/shared")
+                )
+            })
+            .expect("the shared flag's parent must be created before the upload");
+        let upload_pos = calls
+            .iter()
+            .position(|call| {
+                matches!(
+                    call,
+                    exec::test_support::RecordedCall::Upload { remote_path, .. }
+                        if remote_path == MAINTENANCE_SHARED_PATH
+                )
+            })
+            .expect("the shared flag is uploaded");
+        assert!(
+            mkdir_pos < upload_pos,
+            "the shared dir is created BEFORE the shared flag is written"
+        );
+        assert_eq!(
+            upload_paths(&recorder, "web-a"),
+            vec![MAINTENANCE_SHARED_PATH.to_owned()],
+            "only the shared flag can be written without a resolvable release"
         );
     }
 

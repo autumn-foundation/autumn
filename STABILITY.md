@@ -105,6 +105,19 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   in any release. The protocol carries a version field precisely so a host and
   an artifact built from different Autumn versions degrade to origin-serving
   instead of guessing.
+- **The wire-contract lane (issue #1755).** `autumn_web::wire` in full —
+  `Endpoint`, `WireShape`, `WireField`, `ClientEndpoint`, `NoBody`, `WireError`,
+  `call`, and the const checkers `has_field` / `omittable_required_covered` /
+  `client_produces` / `client_accepts` / `client_request_covered` /
+  `path_params_are` / `render_path` — together with the **input syntax** of
+  `#[endpoint]`, `#[derive(WireShape)]`, `wire_client!` and
+  `#[contract_checked]`, and the JSON **descriptor format** written under
+  `target/autumn-contracts/`. All of it is experimental and may change in any
+  release, including a patch. This is a first slice: one workspace, synchronous
+  request/response, JSON over HTTP. The descriptor is a build artifact, not an
+  interchange format — nothing outside this workspace should read it yet, and
+  the cross-version work the format exists to enable will reshape it.
+
 - **The capability-sandboxed plugin lane (issue #1609).** Everything behind the
   `plugin-sandbox` feature — `autumn_web::plugin_sandbox` in full, including the
   sandbox **wire protocol** (`WIRE_VERSION`, its NDJSON frames), the
@@ -382,9 +395,11 @@ UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
 **Every release with a breaking change ships a migration guide** under
 [`docs/migrations/`](docs/migrations/) — pre-`1.0` that means most `0.x`
 releases, not just majors. This is enforced, not merely promised:
-`scripts/check-migration-guides.sh` fails CI when a `CHANGELOG.md` section
-declares a breaking change without a matching `docs/migrations/<version>.md`,
-or when a breaking entry does not link its guide (issue #1588). A release
+`scripts/check-migration-guides.sh` fails CI when a changelog section declares
+a breaking change without a matching `docs/migrations/<version>.md`, or when a
+breaking entry does not link its guide (issue #1588). It reads the unreleased
+notes from their own files under `changelog.d/`, so the gate fires on the PR
+that makes the break. A release
 without an upgrade path is treated as a broken build.
 
 The guide is written against the
@@ -404,7 +419,9 @@ Draft guides are opened alongside the *first* breaking change of a cycle, as
 subsequent breaking-change PR; the draft is renamed to `<version>.md` at
 release time, so the release ships with a complete guide on day one. See
 [`docs/migrations/README.md`](docs/migrations/README.md) for the process and
-the `**Breaking:**` changelog convention.
+the `**Breaking:**` changelog convention, and
+[`changelog.d/README.md`](changelog.d/README.md) for where an unreleased entry
+is written.
 
 ## CSV import/export (issue #808)
 

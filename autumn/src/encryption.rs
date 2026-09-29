@@ -60,6 +60,8 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::KeyInit;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -163,10 +165,18 @@ pub enum Mode {
 }
 
 /// A single 32-byte AES-256 data key with its stable id.
+///
+/// Carries its [`Aes256Gcm`] cipher pre-built from `key`: `Aes256Gcm::new`
+/// runs the AES-256 round-key expansion, a fixed cost independent of the
+/// plaintext. `KeyRing` is built once at startup and reused for the life of
+/// the process, so deriving `DataKey`s once here — instead of re-running
+/// `KeyInit::new_from_slice` on every [`KeyRing::encrypt`]/[`KeyRing::decrypt`]
+/// call — pays that cost once per key instead of once per call.
 #[derive(Clone)]
 pub struct DataKey {
     id: u32,
     key: [u8; 32],
+    cipher: Aes256Gcm,
 }
 
 impl std::fmt::Debug for DataKey {
@@ -174,7 +184,8 @@ impl std::fmt::Debug for DataKey {
         f.debug_struct("DataKey")
             .field("id", &format_args!("{:#010x}", self.id))
             .field("key", &"[REDACTED]")
-            .finish()
+            // `cipher` is derived entirely from `key`, already redacted above.
+            .finish_non_exhaustive()
     }
 }
 
@@ -221,7 +232,8 @@ fn derive_data_key(master: &[u8; 32], salt: &[u8], domain: &[u8]) -> DataKey {
         h.finalize()
     };
     let id = u32::from_be_bytes([id_digest[0], id_digest[1], id_digest[2], id_digest[3]]);
-    DataKey { id, key }
+    let cipher = Aes256Gcm::new_from_slice(&key).expect("32-byte key");
+    DataKey { id, key, cipher }
 }
 
 /// A resolved set of data keys: the current key, any retired keys (for reads
@@ -320,8 +332,8 @@ impl KeyRing {
     /// Panics if the operating system's random number generator is unavailable
     /// (randomized mode only).
     pub fn encrypt(&self, mode: Mode, plaintext: &[u8]) -> Result<String, EncryptionError> {
-        use aes_gcm::aead::{Aead, KeyInit};
-        use aes_gcm::{Aes256Gcm, Nonce};
+        use aes_gcm::Nonce;
+        use aes_gcm::aead::Aead;
         use base64::Engine as _;
 
         let (mode_byte, data_key, nonce_bytes) = match mode {
@@ -344,8 +356,8 @@ impl KeyRing {
             }
         };
 
-        let cipher = Aes256Gcm::new_from_slice(&data_key.key).expect("32-byte key");
-        let ciphertext = cipher
+        let ciphertext = data_key
+            .cipher
             .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
             .expect("AES-GCM encryption cannot fail for valid inputs");
 
@@ -373,11 +385,12 @@ impl KeyRing {
     ///
     /// # Panics
     ///
-    /// Does not panic for any envelope input; the internal cipher construction
-    /// is infallible because data keys are always 32 bytes.
+    /// Does not panic for any envelope input; the selected `DataKey`'s cipher
+    /// is already built (construction is infallible because data keys are
+    /// always 32 bytes).
     pub fn decrypt(&self, envelope: &str) -> Result<Vec<u8>, EncryptionError> {
-        use aes_gcm::aead::{Aead, KeyInit};
-        use aes_gcm::{Aes256Gcm, Nonce};
+        use aes_gcm::Nonce;
+        use aes_gcm::aead::Aead;
         use base64::Engine as _;
 
         let raw = base64::engine::general_purpose::STANDARD
@@ -402,8 +415,8 @@ impl KeyRing {
         let data_key = self
             .find_key(mode, key_id)
             .ok_or(EncryptionError::UnknownKeyId(key_id))?;
-        let cipher = Aes256Gcm::new_from_slice(&data_key.key).expect("32-byte key");
-        cipher
+        data_key
+            .cipher
             .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
             .map_err(|_| EncryptionError::DecryptionFailed)
     }

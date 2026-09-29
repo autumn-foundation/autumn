@@ -321,6 +321,66 @@ fn destroy_scaffold_keeps_the_shared_migration_another_model_still_needs() {
     assert!(photo.contains("#[commentable("), "{photo}");
 }
 
+/// Issue #2265: a hard-deleted parent has no foreign key to cascade from.
+/// So the scaffold must write its own cleanup trigger into the parent's
+/// own migration — not just the shared table.
+#[test]
+fn commentable_emits_a_parent_cleanup_trigger() {
+    let (_tmp, project) = scaffolded("cmt-trigger-app");
+    let dir = migration_ending_in(&project, "_create_posts").expect("posts migration");
+
+    let up = fs::read_to_string(dir.join("up.sql")).expect("up.sql");
+    assert!(
+        up.contains("CREATE TRIGGER posts_delete_comments"),
+        "the parent's own migration must carry its cleanup trigger:\n{up}"
+    );
+    assert!(up.contains("AFTER DELETE ON posts"), "{up}");
+    assert!(
+        up.contains("EXECUTE FUNCTION comments_delete_for_parent('Post')"),
+        "the trigger must clean up only THIS model's rows:\n{up}"
+    );
+
+    let down = fs::read_to_string(dir.join("down.sql")).expect("down.sql");
+    assert!(
+        down.contains("DROP TRIGGER IF EXISTS posts_delete_comments"),
+        "{down}"
+    );
+    assert!(
+        down.find("DROP TRIGGER").unwrap() < down.find("DROP TABLE posts").unwrap(),
+        "the trigger must go before its table, not after:\n{down}"
+    );
+}
+
+/// A second commentable model must get its OWN trigger, bound to its own
+/// discriminator. It must not share the first model's trigger. A shared
+/// trigger would delete the wrong parent's comments.
+#[test]
+fn a_second_commentable_model_gets_its_own_cleanup_trigger() {
+    let (_tmp, project) = scaffolded("cmt-second-trigger-app");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Photo",
+            "caption:String",
+            "comments:commentable",
+        ],
+    );
+
+    let photo_dir = migration_ending_in(&project, "_create_photos").expect("photos migration");
+    let up = fs::read_to_string(photo_dir.join("up.sql")).expect("up.sql");
+    assert!(up.contains("CREATE TRIGGER photos_delete_comments"), "{up}");
+    assert!(
+        up.contains("EXECUTE FUNCTION comments_delete_for_parent('Photo')"),
+        "{up}"
+    );
+    assert!(
+        !up.contains("'Post'"),
+        "Photo's trigger must not reference Post's discriminator:\n{up}"
+    );
+}
+
 /// The non-scaffold generator takes the same token, so it must bring the same
 /// shared table — otherwise the model compiles and fails at runtime with
 /// `relation "comments" does not exist`.

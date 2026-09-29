@@ -333,7 +333,8 @@ violations. It runs entirely in Rust — no Node.js or browser dependency.
 # Check a running development server
 autumn check --a11y --url http://localhost:8080
 
-# Check pre-rendered HTML from a file or stdin
+# Check pre-rendered HTML. `--html` takes the markup itself, so the shell
+# reads the file — there is no file or stdin flag.
 autumn check --a11y --html "$(cat rendered.html)"
 
 # Only fail CI on Critical violations (Serious and Moderate are reported but
@@ -345,12 +346,21 @@ autumn check --a11y --url http://localhost:8080 --critical-only
 
 | Rule ID              | Severity | What it checks                                           |
 |----------------------|----------|----------------------------------------------------------|
-| `html-has-lang`      | Critical | `<html>` element has a non-empty `lang` attribute        |
+| `html-has-lang`      | Serious  | `<html>` element has a non-empty `lang` attribute        |
 | `bypass`             | Serious  | First focusable element is a skip link to `#main`        |
-| `landmark-one-main`  | Serious  | Page contains exactly one `<main>` element               |
+| `landmark-one-main`  | Moderate | Page contains exactly one `<main>` element               |
 | `image-alt`          | Critical | Every `<img>` has an `alt` attribute (may be empty)      |
 | `label`              | Critical | Every `<input>` (non-hidden) has an associated `<label>` |
-| `button-name`        | Serious  | Every `<button>` has discernible text or `aria-label`    |
+| `button-name`        | Critical | Every `<button>` has discernible text or `aria-label`    |
+
+The severity decides whether a finding stops the build, so it is worth reading
+off this table rather than assuming: **Critical** always fails, **Serious**
+fails unless you pass `--critical-only`, and **Moderate** is reported with a
+`⚠️` and never changes the exit code. `landmark-one-main` is the one to note —
+a missing or duplicated `<main>` is a warning, not a failure.
+
+`bypass` is skipped entirely when the main landmark is the first thing inside
+`<body>`: there is nothing before it to skip past, so no skip link is required.
 
 ### CI integration
 
@@ -365,26 +375,67 @@ pre-rendered snapshot:
     autumn check --a11y --url ${{ env.PREVIEW_URL }}
 ```
 
-Exit code 0 means no Critical or Serious violations. Exit code 1 means at
-least one violation was found (or `--critical-only` was set and a Critical
-violation exists).
+Exit code 0 means no Critical or Serious violations — a run whose only findings
+are Moderate reports them and still exits 0. Exit code 1 means at least one
+Critical or Serious violation was found, or, with `--critical-only`, at least
+one Critical.
 
-### Programmatic use
+### From a test
 
-`autumn-cli` exposes the checker as a library function for use in integration
-tests:
+`--html` takes markup on the command line, so a test can check a component
+without serving anything. **Pass it a whole document, not a bare fragment.**
+The checker audits a page: `html-has-lang`, `bypass` and `landmark-one-main`
+run on every input, so a naked `<form>` fails all three on the document it is
+missing rather than on anything wrong with the form.
+
+Wrapping the fragment in a three-tag shell is enough to put those rules at rest
+and leave the assertion about your markup. A `<main>` as the first thing in
+`<body>` satisfies `bypass` with no skip link — there is nothing before the
+landmark to skip:
 
 ```rust
-use autumn_cli::check::{A11yCheckOptions, run_a11y_check, print_report};
+use std::process::Command;
 
 #[test]
-fn homepage_is_accessible() {
-    let html = /* render your Markup to String */;
-    let opts = A11yCheckOptions { html: Some(html), url: None, critical_only: false };
-    let violations = run_a11y_check(&opts).expect("checker failed");
-    assert!(violations.is_empty(), "a11y violations: {violations:?}");
+fn comment_form_is_accessible() {
+    // Render your `Markup` to a String however your app does it.
+    let page = format!(
+        r#"<html lang="en"><body><main>{}</main></body></html>"#,
+        comment_form().into_string(),
+    );
+
+    let out = Command::new("autumn")
+        .args(["check", "--a11y", "--html", &page])
+        .output()
+        .expect("could not run `autumn` (on PATH? markup under the argv limit?)");
+
+    assert!(
+        out.status.success(),
+        "a11y violations:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+    );
 }
 ```
+
+The exit code is the assertion: 0 when no Critical or Serious violation was
+found, 1 otherwise, exactly as in CI above. Add `--critical-only` to let Serious
+violations pass as warnings.
+
+If your layout helper already emits the `<html>`/`<main>` shell, render through
+it instead of hand-rolling one — then the test covers the real page.
+
+**`--html` has a size ceiling, so use `--url` for whole pages.** The markup
+travels as one command-line argument, and the OS caps that: Linux rejects a
+single argument over ~128 KiB with `E2BIG`, and Windows caps the entire command
+line near 32 KiB. A full rendered page can cross either. Past the limit the
+checker never starts — `Command::output()` returns an `Err` before any audit
+runs, which is why the `expect` above does not claim a missing binary as the
+cause. For a whole page, serve it and point `--url` at it, as in the CI example
+above; keep `--html` for fragments, where the limit is not in reach.
+
+There is no library import for the checker. `autumn-cli` ships a binary and no
+`lib` target, so `use autumn_cli::…` does not resolve from another crate no
+matter how the path is spelled — run the command, as above.
 
 ---
 

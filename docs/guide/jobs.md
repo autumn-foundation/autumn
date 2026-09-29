@@ -666,7 +666,9 @@ Semantics:
   `total_deduplicated` in `/actuator/jobs` and recorded with the
   `deduplicated` job-admin status.
 - Jobs over the concurrency cap **wait** (they stay enqueued/parked and run
-  when a slot frees) — they are never dropped.
+  when a slot frees) — they are never dropped. They stay on the admin
+  dashboard's enqueued tab; Redis also marks the row "waiting on a concurrency
+  slot".
 - Keys and slots are released on success, terminal failure, **and worker
   crash**: Postgres ties them to row status recovered by the visibility
   timeout; Redis settles them in the claim-validated transition and
@@ -816,7 +818,13 @@ minutes to `DELETE` expired rows, and Redis expires keys natively via `EX`.
 The synchronous `GET /{plural}/export.csv` admin route runs inline on the
 request thread — fine for small tables, but a 50k-row export blocks the
 worker and risks tripping a proxy idle timeout. A tracked job moves that
-work off the request thread:
+work off the request thread.
+
+`autumn_web::data::csv` is behind the non-default `csv` feature:
+
+```toml
+autumn-web = { version = "0.7", features = ["csv"] }
+```
 
 ```rust,ignore
 use autumn_web::data::csv::export_csv;

@@ -1,0 +1,5 @@
+error: invalid business duration: use a form such as "2 business days"
+ --> tests/compile-fail/obligation_bad_within.rs:8:14
+  |
+8 |     within = "2 bussiness days",
+  |              ^^^^^^^^^^^^^^^^^^

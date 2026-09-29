@@ -26,7 +26,10 @@
 //!         .expect("failed to build paused sim runtime");
 //!     let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
 //!         let mut sim = ::autumn_web::sim::Sim::from_seed(seed);
-//!         runtime.block_on(async move { /* body */ })
+//!         runtime.block_on(::autumn_web::sim::__with_liveness_watchdog(
+//!             seed,
+//!             async move { /* body */ },
+//!         ))
 //!     }));
 //!     if let ::std::result::Result::Err(payload) = result {
 //!         ::std::eprintln!(
@@ -39,8 +42,7 @@
 //! ```
 //!
 //! The paused runtime (`start_paused(true)`) freezes the tokio virtual clock at
-//! start so W1 tests run deterministically; W2 will drive that clock through
-//! [`Sim`](../../autumn_web/sim/struct.Sim.html)'s `SimClock` handle.
+//! start so tests run deterministically. `Sim::advance` drives that clock.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -119,7 +121,12 @@ pub fn sim_test_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let __autumn_sim_result = ::std::panic::catch_unwind(
                 ::std::panic::AssertUnwindSafe(|| {
                     let #sim_pat: #sim_ty = ::autumn_web::sim::Sim::from_seed(__autumn_sim_seed);
-                    __autumn_sim_runtime.block_on(async move #body)
+                    __autumn_sim_runtime.block_on(
+                        ::autumn_web::sim::__with_liveness_watchdog(
+                            __autumn_sim_seed,
+                            async move #body,
+                        ),
+                    )
                 }),
             );
 
@@ -173,6 +180,10 @@ mod tests {
         assert!(
             rendered.contains("catch_unwind"),
             "expansion must catch the panic to print the replay line: {rendered}"
+        );
+        assert!(
+            rendered.contains("__with_liveness_watchdog"),
+            "expansion must run the body under the liveness watchdog: {rendered}"
         );
         assert!(
             rendered.contains("__seed_from_env"),

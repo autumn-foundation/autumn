@@ -75,9 +75,14 @@ async fn cookie_setter() -> (
     )
 }
 
-/// The `Extension` smuggling shape the `#[edge]` macro cannot see: an alias
-/// hides the extractor's name from the token-level refusal, so the runtime's
-/// missing-extension net has to catch it.
+/// The `Extension` smuggling shape a *hand-built* `EdgeRoute` can still reach.
+///
+/// `edge_get` refuses this at compile time now (the sealed `EdgeExtract`
+/// whitelist does not include `Extension<T>`, alias or not), so this route
+/// below is wired with plain `axum::routing::get` instead of `edge_get` — the
+/// one way left to reach this handler at all. `EdgeRoute` fields are public
+/// and hand-construction is supported (see its own doc comment), so the
+/// runtime's missing-extension net still earns its keep for that path.
 #[derive(Clone)]
 struct Smuggled;
 type Alias = axum::Extension<Smuggled>;
@@ -141,7 +146,10 @@ fn routes() -> Vec<EdgeRoute> {
         EdgeRoute {
             method: http::Method::GET,
             path: "/smuggled",
-            handler: edge_get(aliased_extension),
+            // Not `edge_get`: it would refuse `Extension<T>` at compile time.
+            // Hand-wired instead, to prove the runtime net still catches a
+            // hand-built route that skips that guard.
+            handler: axum::routing::get(aliased_extension),
             name: "aliased_extension",
             needs: &[],
         },
@@ -291,10 +299,13 @@ fn head_is_served_by_the_get_router_with_an_empty_body_and_gets_content_length()
 }
 
 #[test]
-fn an_aliased_extension_extractor_falls_through_instead_of_serving_axums_500() {
-    // Also pins axum's rejection wording: if an axum upgrade rephrases
-    // "Missing request extension", this test fails at upgrade time instead of
-    // the net silently going dead.
+fn a_hand_built_route_with_an_extension_extractor_falls_through_instead_of_serving_axums_500() {
+    // `edge_get` cannot even build this route any more — see the `/smuggled`
+    // route above, wired by hand for exactly this reason. This test is the
+    // remaining reason the runtime net still exists: a hand-built `EdgeRoute`
+    // can still reach it. Also pins axum's rejection wording: if an axum
+    // upgrade rephrases "Missing request extension", this test fails at
+    // upgrade time instead of the net silently going dead.
     let frames = drive(&[request_line(EdgeRequest::get("/smuggled"), &[])]);
 
     assert_eq!(frames.len(), 1, "{frames:?}");

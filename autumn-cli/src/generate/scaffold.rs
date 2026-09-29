@@ -1483,82 +1483,12 @@ fn plan_scaffold_with_options_impl(
             // there and rebuilds its Cargo.toml action from DISK, so an edit
             // made at this point would be silently dropped.)
 
-            // Two shared autumn-web widgets build user-facing text inside
-            // themselves, from consts and `format!`s with no parameter to route a
-            // `t!` through. The generator translates every label it passes in and
-            // can reach no further:
-            //
-            //   * `form::rich_text_area` — the toolbar's "Markdown formatting"
-            //     group label and per-control names, the "Markdown supported…"
-            //     hint, and the preview pane's "Preview".
-            //   * `widgets::transition_controls` — each button's `Mark as {to}`
-            //     and the group's `{field} transitions` aria-label.
-            //
-            // Both are free functions with positional parameters, so unlike the
-            // pager and bulk-delete widgets there is no label setter to call.
-            // Reaching them means new public API on autumn-web — a label per
-            // transition edge and per toolbar control — a framework design
-            // decision rather than a scaffold change. Refusing these columns under
-            // `--i18n` would cost more than it buys when the rest of the view does
-            // translate, so the flag does what it can and names what it could not.
-            let untranslated: Vec<(&str, &str, Vec<&Field>)> = vec![
-                (
-                    "Markdown editor",
-                    "the toolbar labels, the \"Markdown supported…\" hint, and the preview \
-                     heading come from `rich_text_area`",
-                    rich_text_fields(&fields),
-                ),
-                (
-                    "state-transition controls",
-                    "the `Mark as …` buttons and the transitions group label come from \
-                     `widgets::transition_controls`",
-                    fields
-                        .iter()
-                        .filter(|f| f.state_machine.is_some())
-                        .collect(),
-                ),
-            ];
-            for (widget, detail, affected) in untranslated {
-                if affected.is_empty() {
-                    continue;
-                }
-                plan.warn(format!(
-                    "`--i18n` translated this view's labels, but the {widget} on {} keeps \
-                     autumn-web's own chrome in English — {detail}, which takes no label \
-                     overrides yet. Everything else in the generated views goes through the \
-                     bundle.",
-                    affected
-                        .iter()
-                        .map(|f| format!("`{}`", f.name))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-
-            // Validation messages are a third surface the flag cannot reach.
-            // `#[validate(...)]` carries an optional `message`, but the `validator`
-            // crate takes it as a compile-time literal, so it can never hold a
-            // runtime `t!` lookup; with no message, autumn-web's `collect_errors`
-            // renders `validation failed: <code>`. Either way the inline error
-            // under a rejected field is English while its label is translated.
-            //
-            // Reaching it means the handler mapping error codes to lookups before
-            // building the changeset — and `into_changeset` flattens the codes away
-            // inside autumn-web, so that needs a public seam there, a
-            // code-to-message resolver, the same kind of framework API the two
-            // widgets above want. Emitting the mapping into every generated handler
-            // instead would duplicate `collect_errors`' nested and list recursion in
-            // template strings, which is worse than saying so.
-            if metadata.has_validator_rules() {
-                plan.warn(
-                    "`--i18n` translated this view's labels, but the inline messages from \
-                     `#[validate(...)]` stay English — the `validator` attribute takes a \
-                     compile-time literal, so a runtime lookup cannot go there, and an \
-                     unmessaged rule renders as `validation failed: <code>`. Translating them \
-                     needs a code-to-message seam in autumn-web's changeset conversion."
-                        .to_owned(),
-                );
-            }
+            // (#2227 closed the three gaps this block used to warn about. The
+            // Markdown editor's chrome now goes through `RichTextLabels`. The
+            // state-transition buttons go through `TransitionLabels`. The
+            // inline validation messages go through `into_changeset_with`. The
+            // one remaining gap — the CSV import report — is named where
+            // `import_enabled` is known, further down.)
 
             // A profile overlay can repoint i18n somewhere else entirely, and
             // the runtime resolves the fully layered config — so the base
@@ -1885,6 +1815,22 @@ fn plan_scaffold_with_options_impl(
              `autumn_web::data::csv::import_csv` is still available for a hand-written \
              import route; see docs/guide/generators.md."
         ));
+    }
+    // #2227: `create` and `update` now resolve each validator error code through
+    // the bundle. A rejected form shows a translated message under a translated
+    // label. The CSV import report shows the same messages but cannot translate
+    // them: `import_csv` calls its row handler once per line, far from the
+    // request, so there is no locale to look the message up in. The report an
+    // operator reads after an upload keeps `validation failed: <code>` in
+    // English.
+    if options_with_key.i18n && import_enabled && metadata.has_validator_rules() {
+        plan.warn(
+            "`--i18n` translates the inline `#[validate(...)]` messages on the create and \
+             update forms, but the CSV import report keeps them in English — the row handler \
+             runs per line, with no request locale to look a message up in. Write your own \
+             import route if that report must be translated too."
+                .to_owned(),
+        );
     }
     // Issue #1332: the trash view + restore/purge controls. Must agree exactly
     // with the `trash_enabled` gate in `render_routes_file` (plus `--api`, which
@@ -3048,7 +2994,51 @@ pub(super) fn render_repository_for_pull(
     )
 }
 
-#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
+/// Warden 2026-09-13: `owner = <col>` on its own does not gate the
+/// auto-generated `api = "..."` CRUD routes at all — only `policy = Type`
+/// does (`GET`/`PUT`/`DELETE <api>/{id}` have no `scope`/`owner`-driven
+/// check; only `has_policy` gates them). `#[repository]` now refuses this
+/// exact combination at compile time (`autumn-macros/src/repository.rs`).
+///
+/// The scaffold's call site only ever passes `owner_column: Some(..)` when
+/// `authorize_wiring` held, which itself requires `policy_on` — i.e. a
+/// `{pascal_name}Policy` is already being generated and registered on the
+/// app in every case that reaches here. So wiring it in is not new
+/// authorization, only completing what the doc comment already told the
+/// developer to do by hand ("reference it from `#[repository(..., policy =
+/// Policy)]` to guard the JSON mutating API too") — for the one path
+/// (owner-scoped, non-sharded, non-live) where the scaffold can do it
+/// automatically because the policy's shape (owner-comparing
+/// `can_show`/`can_update`/`can_delete`) is already known.
+///
+/// `policy = ...` parses as a bare `Ident`, not a path (see
+/// `parse_repo_args`), so the returned attribute names the type unqualified
+/// and the returned `use` import brings it into scope.
+///
+/// Returns `(owner_attr, policy_attr, policy_use)`, each empty when
+/// `owner_column` is `None`.
+fn owner_policy_wiring(
+    owner_column: Option<&str>,
+    pascal_name: &str,
+    snake_name: &str,
+) -> (String, String, String) {
+    owner_column.map_or_else(
+        || (String::new(), String::new(), String::new()),
+        |col| {
+            (
+                format!(", owner = {col}"),
+                format!(", policy = {pascal_name}Policy"),
+                format!("use crate::policies::{snake_name}::{pascal_name}Policy;\n"),
+            )
+        },
+    )
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)] // one straight-line template builder, like its siblings elsewhere in this file
 fn render_repository_file(
     pascal_name: &str,
     snake_name: &str,
@@ -3068,11 +3058,22 @@ fn render_repository_file(
     // When `broadcasts = true` is set, `#[repository]` synthesizes internal
     // hooks whose generated `update` body expands an unqualified
     // `{Pascal}DraftExt::from_patch(...)`. Import that trait alongside the other
-    // model types so the generated repository compiles (issue #1853). Gated on
-    // the same `live` boolean that drives `broadcasts_attr` — the default
-    // (non-broadcast) scaffold emits no hooks and no `from_patch`, so it keeps
-    // the plain three-name import.
-    let draft_ext_import = if live {
+    // model types so the generated repository compiles (issue #1853).
+    //
+    // Warden 2026-09-13: the macro's `_api_update` handler does the same thing
+    // whenever `policy = Type` is present (`has_policy`, issue #1801's
+    // merged-model validation) — and `api = "/api/{plural}"` is unconditional
+    // in this function's template (the `api` bool param below only toggles
+    // the doc comment/fragment content, never whether the attribute carries
+    // `api = ...`), so `has_policy` is live whenever `owner_column.is_some()`
+    // (`owner_policy_wiring` above always wires a `policy = Type` alongside
+    // `owner = <col>`) — on EVERY owner-scoped scaffold, `--api` or not. So
+    // the import is needed whenever EITHER drives `has_policy`: `live`
+    // (broadcasts) or `owner_column.is_some()` (policy). Caught by CI's
+    // `owner-searchable`/`nullable-owner-searchable`/`attachment-owner`/
+    // `policy-scaffold` generator-conformance jobs (E0405: `PostDraftExt` not
+    // found) after an earlier cut of this fix wrongly gated on `api` too.
+    let draft_ext_import = if live || owner_column.is_some() {
         format!(", {pascal_name}DraftExt")
     } else {
         String::new()
@@ -3081,13 +3082,12 @@ fn render_repository_file(
     // `search_page(query, &PageRequest)` methods (backed by the model's
     // `#[searchable]` fields + the migration's `search_vector` column).
     let searchable_attr = if searchable { ", searchable" } else { "" };
-    // Issue #1841: `owner = <col>` makes `#[repository]` emit owner-filtered
-    // `list_scoped` / `search_page_scoped` methods that the owner-scoped index +
-    // `/search` handlers call so they never return another user's rows. Only the
-    // caller's in-scope standard Db path passes `Some`; every other scaffold
-    // (no owner column, `--no-policy`, `--live`, `--sharded`) passes `None` and
-    // the attr — and the scoped methods — are omitted.
-    let owner_attr = owner_column.map_or(String::new(), |col| format!(", owner = {col}"));
+    // Issue #1841 + Warden 2026-09-13 (see `owner_policy_wiring`'s doc comment):
+    // `owner = <col>` + `policy = <Type>` make `#[repository]` emit owner-filtered
+    // `list_scoped`/`search_page_scoped` and gate the auto-API. Only the caller's
+    // in-scope standard Db path passes `Some`; every other scaffold passes `None`.
+    let (owner_attr, policy_attr, policy_use) =
+        owner_policy_wiring(owner_column, pascal_name, snake_name);
     // Issue #1358: a `position`/`position{{scope:col}}` DSL field wires
     // `position(column = "...", scope = "...")` into the generated
     // `#[repository(...)]` attribute, which is what actually generates the
@@ -3204,8 +3204,9 @@ fn render_repository_file(
         "{doc_comment}\n\
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{draft_ext_import}}};\n\
          use crate::schema::{plural};\n\
+         {policy_use}\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr}{position_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr}{searchable_attr}{owner_attr}{policy_attr}{position_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
@@ -3758,6 +3759,19 @@ fn render_routes_file(
     } else {
         ""
     };
+    // Referenced two ways: the i18n `delete_confirm_js` JS-escaping `@let`
+    // (see the comment at its definition) uses `serde_json::to_string`, and
+    // `into_new`'s JSON-field arms (see `FieldKind::Json` below) parse into
+    // bare `serde_json::Value` — the base project template has no direct
+    // `serde_json` dependency, only autumn-web's re-export. Importing it
+    // unconditionally left every scaffold with neither i18n nor a JSON field
+    // (the documented, default case) with an unused import.
+    let has_json_field = fields.iter().any(|f| f.kind == FieldKind::Json);
+    let serde_json_import = if labels.enabled() || has_json_field {
+        "use autumn_web::reexports::serde_json;\n"
+    } else {
+        ""
+    };
     // Empty-state copy. `DataTableConfig::new` takes `&str`, and the config is a
     // temporary borrowed only for the `data_table(...)` call, so an inline
     // `&t!(…)` is fine here — no binding needed.
@@ -4001,6 +4015,22 @@ fn render_routes_file(
     let lock_version_ty: String = lock_version.map(Field::rust_type).unwrap_or_default();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
+    // With no nullable (or synthetic constrained-required-numeric) fields,
+    // `render_nullable_field_match` renders a bare `false` that never reads
+    // its `name` argument — the overwhelmingly common case for a first
+    // scaffold, since every documented example field is required. Name the
+    // parameter `_name` in exactly that case so the generated helper compiles
+    // without an unused-variable warning; every other case still binds `name`,
+    // matching the `matches!(name, ...)` body `render_nullable_field_match`
+    // emits.
+    let nullable_form_field_param = if fields
+        .iter()
+        .any(|f| f.nullable || is_constrained_required_numeric(f))
+    {
+        "name"
+    } else {
+        "_name"
+    };
     let has_attachments = has_attachment_fields(fields);
     // Issue #1125/#1830: inline record-level authorization on the mutating HTML
     // handlers + owner-scoped index. The caller sets `authorize` whenever an
@@ -4104,6 +4134,11 @@ fn render_routes_file(
     } else {
         (String::new(), String::new())
     };
+    // #2227: how `create`/`update` build their changeset. Without `--i18n` this
+    // is plain `form.into_changeset()`. With it, a resolver turns each
+    // validator error code into a bundle lookup, so the inline error matches
+    // the translated label above it.
+    let changeset_build = render_changeset_build(snake_name, fields, validations, labels);
     let export_csv_text = if export_enabled {
         labels.lit("common.export.csv", "Export CSV")
     } else {
@@ -4392,6 +4427,17 @@ fn render_routes_file(
                 let _ = write!(out, ", {ty}");
                 out
             });
+    // `Update{pascal_name}` is only constructed below by `update_stmt`'s
+    // `--live` branch (`render_update_changeset_expr`) — the default,
+    // non-`--live` path writes the update through a raw `diesel::update(...)`
+    // column tuple (`render_update_columns`) and never names the type. Import
+    // it only when `--live` will actually reference it, or every non-`--live`
+    // scaffold (the documented default) carries an unused import.
+    let update_model_import: String = if live {
+        format!(", Update{pascal_name}")
+    } else {
+        String::new()
+    };
     // The destroy handler must honour the resource's delete semantics: when the
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
@@ -5777,7 +5823,7 @@ mod attachment_read_back_tests {{
          use autumn_web::reexports::axum::response::IntoResponse as _;\n    \
          {authz_create_call}\
          {form_decode_block}\n    \
-         let changeset = form.into_changeset();\n    \
+         let changeset = {changeset_build};\n    \
          if !changeset.is_valid() {{\n        \
          {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {new_form_body}).into_response());\n    \
          }}\n    \
@@ -6003,7 +6049,7 @@ mod attachment_read_back_tests {{
          {update_lock_version_preamble}\
          {form_decode_block}\n    \
          {update_load_and_authorize_block}\
-         let changeset = form.into_changeset();\n    \
+         let changeset = {changeset_build};\n    \
          if !changeset.is_valid() {{\n        \
          {blob_cleanup}return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, {edit_form_body}).into_response());\n    \
          }}\n    \
@@ -7850,14 +7896,13 @@ pub async fn search(
 use autumn_web::extract::Path;
 {i18n_imports}use autumn_web::pagination::{{Page, PageRequest}};
 {sort_imports}use autumn_web::reexports::axum::body::Bytes;
-use autumn_web::reexports::serde_json;
-use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
+{serde_json_import}use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
 use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 {db_import}
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{enum_import_suffix}}};
+use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}{update_model_import}{enum_import_suffix}}};
 use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
 use crate::schema::{schema_import};",
         attachment_note = if has_attachments {
@@ -7972,13 +8017,25 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             } else {
                 format!("mut db: {db_ty}")
             };
+            let show_transition_label_binds =
+                render_show_transition_label_binds(&sm_fields, snake_name, labels);
+            // #2227: the group label and each button's text come from
+            // autumn-web. Under `--i18n` the `_with_labels` variant takes them
+            // from the bundle instead. The bindings sit above the `html!`
+            // block (see `render_show_transition_label_binds`), because
+            // `TransitionLabels` borrows them.
             let mut show_transition_controls = String::new();
             for f in &sm_fields {
                 let field = &f.name;
                 let field_upper = f.name.to_uppercase();
+                let (variant, labels_arg) = if labels.enabled() {
+                    ("_with_labels", format!(", &l_tr_{field}_labels"))
+                } else {
+                    ("", String::new())
+                };
                 let _ = writeln!(
                     show_transition_controls,
-                    "        (autumn_web::widgets::transition_controls(&paths::transition_{field}(row.id), \"{field}\", &row.{field}, {pascal_name}::__AUTUMN_SM_{field_upper}_TRANSITIONS, |to| row.can_transition_{field}_to(to), csrf, csrf_field))"
+                    "        (autumn_web::widgets::transition_controls{variant}(&paths::transition_{field}(row.id), \"{field}\", &row.{field}, {pascal_name}::__AUTUMN_SM_{field_upper}_TRANSITIONS, |to| row.can_transition_{field}_to(to), csrf, csrf_field{labels_arg}))"
                 );
             }
             let show_view_fn = format!(
@@ -7992,7 +8049,7 @@ async fn show_view(
     csrf: Option<&CsrfToken>,
     csrf_field: Option<&CsrfFormField>,{show_view_state_param}
 ) -> AutumnResult<Markup> {{
-{show_label_loads}{show_view_attachment_url_binds}{show_prop_binds}    let props: Vec<(&str, maud::Markup)> = vec![
+{show_label_loads}{show_view_attachment_url_binds}{show_prop_binds}{show_transition_label_binds}    let props: Vec<(&str, maud::Markup)> = vec![
 {show_rows}    ];
     Ok({layout_fn}({show_view_title}, {cp_show}flash, html! {{
         h1 {{ {show_view_heading} }}
@@ -8368,7 +8425,7 @@ pub async fn destroy(
     Ok(form)
 }}
 
-fn is_nullable_form_field(name: &str) -> bool {{
+fn is_nullable_form_field({nullable_form_field_param}: &str) -> bool {{
     {nullable_field_match}
 }}
 {lock_version_parser}"#
@@ -8900,6 +8957,78 @@ fn rich_text_fields(fields: &[Field]) -> Vec<&Field> {
     fields.iter().filter(|f| f.kind.is_rich_text()).collect()
 }
 
+/// The Markdown toolbar above a rich-text editor, as
+/// `(key, English name, Markdown syntax)` (issue #2227). Mirrors
+/// `RICH_TEXT_TOOLBAR` in `autumn-web`, entry for entry.
+///
+/// Only the NAME goes through the bundle. A Markdown marker such as `**bold**`
+/// is the syntax the user must type. It reads the same in every locale, so it
+/// stays a literal. The keys are `common.*` because the toolbar reads the same
+/// above every rich-text column in a project.
+const RICH_TEXT_CHROME_CONTROLS: &[(&str, &str, &str)] = &[
+    ("common.richtext.bold", "Bold", "**bold**"),
+    ("common.richtext.italic", "Italic", "_italic_"),
+    ("common.richtext.link", "Link", "[text](url)"),
+    ("common.richtext.code", "Code", "`code`"),
+    ("common.richtext.list", "List", "- item"),
+    ("common.richtext.heading", "Heading", "# Heading"),
+    ("common.richtext.quote", "Quote", "> quote"),
+];
+
+/// The hint under a rich-text editor, as `autumn-web` writes it. Kept here
+/// verbatim so an `en` app reads the same with the flag on or off.
+const RICH_TEXT_CHROME_HINT: &str =
+    "Markdown supported. HTML is not allowed and is shown as plain text.";
+
+/// Emit the `let l_rt_… = …;` bindings the `--i18n` form helper hands to
+/// `RichTextLabels` (issue #2227). This returns an empty string without the
+/// flag, and for a scaffold with no rich-text column. Either way, the plain
+/// output is unchanged.
+///
+/// This uses one binding per label, not one builder chain. `RichTextLabels`
+/// borrows every string. A `t!(locale, …)` temporary built inside a chain
+/// would drop before the form uses it.
+fn render_rich_text_label_binds(fields: &[Field], labels: &scaffold_i18n::ViewLabels) -> String {
+    use std::fmt::Write as _;
+    if !labels.enabled() || !has_rich_text_fields(fields) {
+        return String::new();
+    }
+    let mut out = String::with_capacity(RICH_TEXT_CHROME_CONTROLS.len() * 80 + 400);
+    let _ = writeln!(
+        out,
+        "    let l_rt_toolbar = {};",
+        labels.lit("common.richtext.toolbar", "Markdown formatting")
+    );
+    let _ = writeln!(
+        out,
+        "    let l_rt_hint = {};",
+        labels.lit("common.richtext.hint", RICH_TEXT_CHROME_HINT)
+    );
+    let _ = writeln!(
+        out,
+        "    let l_rt_preview = {};",
+        labels.lit("common.richtext.preview", "Preview")
+    );
+    let mut entries = String::new();
+    for (key, english, syntax) in RICH_TEXT_CHROME_CONTROLS {
+        // The key's last segment names the binding, so the generated source
+        // reads as the toolbar does.
+        let ident = key.rsplit('.').next().unwrap_or(key);
+        let _ = writeln!(out, "    let l_rt_{ident} = {};", labels.lit(key, english));
+        let _ = write!(entries, "\n        (l_rt_{ident}.as_str(), \"{syntax}\"),");
+    }
+    let _ = writeln!(out, "    let l_rt_controls = [{entries}\n    ];");
+    let _ = writeln!(
+        out,
+        "    let l_rt_labels = autumn_web::form::RichTextLabels::new()\n        \
+         .toolbar_group(&l_rt_toolbar)\n        \
+         .controls(&l_rt_controls)\n        \
+         .hint(&l_rt_hint)\n        \
+         .preview_heading(&l_rt_preview);"
+    );
+    out
+}
+
 /// Emit the `FormModel` delegation impl for the generated `{Pascal}Form`
 /// (issue #1135). `form_for` derives its controls from the changeset's own
 /// type, and the `#[model]` derive already produces the field descriptors on
@@ -9057,12 +9186,23 @@ fn render_form_for_helper(
                 } else {
                     "required_rich_text_area_htmx_with_token_field"
                 };
+                // #2227: autumn-web builds the editor's own chrome — the
+                // toolbar, the hint, and the preview heading. Under `--i18n`
+                // the `_with_labels` variant takes it from the bundle instead.
+                // `l_rt_labels` is bound once above the form (see
+                // `render_rich_text_label_binds`), because the chrome reads the
+                // same for every rich-text column.
+                let (variant, labels_arg) = if labels.enabled() {
+                    ("_with_labels", ", &l_rt_labels")
+                } else {
+                    ("", "")
+                };
                 let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                 let _ = write!(
                     appends,
-                    "\n        .append(autumn_web::form::{helper}(\
+                    "\n        .append(autumn_web::form::{helper}{variant}(\
                      changeset, \"{name}\", {label}, &paths::preview_{name}(), \
-                     submit_field.map_or(\"_submit_token\", |f| f.0.as_str())))"
+                     submit_field.map_or(\"_submit_token\", |f| f.0.as_str()){labels_arg}))"
                 );
             }
             FieldKind::Decimal { scale, .. } => {
@@ -9279,6 +9419,10 @@ fn render_form_for_helper(
             }
         }
     }
+    // #2227: one set of chrome bindings for every rich-text column in the form.
+    // This is appended after the per-field loop, so it always sits last in
+    // `preludes`. That keeps the emitted order stable.
+    preludes.push_str(&render_rich_text_label_binds(fields, labels));
     // Issue #1326: a `:states(…)` state-machine column is transition-only. The
     // create form keeps it (initial state), but the EDIT form must not offer it
     // as an editable input — status changes flow only through the dedicated
@@ -11205,7 +11349,15 @@ fn render_csv_import_section(
             ),
             "\n        if !discarded_seen {\n            \
              discarded_seen = CSV_DISCARDED_COLUMNS.iter().any(|column| {\n                \
-             row.get(*column).is_some_and(|value| !value.trim().is_empty())\n            \
+             row.iter().any(|(key, value)| {\n                    \
+             // The row map is keyed by the header's RAW names, while the\n                    \
+             // header check and the decoder below both trim — a file headed\n                    \
+             // `title, tag` (the space RFC 4180 keeps) decodes fine but\n                    \
+             // `row.get(\"tag\")` would miss the `\" tag\"` entry and the\n                    \
+             // alert would never fire. Probe the trimmed keys so all three\n                    \
+             // consumers agree about what a column is called.\n                    \
+             key.trim() == *column && !value.trim().is_empty()\n                \
+             })\n            \
              });\n        }"
                 .to_owned(),
             [
@@ -11755,6 +11907,79 @@ fn render_show_property_label_binds(
     out
 }
 
+/// Emit the `let l_tr_… = …;` bindings `show_view` hands to
+/// `TransitionLabels`, one group label per state-machine column plus one button
+/// label per DISTINCT target state (issue #2227). Empty without `--i18n`.
+///
+/// Per distinct target state, not per edge. Two edges that end at the same
+/// state share one button. A key per edge would define a translation the view
+/// never reads.
+///
+/// The keys are per model, per field, and per state, unlike the rich-text
+/// chrome. A state token such as `published` reads differently beside each
+/// column it belongs to, so one shared key could not serve them all.
+///
+/// The button labels are built in `l_tr_{field}_texts`, and
+/// `l_tr_{field}_buttons` borrows from it. `TransitionLabels` borrows too, so
+/// a `t!(locale, …)` temporary built directly in the array would drop before
+/// the view uses it.
+fn render_show_transition_label_binds(
+    sm_fields: &[&Field],
+    snake_name: &str,
+    labels: &scaffold_i18n::ViewLabels,
+) -> String {
+    use std::fmt::Write as _;
+    if !labels.enabled() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for f in sm_fields {
+        let field = &f.name;
+        let Some(sm) = f.state_machine.as_ref() else {
+            continue;
+        };
+        let mut targets: Vec<&str> = Vec::new();
+        for edge in &sm.transitions {
+            if !targets.contains(&edge.to.as_str()) {
+                targets.push(edge.to.as_str());
+            }
+        }
+        let _ = writeln!(
+            out,
+            "    let l_tr_{field}_group = {};",
+            labels.lit(
+                &format!("{snake_name}.field.{field}.transitions"),
+                &format!("{field} transitions")
+            )
+        );
+        let mut texts = String::new();
+        let mut buttons = String::new();
+        for (index, to) in targets.iter().enumerate() {
+            let _ = write!(
+                texts,
+                "\n        {},",
+                labels.lit(
+                    &format!("{snake_name}.field.{field}.transition.{to}"),
+                    &format!("Mark as {to}")
+                )
+            );
+            let _ = write!(
+                buttons,
+                "\n        (\"{to}\", l_tr_{field}_texts[{index}].as_str()),"
+            );
+        }
+        let _ = writeln!(out, "    let l_tr_{field}_texts = [{texts}\n    ];");
+        let _ = writeln!(out, "    let l_tr_{field}_buttons = [{buttons}\n    ];");
+        let _ = writeln!(
+            out,
+            "    let l_tr_{field}_labels = autumn_web::widgets::TransitionLabels::new()\n        \
+             .group(&l_tr_{field}_group)\n        \
+             .buttons(&l_tr_{field}_buttons);"
+        );
+    }
+    out
+}
+
 /// Emit the `let {name}_label: String = …;` bindings the `show` handler
 /// evaluates before building its `props`, one per `references` field with a
 /// resolved display column (issue #1146). Each does a single per-view lookup
@@ -11879,6 +12104,97 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
+/// The error code the `validator` crate reports for one `#[validate(…)]` rule,
+/// or `None` when the rule carries its own `message` (issue #2227).
+///
+/// The code is the rule's own name — the token before any `(`. So `email` gives
+/// `email` and `length(min = 5)` gives `length`, which is what `e.code` holds at
+/// runtime.
+///
+/// A rule with an explicit `message` never reaches the resolver: autumn-web
+/// keeps that message. An arm for it would define a key nothing ever reads, and
+/// a translator would work on text the app never shows.
+fn validator_code_for_rule(rule: &str) -> Option<&str> {
+    if rule.replace(' ', "").contains("message=") {
+        return None;
+    }
+    let code = rule.split('(').next().unwrap_or(rule).trim();
+    (!code.is_empty()).then_some(code)
+}
+
+/// The expression `create`/`update` build their changeset from (issue #2227).
+///
+/// Without `--i18n` this is the plain `form.into_changeset()`, so the output is
+/// unchanged. With it, the handler passes a resolver with one arm per
+/// `(field, code)` pair the model's rules can produce. Each arm looks the
+/// message up in the bundle.
+///
+/// The English default is the EXACT text autumn-web renders today
+/// (`validation failed: <code>`), so an `en` app reads the same either way. A
+/// translator can still improve the wording in their own locale file.
+fn render_changeset_build(
+    snake_name: &str,
+    fields: &[Field],
+    validations: &BTreeMap<String, Vec<String>>,
+    labels: &scaffold_i18n::ViewLabels,
+) -> String {
+    use std::fmt::Write as _;
+    const PLAIN: &str = "form.into_changeset()";
+    if !labels.enabled() {
+        return PLAIN.to_owned();
+    }
+    let mut arms = String::new();
+    for f in fields {
+        let name = &f.name;
+        let mut codes: Vec<&str> = Vec::new();
+        // A constrained required numeric carries an implicit `required` rule
+        // that `render_model_form` writes, so it is absent from `validations`.
+        if is_constrained_required_numeric(f) {
+            codes.push("required");
+        }
+        for rule in validations.get(name).into_iter().flatten() {
+            if let Some(code) = validator_code_for_rule(rule)
+                && !codes.contains(&code)
+            {
+                codes.push(code);
+            }
+        }
+        for code in codes {
+            let _ = write!(
+                arms,
+                "\n        (\"{name}\", \"{code}\") => Some({}),",
+                labels.lit(
+                    &format!("{snake_name}.field.{name}.error.{code}"),
+                    &format!("validation failed: {code}")
+                )
+            );
+        }
+    }
+    // A model with no rule has nothing to resolve. An empty match would also
+    // leave both closure parameters unused, which the generated crate warns on.
+    if arms.is_empty() {
+        return PLAIN.to_owned();
+    }
+    format!(
+        "form.into_changeset_with(|field, code| match (field, code) {{{arms}\n        _ => None,\n    }})"
+    )
+}
+
+/// Whether `f`'s Rust type implements `Copy`, restricted to the primitive
+/// kinds this generator is certain are `Copy` regardless of nullability
+/// (`Option<T>` is `Copy` whenever `T` is). Used only to decide whether
+/// [`render_update_columns`] needs a `.clone()` to move a field out of a
+/// shared `&New{Model}` reference — deliberately conservative: every other
+/// `FieldKind` (`String`, `Uuid`, `Decimal`, …) keeps its `.clone()` even
+/// where the underlying type happens to also be `Copy`, since verifying that
+/// per-kind is not this helper's job.
+const fn is_copy_field_kind(f: &Field) -> bool {
+    matches!(
+        f.kind,
+        FieldKind::Bool | FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+    )
+}
+
 /// A required numeric carrying a `{min,max}` range (issue #1388) that is
 /// represented as `Option<T>` on the form struct (issue #1748). Extracted so
 /// both the struct/`into_new` emission in [`render_model_form`] and the
@@ -11961,6 +12277,13 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
                 name = f.name,
                 wrapper = encryption_wrapper_type(mode),
             ),
+            None if is_copy_field_kind(f) => {
+                // `clippy::clone_on_copy`: `new` is only ever a shared
+                // reference here, but a `Copy` field (`bool`, `i32`, …) can be
+                // read out of it directly — `.clone()` would just be a
+                // same-cost copy through a different name.
+                write!(out, "{plural}::{name}.eq(new.{name})", name = f.name)
+            }
             None => write!(
                 out,
                 "{plural}::{name}.eq(new.{name}.clone())",
@@ -15630,7 +15953,11 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(routes.contains("use crate::models::post::{Post, NewPost, UpdatePost};"));
+        // Non-`--live` scaffolds write updates through a raw diesel column
+        // tuple, never constructing `UpdatePost` — importing it unconditionally
+        // left every non-`--live` scaffold with an unused import (Onramp).
+        assert!(routes.contains("use crate::models::post::{Post, NewPost};"));
+        assert!(!routes.contains("UpdatePost"), "{routes}");
         assert!(routes.contains("#[get(\"/posts\")]"));
         assert!(routes.contains("#[get(\"/posts/{id}\")]"));
         assert!(
@@ -15668,6 +15995,58 @@ async fn main() {
         assert!(!routes.contains("#[delete("));
         // The HTML delete route must be present and use POST (not DELETE).
         assert!(routes.contains(r#"#[post("/posts/{id}/delete", name = "delete")]"#));
+    }
+
+    /// Companion to `execute_writes_a_routes_file_referencing_model`: a
+    /// `--live` scaffold's `update_stmt` DOES construct `Update{Model}`
+    /// (`render_update_changeset_expr`), so its import must stay — this is
+    /// the one branch `update_model_import` must render non-empty.
+    #[test]
+    fn live_scaffold_routes_file_imports_update_model() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("use crate::models::post::{Post, NewPost, UpdatePost};"),
+            "{routes}"
+        );
+        assert!(routes.contains("UpdatePost {"), "{routes}");
+    }
+
+    /// A nullable field flips `is_nullable_form_field`'s body from a bare
+    /// `false` to a real `matches!` on its `name` argument — the parameter
+    /// must be named (not `_name`) in exactly this case, or the match arm
+    /// itself would not compile.
+    #[test]
+    fn scaffold_with_nullable_field_names_the_form_field_param() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "subtitle:Option<String>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("fn is_nullable_form_field(name: &str) -> bool {"),
+            "{routes}"
+        );
+        assert!(routes.contains("matches!(name, \"subtitle\")"), "{routes}");
     }
 
     // ── enum field: form widgets, boundary validation, imports (issue #1030) ─
@@ -15750,8 +16129,10 @@ async fn main() {
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Non-`--live` (see `execute_writes_a_routes_file_referencing_model`):
+        // no `UpdatePost` import.
         assert!(
-            routes.contains("use crate::models::post::{Post, NewPost, UpdatePost, Status};"),
+            routes.contains("use crate::models::post::{Post, NewPost, Status};"),
             "got:\n{routes}"
         );
     }
@@ -18769,8 +19150,15 @@ async fn main() {
         // scoped methods.
         let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
         assert!(
-            repo.contains(", owner = user_id)"),
+            repo.contains(", owner = user_id"),
             "owner-scoped repository must carry `owner = user_id` on the attr: {repo}"
+        );
+        // Warden 2026-09-13: `owner = ...` alone does not gate `api = "..."`'s
+        // CRUD routes — the scaffold must also wire in the generated policy.
+        assert!(
+            repo.contains(", policy = PostPolicy)")
+                && repo.contains("use crate::policies::post::PostPolicy;"),
+            "owner-scoped repository must also carry `policy = ...` or it no longer compiles: {repo}"
         );
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
@@ -25545,12 +25933,12 @@ exempt_paths = [
         );
     }
 
-    /// The Markdown editor's own chrome lives in autumn-web, behind no
-    /// parameter this generator can route a `t!` through, so an `--i18n`
-    /// scaffold with a `richtext` column translates everything EXCEPT that
-    /// widget. Silence would be the bug — the flag promises the whole view.
+    /// #2227: the Markdown editor's chrome now reaches the bundle through
+    /// `RichTextLabels`. The view looks up the toolbar, the hint, and the
+    /// preview heading like every other label. The flag used to warn here
+    /// instead.
     #[test]
-    fn i18n_says_so_when_the_rich_text_editor_keeps_english_chrome() {
+    fn i18n_translates_the_rich_text_editor_chrome() {
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -25560,52 +25948,140 @@ exempt_paths = [
             &i18n_options(),
         )
         .unwrap();
-
-        let warning = plan
-            .warnings
-            .iter()
-            .find(|w| w.contains("Markdown editor"))
-            .unwrap_or_else(|| panic!("no rich-text warning in {:?}", plan.warnings));
         assert!(
-            warning.contains("`body`"),
-            "must name the column: {warning}"
+            !plan.warnings.iter().any(|w| w.contains("Markdown editor")),
+            "the editor is translated now, so nothing to warn about: {:?}",
+            plan.warnings
+        );
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+
+        assert!(
+            routes.contains(
+                "required_rich_text_area_htmx_with_token_field_with_labels(changeset, \"body\""
+            ),
+            "the editor must take the labels variant:\n{routes}"
+        );
+        assert!(
+            routes.contains(".preview_heading(&l_rt_preview)")
+                && routes.contains(".toolbar_group(&l_rt_toolbar)")
+                && routes.contains(".controls(&l_rt_controls)")
+                && routes.contains(".hint(&l_rt_hint)"),
+            "every chrome label must be passed in:\n{routes}"
+        );
+        for key in [
+            "common.richtext.toolbar",
+            "common.richtext.hint",
+            "common.richtext.preview",
+            "common.richtext.bold",
+            "common.richtext.quote",
+        ] {
+            assert!(
+                routes.contains(&format!("t!(locale, \"{key}\")")),
+                "{key} must be looked up:\n{routes}"
+            );
+        }
+        // The Markdown syntax is what the user types, so it stays as it is.
+        assert!(
+            routes.contains("\"**bold**\"") && routes.contains("\"> quote\""),
+            "the syntax hints must stay literal:\n{routes}"
         );
 
-        // A scaffold without one says nothing.
-        let tmp2 = project_with_main(default_main());
-        let without_rich_text = plan_scaffold_with_options(
-            tmp2.path(),
-            "Post",
-            &["title:String".into()],
-            "20260501000000",
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(
+            ftl.contains("common.richtext.toolbar = Markdown formatting"),
+            "{ftl}"
+        );
+        assert!(ftl.contains("common.richtext.preview = Preview"), "{ftl}");
+        assert!(ftl.contains("common.richtext.bold = Bold"), "{ftl}");
+        assert!(
+            ftl.contains(
+                "common.richtext.hint = Markdown supported. HTML is not allowed and is shown \
+                 as plain text."
+            ),
+            "{ftl}"
+        );
+    }
+
+    /// #2227: `TransitionLabels` carries the group label and one button label
+    /// per DISTINCT target state, so two edges into one state share a key and a
+    /// third state gets its own.
+    #[test]
+    fn i18n_translates_the_transition_controls_chrome() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Order",
+            &[
+                "title:String".into(),
+                "status:String:states(draft -> published, published -> archived, \
+                 draft -> archived)"
+                    .into(),
+            ],
+            "20260502000000",
             &i18n_options(),
         )
         .unwrap();
         assert!(
-            !without_rich_text
-                .warnings
-                .iter()
-                .any(|w| w.contains("Markdown editor")),
-            "{:?}",
-            without_rich_text.warnings
-        );
-        assert!(
-            !without_rich_text
+            !plan
                 .warnings
                 .iter()
                 .any(|w| w.contains("state-transition controls")),
-            "{:?}",
-            without_rich_text.warnings
+            "the controls are translated now: {:?}",
+            plan.warnings
+        );
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
+
+        assert!(
+            routes.contains(
+                "autumn_web::widgets::transition_controls_with_labels(&paths::transition_status("
+            ),
+            "the controls must take the labels variant:\n{routes}"
+        );
+        assert!(
+            routes.contains(", csrf, csrf_field, &l_tr_status_labels))"),
+            "the labels must be the trailing argument:\n{routes}"
+        );
+        for key in [
+            "order.field.status.transitions",
+            "order.field.status.transition.published",
+            "order.field.status.transition.archived",
+        ] {
+            assert!(
+                routes.contains(&format!("t!(locale, \"{key}\")")),
+                "{key} must be looked up:\n{routes}"
+            );
+        }
+        // Two edges end at `archived`; they share one button and one key.
+        assert_eq!(
+            routes
+                .matches("order.field.status.transition.archived")
+                .count(),
+            1,
+            "one key per target state, not per edge:\n{routes}"
+        );
+
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(
+            ftl.contains("order.field.status.transitions = status transitions"),
+            "{ftl}"
+        );
+        assert!(
+            ftl.contains("order.field.status.transition.published = Mark as published"),
+            "{ftl}"
+        );
+        assert!(
+            ftl.contains("order.field.status.transition.archived = Mark as archived"),
+            "{ftl}"
         );
     }
 
-    /// A translated field label with an English error under it is the same
-    /// half-done state the widget gaps are, and it is reached the same way:
-    /// `validator` takes `message` as a compile-time literal, so no runtime
-    /// lookup can go there, and the code-to-message mapping lives inside
-    /// autumn-web's changeset conversion.
+    /// #2227: the create and update handlers resolve each validator code
+    /// through the bundle, so the inline error reads in the same language as
+    /// the label above it.
     #[test]
-    fn i18n_says_so_when_validation_messages_stay_english() {
+    fn i18n_translates_the_inline_validation_messages() {
         let tmp = project_with_main(default_main());
         let mut options = i18n_options();
         options.model.validations = vec!["email=email".to_owned()];
@@ -25617,67 +26093,130 @@ exempt_paths = [
             &options,
         )
         .unwrap();
-
-        let warning = plan
-            .warnings
-            .iter()
-            .find(|w| w.contains("#[validate(...)]"))
-            .unwrap_or_else(|| panic!("no validation warning in {:?}", plan.warnings));
         assert!(
-            warning.contains("validation failed: <code>"),
-            "must show what the author will actually see: {warning}"
+            !plan
+                .warnings
+                .iter()
+                .any(|w| w.contains("validation failed: <code>")),
+            "the messages are translated now: {:?}",
+            plan.warnings
+        );
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/contacts.rs")).unwrap();
+
+        assert!(
+            routes.contains("form.into_changeset_with(|field, code| match (field, code) {"),
+            "the handlers must pass a resolver:\n{routes}"
+        );
+        assert!(
+            routes.contains(
+                "(\"email\", \"email\") => Some(t!(locale, \"contact.field.email.error.email\")),"
+            ),
+            "one arm per (field, code) pair:\n{routes}"
+        );
+        assert!(
+            routes.contains("_ => None,"),
+            "an unlisted code must keep autumn-web's default:\n{routes}"
+        );
+        // Both re-rendering handlers, not just create.
+        assert_eq!(
+            routes.matches("form.into_changeset_with(").count(),
+            2,
+            "create and update both re-render the form:\n{routes}"
         );
 
-        // A scaffold with no rules has nothing to warn about.
-        let unvalidated = plan_scaffold_with_options(
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(
+            ftl.contains("contact.field.email.error.email = validation failed: email"),
+            "the English default must be the text autumn-web renders today:\n{ftl}"
+        );
+    }
+
+    /// A model with no rule has nothing to resolve, so the handler keeps the
+    /// plain call and the bundle gets no error key.
+    #[test]
+    fn i18n_leaves_an_unvalidated_model_on_the_plain_changeset_call() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
             tmp.path(),
             "Note",
             &["body:Text".into()],
             "20260503000001",
             &i18n_options(),
         )
+        .unwrap()
+        .execute(Flags::default())
         .unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/notes.rs")).unwrap();
         assert!(
-            !unvalidated
-                .warnings
-                .iter()
-                .any(|w| w.contains("#[validate(...)]")),
-            "{:?}",
-            unvalidated.warnings
+            routes.contains("form.into_changeset();") && !routes.contains("into_changeset_with("),
+            "no rule means no resolver:\n{routes}"
         );
     }
 
-    /// `transition_controls` builds `Mark as {to}` and the `{field} transitions`
-    /// group label inside autumn-web, from positional arguments that carry no
-    /// label seam — the same shape as the Markdown editor, and named the same
-    /// way rather than left for the reader to find in the browser.
+    /// A rule that carries its own `message` never reaches the resolver —
+    /// autumn-web keeps that message — so an arm for it would record a key no
+    /// call site ever reads and no translator could verify.
     #[test]
-    fn i18n_says_so_when_the_transition_controls_keep_english_chrome() {
+    fn a_validator_rule_with_its_own_message_gets_no_resolver_arm() {
+        assert_eq!(validator_code_for_rule("email"), Some("email"));
+        assert_eq!(validator_code_for_rule("length(min = 5)"), Some("length"));
+        assert_eq!(
+            validator_code_for_rule("range(min = 0, max = 130)"),
+            Some("range")
+        );
+        assert_eq!(
+            validator_code_for_rule("length(min = 5, message = \"too short\")"),
+            None
+        );
+        assert_eq!(validator_code_for_rule("email(message=\"nope\")"), None);
+    }
+
+    /// The one surface #2227 could not reach. `import_csv` calls its row
+    /// handler per line, away from the request, so the report an operator
+    /// reads keeps English messages. The flag warns about this instead of
+    /// leaving it to be found in production.
+    #[test]
+    fn i18n_says_so_when_the_csv_import_report_keeps_english_messages() {
         let tmp = project_with_main(default_main());
+        let mut options = i18n_options();
+        options.import = true;
+        options.model.validations = vec!["email=email".to_owned()];
         let plan = plan_scaffold_with_options(
             tmp.path(),
-            "Order",
-            &[
-                "title:String".into(),
-                "status:String:states(draft -> published, published -> archived)".into(),
-            ],
-            "20260502000000",
-            &i18n_options(),
+            "Contact",
+            &["email:String".into()],
+            "20260503000002",
+            &options,
         )
         .unwrap();
-
-        let warning = plan
-            .warnings
-            .iter()
-            .find(|w| w.contains("state-transition controls"))
-            .unwrap_or_else(|| panic!("no transition warning in {:?}", plan.warnings));
         assert!(
-            warning.contains("`status`"),
-            "must name the column: {warning}"
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("CSV import report")),
+            "no import warning in {:?}",
+            plan.warnings
         );
+
+        // Without the import surface there is no gap to name.
+        let tmp2 = project_with_main(default_main());
+        let mut no_import = i18n_options();
+        no_import.model.validations = vec!["email=email".to_owned()];
+        let plan2 = plan_scaffold_with_options(
+            tmp2.path(),
+            "Contact",
+            &["email:String".into()],
+            "20260503000003",
+            &no_import,
+        )
+        .unwrap();
         assert!(
-            warning.contains("transition_controls"),
-            "must name the widget the author has to look at: {warning}"
+            !plan2
+                .warnings
+                .iter()
+                .any(|w| w.contains("CSV import report")),
+            "{:?}",
+            plan2.warnings
         );
     }
 

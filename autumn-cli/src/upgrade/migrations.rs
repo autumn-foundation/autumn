@@ -21,6 +21,10 @@
 pub enum Confidence {
     /// Safe by construction — a rename or import move. Rewritten sites are
     /// reported as a count plus the diff.
+    // No shipped migration currently earns this label (issue #2234); kept for
+    // the next one that does. Tests construct it, so production code alone
+    // does not.
+    #[cfg_attr(not(test), allow(dead_code))]
     Auto,
     /// Rewritten, but each site is listed individually in the summary for a
     /// human to read before committing.
@@ -208,7 +212,11 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         id: "0.6.0-repository-with-pool-untracked",
         version: "0.6.0",
         title: "repository constructor `with_pool` is renamed to `with_pool_untracked`",
-        confidence: Confidence::Auto,
+        // `review`, not `auto` (issue #2234): the receiver check is textual,
+        // not name resolution, so it can miss a hand-written type or a
+        // foreign `#[repository]`. Every site is still rewritten; each one is
+        // also flagged for a human to read.
+        confidence: Confidence::Review,
         guide: "docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked",
         rewrite: Rewrite::CallRename {
             from: "with_pool",
@@ -836,7 +844,10 @@ mod tests {
             .iter()
             .find(|m| m.id == "0.6.0-repository-with-pool-untracked")
             .expect("the with_pool rename is the first shipped codemod (issue #1629)");
-        assert_eq!(migration.confidence, Confidence::Auto);
+        // `review`, not `auto` (issue #2234): receiver identification is
+        // textual, not name resolution, so flagging every rewrite for a human
+        // to read is the safer default until that gap closes.
+        assert_eq!(migration.confidence, Confidence::Review);
         assert_eq!(
             migration.rewrite,
             Rewrite::CallRename {

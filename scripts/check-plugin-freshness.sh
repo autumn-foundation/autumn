@@ -2,11 +2,17 @@
 # Plugin freshness gate: keep the Claude plugin (skills/, agents/,
 # .claude-plugin/) from drifting behind the framework.
 #
-# WHY THIS FIRED: your PR adds user-facing entries to CHANGELOG.md's
-# `## [Unreleased]` `### Added`/`### Changed` sections but does not touch
-# the Claude plugin. New framework surface that agents should reach for
-# belongs in the plugin too (usually a row/bullet in
-# skills/autumn-web/SKILL.md or references/api-reference.md).
+# WHY THIS FIRED: your PR adds user-facing entries to the `### Added` /
+# `### Changed` part of the changelog but does not touch the Claude plugin.
+# New framework surface that agents should reach for belongs in the plugin
+# too (usually a row/bullet in skills/autumn-web/SKILL.md or
+# references/api-reference.md).
+#
+# The entries are read from the changelog VIEW (scripts/lib/changelog.sh):
+# CHANGELOG.md with every `changelog.d/` fragment spliced into its
+# `## [Unreleased]` section. A PR writes its note as a fragment, so the note
+# it adds is a new file rather than a new line in a file every other PR also
+# edits — but this gate asks the same question of it either way.
 #
 # HOW TO SATISFY IT:
 #   - Update the relevant plugin file in the same PR (preferred), or
@@ -21,7 +27,7 @@
 #
 # WHAT IT CHECKS (single fast job, no Rust toolchain needed):
 #   1. Drift gate: diff against the merge base of $BASE_REF; if bullets were
-#      added inside CHANGELOG.md's Unreleased Added/Changed sections and no
+#      added inside the view's Unreleased Added/Changed sections and no
 #      file under skills/, agents/, or .claude-plugin/ changed, fail —
 #      unless an escape hatch (above) applies.
 #   2. Static sanity: .claude-plugin/plugin.json parses as JSON, and every
@@ -43,6 +49,8 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=scripts/lib/changelog.sh
+source "$root/scripts/lib/changelog.sh"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -88,12 +96,14 @@ unreleased_added_changed() {
 }
 
 new_changelog_lines() {
-  # Compare CHANGELOG.md between two committed refs (working-tree state is
-  # deliberately ignored — CI checks out the PR head commit).
+  # Compare the changelog view between two committed refs (working-tree state
+  # is deliberately ignored — CI checks out the PR head commit). The view is
+  # CHANGELOG.md with the `changelog.d/` fragments spliced in, so a note added
+  # as a fragment counts exactly as a note written into the section did.
   local dir="$1" base="$2" head="$3"
   local base_section head_section
-  base_section="$(git -C "$dir" show "$base:CHANGELOG.md" 2>/dev/null | unreleased_added_changed || true)"
-  head_section="$(git -C "$dir" show "$head:CHANGELOG.md" 2>/dev/null | unreleased_added_changed || true)"
+  base_section="$( (cd "$dir" && changelog_view "$base") | unreleased_added_changed || true)"
+  head_section="$( (cd "$dir" && changelog_view "$head") | unreleased_added_changed || true)"
   # Bullets in head but not in base.
   comm -13 <(printf '%s\n' "$base_section" | sort) <(printf '%s\n' "$head_section" | sort) | sed '/^$/d'
 }
@@ -181,7 +191,8 @@ self_test() {
     local dir="$1"
     git init -q "$dir"
     git -C "$dir" config user.email test@test && git -C "$dir" config user.name test
-    mkdir -p "$dir/skills/autumn-web" "$dir/.claude-plugin" "$dir/agents" "$dir/docs/guide"
+    mkdir -p "$dir/skills/autumn-web" "$dir/.claude-plugin" "$dir/agents" \
+      "$dir/docs/guide" "$dir/changelog.d"
     printf '{"name": "autumn", "version": "0.5.0"}\n' > "$dir/.claude-plugin/plugin.json"
     printf '# skill\nSee docs/guide/jobs.md.\n' > "$dir/skills/autumn-web/SKILL.md"
     printf '# reviewer\n' > "$dir/agents/autumn-reviewer.md"
@@ -301,6 +312,36 @@ EOF
   sed -i 's/- \*\*old:\*\* an existing bullet/- **old:** an existing bullet\n- **new:** shiny feature agents should know about/' "$r13/CHANGELOG.md"
   git -C "$r13" commit -qam "feat: exempt label, changelog only"
   check "exempt label skips drift gate on changelog-only change" pass run_checks "$r13" base "" true
+
+  # Scenario 14: the note arrives as a changelog.d fragment, no plugin change
+  # -> gate fails. This is the shape every PR uses now, so it is the scenario
+  # that matters most.
+  local r14="$tmp/r14"; make_repo "$r14"
+  printf '### Added\n\n- **jobs:** shiny feature agents should know about\n' \
+    > "$r14/changelog.d/1-jobs.md"
+  git -C "$r14" add -A && git -C "$r14" commit -qm "feat: fragment only"
+  check "fragment-only change fails" fail run_gate "$r14" base ""
+
+  # Scenario 15: fragment plus a plugin change -> gate passes.
+  local r15="$tmp/r15"; make_repo "$r15"
+  printf '### Added\n\n- **jobs:** shiny feature\n' > "$r15/changelog.d/1-jobs.md"
+  printf 'Documents the shiny feature.\n' >> "$r15/skills/autumn-web/SKILL.md"
+  git -C "$r15" add -A && git -C "$r15" commit -qm "feat: fragment + plugin"
+  check "fragment+skills change passes" pass run_gate "$r15" base ""
+
+  # Scenario 16: [no-plugin] inside the fragment bullet -> gate passes.
+  local r16="$tmp/r16"; make_repo "$r16"
+  printf '### Changed\n\n- **internal:** no agent surface [no-plugin]\n' \
+    > "$r16/changelog.d/1-internal.md"
+  git -C "$r16" add -A && git -C "$r16" commit -qm "refactor: exempt fragment"
+  check "[no-plugin] fragment bullet passes" pass run_gate "$r16" base ""
+
+  # Scenario 17: a Fixed-only fragment -> gate passes. The gate asks about new
+  # surface, and a fix is not new surface.
+  local r17="$tmp/r17"; make_repo "$r17"
+  printf '### Fixed\n\n- **pdf:** a layout cap\n' > "$r17/changelog.d/1-pdf.md"
+  git -C "$r17" add -A && git -C "$r17" commit -qm "fix: fragment"
+  check "Fixed-only fragment passes" pass run_gate "$r17" base ""
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]]

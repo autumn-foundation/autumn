@@ -395,6 +395,246 @@ For the transaction shape see [`Db::tx`](transactions.md).
 For provider APIs like SES, Postmark, or SendGrid, implement `MailTransport` and
 build a `Mailer::with_transport(...)`.
 
+## Receiving Mail (Inbound Email)
+
+Everything above sends. Autumn also *receives*: support inboxes, reply-by-email
+threading, ticket routing, and bounce processing all arrive as an HTTP webhook
+from your mail provider, which Autumn verifies, parses into an
+`InboundEmail`, and dispatches to a handler you write.
+
+Receiving is its own Cargo feature, and it does not come with `mail`:
+
+```toml
+autumn-web = { version = "0.7", features = ["mail", "inbound-mailgun"] }
+```
+
+`inbound-mail` is the base feature — it carries the router, the RFC 5322 parser,
+and the generic and Mailgun adapters. `inbound-mailgun` and `inbound-ses` both
+imply it and name the provider you are wiring up. The two are not
+interchangeable: `inbound-mailgun` compiles no extra code today and is there to
+state intent, while `inbound-ses` is what actually pulls in the SNS signature
+verifier, without which an SES endpoint cannot work at all.
+
+### Inbound email webhooks: Mailgun, SES, and generic
+
+Each `InboundMailEndpointConfig` you register becomes one `POST` route with a
+50 MB body limit. What that route checks before parsing depends on which
+constructor built it:
+
+| Constructor | Provider | What it checks before parsing |
+| --- | --- | --- |
+| `InboundMailEndpointConfig::mailgun(path, signing_key)` | Mailgun | HMAC-SHA256 over `timestamp \|\| token`, compared in constant time, with the `timestamp` required to be within 5 minutes of now |
+| `InboundMailEndpointConfig::ses(path)` | AWS SES via SNS | SNS RSA signature against the certificate named by `SigningCertURL`, plus the `TopicArn` binding below |
+| `InboundMailEndpointConfig::generic(path)` | Postfix, a relay, anything posting raw RFC 5322 | `X-Inbound-Signature: HMAC-SHA256(key, body)` — **only if you set a key.** With none set it checks nothing |
+
+Mailgun and SES authenticate unconditionally, and both fail closed: a Mailgun
+endpoint whose signing key is empty answers `500` to every request rather than
+accept unsigned mail, a bad signature or a timestamp outside the window is
+`401`, and the SES cases are below.
+
+**Nothing here de-duplicates.** Mailgun's timestamp check is a freshness bound,
+not replay protection: it caps how long a captured request stays usable at five
+minutes, and within that window the same `timestamp`/`token`/`signature` triple
+is accepted every time it arrives, because no delivery identifier is retained.
+Providers redeliver on their own schedule too, so a handler sees the same
+message more than once for reasons that have nothing to do with an attacker.
+
+So make any handler with side effects idempotent, keyed on something that
+identifies the **message** rather than the conversation.
+`email.headers.get("message-id")` is the usual choice — and note `email.headers`
+is keyed by **lower-cased** name on both the Mailgun and RFC 5322 paths, so
+`get("Message-Id")` returns `None`. Do **not** key on the plus-address token: in
+the reply scheme below it identifies the *thread*, so every reply in that thread
+carries the same value and you would drop all but the first. `Message-Id` comes
+from the sender, so scope the key to its endpoint and expire it rather than
+trusting it as a globally unique id.
+
+This is the one place inbound mail differs from
+[`autumn generate webhook`](generators.md#autumn-generate-webhook), whose
+`SignedWebhook` extractor does keep replay markers.
+
+> **The generic endpoint is unauthenticated by default.** `generic(path)`
+> leaves both `signing_key` and `signing_key_env` unset, and with no key the
+> signature check is skipped entirely — every body that arrives is parsed and
+> dispatched to your handlers. That is fine for a Postfix relay reachable only
+> on a private network, and it is a forged-mail hole on anything an attacker
+> can POST to. Set a key before the route is internet-facing.
+
+Set one with `signing_key_env`, which is read at startup so the secret stays out
+of the source. This applies to **Mailgun and generic endpoints only** — an SES
+endpoint is authenticated by the SNS certificate signature and its topic ARN,
+and `build_routes` never hands its signing key to the route, so setting one
+there does nothing:
+
+```rust
+use autumn_web::inbound_mail::{InboundMailEndpointConfig, InboundMailProvider};
+
+let endpoint = InboundMailEndpointConfig {
+    path: "/inbound/mailgun".to_string(),
+    provider: InboundMailProvider::Mailgun,
+    signing_key_env: Some("MAILGUN_SIGNING_KEY".to_string()),
+    ..Default::default()
+};
+```
+
+`resolve_signing_key()` prefers the literal `signing_key` when both are set. If
+the variable is missing at startup the key resolves to nothing, and the endpoint
+rejects rather than skips verification — a missing secret is a `500`, never an
+open door.
+
+### SES endpoints need a topic ARN
+
+An SES endpoint without `.with_topic_arn(...)` **rejects every notification
+with `503`**, and logs an error naming the path at startup. This is not a
+hardening step you can postpone: without the ARN, any AWS account could
+subscribe your endpoint to a topic of their own and deliver validly-signed
+payloads, so the endpoint fails closed instead.
+
+```rust
+use autumn_web::inbound_mail::InboundMailEndpointConfig;
+
+let endpoint = InboundMailEndpointConfig::ses("/inbound/ses")
+    .with_topic_arn("arn:aws:sns:us-east-1:123456789012:inbound-mail");
+```
+
+A notification carrying any other `TopicArn` is rejected with `401`. SNS
+subscription confirmation is handled for you — Autumn fetches the `SubscribeURL`
+and answers `500` if that fetch fails, so SNS retries.
+
+The SES adapter also needs the `inbound-ses` feature specifically: with only
+`inbound-mail` enabled the SNS signature verifier is not compiled in, and rather
+than accept unauthenticated notifications the endpoint answers `503` to all of
+them and says so in an error log.
+
+### Routing a message to a handler
+
+Write a handler, annotate it, and register the companion it generates:
+
+```rust
+use autumn_web::prelude::*;
+// `#[inbound_mail]` is NOT in the prelude, unlike `#[mailer]` and
+// `#[mailer_preview]`. Import the attribute itself:
+use autumn_web::inbound_mail;
+use autumn_web::inbound_mail::{InboundEmail, InboundMailEndpointConfig, InboundMailRouter};
+
+#[inbound_mail(to = "support@company.com")]
+async fn support(email: InboundEmail) -> AutumnResult<()> {
+    tracing::info!(from = %email.from, subject = %email.subject, "support mail");
+    Ok(())
+}
+```
+
+```rust,ignore
+autumn_web::app()
+    .inbound_mail_router(
+        InboundMailRouter::new()
+            .endpoint(InboundMailEndpointConfig::mailgun("/inbound/mailgun", key))
+            .handler(support_handler_info()),
+    )
+    .routes(routes![...])
+    .run()
+    .await;
+```
+
+`#[inbound_mail]` generates the `support_handler_info()` function from the
+handler's name; [Macro Transparency](macro-transparency.md) shows exactly what it
+expands to.
+
+The `to` argument becomes a `RecipientPattern`, and the spelling picks the kind:
+
+| `to = …` | Pattern | Matches |
+| --- | --- | --- |
+| `"support@company.com"` | `Exact` | that address, case-insensitively |
+| `"ticket*"` | `LocalPrefix` | any local part starting `ticket` — `ticket@`, `ticket+42@`, `tickets@`. The `*` is stripped along with a trailing `.`, so `"ticket.*"` is the same rule; `"ticket+*"` keeps the `+` in the prefix and therefore does **not** match a plain `ticket@` |
+| `"replies+{token}@app.example"` | `PlusAddress` | the token is captured; drop `@domain` to match any domain |
+| `"*"` or omitted | `Any` | every message, even one delivered `Bcc`-only with no `To` |
+
+Handlers are tried in **registration order and the first match wins**, so
+register the specific patterns before the catch-all.
+
+A message that matches nothing is logged at `WARN` and **dropped** — the webhook
+still answers `200`, so the provider never retries it. Register
+`.fallback(handler)` if you would rather see those messages than lose them.
+
+### Reply-by-email and plus-address routing
+
+`PlusAddress` is how a reply gets back to the thread it belongs to. Address the
+outgoing mail's `Reply-To` as `replies+<thread-id>@your.app`, and the token comes
+back on the way in:
+
+```rust
+use autumn_web::prelude::*;
+use autumn_web::inbound_mail;
+use autumn_web::inbound_mail::InboundEmail;
+
+#[inbound_mail(to = "replies+{token}@app.example")]
+async fn reply(email: InboundEmail) -> AutumnResult<()> {
+    let thread_id = email.plus_token().unwrap_or_default();
+    tracing::info!(thread_id, "reply received");
+    Ok(())
+}
+```
+
+The token keeps its original casing even though address matching is
+case-insensitive.
+
+### Sync or background: when the webhook returns 200
+
+`processing = "background"` is the **default**, and it decides what the provider
+sees:
+
+- `"background"` answers `200` immediately and runs the handler in a spawned
+  task. A handler that then returns `Err` is logged at `ERROR` and the message
+  is gone — the provider already got its `200` and will not retry.
+- `"sync"` awaits the handler first. `Err` becomes a `500`, so whether the
+  message gets another chance is down to your provider's retry policy rather
+  than being decided for you. Handlers that must not silently lose a message
+  belong here.
+
+Choose `"sync"` for anything you would be sorry to drop, and keep it fast enough
+for the provider's webhook timeout.
+
+### Bounces and spam verdicts
+
+Two handlers run ahead of recipient matching:
+
+- `.on_bounce(handler)` fires when the **provider's own** webhook field reports a
+  bounce (Mailgun's `X-Mailgun-Bounced-Address`). It is never inferred from
+  headers inside the forwarded message, so a sender cannot spoof their way into
+  the bounce path. `email.bounced_address` carries the address that failed,
+  which is not `email.to` — on a bounce that is your own inbound address.
+- `.on_spam(handler)` fires on a provider spam verdict (`X-Mailgun-Sflag: Yes`),
+  readable in full via `email.spam_report`. This is the provider's inbound
+  verdict, not a recipient's complaint.
+
+To turn a bounce into a suppression entry, wire
+`autumn_web::mail::suppression::record_inbound` into `.on_bounce` — it reads
+`bounced_address` and never falls back to `email.to`. Routing `.on_spam` there
+too is a deliberate no-op: an inbound spam verdict names no complainant, so
+there is no address it could safely suppress.
+
+### Scaffolding a handler
+
+`autumn generate inbound-mail Support` writes the handler, its module wiring, a
+smoke test and the `InboundMailRouter` registration in `src/main.rs` — see
+[Generators](generators.md#autumn-generate-inbound-mail).
+
+It scaffolds a **Mailgun** endpoint and nothing else: there is no provider flag,
+so the emitted `.endpoint(...)` is always
+`InboundMailEndpointConfig::mailgun("/inbound/mailgun", …)` and the generated
+test posts a Mailgun fixture. For SES or generic, generate it anyway and swap
+that one call for `::ses(path).with_topic_arn(…)` or `::generic(path)` — the
+handler, the routing and the wiring are provider-independent.
+
+Swapping the call is the whole job for `::generic`: the `inbound-mailgun` feature
+the generator adds implies `inbound-mail`, which carries the generic adapter.
+**SES needs `inbound-ses` in that feature list too** — added alongside
+`inbound-mailgun` or in place of it. Without it the SNS verifier is not compiled
+in and the endpoint answers `503` to every request, as
+[SES endpoints need a topic ARN](#ses-endpoints-need-a-topic-arn) describes. The
+generated integration test posts a Mailgun fixture, so it needs rewriting for
+either other provider.
+
 ## Production Checklist
 
 - Enable the `mail` feature.
@@ -415,3 +655,10 @@ build a `Mailer::with_transport(...)`.
 - Shipping newsletters, digests, or other bulk mail? See
   [Mail compliance: List-Unsubscribe](mail-compliance.md) to meet Gmail/Yahoo
   bulk-sender requirements with one attribute and one config key.
+- Receiving mail? Set a signing key on every Mailgun and generic endpoint — a
+  `generic` one with no key authenticates nothing, and an unresolved key is a
+  `500` rather than an open route. Give every SES endpoint a
+  [topic ARN](#ses-endpoints-need-a-topic-arn) instead; it takes no signing key.
+  Make side-effecting handlers idempotent — no inbound endpoint de-duplicates —
+  and decide per handler whether `background` losing a message on error is
+  acceptable. See [Receiving Mail](#receiving-mail-inbound-email).

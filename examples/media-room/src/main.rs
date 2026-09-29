@@ -172,6 +172,10 @@ fn page(rooms: &[RoomEntry]) -> Markup {
                             }
                             li { code { "POST /api/media/rooms/{room_id}/leave" } " — leave" }
                             li {
+                                code { "POST /api/media/rooms/{room_id}/heartbeat" }
+                                " — hold the seat (refresh liveness, renew the token expiry)"
+                            }
+                            li {
                                 code { "GET /api/media/rooms/{room_id}" }
                                 " — member-gated roster (Authorization: Bearer <token>)"
                             }

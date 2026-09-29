@@ -34,6 +34,14 @@
 //! slots = ["8192-16383"]
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -460,7 +468,7 @@ impl DirectoryShardRouter {
     }
 
     fn cache_get(&self, key: &str) -> Option<ShardId> {
-        let now = std::time::Instant::now();
+        let now = crate::time::ambient_instant();
         {
             let cache = self.cache.read().ok()?;
             match cache.get(key) {
@@ -489,7 +497,7 @@ impl DirectoryShardRouter {
     /// invalidation listener.
     fn sweep_expired(&self) {
         if let Ok(mut cache) = self.cache.write() {
-            let now = std::time::Instant::now();
+            let now = crate::time::ambient_instant();
             cache.retain(|_, entry| entry.expires_at > now);
         }
     }
@@ -500,7 +508,7 @@ impl DirectoryShardRouter {
                 key,
                 DirectoryCacheEntry {
                     shard,
-                    expires_at: std::time::Instant::now() + self.ttl,
+                    expires_at: crate::time::ambient_instant() + self.ttl,
                 },
             );
         }
@@ -673,8 +681,10 @@ impl ShardRuntime {
             .parity_checked_at
             .lock()
             .expect("shard runtime lock poisoned");
-        if checked_at.is_none_or(|at| at.elapsed() >= PARITY_RECHECK_INTERVAL) {
-            *checked_at = Some(std::time::Instant::now());
+        let now = crate::time::ambient_instant();
+        if checked_at.is_none_or(|at| now.saturating_duration_since(at) >= PARITY_RECHECK_INTERVAL)
+        {
+            *checked_at = Some(now);
             true
         } else {
             false
@@ -1326,22 +1336,35 @@ impl ShardHealthIndicator {
         // connections) and runs on every probe; the parity comparison
         // opens fresh connections to both roles and is throttled.
         match replica_pool.get().await {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                let alive = crate::db::probe_connection_alive(&mut conn).await;
                 drop(conn);
-                self.shard.runtime().mark_replica_connection_ready();
-                if self.shard.runtime().parity_check_due()
-                    && let Some((primary_url, replica_url)) = self.shard.runtime().migration_check()
-                {
-                    let readiness = crate::migrate::check_replica_migration_readiness_blocking(
-                        primary_url,
-                        replica_url,
-                    )
-                    .await;
-                    if readiness.is_ready() {
-                        self.shard.runtime().mark_replica_migrations_ready();
-                    } else if let Some(detail) = readiness.detail() {
-                        self.shard.runtime().mark_replica_migrations_unready(detail);
+                match alive {
+                    Ok(()) => {
+                        self.shard.runtime().mark_replica_connection_ready();
+                        if self.shard.runtime().parity_check_due()
+                            && let Some((primary_url, replica_url)) =
+                                self.shard.runtime().migration_check()
+                        {
+                            let readiness =
+                                crate::migrate::check_replica_migration_readiness_blocking(
+                                    primary_url,
+                                    replica_url,
+                                )
+                                .await;
+                            if readiness.is_ready() {
+                                self.shard.runtime().mark_replica_migrations_ready();
+                            } else if let Some(detail) = readiness.detail() {
+                                self.shard.runtime().mark_replica_migrations_unready(detail);
+                            }
+                        }
                     }
+                    Err(error) => self
+                        .shard
+                        .runtime()
+                        .mark_replica_connection_unready(format!(
+                            "replica connection failed: {error}"
+                        )),
                 }
             }
             Err(error) => self
@@ -1392,10 +1415,16 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
             // it so load balancers stop routing to an instance that cannot
             // reach a shard primary.
             let primary_ok = match self.shard.primary_pool().get().await {
-                Ok(conn) => {
-                    drop(conn);
-                    true
-                }
+                Ok(mut conn) => match crate::db::probe_connection_alive(&mut conn).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        details.insert(
+                            "primary_detail".to_owned(),
+                            serde_json::json!(format!("primary connection failed: {error}")),
+                        );
+                        false
+                    }
+                },
                 Err(error) => {
                     details.insert(
                         "primary_detail".to_owned(),

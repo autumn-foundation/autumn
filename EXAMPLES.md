@@ -227,6 +227,24 @@ Boots with no database or `MediaMTX` server; the companion narrative is
 
 ---
 
+### `examples/collab-notes` — Collaborative Editing
+
+<!-- catalog:example name=collab-notes tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer who needs multiplayer editing and does not want to rent a real-time backend |
+| **Journey** | Mark a field `#[collaborative]` → open one note in two browsers → type in both → watch the text merge character by character with a live participant list |
+| **Key capabilities** | `#[collaborative]` field marker, `CollabText` (an in-tree RGA text CRDT), `CollabHub` + `serve_socket` over the existing `#[ws]`/channel/presence seams, a 150-line browser replica, cursor reporting |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p collab-notes` |
+| **Success proof** | `curl -s http://localhost:3000/notes/1 \| grep -o 'data-socket="[^"]*"'` prints `data-socket="/notes/1/collab"`; opening that page in two browser windows and typing in both leaves both windows showing the same merged text |
+
+Boots with no database or external real-time service; the companion narrative
+is `docs/guide/collaboration.md`.
+
+---
+
 ### `examples/invoice` — PDF Downloads
 
 <!-- catalog:example name=invoice tier=supported -->
@@ -308,6 +326,42 @@ Two binaries rather than one — the whole point is the *old* build becoming the
 
 ---
 
+### `examples/mesh-catalog` — Service Contract (callee half)
+
+<!-- catalog:example name=mesh-catalog tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Team carving the first service out of an Autumn monolith |
+| **Journey** | Service contract, callee side: mark a typed handler `#[endpoint]` and let the framework emit the contract its callers are compiled against |
+| **Key capabilities** | `#[endpoint]`, `#[derive(WireShape)]`, the JSON wire descriptor build artifact |
+| **Prerequisites** | Rust 1.88.0+. No database, no config file |
+| **Run command** | `AUTUMN_SERVER__PORT=3001 cargo run -p mesh-catalog` |
+| **Success proof** | `curl http://127.0.0.1:3001/items/42` returns the item as JSON; `target/autumn-contracts/` carries its wire descriptors |
+| **Rationale for the tier** | Half of a two-crate pair whose proof is a *compile-time* contract failure in its sibling, not a browser smoke. See `examples/mesh-storefront`. |
+
+Boots with no database; the companion narrative is `docs/guide/wire-contracts.md`.
+
+---
+
+### `examples/mesh-storefront` — Service Contract (caller half)
+
+<!-- catalog:example name=mesh-storefront tier=experimental -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Team carving the first service out of an Autumn monolith |
+| **Journey** | Service contract, caller side: call another Autumn service through a generated typed client, and have a breaking change on the callee fail *this* build at the call site |
+| **Key capabilities** | `wire_client!`, `#[contract_checked]`, `autumn_web::wire::Endpoint`, `NoBody` |
+| **Prerequisites** | Rust 1.88.0+ and `examples/mesh-catalog` in the same workspace |
+| **Run command** | `CATALOG_URL=http://127.0.0.1:3001 cargo run -p mesh-storefront` |
+| **Success proof** | `python3 scripts/wire-contract-sweep.py` seeds wire-breaking and compatible changes into `mesh-catalog` and reports that every breaking one turns `cargo build` red with a caller-named error, and no compatible one is rejected |
+| **Rationale for the tier** | Its proof is a build that must *fail*, which no Chromium smoke can express. The sweep script is the dedicated proof. |
+
+Boots with no database; the companion narrative is `docs/guide/wire-contracts.md`.
+
+---
+
 ## Excluded Examples
 
 Excluded examples are intentionally kept out of the workspace and the normal
@@ -352,6 +406,7 @@ can pick the closest starting point without overlap.
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO, accessible forms, rich text, cookie consent, pagination, failure capsules and a seeded `#[sim_test]` — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
+| Collaborative editing | `collab-notes` | A `#[collaborative]` text field merged by an in-tree CRDT, streamed with live presence over `#[ws]` + channels, with no external real-time service |
 | PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf`; also carries the worked `#[lifecycle]` invoice state machine |
 | SPA + GraphQL plugin | `react-graphql` | Autumn-rendered shell, committed Vite/React/TypeScript bundle, and a generic `GraphqlPlugin` whose resolvers go through a `#[model]`/`#[repository]` with hooks — the same rows also served by generated REST |
 

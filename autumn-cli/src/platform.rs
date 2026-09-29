@@ -100,7 +100,23 @@ pub const POLICY: &[PolicyEntry] = &[
     PolicyEntry {
         command: "autumn serve (foreground)",
         tier: SupportTier::Native,
-        note: "Builds and runs the app in the foreground, binding TCP per config.",
+        note: "Builds and runs the app in the foreground, binding TCP per config. \
+               A console-control stop (a supervisor, or Windows shutting down) \
+               drains it the way SIGTERM does on Unix.",
+    },
+    PolicyEntry {
+        command: "autumn serve --daemon / stop / status / restart",
+        tier: SupportTier::Native,
+        note: "Runs natively (#1639). The daemon binds its configured TCP \
+               address and records it in serve.addr; stop drains cooperatively \
+               before force-killing. State lives under %LOCALAPPDATA%.",
+    },
+    PolicyEntry {
+        command: "autumn serve install-service / uninstall-service",
+        tier: SupportTier::Native,
+        note: "Registers the daemon as a Windows service that starts at boot \
+               and restarts after a crash. Needs an elevated (Administrator) \
+               shell, like any service registration.",
     },
     PolicyEntry {
         command: "managed Postgres",
@@ -114,12 +130,6 @@ pub const POLICY: &[PolicyEntry] = &[
         note: "Local-only: plan renders the unit and step list, check grades the \
                config and probes SSH reachability with a portable TCP connect. \
                Validate a deploy config here before running it from WSL2.",
-    },
-    PolicyEntry {
-        command: "autumn serve --daemon / stop / status / restart",
-        tier: SupportTier::Wsl2,
-        note: "The daemon lifecycle is built on Unix domain sockets and POSIX \
-               signals; run it inside WSL2.",
     },
     PolicyEntry {
         command: "autumn deploy up / rollback / status / maintenance",
@@ -158,8 +168,12 @@ pub const WINDOWS_PREREQUISITES: &[WindowsPrerequisite] = &[
         requirement: "OpenSSL via vcpkg with VCPKG_ROOT set (see docs/guide/generators.md)",
     },
     WindowsPrerequisite {
-        subject: "autumn serve --daemon / deploy up / scripts/*.sh",
+        subject: "autumn deploy up / scripts/*.sh",
         requirement: "WSL2 (Tier 2)",
+    },
+    WindowsPrerequisite {
+        subject: "autumn serve install-service / uninstall-service",
+        requirement: "an elevated (Administrator) shell to register a service",
     },
 ];
 
@@ -230,6 +244,10 @@ mod tests {
             "autumn test",
             "autumn serve (foreground)",
             "managed Postgres",
+            // Promoted out of Tier 2 by #1639: the daemon lifecycle and the
+            // Windows service journey now run natively.
+            "autumn serve --daemon / stop / status / restart",
+            "autumn serve install-service / uninstall-service",
         ] {
             assert_eq!(
                 tier_for(command),
@@ -242,7 +260,6 @@ mod tests {
     #[test]
     fn every_ac_named_tier_two_command_is_tier_two() {
         for command in [
-            "autumn serve --daemon / stop / status / restart",
             "autumn deploy up / rollback / status / maintenance",
             "scripts/*.sh contributor gates",
         ] {
@@ -311,12 +328,40 @@ mod tests {
 
     #[test]
     fn tier_two_error_names_the_tier_the_fix_and_the_policy() {
-        let message = tier_two_windows_error("autumn serve --daemon / stop / status / restart");
+        let message = tier_two_windows_error("autumn deploy up / rollback / status / maintenance");
         assert!(message.contains("Tier 2 (WSL2)"), "{message}");
         assert!(message.contains("WSL2 shell"), "{message}");
         assert!(message.contains(POLICY_DOC_URL), "{message}");
         // The refusal must say what is actually unsupported, not just "unsupported".
-        assert!(message.contains("Unix domain sockets"), "{message}");
+        assert!(message.contains("ssh"), "{message}");
+    }
+
+    #[test]
+    fn the_daemon_lifecycle_can_no_longer_fail_fast_on_windows() {
+        // #1639 promoted it to Tier 1. `tier_two_windows_error` panics for a
+        // Tier 1 row precisely so a leftover refusal cannot outlive the move.
+        assert_eq!(
+            tier_for("autumn serve --daemon / stop / status / restart"),
+            Some(SupportTier::Native)
+        );
+        assert_eq!(
+            tier_for("autumn serve install-service / uninstall-service"),
+            Some(SupportTier::Native)
+        );
+    }
+
+    #[test]
+    fn doctor_flags_the_elevation_the_service_journey_needs() {
+        // Registering a service needs an elevated shell. A developer should
+        // learn that from `doctor`, not from an access-denied error mid-install.
+        let elevation = WINDOWS_PREREQUISITES
+            .iter()
+            .find(|p| p.subject.contains("install-service"))
+            .expect("doctor must flag the service-registration prerequisite");
+        assert!(
+            elevation.requirement.contains("Administrator"),
+            "{elevation:?}"
+        );
     }
 
     #[test]
@@ -337,7 +382,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "it must not fail fast on Windows")]
     fn tier_two_error_rejects_a_tier_one_command() {
-        let _ = tier_two_windows_error("autumn dev");
+        let _ = tier_two_windows_error("autumn serve --daemon / stop / status / restart");
     }
 
     #[test]

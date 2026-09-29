@@ -4,6 +4,14 @@
 //! serializable [`RouteInfo`] values that the CLI can consume without booting
 //! the full HTTP server.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use serde::{Deserialize, Serialize};
 
 use crate::capacity::{POOL_DB, ResourceShape};
@@ -86,6 +94,22 @@ pub struct HeadersDump {
     pub csp_nonce: bool,
 }
 
+/// Resolved mTLS client-auth configuration carried across the dump boundary for
+/// the `declared` mTLS manifest dimension (issue #1640).
+///
+/// Mirrors the runtime-relevant subset of
+/// [`ClientAuthConfig`](crate::config::ClientAuthConfig): the listener mode plus
+/// the route prefixes that demand a certificate. The trust-store *paths* are
+/// deliberately absent — rotating a bundle is not a posture change, and a path
+/// in the manifest would make every filesystem-layout change a finding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientAuthDump {
+    /// Listener requirement level: `off`, `optional`, or `required`.
+    pub mode: String,
+    /// Route prefixes that demand a verified client certificate (sorted).
+    pub required_paths: Vec<String>,
+}
+
 /// Resolved security configuration snapshot emitted after
 /// [`SECURITY_CONFIG_MARKER`] for the manifest's `declared` dimensions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +118,22 @@ pub struct SecurityDump {
     pub csrf: CsrfDump,
     /// Security-headers configuration.
     pub headers: HeadersDump,
+    /// mTLS client-certificate configuration (issue #1640). Defaults to `off`
+    /// with no required paths, so a dump from a build without
+    /// `[server.tls.client_auth]` reads as "no route requires mTLS".
+    #[serde(default = "ClientAuthDump::off")]
+    pub client_auth: ClientAuthDump,
+}
+
+impl ClientAuthDump {
+    /// The dump for a deployment with no client-certificate verification.
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            mode: crate::config::ClientAuthMode::Off.as_str().to_owned(),
+            required_paths: Vec::new(),
+        }
+    }
 }
 
 impl SecurityDump {
@@ -148,6 +188,20 @@ impl SecurityDump {
                 hsts_include_subdomains: headers.hsts_include_subdomains,
                 csp_nonce: headers.csp_nonce.enabled,
             },
+            client_auth: config
+                .server
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.client_auth.as_ref())
+                .map_or_else(ClientAuthDump::off, |ca| {
+                    let mut required_paths = ca.required_paths.clone();
+                    required_paths.sort();
+                    required_paths.dedup();
+                    ClientAuthDump {
+                        mode: ca.mode.as_str().to_owned(),
+                        required_paths,
+                    }
+                }),
         }
     }
 }
@@ -554,7 +608,7 @@ pub fn collect_route_infos(
     api_versions: &[crate::app::ApiVersion],
 ) -> Result<Vec<RouteInfo>, crate::router::RouterBuildError> {
     let mut infos = Vec::with_capacity(routes.len());
-    let now = chrono::Utc::now();
+    let now = crate::time::ambient_now();
 
     let resolve_status = |route_name: &str,
                           api_version: Option<&str>,
@@ -777,13 +831,25 @@ pub(crate) fn append_framework_routes(
         for (path, handler) in [
             (crate::stories::STORIES_PATH, "story_gallery_index"),
             ("/_stories/{slug}", "story_gallery_story"),
+            // Live demo backends for the Active search / Autocomplete /
+            // Infinite feed stories (review follow-up — route-dump
+            // consumers couldn't see these three without an entry here).
+            ("/_stories/demo/search", "story_gallery_demo_search"),
+            (
+                "/_stories/demo/tags/search",
+                "story_gallery_demo_tag_search",
+            ),
+            (
+                "/_stories/demo/posts/feed",
+                "story_gallery_demo_infinite_feed",
+            ),
         ] {
             infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
     }
 
     // Dev request inspector routes.
-    if matches!(config.profile.as_deref(), Some("dev" | "development")) {
+    if crate::config::profile_is_dev(config.profile.as_deref()) {
         let inspector_path = &config.dev.inspector_path;
         let inspector_detail_path = format!("{inspector_path}/requests/{{id}}");
         for (path, handler) in [
@@ -1863,6 +1929,20 @@ mod tests {
             paths.contains(&"/_stories/{slug}"),
             "enabled stories must list the detail route: {paths:?}"
         );
+        // Review follow-up: the Active search / Autocomplete / Infinite feed
+        // stories' live demo backends must be listed too, or route-dump
+        // consumers can't see them and the OpenAPI/MCP collision preflight
+        // (`collect_framework_get_paths` in router.rs) can't reserve them.
+        for demo_path in [
+            "/_stories/demo/search",
+            "/_stories/demo/tags/search",
+            "/_stories/demo/posts/feed",
+        ] {
+            assert!(
+                paths.contains(&demo_path),
+                "enabled stories must list the demo route {demo_path}: {paths:?}"
+            );
+        }
 
         let default_config = AutumnConfig::default();
         let mut infos = Vec::new();

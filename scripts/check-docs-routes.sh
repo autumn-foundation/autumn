@@ -212,6 +212,7 @@ run_py() {
 import os
 import pathlib
 import re
+import tomllib
 import subprocess
 import sys
 
@@ -339,23 +340,158 @@ def in_scope(path):
 # `autumn/vendor/README.md`, `benchmarks/*/README.md` and the CLI's starter
 # templates are working notes, not published pages, and none of them is named by
 # a manifest.
-CARGO_README = re.compile(r"^\s*readme\s*=\s*\"([^\"]+)\"", re.M)
+# TOML has two string forms and a manifest may use either, so both are read. The
+# double-quote-only spelling missed `readme = 'README.md'` — valid TOML that
+# every gate sharing this parser would have skipped in step, which an agreement
+# check between them cannot see.
+#
+# Cargo's IMPLICIT discovery (no `readme` key, a `README.md` beside the
+# manifest) is deliberately not modelled: `scripts/check-crate-metadata.sh`
+# lists `readme` among REQUIRED_FIELDS for every publishable crate, so a
+# published landing page always has an explicit key to find. The crates that
+# rely on discovery here are the `examples/*`, all `publish = false` and so not
+# published at all, and their READMEs are already corpus by directory.
+README_CANDIDATES = ('README.md', 'README.txt', 'README')
+
+
+def tracked_files(root):
+    """Every tracked path, for the published READMEs the markdown glob misses."""
+    out = subprocess.run(
+        ['git', 'ls-files', '-z'],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout
+    return {f for f in out.split('\0') if f}
+
+
+def _inherited(value):
+    """Whether a manifest value defers to `[workspace.package]`."""
+    return isinstance(value, dict) and value.get('workspace') is True
+
+
+def _published(pkg, workspace):
+    """Cargo's `publish`: absent means yes, `false` and `[]` mean no."""
+    value = pkg.get('publish')
+    if _inherited(value):
+        value = workspace.get('publish')
+    if value is None:
+        return True
+    if value is False:
+        return False
+    if isinstance(value, list):
+        return bool(value)
+    return True
+
+
+def _workspace_of(rel, tracked, parsed):
+    """The manifest whose `[workspace.package]` this one inherits from.
+
+    Cargo walks UP from the package directory to the nearest ancestor manifest
+    carrying a `[workspace]` table, and `package.workspace = "…"` names one
+    explicitly. A manifest with its own `[workspace]` table is its own root,
+    which is how five standalone workspaces sit inside this repository without
+    belonging to the root one: `fuzz/`, `examples/island-flock/`,
+    `examples/reddit-clone/src-tauri/` and the two benchmark harnesses.
+
+    Always reading the repository-root manifest instead would resolve an
+    inherited value from a workspace the package is not in — the right answer
+    only by coincidence, and only for packages in the root workspace.
+    """
+    data = parsed(rel)
+    named = (data.get('package') or {}).get('workspace')
+    if isinstance(named, str):
+        here = str(pathlib.PurePosixPath(rel).parent)
+        for suffix in (named, os.path.join(named, 'Cargo.toml')):
+            cand = os.path.normpath(os.path.join(here, suffix))
+            cand = cand.replace(os.sep, '/')
+            if cand in tracked and 'workspace' in parsed(cand):
+                return cand
+    if 'workspace' in data:
+        return rel
+    parts = rel.split('/')[:-1]
+    while parts:
+        parts.pop()
+        cand = '/'.join(parts + ['Cargo.toml'])
+        if cand in tracked and 'workspace' in parsed(cand):
+            return cand
+    return None
 
 
 def package_readmes(root):
-    """Every file a `Cargo.toml` publishes as its crate's README."""
-    listing = subprocess.run(
-        ["git", "ls-files", "-z", "*Cargo.toml"],
-        cwd=root, capture_output=True, text=True, check=True,
-    ).stdout
+    """Every file a `Cargo.toml` publishes as its crate's README.
+
+    PARSED AS TOML, not matched with a regex, and that is the point. Review
+    found four ways a hand-rolled matcher misread a manifest: it took only
+    double-quoted values, then only explicit keys, then ignored `publish`, then
+    missed the inline-table spelling of the inheritance it did match. Each fix
+    was correct and each left the next corner of the same grammar uncovered,
+    because the thing being approximated is a TOML parser. `tomllib` is
+    standard library and already used by `check-docs-toml.sh` and by
+    `check-example-bin-names.sh`, the latter on `Cargo.toml` exactly like this.
+
+    `cargo metadata` would be more authoritative still, and is deliberately not
+    used: every docs gate shares a CI job that carries no Rust toolchain and no
+    cache, on purpose, so that it reports in seconds and cannot be blocked by a
+    compile failure elsewhere. Reading the manifests keeps that property.
+
+    What Cargo does, and so does this: `readme = false` means none; a string is
+    a path relative to the manifest; `workspace = true` takes the
+    `[workspace.package]` value of the package's OWN workspace, relative to
+    that workspace's root; and an ABSENT key discovers `README.md`,
+    `README.txt` or `README` beside the manifest, in that order. A package that
+    does not publish is skipped — it has no landing page to keep true, and
+    enrolling its working notes made the drift gates fail on the illustrative
+    commands such a page may contain.
+    """
+    tracked = tracked_files(root)
+    root_path = pathlib.Path(root)
+    cache = {}
+
+    def parsed(rel):
+        if rel not in cache:
+            cache[rel] = tomllib.loads(
+                (root_path / rel).read_text(encoding='utf-8'))
+        return cache[rel]
+
     out = set()
-    for rel in filter(None, listing.split("\0")):
+    for rel in sorted(f for f in tracked
+                      if f == 'Cargo.toml' or f.endswith('/Cargo.toml')):
         manifest = pathlib.PurePosixPath(rel)
-        text = (root / rel).read_text(encoding="utf-8", errors="ignore")
-        for named in CARGO_README.findall(text):
+        parent = str(manifest.parent)
+        parent = '' if parent == '.' else parent + '/'
+        pkg = parsed(rel).get('package')
+        if not isinstance(pkg, dict):
+            continue
+
+        ws_manifest = _workspace_of(rel, tracked, parsed)
+        workspace, ws_dir = {}, ''
+        if ws_manifest:
+            workspace = parsed(ws_manifest).get('workspace', {}).get(
+                'package', {})
+            ws_dir = str(pathlib.PurePosixPath(ws_manifest).parent)
+            ws_dir = '' if ws_dir == '.' else ws_dir
+
+        if not _published(pkg, workspace):
+            continue
+
+        named = pkg.get('readme')
+        if _inherited(named):
+            # An inherited path is relative to ITS workspace's root.
+            named = workspace.get('readme')
+            if isinstance(named, str):
+                resolved = os.path.normpath(os.path.join(ws_dir, named))
+                out.add(resolved.replace(os.sep, '/'))
+            continue
+        if named is False:
+            continue
+        if isinstance(named, str):
             # `readme = "../README.md"` points at the workspace root's page.
             resolved = os.path.normpath(str(manifest.parent / named))
-            out.add(resolved.replace(os.sep, "/"))
+            out.add(resolved.replace(os.sep, '/'))
+            continue
+        for candidate in README_CANDIDATES:
+            if parent + candidate in tracked:
+                out.add(parent + candidate)
+                break
     return out
 
 
@@ -378,8 +514,20 @@ def corpus(root):
                          cwd=root, capture_output=True, text=True,
                          check=True).stdout
     published = package_readmes(root)
-    return [f for f in out.split("\0")
-            if f and (in_scope(f) or f.endswith(".md.tmpl") or f in published)]
+    files = [f for f in out.split("\0")
+             if f and (in_scope(f) or f.endswith(".md.tmpl")
+                       or f in published)]
+    # A published landing page is corpus whatever it is NAMED. Using
+    # `published` only to filter the markdown glob meant a crate that names a
+    # `README.rst` or `README.txt` — valid, and unrestricted by
+    # `check-crate-metadata.sh` — resolved to a path the glob never produced, so
+    # the clause above could not add it and the page had no owner in any gate.
+    # All four filtered identically, so they agreed and the scope gate stayed
+    # green over it. Unioned in instead, and only when tracked.
+    seen = set(files)
+    tracked = tracked_files(root)
+    return files + sorted(p for p in published
+                          if p in tracked and p not in seen)
 
 
 # ── Extraction ───────────────────────────────────────────────────────────────
@@ -1002,7 +1150,24 @@ def self_test():
     return 0 if failed == 0 else 1
 
 
-sys.exit({"--self-test": self_test, "--list": list_surface}.get(MODE, main)())
+
+def print_corpus():
+    """Print this gate's resolved corpus, one path per line.
+
+    `scripts/check-docs-scope.sh` compares these lists across the four gates
+    that share a reader-facing corpus. It asks each gate what it reads rather
+    than re-deriving it from this file's source, because a corpus is widened in
+    several places at once — the `git ls-files` globs, the scope tuples, the
+    `.md.tmpl` clause, the crate `readme =` manifests — and a checker that
+    models some of those rules reports agreement over the rest. Asking cannot
+    drift from the answer; modelling can, and did.
+    """
+    for f in sorted(corpus(ROOT)):
+        print(f)
+    return 0
+
+sys.exit({"--self-test": self_test, "--list": list_surface,
+          "--corpus": print_corpus}.get(MODE, main)())
 PYEOF
 }
 
@@ -1012,6 +1177,9 @@ case "${1-}" in
     ;;
   --list)
     run_py --list "$root"
+    ;;
+  --corpus)
+    run_py --corpus "$root"
     ;;
   "")
     echo "Checking actuator paths across the reader-facing docs..."

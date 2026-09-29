@@ -1,9 +1,10 @@
 # Migrating to the next Autumn release (rolling draft)
 
-> **Rolling draft.** This is the in-flight guide for the changes currently
-> under `## [Unreleased]` in [`CHANGELOG.md`](../../CHANGELOG.md). Every PR
-> that lands a breaking change appends a section here and links this file from
-> its changelog entry. At release time the file is renamed to
+> **Rolling draft.** This is the in-flight guide for the changes that are not
+> released yet. Every PR that lands a breaking change appends a section here
+> and links this file from its changelog note — which is a file under
+> [`changelog.d/`](../../changelog.d/README.md), not a line in
+> [`CHANGELOG.md`](../../CHANGELOG.md). At release time the file is renamed to
 > `docs/migrations/<version>.md`, its version placeholders are filled in, and
 > the index in [`README.md`](README.md) is updated — see
 > [`docs/release-checklist.md`](../release-checklist.md), *Migration Guide
@@ -108,6 +109,79 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### TLS: `TlsConfig`, `TlsError` and `SecurityDump` gain mTLS members (#1640)
+
+**Why:** mutual TLS needs a trust store in `[server.tls]`, error variants that
+name what went wrong with it, and a posture-manifest field for the routes that
+require it. Each is additive at the *config* and *document* level — an absent
+`[server.tls.client_auth]` section and a v3 manifest both behave exactly as
+before — but each also widens a Rust type that user code can name.
+
+Three types moved. You are affected only if your code constructs or matches one
+of them exhaustively; none of them changes meaning.
+
+**The `tls` feature does not exempt you from two of the three.** `TlsConfig`
+(`autumn_web::config`) and `SecurityDump` (`autumn_web::route_listing`) live in
+modules that are always compiled, and their new `client_auth` fields are
+unconditional — so an app that has never enabled `tls` and constructs either
+struct literally still gets `E0063: missing field client_auth` after
+upgrading. Only `TlsError` below is behind the non-default `tls` feature; that
+one snippet needs `features = ["tls"]` to compile at all.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::TlsConfig;
+
+let tls = TlsConfig {
+    cert_path: Some("fullchain.pem".into()),
+    key_path: Some("privkey.pem".into()),
+    reload_interval_secs: 60,
+    handshake_timeout_secs: 10,
+    acme: None,
+};
+
+match tls_error {
+    autumn_web::tls::TlsError::Expired { .. } => …,
+    // an exhaustive match over every variant
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::TlsConfig;
+
+let tls = TlsConfig {
+    cert_path: Some("fullchain.pem".into()),
+    key_path: Some("privkey.pem".into()),
+    reload_interval_secs: 60,
+    handshake_timeout_secs: 10,
+    acme: None,
+    client_auth: None,   // new: no client-certificate verification
+};
+
+match tls_error {
+    autumn_web::tls::TlsError::Expired { .. } => …,
+    // `TlsError` is now `#[non_exhaustive]`; add a catch-all arm
+    _ => …,
+}
+```
+
+`autumn_web::route_listing::SecurityDump` gains `client_auth`, the snapshot the
+security-posture manifest reads. Fill it with `ClientAuthDump::off()` unless you
+are modelling an mTLS deployment. The type exists to carry the dump across the
+`autumn routes audit` boundary, so a literal construction is rare outside tests.
+
+`TlsError`, `ClientAuthMode`, `RejectionReason`, `CaInspection` and
+`CrlInspection` are all `#[non_exhaustive]` from this release, so the next
+variant or field added to any of them will not break you again.
+
+**Automation:** `manual` — the fix is a field initializer or a match arm whose
+correct value depends on what the surrounding code is modelling, so no codemod
+can choose it. Both shapes surface as a compiler error (`E0063` for the missing
+field, `E0004` for the non-exhaustive match), never as a silent behaviour change.
+
 ### Audit: `AuditEvent` gains a `metadata` field
 
 **Why:** A retention sweep has to record three facts — which dataset, what
@@ -167,6 +241,64 @@ Also additive, and requiring no change: `AuditSink` gains a **provided**
 sink stores audit events somewhere that can be pruned in place and you want
 `retention.audit_archives` to reach it — see
 [Data Retention for Framework-Owned Data](../guide/data-retention.md).
+
+### openapi: `Parameter` gains a `description` field
+
+**Why:** A `Query<T>` field that decodes as an array of objects
+(`?items[0][sku]=A-1`) has no OpenAPI `style` that describes it — neither
+RFC 6570 nor OAS 3.x define one. `Parameter` now carries a `description` so
+the generated spec names that encoding instead of staying silent about it
+(issue #2251).
+
+Only code that constructs a `Parameter` *by struct literal*, outside this
+crate, has to change. Every route macro and the OpenAPI generator itself
+already build one field at a time and are unaffected. `Parameter` is behind the
+non-default `openapi` feature, so an app that does not enable it is unaffected
+— the module `autumn_web::openapi` compiles either way, but the type does not
+exist without `features = ["openapi"]`.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::openapi::Parameter;
+
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    style: None,
+    explode: None,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::openapi::Parameter;
+
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    style: None,
+    explode: None,
+    description: None,
+};
+
+// …or, now that `Parameter` derives `Default`:
+let param = Parameter {
+    name: "id".to_owned(),
+    location: "path".to_owned(),
+    required: true,
+    schema: serde_json::json!({ "type": "string" }),
+    ..Default::default()
+};
+```
+
+**Automation:** `manual` — this needs a value for a new field (or a switch to
+`..Default::default()`), which no mechanical rewrite can choose safely.
 
 ### SSG: `ManifestEntry` / `StaticManifest` are `#[non_exhaustive]`, and generated pages carry their declared `Content-Type`
 
@@ -473,6 +605,73 @@ they are.
 which fields the caller meant to default, and a match arm needs a decision about
 what the new variant means for that call site.
 
+### Media rooms: `RoomStore` gains a required `heartbeat` method
+
+Mesh-room participants can now hold a seat with an explicit heartbeat, not only
+by polling the roster (see
+[the media guide](../guide/media.md)). `autumn_media_plugin::rooms::RoomStore` is
+the documented swap seam for a custom room-state backend, so the new operation is
+a required trait method with no default body: an out-of-tree `impl RoomStore`
+stops compiling until it implements
+
+```rust
+fn heartbeat<'a>(
+    &'a self,
+    namespace: &'a str,
+    room_id: &'a str,
+    participant_id: &'a str,
+    token: &'a str,
+    token_ttl: Duration,
+) -> RoomStoreFuture<'a, DateTime<Utc>>;
+```
+
+It must verify `token` against `participant_id` in constant time and by value,
+set that participant's `last_seen_at` to now, renew `token_expires_at` to
+`now + token_ttl` **without rotating the token value**, and return the renewed
+expiry. Every miss — unknown room, namespace mismatch, unknown participant,
+wrong token — returns `RoomError::RoomNotFound`, so a heartbeat cannot probe room
+existence or membership. `InMemoryRoomStore` and `DbRoomStore` are the reference
+implementations. There is no default body on purpose: a store that silently did
+nothing would let the reaper evict live participants.
+
+**Automation:** `manual` — the body depends on how the store holds its state.
+
+### admin-plugin: `ExperimentChange::changed_at` is now `NaiveDateTime`
+
+`autumn-admin-plugin` could not compile at all under the `autumn-web/sqlite`
+backend (#2108). One cause was the `Timestamptz` SQL type, which diesel
+implements for `Pg` only. `autumn_admin_plugin::experiments::ExperimentChange`
+is public, and the Rust field type decides which SQL type the generated DSL
+binds, so the field had to change:
+
+```diff
+ pub struct ExperimentChange {
+     …
+-    pub changed_at: chrono::DateTime<chrono::Utc>,
++    pub changed_at: chrono::NaiveDateTime,
+ }
+```
+
+Three things change for code that names the type:
+
+- **The field type.** Call `.and_utc()` on the field to get the old
+  `DateTime<Utc>` back. The value is the same instant.
+- **The `Serialize` output.** `changed_at` now serializes as
+  `"2024-01-15T12:34:56"`, with no `Z`. A consumer that parses strict RFC 3339
+  needs the offset added back, or a `serde` attribute of its own.
+- **The derived OpenAPI schema.** The property loses
+  `"format": "date-time"` and stays `"type": "string"`, so a generated client
+  gets a plain string where it had a timestamp.
+
+Nothing changes on the database. The `autumn_experiment_changes.changed_at`
+column stays `timestamptz`, and no migration is needed. Postgres sends
+`timestamp` and `timestamptz` in the same binary form — microseconds from
+2000-01-01 UTC — so the value read is identical, whatever the session time
+zone. `autumn-admin-plugin/tests/experiment_admin_db.rs` asserts that on a
+non-UTC session.
+
+**Automation:** `manual` — one call to `.and_utc()` at each use site.
+
 ### Capacity contracts: three metadata structs gain fields
 
 Deploys can now carry a proven capacity contract (`autumn calibrate` →
@@ -502,6 +701,75 @@ literal would silently paper over a genuinely missing value on a later field
 addition. Direct struct-literal construction of all three types is rare outside
 the framework: `ApiDoc` and `RouteInfo` are macro-emitted, and `ServerConfig` is
 normally deserialized from `autumn.toml`.
+
+### Jobs: `JobAdminRecord` gains a `blocked_on_concurrency` field
+
+**Why:** On the Redis backend a job that waits for a free concurrency slot is
+parked in a `{prefix}:blocked` zset and promoted back to its queue every
+~100 ms. The `/admin/jobs` enqueued tab read the queue lists only, so a parked
+job blinked in and out of the table (issue #1186). The tab now lists the queues
+and the parked set as one page, and the new field tells the two apart, so the
+dashboard can mark a row "waiting on a concurrency slot" instead of showing it
+as ready to claim.
+
+`JobAdminRecord` is public and not `#[non_exhaustive]`, so **struct-literal
+construction** of it no longer compiles. Only a custom `JobAdminBackend` builds
+one; reading a field, and every built-in backend, are unaffected. The built-in
+local, Postgres and SQLite backends report `false`: they keep an over-cap job in
+`enqueued` status, so it never leaves the tab in the first place.
+
+`JobAdminRecord` now derives `Default`, so the fix is to end the literal with
+`..Default::default()` — and that form survives the next field too.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::job::{JobAdminRecord, JobAdminStatus};
+
+let record = JobAdminRecord {
+    id: "job-1".to_owned(),
+    name: "send_email".to_owned(),
+    queue: "default".to_owned(),
+    status: JobAdminStatus::Enqueued,
+    enqueued_at: None,
+    scheduled_for: None,
+    started_at: None,
+    finished_at: None,
+    attempt: 1,
+    max_attempts: 5,
+    last_error: None,
+    principal_id: None,
+    correlation_id: None,
+};
+```
+
+**After (`{X.Z}`):**
+
+```rust
+use autumn_web::job::{JobAdminRecord, JobAdminStatus};
+
+let record = JobAdminRecord {
+    id: "job-1".to_owned(),
+    name: "send_email".to_owned(),
+    queue: "default".to_owned(),
+    status: JobAdminStatus::Enqueued,
+    attempt: 1,
+    max_attempts: 5,
+    // Set it to `true` only for a job your backend parks on a full
+    // concurrency slot.
+    blocked_on_concurrency: false,
+    ..Default::default()
+};
+```
+
+`JobAdminStatus` also derives `Default` now (`Enqueued`), which is what makes
+the spread work. Both derives are additive.
+
+**Automation:** `manual` — `autumn upgrade` ships no codemod for this. The edit
+is mechanical, but a rewrite cannot tell a literal that means to name every
+field from one that simply predates this one, and appending a rest pattern to
+the wrong literal would hide a genuinely missing value on a later field
+addition.
 
 ### Scrub: a `DELETE` trigger or rule on a table `autumn db scrub` empties is refused
 
@@ -783,6 +1051,66 @@ async fn beta_page() -> &'static str {
 `AppBuilder::static_gate` is a structural change no codemod can make safely
 (it needs the app's `AppBuilder` chain, not just the handler function).
 
+### repository: `owner = column` next to `api = "..."` now requires `policy`
+
+**Why:** Found during a Warden security review of `#[repository]`'s
+auto-generated CRUD API. `owner = <column>` only ever emitted opt-in
+`list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` repository
+methods for a hand-written handler to call with an explicit owner id — the
+generated `api = "..."` HTTP handlers never called them. Declared on its own
+next to `api = "..."`, `owner` therefore compiled to a fully public REST API
+that read, at the declaration site, like a per-owner-scoped one: `GET <api>`
+returned every user's rows, and `GET`/`PUT`/`DELETE <api>/{id}` let any
+authenticated caller read, overwrite, or delete any other user's row by id.
+
+`scope = Type` does not close this on its own either: it only filters `GET
+<api>`'s SQL query (a performance optimization for the list endpoint), and
+has no effect on `_api_get`/`_api_update`/`_api_delete` — only `policy =
+Type` gates those (`can_show`/`can_update`/`can_delete`). An initial version
+of this fix accepted `scope` as an alternative to `policy`, which still left
+every single-record route unguarded; that gap was caught in review before
+merge, so the gate now requires `policy` unconditionally.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[autumn_web::repository(Note, table = "notes", api = "/api/notes", owner = author_id)]
+pub trait NoteRepository {}
+```
+
+This compiled, and `GET /api/notes/{id}` (also `PUT`/`DELETE`) served or
+mutated *any* note by id, and `GET /api/notes` returned every user's notes —
+`owner = author_id` had no effect on any of the five generated routes. So
+did adding `scope = Type` alone: the list endpoint would then filter
+correctly, but `GET`/`PUT`/`DELETE /api/notes/{id}` stayed wide open.
+
+**After (`{X.Z}`):** add `policy = Type`, comparing `ctx.user_id_i64()`
+against the owner column in `can_show`/`can_update`/`can_delete`:
+
+```rust
+#[autumn_web::repository(
+    Note, table = "notes", api = "/api/notes",
+    owner = author_id, policy = NotePolicy,
+)]
+pub trait NoteRepository {}
+
+impl autumn_web::authorization::Policy<Note> for NotePolicy {
+    // can_show/can_update/can_delete compare ctx.user_id_i64() against
+    // note.author_id (or ctx.has_role("admin")); see
+    // autumn/tests/integration/repository_authorization.rs for a worked example.
+}
+```
+
+Keep `scope = Type` alongside `policy` if you also want the list endpoint's
+cheaper SQL-level filter instead of `policy`'s in-memory `can_show` sweep —
+`scope` is accepted as an addition to `policy`, never as a replacement for
+it. Or drop `api = "..."` entirely and call the generated
+`list_scoped`/`search_page_scoped` methods from your own hand-written,
+owner-checked routes.
+
+**Automation:** `manual` — what the policy actually checks is an application
+decision no codemod can make.
+
 ### Lifecycle: an unsound `#[lifecycle]` graph is now a compile error
 
 **Why:** `#[lifecycle]` proved its *endpoints* — every `initial`, `terminal` and
@@ -889,6 +1217,252 @@ accepts, so a codemod that added it everywhere would silently widen a request
 contract. `#[model]` is unaffected: its read schema describes a response only,
 so a conditionally-skipped column there stays sound without the attribute.
 
+### Macros: `autumn-macros` no longer holds the database macros (#2809)
+
+**Why:** `autumn-macros` was one 87k-line proc-macro dylib, and a full-crate
+check ran rustc out of memory on a modest machine. The database codegen —
+`#[model]`, `#[commentable]`, `#[repository]`, `#[service]` — now lives in two
+sibling crates, `autumn-macros-model` and `autumn-macros-repository`, so a
+no-database build never compiles it.
+
+**You are affected only if you depend on `autumn-macros` directly.** Nearly
+nobody does. Every `autumn_web::` path is unchanged, so an app that writes
+`use autumn_web::prelude::*` or `autumn_web::{model, repository, service}`
+needs no change at all.
+
+A direct dependant loses these three macro paths. `autumn-macros`'s `db`
+feature still resolves, but it is now an empty no-op: the macros it used to
+switch on are in other crates. Rust does not let a proc-macro crate re-export
+another crate's proc macro, so a compatibility facade in `autumn-macros` is
+not possible.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-macros = { version = "{X.Y.Z}", features = ["db"] }
+```
+
+```rust
+#[autumn_macros::model]
+struct Post { id: i32 }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+autumn-macros-model = "{X.Z.0}"
+autumn-macros-repository = "{X.Z.0}"
+```
+
+```rust
+#[autumn_macros_model::model]
+struct Post { id: i32 }
+```
+
+`#[repository]` comes from `autumn_macros_repository`; `#[model]`,
+`#[commentable]` and `#[service]` come from `autumn_macros_model`. Depending
+on `autumn-web` instead is the better fix, and the one we recommend: it pins
+both crates for you and keeps the paths you already write.
+
+**Automation:** `manual` — the rewrite needs a new dependency in `Cargo.toml`
+that no codemod may add on the reader's behalf, and the right answer for most
+readers is to depend on `autumn-web` instead, which is a design decision.
+
+### Widgets: widget CSS classes are now `autumn-`-prefixed (#2354)
+
+**Why:** several widgets emitted unprefixed class hooks (`card`,
+`card-header`, `stat-card`, `active`, …) that the widget stylesheet
+(`/static/css/autumn-widgets.css`) never styled — so the `/_stories`
+previews and any app linking only the bundle rendered those widgets
+unstyled, and generic hooks like `active` collided with app CSS. Every
+widget-emitted class now lives in the `autumn-*` namespace and is backed by
+a rule in the widget stylesheet.
+
+**You are affected only if your own CSS or JS targets the old hooks.**
+Widget output is unchanged apart from the class names.
+
+**Before (`{X.Y}`):**
+
+```css
+.card { border: 1px solid #e5e7eb; }
+.card-header { font-weight: 600; }
+a.active { color: red; }
+```
+
+**After (`{(X+1).0}`):**
+
+```css
+.autumn-card { border: 1px solid #e5e7eb; }
+.autumn-card__header { font-weight: 600; }
+a.autumn-active { color: red; }
+```
+
+Full mapping: `card` → `autumn-card`, `card-header` →
+`autumn-card__header`, `card-title` → `autumn-card__title`, `card-body` →
+`autumn-card__body`, `card-footer` → `autumn-card__footer`, `stat-card` →
+`autumn-stat-card`, `stat-label` → `autumn-stat-card__label`, `stat-value` →
+`autumn-stat-card__value`, `stat-link` → `autumn-stat-card__link`,
+`search-empty` → `autumn-search-empty`, `autocomplete-empty` →
+`autumn-autocomplete-empty`, `alert__icon-svg` → `autumn-alert__icon-svg`,
+`active` → `autumn-active` (on `nav_link()` output only).
+
+**Automation:** `manual` — the selectors live in the reader's own
+stylesheets, which no codemod may rewrite on their behalf.
+### autumn-billing: `Customer.user_id` is tenant-scoped under tenancy
+
+**Why:** `SessionUser`/`Entitled<R>` keyed every `autumn-billing` store lookup
+on the bare session user id, with no tenant component. That id is only
+guaranteed unique WITHIN one tenant — a sharded, `tenant_scoped` `User`
+model's row id is a **shard-local** `BIGSERIAL` (`docs/guide/sharding.md`),
+so two different tenants routinely produce the identical id — while
+`BillingPlugin` always resolves the app's one primary connection pool, never
+a per-shard one. An app combining `BillingPlugin` with tenancy could have one
+tenant's user read, and through the hosted Stripe portal potentially manage,
+another tenant's subscription the instant both users' ids collided. See
+`docs/security/2026-09-23-billing-cross-tenant-identity-collision/`.
+
+**You are affected only if your app enables Autumn's tenancy feature AND
+mounts `BillingPlugin`.** An app without tenancy enabled sees no change at
+all — `Customer.user_id` is computed exactly as before.
+
+For an affected app, `Customer.user_id` — and therefore whatever
+[`BillingHooks::recipient_for`](../../autumn-billing/src/hooks.rs) receives —
+is now an opaque, tenant-scoped identity rather than the bare session id.
+Recover the raw id with
+[`autumn_billing::gate::strip_tenant_scope`](../../autumn-billing/src/gate.rs);
+the exact wire format is deliberately not documented here — it is not public
+API and is not guaranteed stable. The **default** `recipient_for`
+implementation already calls it, so it needs no change. A custom override
+that assumed the bare session id under tenancy needs the same one-line
+change:
+
+```diff
+ fn recipient_for(&self, user_id: &str) -> Option<i64> {
+-    user_id.parse().ok()
++    autumn_billing::gate::strip_tenant_scope(user_id).parse().ok()
+ }
+```
+
+**Every pre-existing `billing_customers` row keyed by a bare, unscoped
+`user_id` goes dark, immediately, on upgrade** — not "eventually" or
+"indistinguishably": every lookup now keys on the tenant-scoped identity, so
+`customer_by_user` misses the row on the very next request, and `Entitled<R>`
+reports `entitled: false` for an already-paying user until it is relinked.
+This is not only the app newly enabling tenancy on top of existing billing
+data — **it is every tenancy-enabled app upgrading `autumn-billing` past
+this fix**, including one that already ran tenancy and `BillingPlugin`
+together before this release: pre-fix, `Customer.user_id` was never
+tenant-scoped regardless of when tenancy was turned on, so every row any
+such app has today is a bare id. Nothing relinks it automatically:
+`upsert_customer` deliberately never replaces an existing `user_id` link (see
+its doc), so even a fresh checkout does not repair the row — it creates a
+**second** provider customer instead, which can produce a duplicate Stripe
+subscription. Relink every pre-existing row explicitly — before upgrading if
+you can stage it, immediately after if you cannot — with the tenant you
+already know it belongs to from your own records:
+
+```rust
+let service = autumn_billing::BillingService::require(&state)?;
+let scoped_id = autumn_billing::gate::scope_identity(tenant, &legacy_user_id);
+service
+    .store()
+    .relink_customer(&customer_id, scoped_id, Utc::now())
+    .await?;
+```
+
+`relink_customer` is the one store method allowed to overwrite an existing
+link — restricted to operator-driven migrations for exactly this reason (see
+its doc on [`BillingStore`](../../autumn-billing/src/store/mod.rs)); nothing
+in request-handling or webhook code calls it. It returns
+`BillingError::Conflict` if `scoped_id` already links a different customer
+(for example, a fresh checkout already created one under the new id before
+you relinked the old row) — resolve that by hand, since it means two
+provider customers now exist for the one legacy row.
+
+`relink_customer` is a **new method on the `BillingStore` trait**, which an
+app can implement its own backend against (`BillingPlugin::store`). It has a
+default implementation returning `BillingError::Unsupported`, specifically
+so a `BillingStore` implemented before this method existed keeps compiling
+unchanged — this is source-compatible for every implementor, tenancy or not.
+A custom store that wants to support the relink recipe above needs to
+override it; `MemoryBillingStore` and `DbBillingStore` already do.
+
+**A caller of `Billing::current_subscription`, `is_entitled`, or `require`
+directly** — outside `SessionUser`/`Entitled<R>`, which already resolve the
+right value internally — must pass the same tenant-scoped identity these
+three methods key their store lookup on. If your own code resolves "the
+current user" some other way (your own auth extractor, a background job) and
+calls one of these three with that bare id under tenancy, it silently misses
+an otherwise-paying user's row and denies entitlement — nothing in these
+methods' `user_id: &str` signature stops you from passing the wrong one.
+Pass whatever `Billing::current_user`/`session_user_id` already returned for
+this request, or build the identity explicitly with
+`autumn_billing::gate::scope_identity(tenant, &raw_user_id)` when you don't
+have that value at hand.
+
+**Automation:** `manual` — a custom `recipient_for` override, if one exists,
+needs the diff above; every pre-existing `billing_customers` row of every
+tenancy-enabled app running `BillingPlugin` — whether tenancy was just
+turned on or has been running alongside billing all along — needs the
+`relink_customer` call above; a direct caller of `current_subscription`/
+`is_entitled`/`require` needs the scoped-identity fix above; the default
+`recipient_for` implementation, `SessionUser`/`Entitled<R>`, and every other
+consumer of `Customer.user_id` need no change.
+
+
+### http_client: `ClientError` is `#[non_exhaustive]` and gains `SimNetwork` (#2967)
+
+**Why:** the simulated network (`sim::SimNet`) fails calls with drops,
+partitions, timeouts and unknown hosts. A real `reqwest::Error` cannot be built
+for these, so they need their own variant. The enum is now
+`#[non_exhaustive]`, so the next new variant is not a breaking change.
+
+You are affected only if you `match` on `ClientError` with no wildcard arm.
+Outside a `Sim` with a `SimNet`, the variant never occurs.
+
+**Before (`{X.Y}`):**
+
+```rust
+match error {
+    ClientError::Request(_) => retry(),
+    ClientError::Json(_) => bad_payload(),
+    // … every other variant, no `_` arm
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match error {
+    ClientError::Request(_) | ClientError::SimNetwork(_) => retry(),
+    ClientError::Json(_) => bad_payload(),
+    _ => give_up(), // required: the enum is `#[non_exhaustive]`
+}
+```
+
+**Automation:** `manual` — the right arm depends on what your code does with a
+network failure.
+
+### Sim: `SimClock` and `SimApp` are no longer public (#2967)
+
+**Why:** no public API returned either type, so no code could hold one.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::sim::{Sim, SimApp, SimClock};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::sim::Sim;
+// Reach the app with `sim.client()` and time with `sim.advance(..)`.
+```
+
+**Automation:** `manual` — delete the import; nothing else can have used the
+types.
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that
@@ -983,6 +1557,26 @@ single most valuable section of the guide — keep it factual and short.
 
 ## Configuration changes
 
+**New `[server.tls.client_auth]` section** (additive; absent means the listener
+requests no client certificate, exactly as before). It turns #1603's TLS
+listener into a mutual-TLS one, verifying the caller against a PEM bundle of
+client CAs:
+
+```toml
+[server.tls.client_auth]
+mode           = "required"                          # off (default) | optional | required
+ca_bundle_path = "/etc/autumn/tls/client-ca.pem"     # one or more PEM CAs
+crl_path       = "/etc/autumn/tls/client-ca.crl.pem" # optional revocation list
+required_paths = ["/internal/"]                      # routes that demand a certificate
+```
+
+Startup fails, naming the path, when the bundle or CRL is missing, unparseable
+or empty; when `mode` is not `off` and no `ca_bundle_path` is set; and when
+`required_paths` is non-empty under `mode = "off"` (those routes would reject
+every request). Like the sibling `[server.tls.acme]` table, these keys have no
+`AUTUMN_SERVER__TLS__*` environment override. See the
+[TLS guide](../guide/tls.md#mutual-tls-verifying-client-certificates-servertlsclient_auth).
+
 **New `[server.tls.acme.dns]` section** (additive; absent means HTTP-01, exactly
 as before). It names a DNS provider and the *credentials-store key* holding that
 provider's API credential — never the credential itself. The section is
@@ -1042,6 +1636,36 @@ how fast an idle worker sees work another process enqueued. See
 
 ## Behavior changes
 
+### HTTPS: the listener's connect-info type changed (#1640)
+
+Only the **in-process TLS listener** (`[server.tls]`) is affected; the plain-TCP
+and Unix-socket paths are untouched.
+
+The HTTPS serve arm now hands axum a `TlsConnectInfo` (peer address plus the
+verified client identity, when there is one) instead of a bare `SocketAddr`, and
+a new framework layer immediately re-stamps `ConnectInfo<SocketAddr>` from it.
+So `ClientAddr`, trusted-proxy resolution, IP-keyed rate limiting, SSE and
+`wss://` all behave exactly as before, and a handler extracting
+`ConnectInfo<SocketAddr>` keeps compiling and keeps resolving the real peer.
+
+One case needs a change: a handler that extracted the HTTPS connect-info by some
+other route — say a custom layer reading `ConnectInfo<SocketAddr>` *outside* the
+framework stack, or a test that wires `axum::serve` over
+`autumn_web::tls::TlsListener` by hand. Wire such a test the way the framework
+does:
+
+```rust
+use autumn_web::tls::{TlsConnectInfo, client_auth::ClientIdentityLayer};
+
+let service = tower::Layer::layer(&ClientIdentityLayer, router);
+let make_service =
+    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+        TlsConnectInfo,
+    >(service);
+```
+
+The previous `listener.tap_io(|_io| {})` wrapper is no longer needed.
+
 ### CI: `autumn upgrade` adds a blocking dependency audit — add `deny.toml` with it
 
 `.github/workflows/ci.yml` is framework-owned, so `autumn upgrade --apply`
@@ -1084,6 +1708,23 @@ Other changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+### Sim: framework code reads the sim clock (#2967)
+
+Inside a `Sim`, framework code with no clock in scope now reads the sim's
+virtual clock (`time::ambient_now` and its siblings), not the OS clock. This
+covers about 55 modules and the `deleted_at` stamp `#[repository]` writes for a
+soft delete. Wall time starts at the sim epoch, `2020-01-01T00:00:00Z`. A sim
+test that compares such a value with `Utc::now()` fails; compare it with the
+sim clock instead. Outside a `Sim`, nothing changes.
+
+### Sim: `run_to_idle` panics when the drain does not settle (#2967)
+
+Before, `Sim::run_to_idle` stopped after its step bound and gave no signal.
+Now, when work still runs in the last rounds of the drain (for example, a job
+that enqueues itself again), it panics with a `sim drain stall` message and
+the seed. A test that relied on the silent stop fails with that message. Fix
+the endless work, or call `Sim::try_run_to_idle` and handle the `SimStall`.
 
 ## Deprecations retained from `{X.Y}`
 

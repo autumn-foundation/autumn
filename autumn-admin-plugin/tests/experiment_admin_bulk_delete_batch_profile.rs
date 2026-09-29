@@ -100,7 +100,6 @@ use autumn_admin_plugin::experiments::ExperimentAdminModel;
 use diesel::connection::SimpleConnection;
 use diesel::sql_types::{BigInt, Text};
 use diesel::{Connection, PgConnection, QueryableByName};
-use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use testcontainers::ImageExt;
@@ -468,7 +467,10 @@ async fn experiment_admin_bulk_delete_batch_profile() {
             .expect("audit watermark")
             .n;
 
-    let config = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    // `RuntimeConnection`, not `AsyncPgConnection`: the model takes the
+    // runtime pool type (issue #2108). This harness still needs Postgres
+    // at run time — it reads `pg_stat_statements`.
+    let config = AsyncDieselConnectionManager::<::autumn_web::RuntimeConnection>::new(url);
     let pool = Pool::builder(config).build().expect("pool");
     let model = ExperimentAdminModel;
 

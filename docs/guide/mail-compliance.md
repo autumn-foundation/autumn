@@ -42,6 +42,12 @@ from mail they actually need — keep those mailers plain.
 
 ## 15-minute setup
 
+Mailers are behind the non-default `mail` feature:
+
+```toml
+autumn-web = { version = "0.7", features = ["mail"] }
+```
+
 ### 1. Scaffold a list mailer
 
 ```bash

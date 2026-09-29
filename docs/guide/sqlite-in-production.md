@@ -192,6 +192,19 @@ published support contract**. Available **today**:
   AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of
   being refused, and the generated auth session store is typed against
   `::autumn_web::RuntimeConnection` so it compiles on either backend.
+- **Backend-aware `generate teams` (#1927)** — the organizations / memberships /
+  invitations scaffold, refused on SQLite until now, emits its migration in the
+  app's dialect. The portable parts are shared: the `role` / `status` `CHECK`
+  enums, the `UNIQUE (tenant_id, user_id)` constraint, and the partial
+  `idx_invitations_pending_email` unique index (SQLite has had partial indexes
+  since 3.8.0). Its `#[repository]`/`#[model]` templates needed no fork —
+  `#[repository]` binds `::autumn_web::RuntimeConnection`, and
+  `src/teams/schema.rs` uses only sql-types both diesel backends carry — but its
+  route handlers' 19 `.for_update()` row locks now go through
+  `::autumn_web::maybe_for_update!` (diesel implements the locking clause for
+  Postgres and MySQL only), and the generator now selects the SQLite dependency
+  set and enables `autumn-web`'s `sqlite` feature, without which the app would
+  refuse its own `sqlite://` URL at boot.
 - **DB-backed sessions store on SQLite (#1908)** — the `generate auth`
   tracked-sessions store bounds its query functions by
   `::autumn_web::RuntimeBackend` instead of a hard-coded `diesel::pg::Pg`, so the
@@ -717,6 +730,40 @@ Additional generator shapes are refused on SQLite:
 > feature), so it compiles on whichever backend the app selected. Its query
 > functions bind `::autumn_web::RuntimeBackend` for the same reason (#1908), and
 > the scaffolded session-management guide emits its SQL in the app's dialect.
+
+> **`generate teams` now generates on SQLite (#1927).** Also historically
+> refused, it emits its organizations / memberships / invitations migration in
+> the app's dialect. The `role` / `status` `CHECK` enums, the
+> `UNIQUE (tenant_id, user_id)` constraint and the partial
+> `idx_invitations_pending_email` unique index are portable and shared. Its
+> `#[repository]`/`#[model]` templates needed no forking either — the
+> `#[repository]` macro binds `::autumn_web::RuntimeConnection`, and
+> `src/teams/schema.rs` uses only sql-types both diesel backends carry.
+>
+> DDL was not the whole of it. The generated route handlers took 19 pessimistic
+> row locks with `.for_update()`, which diesel implements for Postgres and MySQL
+> only; they now go through `::autumn_web::maybe_for_update!`, which is a plain
+> read on SQLite. Write-write correctness then rests on SQLite's single-writer
+> transaction: a second writer that read the same snapshot fails closed with
+> `SQLITE_BUSY_SNAPSHOT` rather than losing the update, so the "don't remove the
+> sole Owner" and "don't accept one invitation twice" invariants still hold —
+> but under contention a request errors instead of queueing behind a row lock.
+> The generator also now writes the SQLite dependency set (no `pq-sys`, and the
+> `returning_clauses_for_sqlite_3_35` the generated inserts need) and enables
+> `autumn-web`'s `sqlite` feature, without which the app compiles but refuses
+> its own `sqlite://` URL at boot.
+>
+> `auth`, `mailer --list-unsubscribe`, `teams` and `commentable` hand-write
+> their `CREATE TABLE` DDL rather than deriving it from a model's fields, which
+> is the shape #1927 was opened about; `notifications` and `pwa` derive theirs
+> through `schema_edit`. A guard covers all six: it plans each against a SQLite
+> app, applies and rolls back every migration it emits on a real in-memory
+> SQLite, scans the SQL for Postgres-only spellings, and scans the generated
+> Rust for constructs SQLite has no diesel implementation for. Neither scan is
+> redundant. SQLite accepts an unknown type name (falling back to BLOB
+> affinity), so `id BIGSERIAL PRIMARY KEY` applies cleanly there and simply
+> stops auto-incrementing; and applying SQL cannot see a generated crate that
+> would not compile.
 
 > **Full-text search now generates on SQLite (#2047).** The `--searchable` /
 > `#[searchable]` scaffold — historically rejected at generate time on SQLite —

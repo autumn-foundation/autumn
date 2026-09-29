@@ -63,6 +63,7 @@ mod schema;
 mod search;
 mod seed;
 mod serve;
+mod service;
 mod setup;
 mod shard;
 mod starters;
@@ -671,25 +672,27 @@ pub enum SearchSubcommands {
 pub enum PluginSubcommands {
     /// List installable plugins with the version compatible with this app.
     ///
-    /// Covers every first-party plugin plus community crates discoverable on
-    /// crates.io through the documented `autumn-plugin-<name>` convention.
+    /// Reads the curated plugin index first (trust, tier, conformance), then
+    /// crates.io `autumn-plugin-<name>` crates, marked unlisted. Set
+    /// `AUTUMN_PLUGIN_INDEX=<path>` to read another index file.
     List {
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
-        /// Do not query crates.io; list the first-party catalog only.
+        /// Do not query crates.io; list the plugin index only.
         #[arg(long)]
         offline: bool,
     },
-    /// Add a plugin: dependency, builder-chain mount, and post-install steps.
+    /// Add a plugin: trust review, dependency, builder-chain mount, and
+    /// post-install steps.
     Add {
         /// Plugin crate name, e.g. `autumn-admin-plugin`.
         name: String,
         /// Print what would change without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Do not query crates.io. First-party plugins install normally;
-        /// a community crate cannot have its version resolved and is refused.
+        /// Do not query crates.io. Listed plugins install. The command
+        /// refuses an unlisted crate, because it cannot find its version.
         #[arg(long)]
         offline: bool,
     },
@@ -784,6 +787,128 @@ pub enum PluginSubcommands {
         #[arg(long, value_name = "ARTIFACT")]
         against: Option<String>,
     },
+
+    /// Maintain the curated plugin index (issue #1625).
+    ///
+    /// `check` is the gate a listing must pass. `record` writes an
+    /// `autumn plugin-check --format json` report into a listing. See
+    /// autumn-cli/plugin-index/README.md.
+    Index {
+        /// The index subcommand to run.
+        #[command(subcommand)]
+        action: IndexSubcommands,
+    },
+}
+
+/// Subcommands for `autumn plugin index`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum IndexSubcommands {
+    /// Check the index: admission rules, and re-verification against a
+    /// release. Exits 1 on any finding.
+    ///
+    /// Examples:
+    ///   autumn plugin index check --index autumn-cli/plugin-index/index.toml
+    ///   autumn plugin index check --against 0.8.0 --format json
+    #[command(verbatim_doc_comment)]
+    Check {
+        /// The index file. Default: `AUTUMN_PLUGIN_INDEX`, else the copy in
+        /// this CLI.
+        #[arg(long, value_name = "FILE")]
+        index: Option<String>,
+        /// The `autumn-web` release to check against. Default: this CLI's.
+        #[arg(long, value_name = "VERSION")]
+        against: Option<String>,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+    },
+    /// Write conformance results into the index file.
+    ///
+    /// A pass lists the plugin. A fail flags it incompatible. A second fail
+    /// on a later release delists it. Writes nothing if any step fails.
+    ///
+    /// Examples:
+    ///   autumn plugin index record --index autumn-cli/plugin-index/index.toml \
+    ///       --report admin.json --report search.json --exempt autumn-storage-s3
+    #[command(verbatim_doc_comment)]
+    Record {
+        /// The index file to update.
+        #[arg(long, value_name = "FILE")]
+        index: String,
+        /// `autumn plugin-check --format json` reports. Takes one or more
+        /// files, so `--report reports/*.json` works.
+        #[arg(long = "report", value_name = "FILE", num_args = 1..)]
+        reports: Vec<String>,
+        /// `autumn plugin inspect --format json` reports, for sandboxed
+        /// listings. Takes one or more files.
+        #[arg(long = "inspect", value_name = "FILE", num_args = 1..)]
+        inspects: Vec<String>,
+        /// An exempt listing whose install gate passed (repeatable).
+        #[arg(long, value_name = "NAME")]
+        exempt: Vec<String>,
+        /// An exempt listing whose install gate failed (repeatable). It is
+        /// flagged, or delisted on a second release; a later pass recovers it.
+        #[arg(long = "exempt-failed", value_name = "NAME")]
+        exempt_failed: Vec<String>,
+        /// The `autumn-web` release the runs used. Default: this CLI's.
+        #[arg(long, value_name = "VERSION")]
+        against: Option<String>,
+        /// The run date, `YYYY-MM-DD`. Default: today.
+        #[arg(long, value_name = "DATE")]
+        date: Option<String>,
+    },
+}
+
+/// Run `autumn plugin index <action>`. Returns the exit code.
+fn run_plugin_index(action: IndexSubcommands) -> i32 {
+    let release = env!("CARGO_PKG_VERSION");
+    match action {
+        IndexSubcommands::Check {
+            index,
+            against,
+            format,
+        } => {
+            let json = match format.as_str() {
+                "text" => false,
+                "json" => true,
+                other => {
+                    eprintln!(
+                        "autumn plugin index check: unknown format '{other}'; expected 'text' or 'json'"
+                    );
+                    return 1;
+                }
+            };
+            plugin::curate::run_check(&plugin::curate::CheckOptions {
+                index: index.as_deref().map(std::path::Path::new),
+                against: against.as_deref().unwrap_or(release),
+                json,
+            })
+        }
+        IndexSubcommands::Record {
+            index,
+            reports,
+            inspects,
+            exempt,
+            exempt_failed,
+            against,
+            date,
+        } => {
+            let reports: Vec<std::path::PathBuf> =
+                reports.iter().map(std::path::PathBuf::from).collect();
+            let inspects: Vec<std::path::PathBuf> =
+                inspects.iter().map(std::path::PathBuf::from).collect();
+            let today = chrono::Local::now().date_naive().to_string();
+            plugin::curate::run_record(&plugin::curate::RecordOptions {
+                index: std::path::Path::new(&index),
+                reports: &reports,
+                inspects: &inspects,
+                exempt: &exempt,
+                exempt_failed: &exempt_failed,
+                against: against.as_deref().unwrap_or(release),
+                date: date.as_deref().unwrap_or(&today),
+            })
+        }
+    }
 }
 
 /// Subcommands for `autumn jobs`.
@@ -1100,6 +1225,14 @@ enum Commands {
         /// production Dockerfile does this for `embed-assets` builds.
         #[arg(long, value_name = "FEATURES", conflicts_with = "binary")]
         features: Option<String>,
+        /// Resolve with the `default` feature disabled.
+        ///
+        /// An app built with `cargo build --no-default-features` links fewer
+        /// crates than the default set; without this the SBOM would list the
+        /// optional dependencies the default feature set pulls in. Composes
+        /// with `--features`.
+        #[arg(long, conflicts_with = "binary")]
+        no_default_features: bool,
         /// Restrict resolution to one target triple.
         ///
         /// Without it the document lists target-specific dependencies for
@@ -1795,10 +1928,12 @@ enum Commands {
 
     /// Discover, install, package and review Autumn plugins.
     ///
-    /// `list` shows every installable plugin with the version compatible with
-    /// this app (querying crates.io for community crates unless `--offline`);
-    /// `add` writes the dependency, mounts the plugin in the
-    /// `autumn_web::app()` builder chain, and prints the post-install steps.
+    /// `list` reads the curated plugin index first: each listing shows its
+    /// trust class, API tier and last conformance result. Then it queries
+    /// crates.io (unless `--offline`) and marks those results unlisted.
+    /// `add` prints the trust review, writes the dependency, mounts the plugin
+    /// in the `autumn_web::app()` builder chain, and prints the post-install
+    /// steps. `index` checks and updates the index (maintainers).
     ///
     /// `package` and `inspect` are the capability-sandboxed lane: a sandboxed
     /// plugin runs as a `wasm32-wasip1` module inside a deny-by-default
@@ -1818,6 +1953,7 @@ enum Commands {
     ///   autumn plugin package --manifest plugin.toml --module hello.wasm \
     ///       --out hello.autumn-plugin
     ///   autumn plugin inspect hello.autumn-plugin
+    ///   autumn plugin index check
     #[command(verbatim_doc_comment)]
     Plugin {
         /// The plugin subcommand to run.
@@ -1877,6 +2013,10 @@ enum Commands {
         /// in a plugin's own CI to forbid it.
         #[arg(long)]
         deny_experimental: bool,
+        /// Assert the plugin mounts no routes (a cache, a search index).
+        /// Without it, finding no routes fails `route-attribution`.
+        #[arg(long, conflicts_with = "prefix")]
+        no_routes: bool,
     },
 
     /// Inspect and mutate live runtime configuration values.
@@ -2770,6 +2910,44 @@ enum ServeCommands {
     Status,
     /// Stop the daemon (if running) and start it again in the background.
     Restart,
+    /// Windows only: build the app and register it as a Windows service that
+    /// starts at boot and restarts after a crash.
+    ///
+    /// The service runs the same app `--daemon` runs and leaves the same
+    /// pidfile, address file and logs, so `autumn serve status` and
+    /// `autumn serve stop` keep working against it. It is an ordinary entry in
+    /// `services.msc` and `sc.exe`.
+    InstallService,
+    /// Windows only: stop the registered service, deregister it, and remove the
+    /// daemon's state. The managed-Postgres data directory is kept.
+    UninstallService,
+    /// Internal: run as the Windows Service Control Manager's hosted process.
+    ///
+    /// Registered as the service's command line by `install-service`; running it
+    /// by hand does nothing useful.
+    #[command(hide = true)]
+    RunService {
+        /// Path to the record `install-service` wrote.
+        #[arg(long = "service-record")]
+        service_record: Option<std::path::PathBuf>,
+    },
+}
+
+/// Normalize a repeated/comma-separated `--pin` into what the app parses.
+///
+/// No `--pin` at all leaves `AUTUMN_JOBS__PIN` untouched so the child reads
+/// `[jobs] pin` from its own config; `--pin ""` is a deliberate unpin and must
+/// stay distinguishable from that, so presence is carried by the `Option`, not
+/// by the list being non-empty. Trimming and dropping blanks here means the pin
+/// `serve restart` recovers and the pin the app parses are the same list.
+fn normalize_pin(pin: &[String]) -> Option<Vec<String>> {
+    (!pin.is_empty()).then(|| {
+        pin.iter()
+            .map(|q| q.trim())
+            .filter(|q| !q.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 /// Process role selector for `autumn serve --role`.
@@ -2886,6 +3064,50 @@ enum MigrateCommands {
         #[arg(long = "force", value_name = "VERSION")]
         force: Option<String>,
     },
+    /// Create `migrations/<version>_<name>/{up,down}.sql` with a version
+    /// that will not collide with any migration this checkout can see.
+    ///
+    /// Diesel records applied migrations BY VERSION (the leading
+    /// `YYYYMMDDHHMMSS` directory prefix). When two directories share one
+    /// version, a fresh database runs exactly one of them and records the
+    /// version as done — the other is skipped forever, with no error
+    /// anywhere. This picks a version free across the working tree, every
+    /// local and remote-tracking git branch, and this CLI's own compiled-in
+    /// framework migrations — never before the latest version already
+    /// claimed anywhere it can see.
+    ///
+    /// Does not touch the database. Prints the created directory's path.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate new add_widget_archived_at
+    #[command(verbatim_doc_comment)]
+    #[allow(clippy::doc_markdown)]
+    New {
+        /// `snake_case` name for the migration (no leading digit — the CLI
+        /// treats everything up to the first `_` as part of the version).
+        name: String,
+    },
+    /// Fail when a migration version this checkout introduces is already
+    /// claimed by a different directory elsewhere.
+    ///
+    /// The CI-time backstop for `autumn migrate new`: checks the working
+    /// tree's migration versions against the repository's default branch,
+    /// every other pushed branch, and this CLI's own compiled-in framework
+    /// migrations. Reports a collision only when this checkout's working
+    /// tree is one of the colliding directories — a collision between two
+    /// other branches is real but is that branch's own gate to fail on.
+    ///
+    /// Requires the full branch history (`git fetch --all` or
+    /// `actions/checkout` with `fetch-depth: 0`); degrades to a working-tree-
+    /// only check with a loud warning otherwise. Does not require a database
+    /// connection.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate check-collisions
+    #[command(verbatim_doc_comment, name = "check-collisions")]
+    CheckCollisions,
 }
 
 /// Subcommands for `autumn shard`.
@@ -3722,7 +3944,13 @@ enum GenerateCommands {
     /// When an owner column (`user_id`, `author_id`, or `owner_id`) is present,
     /// the generated `can_update`/`can_delete` allow the record owner or an
     /// `admin`, and the scope filters lists to the current user's rows.
-    /// Otherwise those default-deny with a `TODO` marker.
+    ///
+    /// When NO owner column is detected there is no ownership rule to emit, so
+    /// `can_update`/`can_delete` fall back to an authentication check under a
+    /// `SECURITY TODO` marker: any signed-in user may update or delete any row.
+    /// That is a placeholder, not a policy — replace it with a real per-record
+    /// rule before production. (The `Scope` does deny by default: it lists no
+    /// rows until its own `TODO` filter is written.)
     ///
     /// Requires the target model to already exist (`src/models/<snake>.rs`).
     /// Run `autumn generate model <Pascal>` (or `scaffold`) first.
@@ -3952,7 +4180,7 @@ enum GenerateCommands {
     ///   - `src/inbound_mailers/mod.rs`      — created/updated with `pub mod`
     ///   - `tests/<snake>_inbound_mail.rs`   — integration smoke test
     ///   - `src/main.rs`                    — wired into `InboundMailRouter`
-    ///   - `Cargo.toml`                     — `inbound-mail` feature added
+    ///   - `Cargo.toml`                     — `inbound-mailgun` feature added
     ///
     /// Example:
     ///
@@ -4433,41 +4661,39 @@ fn run_command(command: Commands) {
             role,
             pin,
         } => {
-            let action = action.map(|a| match a {
-                ServeCommands::Stop => serve::ServeAction::Stop,
-                ServeCommands::Status => serve::ServeAction::Status,
-                ServeCommands::Restart => serve::ServeAction::Restart,
-            });
-            serve::run(
-                action,
-                &serve::ServeOptions {
-                    package,
-                    // --bundled-pg implies --daemon.
-                    daemon: daemon || bundled_pg,
-                    release,
-                    bundled_pg,
-                    // Normal start: the child inherits this shell's env. Only
-                    // `restart` sets this, to restore a lost profile.
-                    profile: None,
-                    // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
-                    // the child pick its default (combined) or read its own env.
-                    role: role.map(|r| r.as_str().to_owned()),
-                    // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3). No `--pin`
-                    // at all leaves the variable untouched so the child reads
-                    // `[jobs] pin`; `--pin ""` is a deliberate unpin and must
-                    // stay distinguishable from that, so presence is carried by
-                    // the `Option`, not by the list being non-empty. Normalized
-                    // here (trim, drop blanks) so the recorded pin and the pin
-                    // the app parses are the same list.
-                    pin: (!pin.is_empty()).then(|| {
-                        pin.iter()
-                            .map(|q| q.trim())
-                            .filter(|q| !q.is_empty())
-                            .map(str::to_owned)
-                            .collect()
-                    }),
-                },
-            );
+            // The service journeys are their own command family: they build
+            // and register rather than start, so they never reach `serve::run`.
+            let service_action = match action {
+                Some(ServeCommands::InstallService) => Some(service::ServiceAction::Install),
+                Some(ServeCommands::UninstallService) => Some(service::ServiceAction::Uninstall),
+                Some(ServeCommands::RunService { .. }) => Some(service::ServiceAction::Run),
+                _ => None,
+            };
+            let lifecycle = match action {
+                Some(ServeCommands::Stop) => Some(serve::ServeAction::Stop),
+                Some(ServeCommands::Status) => Some(serve::ServeAction::Status),
+                Some(ServeCommands::Restart) => Some(serve::ServeAction::Restart),
+                _ => None,
+            };
+            let opts = serve::ServeOptions {
+                package,
+                // --bundled-pg implies --daemon, and a service always hosts one.
+                daemon: daemon || bundled_pg || service_action.is_some(),
+                release,
+                bundled_pg,
+                // Normal start: the child inherits this shell's env. Only
+                // `restart` sets this, to restore a lost profile.
+                profile: None,
+                // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
+                // the child pick its default (combined) or read its own env.
+                role: role.map(|r| r.as_str().to_owned()),
+                // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3).
+                pin: normalize_pin(&pin),
+            };
+            if let Some(service_action) = service_action {
+                std::process::exit(service::run(service_action, &opts));
+            }
+            serve::run(lifecycle, &opts);
         }
         Commands::Schema { action } => schema::run(action),
         Commands::Migrate {
@@ -4478,6 +4704,21 @@ fn run_command(command: Commands) {
             profile,
             wait,
         } => {
+            // `new` and `check-collisions` are pure filesystem/git operations
+            // with no database target — handle them before the DB-target
+            // resolution below, which every other `MigrateCommands` variant
+            // needs.
+            match &action {
+                Some(MigrateCommands::New { name }) => {
+                    migrate::versions::run_new(name);
+                    return;
+                }
+                Some(MigrateCommands::CheckCollisions) => {
+                    migrate::versions::run_check_collisions();
+                    return;
+                }
+                _ => {}
+            }
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
                 Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
@@ -4494,6 +4735,9 @@ fn run_command(command: Commands) {
                     migrate::MigrateAction::Baseline(migrate::BaselineArgs {
                         force_version: force,
                     })
+                }
+                Some(MigrateCommands::New { .. } | MigrateCommands::CheckCollisions) => {
+                    unreachable!("handled above and returned")
                 }
                 None => migrate::MigrateAction::Run,
             };
@@ -4868,6 +5112,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            no_default_features,
             filter_platform,
             expect_version,
         } => sbom::run(&sbom::SbomOptions {
@@ -4878,6 +5123,7 @@ fn run_command(command: Commands) {
             locked,
             all_features,
             features,
+            no_default_features,
             filter_platform,
             expect_version,
         }),
@@ -5362,6 +5608,7 @@ fn run_command(command: Commands) {
                     );
                     0
                 }
+                PluginSubcommands::Index { action } => run_plugin_index(action),
             };
             if code != 0 {
                 std::process::exit(code);
@@ -5375,6 +5622,7 @@ fn run_command(command: Commands) {
             sensitive_route,
             format,
             deny_experimental,
+            no_routes,
         } => {
             run_plugin_check_command(
                 package.as_deref(),
@@ -5383,7 +5631,7 @@ fn run_command(command: Commands) {
                 prefix.as_deref(),
                 &sensitive_route,
                 &format,
-                deny_experimental,
+                (deny_experimental, no_routes),
             );
         }
         Commands::Generate(cmd) => run_generate_command(cmd, ApplyMode::Generate),
@@ -5633,8 +5881,27 @@ fn resolve_scaffold_plugins(
     if names.is_empty() {
         return Vec::new();
     }
+    let loaded = plugin::load_index().unwrap_or_else(|err| {
+        eprintln!("autumn new: {err}");
+        std::process::exit(1);
+    });
+    // The trust review, before any file is written and before a refusal, so
+    // a refused listing still shows its facts (#1625, AC 6).
+    let mut shown: Vec<String> = Vec::new();
+    for name in names {
+        let standing = plugin::standing(&loaded.index, name);
+        let listed_name = match &standing {
+            plugin::Standing::Listed(l) | plugin::Standing::Delisted(l) => l.name.clone(),
+            plugin::Standing::Unlisted => name.clone(),
+        };
+        if !shown.contains(&listed_name) {
+            println!("{}", plugin::render_trust(&listed_name, &standing));
+            shown.push(listed_name);
+        }
+    }
     match plugin::preflight_scaffold_plugins(
         names,
+        &loaded.index,
         scaffold_autumn_web,
         plugin::registry::latest_version,
     ) {
@@ -5669,7 +5936,7 @@ fn run_plugin_check_command(
     prefix: Option<&str>,
     sensitive_route_args: &[String],
     format: &str,
-    deny_experimental: bool,
+    (deny_experimental, no_routes): (bool, bool),
 ) {
     let fmt = format.parse().unwrap_or_else(|e| {
         eprintln!("autumn plugin-check: {e}");
@@ -5701,6 +5968,7 @@ fn run_plugin_check_command(
         // Populated by `run` from the built binary's contract dump.
         contracts: &plugin_check::ContractDump::Absent,
         deny_experimental,
+        no_routes,
     });
 }
 
@@ -6763,6 +7031,7 @@ mod tests {
             expect_version,
             all_features,
             features,
+            no_default_features,
             filter_platform,
         } = cli.command
         else {
@@ -6783,6 +7052,11 @@ mod tests {
              what the document describes by default"
         );
         assert!(features.is_none());
+        assert!(
+            !no_default_features,
+            "the default feature set is what a build actually links by default, \
+             so disabling it must be opt-in"
+        );
         assert!(
             filter_platform.is_none(),
             "a source release is consumed on every platform, so no filter by default"
@@ -6817,6 +7091,19 @@ mod tests {
             panic!("expected Sbom command");
         };
         assert_eq!(features.as_deref(), Some("embed-assets"));
+    }
+
+    #[test]
+    fn parse_sbom_no_default_features() {
+        let cli = Cli::try_parse_from(["autumn", "sbom", "--no-default-features"]).unwrap();
+        let Commands::Sbom {
+            no_default_features,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Sbom command");
+        };
+        assert!(no_default_features);
     }
 
     #[test]
@@ -7130,6 +7417,89 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn serve_service_subcommands_parse() {
+        for (argv, expected) in [
+            (["autumn", "serve", "install-service"].as_slice(), "install"),
+            (
+                ["autumn", "serve", "uninstall-service"].as_slice(),
+                "uninstall",
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command {
+                Commands::Serve { action, .. } => {
+                    let got = match action {
+                        Some(ServeCommands::InstallService) => "install",
+                        Some(ServeCommands::UninstallService) => "uninstall",
+                        _ => "other",
+                    };
+                    assert_eq!(got, expected, "{argv:?}");
+                }
+                _ => panic!("expected Serve for {argv:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn serve_flags_belong_to_serve_not_to_the_service_subcommand() {
+        // clap gives everything after a subcommand NAME to that subcommand, and
+        // `install-service` takes no arguments — so `serve install-service
+        // --bundled-pg` is a parse error, not a bundled install. The supported
+        // spelling puts the flag before the subcommand, exactly as `--pin` and
+        // `--role` already do for `restart`. Pinned here because the failure is
+        // silent in a script: exit 2 with a usage message.
+        let cli = Cli::try_parse_from(["autumn", "serve", "--bundled-pg", "install-service"])
+            .expect("flags before the subcommand must parse");
+        match cli.command {
+            Commands::Serve {
+                action, bundled_pg, ..
+            } => {
+                assert!(matches!(action, Some(ServeCommands::InstallService)));
+                assert!(bundled_pg);
+            }
+            _ => panic!("expected Serve"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "serve", "install-service", "--bundled-pg"]).is_err(),
+            "a flag after the subcommand is a parse error, so callers must not \
+             be told that spelling works"
+        );
+    }
+
+    #[test]
+    fn run_service_carries_the_record_path_the_scm_was_registered_with() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "serve",
+            "run-service",
+            "--service-record",
+            "C:\\state\\serve.service.toml",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Serve { action, .. } => assert!(matches!(
+                action,
+                Some(ServeCommands::RunService {
+                    service_record: Some(_)
+                })
+            )),
+            _ => panic!("expected Serve"),
+        }
+    }
+
+    #[test]
+    fn normalize_pin_distinguishes_unpinned_from_absent() {
+        // `--pin ""` is a deliberate unpin and must stay distinguishable from no
+        // `--pin` at all, which leaves the app reading `[jobs] pin` itself.
+        assert_eq!(normalize_pin(&[]), None);
+        assert_eq!(normalize_pin(&[String::new()]), Some(vec![]));
+        assert_eq!(
+            normalize_pin(&[" critical ".to_owned(), String::new(), "default".to_owned()]),
+            Some(vec!["critical".to_owned(), "default".to_owned()])
+        );
     }
 
     #[test]
@@ -9410,6 +9780,121 @@ mod tests {
         }
     }
 
+    // ── autumn plugin index (issue #1625) ──────────────────────────────────
+
+    #[test]
+    fn parse_plugin_index_check() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "index",
+            "check",
+            "--index",
+            "i.toml",
+            "--against",
+            "0.8.0",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Index {
+                        action:
+                            IndexSubcommands::Check {
+                                index,
+                                against,
+                                format,
+                            },
+                    },
+            } => {
+                assert_eq!(index.as_deref(), Some("i.toml"));
+                assert_eq!(against.as_deref(), Some("0.8.0"));
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected plugin index check"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_index_record_takes_repeated_reports() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "index",
+            "record",
+            "--index",
+            "i.toml",
+            "--report",
+            "a.json",
+            "--report",
+            "b.json",
+            "--exempt",
+            "autumn-storage-s3",
+            "--date",
+            "2026-10-01",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Index {
+                        action:
+                            IndexSubcommands::Record {
+                                index,
+                                reports,
+                                exempt,
+                                against,
+                                date,
+                                ..
+                            },
+                    },
+            } => {
+                assert_eq!(index, "i.toml");
+                assert_eq!(reports, ["a.json", "b.json"]);
+                assert_eq!(exempt, ["autumn-storage-s3"]);
+                assert_eq!(against, None);
+                assert_eq!(date.as_deref(), Some("2026-10-01"));
+            }
+            _ => panic!("expected plugin index record"),
+        }
+    }
+
+    /// The documented `--report <dir>/*.json` expands to several values.
+    #[test]
+    fn parse_plugin_index_record_takes_a_glob_of_reports() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin",
+            "index",
+            "record",
+            "--index",
+            "i.toml",
+            "--report",
+            "a.json",
+            "b.json",
+            "--exempt",
+            "autumn-storage-s3",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Plugin {
+                action:
+                    PluginSubcommands::Index {
+                        action:
+                            IndexSubcommands::Record {
+                                reports, exempt, ..
+                            },
+                    },
+            } => {
+                assert_eq!(reports, ["a.json", "b.json"]);
+                assert_eq!(exempt, ["autumn-storage-s3"]);
+            }
+            _ => panic!("expected plugin index record"),
+        }
+    }
+
     // ── autumn plugin (list/add) tests ─────────────────────────────────────
 
     #[test]
@@ -9691,8 +10176,10 @@ mod tests {
                 sensitive_route,
                 format,
                 deny_experimental,
+                no_routes,
             } => {
                 assert!(!deny_experimental, "the flag defaults off");
+                assert!(!no_routes, "the flag defaults off");
                 assert_eq!(package.as_deref(), Some("my-app"));
                 assert_eq!(bin.as_deref(), Some("server"));
                 assert_eq!(plugin_name, "autumn-admin-plugin");
@@ -9702,6 +10189,38 @@ mod tests {
             }
             _ => panic!("expected PluginCheck"),
         }
+    }
+
+    /// `--no-routes` parses, and contradicts `--prefix`.
+    #[test]
+    fn parse_plugin_check_no_routes() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "x",
+            "--no-routes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::PluginCheck {
+                no_routes: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "plugin-check",
+                "--plugin-name",
+                "x",
+                "--no-routes",
+                "--prefix",
+                "/x",
+            ])
+            .is_err()
+        );
     }
 
     // ── autumn generate admin tests ────────────────────────────────────────

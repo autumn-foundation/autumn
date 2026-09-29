@@ -129,6 +129,13 @@ REQUEST_PATH_MODULES=(
   autumn/src/capsule/redact.rs:reporting
   autumn/src/capsule/schema.rs:reporting
   autumn/src/search.rs:db
+  # Money and the double-entry ledger (#1837). A posting runs in a request
+  # handler, and a panic there is a half-written charge.
+  autumn/src/money/mod.rs:default
+  autumn/src/money/ledger.rs:db
+  # Calendar-aware SLA obligations (#1826). The Sla extractor calculates
+  # deadlines on the request path.
+  autumn/src/sla/mod.rs:sla
   autumn/src/cluster/mod.rs:default
   autumn/src/cluster/counter.rs:default
   autumn/src/cluster/membership.rs:default
@@ -165,6 +172,10 @@ REQUEST_PATH_MODULES=(
   autumn/src/constela/validate.rs:constela
   autumn/src/constela/render.rs:constela
   autumn/src/constela/dispatch.rs:constela
+  autumn-billing/src/money.rs:default
+  autumn-billing/src/reconcile.rs:default
+  autumn-billing/src/gate.rs:default
+  autumn-billing/src/routes.rs:default
 )
 
 # The manifest may grow, never shrink. Deleting a gated module is a deliberate
@@ -172,7 +183,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=74
+MODULE_COUNT_FLOOR=84
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny
@@ -200,7 +211,7 @@ GATE_FEATURE_EXEMPT=(${FEATURE_LINT_EXEMPT[@]+"${FEATURE_LINT_EXEMPT[@]}"})
 # path is a hole, so the sibling framework crates are swept too. `autumn-cli`
 # (an operator tool) and `autumn-macros` (compile-time proc-macro internals) are
 # deliberately EXEMPT and absent here.
-SCAN_DIRS="autumn/src,autumn-search/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src"
+SCAN_DIRS="autumn/src,autumn-search/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src,autumn-billing/src"
 
 # Read-only inputs for the feature-reachability check.
 CI_WORKFLOW=".github/workflows/ci.yml"

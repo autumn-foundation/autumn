@@ -288,7 +288,9 @@ Audit with the feature set you ship.
   nothing can read it back out.
 - **The database sees a plain `Text` column.** Classification says where a value
   may *go*, not how it is stored. For at-rest protection, that is
-  [`#[encrypted]`](attribute-encryption.md). The column round-trips through
+  [`#[encrypted]`](attribute-encryption.md), or, where the operator must not
+  read the value at all, [`#[confidential]`](confidential-fields.md). The column
+  round-trips through
   `ClassifiedText<CustomerEmailClassified>`, which carries the same field marker
   as the value: an `F`-erasing column type would have been a way to convert a
   value in as one classified column and back out as another, releasing it through
