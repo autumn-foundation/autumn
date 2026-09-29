@@ -311,7 +311,7 @@ impl SandboxedPlugin {
         // page losing its panel over a caller's mistake is the outcome this
         // whole path exists to avoid.
         let context = super::host::bounded_context(context);
-        let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = crate::time::spawn_blocking(move || {
             let outcome = host.render(&slot_owned, &context, services);
             // Inside the closure for the same reason as `serve`: a reader who
             // navigates away drops this future and its join handle while the
@@ -597,7 +597,7 @@ async fn serve(
     // whose record is most worth having is the one nobody waited for.
     let ingest_log = Arc::clone(&activity);
     let ingest_plugin = plugin.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = crate::time::spawn_blocking(move || {
         let outcome = host.run_with(&request, services);
         ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
         ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_activity);
