@@ -563,6 +563,66 @@ impl IntoResponse for HtmxFragments {
     }
 }
 
+/// Elements whose content a browser tokenizes as raw text or RCDATA: no tags
+/// and no comments inside, only the matching end tag ends them. `noscript` is
+/// included because htmx implies scripting is on, and the parser then treats
+/// it as raw text too.
+#[cfg(feature = "maud")]
+const RAW_TEXT_ELEMENTS: [&str; 10] = [
+    "script",
+    "style",
+    "textarea",
+    "title",
+    "xmp",
+    "iframe",
+    "noembed",
+    "noframes",
+    "noscript",
+    "plaintext",
+];
+
+/// If `after_lt` (the text after a `<`) opens a raw-text/RCDATA element,
+/// return its name.
+#[cfg(feature = "maud")]
+fn raw_text_element(after_lt: &str) -> Option<&'static str> {
+    RAW_TEXT_ELEMENTS.into_iter().find(|name| {
+        after_lt
+            .get(..name.len())
+            .is_some_and(|tag| tag.eq_ignore_ascii_case(name))
+            && after_lt[name.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_ascii_whitespace() || c == '/' || c == '>')
+    })
+}
+
+/// Byte offset in `html`, searching from `from`, of the end tag that closes the
+/// raw-text element `name` (`</name` followed by whitespace, `/` or `>`), or
+/// the end of input. `<plaintext>` has no end tag: it runs to end of input.
+#[cfg(feature = "maud")]
+fn raw_text_end(html: &str, from: usize, name: &str) -> usize {
+    if name == "plaintext" {
+        return html.len();
+    }
+    let mut search = from;
+    while let Some(rel) = html[search..].find("</") {
+        let pos = search + rel;
+        let after = &html[pos + 2..];
+        if after
+            .get(..name.len())
+            .is_some_and(|tag| tag.eq_ignore_ascii_case(name))
+            && after[name.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_ascii_whitespace() || c == '/' || c == '>')
+        {
+            return pos;
+        }
+        search = pos + 2;
+    }
+    html.len()
+}
+
 /// Byte length of the HTML comment at the start of `s` (which begins with
 /// `<!--`), ending where the WHATWG tokenizer ends it:
 ///
@@ -596,6 +656,9 @@ fn comment_len(s: &str) -> usize {
 fn has_oob_attribute(html: &str) -> bool {
     let mut in_tag = false;
     let mut in_quote = None;
+    // Set while inside a raw-text/RCDATA start tag; its body is skipped once
+    // the tag closes.
+    let mut raw_text = None;
     let mut chars = html.char_indices().peekable();
 
     while let Some((idx, c)) = chars.next() {
@@ -608,6 +671,12 @@ fn has_oob_attribute(html: &str) -> bool {
                 in_quote = Some(c);
             } else if c == '>' {
                 in_tag = false;
+                if let Some(name) = raw_text.take() {
+                    // The body is text to the browser, not markup: an
+                    // attribute-looking string inside it is not an attribute.
+                    let end = raw_text_end(html, idx + 1, name);
+                    while chars.next_if(|&(i, _)| i < end).is_some() {}
+                }
             } else {
                 let remaining = &html[idx..];
                 let match_len = if remaining
@@ -657,6 +726,7 @@ fn has_oob_attribute(html: &str) -> bool {
             } else {
                 in_tag = true;
                 in_quote = None;
+                raw_text = raw_text_element(&html[idx + 1..]);
             }
         }
     }
@@ -1261,6 +1331,39 @@ mod bypass_tests {
         assert!(!has_oob_attribute("<!-- hx-swap-oob=\"x\" --!><div></div>"));
         // An unterminated comment swallows the rest, as in the browser.
         assert!(!has_oob_attribute("<!-- <div hx-swap-oob=\"x\">"));
+    }
+
+    /// Text inside raw-text/RCDATA elements is not markup, so neither an
+    /// apparent comment nor an attribute-looking string in it counts — the
+    /// fragment still gets its server-generated OOB carrier.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn has_oob_attribute_ignores_raw_text_element_bodies() {
+        for html in [
+            "<textarea><!-- --!><div hx-swap-oob=\"true\"></div></textarea>",
+            "<textarea><div hx-swap-oob=\"true\"></div></textarea>",
+            "<script>let s = '<div hx-swap-oob=\"true\">';</script>",
+            "<STYLE>/* <p hx-swap-oob> */</STYLE>",
+            "<title>a <b hx-swap-oob=\"x\"></title>",
+            "<plaintext><div hx-swap-oob=\"true\"></div>",
+        ] {
+            assert!(!has_oob_attribute(html), "false positive in {html:?}");
+        }
+        // Markup after the raw-text element's end tag is scanned again.
+        assert!(has_oob_attribute(
+            "<textarea>x</textarea ><div hx-swap-oob=\"true\"></div>"
+        ));
+        // The raw-text element's own start tag can carry the attribute.
+        assert!(has_oob_attribute(
+            "<textarea hx-swap-oob=\"true\"></textarea>"
+        ));
+        // `</textareax` is not the end tag; `<titles>` is not `<title>`.
+        assert!(!has_oob_attribute(
+            "<textarea></textareax><i hx-swap-oob=\"x\"></textarea>"
+        ));
+        assert!(has_oob_attribute(
+            "<titles><i hx-swap-oob=\"x\"></i></titles>"
+        ));
     }
 
     #[cfg(feature = "maud")]
