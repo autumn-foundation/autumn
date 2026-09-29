@@ -1,0 +1,18 @@
+# Workspace-wide Cargo configuration.
+
+[env]
+# `cargo test` on the `autumn-cli` binary aborts with a stack overflow without
+# this, in the very first test that calls `Cli::try_parse_from`.
+#
+# The cause is not the tests: clap's derive macro expands the whole `Commands`
+# tree — every subcommand, every argument — into a single `augment_args`
+# function, and this CLI has a lot of both. Unoptimized, that one frame is
+# larger than the 2 MiB stack libtest gives a test thread, so building the
+# command tree overflows before any assertion runs. Release builds inline it
+# away and never hit it, which is why only `cargo test` is affected.
+#
+# `[env]` (rather than exporting the variable in CI) keeps the fix with the
+# code: every `cargo test` invocation picks it up — local, CI, and the
+# pre-push gate alike — so the suite cannot pass on one machine and abort on
+# another. Raise it further if the CLI grows enough to overflow 16 MiB again.
+RUST_MIN_STACK = "16777216"

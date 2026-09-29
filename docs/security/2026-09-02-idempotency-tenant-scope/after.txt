@@ -1,0 +1,72 @@
+$ cargo test -p autumn-web --test integration_tests idempotency
+# with the fix applied
+
+running 64 tests
+test integration::idempotency_tenant_scope::header_tenancy_does_not_replay_across_tenants ... ok
+test integration::idempotency_tenant_scope::same_tenant_retry_still_replays ... ok
+test integration::idempotency_tenant_scope::subdomain_tenancy_does_not_replay_across_tenants ... ok
+test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 1725 filtered out; finished in 0.50s
+EXIT=0
+
+$ cargo test -p autumn-web --lib idempotency
+
+running 22 tests
+test idempotency::tests::cookie_session_extension_scopes_idempotency_storage_key ... ok
+test idempotency::tests::storage_key_hashes_length_delimited_components ... ok
+test idempotency::tests::storage_key_partitions_by_resolved_tenant ... ok
+test idempotency::tests::storage_key_tenant_component_is_length_delimited ... ok
+test idempotency::tests::storage_key_without_a_resolved_tenant_is_unchanged ... ok
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 5306 filtered out; finished in 0.26s
+EXIT=0
+
+$ cargo test -p autumn-web --test integration_tests -- --skip compile_fail
+
+test result: FAILED. 1542 passed; 1 failed; 240 ignored; 0 measured; 6 filtered out
+  failures:
+      integration::schema_drift_guard::schema_keys_snapshot_guard
+
+  PRE-EXISTING, unrelated to this change: the guard reports the
+  `auth.oauth2` / `security.rate_limit.redis` config keys as "removed"
+  because they are feature-gated and this run uses the default feature
+  set. Verified identical on the unmodified tree (fix stashed):
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1788 filtered out
+
+  `compile_fail` (trybuild) is skipped because each of its cases spawns a
+  nested `cargo build` at test-RUN time (~17 GB of scratch); see the
+  rationale in scripts/pre-push-check.sh.
+
+$ cargo clippy -p autumn-web --all-targets -- -D warnings
+  EXIT=0
+
+  (`cargo clippy --workspace` fails in this sandbox on a pre-existing
+  toolchain mismatch unrelated to this change: the workspace lint table
+  sets `clippy::unused_async_trait_impl = "allow"`, a lint the installed
+  rustc 1.94 does not know, which `-D warnings` turns into an error while
+  linting `autumn-macros`.)
+
+$ ./scripts/check-panic-gate.sh
+  EXIT=0 — self-test 35/35, 52 request-path modules gated
+
+$ ./scripts/check-determinism-gate.sh
+  EXIT=0 — 18 modules gated (floor 18)
+
+$ ./scripts/pre-push-check.sh
+  check-panic-gate.sh                                        PASS
+  check-determinism-gate.sh                                  PASS
+  cargo fmt --all -- --check                                 PASS
+  cargo clippy --workspace --all-targets -- -D warnings      PASS
+  cargo clippy -p autumn-web --features "<gated set>" --lib  PASS
+  cargo test --workspace --no-run                            NOT COMPLETABLE HERE
+
+  The final compile-only leg cannot finish in this sandbox: the container's
+  38 GB disk cap is exhausted while linking the workspace's test binaries and
+  `ld` dies with `signal 7 [Bus error]` (the ENOSPC symptom), on example
+  crates this change does not touch (`reddit-clone`, `saas`, `invoice`, …).
+  Cleaning and retrying reproduces the same wall.
+
+  Cross-package compile risk for this diff is nil by construction — it adds a
+  private `fn` and one private struct field in `autumn/src/idempotency.rs`,
+  plus a new test module — and `cargo clippy -p autumn-web --all-targets`
+  (green, above) type-checks every autumn-web test target including the
+  consolidated `integration_tests` binary. CI runs the full leg.

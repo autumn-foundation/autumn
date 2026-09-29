@@ -173,4 +173,15 @@ mod tests {
         assert!(html.contains("Getting Started"));
         assert!(html.contains("Configuration"));
     }
+
+    #[tokio::test]
+    async fn test_doc_params_returns_non_empty_vec() {
+        let dummy_router = autumn_web::reexports::axum::Router::new();
+        let params = doc_params(dummy_router).await;
+        assert!(
+            !params.is_empty(),
+            "doc_params should return a non-empty list of static params"
+        );
+        assert_eq!(params.len(), docs().len());
+    }
 }

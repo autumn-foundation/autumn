@@ -116,26 +116,24 @@ async fn pg_job_enqueue_participates_in_transaction() {
 
     // Open a transaction, insert a user + a job row, then roll back.
     let _: Result<(), diesel::result::Error> = conn
-        .transaction(|conn| {
-            Box::pin(async move {
-                diesel::sql_query(
-                    "INSERT INTO users (username, password_hash) VALUES ('ferris', 'hash')",
-                )
-                .execute(conn)
-                .await?;
+        .transaction(async |conn| {
+            diesel::sql_query(
+                "INSERT INTO users (username, password_hash) VALUES ('ferris', 'hash')",
+            )
+            .execute(conn)
+            .await?;
 
-                diesel::sql_query(
-                    "INSERT INTO autumn_jobs \
-                     (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
-                      enqueued_at, run_at) \
-                     VALUES ('rollback-test-id', 'user_onboarding', '{}'::JSONB, \
-                             'enqueued', 1, 5, 500, NOW(), NOW())",
-                )
-                .execute(conn)
-                .await?;
+            diesel::sql_query(
+                "INSERT INTO autumn_jobs \
+                 (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
+                  enqueued_at, run_at) \
+                 VALUES ('rollback-test-id', 'user_onboarding', '{}'::JSONB, \
+                         'enqueued', 1, 5, 500, NOW(), NOW())",
+            )
+            .execute(conn)
+            .await?;
 
-                Err(diesel::result::Error::RollbackTransaction)
-            })
+            Err(diesel::result::Error::RollbackTransaction)
         })
         .await;
 

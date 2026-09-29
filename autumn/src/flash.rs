@@ -21,10 +21,9 @@
 //! async fn list_items(flash: Flash) -> Markup {
 //!     let messages = flash.consume().await;
 //!     html! {
-//!         // ... render messages ...
-//!         @for msg in messages {
-//!             div class=(msg.level.as_str()) { (msg.message) }
-//!         }
+//!         // Accessible banners with correct `role`/`aria-live` per severity —
+//!         // no hand-rolled ARIA. See [`flash_messages`].
+//!         (flash_messages(&messages))
 //!     }
 //! }
 //! ```
@@ -239,6 +238,133 @@ pub fn flash_message_divs(messages: &[FlashMessage]) -> maud::Markup {
     }
 }
 
+impl FlashLevel {
+    /// Live-region semantics for this severity, as `(role, aria-live)`.
+    ///
+    /// `Error`/`Warning` are assertive (`role="alert"`, `aria-live="assertive"`)
+    /// so they interrupt a screen reader immediately; `Success`/`Info` are polite
+    /// (`role="status"`, `aria-live="polite"`) so they announce without cutting
+    /// off the current utterance.
+    #[must_use]
+    pub const fn live_region(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::Error | Self::Warning => ("alert", "assertive"),
+            Self::Success | Self::Info => ("status", "polite"),
+        }
+    }
+}
+
+/// Rendering options for [`flash_messages_with`].
+///
+/// Build with [`FlashMessagesConfig::new`] and chain the setters. The default
+/// (used by [`flash_messages`]) renders plain banners with no dismiss control.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlashMessagesConfig {
+    dismissible: bool,
+}
+
+#[cfg(feature = "maud")]
+impl FlashMessagesConfig {
+    /// A default config: no dismiss control.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { dismissible: false }
+    }
+
+    /// Render a no-JavaScript dismiss control on each banner.
+    ///
+    /// The control is a `<label>`-wrapped hidden checkbox; toggling it hides the
+    /// banner via the stylesheet's `:has()` rule, so it degrades to an inert
+    /// (already-visible) banner when CSS `:has()` is unavailable and never
+    /// depends on JavaScript.
+    #[must_use]
+    pub const fn dismissible(mut self, yes: bool) -> Self {
+        self.dismissible = yes;
+        self
+    }
+}
+
+/// Render pending flash messages as accessible, styled banners.
+///
+/// Each message becomes its own live region whose `role`/`aria-live` pair is
+/// chosen by severity ([`FlashLevel::live_region`]): `Error`/`Warning` announce
+/// assertively, `Success`/`Info` politely. Messages carry the semantic
+/// `autumn-flash` / `autumn-flash--<level>` classes backed by [`FLASH_CSS`], so
+/// no per-app CSS or hand-written ARIA is required. Message text is HTML-escaped
+/// by Maud.
+///
+/// An **empty** slice renders nothing at all — no container and no empty live
+/// region — so a page with no flash is byte-for-byte unchanged.
+///
+/// For a dismiss control use [`flash_messages_with`] with
+/// [`FlashMessagesConfig::dismissible`].
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::flash::{flash_messages, FlashLevel, FlashMessage};
+///
+/// let messages = vec![
+///     FlashMessage { level: FlashLevel::Success, message: "Saved!".into() },
+///     FlashMessage { level: FlashLevel::Error, message: "Invalid email".into() },
+/// ];
+/// let html = flash_messages(&messages).into_string();
+/// assert!(html.contains(r#"role="status""#));       // Success → polite
+/// assert!(html.contains(r#"aria-live="polite""#));
+/// assert!(html.contains(r#"role="alert""#));         // Error → assertive
+/// assert!(html.contains(r#"aria-live="assertive""#));
+/// assert!(html.contains("autumn-flash--success"));
+///
+/// // Nothing renders for an empty slice.
+/// assert_eq!(flash_messages(&[]).into_string(), "");
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn flash_messages(messages: &[FlashMessage]) -> maud::Markup {
+    flash_messages_with(messages, &FlashMessagesConfig::new())
+}
+
+/// Render pending flash messages as accessible banners, with rendering options.
+///
+/// See [`flash_messages`] for the semantics; this variant additionally honors
+/// [`FlashMessagesConfig`] (e.g. a no-JavaScript dismiss control). An empty
+/// slice still renders nothing.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn flash_messages_with(
+    messages: &[FlashMessage],
+    config: &FlashMessagesConfig,
+) -> maud::Markup {
+    // An empty slice renders nothing — no container, no empty live region.
+    if messages.is_empty() {
+        return maud::html! {};
+    }
+    maud::html! {
+        div class="autumn-flash-group" {
+            @for msg in messages {
+                @let (role, live) = msg.level.live_region();
+                div class={ "autumn-flash autumn-flash--" (msg.level.as_str()) }
+                    role=(role) aria-live=(live) {
+                    span class="autumn-flash__body" { (msg.message) }
+                    @if config.dismissible {
+                        // The checkbox stays in tab order (visually hidden but
+                        // focusable via `.autumn-flash__dismiss-toggle`, never
+                        // `hidden`/`display:none`) so keyboard and screen-reader
+                        // users can dismiss; the accessible name is on the
+                        // control itself.
+                        label class="autumn-flash__dismiss" {
+                            input type="checkbox" class="autumn-flash__dismiss-toggle"
+                                aria-label="Dismiss this message";
+                            span aria-hidden="true" { "×" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// URL of the framework-served flash stylesheet.
 ///
 /// The default Autumn server mounts this asset automatically. Link it from your
@@ -259,6 +385,17 @@ pub const FLASH_CSS: &str = "\
 .flash-info{background:var(--flash-info-bg,#eff6ff);color:var(--flash-info-fg,#1e3a8a);border-color:var(--flash-info-border,#93c5fd)}\
 .flash-warning{background:var(--flash-warning-bg,#fffbeb);color:var(--flash-warning-fg,#92400e);border-color:var(--flash-warning-border,#fcd34d)}\
 .flash-error{background:var(--flash-error-bg,#fef2f2);color:var(--flash-error-fg,#991b1b);border-color:var(--flash-error-border,#fca5a5)}\
+.autumn-flash-group{display:flex;flex-direction:column;gap:.5rem}\
+.autumn-flash{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem;padding:.75rem 1rem;border-radius:.375rem;border:1px solid}\
+.autumn-flash__body{flex:1 1 auto}\
+.autumn-flash--success{background:var(--flash-success-bg,#ecfdf5);color:var(--flash-success-fg,#065f46);border-color:var(--flash-success-border,#6ee7b7)}\
+.autumn-flash--info{background:var(--flash-info-bg,#eff6ff);color:var(--flash-info-fg,#1e3a8a);border-color:var(--flash-info-border,#93c5fd)}\
+.autumn-flash--warning{background:var(--flash-warning-bg,#fffbeb);color:var(--flash-warning-fg,#92400e);border-color:var(--flash-warning-border,#fcd34d)}\
+.autumn-flash--error{background:var(--flash-error-bg,#fef2f2);color:var(--flash-error-fg,#991b1b);border-color:var(--flash-error-border,#fca5a5)}\
+.autumn-flash__dismiss{flex:0 0 auto;cursor:pointer;line-height:1;font-size:1.25rem;color:inherit;background:none;border:0;padding:0 .25rem}\
+.autumn-flash__dismiss-toggle{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}\
+.autumn-flash__dismiss:has(.autumn-flash__dismiss-toggle:focus-visible){outline:2px solid var(--primary,#7c3aed);outline-offset:2px}\
+.autumn-flash:has(.autumn-flash__dismiss-toggle:checked){display:none}\
 ";
 
 impl<S> FromRequestParts<S> for Flash
@@ -438,6 +575,138 @@ mod tests {
 
         // Like render(), render_oob() consumes.
         assert_eq!(flash.peek().await.len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "maud")]
+    fn flash_messages_empty_slice_renders_nothing() {
+        // No container, no empty live region.
+        assert_eq!(flash_messages(&[]).into_string(), "");
+        assert_eq!(
+            flash_messages_with(&[], &FlashMessagesConfig::new().dismissible(true)).into_string(),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "maud")]
+    fn flash_messages_maps_severity_to_live_region() {
+        // Success/Info are polite; Error/Warning are assertive.
+        for (level, role, live) in [
+            (FlashLevel::Success, "status", "polite"),
+            (FlashLevel::Info, "status", "polite"),
+            (FlashLevel::Warning, "alert", "assertive"),
+            (FlashLevel::Error, "alert", "assertive"),
+        ] {
+            let msg = [FlashMessage {
+                level,
+                message: "hi".into(),
+            }];
+            let html = flash_messages(&msg).into_string();
+            assert!(
+                html.contains(&format!(r#"role="{role}""#)),
+                "level {level:?} should carry role={role}: {html}"
+            );
+            assert!(
+                html.contains(&format!(r#"aria-live="{live}""#)),
+                "level {level:?} should carry aria-live={live}: {html}"
+            );
+            assert!(
+                html.contains(&format!("autumn-flash--{}", level.as_str())),
+                "level {level:?} should carry semantic class: {html}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "maud")]
+    fn flash_messages_escapes_message_text() {
+        let msg = [FlashMessage {
+            level: FlashLevel::Error,
+            message: "<script>alert(1)</script>".into(),
+        }];
+        let html = flash_messages(&msg).into_string();
+        assert!(
+            !html.contains("<script>"),
+            "must escape message text: {html}"
+        );
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    #[cfg(feature = "maud")]
+    fn flash_messages_emits_no_inline_style() {
+        let msg = [FlashMessage {
+            level: FlashLevel::Success,
+            message: "Saved!".into(),
+        }];
+        // Class-based styling only — CSP `style-src 'self'` / nonce-mode safe.
+        assert!(!flash_messages(&msg).into_string().contains("style="));
+    }
+
+    #[test]
+    #[cfg(feature = "maud")]
+    fn flash_messages_dismiss_control_is_opt_in_and_js_free() {
+        let msg = [FlashMessage {
+            level: FlashLevel::Info,
+            message: "Heads up".into(),
+        }];
+        // Default: no dismiss control.
+        assert!(
+            !flash_messages(&msg)
+                .into_string()
+                .contains("autumn-flash__dismiss")
+        );
+        // Opt-in: a checkbox-hack control, no JS attributes.
+        let dismissible =
+            flash_messages_with(&msg, &FlashMessagesConfig::new().dismissible(true)).into_string();
+        assert!(
+            dismissible.contains("autumn-flash__dismiss"),
+            "{dismissible}"
+        );
+        assert!(dismissible.contains(r#"type="checkbox""#), "{dismissible}");
+        assert!(!dismissible.contains("onclick"), "{dismissible}");
+        assert!(!dismissible.contains("<script"), "{dismissible}");
+        // WCAG 2.1.1: the toggle must NOT be `hidden` (that removes it from tab
+        // order) — it stays focusable via the sr-only toggle class, with the
+        // accessible name on the control itself.
+        assert!(
+            !dismissible.contains(r#"autumn-flash__dismiss-toggle" hidden"#),
+            "toggle must not be `hidden`: {dismissible}"
+        );
+        assert!(
+            dismissible.contains("autumn-flash__dismiss-toggle"),
+            "sr-only focusable toggle class present: {dismissible}"
+        );
+        assert!(
+            dismissible.contains(r#"aria-label="Dismiss this message""#),
+            "{dismissible}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "maud")]
+    fn flash_css_backs_the_autumn_flash_classes() {
+        for selector in [
+            ".autumn-flash",
+            ".autumn-flash--success",
+            ".autumn-flash--info",
+            ".autumn-flash--warning",
+            ".autumn-flash--error",
+            ".autumn-flash__dismiss",
+            ".autumn-flash__dismiss-toggle",
+        ] {
+            assert!(FLASH_CSS.contains(selector), "FLASH_CSS missing {selector}");
+        }
+        // WCAG 2.1.1: sr-only-but-focusable toggle + a visible focus indicator.
+        assert!(
+            FLASH_CSS.contains("clip-path:inset(50%)"),
+            "FLASH_CSS must ship the sr-only (focusable) toggle rule"
+        );
+        assert!(
+            FLASH_CSS.contains(":focus-visible"),
+            "FLASH_CSS must ship a focus indicator"
+        );
     }
 
     #[tokio::test]

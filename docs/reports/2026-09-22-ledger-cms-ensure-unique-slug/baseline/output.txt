@@ -1,0 +1,56 @@
+$ cargo test -p cms --test ensure_unique_slug_batch_profile -- --ignored --nocapture --test-threads=1
+
+     Running tests/ensure_unique_slug_batch_profile.rs (target/debug/deps/ensure_unique_slug_batch_profile-b4261d9b2b66be94)
+
+running 1 test
+test ensure_unique_slug_batch_profile ... 
+=== pg_stat_statements: 60 pre-existing collisions -> some-title-61 ===
+calls=61     buffers=325      SELECT COUNT(*) FROM "posts" WHERE ((("posts"."slug" = $1) AND ("posts"."post_type" = ANY($2))) AND (("posts"."post_type" = $3) OR ("posts"."parent_id" IS NULL)))
+-- single-candidate slug probe (unbatched, one call per suffix tried): calls=61 buffers=325 -- batched slug ANY() probe (the fix, one call for the whole candidate list): calls=0 buffers=0 --
+
+=== statement-count summary ===
+scenario                                      single calls single buffers  any calls  any buffers
+ensure_unique_slug (60 collisions)                      61            325          0            0
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-candidate slug probe shape (pre-fix, one call per suffix tried) ===
+SELECT count(*) FROM posts WHERE slug = 'some-title-30' AND post_type = ANY(ARRAY['post', 'page']) AND (post_type = 'post' OR parent_id IS NULL)
+Aggregate  (cost=12.58..12.59 rows=1 width=8) (actual time=0.061..0.062 rows=1 loops=1)
+  Output: count(*)
+  Buffers: shared hit=8
+  ->  Index Scan using idx_posts_type_slug on public.posts  (cost=0.27..12.58 rows=1 width=0) (actual time=0.058..0.059 rows=1 loops=1)
+        Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
+        Index Cond: ((posts.post_type = ANY ('{post,page}'::text[])) AND (posts.slug = 'some-title-30'::text))
+        Filter: ((posts.post_type = 'post'::text) OR (posts.parent_id IS NULL))
+        Buffers: shared hit=8
+Query Identifier: 982176618951124514
+Planning:
+  Buffers: shared hit=92
+Planning Time: 1.181 ms
+Execution Time: 0.114 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched slug ANY() probe shape (the fix, one call for the whole candidate list) ===
+SELECT slug FROM posts WHERE slug = ANY(ARRAY['some-title','some-title-2','some-title-3','some-title-4','some-title-5','some-title-6','some-title-7','some-title-8','some-title-9','some-title-10','some-title-11','some-title-12','some-title-13','some-title-14','some-title-15','some-title-16','some-title-17','some-title-18','some-title-19','some-title-20','some-title-21','some-title-22','some-title-23','some-title-24','some-title-25','some-title-26','some-title-27','some-title-28','some-title-29','some-title-30','some-title-31','some-title-32','some-title-33','some-title-34','some-title-35','some-title-36','some-title-37','some-title-38','some-title-39','some-title-40','some-title-41','some-title-42','some-title-43','some-title-44','some-title-45','some-title-46','some-title-47','some-title-48','some-title-49','some-title-50','some-title-51','some-title-52','some-title-53','some-title-54','some-title-55','some-title-56','some-title-57','some-title-58','some-title-59','some-title-60','some-title-61']) AND post_type = ANY(ARRAY['post', 'page']) AND (post_type = 'post' OR parent_id IS NULL)
+Seq Scan on public.posts  (cost=0.15..21.35 rows=61 width=12) (actual time=0.118..0.150 rows=60 loops=1)
+  Output: slug
+  Filter: ((posts.post_type = ANY ('{post,page}'::text[])) AND ((posts.post_type = 'post'::text) OR (posts.parent_id IS NULL)) AND (posts.slug = ANY ('{some-title,some-title-2,some-title-3,some-title-4,some-title-5,some-title-6,some-title-7,some-title-8,some-title-9,some-title-10,some-title-11,some-title-12,some-title-13,some-title-14,some-title-15,some-title-16,some-title-17,some-title-18,some-title-19,some-title-20,some-title-21,some-title-22,some-title-23,some-title-24,some-title-25,some-title-26,some-title-27,some-title-28,some-title-29,some-title-30,some-title-31,some-title-32,some-title-33,some-title-34,some-title-35,some-title-36,some-title-37,some-title-38,some-title-39,some-title-40,some-title-41,some-title-42,some-title-43,some-title-44,some-title-45,some-title-46,some-title-47,some-title-48,some-title-49,some-title-50,some-title-51,some-title-52,some-title-53,some-title-54,some-title-55,some-title-56,some-title-57,some-title-58,some-title-59,some-title-60,some-title-61}'::text[])))
+  Rows Removed by Filter: 300
+  Buffers: shared hit=14
+Query Identifier: -8903220515327007956
+Planning:
+  Buffers: shared hit=3 read=1
+Planning Time: 0.230 ms
+Execution Time: 0.160 ms
+
+All equivalence checks passed.
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.78s
+
+NOTE: this baseline was captured against the unbatched loop-of-`SELECT COUNT(*)`
+code (the pre-fix state) still in the tree when this file was committed. The
+"batched slug ANY() probe shape" EXPLAIN above previews the fix's own
+statement shape (run directly, not yet `ensure_unique_slug`'s own behavior) so
+before/after can be read side by side; it is not evidence the function emits
+it yet — `after/output.txt`, captured post-fix, is. The equivalence assertions
+in this same run passed against the pre-fix code too, which is expected: they
+assert observable behavior, not which implementation produced it.

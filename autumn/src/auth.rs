@@ -73,6 +73,30 @@ use serde::Deserialize;
 #[cfg(feature = "oauth2")]
 use url::Url;
 
+pub mod password;
+pub use password::{
+    BreachCheck, PasswordConfig, PasswordFailure, PasswordPolicy, PasswordValidation,
+    validate_password,
+};
+
+pub mod impersonation;
+pub use impersonation::{
+    BEGIN_AUDIT_ACTION, END_AUDIT_ACTION, IMPERSONATED_SESSION_KEY, IMPERSONATION_SESSION_ID_KEY,
+    IMPERSONATOR_ROLE_SESSION_KEY, IMPERSONATOR_SESSION_KEY, IMPERSONATOR_STEP_UP_SESSION_KEY,
+    Impersonation, ImpersonationGate, ImpersonationPolicy, ImpersonationState, ImpersonationTarget,
+    RESERVED_SESSION_KEYS, audit_actor_id, begin_impersonation, end_impersonation,
+    impersonation_state, impersonator_id, is_impersonating, is_reserved_session_key,
+};
+
+pub mod remember;
+pub use remember::{
+    DEFAULT_ROTATION_GRACE_SECS, RememberConfig, RememberCredential, RememberDecision,
+    RememberRecord, build_remember_clear_cookie, build_remember_cookie, constant_time_eq,
+    default_rotation_grace, evaluate_remember, format_remember_cookie_value,
+    generate_remember_credential, generate_token, hash_remember_token, parse_remember_cookie_value,
+    verify_remember_token,
+};
+
 // ── Password hashing ────────────────────────────────────────────
 
 /// Default bcrypt cost factor.
@@ -98,7 +122,7 @@ const DEFAULT_BCRYPT_COST: u32 = 12;
 /// ```
 pub async fn hash_password(password: &str) -> crate::AutumnResult<String> {
     let password = password.to_string();
-    tokio::task::spawn_blocking(move || {
+    crate::time::spawn_blocking(move || {
         bcrypt::hash(password, DEFAULT_BCRYPT_COST)
             .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
     })
@@ -139,7 +163,7 @@ pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<
         "$2b$12$KIXe8K4j1sH6/xH.x9d71uJ5Jk8t6O4m6Q110g4H8y1r6J6O6O6O6".to_string()
     };
 
-    let result = tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash_to_verify))
+    let result = crate::time::spawn_blocking(move || bcrypt::verify(&password, &hash_to_verify))
         .await
         .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?;
 
@@ -188,8 +212,28 @@ pub async fn __check_secured_with_key(
         ));
     };
 
-    // Tag the request-scoped log context (#1169) with the authenticated user
-    // so every subsequent event automatically carries `user_id`.
+    // Publish the authenticated principal as the request's current actor
+    // (#1383) so generated repository/audit writes auto-attribute to it, and
+    // tag the request-scoped log context (#1169) with the same user so every
+    // subsequent event automatically carries `user_id`.
+    //
+    // Seed the actor only if no stronger/earlier principal is already set. This
+    // `#[secured]` role check runs inside the handler body, *inner* to the auth
+    // middleware layers (`RequireApiToken` bearer, `RequireAuth` session). On a
+    // route that combines `RequireApiToken` with `#[secured]`, the bearer
+    // middleware has already published the token principal by the time this runs;
+    // a request that *also* carries a session cookie must stay attributed to the
+    // token principal, so we must not clobber it with the session user here.
+    // (`log::context::set_user_id` for #1169 is independent and stays
+    // unconditional.)
+    //
+    // While the session is impersonating (#1394) the responsible principal is
+    // the *real* impersonator, not the user the request resolves as, so the
+    // actor published here is the impersonator. The log context keeps carrying
+    // the effective user (that is the identity the request is acting under).
+    if crate::current::Current::actor().is_none() {
+        crate::current::Current::set_actor(impersonation::audit_actor_id(session, &user_id).await);
+    }
     crate::log::context::set_user_id(user_id);
 
     // Check authorization: if roles are specified, the session's "role"
@@ -392,9 +436,30 @@ where
                 // "authenticated_principal" works without an extra middleware shim.
                 req.extensions_mut()
                     .insert(crate::security::RateLimitPrincipal(user_id.clone()));
-                // Tag the request-scoped log context (#1169) so handler logs for
-                // middleware-authenticated requests carry `user_id` too, matching
-                // the `#[secured]` path.
+                // Publish the authenticated principal as the request's current
+                // actor (#1383) and tag the request-scoped log context (#1169)
+                // so handler logs for middleware-authenticated requests carry
+                // `user_id` too, matching the `#[secured]` path.
+                //
+                // Seed the actor only if no stronger/earlier principal is already
+                // set. On a normal session-auth route nothing publishes an actor
+                // before this middleware (the outer `LogContextLayer` only
+                // establishes an empty scope), so `actor().is_none()` is true and
+                // this still seeds. The guard keeps the uniform "first/outermost
+                // resolver wins" rule: if an outer bearer layer or an explicit
+                // `with_actor(...)` scope already resolved a principal, that one
+                // stays. (`set_user_id` for #1169 is independent, stays unconditional.)
+                //
+                // Impersonation (#1394): the actor is the real impersonator
+                // whenever the session carries one, so writes made while
+                // impersonating stay attributed to the operator.
+                if crate::current::Current::actor().is_none() {
+                    let actor = match session.as_ref() {
+                        Some(session) => impersonation::audit_actor_id(session, &user_id).await,
+                        None => user_id.clone(),
+                    };
+                    crate::current::Current::set_actor(actor);
+                }
                 crate::log::context::set_user_id(user_id);
                 inner.call(req).await
             } else {
@@ -521,6 +586,52 @@ pub struct AuthConfig {
     /// ```
     #[serde(default)]
     pub sessions: SessionTrackingConfig,
+
+    /// Password policy: length, weak-password rejection, context-similarity,
+    /// and optional Have I Been Pwned (HIBP) breach checking.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.password]
+    /// min_length = 8
+    /// reject_common = true
+    /// breach_check = "off"  # "off" | "fail_open" | "fail_closed"
+    /// ```
+    #[serde(default)]
+    pub password: PasswordConfig,
+
+    /// Persistent "remember-me" login policy (issue #1397).
+    ///
+    /// Controls the rotating, revocable remember-me tokens issued alongside a
+    /// session on login. Each credential is a `(series, token)` pair with the
+    /// token rotated on every use for theft detection.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.remember]
+    /// enabled = true             # issue remember cookies on login (default)
+    /// duration_secs = 2592000    # cookie lifetime in seconds (30 days)
+    /// cookie_name = "autumn.remember"
+    /// ```
+    #[serde(default)]
+    pub remember: RememberConfig,
+
+    /// Passwordless magic-link login policy (issue #1737).
+    ///
+    /// Controls the one-time sign-in link lifetime and the per-email re-mint
+    /// cooldown for the routes emitted by `autumn generate auth --magic-link`.
+    ///
+    /// Configure in `autumn.toml`:
+    ///
+    /// ```toml
+    /// [auth.magic_link]
+    /// ttl_minutes = 15          # link lifetime; keep ≤ 15 min for a tight window
+    /// email_cooldown_secs = 60  # per-email re-mint cooldown (email-bomb throttle)
+    /// ```
+    #[serde(default)]
+    pub magic_link: MagicLinkConfig,
 }
 
 /// Account lockout policy configuration.
@@ -652,6 +763,64 @@ impl Default for SessionTrackingConfig {
         Self {
             revoke_on_credential_change: true,
             last_seen_update_secs: default_last_seen_update_secs(),
+        }
+    }
+}
+
+/// Passwordless magic-link login configuration (issue #1737).
+///
+/// Read from the `[auth.magic_link]` section of `autumn.toml`. Consumed by the
+/// routes emitted by `autumn generate auth --magic-link` via `state.config_arc()`.
+/// All fields have safe production defaults.
+///
+/// ```toml
+/// [auth.magic_link]
+/// ttl_minutes = 15          # default
+/// email_cooldown_secs = 60  # default
+/// ```
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct MagicLinkConfig {
+    /// One-time sign-in link lifetime, in minutes (default: `15`).
+    ///
+    /// Keep this at `15` or less: a magic link is a bearer credential, so a
+    /// tight expiry window bounds the blast radius of a leaked link (e.g. via a
+    /// forwarded email or a shared inbox). Raise it only with that tradeoff in
+    /// mind.
+    ///
+    /// Unsigned: a negative `ttl_minutes` in `autumn.toml` fails deserialization
+    /// (a negative TTL would mint already-expired tokens, breaking login).
+    #[serde(default = "default_magic_link_ttl_minutes")]
+    pub ttl_minutes: u64,
+
+    /// Per-email cooldown, in seconds (default: `60`).
+    ///
+    /// `POST /login/magic` skips minting a fresh token when an unexpired,
+    /// unconsumed token was already issued for the account within this window —
+    /// throttling email-bombing a single address even from rotating IPs (the
+    /// per-IP limit is enforced separately by `#[throttle]`).
+    ///
+    /// Unsigned: a negative `email_cooldown_secs` in `autumn.toml` fails
+    /// deserialization. A negative value would push the cooldown window start
+    /// into the future, so the "outstanding token" lookup would never match and
+    /// every request would re-mint and re-send — silently defeating the
+    /// email-bomb throttle.
+    #[serde(default = "default_magic_link_email_cooldown_secs")]
+    pub email_cooldown_secs: u64,
+}
+
+const fn default_magic_link_ttl_minutes() -> u64 {
+    15
+}
+
+const fn default_magic_link_email_cooldown_secs() -> u64 {
+    60
+}
+
+impl Default for MagicLinkConfig {
+    fn default() -> Self {
+        Self {
+            ttl_minutes: default_magic_link_ttl_minutes(),
+            email_cooldown_secs: default_magic_link_email_cooldown_secs(),
         }
     }
 }
@@ -1237,6 +1406,67 @@ fn extract_subject(
     Err(crate::AutumnError::bad_request_msg("missing sub claim"))
 }
 
+/// Returns the set of signature algorithms a given JWKS key is allowed to
+/// verify. The set is derived from trusted key material only (the JWK's
+/// declared `alg`, or failing that its key type), never from the untrusted
+/// token header. Symmetric algorithms are always rejected: OIDC `id_token`s are
+/// verified against public JWKS keys, and accepting HS* here would enable
+/// algorithm-confusion forgeries.
+#[cfg(feature = "oauth2")]
+fn jwk_allowed_algorithms(
+    jwk: &jsonwebtoken::jwk::Jwk,
+) -> crate::AutumnResult<Vec<jsonwebtoken::Algorithm>> {
+    use jsonwebtoken::Algorithm;
+    use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, KeyAlgorithm};
+
+    // If the JWKS entry declares an algorithm, it is the only one accepted.
+    if let Some(key_alg) = jwk.common.key_algorithm {
+        let alg = match key_alg {
+            KeyAlgorithm::RS256 => Algorithm::RS256,
+            KeyAlgorithm::RS384 => Algorithm::RS384,
+            KeyAlgorithm::RS512 => Algorithm::RS512,
+            KeyAlgorithm::PS256 => Algorithm::PS256,
+            KeyAlgorithm::PS384 => Algorithm::PS384,
+            KeyAlgorithm::PS512 => Algorithm::PS512,
+            KeyAlgorithm::ES256 => Algorithm::ES256,
+            KeyAlgorithm::ES384 => Algorithm::ES384,
+            KeyAlgorithm::EdDSA => Algorithm::EdDSA,
+            // Symmetric (HS*) and encryption algorithms are never valid for
+            // verifying an id_token signature against a JWKS document.
+            other => {
+                return Err(crate::AutumnError::unauthorized_msg(format!(
+                    "jwk algorithm {other} not allowed for id_token verification"
+                )));
+            }
+        };
+        return Ok(vec![alg]);
+    }
+
+    // Otherwise derive the allowed set from the key type. Only asymmetric
+    // signature algorithms compatible with the key are permitted.
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => Ok(vec![
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ]),
+        AlgorithmParameters::EllipticCurve(params) => match params.curve {
+            EllipticCurve::P256 => Ok(vec![Algorithm::ES256]),
+            EllipticCurve::P384 => Ok(vec![Algorithm::ES384]),
+            ref other => Err(crate::AutumnError::unauthorized_msg(format!(
+                "unsupported jwk curve {other:?} for id_token verification"
+            ))),
+        },
+        AlgorithmParameters::OctetKeyPair(_) => Ok(vec![Algorithm::EdDSA]),
+        AlgorithmParameters::OctetKey(_) => Err(crate::AutumnError::unauthorized_msg(
+            "symmetric jwk not allowed for id_token verification",
+        )),
+    }
+}
+
 #[cfg(feature = "oauth2")]
 async fn validate_and_decode_id_token(
     token: &str,
@@ -1280,7 +1510,19 @@ async fn validate_and_decode_id_token(
     let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk)
         .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid jwk key: {e}")))?;
 
+    // Never trust the token header's `alg` to select the verification
+    // algorithm (algorithm-confusion defense). Pin the accepted set from the
+    // matched JWK and reject tokens whose header alg is not in it — in
+    // particular symmetric (HS*) algorithms, which would otherwise let an
+    // attacker forge tokens HMAC-signed with the public JWKS material.
+    let allowed_algs = jwk_allowed_algorithms(jwk)?;
+    if !allowed_algs.contains(&alg) {
+        return Err(crate::AutumnError::unauthorized_msg(format!(
+            "id_token alg {alg:?} not permitted by matching jwk"
+        )));
+    }
     let mut validation = jsonwebtoken::Validation::new(alg);
+    validation.algorithms = allowed_algs;
     let mut issuers = vec![issuer.to_owned()];
     let is_multi_tenant = issuer.contains("/common/")
         || issuer.contains("/organizations/")
@@ -1474,6 +1716,9 @@ impl Default for AuthConfig {
             lockout: LockoutConfig::default(),
             step_up: StepUpConfig::default(),
             sessions: SessionTrackingConfig::default(),
+            password: PasswordConfig::default(),
+            remember: RememberConfig::default(),
+            magic_link: MagicLinkConfig::default(),
         }
     }
 }
@@ -1759,10 +2004,109 @@ impl InMemoryApiTokenStore {
         self
     }
 
+    /// Seed a known raw token for `principal_id`, returning the store for
+    /// chaining.
+    ///
+    /// The raw value is hashed with [`hash_api_token`] and stored exactly like a
+    /// minted token, so it resolves through the same [`ApiTokenStore::verify`] /
+    /// [`ApiTokenStore::verify_scoped`] path as a minted one — there is no second
+    /// verification code path. This exists for the dev / single-tenant case where
+    /// the server's bearer token comes from an env var and the operator pastes
+    /// that same value into their MCP client config. **Not suitable for
+    /// production** — a database-backed [`ApiTokenStore`] remains the production
+    /// answer.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::auth::{ApiTokenStore, InMemoryApiTokenStore};
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let store = InMemoryApiTokenStore::default().with_token("dev-token", "user:dev");
+    /// assert_eq!(
+    ///     store.verify("dev-token").await.unwrap(),
+    ///     Some("user:dev".to_owned())
+    /// );
+    /// # });
+    /// ```
+    #[must_use]
+    pub fn with_token(self, raw_token: &str, principal_id: &str) -> Self {
+        self.with_scoped_token(raw_token, principal_id, &[])
+    }
+
+    /// Seed a known raw token carrying `scopes` for `principal_id`.
+    ///
+    /// Like [`Self::with_token`], but grants scopes so the seeded token also
+    /// satisfies [`ApiTokenStore::verify_scoped`] and the
+    /// `#[secured(scopes = [...])]` gate. Hashes via [`hash_api_token`] and
+    /// stores through the same path as a minted token.
+    #[must_use]
+    pub fn with_scoped_token(self, raw_token: &str, principal_id: &str, scopes: &[String]) -> Self {
+        self.store_raw_token(
+            raw_token,
+            &IssueTokenSpec {
+                principal_id,
+                scopes,
+                ..Default::default()
+            },
+        );
+        self
+    }
+
+    /// Build a store seeded with the raw token read from environment variable
+    /// `var`, registered for `principal_id`.
+    ///
+    /// The one-liner for a dev / single-tenant MCP server whose bearer token is
+    /// supplied out-of-band (an env var) and pasted verbatim into the MCP client
+    /// config. Delegates to [`Self::with_token`], so the seeded token verifies
+    /// through the same path as a minted one. **Not suitable for production.**
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `var` is unset or holds an empty / whitespace-only
+    /// value — a seeding store with no usable token would silently reject every
+    /// request, so this fails loudly at startup instead.
+    pub fn from_env(var: &str, principal_id: &str) -> crate::AutumnResult<Self> {
+        let raw = std::env::var(var).unwrap_or_default();
+        if raw.trim().is_empty() {
+            return Err(crate::AutumnError::internal_server_error_msg(format!(
+                "InMemoryApiTokenStore::from_env: environment variable `{var}` is unset or empty"
+            )));
+        }
+        Ok(Self::default().with_token(&raw, principal_id))
+    }
+
     /// Insert a freshly-minted token and return its raw value.
     fn insert_token(&self, spec: &IssueTokenSpec<'_>) -> String {
         let raw = generate_raw_token();
-        let hash = hash_api_token(&raw);
+        self.store_raw_token(&raw, spec);
+        raw
+    }
+
+    /// Store `raw_token` for `spec`, hashing it with [`hash_api_token`] into the
+    /// same `hash → StoredToken` map that [`Self::resolve_used`] reads.
+    ///
+    /// Shared by both the random-mint path ([`Self::insert_token`]) and the
+    /// seeding builders ([`Self::with_token`] / [`Self::with_scoped_token`]), so
+    /// a seeded token flows through the exact same verification path as a minted
+    /// one — there is never a second hashing or lookup scheme.
+    ///
+    /// A blank (empty or whitespace-only) `raw_token` is a **safe no-op**: it is
+    /// skipped with a `warn!` rather than stored, so a config typo on the
+    /// infallible seeding builders can never mint a `hash("")` credential that a
+    /// blank `Authorization: Bearer ` header would then satisfy. This mirrors the
+    /// empty/whitespace rejection [`Self::from_env`] applies (which fails loudly
+    /// before ever reaching here). Minted tokens ([`Self::insert_token`]) are
+    /// never blank, so the guard is a no-op on that path.
+    fn store_raw_token(&self, raw_token: &str, spec: &IssueTokenSpec<'_>) {
+        if raw_token.trim().is_empty() {
+            tracing::warn!(
+                "InMemoryApiTokenStore: ignoring a blank (empty or whitespace-only) seed token; \
+                 no credential was stored"
+            );
+            return;
+        }
+        let hash = hash_api_token(raw_token);
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1780,7 +2124,6 @@ impl InMemoryApiTokenStore {
             .write()
             .expect("api token store lock poisoned")
             .insert(hash, stored);
-        raw
     }
 
     /// Resolve a live token by raw value, stamping `last_used_at`.
@@ -2143,6 +2486,20 @@ where
                     // `#[secured(scopes = …)]` gate and `PolicyContext`
                     // scope-aware helpers read this extension.
                     req.extensions_mut().insert(ApiTokenScopes(scopes));
+                    // Publish the token's principal as the request's current
+                    // actor (#1383) so generated repository/audit writes
+                    // auto-attribute to it.
+                    //
+                    // Seed the actor only if no stronger/earlier principal is
+                    // already set. On a bearer-auth route nothing publishes an
+                    // actor before this middleware (the outer `LogContextLayer`
+                    // only establishes an empty scope), so `actor().is_none()` is
+                    // true and this still seeds. The guard keeps the uniform
+                    // "first/outermost resolver wins" rule: an explicit
+                    // `with_actor(...)` scope already in effect is preserved.
+                    if crate::current::Current::actor().is_none() {
+                        crate::current::Current::set_actor(principal_id.clone());
+                    }
                     req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
                     inner.call(req).await
                 }
@@ -2186,21 +2543,35 @@ fn api_token_unauthorized_response<ResBody: From<String> + Default>(
 }
 
 /// Build a Problem Details response from the API token store error.
+///
+/// Renders through the same classification the canonical [`AutumnError`]
+/// response uses: the rendered status/problem type (which carries the
+/// explicit problem type and the query-timeout reclassification) and the
+/// validation field map. Building the body from `status()` alone derived the
+/// wrong `code` and dropped `errors` (issue #2635).
 fn api_token_error_response<ResBody: From<String> + Default>(
     err: &crate::AutumnError,
     request_id: Option<String>,
     instance: Option<String>,
 ) -> Response<ResBody> {
-    let status = err.status();
-    let message = err.to_string();
+    let (status, problem_type) = err.rendered_problem();
+    // `message`, not `Display`: this string becomes the response `detail`,
+    // which stays the wrapped error even when the error carries a field map.
+    let message = err.message();
+    let details = err.details().cloned();
+    // Redact server-error detail in the body itself: this is the response the
+    // client sees unless a downstream exception filter rebuilds it, and the
+    // raw message stays available to filters/logging via
+    // `AutumnErrorInfo.message`. A reclassified query timeout must read
+    // "Service unavailable", not leak the store's db message.
     let body = crate::error::problem_details_json_string(
         status,
         message.clone(),
-        None,
-        None,
+        details.as_ref(),
+        problem_type,
         request_id,
         instance,
-        true,
+        false,
     );
     let mut response = Response::builder()
         .status(status)
@@ -2212,8 +2583,8 @@ fn api_token_error_response<ResBody: From<String> + Default>(
         .insert(crate::middleware::AutumnErrorInfo {
             status,
             message,
-            details: None,
-            problem_type: None,
+            details,
+            problem_type,
             backtrace_string: None,
         });
     response
@@ -2642,37 +3013,8 @@ mod tests {
     /// otherwise-identical struct literal that each test would copy verbatim.
     fn test_app_state(auth_session_key: &str) -> crate::state::AppState {
         crate::state::AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: auth_session_key.to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
+            auth_session_key: auth_session_key.into(),
+            ..crate::state::AppState::test_default()
         }
     }
 
@@ -2830,6 +3172,186 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "provider.issuer required for oidc");
+    }
+
+    /// RFC 7515 appendix A.2 example RSA public key as a JWK, optionally with
+    /// a declared `alg`.
+    #[cfg(feature = "oauth2")]
+    fn rsa_test_jwk_json(key_algorithm: Option<&str>) -> serde_json::Value {
+        let mut jwk = serde_json::json!({
+            "kty": "RSA",
+            "kid": "test-kid",
+            "n": "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp\
+                  -Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOW\
+                  vG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUs\
+                  LA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9k\
+                  G4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2\
+                  PAcDTW9gb54h4FRWyuXpoQ",
+            "e": "AQAB"
+        });
+        if let Some(alg) = key_algorithm {
+            jwk["alg"] = serde_json::json!(alg);
+        }
+        jwk
+    }
+
+    #[cfg(feature = "oauth2")]
+    fn rsa_test_jwk(key_algorithm: Option<&str>) -> jsonwebtoken::jwk::Jwk {
+        serde_json::from_value(rsa_test_jwk_json(key_algorithm)).unwrap()
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn jwk_allowed_algorithms_pins_declared_algorithm() {
+        let algs = jwk_allowed_algorithms(&rsa_test_jwk(Some("RS256"))).unwrap();
+        assert_eq!(algs, vec![jsonwebtoken::Algorithm::RS256]);
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn jwk_allowed_algorithms_rejects_symmetric_declared_algorithm() {
+        let err = jwk_allowed_algorithms(&rsa_test_jwk(Some("HS256"))).unwrap_err();
+        assert!(
+            err.to_string().contains("not allowed"),
+            "expected symmetric alg rejection, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn jwk_allowed_algorithms_derives_asymmetric_set_from_key_type() {
+        let algs = jwk_allowed_algorithms(&rsa_test_jwk(None)).unwrap();
+        assert!(algs.contains(&jsonwebtoken::Algorithm::RS256));
+        assert!(algs.contains(&jsonwebtoken::Algorithm::PS256));
+        assert!(!algs.contains(&jsonwebtoken::Algorithm::HS256));
+        assert!(!algs.contains(&jsonwebtoken::Algorithm::HS384));
+        assert!(!algs.contains(&jsonwebtoken::Algorithm::HS512));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn jwk_allowed_algorithms_rejects_symmetric_octet_key() {
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "oct",
+            "kid": "sym-kid",
+            "k": "c2VjcmV0"
+        }))
+        .unwrap();
+        let err = jwk_allowed_algorithms(&jwk).unwrap_err();
+        assert!(
+            err.to_string().contains("symmetric jwk not allowed"),
+            "expected symmetric jwk rejection, got: {err}"
+        );
+    }
+
+    /// Serves a fixed JSON body over plain HTTP/1.1 on a random localhost
+    /// port; returns the URL to fetch it from.
+    #[cfg(feature = "oauth2")]
+    async fn spawn_jwks_stub(body: String) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{addr}/jwks")
+    }
+
+    #[cfg(feature = "oauth2")]
+    fn oidc_test_provider(jwks_url: String) -> OAuth2ProviderConfig {
+        OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid".into(),
+            issuer: Some("https://idp.example".into()),
+            jwks_url: Some(jwks_url),
+            discovery_url: None,
+        }
+    }
+
+    #[cfg(feature = "oauth2")]
+    fn unix_now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Algorithm-confusion attack: the JWKS serves an RSA public key, and the
+    /// attacker forges an HS256 token (HMAC keyed with material derivable
+    /// from the public key). The token must be rejected because its header
+    /// alg is not in the set pinned from the JWK — before any signature
+    /// check is even attempted.
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_id_token_rejects_hs256_against_rsa_jwks_key() {
+        let jwks_body = serde_json::json!({ "keys": [rsa_test_jwk_json(None)] }).to_string();
+        let provider = oidc_test_provider(spawn_jwks_stub(jwks_body).await);
+
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some("test-kid".into());
+        let claims = serde_json::json!({
+            "sub": "attacker-controlled",
+            "iss": "https://idp.example",
+            "aud": "cid",
+            "exp": unix_now_secs() + 3600,
+        });
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"guessed-public-key-material"),
+        )
+        .unwrap();
+
+        let err = validate_and_decode_id_token(&token, &provider)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not permitted by matching jwk"),
+            "expected algorithm pinning rejection, got: {err}"
+        );
+    }
+
+    /// A token whose header declares `alg: none` must be rejected outright.
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_id_token_rejects_alg_none() {
+        use base64::Engine as _;
+        let b64 = |v: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+        };
+        let header = b64(&serde_json::json!({"alg": "none", "kid": "test-kid", "typ": "JWT"}));
+        let payload = b64(&serde_json::json!({
+            "sub": "attacker-controlled",
+            "iss": "https://idp.example",
+            "aud": "cid",
+            "exp": unix_now_secs() + 3600,
+        }));
+        let token = format!("{header}.{payload}.");
+
+        // Unreachable jwks_url: the token must be rejected before any fetch.
+        let provider = oidc_test_provider("http://127.0.0.1:9/jwks".into());
+        let err = validate_and_decode_id_token(&token, &provider)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid id_token header"),
+            "expected header rejection for alg=none, got: {err}"
+        );
     }
 
     #[cfg(feature = "oauth2")]
@@ -3092,6 +3614,47 @@ mod tests {
         let session = crate::session::Session::new_for_test("sess".into(), data);
         let result = __check_secured(&session, &["admin", "editor"]).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_secured_seeds_actor_when_none_established() {
+        // On a normal single-auth `#[secured]` route nothing publishes an actor
+        // before the role check (the outer `LogContextLayer` establishes only an
+        // empty scope), so the resolved session user becomes the ambient actor
+        // and versioned writes attribute to them (#1383).
+        crate::current::scope_request(async {
+            assert_eq!(crate::current::Current::actor(), None);
+            let data = std::collections::HashMap::from([("user_id".into(), "42".into())]);
+            let session = crate::session::Session::new_for_test("sess".into(), data);
+            let result = __check_secured_with_key(&session, "user_id", &[]).await;
+            assert!(result.is_ok());
+            assert_eq!(crate::current::Current::actor(), Some("42".to_owned()));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn check_secured_preserves_already_established_actor() {
+        // The flagged clobber (#1383): a route that combines `RequireApiToken`
+        // (bearer, OUTER) with `#[secured]` and *also* carries a session cookie.
+        // The bearer middleware has already published the token principal by the
+        // time this inner role check runs; resolving the session user here must
+        // NOT overwrite the stronger, earlier principal, so versioned writes stay
+        // attributed to the token principal rather than the cookie user.
+        crate::current::scope_request(async {
+            crate::current::Current::set_actor("token-principal".to_owned());
+            let data = std::collections::HashMap::from([("user_id".into(), "42".into())]);
+            let session = crate::session::Session::new_for_test("sess".into(), data);
+            let result = __check_secured_with_key(&session, "user_id", &[]).await;
+            // The session still authenticates/authorizes normally...
+            assert!(result.is_ok());
+            // ...but the already-established principal wins as the ambient actor.
+            assert_eq!(
+                crate::current::Current::actor(),
+                Some("token-principal".to_owned())
+            );
+        })
+        .await;
     }
 
     // ── #[secured] macro integration tests ──────────────────────
@@ -3895,6 +4458,97 @@ mod api_token_tests {
         assert_eq!(store.verify(&raw).await.unwrap(), None);
     }
 
+    // ── Seeding a known token (issue #1970) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn with_token_seeds_token_resolvable_through_same_path() {
+        // A seeded token must flow through the exact `verify` / `verify_scoped`
+        // path a minted token uses — no second hashing or lookup scheme.
+        let store = InMemoryApiTokenStore::default().with_token("known-dev-token", "user:dev");
+        assert_eq!(
+            store.verify("known-dev-token").await.unwrap(),
+            Some("user:dev".to_owned()),
+        );
+        // The stored hash is exactly `hash_api_token(raw)` — a tampered raw
+        // hashes differently and must miss.
+        assert_eq!(store.verify("known-dev-tokenx").await.unwrap(), None);
+        // And it resolves through the scoped path too (empty scopes).
+        let verified = store
+            .verify_scoped("known-dev-token")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.principal_id, "user:dev");
+        assert!(verified.scopes.is_empty());
+        // Revocation uses the same hash → the seeded token can be revoked.
+        store.revoke("known-dev-token").await.unwrap();
+        assert_eq!(store.verify("known-dev-token").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn with_scoped_token_seeds_scopes_via_verify_scoped() {
+        let granted = scopes(&["reports:read", "reports:write"]);
+        let store = InMemoryApiTokenStore::default().with_scoped_token(
+            "scoped-dev-token",
+            "svc:reports",
+            &granted,
+        );
+        let verified = store
+            .verify_scoped("scoped-dev-token")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.principal_id, "svc:reports");
+        assert_eq!(verified.scopes, granted);
+    }
+
+    #[tokio::test]
+    async fn blank_seed_token_stores_no_credential() {
+        // A blank (empty or whitespace-only) seed on the infallible builders must
+        // be a safe no-op — never minting a `hash("")` credential that a blank
+        // `Authorization: Bearer ` header could satisfy. `with_token` and
+        // `with_scoped_token` both route through the same `store_raw_token` guard.
+        for blank in ["", "   ", "\t\n"] {
+            let store = InMemoryApiTokenStore::default().with_token(blank, "user:oops");
+            // Neither the blank raw value nor an empty bearer resolves anything.
+            assert_eq!(store.verify(blank).await.unwrap(), None);
+            assert_eq!(store.verify("").await.unwrap(), None);
+            assert!(store.verify_scoped(blank).await.unwrap().is_none());
+            assert!(store.verify_scoped("").await.unwrap().is_none());
+
+            // The scoped builder shares the guard.
+            let scoped = InMemoryApiTokenStore::default().with_scoped_token(
+                blank,
+                "svc:oops",
+                &scopes(&["reports:read"]),
+            );
+            assert_eq!(scoped.verify(blank).await.unwrap(), None);
+            assert!(scoped.verify_scoped("").await.unwrap().is_none());
+        }
+
+        // A normal non-blank seed alongside still works, proving the guard only
+        // drops the blank one.
+        let store = InMemoryApiTokenStore::default().with_token("real-token", "user:ok");
+        assert_eq!(
+            store.verify("real-token").await.unwrap(),
+            Some("user:ok".to_owned()),
+        );
+    }
+
+    #[test]
+    fn from_env_errors_when_variable_unset() {
+        // The crate is `#![forbid(unsafe_code)]`, and `std::env::set_var` is
+        // `unsafe` in edition 2024, so a test cannot mutate the process
+        // environment to exercise the positive path here — the seeding core is
+        // proven by the `with_token` / `with_scoped_token` tests above. This
+        // proves `from_env` consults exactly the named variable and rejects an
+        // unset one (a uniquely-named var is naturally absent, so no mutation is
+        // needed).
+        const VAR: &str = "AUTUMN_TEST_MCP_TOKEN_1970_UNSET";
+        assert!(std::env::var(VAR).is_err(), "test var must be unset");
+        assert!(InMemoryApiTokenStore::from_env(VAR, "user:mcp").is_err());
+    }
+
     // ── Scoped service tokens (issue #1158) ──────────────────────────────────
 
     use super::{
@@ -4212,7 +4866,10 @@ mod api_token_tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], 503);
         assert_eq!(json["code"], "autumn.service_unavailable");
-        assert_eq!(json["detail"], "api token store unavailable");
+        // Server-error detail is redacted in the body (issue #2635): the
+        // store's message stays available to exception filters and logging
+        // via `AutumnErrorInfo.message`, never to the client.
+        assert_eq!(json["detail"], "Service unavailable");
     }
 
     #[tokio::test]
@@ -4294,6 +4951,118 @@ mod api_token_tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[test]
+    fn api_token_error_response_detail_omits_the_field_map() {
+        // The body renders through the canonical classification, but `detail`
+        // must take `message()`. With `Display` a store returning a
+        // validation error would put the field list in `detail` (issue
+        // #2587).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+        assert_eq!(err.to_string(), "Validation failed: token: Malformed");
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(json["detail"], "Validation failed");
+    }
+
+    #[test]
+    fn api_token_error_response_carries_code_and_errors_for_validation() {
+        // Regression for issue #2635: the body dropped the field map and the
+        // explicit problem type, so `code`/`errors` disagreed with the
+        // canonical render (`autumn.unprocessable_entity`, `errors` empty).
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["code"], "autumn.validation_failed");
+        assert_eq!(
+            json["type"],
+            "https://autumn.dev/problems/validation-failed"
+        );
+        assert_eq!(
+            json["errors"],
+            serde_json::json!([{"field": "token", "messages": ["Malformed"]}]),
+        );
+        // The canonical render agrees: same error through `code()`.
+        assert_eq!(err.code(), "autumn.validation_failed");
+    }
+
+    #[test]
+    fn api_token_error_response_carries_explicit_problem_type() {
+        // Regression for issue #2635: an explicit problem type rendered under
+        // the status-derived code (`autumn.service_unavailable`).
+        let err = crate::AutumnError::query_timeout("query exceeded statement_timeout");
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], "autumn.query_timeout");
+        assert_eq!(json["type"], "https://autumn.dev/problems/query-timeout");
+        assert_eq!(err.code(), "autumn.query_timeout");
+    }
+
+    #[test]
+    fn api_token_error_response_reclassifies_cancelled_statements() {
+        // A database error from a custom `ApiTokenStore` whose message shows a
+        // cancelled statement renders as a redacted 503 query timeout, like
+        // the canonical `IntoResponse` path, not the assigned 500.
+        let err = crate::AutumnError::internal_server_error_msg(
+            "db: canceling statement due to statement timeout",
+        );
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let json: serde_json::Value =
+            serde_json::from_str(response.body()).expect("problem+json body");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], "autumn.query_timeout");
+        // Internal detail stays redacted in the body.
+        assert_eq!(json["detail"], "Service unavailable");
+    }
+
+    #[test]
+    fn api_token_error_response_stashes_details_for_exception_filters() {
+        // Regression for issue #2635: the `AutumnErrorInfo` extension dropped
+        // `details`/`problem_type`, so a downstream exception filter could not
+        // recover them either.
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("token".to_owned(), vec!["Malformed".to_owned()]);
+        let err = crate::AutumnError::validation(fields);
+
+        let response: http::Response<String> = super::api_token_error_response(&err, None, None);
+        let info = response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .expect("AutumnErrorInfo in extensions");
+        assert_eq!(info.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            info.details.as_ref().and_then(|m| m.get("token")),
+            Some(&vec!["Malformed".to_owned()]),
+        );
+        // Validation errors carry no explicit problem type (the type URI is
+        // derived from the 422 + field map at render); explicit types like
+        // `query_timeout` are preserved verbatim.
+        assert_eq!(info.problem_type, None);
+        let timeout_err = crate::AutumnError::query_timeout("slow");
+        let timeout_response: http::Response<String> =
+            super::api_token_error_response(&timeout_err, None, None);
+        let timeout_info = timeout_response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .expect("AutumnErrorInfo in extensions");
+        assert_eq!(
+            timeout_info.problem_type,
+            Some("https://autumn.dev/problems/query-timeout")
+        );
+    }
+
     #[tokio::test]
     async fn require_api_token_401_response_has_problem_details() {
         use axum::body::Body;
@@ -4341,7 +5110,7 @@ mod api_token_tests {
         let app = axum::Router::new()
             .route("/api/private", axum::routing::get(|| async { "ok" }))
             .layer(RequireApiToken::new(store))
-            .layer(RequestIdLayer);
+            .layer(RequestIdLayer::default());
 
         let response = app
             .oneshot(

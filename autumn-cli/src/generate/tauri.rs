@@ -136,7 +136,8 @@ fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), 
 // ── Mixed-mode guard (issue #1506) ────────────────────────────────────────────
 
 /// Files only the mobile thin-client scaffold (`--remote-url`) emits, relative
-/// to `src-tauri/` — checked before scaffolding the desktop mode.
+/// to `src-tauri/` — checked before scaffolding the desktop mode (and, via
+/// `tauri_mobile::ensure_no_other_mode_scaffold`, the mobile in-process mode).
 ///
 /// The capability files are the actively harmful leftovers: Tauri loads
 /// *every* file under `src-tauri/capabilities/`, and the desktop shell crate
@@ -144,21 +145,22 @@ fn plan_icons(plan: &mut Plan, project_root: &Path, tauri: &Path) -> Result<(), 
 /// name, so `tauri-build` fails permission validation. `Info.ios.plist` is
 /// merely dead on desktop but is equally unambiguous evidence of a
 /// thin-client scaffold.
-const THIN_CLIENT_MARKERS: [&str; 3] = [
+pub const THIN_CLIENT_MARKERS: [&str; 3] = [
     "capabilities/remote-app.json",
     "capabilities/remote-app-mobile.json",
     "Info.ios.plist",
 ];
 
 /// Files only the desktop (sidecar) scaffold emits, relative to `src-tauri/`
-/// — checked before scaffolding the thin-client mode.
+/// — checked before scaffolding the thin-client mode (and, via
+/// `tauri_mobile::ensure_no_other_mode_scaffold`, the mobile in-process mode).
 ///
 /// The per-OS overlay confs are the actively harmful leftovers: Tauri CLI
 /// merges `tauri.<platform>.conf.json` on top of `tauri.conf.json`
 /// automatically, so a stale overlay keeps running the sidecar staging script
 /// as `beforeBuildCommand`/`beforeDevCommand` on every `cargo tauri
 /// build`/`dev` of the thin client.
-const DESKTOP_MARKERS: [&str; 5] = [
+pub const DESKTOP_MARKERS: [&str; 5] = [
     "stage-sidecar.sh",
     "stage-sidecar.ps1",
     "tauri.linux.conf.json",
@@ -242,38 +244,31 @@ pub fn ensure_no_opposite_mode_scaffold(
 /// `--features autumn-web/embed-assets` (dep path only), so that the app's
 /// `#[cfg(feature = "embed-assets")]` guard on `.embedded_static()` is
 /// satisfied — mirroring what `autumn build --embed` does.
-/// Walk ancestor `Cargo.toml` files to find the `package` field of a
-/// workspace-inherited dependency entry.
+/// Find the `package` field of a workspace-inherited dependency entry in
+/// the app's EFFECTIVE workspace root.
 ///
 /// When a member has `autumn_web = { workspace = true }`, the `package` alias
-/// is recorded in `[workspace.dependencies]` of an ancestor, not the member.
+/// is recorded in `[workspace.dependencies]` of the workspace root, not the
+/// member. Cargo resolves that root as exactly one manifest — the member's
+/// own `[workspace]`, the target of an explicit `[package] workspace = "…"`
+/// pointer, or the nearest non-excluding ancestor — so this reuses
+/// [`super::tauri_mobile::effective_workspace_root`] rather than walking
+/// ancestors (an ancestor-only walk never finds a pointer target that is not
+/// an ancestor, so a renamed inherited dep would silently mis-resolve to the
+/// bare package name).
 /// Returns `None` when the dep key is not found or has no `package` field.
 fn resolve_workspace_dep_package(project_root: &Path, dep_key: &str) -> Option<String> {
-    let mut dir: Option<&Path> = Some(project_root);
-    while let Some(d) = dir {
-        let cargo = d.join("Cargo.toml");
-        if cargo.is_file()
-            && let Ok(content) = std::fs::read_to_string(&cargo)
-            && let Ok(ws_doc) = toml::from_str::<toml::Value>(&content)
-        {
-            if let Some(pkg_name) = ws_doc
-                .get("workspace")
-                .and_then(|w| w.get("dependencies"))
-                .and_then(|deps| deps.get(dep_key))
-                .and_then(toml::Value::as_table)
-                .and_then(|t| t.get("package"))
-                .and_then(toml::Value::as_str)
-            {
-                return Some(pkg_name.to_owned());
-            }
-            // Stop at the workspace root even when the dep is not there.
-            if ws_doc.get("workspace").is_some() {
-                return None;
-            }
-        }
-        dir = d.parent();
-    }
-    None
+    let root = super::tauri_mobile::effective_workspace_root(project_root);
+    let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let ws_doc = toml::from_str::<toml::Value>(&content).ok()?;
+    ws_doc
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|deps| deps.get(dep_key))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("package"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Find the `[dependencies]` key used to depend on `package_name`.
@@ -284,7 +279,7 @@ fn resolve_workspace_dep_package(project_root: &Path, dep_key: &str) -> Option<S
 /// workspace-inherited deps (`autumn_web = { workspace = true }`) by walking
 /// up to the workspace `Cargo.toml` to read the effective `package` there.
 /// Returns `package_name` itself when no alias is found.
-fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &str) -> String {
+pub fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &str) -> String {
     let Some(deps) = doc.get("dependencies").and_then(toml::Value::as_table) else {
         return package_name.to_owned();
     };
@@ -1639,8 +1634,9 @@ fn mobile_lib_name(package_name: &str) -> String {
     package_name.replace('-', "_") + "_mobile"
 }
 
-/// Bundle identifier for the mobile thin client: reverse-DNS with `-` and `_`
-/// stripped from the package name (`demo-app` → `com.example.demoapp`).
+/// Bundle identifier for the mobile modes (thin client here, in-process in
+/// `tauri_mobile.rs`): reverse-DNS with `-` and `_` stripped from the
+/// package name (`demo-app` → `com.example.demoapp`).
 ///
 /// Unlike the desktop derivation ([`derive_identifier`], which hyphenates for
 /// Apple), the mobile identifier must satisfy *both* stores: Android forbids
@@ -1648,7 +1644,7 @@ fn mobile_lib_name(package_name: &str) -> String {
 /// (tauri-apps/tauri#9707) — and Apple forbids underscores. Alphanumeric
 /// segments are valid on both. Users should replace the `com.example.*`
 /// placeholder with their real identifier before running `android`/`ios init`.
-fn derive_mobile_identifier(package_name: &str) -> String {
+pub fn derive_mobile_identifier(package_name: &str) -> String {
     format!("com.example.{}", package_name.replace(['-', '_'], ""))
 }
 
@@ -1996,7 +1992,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2012,7 +2008,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/main.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2031,7 +2027,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"./src/main.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2048,7 +2044,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/./main.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2067,7 +2063,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2092,7 +2088,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{worker_name}\"\npath=\"src/worker.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2123,7 +2119,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  default-run=\"{default_run}\"\
-                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2151,7 +2147,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  default-run=\"{default_run}\"\n\
-                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2173,7 +2169,7 @@ mod tests {
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  autobins=false\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/{bin_name}.rs\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2200,7 +2196,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\
-                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2218,7 +2214,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion.workspace = true\nedition=\"2024\"\n\
                  \n[workspace]\n\n[workspace.package]\nversion=\"{ws_version}\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2236,7 +2232,7 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[features]\nembed-assets = [\"autumn-web/embed-assets\"]\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2254,7 +2250,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2276,7 +2272,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -2297,7 +2293,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();
@@ -3023,7 +3019,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nedition=\"2024\"\nautobins=false\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
@@ -3050,7 +3046,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"my-lib\"\nversion=\"0.1.0\"\nedition=\"2024\"\nautobins=false\n\
-             \n[lib]\nname=\"my_lib\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[lib]\nname=\"my_lib\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -4850,7 +4846,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let doc: toml::Value = toml::from_str(
             "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\ndefault-run=\"webserver\"\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         let result = resolve_bin_name(tmp.path(), "my-app", Some("webserver"), true, &doc);
@@ -4939,7 +4935,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"no-version-app\"\nedition=\"2024\"\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
@@ -4981,7 +4977,7 @@ mod tests {
         fs::write(
             app.join("Cargo.toml"),
             "[package]\nname=\"my-app\"\nversion.workspace = true\nedition=\"2024\"\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -5003,7 +4999,7 @@ mod tests {
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"my-app\"\nversion.workspace = true\nedition=\"2024\"\n\
-             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+             \n[dependencies]\nautumn-web = \"0.6.0\"\n",
         )
         .unwrap();
         let version = resolve_workspace_version(tmp.path());
@@ -5492,7 +5488,7 @@ mod tests {
             tmp.path().join("Cargo.toml"),
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.3.0\"\nedition=\"2024\"\n\
-                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+                 \n[dependencies]\nautumn-web = \"0.6.0\"\n"
             ),
         )
         .unwrap();

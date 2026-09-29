@@ -57,9 +57,10 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::Body;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, IntoResponseParts, Response as AxumResponse, ResponseParts};
 use futures::stream::StreamExt as _;
 use http::header::{
     CACHE_CONTROL, CONTENT_LOCATION, DATE, ETAG, EXPIRES, IF_MODIFIED_SINCE, IF_NONE_MATCH,
@@ -512,6 +513,283 @@ fn parse_http_date(s: &str) -> Option<std::time::SystemTime> {
             })
         })
         .ok()
+}
+
+// ── Cache-Control freshness ─────────────────────────────────────────────────
+
+/// Cache visibility scope for a [`CacheControl`] directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    /// `public` — any cache (browser **and** shared/CDN) may store the response.
+    Public,
+    /// `private` — only the end-client's browser cache may store it.
+    Private,
+}
+
+/// A declarative builder for the `Cache-Control` response header.
+///
+/// `CacheControl` is the freshness companion to [`fresh_when`]: where
+/// `fresh_when` decides whether a cached copy is still *valid* (revalidation),
+/// `Cache-Control` tells caches how long a copy stays *fresh* before they need
+/// to revalidate at all. Build one with [`cache_for`] and attach it to any
+/// response.
+///
+/// # Two ways to attach it
+///
+/// It implements [`IntoResponseParts`], so it composes as a tuple with any
+/// [`IntoResponse`] body — the idiomatic axum form:
+///
+/// ```rust
+/// use autumn_web::etag::cache_for;
+/// use axum::response::IntoResponse;
+/// use std::time::Duration;
+///
+/// # fn markup() -> &'static str { "<h1>hi</h1>" }
+/// # fn handler() -> impl IntoResponse {
+/// (cache_for(Duration::from_secs(60)).public(), markup())
+/// # }
+/// ```
+///
+/// Or call [`CacheControl::wrap`] for a single expression:
+///
+/// ```rust
+/// use autumn_web::etag::cache_for;
+/// use std::time::Duration;
+///
+/// # fn markup() -> &'static str { "<h1>hi</h1>" }
+/// let response = cache_for(Duration::from_secs(60)).public().wrap(markup());
+/// ```
+///
+/// Either way the `Cache-Control` header is **inserted** (replacing any prior
+/// value), so a response never ends up with two conflicting `Cache-Control`
+/// values.
+///
+/// # `max-age` vs `s-maxage`
+///
+/// - [`max_age`](CacheControl::max_age) (`max-age=N`) is the freshness lifetime
+///   for **every** cache, including the end-user's browser.
+/// - [`s_maxage`](CacheControl::s_maxage) (`s-maxage=N`) overrides `max-age`
+///   **only for shared caches** (CDNs, reverse proxies). Use it to let a CDN
+///   hold a page longer than the browser does — e.g. `max-age=60, s-maxage=600`
+///   keeps the browser copy fresh for a minute but lets the CDN serve it for ten.
+///
+/// # `Vary` and personalized responses
+///
+/// A `public` response may be served by a **shared** cache to *any* client, so
+/// never mark a page that embeds per-user state (a signed-in username, a
+/// cart, CSRF-bound markup) `public` without also emitting a matching `Vary`
+/// header (e.g. `Vary: Cookie`) so the shared cache keys separate variants per
+/// user. When in doubt keep the response [`private`](CacheControl::private) or
+/// [`no_store`](CacheControl::no_store) — a shared cache must never hand one
+/// user's personalized page to another.
+///
+/// # Default-private safety
+///
+/// [`cache_for`] defaults to **`private`**. `public` is an explicit opt-in via
+/// [`CacheControl::public`]. This means dropping `cache_for(..)` onto a
+/// secured / authenticated handler can never *silently* publish that page to a
+/// shared cache — you have to ask for `public` on purpose.
+#[derive(Debug, Clone)]
+#[must_use = "attach the CacheControl to a response via a tuple or `.wrap(..)`"]
+#[allow(clippy::struct_excessive_bools)] // independent, orthogonal Cache-Control directive toggles
+pub struct CacheControl {
+    visibility: Option<Visibility>,
+    max_age: Option<Duration>,
+    s_maxage: Option<Duration>,
+    stale_while_revalidate: Option<Duration>,
+    no_store: bool,
+    no_cache: bool,
+    must_revalidate: bool,
+    immutable: bool,
+}
+
+/// Start a `Cache-Control` freshness directive with a `max-age` lifetime.
+///
+/// The returned [`CacheControl`] defaults to **`private`** (browser-only) — see
+/// [`CacheControl`] for the default-private safety rule, the `max-age` vs
+/// `s-maxage` distinction, and the `Vary` interaction. Call
+/// [`public`](CacheControl::public) to opt in to shared/CDN caching.
+///
+/// ```rust
+/// use autumn_web::etag::cache_for;
+/// use std::time::Duration;
+///
+/// // "private, max-age=60"
+/// let cc = cache_for(Duration::from_secs(60));
+/// assert_eq!(cc.header_value(), "private, max-age=60");
+/// ```
+pub const fn cache_for(ttl: Duration) -> CacheControl {
+    CacheControl {
+        visibility: Some(Visibility::Private),
+        max_age: Some(ttl),
+        s_maxage: None,
+        stale_while_revalidate: None,
+        no_store: false,
+        no_cache: false,
+        must_revalidate: false,
+        immutable: false,
+    }
+}
+
+impl CacheControl {
+    /// Mark the response cacheable by **shared** caches (CDNs, proxies) as well
+    /// as the browser (`public`). Explicit opt-in — see the default-private
+    /// safety rule on [`CacheControl`]. Only mark a personalized page `public`
+    /// alongside a matching `Vary` header.
+    pub const fn public(mut self) -> Self {
+        self.visibility = Some(Visibility::Public);
+        self
+    }
+
+    /// Restrict the response to the end-client's browser cache (`private`).
+    /// This is the default for [`cache_for`].
+    pub const fn private(mut self) -> Self {
+        self.visibility = Some(Visibility::Private);
+        self
+    }
+
+    /// Set the `max-age=N` freshness lifetime (applies to every cache,
+    /// including the browser). Rendered as whole seconds.
+    pub const fn max_age(mut self, d: Duration) -> Self {
+        self.max_age = Some(d);
+        self
+    }
+
+    /// Set the `s-maxage=N` freshness lifetime for **shared** caches only
+    /// (CDNs, reverse proxies); overrides `max-age` there. Rendered as whole
+    /// seconds.
+    pub const fn s_maxage(mut self, d: Duration) -> Self {
+        self.s_maxage = Some(d);
+        self
+    }
+
+    /// Set `stale-while-revalidate=N` — a shared cache may serve the stale
+    /// copy for up to `N` seconds while it revalidates in the background.
+    /// Rendered as whole seconds.
+    pub const fn stale_while_revalidate(mut self, d: Duration) -> Self {
+        self.stale_while_revalidate = Some(d);
+        self
+    }
+
+    /// Emit exactly `no-store` — forbid any cache from storing the response.
+    /// Overrides every freshness directive (`max-age`, `s-maxage`,
+    /// `stale-while-revalidate`, visibility) in [`header_value`](Self::header_value).
+    pub const fn no_store(mut self) -> Self {
+        self.no_store = true;
+        self
+    }
+
+    /// Add `no-cache` — a cache may store the response but must revalidate with
+    /// the origin before reusing it.
+    pub const fn no_cache(mut self) -> Self {
+        self.no_cache = true;
+        self
+    }
+
+    /// Add `must-revalidate` — once stale, a cache MUST revalidate and MUST NOT
+    /// serve the stale copy on origin failure.
+    pub const fn must_revalidate(mut self) -> Self {
+        self.must_revalidate = true;
+        self
+    }
+
+    /// Add `immutable` — the response body will not change over its freshness
+    /// lifetime, so clients skip revalidation even on reload.
+    pub const fn immutable(mut self) -> Self {
+        self.immutable = true;
+        self
+    }
+
+    /// Render the byte-for-byte `Cache-Control` header value.
+    ///
+    /// If [`no_store`](Self::no_store) is set the value is exactly `"no-store"`
+    /// and every freshness directive is ignored. Otherwise directives are
+    /// joined, comma+space separated, in this fixed deterministic order:
+    /// visibility (`public`/`private`), `no-cache`, `max-age=N`, `s-maxage=N`,
+    /// `stale-while-revalidate=N`, `must-revalidate`, `immutable`. Durations
+    /// render as whole seconds.
+    ///
+    /// ```rust
+    /// use autumn_web::etag::cache_for;
+    /// use std::time::Duration;
+    ///
+    /// let v = cache_for(Duration::from_secs(60))
+    ///     .public()
+    ///     .s_maxage(Duration::from_secs(120))
+    ///     .stale_while_revalidate(Duration::from_secs(30))
+    ///     .header_value();
+    /// assert_eq!(v, "public, max-age=60, s-maxage=120, stale-while-revalidate=30");
+    /// ```
+    #[must_use]
+    pub fn header_value(&self) -> String {
+        if self.no_store {
+            return "no-store".to_string();
+        }
+        // Pre-allocate a single buffer and append directives directly, only
+        // allocating for the dynamic `max-age`/`s-maxage`/`stale-while-revalidate`
+        // parts. The ", " separator is written before every directive but the first.
+        let mut out = String::with_capacity(64);
+        let mut push = |directive: &str| {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            out.push_str(directive);
+        };
+        match self.visibility {
+            Some(Visibility::Public) => push("public"),
+            Some(Visibility::Private) => push("private"),
+            None => {}
+        }
+        if self.no_cache {
+            push("no-cache");
+        }
+        if let Some(d) = self.max_age {
+            push(&format!("max-age={}", d.as_secs()));
+        }
+        if let Some(d) = self.s_maxage {
+            push(&format!("s-maxage={}", d.as_secs()));
+        }
+        if let Some(d) = self.stale_while_revalidate {
+            push(&format!("stale-while-revalidate={}", d.as_secs()));
+        }
+        if self.must_revalidate {
+            push("must-revalidate");
+        }
+        if self.immutable {
+            push("immutable");
+        }
+        out
+    }
+
+    /// Insert the rendered `Cache-Control` header into `headers`, replacing any
+    /// pre-existing value so exactly one `Cache-Control` remains.
+    fn apply_to(&self, headers: &mut HeaderMap) {
+        if let Ok(v) = HeaderValue::try_from(self.header_value()) {
+            headers.insert(CACHE_CONTROL, v);
+        }
+    }
+
+    /// Attach the `Cache-Control` header to `response` and return it.
+    ///
+    /// The header is **inserted** (any pre-existing `Cache-Control` is
+    /// replaced), so the response carries exactly one `Cache-Control` value.
+    /// Prefer the tuple form `(cache_for(..).public(), body)` when you can; use
+    /// `wrap` when a single expression is more convenient.
+    #[must_use]
+    pub fn wrap(self, response: impl IntoResponse) -> AxumResponse {
+        let mut r = response.into_response();
+        self.apply_to(r.headers_mut());
+        r
+    }
+}
+
+impl IntoResponseParts for CacheControl {
+    type Error = std::convert::Infallible;
+
+    fn into_response_parts(self, mut res: ResponseParts) -> Result<ResponseParts, Self::Error> {
+        self.apply_to(res.headers_mut());
+        Ok(res)
+    }
 }
 
 // ── EtagLayer ─────────────────────────────────────────────────────────────────
@@ -1459,5 +1737,158 @@ mod tests {
         let old_etag: ETag = 1_i64.into_etag();
         // New ETag must differ from old one.
         assert_ne!(new_etag, &old_etag.header_value());
+    }
+
+    // ── RED: CacheControl freshness (issue #1344) ─────────────────────────────
+
+    // AC#2: byte-for-byte header_value() rendering.
+
+    #[test]
+    fn cache_for_default_is_private_max_age() {
+        assert_eq!(
+            cache_for(Duration::from_secs(60)).header_value(),
+            "private, max-age=60"
+        );
+    }
+
+    #[test]
+    fn cache_for_public_with_s_maxage_and_swr_orders_deterministically() {
+        let v = cache_for(Duration::from_secs(60))
+            .public()
+            .s_maxage(Duration::from_secs(120))
+            .stale_while_revalidate(Duration::from_secs(30))
+            .header_value();
+        assert_eq!(
+            v,
+            "public, max-age=60, s-maxage=120, stale-while-revalidate=30"
+        );
+    }
+
+    #[test]
+    fn cache_for_no_store_emits_only_no_store() {
+        // no-store overrides every freshness directive.
+        let v = cache_for(Duration::from_secs(60))
+            .public()
+            .s_maxage(Duration::from_secs(120))
+            .stale_while_revalidate(Duration::from_secs(30))
+            .no_store()
+            .header_value();
+        assert_eq!(v, "no-store");
+    }
+
+    #[test]
+    fn cache_control_full_ordering() {
+        // Every directive present exercises the fixed ordering.
+        let v = cache_for(Duration::from_secs(1))
+            .public()
+            .no_cache()
+            .max_age(Duration::from_secs(10))
+            .s_maxage(Duration::from_secs(20))
+            .stale_while_revalidate(Duration::from_secs(30))
+            .must_revalidate()
+            .immutable()
+            .header_value();
+        assert_eq!(
+            v,
+            "public, no-cache, max-age=10, s-maxage=20, stale-while-revalidate=30, must-revalidate, immutable"
+        );
+    }
+
+    #[test]
+    fn cache_control_durations_render_as_whole_seconds() {
+        // Sub-second remainder is truncated (as_secs()).
+        let v = cache_for(Duration::from_millis(1500)).header_value();
+        assert_eq!(v, "private, max-age=1");
+    }
+
+    // AC#4: default-private safety — never public unless asked.
+
+    #[test]
+    fn cache_for_never_public_by_default() {
+        let v = cache_for(Duration::from_secs(300)).header_value();
+        assert!(!v.contains("public"), "default must not be public: {v}");
+        assert!(v.contains("private"), "default must be private: {v}");
+    }
+
+    #[test]
+    fn cache_for_private_stays_private_after_explicit_call() {
+        let v = cache_for(Duration::from_secs(300)).private().header_value();
+        assert_eq!(v, "private, max-age=300");
+    }
+
+    #[test]
+    fn cache_for_public_is_explicit_opt_in() {
+        let v = cache_for(Duration::from_secs(300)).public().header_value();
+        assert!(v.starts_with("public"), "{v}");
+    }
+
+    // AC#1: wrap() inserts the header on a response.
+
+    #[tokio::test]
+    async fn cache_control_wrap_sets_single_cache_control_header() {
+        let response = cache_for(Duration::from_secs(60))
+            .public()
+            .wrap("hello".into_response());
+        let values: Vec<_> = response.headers().get_all(CACHE_CONTROL).iter().collect();
+        assert_eq!(values.len(), 1, "exactly one Cache-Control header");
+        assert_eq!(values[0].to_str().unwrap(), "public, max-age=60");
+    }
+
+    #[tokio::test]
+    async fn cache_control_wrap_replaces_existing_cache_control() {
+        let base = Response::builder()
+            .status(StatusCode::OK)
+            .header(CACHE_CONTROL, "max-age=1")
+            .body(Body::from("hi"))
+            .unwrap();
+        let response = cache_for(Duration::from_secs(60)).wrap(base);
+        let values: Vec<_> = response.headers().get_all(CACHE_CONTROL).iter().collect();
+        assert_eq!(values.len(), 1, "insert replaces, does not append");
+        assert_eq!(values[0].to_str().unwrap(), "private, max-age=60");
+    }
+
+    // AC#1: IntoResponseParts tuple composition.
+
+    #[tokio::test]
+    async fn cache_control_tuple_sets_header() {
+        let response = (cache_for(Duration::from_secs(90)).public(), "body").into_response();
+        let values: Vec<_> = response.headers().get_all(CACHE_CONTROL).iter().collect();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].to_str().unwrap(), "public, max-age=90");
+    }
+
+    // AC#3: composing ETag + freshness emits exactly ONE Cache-Control header.
+
+    #[tokio::test]
+    async fn fresh_when_or_with_cache_control_emits_single_header_on_200() {
+        // Stale request (no If-None-Match): 200 with both ETag and Cache-Control.
+        let headers = HeaderMap::new();
+        let markup = "<h1>hi</h1>";
+        let response = fresh_when(&headers, "v1")
+            .or(cache_for(Duration::from_secs(60)).public().wrap(markup))
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key(ETAG));
+        let values: Vec<_> = response.headers().get_all(CACHE_CONTROL).iter().collect();
+        assert_eq!(values.len(), 1, "exactly one Cache-Control on 200");
+        assert_eq!(values[0].to_str().unwrap(), "public, max-age=60");
+    }
+
+    // AC#5: 304 revalidation preserves the freshness directives (single header).
+
+    #[tokio::test]
+    async fn fresh_when_or_preserves_cache_control_on_304() {
+        let etag: ETag = "v1".into_etag();
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.header_value());
+
+        let markup = "<h1>hi</h1>";
+        let response = fresh_when(&headers, "v1")
+            .or(cache_for(Duration::from_secs(60)).public().wrap(markup))
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        let values: Vec<_> = response.headers().get_all(CACHE_CONTROL).iter().collect();
+        assert_eq!(values.len(), 1, "exactly one Cache-Control on 304");
+        assert_eq!(values[0].to_str().unwrap(), "public, max-age=60");
     }
 }

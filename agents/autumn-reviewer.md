@@ -68,6 +68,11 @@ Check every file you review against these items. Report only items that fail.
   no `ChangesetForm`, no manual `.validate()` call, and no body-level error
   checks. Do NOT flag `Form<T>` that is followed by explicit validation logic
   or uses a `Changeset`/`ChangesetForm` helper; those are supported patterns.
+  Since #2586, also do NOT flag one that reaches a **generated** repository's
+  `save`/`save_many`/`save_many_skip_invalid`/`find_or_create_by_*` on a model
+  carrying `#[validate]` — the repository enforces those rules. That exemption
+  does not extend to a hand-written repository, raw `diesel::insert_into`,
+  `upsert_many`, or any update path.
 - **Route-level authorization missing**: Check that record-level operations
   (edit, delete, update) have `#[authorize("action", resource = Model)]` or
   explicit ownership checks in the handler body.
@@ -132,6 +137,13 @@ is a defect. Flag these and name the framework replacement:
   `LIMIT/OFFSET` pagination, per-row insert loops, or CRUD queries when the
   model has a `#[repository]`. Fix: `page`/`cursor_page`, bulk
   `save_many`/`update_many`/`delete_many`/`upsert_many`, generated CRUD.
+- **Hand-rolled find-then-create / insert-or-catch-23505** (a `find_by_x` +
+  branch-then-`insert`, or `insert_into(...).on_conflict...`/error-mapping a
+  unique violation) when the model has a `#[repository]` and a unique
+  constraint on the lookup column. Fix: declare
+  `fn find_or_create_by_<field>(...)` and call the generated race-safe
+  `find_or_create_by_<field>(field, &new) -> (Model, bool)` **(unreleased)** —
+  the manual read-then-insert is a TOCTOU race that can surface a `23505`.
 - **Raw `axum::Router` handlers for app routes**: `.route("/x", get(...))`
   instead of `#[get]`/`#[post]` + `routes![...]`. `.merge()`/`.nest()` is
   acceptable only for third-party routers.

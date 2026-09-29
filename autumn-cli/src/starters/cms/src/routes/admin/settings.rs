@@ -1,0 +1,287 @@
+//! Settings — WordPress's General, Reading, Discussion and Permalinks screens,
+//! on one page because there are not enough of them to warrant four.
+
+use autumn_web::AutumnResult;
+use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
+use serde::Deserialize;
+
+use crate::capabilities::Capability;
+use crate::permalinks::PermalinkStructure;
+use crate::repositories::{PgSiteOptionRepository, PostRepository as _};
+use crate::require_capability;
+use crate::settings::Settings;
+use crate::theme;
+
+use super::super::site::{Csrf, Repos};
+use super::layout;
+
+#[derive(Deserialize)]
+pub struct SettingsForm {
+    pub site_title: String,
+    #[serde(default)]
+    pub tagline: String,
+    pub posts_per_page: String,
+    pub permalink_structure: String,
+    pub default_comment_status: String,
+    #[serde(default)]
+    pub comment_moderation: Option<String>,
+    #[serde(default)]
+    pub allow_guest_comments: Option<String>,
+    pub active_theme: String,
+    pub date_format: String,
+    #[serde(default)]
+    pub timezone: String,
+    #[serde(default)]
+    pub front_page_id: String,
+}
+
+#[get("/admin/settings")]
+pub async fn show(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<Response> {
+    let user = require_capability!(repos, session, csrf, Capability::ManageOptions);
+    let settings = repos.settings().await?;
+    // The newest 200 pages, plus whichever one is configured. Without the
+    // second half, a front page older than the newest 200 is simply absent from
+    // the `<select>` — the browser then selects the empty option, and saving
+    // any unrelated setting submits an empty `front_page_id` and silently
+    // switches the site back to the posts index.
+    let mut pages = repos.published_posts("page", 200).await?;
+    if let Some(configured) = settings.front_page_id
+        && !pages.iter().any(|page| page.id == configured)
+        && let Some(page) = repos.posts.find_by_id(configured).await?
+    {
+        pages.insert(0, page);
+    }
+
+    let body = html! {
+        form action="/admin/settings" method="post" class="max-w-2xl space-y-6" {
+            (csrf.input())
+            section class="bg-white rounded-lg shadow p-5 space-y-4" {
+                h2 class="font-semibold" { "General" }
+                div {
+                    label for="site_title" class="block text-sm font-medium mb-1" {
+                        "Site title"
+                    }
+                    input #site_title type="text" name="site_title" required
+                          value=(settings.site_title) class="w-full border rounded px-3 py-2";
+                }
+                div {
+                    label for="tagline" class="block text-sm font-medium mb-1" { "Tagline" }
+                    input #tagline type="text" name="tagline" value=(settings.tagline)
+                          class="w-full border rounded px-3 py-2";
+                }
+                div {
+                    label for="date_format" class="block text-sm font-medium mb-1" {
+                        "Date format "
+                        span class="text-gray-400 font-normal" { "(strftime)" }
+                    }
+                    input #date_format type="text" name="date_format" required
+                          value=(settings.date_format)
+                          class="w-full border rounded px-3 py-2 font-mono text-sm";
+                }
+                div {
+                    label for="timezone" class="block text-sm font-medium mb-1" {
+                        "Timezone "
+                        span class="text-gray-400 font-normal" { "(IANA name)" }
+                    }
+                    // A text field rather than a `<select>` of every zone the
+                    // database knows: that list is some six hundred entries, and
+                    // rendering all of them into every settings page is the same
+                    // unbounded-control shape the media and parent pickers were
+                    // just fixed for.
+                    input #timezone type="text" name="timezone" required
+                          value=(settings.timezone) placeholder="Europe/London"
+                          class="w-full border rounded px-3 py-2 font-mono text-sm";
+                    p class="text-xs text-gray-400 mt-1" {
+                        "Times are stored in UTC and shown in this zone — including \
+                         the publish date the editor collects for a scheduled post."
+                    }
+                }
+            }
+
+            section class="bg-white rounded-lg shadow p-5 space-y-4" {
+                h2 class="font-semibold" { "Reading" }
+                div {
+                    label for="posts_per_page" class="block text-sm font-medium mb-1" {
+                        "Posts per page"
+                    }
+                    input #posts_per_page type="number" name="posts_per_page" min="1" max="100"
+                          value=(settings.posts_per_page)
+                          class="w-full border rounded px-3 py-2";
+                }
+                div {
+                    label for="front_page_id" class="block text-sm font-medium mb-1" {
+                        "Front page"
+                    }
+                    select #front_page_id name="front_page_id"
+                           class="w-full border rounded px-3 py-2" {
+                        option value="" selected[settings.front_page_id.is_none()] {
+                            "Your latest posts"
+                        }
+                        @for page in &pages {
+                            option value=(page.id)
+                                   selected[settings.front_page_id == Some(page.id)] {
+                                (page.title)
+                            }
+                        }
+                    }
+                }
+            }
+
+            section class="bg-white rounded-lg shadow p-5 space-y-4" {
+                h2 class="font-semibold" { "Discussion" }
+                div {
+                    label for="default_comment_status" class="block text-sm font-medium mb-1" {
+                        "New posts"
+                    }
+                    select #default_comment_status name="default_comment_status"
+                           class="w-full border rounded px-3 py-2" {
+                        option value="open" selected[settings.default_comment_status == "open"] {
+                            "Allow comments"
+                        }
+                        option value="closed"
+                               selected[settings.default_comment_status == "closed"] {
+                            "Do not allow comments"
+                        }
+                    }
+                }
+                label class="flex items-center gap-2 text-sm" {
+                    input type="checkbox" name="comment_moderation" value="on"
+                          checked[settings.comment_moderation] class="rounded border-gray-300";
+                    "Hold guest comments for moderation"
+                }
+                label class="flex items-center gap-2 text-sm" {
+                    input type="checkbox" name="allow_guest_comments" value="on"
+                          checked[settings.allow_guest_comments] class="rounded border-gray-300";
+                    "Allow comments from visitors without an account"
+                }
+            }
+
+            section class="bg-white rounded-lg shadow p-5 space-y-4" {
+                h2 class="font-semibold" { "Permalinks" }
+                p class="text-xs text-gray-500" {
+                    "Changing this changes the URLs new links are built from. Existing URLs keep \
+                     working: the router resolves every structure's shape, not just the \
+                     configured one."
+                }
+                @for structure in PermalinkStructure::all() {
+                    label class="flex items-center gap-2 text-sm" {
+                        input type="radio" name="permalink_structure" value=(structure.as_str())
+                              checked[settings.permalink_structure == *structure]
+                              class="border-gray-300";
+                        (structure.label())
+                    }
+                }
+            }
+
+            section class="bg-white rounded-lg shadow p-5 space-y-4" {
+                h2 class="font-semibold" { "Theme" }
+                div {
+                    label for="active_theme" class="block text-sm font-medium mb-1" {
+                        "Active theme"
+                    }
+                    select #active_theme name="active_theme"
+                           class="w-full border rounded px-3 py-2" {
+                        @for registered in theme::registered_themes() {
+                            option value=(registered.slug())
+                                   selected[settings.active_theme == registered.slug()] {
+                                (registered.name())
+                            }
+                        }
+                    }
+                }
+            }
+
+            button type="submit"
+                   class="px-5 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700" {
+                "Save settings"
+            }
+        }
+    };
+
+    Ok(layout(&user, &csrf, "/admin/settings", "Settings", body).into_response())
+}
+
+#[post("/admin/settings")]
+pub async fn save(
+    repos: Repos,
+    session: Session,
+    csrf: Csrf,
+    Form(form): Form<SettingsForm>,
+) -> AutumnResult<Response> {
+    let _user = require_capability!(repos, session, csrf, Capability::ManageOptions);
+
+    // Two fields are checked *before* the round trip below rather than left to
+    // it. `from_rows` ignores a value it cannot use and keeps the default,
+    // which is exactly right for reading the options table — a bad row must
+    // never take the site down — but it is the wrong answer for a form: the
+    // default for `timezone` is UTC, so a typo would silently move a non-UTC
+    // site to UTC, shifting every displayed date and the meaning of every
+    // subsequent scheduled time, and a typo in `date_format` would silently
+    // reset the site's date style. Both are settings whose current value is
+    // more valuable than any guess at what was meant.
+    let timezone = form.timezone.trim();
+    if !crate::settings::is_known_timezone(timezone) {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "`{timezone}` is not a timezone this site knows — use an IANA name \
+             such as Europe/London"
+        )));
+    }
+    if !crate::settings::is_renderable_date_format(form.date_format.trim()) {
+        return Err(AutumnError::unprocessable_msg(
+            "That date format cannot be rendered — check the strftime directives",
+        ));
+    }
+
+    // Round-trip through `Settings` rather than writing the form fields
+    // straight to the options table: `from_rows` is where every value is
+    // validated and clamped, so a hand-crafted POST cannot store a
+    // `posts_per_page` of 0 that would paginate forever.
+    let submitted = Settings::from_rows(&[
+        ("site_title".to_owned(), form.site_title.trim().to_owned()),
+        ("tagline".to_owned(), form.tagline.trim().to_owned()),
+        ("posts_per_page".to_owned(), form.posts_per_page.clone()),
+        (
+            "permalink_structure".to_owned(),
+            form.permalink_structure.clone(),
+        ),
+        (
+            "default_comment_status".to_owned(),
+            form.default_comment_status.clone(),
+        ),
+        (
+            "comment_moderation".to_owned(),
+            form.comment_moderation.is_some().to_string(),
+        ),
+        (
+            "allow_guest_comments".to_owned(),
+            form.allow_guest_comments.is_some().to_string(),
+        ),
+        ("active_theme".to_owned(), form.active_theme.clone()),
+        ("date_format".to_owned(), form.date_format.clone()),
+        ("timezone".to_owned(), timezone.to_owned()),
+        ("front_page_id".to_owned(), form.front_page_id.clone()),
+    ]);
+
+    // One transaction for the whole form. Committing option by option let two
+    // administrators saving at once interleave into a configuration neither
+    // submitted, and a failure part-way through left the form half-applied
+    // while reporting an error.
+    repos
+        .with_conn(async |conn| crate::content::save_settings(conn, submitted.to_rows()).await)
+        .await?;
+
+    // Discharge the invalidation `SiteOptionRepository` declares. *After* the
+    // commit, so a reader that repopulates the cache in between cannot cache
+    // the pre-commit values and then have the invalidation land before them. Without it the
+    // site would keep serving the old title, theme and permalink structure for
+    // up to the 60-second TTL — the settings form would look broken.
+    if !PgSiteOptionRepository::invalidate_declared_caches() {
+        autumn_web::reexports::tracing::warn!(
+            "cache backend cannot invalidate by namespace; settings may be stale until the TTL \
+             expires"
+        );
+    }
+
+    Ok(Redirect::to("/admin/settings").into_response())
+}

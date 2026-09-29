@@ -75,10 +75,21 @@ async fn delete_directory_row(db: &TestDb, tenant_key: &str) {
 #[ignore = "requires Docker (testcontainers)"]
 async fn directory_pins_tenant_then_invalidate_falls_back_to_hash() {
     let db = TestDb::shared().await;
-    db.execute_sql(include_str!(
-        "../../migrations/20260612000000_create_shard_directory/up.sql"
-    ))
-    .await;
+    // The shard-directory migration `up.sql` is a multi-statement script
+    // (CREATE TABLE + INDEX + FUNCTION + TRIGGER); apply it through the
+    // simple-query protocol (`batch_execute`), matching the production
+    // migration runner. The prepared/extended-query path (`execute_sql` ->
+    // `sql_query(..).execute(..)`) rejects multi-statement input with "cannot
+    // insert multiple commands into a prepared statement".
+    {
+        use diesel_async::SimpleAsyncConnection;
+        let mut conn = db.pool().get().await.expect("control connection");
+        conn.batch_execute(include_str!(
+            "../../migrations/20260612000000_create_shard_directory/up.sql"
+        ))
+        .await
+        .expect("apply shard_directory migration");
+    }
 
     let shards = create_shard_set(&two_shard_config(), Arc::new(HashShardRouter))
         .expect("lazy shard pools build")

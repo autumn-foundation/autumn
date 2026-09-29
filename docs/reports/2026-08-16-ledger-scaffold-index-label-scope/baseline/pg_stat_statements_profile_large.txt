@@ -1,0 +1,7 @@
+ calls | total_buffers |  rows  |                         query_text                         
+-------+---------------+--------+------------------------------------------------------------
+     1 |          7051 | 500000 | SELECT id, title FROM posts ORDER BY id ASC
+     1 |          3061 |      1 | SELECT count(*) FROM comments
+     1 |             4 |     20 | SELECT * FROM comments ORDER BY id DESC LIMIT $1 OFFSET $2
+(3 rows)
+
