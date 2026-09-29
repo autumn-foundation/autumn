@@ -15785,12 +15785,13 @@ async fn granted_locks(pid: i32, relation: &str, mode: &str) -> i64 {
     rows.into_iter().next().map_or(0, |row| row.n)
 }
 
-/// A comment the page cannot render is not promised an anchor.
+/// A comment the page cannot render is refused rather than anchored.
 ///
 /// A page is capped at `MAX_THREAD_COMMENTS`, so on a thread past the cap a new
-/// reply can belong to a page with no room left for it. Sending the browser to
-/// `#comment-<id>` for a comment that is not on the page it lands on is the
-/// same broken promise as sending it to the wrong page.
+/// reply can belong to a page with no room left for it. Redirecting to
+/// `#comment-<id>` for a comment that is not on the page it lands on is a
+/// broken promise, and accepting it counts a comment no reader can reach; the
+/// write path refuses it with a 422.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_comment_the_page_cannot_render_is_not_anchored() {
@@ -15847,23 +15848,12 @@ async fn a_comment_the_page_cannot_render_is_not_anchored() {
         ]))
         .send()
         .await;
-    let location = posted
-        .assert_status(303)
-        .header("location")
-        .expect("a redirect");
-    assert!(
-        !location.contains("#comment-"),
-        "the redirect must not promise an anchor the page does not render: {location}"
-    );
-
-    // The comment really was accepted — the page just cannot show it, and says
-    // so through the truncation notice.
-    client
-        .get(location)
-        .send()
-        .await
-        .assert_ok()
-        .assert_body_contains("some replies are not shown");
+    // Accepting it would count a comment no reader can reach, and redirect to
+    // an anchor the page does not render. The write path refuses instead, so
+    // there is no such comment to promise an anchor for.
+    posted
+        .assert_status(422)
+        .assert_body_contains("This conversation has reached its display limit");
 }
 
 /// A comment URL survives the one permalink structure that is already a query.
