@@ -294,20 +294,15 @@ pub fn for_each_code_line<T>(
         .find_map(|(line, offset)| f(&line, offset))
 }
 
-/// Whether `line` declares `async fn main` — the entry point, not a helper
+/// Where `line` declares `async fn main` — the entry point, not a helper
 /// whose name merely starts with it (`async fn main_loop`).
 ///
 /// Only meaningful at brace depth 0: an indented `async fn main` inside an
 /// `impl` block is a method, not the entry point (see `builder_anchor` in
 /// `plugin::install`, which tracks the depth).
-#[must_use]
-pub fn declares_async_main(line: &str) -> bool {
-    async_main_offset(line).is_some()
-}
-
-/// Byte offset of the `async fn main` occurrence that
-/// [`declares_async_main`] accepts — the first one not followed by an
-/// identifier character — so callers measure context at the declaration that
+///
+/// Returns the byte offset of the first `async fn main` not followed by an
+/// identifier character, so callers measure context at the declaration that
 /// actually matched, not at an earlier `async fn main_loop`.
 #[must_use]
 pub fn async_main_offset(line: &str) -> Option<usize> {
@@ -331,7 +326,7 @@ pub fn async_main_offset(line: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        balanced_close_paren, code_lines, declares_async_main, for_each_code_line, mask_non_code,
+        async_main_offset, balanced_close_paren, code_lines, for_each_code_line, mask_non_code,
     };
 
     /// The mask must be a byte-for-byte overlay: offsets computed on it index
@@ -532,11 +527,11 @@ mod tests {
 
     #[test]
     fn a_helper_whose_name_starts_with_main_is_not_the_entry_point() {
-        assert!(declares_async_main("async fn main() {"));
-        assert!(declares_async_main("pub async fn main() {"));
-        assert!(!declares_async_main("async fn main_loop() {"));
-        assert!(!declares_async_main("async fn mainly() {"));
-        assert!(!declares_async_main("fn main() {"));
+        assert!(async_main_offset("async fn main() {").is_some());
+        assert!(async_main_offset("pub async fn main() {").is_some());
+        assert!(async_main_offset("async fn main_loop() {").is_none());
+        assert!(async_main_offset("async fn mainly() {").is_none());
+        assert!(async_main_offset("fn main() {").is_none());
     }
 
     #[test]
