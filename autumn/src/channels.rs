@@ -531,6 +531,9 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
     use crate::htmx::{OobMethod, OobSwap};
     match strategy {
         OobSwap::Delete => {
+            // The id may be derived from user data: escape it so a `"` cannot
+            // break out of the attribute (same XSS class as `inject_oob_attr`).
+            let id = crate::htmx::escape_attribute_string(id);
             format!("<div id=\"{id}\" hx-swap-oob=\"delete\"></div>")
         }
         OobSwap::True => inject_oob_attr(fragment_html, "true"),
@@ -2347,7 +2350,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "maud"))]
 mod security_tests {
     use super::*;
 
@@ -2359,5 +2362,26 @@ mod security_tests {
             "channels::inject_oob_attr is vulnerable!"
         );
         assert!(result.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
+
+    #[test]
+    fn delete_tombstone_escapes_id() {
+        let result = sse_oob_envelope(
+            "\"><script>alert(1)</script>",
+            &crate::htmx::OobSwap::Delete,
+            "",
+        );
+        assert!(
+            !result.contains("<script>"),
+            "delete tombstone id must be attribute-escaped: {result}"
+        );
+        assert!(
+            result.starts_with("<div id=\"&quot;&gt;&lt;script&gt;"),
+            "{result}"
+        );
+        assert!(
+            result.ends_with("\" hx-swap-oob=\"delete\"></div>"),
+            "{result}"
+        );
     }
 }
