@@ -108,7 +108,7 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
     ("serde_json", "\"1\""),
     (
         "validator",
-        "{ version = \"0.20\", features = [\"derive\"] }",
+        "{ version = \"0.21\", features = [\"derive\"] }",
     ),
     // `minimal_page`/`routes::organizations::*`/etc. all render `Markup`
     // via `html!`/`maud::DOCTYPE`. A default `autumn new` project already
@@ -152,7 +152,7 @@ const TEAMS_DEPS_SQLITE: &[(&str, &str)] = &[
     ("serde_json", "\"1\""),
     (
         "validator",
-        "{ version = \"0.20\", features = [\"derive\"] }",
+        "{ version = \"0.21\", features = [\"derive\"] }",
     ),
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
 ];
