@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::capabilities::Capability;
 use crate::content;
-use crate::models::{NewMenuItem, NewWidget, UpdateWidget};
+use crate::models::{NewMenuItem, NewWidget, UpdateWidget, User};
 use crate::repositories::{MenuItemRepository as _, WidgetRepository as _};
 use crate::require_capability;
 use crate::theme::WidgetKind;
@@ -18,6 +18,16 @@ use super::layout;
 /// The longest widget title accepted, matching the cap the `Menu` and
 /// `MenuItem` models declare for the same kind of label.
 const MAX_WIDGET_TITLE: usize = 200;
+
+/// The bound `Menu::name` declares (`#[validate(length(min = 1, max = 200))]`).
+///
+/// `replace_menu_at_location` writes the row via a raw `diesel::insert_into`,
+/// bypassing the model's generated `validator::Validate` entirely — so
+/// nothing enforced this bound before `create_menu` checked it explicitly. An
+/// empty (or whitespace-only, which HTML5 `required` does not reject) name
+/// slugified to a fallback hash token and was inserted with a blank display
+/// name; an overlong one was inserted uncapped.
+const MAX_MENU_NAME: usize = 200;
 
 /// The longest body a text widget may carry.
 ///
@@ -87,6 +97,11 @@ pub struct AppearanceFilter {
     pub page: Option<usize>,
 }
 
+/// The "New menu" card's field values, carried through a failed submission so
+/// the administrator does not have to retype them — same convention as
+/// `users.rs`'s `AddUserValues`.
+type NewMenuValues<'a> = (&'a str, &'a str);
+
 #[get("/admin/appearance")]
 pub async fn show(
     repos: Repos,
@@ -95,7 +110,22 @@ pub async fn show(
     Query(filter): Query<AppearanceFilter>,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
+    let body = appearance_page(&repos, &csrf, &filter, ("", ""), None).await?;
+    Ok(layout(&user, &csrf, "/admin/appearance", "Appearance", body).into_response())
+}
 
+/// Renders the whole Appearance screen — menus, the "New menu" card, and
+/// widgets — parameterized by what the "New menu" card should show. `show`
+/// calls this with a blank card; `create_menu` calls it again, with the
+/// administrator's own submission and failure message, whenever that
+/// submission cannot be saved (same pattern as `users.rs`'s `users_page`).
+async fn appearance_page(
+    repos: &Repos,
+    csrf: &Csrf,
+    filter: &AppearanceFilter,
+    new_menu: NewMenuValues<'_>,
+    new_menu_error: Option<&str>,
+) -> AutumnResult<Markup> {
     // Bounded and batched. Every menu was loaded and then queried for its items
     // one at a time, so the screen's cost was the number of menus times the size
     // of each — and menus are created through the form on this very page, with
@@ -298,10 +328,15 @@ pub async fn show(
                      class="bg-white rounded-lg shadow p-5 space-y-3 h-fit" {
                          (csrf.input())
                     h3 class="font-semibold text-sm" { "New menu" }
+                    @if let Some(error) = new_menu_error {
+                        p class="text-sm text-red-700 whitespace-pre-line" role="alert" {
+                            (error)
+                        }
+                    }
                     div {
                         label for="menu-name" class="block text-sm font-medium mb-1" { "Name" }
-                        input #menu-name type="text" name="name" required
-                              class="w-full border rounded px-3 py-2";
+                        input #menu-name type="text" name="name" value=(new_menu.0) required
+                              maxlength=(MAX_MENU_NAME) class="w-full border rounded px-3 py-2";
                     }
                     div {
                         label for="menu-location" class="block text-sm font-medium mb-1" {
@@ -309,9 +344,9 @@ pub async fn show(
                         }
                         select #menu-location name="location"
                                class="w-full border rounded px-3 py-2" {
-                            option value="" { "(unassigned)" }
+                            option value="" selected[new_menu.1.is_empty()] { "(unassigned)" }
                             @for (value, label) in LOCATIONS {
-                                option value=(value) { (label) }
+                                option value=(value) selected[new_menu.1 == *value] { (label) }
                             }
                         }
                     }
@@ -416,7 +451,33 @@ pub async fn show(
         }
     };
 
-    Ok(layout(&user, &csrf, "/admin/appearance", "Appearance", body).into_response())
+    Ok(body)
+}
+
+/// Redisplays the Appearance screen at 422 with the "New menu" card filled
+/// back in and `message` shown against it, instead of discarding what the
+/// administrator typed or falling through to the generic error page — the
+/// same pattern `users.rs`'s `redisplay_add_user` uses.
+async fn redisplay_new_menu(
+    repos: &Repos,
+    user: &User,
+    csrf: &Csrf,
+    new_menu: NewMenuValues<'_>,
+    message: &str,
+) -> AutumnResult<Response> {
+    let body = appearance_page(
+        repos,
+        csrf,
+        &AppearanceFilter::default(),
+        new_menu,
+        Some(message),
+    )
+    .await?;
+    Ok((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        layout(user, csrf, "/admin/appearance", "Appearance", body),
+    )
+        .into_response())
 }
 
 #[post("/admin/appearance/menus")]
@@ -426,8 +487,27 @@ pub async fn create_menu(
     csrf: Csrf,
     Form(form): Form<MenuForm>,
 ) -> AutumnResult<Response> {
-    let _user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
+    let user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
     let name = form.name.trim().to_owned();
+    let location = form.location.trim().to_owned();
+
+    // `Menu::name` declares `#[validate(length(min = 1, max = 200))]`, but
+    // `replace_menu_at_location` writes the row through a raw
+    // `diesel::insert_into` that never runs the model's generated
+    // `validator::Validate` — so this was the only place that bound could be
+    // enforced at all. An empty (or whitespace-only — HTML5 `required` does
+    // not reject that) name previously slugified to a fallback hash token and
+    // was inserted with a blank display name, silently, with no feedback.
+    if name.is_empty() || name.chars().count() > MAX_MENU_NAME {
+        return redisplay_new_menu(
+            &repos,
+            &user,
+            &csrf,
+            (&form.name, &form.location),
+            &format!("A menu name must be between 1 and {MAX_MENU_NAME} characters"),
+        )
+        .await;
+    }
 
     // Only one menu can hold a given theme location, so assigning this one
     // clears the previous holder rather than leaving two menus both claiming
@@ -437,9 +517,29 @@ pub async fn create_menu(
     // — a duplicate slug is the easy way to get one — would leave the previous
     // menu detached and the site's navigation simply gone, from a request that
     // reported an error.
-    let location = form.location.trim().to_owned();
-    let mut conn = repos.conn().await?;
-    crate::content::replace_menu_at_location(&mut conn, &name, &location).await?;
+    // `with_conn` scopes the checkout to this call, so the connection is
+    // returned to the pool before `redisplay_new_menu` below checks any more
+    // out — a `let conn = repos.conn().await?` held open across that awaited
+    // call would otherwise sit on a pool slot through the whole redisplay,
+    // and a small pool serializes every rejected submission behind it.
+    let result = repos
+        .with_conn(async |conn| {
+            crate::content::replace_menu_at_location(conn, &name, &location).await
+        })
+        .await;
+    if let Err(error) = result {
+        // A location race (`idx_menus_location`) or the slug allocator's own
+        // "too many menus share that name" both land here as a message the
+        // administrator can act on by resubmitting — same distinction the
+        // Users screen draws between "fix the form" and "something else
+        // broke".
+        let message = match error.status() {
+            StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY => error.to_string(),
+            _ => return Err(error),
+        };
+        return redisplay_new_menu(&repos, &user, &csrf, (&form.name, &form.location), &message)
+            .await;
+    }
     Ok(Redirect::to("/admin/appearance").into_response())
 }
 

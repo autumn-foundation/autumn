@@ -116,10 +116,10 @@ pub struct MutationContext {
 impl MutationContext {
     /// Create a new context for the given operation.
     ///
-    /// Auto-populates `now` with `Utc::now()`, `request_id` with a freshly
-    /// generated UUID v4, and `actor` from the ambient
-    /// [`Current::actor`](crate::current::Current::actor) (the authenticated
-    /// principal when inside a request; `None` otherwise).
+    /// Auto-populates `now` with [`ambient_now`](crate::time::ambient_now),
+    /// `request_id` with a freshly generated UUID v4, and `actor` from the
+    /// ambient [`Current::actor`](crate::current::Current::actor) (the
+    /// authenticated principal when inside a request; `None` otherwise).
     #[must_use]
     pub fn new(op: MutationOp) -> Self {
         Self {
@@ -131,7 +131,7 @@ impl MutationContext {
             // since hooks run after construction.
             actor: crate::current::Current::actor(),
             request_id: Some(uuid::Uuid::new_v4().to_string()),
-            now: chrono::Utc::now(),
+            now: crate::time::ambient_now(),
             invalidate_keys: Vec::new(),
             idempotency_key: None,
         }
