@@ -555,6 +555,9 @@ features = [
   # `tls` module (TlsListener, CertReloader, load_certified_key) is missing
   # from the published docs.
   "tls",
+  # SLA obligations (#1826). Zero new dependencies. Without it, the `sla`
+  # module and `#[obligation]` are missing from the published docs.
+  "sla",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
