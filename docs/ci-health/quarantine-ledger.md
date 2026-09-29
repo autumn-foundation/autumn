@@ -2708,3 +2708,21 @@ measured fix, and verification; not repeated here.
   Treat as closed once #2994 merges; revisit only if a fifth occurrence
   lands on `trunk-dev` after that.
 
+
+  **Update 2026-09-29 — the pin was incomplete; 5th occurrence, new
+  signature.** Workflow run 36460138986 (job 109065947467,
+  `claude/epic-meitner-ageu82`, 2026-09-28T18:15Z), run *after* #2994 landed
+  on trunk and with `@1.88.0` verifiably installed up front, failed the same
+  step with a different rustup error:
+  `error: failed to install component: 'rustfmt-preview-x86_64-pc-windows-msvc', detected conflict: 'bin\cargo-fmt.exe'`.
+  **Mechanism**: `dtolnay/rust-toolchain` installs `--profile minimal`, while
+  the scaffolded app's `rust-toolchain.toml` requests
+  `components = ["rustfmt", "clippy"]`, so `autumn setup`'s first `cargo
+  metadata` still triggers an implicit, un-retried component install on a
+  loaded Windows runner — the same on-demand-install class #2994 targeted,
+  one level down. **Verdict**: CI provisioning, not product/test. **Fix**:
+  `components: rustfmt, clippy` on the job's toolchain step. Not
+  quarantined. CI-native verification pending this PR's own `Windows Tier 1
+  journey` run; a single pass is anecdote, so this entry stays open until
+  the job has run clean on several subsequent PRs. Reverting the
+  `components:` line restores the exact failing path.

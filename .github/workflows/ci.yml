@@ -2492,7 +2492,18 @@ jobs:
       # error visible. Installing the exact MSRV toolchain up front — the same
       # thing the `msrv` job below already does — removes the on-demand
       # install path entirely, so there is nothing left to race.
+      #
+      # Follow-up (run 36460138986, job 109065947467, 2026-09-28): the pin
+      # alone was incomplete. The action installs `--profile minimal`, but the
+      # scaffolded app's `rust-toolchain.toml` also asks for `rustfmt` and
+      # `clippy` (`components = [...]`), so `autumn setup`'s first `cargo
+      # metadata` still triggered an on-demand component install and died with
+      # `failed to install component: 'rustfmt-preview-...', detected
+      # conflict: 'bin\cargo-fmt.exe'`. Installing the components up front
+      # leaves rustup nothing to fetch inside the journey.
       - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 
