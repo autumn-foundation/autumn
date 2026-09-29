@@ -140,6 +140,22 @@ diff routes-snapshot.json routes-current.json
 Because rows are stable-sorted by path then method, `git diff` and `diff`
 output is minimal and easy to review.
 
+## Interactive explorer (`autumn explore`)
+
+`autumn explore` builds the same route table as `autumn routes` and opens it in
+a terminal UI instead of printing it:
+
+```bash
+autumn explore
+autumn explore -p blog --bin blog-server
+```
+
+Type to filter incrementally — the query matches method, path, handler,
+source, and middleware. Use the up/down arrow keys to move through the
+matches; the detail panel shows the selected route's source, middleware, API
+version, and sunset status. `Backspace` edits the query and `Esc` exits. It
+takes the same `--package` / `--bin` options as `autumn routes`.
+
 ## How it works
 
 `autumn routes` compiles your application in debug mode, then runs the
