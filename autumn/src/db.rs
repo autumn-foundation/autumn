@@ -1557,7 +1557,7 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// deferred read→write transactions deadlock permanently: the deferred lock
 /// upgrade fails with `SQLITE_LOCKED` / `SQLITE_BUSY_SNAPSHOT`, which bypasses
 /// the busy-timeout handler, so no amount of retrying unblocks it (issue
-/// #2885). SQLite's own docs call shared-cache mode "obsolete" and
+/// #2885). `SQLite`'s own docs call shared-cache mode "obsolete" and
 /// "discouraged", recommending WAL mode instead — and WAL does **not** fix this
 /// deadlock class (the table-lock protocol is orthogonal to the journal mode).
 ///
