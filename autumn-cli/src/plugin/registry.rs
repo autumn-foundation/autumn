@@ -110,7 +110,13 @@ fn pick_version(entry: &serde_json::Value) -> Option<String> {
 /// installed.
 fn one_line(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if super::index::is_unsafe_char(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
