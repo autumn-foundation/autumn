@@ -5,7 +5,7 @@ use std::path::Path;
 use super::emit::Plan;
 use super::model::{plan_cargo_deps, validate_resource_name};
 use super::naming::{pascal, snake};
-use super::{Flags, GenerateError, ensure_project_root};
+use super::{GenerateError, ensure_project_root};
 
 const TASK_DEPS: &[(&str, &str)] = &[("serde", "{ version = \"1\", features = [\"derive\"] }")];
 
@@ -24,7 +24,12 @@ pub fn plan_task(project_root: &Path, name: &str) -> Result<Plan, GenerateError>
         project_root.join("tasks").join(format!("{snake_name}.rs")),
         render_task_file(&snake_name, &pascal_name),
     );
-    plan_cargo_deps(&mut plan, project_root, TASK_DEPS);
+    plan_cargo_deps(
+        &mut plan,
+        project_root,
+        TASK_DEPS,
+        &project_root.join("tasks"),
+    );
     Ok(plan)
 }
 
@@ -55,27 +60,10 @@ pub async fn {snake_name}(TaskArgs(args): TaskArgs<{pascal_name}Args>) -> Autumn
     )
 }
 
-/// CLI entry point.
-pub fn run(name: &str, flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_task(&cwd, name).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 

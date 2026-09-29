@@ -34,6 +34,8 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+#[cfg(feature = "embed-assets")]
+use std::sync::RwLock;
 
 /// Filename of the fingerprint manifest within the `static/` tree.
 #[cfg(any(not(debug_assertions), feature = "embed-assets"))]
@@ -392,29 +394,156 @@ pub async fn asset_cache_control(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let path = req.uri().path().to_owned();
+    let header = cache_control_for_request(&req);
     let mut resp = next.run(req).await;
-    if path.starts_with("/static/") && resp.status().is_success() {
-        let is_immutable = path.strip_prefix("/static/").is_some_and(is_manifest_asset);
-        let header = if is_immutable {
+    apply_cache_control(&mut resp, header);
+    resp
+}
+
+/// `Cache-Control` value a `/static/...` request's successful response should
+/// carry, or `None` for any request that is not a static-asset request.
+///
+/// Resolved from the request *before* the response exists so the decision costs
+/// no allocation: the old form owned the path in a `String` for the whole
+/// downstream call, purely to re-read it afterwards.
+///
+/// One consequence of resolving up front: [`is_manifest_asset`] now runs for
+/// every `/static/...` request rather than only for successful ones, so a `404`
+/// for a missing asset can be the call that populates the process-lifetime
+/// manifest `OnceLock`. The manifest is written by `autumn build` before the
+/// server starts and never changes while it runs, so *which* request warms it
+/// is not observable; non-asset requests are unaffected either way, since
+/// `strip_prefix` returns `None` before any manifest lookup happens.
+fn cache_control_for_request<B>(req: &axum::http::Request<B>) -> Option<&'static str> {
+    req.uri().path().strip_prefix("/static/").map(|rel| {
+        if is_manifest_asset(rel) {
             "public, max-age=31536000, immutable"
         } else {
             "public, max-age=0, must-revalidate"
-        };
+        }
+    })
+}
+
+/// Stamp `header` onto `resp` when the request was for a static asset and the
+/// response succeeded. Shared by [`asset_cache_control`] and
+/// [`AssetCacheControlFuture`] so the two forms cannot drift.
+fn apply_cache_control<B>(resp: &mut axum::http::Response<B>, header: Option<&'static str>) {
+    if let Some(header) = header
+        && resp.status().is_success()
+    {
         resp.headers_mut().insert(
             http::header::CACHE_CONTROL,
             http::HeaderValue::from_static(header),
         );
     }
-    resp
 }
 
-/// Best-effort `Content-Type` for an embedded asset, derived from its
+/// Tower [`Layer`](tower::Layer) form of [`asset_cache_control`], used by the
+/// framework's ingress stack.
+///
+/// The `axum::middleware::from_fn` this replaces cost a `Box::pin` of the
+/// wrapped async block on every request — every request in the app, not just
+/// requests for `/static/...`, because this layer is applied globally — plus a
+/// deep clone of the erased service beneath it and a `String` clone of the
+/// request path (issue #2214). None of that survives here: the header is a
+/// `&'static str` decided up front and the future is the inner service's own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AssetCacheControlLayer;
+
+impl<S> tower::Layer<S> for AssetCacheControlLayer {
+    type Service = AssetCacheControlService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AssetCacheControlService { inner }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`AssetCacheControlLayer`].
+#[derive(Clone, Debug)]
+pub(crate) struct AssetCacheControlService<S> {
+    inner: S,
+}
+
+impl<S, ReqBody, ResBody> tower::Service<axum::http::Request<ReqBody>>
+    for AssetCacheControlService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>, Response = axum::http::Response<ResBody>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = AssetCacheControlFuture<S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        AssetCacheControlFuture {
+            header: cache_control_for_request(&req),
+            inner: self.inner.call(req),
+        }
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future returned by [`AssetCacheControlService`]: the inner service's own
+    /// future plus the `&'static str` header to stamp on its response.
+    pub(crate) struct AssetCacheControlFuture<F> {
+        #[pin]
+        inner: F,
+        header: Option<&'static str>,
+    }
+}
+
+impl<F, ResBody, E> std::future::Future for AssetCacheControlFuture<F>
+where
+    F: std::future::Future<Output = Result<axum::http::Response<ResBody>, E>>,
+{
+    type Output = Result<axum::http::Response<ResBody>, E>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        let mut response = std::task::ready!(this.inner.poll(cx))?;
+        apply_cache_control(&mut response, *this.header);
+        std::task::Poll::Ready(Ok(response))
+    }
+}
+
+/// Best-effort `Content-Type` for a static/embedded asset, derived from its
 /// extension. Covers the closed set of asset types Autumn apps ship; unknown
 /// extensions fall back to `application/octet-stream`.
-#[cfg(feature = "embed-assets")]
+///
+/// Used both by the embedded-asset serving path and by the static-first
+/// (SSG/ISR) middleware, which serves manifest-backed files from `dist/` and
+/// needs an accurate MIME type so the response compression layer only encodes
+/// compressible content types (and skips binary assets).
 #[must_use]
 pub(crate) fn content_type_for(path: &str) -> &'static str {
+    content_type_for_opt(path).unwrap_or("application/octet-stream")
+}
+
+/// Like [`content_type_for`], but returns `Some(mime)` **only** when the final
+/// path segment carries a *recognized* asset extension, and `None` otherwise
+/// (extensionless input, or an extension not in the closed asset set).
+///
+/// This lets callers distinguish "the route names a real asset type" from "no
+/// idea, fall back to octet-stream". The static-first middleware relies on that
+/// distinction: a generated page whose slug merely *contains* a dot
+/// (`/posts/release.v1`, `/users/alice@example.com`) has an unrecognized
+/// trailing extension, so it returns `None` here and the caller derives the
+/// MIME from the served `index.html` file instead of mislabeling HTML as
+/// `application/octet-stream`.
+///
+/// Only the last `/`-delimited segment's extension is inspected, so dotted
+/// *ancestor* directories never affect the result.
+#[must_use]
+pub(crate) fn content_type_for_opt(path: &str) -> Option<&'static str> {
     // Lowercase the extension into a small stack buffer (extensions are short
     // and ASCII) to avoid a per-request heap allocation on the serving path.
     let raw = path
@@ -429,9 +558,9 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
         buf[..raw.len()].make_ascii_lowercase();
         std::str::from_utf8(&buf[..raw.len()]).unwrap_or("")
     } else {
-        "" // unknown long/non-ASCII extension → octet-stream
+        "" // unknown long/non-ASCII extension → unrecognized
     };
-    match ext {
+    let mime = match ext {
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" | "map" => "application/json",
@@ -450,8 +579,56 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
         "ttf" => "font/ttf",
         "otf" => "font/otf",
         "wasm" => "application/wasm",
-        _ => "application/octet-stream",
+        _ => return None,
+    };
+    Some(mime)
+}
+
+/// Process-wide cache of computed embedded-asset `ETag`s, keyed by the stable
+/// `&'static` byte pointer of the asset's contents.
+///
+/// SHA-256-hashing a whole asset on every request is a hot-path CPU cost for
+/// large full `GET`s. Embedded asset bytes are `&'static`, so their start
+/// pointer is a stable per-asset identity for the process lifetime — memoizing
+/// the tag against it computes the hash once per asset and reuses it thereafter.
+/// Two empty assets can share a pointer, but their content hash is identical, so
+/// a collision still returns the correct tag.
+#[cfg(feature = "embed-assets")]
+static EMBEDDED_ETAG_CACHE: OnceLock<RwLock<HashMap<usize, crate::etag::ETag>>> = OnceLock::new();
+
+/// Return the strong content-hash `ETag` for an embedded asset, computing it on
+/// the first serve and reusing the cached value thereafter.
+///
+/// Preserves the exact tag value/format produced by [`embedded_etag`] so
+/// `If-Range` validation is unchanged.
+#[cfg(feature = "embed-assets")]
+fn embedded_etag_cached(bytes: &[u8]) -> crate::etag::ETag {
+    let key = bytes.as_ptr() as usize;
+    let cache = EMBEDDED_ETAG_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(etag) = cache.read().unwrap().get(&key) {
+        return etag.clone();
     }
+    let etag = embedded_etag(bytes);
+    cache.write().unwrap().insert(key, etag.clone());
+    etag
+}
+
+/// Derive a stable **strong** `ETag` from an embedded asset's bytes.
+///
+/// A content hash gives embedded assets a meaningful `If-Range` (and
+/// conditional-GET) validator: the tag changes only when the bytes change, so a
+/// client's cached range stays valid across restarts of the same binary.
+#[cfg(feature = "embed-assets")]
+fn embedded_etag(bytes: &[u8]) -> crate::etag::ETag {
+    use sha2::{Digest as _, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        hex.push(HEX[(b >> 4) as usize] as char);
+        hex.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    crate::etag::ETag::strong(hex)
 }
 
 /// Serve a single file from the registered embedded `static/` tree.
@@ -460,8 +637,13 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
 /// (`.autumn-manifest.json`, which must never be exposed), missing files, or
 /// when no embedded dir is registered. Other files — including legitimate
 /// dotfile assets — are served, matching the on-disk `ServeDir` behavior.
+///
+/// Honours HTTP `Range` requests (RFC 7233) via [`crate::range`]: a satisfiable
+/// `Range` yields `206 Partial Content` with `Content-Range`, an unsatisfiable
+/// one yields `416`, and every response advertises `Accept-Ranges: bytes`. A
+/// strong content-hash `ETag` gates `If-Range`.
 #[cfg(feature = "embed-assets")]
-fn embedded_response(rel_path: &str) -> axum::response::Response {
+fn embedded_response(rel_path: &str, req_headers: &http::HeaderMap) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     let is_traversal = rel_path
@@ -480,12 +662,21 @@ fn embedded_response(rel_path: &str) -> axum::response::Response {
     dir.0.get_file(rel_path).map_or_else(
         || http::StatusCode::NOT_FOUND.into_response(),
         |file| {
-            // `contents()` is `&'static [u8]`; serve it directly (no per-request copy).
-            (
-                [(http::header::CONTENT_TYPE, content_type_for(rel_path))],
-                file.contents(),
-            )
-                .into_response()
+            // `contents()` is `&'static [u8]`; wrap it without a per-request
+            // copy so a full response still serves the static bytes directly.
+            let bytes = bytes::Bytes::from_static(file.contents());
+            let total = bytes.len() as u64;
+            let etag = embedded_etag_cached(&bytes);
+            let validator = crate::range::Validator::new().with_etag(&etag);
+            let resolution = crate::range::resolve(req_headers, total, Some(validator));
+            let mut response = crate::range::partial_bytes_response(&resolution, bytes);
+            let headers = response.headers_mut();
+            headers.insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static(content_type_for(rel_path)),
+            );
+            headers.insert(http::header::ETAG, etag.header_value());
+            response
         },
     )
 }
@@ -494,8 +685,9 @@ fn embedded_response(rel_path: &str) -> axum::response::Response {
 #[cfg(feature = "embed-assets")]
 pub(crate) async fn serve_embedded(
     axum::extract::Path(path): axum::extract::Path<String>,
+    headers: http::HeaderMap,
 ) -> axum::response::Response {
-    embedded_response(&path)
+    embedded_response(&path, &headers)
 }
 
 /// A standalone router that serves `/static/*` from the registered embedded
@@ -508,7 +700,7 @@ pub(crate) async fn serve_embedded(
 pub fn embedded_static_router() -> axum::Router {
     axum::Router::new()
         .route("/static/{*path}", axum::routing::get(serve_embedded))
-        .layer(axum::middleware::from_fn(asset_cache_control))
+        .layer(AssetCacheControlLayer)
 }
 
 #[cfg(test)]
@@ -623,5 +815,114 @@ mod tests {
         // Unknown / extensionless fall back to octet-stream.
         assert_eq!(content_type_for("data.bin"), "application/octet-stream");
         assert_eq!(content_type_for("LICENSE"), "application/octet-stream");
+    }
+}
+
+/// Direct coverage for [`AssetCacheControlService`] (issue #2214).
+///
+/// The framework's ingress installs the *layer*; the retained
+/// [`asset_cache_control`] `async fn` is what every pre-existing test exercises.
+/// An end-to-end test cannot cover the layer under default features either: the
+/// `/static` route is a `ServeDir` over a `static/` directory this crate does
+/// not ship, so every `/static/...` request in the test suite 404s and the
+/// success branch — the entire point of this middleware — is never reached.
+/// Driving the service directly over a stub inner service closes that.
+#[cfg(test)]
+mod cache_control_service_tests {
+    use super::{AssetCacheControlLayer, cache_control_for_request};
+    use axum::body::Body;
+    use axum::http::{Request, Response, StatusCode};
+    use tower::{Layer, Service, ServiceExt};
+
+    const REVALIDATE: &str = "public, max-age=0, must-revalidate";
+
+    /// Inner service that answers every request with `status` and no
+    /// `Cache-Control`, so any header on the way out came from the layer.
+    fn responder(
+        status: StatusCode,
+    ) -> impl Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible> + Clone
+    {
+        tower::service_fn(move |_req: Request<Body>| async move {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(status)
+                    .body(Body::empty())
+                    .expect("response builds"),
+            )
+        })
+    }
+
+    /// `#[allow(future_not_send)]`: `tower::service_fn`'s closure is not
+    /// `Sync`, so this helper's future is `!Send`. It only ever runs on a
+    /// `#[tokio::test]` current-thread runtime, which never moves it.
+    #[allow(clippy::future_not_send)]
+    async fn cache_control_for(path: &str, status: StatusCode) -> Option<String> {
+        let service = AssetCacheControlLayer.layer(responder(status));
+        let response = service
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("infallible");
+        response
+            .headers()
+            .get(http::header::CACHE_CONTROL)
+            .map(|v| v.to_str().expect("ascii header").to_owned())
+    }
+
+    #[tokio::test]
+    async fn stamps_successful_static_responses() {
+        // Debug builds have no fingerprint manifest, so every asset is the
+        // revalidate (non-immutable) case.
+        assert_eq!(
+            cache_control_for("/static/css/app.css", StatusCode::OK).await,
+            Some(REVALIDATE.to_owned()),
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_non_static_routes_alone() {
+        assert_eq!(cache_control_for("/ping", StatusCode::OK).await, None);
+        // `/static` without the trailing slash is NOT an asset path — the
+        // predicate is a `/static/` prefix, matching the original `starts_with`.
+        assert_eq!(cache_control_for("/static", StatusCode::OK).await, None);
+        assert_eq!(cache_control_for("/staticky/x", StatusCode::OK).await, None);
+    }
+
+    #[tokio::test]
+    async fn leaves_unsuccessful_static_responses_alone() {
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert_eq!(
+                cache_control_for("/static/css/app.css", status).await,
+                None,
+                "only a successful response may be given a Cache-Control"
+            );
+        }
+    }
+
+    /// The request-side half of the decision, isolated: `/static/` exactly
+    /// yields an empty relative path and still counts as an asset request,
+    /// matching the original `starts_with(..) && strip_prefix(..)` pair.
+    #[test]
+    fn the_predicate_matches_the_original_starts_with_form() {
+        let req = |path: &str| {
+            Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request builds")
+        };
+        assert!(cache_control_for_request(&req("/static/")).is_some());
+        assert!(cache_control_for_request(&req("/static/a.css")).is_some());
+        // Query strings are not part of `Uri::path()`, so they cannot affect it.
+        assert!(cache_control_for_request(&req("/static/a.css?v=1")).is_some());
+        assert!(cache_control_for_request(&req("/static")).is_none());
+        assert!(cache_control_for_request(&req("/")).is_none());
     }
 }

@@ -1,0 +1,7 @@
+error: `#[edge]` cannot be combined with `#[agent_operable(...)]` — the edge lane is read-only, and the capsule has no audit sink or `AppState` to record an agent invocation against, so a governed action would run there unaudited; serve this route from the origin.
+
+       Serve the route from the origin, or drop `#[agent_operable]`. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_edge_with_agent_operable.rs:22:3
+   |
+22 | #[edge]
+   |   ^^^^

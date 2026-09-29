@@ -20,7 +20,7 @@ use std::path::Path;
 use super::emit::Plan;
 use super::naming::{pascal, snake};
 use super::schema_edit::add_mod_declaration;
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Minimum two steps are required.
 const MIN_STEPS: usize = 2;
@@ -89,7 +89,11 @@ pub fn plan_wizard(
     // Update src/wizards/mod.rs — idempotent
     let mod_file = wizards_dir.join("mod.rs");
     let updated_mod = add_mod_declaration(&read_or_empty(&mod_file), &snake_name);
-    plan.modify(mod_file, updated_mod);
+    plan.modify(mod_file.clone(), updated_mod);
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: mod_file,
+        name: snake_name.clone(),
+    });
 
     // Integration test
     plan.create(
@@ -502,27 +506,10 @@ async fn {snake_name}_cancel_clears_session_state() {{
     )
 }
 
-/// CLI entry point.
-pub fn run(name: &str, steps: &[String], flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_wizard(&cwd, name, steps).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 

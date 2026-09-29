@@ -1,0 +1,704 @@
+//! Built-in widget stories: one story per gallery-visible widget in
+//! [`crate::widgets`] (issue #1526).
+//!
+//! Every story is authored with the [`story!`](crate::stories::story) macro,
+//! so the snippet shown in the gallery is byte-for-byte the code that
+//! rendered. Blocks are self-contained (demo data is defined inside), because
+//! they are coerced to zero-arg `fn() -> Markup` pointers — no environment
+//! capture compiles.
+//!
+//! The CI coverage gate (`autumn/tests/integration/stories.rs`) enforces that
+//! every public widget fn in `src/widgets.rs` is exercised by at least one
+//! story's source. When you add a widget, add (or extend) a story here and
+//! add the new top-level widget's slug to `EXPECTED_STORY_SLUGS` in that test.
+
+use super::{Story, story};
+
+/// The built-in story set, in gallery display order.
+#[allow(clippy::too_many_lines)]
+pub(super) fn builtin_stories() -> Vec<Story> {
+    vec![
+        story! {
+            "Forms",
+            "Active search",
+            {
+                use autumn_web::widgets::{
+                    ActiveSearchConfig, active_search, active_search_empty_state,
+                    active_search_input, active_search_results,
+                };
+
+                // A real, live-wired demo — unlike most story action URLs,
+                // which stay synthetic 404s on purpose (see e.g. the Confirm
+                // action or Bulk actions stories): a search box that visibly
+                // does nothing while typing reads as broken. The gallery
+                // itself serves this path (see `stories::demo_search`).
+                let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
+                    .placeholder("Search posts…");
+                maud::html! {
+                    // The claim below only holds when htmx is actually on
+                    // the page — story_page only loads it under the `htmx`
+                    // feature (review follow-up: a maud-only, no-htmx build
+                    // still compiles this story, and its hx-* attributes
+                    // stay inert without htmx there to process them).
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, searching a small demo post list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
+                    (active_search("post-search", "Search posts", &config))
+                    p { em { "For reference — not live — what your handler returns when nothing matches:" } }
+                    (active_search_empty_state("No posts matched your search."))
+                    // Compose the pieces yourself when you need custom layout
+                    // between the input and the results container: this needs
+                    // its own config, targeting its own results container —
+                    // reusing `config` above would target
+                    // "#post-search-results" (the first demo's), leaving this
+                    // one empty on a successful response (review follow-up).
+                    div {
+                        (active_search_input(
+                            "post-search-split",
+                            "Search posts",
+                            &ActiveSearchConfig::new("/_stories/demo/search", "#post-search-split-results")
+                                .placeholder("Search posts…"),
+                        ))
+                        (active_search_results("post-search-split-results"))
+                    }
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Autocomplete",
+            {
+                use autumn_web::widgets::{
+                    AutocompleteConfig, autocomplete_empty_state, autocomplete_input,
+                    autocomplete_option,
+                };
+
+                // Real, live-wired demo — see the Active search story above
+                // for why (and `stories::demo_tag_search` for the handler).
+                let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
+                    .placeholder("Start typing a tag…");
+                maud::html! {
+                    // See the Active search story above for why this is
+                    // conditional (review follow-up).
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, matching against a small demo tag list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
+                    (autocomplete_input("tag-picker", "Tag", &config))
+                    p { em { "For reference — not live — the two shapes your handler returns:" } }
+                    // One matching option, as your handler would render it:
+                    (autocomplete_option("42", "rust"))
+                    // And the empty state when nothing matches:
+                    (autocomplete_empty_state("No matching tags."))
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Property list",
+            {
+                use autumn_web::widgets::property_list;
+
+                property_list(&[
+                    ("Title", maud::html! { "Autumn in Practice" }),
+                    ("Status", maud::html! { strong { "Published" } }),
+                    ("Views", maud::html! { "1,024" }),
+                ])
+            }
+        },
+        story! {
+            "Display",
+            "Data table",
+            {
+                use autumn_web::widgets::{Column, DataTableConfig, data_table};
+
+                struct Book {
+                    title: &'static str,
+                    author: &'static str,
+                    year: u16,
+                }
+                let books = [
+                    Book { title: "The Long Autumn", author: "R. Ellis", year: 2021 },
+                    Book { title: "Falling Leaves", author: "M. Okafor", year: 2023 },
+                ];
+                let columns = [
+                    Column::new("Title", |b: &Book| maud::html! { (b.title) })
+                        .sortable("title"),
+                    Column::new("Author", |b: &Book| maud::html! { (b.author) }),
+                    Column::new("Year", |b: &Book| maud::html! { (b.year) }),
+                ];
+                let config = DataTableConfig::new("No books yet.")
+                    .caption("Books")
+                    .base_path("/books");
+                data_table(&books, &columns, &config)
+            }
+        },
+        story! {
+            "Display",
+            "Breadcrumb",
+            {
+                use autumn_web::widgets::{Crumb, breadcrumb};
+
+                breadcrumb(&[
+                    Crumb::link("Home", "/"),
+                    Crumb::link("Posts", "/posts"),
+                    Crumb::current("My Post"),
+                ])
+            }
+        },
+        story! {
+            "Display",
+            "Card",
+            {
+                use autumn_web::widgets::{CardConfig, card};
+
+                let body = maud::html! { p { "Ship features, not boilerplate." } };
+                let config = CardConfig::new()
+                    .title("Release notes")
+                    .footer(maud::html! { a href="/changelog" { "Read the changelog" } });
+                card(&body, &config)
+            }
+        },
+        story! {
+            "Display",
+            "Charts",
+            {
+                use autumn_web::widgets::{
+                    ChartConfig, bar_chart, bar_chart_with, line_chart, line_chart_with,
+                    sparkline, sparkline_with,
+                };
+
+                // A 30-point trend series, built with a loop (no env capture).
+                let owned: Vec<(String, f64)> = (0..30)
+                    .map(|day| {
+                        let label = format!("Day {}", day + 1);
+                        let swing = (f64::from(day) * 0.4).sin() * 10.0;
+                        let value = 20.0 + swing;
+                        (label, value)
+                    })
+                    .collect();
+                let trend: Vec<(&str, f64)> =
+                    owned.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+
+                let weekly = [
+                    ("Mon", 3.0), ("Tue", 5.0), ("Wed", 4.0),
+                    ("Thu", 7.0), ("Fri", 6.0),
+                ];
+
+                maud::html! {
+                    // Compact inline trend — plain and configured variants:
+                    (sparkline(&weekly))
+                    (sparkline_with(&weekly, &ChartConfig::new().title("Weekly visits")))
+                    // Bars, with a caller axis override + table fallback:
+                    (bar_chart(&weekly))
+                    (bar_chart_with(
+                        &weekly,
+                        &ChartConfig::new().min(0.0).max(10.0).with_table(),
+                    ))
+                    // A 30-point line chart, auto-scaled and configured:
+                    (line_chart(&trend))
+                    (line_chart_with(&trend, &ChartConfig::new().title("30-day trend")))
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Stat card",
+            {
+                use autumn_web::widgets::stat_card;
+
+                maud::html! {
+                    (stat_card("Subscribers", "1,024", Some(("/subscribers", "View all"))))
+                    (stat_card("Open rate", "62%", None))
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Tabs",
+            {
+                use autumn_web::widgets::tabs;
+
+                let panels = [
+                    ("demo-profile", "Profile", maud::html! { p { "Profile settings" } }),
+                    ("demo-security", "Security", maud::html! { p { "Security settings" } }),
+                    ("demo-billing", "Billing", maud::html! { p { "Billing settings" } }),
+                ];
+                tabs("settings-tabs", None, &panels)
+            }
+        },
+        story! {
+            "Navigation",
+            "Nav bar",
+            {
+                use autumn_web::widgets::{NavBarConfig, NavItem, NavMenu, nav_bar};
+
+                let config = NavBarConfig::new()
+                    .brand("Acme", "/")
+                    .item(NavItem::link("/", "Home"))
+                    .item(NavItem::link("/posts", "Posts"))
+                    .item(NavItem::menu(
+                        NavMenu::new("More")
+                            .link("/about", "About")
+                            .plain_link("https://docs.example.com", "Docs"),
+                    ))
+                    .trailing(NavItem::plain_link("/login", "Sign in"));
+                // "/posts" is the current request path, so that link is active.
+                nav_bar("/posts", &config)
+            }
+        },
+        story! {
+            "Navigation",
+            "Nav link",
+            {
+                use autumn_web::widgets::{NavLinkMatch, nav_link, nav_link_matched};
+
+                maud::html! {
+                    nav {
+                        // Exact match: active only on "/posts" itself.
+                        (nav_link("/posts", "/posts", "Posts"))
+                        // Prefix match: "/posts/3/edit" keeps "All posts" active.
+                        (nav_link_matched("/posts/3/edit", "/posts", "All posts", NavLinkMatch::Prefix))
+                        (nav_link("/posts", "/about", "About"))
+                    }
+                }
+            }
+        },
+        story! {
+            "Navigation",
+            "Locale switcher",
+            {
+                use autumn_web::widgets::{locale_switcher, localized_path};
+
+                maud::html! {
+                    p { "Current page: " code { "/posts" } }
+                    (locale_switcher(
+                        "/posts",
+                        "en",
+                        &["en".to_owned(), "es".to_owned(), "fr".to_owned()],
+                    ))
+                    p class="text-xs text-stone-500" {
+                        "Each link is built with " code { "localized_path" }
+                        " — e.g. " code { (localized_path("/posts", "es")) }
+                    }
+                }
+            }
+        },
+        story! {
+            "Marketing",
+            "Hero",
+            {
+                use autumn_web::widgets::{Cta, HeroConfig, hero};
+
+                let config = HeroConfig::new("Welcome to the Blog")
+                    .subtitle("Thoughts, tutorials, and stories.")
+                    .cta(Cta::primary("New post", "/admin/new"))
+                    .cta(Cta::secondary("About", "/about"));
+                hero(&config)
+            }
+        },
+        story! {
+            "Overlays",
+            "Modal",
+            {
+                use autumn_web::widgets::{
+                    ModalConfig, modal, modal_close_button, modal_trigger,
+                };
+
+                let body = maud::html! { p { "This action cannot be undone." } };
+                let config = ModalConfig::new()
+                    .footer(maud::html! {
+                        (modal_close_button("Cancel", "delete-confirm", None))
+                    })
+                    .light_dismiss(true);
+                maud::html! {
+                    (modal_trigger("Delete post", "delete-confirm", None))
+                    (modal("delete-confirm", "Delete this post?", &body, &config))
+                }
+            }
+        },
+        story! {
+            "Overlays",
+            "Confirm action",
+            {
+                use autumn_web::widgets::{ConfirmActionConfig, confirm_action};
+
+                let config = ConfirmActionConfig::new()
+                    .title("Delete this post?")
+                    .message(maud::html! { p { "This permanently removes the post." } })
+                    .confirm_label("Delete post");
+                // The rendered form is live, so this demo points it at a
+                // synthetic target (nothing is mounted there — submitting on
+                // a served gallery is a 404 no-op) with a fake CSRF token.
+                confirm_action(
+                    "delete-post",
+                    "Delete…",
+                    "/_stories/demo/delete-post",
+                    http::Method::DELETE,
+                    "demo-csrf-token",
+                    &config,
+                )
+            }
+        },
+        story! {
+            "Display",
+            "Badge",
+            {
+                use autumn_web::widgets::{
+                    BadgeConfig, BadgeVariant, badge, badge_with, status_tag,
+                };
+
+                maud::html! {
+                    // Explicit variant, and a deterministic color from a label:
+                    (badge("Published", BadgeVariant::Success))
+                    (badge("Draft", BadgeVariant::for_label("draft")))
+                    // With a tooltip / accessible name for an abbreviated label:
+                    (badge_with(
+                        "WIP",
+                        BadgeVariant::Info,
+                        &BadgeConfig::new().title("Work in progress"),
+                    ))
+                    // Neutral one-liner:
+                    (status_tag("Archived"))
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Avatar",
+            {
+                use autumn_web::widgets::{AvatarConfig, AvatarSize, avatar};
+
+                maud::html! {
+                    // With an image (the demo URL is synthetic — a served
+                    // gallery has nothing mounted there):
+                    (avatar("Ada Lovelace", &AvatarConfig::new()
+                        .image("/_stories/demo/ada.png")
+                        .size(AvatarSize::Large)))
+                    // Deterministic colored-initials fallback, no image:
+                    (avatar("Ada Lovelace", &AvatarConfig::new()))
+                    (avatar("Grace Hopper", &AvatarConfig::new().size(AvatarSize::Small)))
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Alert",
+            {
+                use autumn_web::form::Changeset;
+                use autumn_web::widgets::{
+                    AlertConfig, AlertVariant, alert, alert_with, error_summary,
+                };
+
+                // A form error summary from an invalid changeset.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("email".to_string(), vec!["is invalid".to_string()]);
+                let changeset = Changeset::from_errors((), errors);
+
+                maud::html! {
+                    (alert(
+                        AlertVariant::Info,
+                        maud::html! { "No posts yet — create your first one." },
+                    ))
+                    (alert_with(
+                        AlertVariant::Warning,
+                        maud::html! { "Your trial ends in 3 days." },
+                        &AlertConfig::new().title("Heads up").icon(true).dismissible(true),
+                    ))
+                    @if let Some(summary) = error_summary(&changeset) {
+                        (summary)
+                    }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Toast",
+            {
+                use autumn_web::widgets::{
+                    AlertVariant, DEFAULT_TOAST_REGION_ID, toast, toast_in, toast_region,
+                };
+
+                maud::html! {
+                    // Drop the region once in your base layout:
+                    (toast_region(DEFAULT_TOAST_REGION_ID))
+                    // Then return toasts from htmx handlers — appended OOB into
+                    // the region. `Error` announces assertively, others politely.
+                    (toast("Saved successfully", AlertVariant::Success))
+                    (toast("Could not save — please retry", AlertVariant::Error))
+                    // Target a differently-named region with `toast_in`:
+                    (toast_in(DEFAULT_TOAST_REGION_ID, "Heads up: trial ends soon", AlertVariant::Warning))
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Infinite feed",
+            {
+                use autumn_web::widgets::{FeedConfig, FeedMode, feed_page, infinite_feed};
+
+                let items = maud::html! {
+                    article class="post" { h3 { "First post" } }
+                    article class="post" { h3 { "Second post" } }
+                };
+                let next = maud::html! {
+                    article class="post" { h3 { "Third post" } }
+                };
+                // Reveal mode's sentinel fires on scroll-into-view with no
+                // click needed (`hx-trigger="revealed, click"`), so this
+                // points at a real demo backend rather than the synthetic
+                // 404 URLs most other stories use — otherwise the sentinel
+                // below would 404-swap the instant this page loads, not on
+                // any visitor action. See `stories::demo_infinite_feed`.
+                let config = FeedConfig::new("/_stories/demo/posts/feed").mode(FeedMode::Reveal);
+                maud::html! {
+                    // Initial view: the feed container + an auto-loading sentinel.
+                    (infinite_feed(items, Some("eyJpZCI6Mn0"), &config))
+                    // The fragment a handler returns for each append (here the
+                    // last page, so no further sentinel is emitted):
+                    (feed_page(next, None, &FeedConfig::new("/_stories/demo/posts/feed").button()))
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Transition controls",
+            {
+                use autumn_web::widgets::transition_controls;
+
+                // A `#[state_machine]` field emits a `(from, to, Option<guard>)`
+                // transitions constant and a `can_transition_<field>_to`
+                // predicate; pass those two straight through. Here they are
+                // inlined so the story is self-contained.
+                let transitions: &[(&str, &str, Option<&str>)] = &[
+                    ("draft", "published", None),
+                    ("published", "archived", None),
+                ];
+                // Only edges leaving `current` ("draft") render, so this shows
+                // the single `draft -> published` action button.
+                transition_controls(
+                    "/orders/1/transitions/status",
+                    "status",
+                    "draft",
+                    transitions,
+                    |_to| true, // |to| order.can_transition_status_to(to)
+                    None,
+                    None,
+                )
+            }
+        },
+        story! {
+            "Forms",
+            "Translated transition controls",
+            {
+                use autumn_web::widgets::{TransitionLabels, transition_controls_with_labels};
+
+                // Same shape as "Transition controls", with the group label and
+                // one button text overridden. A target state left out of
+                // `.buttons(...)` keeps the default "Mark as {state}" text —
+                // here that is the untranslated "archived" edge.
+                let transitions: &[(&str, &str, Option<&str>)] = &[
+                    ("draft", "published", None),
+                    ("published", "archived", None),
+                ];
+                let labels = TransitionLabels::new()
+                    .group("Estado del pedido")
+                    .buttons(&[("published", "Publicar")]);
+                transition_controls_with_labels(
+                    "/orders/1/transitions/status",
+                    "status",
+                    "draft",
+                    transitions,
+                    |_to| true, // |to| order.can_transition_status_to(to)
+                    None,
+                    None,
+                    &labels,
+                )
+            }
+        },
+        story! {
+            "Display",
+            "Comment thread",
+            {
+                use autumn_web::widgets::{CommentThread, CommentView, comment_dom_id, comment_thread};
+
+                // The view half of `#[commentable]`. The router hands back a
+                // nested thread; this renders it with an inline reply form per
+                // node. Plain POST forms, swapped in place by htmx when it is
+                // present and a full page load when it is not.
+                let thread = vec![
+                    CommentView {
+                        id: 7,
+                        author: "ada".to_owned(),
+                        body: "Does this nest?".to_owned(),
+                        datetime: Some("2026-08-21T09:30:00Z".to_owned()),
+                        timestamp: "2026-08-21 09:30".to_owned(),
+                        replies: vec![CommentView {
+                            id: 8,
+                            author: "grace".to_owned(),
+                            body: "It does — up to `max_depth`,\nafter which the reply form stops rendering.".to_owned(),
+                            datetime: Some("2026-08-21T09:41:00Z".to_owned()),
+                            timestamp: "2026-08-21 09:41".to_owned(),
+                            replies: Vec::new(),
+                        }],
+                    },
+                    CommentView {
+                        id: 9,
+                        author: "linus".to_owned(),
+                        body: "A second top-level comment.".to_owned(),
+                        datetime: None,
+                        timestamp: String::new(),
+                        replies: Vec::new(),
+                    },
+                ];
+
+                let signed_in = CommentThread::new("comments-post-42", "/comments/Post/42")
+                    .label("Post comments")
+                    .csrf_token("story-token")
+                    .return_to("/posts/42");
+
+                // Anything linking to one comment — a notification, an email —
+                // needs the id the widget actually renders, so the convention
+                // has one definition rather than a copy per caller.
+                let deep_link = comment_dom_id("comments-post-42", 8);
+
+                maud::html! {
+                    (comment_thread(&signed_in, &thread))
+
+                    // Signed out: the thread still reads, the form is replaced
+                    // by a prompt rather than a control that would 401.
+                    (comment_thread(
+                        &CommentThread::new("comments-post-43", "/comments/Post/43")
+                            .label("Signed-out view")
+                            .read_only()
+                            .sign_in_prompt("Log in to comment."),
+                        &thread,
+                    ))
+
+                    // Empty, and a rejected submission re-rendered inline —
+                    // a bare 422 would be swallowed by htmx.
+                    (comment_thread(
+                        &CommentThread::new("comments-post-44", "/comments/Post/44")
+                            .label("Empty and errored")
+                            .empty_text("No comments yet. Start the conversation!")
+                            .csrf_token("story-token")
+                            .error("Comment cannot be empty."),
+                        &[],
+                    ))
+
+                    p class="text-sm text-gray-500" {
+                        "Deep link to the nested reply: #" (deep_link)
+                    }
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Reaction controls",
+            {
+                use autumn_web::widgets::{ReactionControls, reaction_controls};
+
+                // The view half of `#[votable]`: `react()` returns the new
+                // aggregate and the viewer's own reaction, which is all this
+                // widget needs. Plain POST forms, upgraded in place by htmx.
+                maud::html! {
+                    // Sum mode -- signed up/down votes. The viewer has already
+                    // upvoted, so the up arrow renders as a pressed toggle.
+                    (reaction_controls(
+                        &ReactionControls::votes(
+                            "votes-42",
+                            "/posts/42/upvote",
+                            "/posts/42/downvote",
+                        )
+                        .aggregate(7)
+                        .current(Some(1))
+                        .label("Post score"),
+                    ))
+                    // Count mode -- one membership toggle, not yet pressed.
+                    (reaction_controls(
+                        &ReactionControls::likes("likes-42", "/posts/42/like")
+                            .aggregate(3)
+                            .label("Likes"),
+                    ))
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Bulk actions",
+            {
+                use autumn_web::widgets::{
+                    BulkActionsConfig, Column, DataTableConfig, bulk_actions_form,
+                    bulk_actions_toolbar, bulk_select_checkbox, data_table,
+                };
+
+                struct Post {
+                    id: i64,
+                    title: &'static str,
+                }
+                let rows = vec![
+                    Post { id: 1, title: "First post" },
+                    Post { id: 2, title: "Second post" },
+                ];
+
+                // `action` is the bulk endpoint -- `paths::bulk_delete()` in a
+                // scaffolded app. The flow is entirely unscripted, so it works
+                // with JavaScript disabled.
+                let config = BulkActionsConfig::new("/posts/bulk_delete");
+
+                // The checkbox goes in the row's first cell, so every row can be
+                // selected. Each one submits as a repeated `ids=<id>` pair.
+                let columns: Vec<Column<Post>> = vec![
+                    Column::new("", |row: &Post| {
+                        maud::html! { (bulk_select_checkbox(row.id, &config)) }
+                    }),
+                    Column::new("Title", |row: &Post| maud::html! { (row.title) }),
+                ];
+
+                // A second bulk action, driving a hand-rolled list instead of a
+                // `data_table`. `bulk_actions_form` already appends a toolbar, so
+                // `bulk_actions_toolbar` is called directly only here, where the
+                // surrounding <form> is hand-built -- a bare toolbar outside any
+                // form would render a submit button that does nothing.
+                let archive = BulkActionsConfig::new("/posts/bulk_archive")
+                    .submit_label("Archive selected");
+
+                maud::html! {
+                    // Page furniture stays OUTSIDE the form -- anything inside is
+                    // submitted along with the selection.
+                    a href="/posts/new" { "New Post" }
+                    (bulk_actions_form(
+                        &config,
+                        Some("demo-csrf-token"),
+                        None,
+                        Some("demo-submit-token"),
+                        None,
+                        maud::html! {
+                            (data_table(&rows, &columns, &DataTableConfig::new("No posts yet.")))
+                        },
+                    ))
+                    form method="post" action="/posts/bulk_archive" class="autumn-bulk-form" {
+                        // Hand-built forms carry the same hidden fields
+                        // `bulk_actions_form` emits, and for the same reason: both
+                        // lead the body, ahead of the checkboxes, because
+                        // `SubmitTokenLayer` only scans its first chunk.
+                        input type="hidden" name="_submit_token" value="demo-archive-token";
+                        input type="hidden" name="_csrf" value="demo-csrf-token";
+                        ul {
+                            @for row in &rows {
+                                li {
+                                    (bulk_select_checkbox(row.id, &archive))
+                                    " " (row.title)
+                                }
+                            }
+                        }
+                        (bulk_actions_toolbar(&archive))
+                    }
+                }
+            }
+        },
+    ]
+}

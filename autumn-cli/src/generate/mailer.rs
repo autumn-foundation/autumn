@@ -21,7 +21,7 @@
 //!
 //! Use `--no-layout` to opt out of the shared layout for a specific mailer.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::emit::Plan;
 use super::model::validate_resource_name;
@@ -29,7 +29,7 @@ use super::naming::{pascal, snake};
 use super::schema_edit::{
     add_mail_preview_to_app, add_mod_declaration, ensure_autumn_web_feature, update_main_rs,
 };
-use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
+use super::{GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
 /// Compute the file actions for `autumn generate mailer`.
 ///
@@ -51,6 +51,30 @@ pub fn plan_mailer(
     name: &str,
     list_unsubscribe: Option<&str>,
     no_layout: bool,
+) -> Result<Plan, GenerateError> {
+    plan_mailer_ex(project_root, name, list_unsubscribe, no_layout, false)
+}
+
+/// Shared implementation of [`plan_mailer`]. The `_for_revert` flag is retained
+/// for `destroy`-path symmetry with the other generators, but the mailer
+/// generator no longer branches on it: the `--list-unsubscribe` suppression
+/// migration is now backend-aware (`SQLite`-dialect DDL under a `SQLite` app,
+/// issue #1927), so there is no generate-only rejection left to suppress on the
+/// revert path.
+///
+/// # Errors
+/// Project layout and name validation errors surface here.
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear sequence of independent file/revert steps mirroring the files this \
+              generator emits; splitting it up would not make any single step clearer"
+)]
+pub fn plan_mailer_ex(
+    project_root: &Path,
+    name: &str,
+    list_unsubscribe: Option<&str>,
+    no_layout: bool,
+    _for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
@@ -134,12 +158,24 @@ pub fn plan_mailer(
         previews_mod_path.clone(),
         add_mod_declaration(&read_or_empty(&previews_mod_path), &snake_name),
     );
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: previews_mod_path,
+        name: snake_name.clone(),
+    });
 
     // ── src/mailers/mod.rs (create or update) ──────────────────────────────
+    // The "previews" sub-module declared here is shared by every generated
+    // mailer, not owned by this one — `emit::sync_mod_declarations_in`
+    // removes it once `src/mailers/previews/mod.rs` no longer exists, so no
+    // static revert is pushed for it here.
     let mod_path = project_root.join("src").join("mailers").join("mod.rs");
     let with_mailer_mod = add_mod_declaration(&read_or_empty(&mod_path), &snake_name);
     let with_both_mods = add_mod_declaration(&with_mailer_mod, "previews");
-    plan.modify(mod_path, with_both_mods);
+    plan.modify(mod_path.clone(), with_both_mods);
+    plan.push_revert(crate::generate::emit::Revert::ModDecl {
+        path: mod_path,
+        name: snake_name,
+    });
 
     // ── src/main.rs: add mod mailers; and .mail_previews(…) ────────────────
     let main_path = project_root.join("src").join("main.rs");
@@ -151,19 +187,34 @@ pub fn plan_mailer(
     })?;
     let with_mods = update_main_rs(&main_existing, &["mailers"], &[]);
     let updated_main = add_mail_preview_to_app(&with_mods, &mailer_type);
-    plan.modify(main_path, updated_main);
+    plan.modify(main_path.clone(), updated_main);
+    plan.push_revert(crate::generate::emit::Revert::MailPreview {
+        path: main_path,
+        mailer_type,
+    });
 
     // ── Cargo.toml: ensure autumn-web has the "mail" feature ───────────────
     let cargo_path = project_root.join("Cargo.toml");
     let cargo_existing = read_or_empty(&cargo_path);
     let updated_cargo = ensure_autumn_web_feature(&cargo_existing, "mail");
     if updated_cargo != cargo_existing {
-        plan.modify(cargo_path, updated_cargo);
+        plan.modify(cargo_path.clone(), updated_cargo);
     }
+    plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
+        path: cargo_path,
+        feature: "mail".to_owned(),
+        owner_dir: Some(project_root.join("src").join("mailers")),
+    });
 
     // ── migrations/<ts>_create_mail_unsubscribes (opt-in, idempotent) ──────
     if list_unsubscribe.is_some() {
-        plan_unsubscribe_migration(project_root, &mut plan);
+        // The suppression migration is backend-aware (issue #1927): a SQLite app
+        // gets SQLite-dialect DDL (`INTEGER PRIMARY KEY AUTOINCREMENT`,
+        // `DEFAULT CURRENT_TIMESTAMP`) instead of the Postgres-only
+        // `BIGSERIAL`/`NOW()` form, so the generated migration applies on either
+        // backend.
+        let backend = super::detect_backend(project_root);
+        plan_unsubscribe_migration(project_root, &mut plan, backend);
     }
 
     Ok(plan)
@@ -191,28 +242,59 @@ fn validate_list_unsubscribe_scope(scope: &str) -> Result<(), GenerateError> {
     Ok(())
 }
 
-/// Add the `mail_unsubscribes` suppression migration unless one already exists.
-fn plan_unsubscribe_migration(project_root: &Path, plan: &mut Plan) {
+/// Add the `mail_unsubscribes` suppression migration, reusing the existing
+/// one (by its real on-disk path) if a prior mailer already created it.
+///
+/// The old design skipped pushing any action at all once a
+/// `*_create_mail_unsubscribes` directory existed — correct for `generate`,
+/// but it meant a second `--list-unsubscribe` mailer's plan carried no
+/// migration action, so `autumn destroy` recomputing that same plan could
+/// never locate (and thus never remove) the suppression migration. Instead,
+/// always push `create_if_absent` actions, targeting the *existing*
+/// directory's real path when one is already on disk (so `generate` is
+/// still a silent no-op there) and a fresh timestamp only when none exists
+/// yet. Either way the action is present for `autumn destroy`'s
+/// suffix-based migration matching (`resolve_migration_removal`) to find.
+fn plan_unsubscribe_migration(
+    project_root: &Path,
+    plan: &mut Plan,
+    backend: autumn_web::config::DatabaseBackend,
+) {
     let migrations_dir = project_root.join("migrations");
-    if migration_already_present(&migrations_dir) {
-        return;
-    }
-    let timestamp = timestamp_now();
-    let dir = migrations_dir.join(format!("{timestamp}_create_mail_unsubscribes"));
-    plan.create(dir.join("up.sql"), UNSUBSCRIBE_MIGRATION_UP.to_owned());
-    plan.create(dir.join("down.sql"), UNSUBSCRIBE_MIGRATION_DOWN.to_owned());
+    let dir = existing_mail_unsubscribes_dir(&migrations_dir).unwrap_or_else(|| {
+        migrations_dir.join(format!("{}_create_mail_unsubscribes", timestamp_now()))
+    });
+    plan.create_if_absent(
+        dir.join("up.sql"),
+        unsubscribe_migration_up(backend).to_owned(),
+    );
+    plan.create_if_absent(dir.join("down.sql"), UNSUBSCRIBE_MIGRATION_DOWN.to_owned());
 }
 
-/// Whether a `*_create_mail_unsubscribes` migration already exists on disk.
-fn migration_already_present(migrations_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(migrations_dir) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| name.ends_with("_create_mail_unsubscribes"))
+/// The `mail_unsubscribes` `up.sql` for the target `backend` (issue #1927).
+///
+/// Postgres keeps the historical DDL byte-for-byte (`BIGSERIAL PRIMARY KEY`,
+/// `TIMESTAMPTZ NOT NULL DEFAULT NOW()`). `SQLite` — which has neither
+/// `BIGSERIAL` nor `NOW()` nor a dedicated timestamp type — gets the portable
+/// form (`INTEGER PRIMARY KEY AUTOINCREMENT`, ISO-8601 `TEXT ... DEFAULT
+/// CURRENT_TIMESTAMP`), matching the `SQLite` dialect the backend-aware
+/// model/migration generators emit.
+const fn unsubscribe_migration_up(backend: autumn_web::config::DatabaseBackend) -> &'static str {
+    match backend {
+        autumn_web::config::DatabaseBackend::Postgres => UNSUBSCRIBE_MIGRATION_UP,
+        autumn_web::config::DatabaseBackend::Sqlite => UNSUBSCRIBE_MIGRATION_UP_SQLITE,
+    }
+}
+
+/// The real on-disk `*_create_mail_unsubscribes` migration directory, if one
+/// already exists (from a previous `--list-unsubscribe` mailer).
+fn existing_mail_unsubscribes_dir(migrations_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(migrations_dir).ok()?;
+    entries.filter_map(Result::ok).map(|e| e.path()).find(|p| {
+        p.is_dir()
+            && p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with("_create_mail_unsubscribes"))
     })
 }
 
@@ -225,6 +307,24 @@ CREATE TABLE mail_unsubscribes (
     subscriber TEXT NOT NULL,
     list_id TEXT NOT NULL,
     unsubscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (subscriber, list_id)
+);
+";
+
+/// `SQLite`-dialect companion to [`UNSUBSCRIBE_MIGRATION_UP`] (issue #1927):
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` for the id and an ISO-8601 `TEXT` column
+/// defaulted to `CURRENT_TIMESTAMP` (`SQLite` has no `BIGSERIAL`, `TIMESTAMPTZ`,
+/// or `NOW()`). The `UNIQUE` constraint and column names are portable and
+/// unchanged.
+const UNSUBSCRIBE_MIGRATION_UP_SQLITE: &str = "\
+-- Suppression list for RFC 8058 List-Unsubscribe.
+-- Keyed by (subscriber, list_id, unsubscribed_at); send-time checks skip any
+-- recipient with a matching (subscriber, list_id) row.
+CREATE TABLE mail_unsubscribes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscriber TEXT NOT NULL,
+    list_id TEXT NOT NULL,
+    unsubscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (subscriber, list_id)
 );
 ";
@@ -269,6 +369,10 @@ impl {struct_name} {{
             .subject("{struct_name}")
             .html(include_str!("../../templates/mailers/{snake_name}.html"))
             .text(include_str!("../../templates/mailers/{snake_name}.txt")){layout_call}
+            // Rewrite the template's `<style>` rules onto elements as inline
+            // `style="…"` attributes at send time, so the mail renders styled in
+            // Gmail/Outlook (which strip `<head>`/`<style>`). See issue #1254.
+            .inline_css(true)
             .build()
             .expect("valid mail")
     }}
@@ -307,6 +411,10 @@ impl {struct_name} {{
             .subject("{struct_name}")
             .html(include_str!("../../../templates/mailers/{snake_name}.html"))
             .text(include_str!("../../../templates/mailers/{snake_name}.txt")){layout_call}
+            // Match the production mailer's opt-in so the preview renders the
+            // `<style>` rules inlined regardless of the app's `mail.inline_css`
+            // config default. See issue #1254.
+            .inline_css(true)
             .build()
             .expect("valid preview mail")
     }}
@@ -380,19 +488,41 @@ fn render_layout_txt() -> String {
 /// full document is emitted instead.
 fn render_html_template(struct_name: &str, no_layout: bool) -> String {
     if no_layout {
+        // Full self-contained document with a `<head>` `<style>` block. The
+        // generated mailer calls `.inline_css(true)`, so these class rules are
+        // rewritten onto the elements as inline `style="…"` at send time and
+        // render in Gmail/Outlook (which drop `<head>`/`<style>`). See #1254.
         format!(
             "<!DOCTYPE html>\n\
              <html>\n\
-             <head><meta charset=\"utf-8\"></head>\n\
+             <head>\n\
+               <meta charset=\"utf-8\">\n\
+               <style>\n\
+            \x20    .lead {{ font-size:16px; line-height:1.6; color:#333333; }}\n\
+               </style>\n\
+             </head>\n\
              <body>\n\
-               <p>Hello from {struct_name}!</p>\n\
+               <p class=\"lead\">Hello from {struct_name}!</p>\n\
              </body>\n\
              </html>\n"
         )
     } else {
+        // Authored with a `<style>` block + CSS classes — the ergonomic way to
+        // style email. The generated mailer calls `.inline_css(true)`, so at
+        // send time Autumn rewrites these rules onto the elements as
+        // `style="…"` attributes (issue #1254); that is what makes them render
+        // in Gmail/Outlook, which strip `<head>`/`<style>`. The `@media` rule is
+        // preserved in a retained `<style>` block for clients that honor it.
         format!(
-            "<h1 style=\"margin:0 0 16px;font-size:24px;color:#1a1a2e;\">Hello from {struct_name}!</h1>\n\
-             <p style=\"margin:0;font-size:16px;line-height:1.6;color:#333333;\">Your email body goes here.</p>\n"
+            "<style>\n\
+            \x20 .greeting {{ margin:0 0 16px; font-size:24px; color:#1a1a2e; }}\n\
+            \x20 .lead {{ margin:0 0 24px; font-size:16px; line-height:1.6; color:#333333; }}\n\
+            \x20 .btn {{ display:inline-block; padding:12px 20px; background:#1a1a2e; color:#ffffff; text-decoration:none; border-radius:4px; }}\n\
+            \x20 @media (max-width:600px) {{ .btn {{ display:block; text-align:center; }} }}\n\
+             </style>\n\
+             <h1 class=\"greeting\">Hello from {struct_name}!</h1>\n\
+             <p class=\"lead\">Your email body goes here.</p>\n\
+             <a class=\"btn\" href=\"https://example.com\">Call to action</a>\n"
         )
     }
 }
@@ -447,27 +577,10 @@ fn render_smoke_test(struct_name: &str, snake_name: &str, no_layout: bool) -> St
     )
 }
 
-/// CLI entry point.
-pub fn run(name: &str, list_unsubscribe: Option<&str>, no_layout: bool, flags: Flags) {
-    let cwd = match std::env::current_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot determine current directory: {e}");
-            std::process::exit(1);
-        }
-    };
-    match plan_mailer(&cwd, name, list_unsubscribe, no_layout).and_then(|p| p.execute(flags)) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generate::Flags;
     use std::fs;
     use tempfile::TempDir;
 
@@ -497,6 +610,273 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    /// Backend-aware DDL (issue #1927): `generate mailer --list-unsubscribe` on a
+    /// `SQLite` app now scaffolds the `mail_unsubscribes` suppression migration in
+    /// `SQLite` dialect (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
+    /// CURRENT_TIMESTAMP`) instead of being rejected — and no Postgres-only
+    /// `BIGSERIAL` / `TIMESTAMPTZ` / `NOW()` leaks into the `SQLite` migration.
+    #[test]
+    fn plan_mailer_with_list_unsubscribe_emits_sqlite_ddl() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", Some("newsletter"), false)
+            .expect("a --list-unsubscribe mailer must scaffold on a SQLite app");
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/mailers/welcome.rs").exists());
+
+        let migration_dir = fs::read_dir(tmp.path().join("migrations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with("_create_mail_unsubscribes"))
+            })
+            .expect("a mail_unsubscribes migration must be generated on SQLite");
+        let up = fs::read_to_string(migration_dir.path().join("up.sql")).unwrap();
+        assert!(
+            up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"),
+            "SQLite up.sql must use INTEGER PRIMARY KEY AUTOINCREMENT: {up}"
+        );
+        assert!(
+            up.contains("unsubscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "SQLite up.sql must default the timestamp to CURRENT_TIMESTAMP: {up}"
+        );
+        for leak in ["BIGSERIAL", "TIMESTAMPTZ", "NOW()"] {
+            assert!(
+                !up.contains(leak),
+                "SQLite up.sql leaked Postgres-only `{leak}`: {up}"
+            );
+        }
+    }
+
+    /// Regression guard: on a Postgres app (the default) the suppression
+    /// migration stays byte-for-byte the historical Postgres DDL.
+    #[test]
+    fn plan_mailer_with_list_unsubscribe_emits_postgres_ddl_by_default() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", Some("newsletter"), false).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let migration_dir = fs::read_dir(tmp.path().join("migrations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with("_create_mail_unsubscribes"))
+            })
+            .expect("a mail_unsubscribes migration must be generated on Postgres");
+        let up = fs::read_to_string(migration_dir.path().join("up.sql")).unwrap();
+        assert!(
+            up.contains("id BIGSERIAL PRIMARY KEY"),
+            "Postgres up.sql must keep BIGSERIAL PRIMARY KEY: {up}"
+        );
+        assert!(
+            up.contains("unsubscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
+            "Postgres up.sql must keep TIMESTAMPTZ DEFAULT NOW(): {up}"
+        );
+    }
+
+    /// Finding F22: a plain `generate mailer` (no `--list-unsubscribe`) emits only
+    /// Rust/template files and enables the `mail` feature — nothing
+    /// `SQLite`-incompatible — so it must SUCCEED on a `SQLite` app rather than
+    /// being over-rejected by the unsubscribe-migration gate.
+    #[test]
+    fn plan_mailer_without_list_unsubscribe_succeeds_on_sqlite_app() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false)
+            .expect("a plain mailer must scaffold on a SQLite app");
+        // It plans the Rust file and no unsubscribe migration is present.
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/mailers/welcome.rs").exists());
+        let has_unsubscribe_migration =
+            fs::read_dir(tmp.path().join("migrations")).is_ok_and(|rd| {
+                rd.filter_map(Result::ok).any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .contains("mail_unsubscribes")
+                })
+            });
+        assert!(
+            !has_unsubscribe_migration,
+            "a plain mailer must not scaffold the Postgres-only unsubscribe migration"
+        );
+    }
+
+    /// A Postgres app (the default) is not rejected — `generate mailer` still
+    /// plans its files.
+    #[test]
+    fn plan_mailer_not_rejected_on_postgres_app() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://localhost/app\"\n",
+        )
+        .unwrap();
+        assert!(plan_mailer(tmp.path(), "Welcome", None, false).is_ok());
+    }
+
+    /// `autumn destroy mailer` recomputes this same plan with `for_revert` before
+    /// [`Plan::revert`], so it must build a revert plan on a `SQLite` app even for
+    /// the `--list-unsubscribe` variant (issue #1927 made its generate path
+    /// `SQLite`-valid too, so this is now symmetric with the generate path).
+    #[test]
+    fn plan_mailer_ex_for_revert_not_rejected_on_sqlite_app() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"sqlite://app.db\"\n",
+        )
+        .unwrap();
+        assert!(
+            plan_mailer_ex(tmp.path(), "Welcome", Some("newsletter"), false, true).is_ok(),
+            "destroy mailer must build its revert plan on a SQLite app even for the \
+             --list-unsubscribe variant"
+        );
+    }
+
+    #[test]
+    fn generate_then_destroy_mailer_round_trips_to_original_project_state() {
+        let tmp = project_with_main(default_main());
+        let cargo_path = tmp.path().join("Cargo.toml");
+        let main_path = tmp.path().join("src/main.rs");
+        let original_cargo = fs::read_to_string(&cargo_path).unwrap();
+        let original_main = fs::read_to_string(&main_path).unwrap();
+
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(tmp.path().join("src/mailers/welcome.rs").exists());
+        assert!(
+            fs::read_to_string(&main_path)
+                .unwrap()
+                .contains("mail_previews!")
+        );
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("\"mail\"")
+        );
+
+        let destroy_plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
+        destroy_plan.revert(Flags::default()).unwrap();
+
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        assert!(!tmp.path().join("src/mailers/mod.rs").exists());
+        assert!(!tmp.path().join("src/mailers/previews").exists());
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), original_main);
+        assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
+    }
+
+    #[test]
+    fn destroying_one_of_two_mailers_keeps_shared_mail_feature_the_other_still_needs() {
+        let tmp = project_with_main(default_main());
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "Goodbye", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("\"mail\"")
+        );
+
+        // Destroying Welcome alone must NOT strip the "mail" feature —
+        // Goodbye's mailer still needs it.
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        assert!(tmp.path().join("src/mailers/goodbye.rs").exists());
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("\"mail\""),
+            "mail feature must survive — Goodbye's mailer still uses it: {cargo_after}"
+        );
+
+        // Now destroy the last remaining mailer — the feature must finally go.
+        plan_mailer(tmp.path(), "Goodbye", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!tmp.path().join("src/mailers/goodbye.rs").exists());
+        assert!(
+            !fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("\"mail\""),
+            "mail feature must be removed once no mailer uses it anymore"
+        );
+    }
+
+    #[test]
+    fn destroying_one_of_two_mailers_keeps_shared_layout_the_other_still_includes() {
+        let tmp = project_with_main(default_main());
+        let layout_html = tmp.path().join("templates/mailers/_layout.html");
+        let layout_txt = tmp.path().join("templates/mailers/_layout.txt");
+
+        // Welcome creates the shared layout files (create_if_absent);
+        // Goodbye's own plan carries the SAME create_if_absent actions
+        // (they're silently skipped at execute time since the files already
+        // exist), so both mailers' plans mention them.
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "Goodbye", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(layout_html.exists());
+        assert!(layout_txt.exists());
+
+        // Destroying Welcome alone must NOT delete the shared layout —
+        // Goodbye's mailer/preview files still `include_str!` it.
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        assert!(
+            layout_html.exists(),
+            "shared _layout.html must survive — Goodbye's mailer still includes it"
+        );
+        assert!(
+            layout_txt.exists(),
+            "shared _layout.txt must survive — Goodbye's mailer still includes it"
+        );
+
+        // Now destroy the last remaining mailer — the shared layout must
+        // finally go too.
+        plan_mailer(tmp.path(), "Goodbye", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!layout_html.exists());
+        assert!(!layout_txt.exists());
     }
 
     // ── RED: file plan assertions ─────────────────────────────────────────
@@ -674,15 +1054,152 @@ async fn main() {
             .unwrap()
             .execute(Flags::default())
             .unwrap();
-        // A second list mailer must reuse the existing suppression table.
+        let migrations_dir = tmp.path().join("migrations");
+        let existing_dirs = || {
+            fs::read_dir(&migrations_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .count()
+        };
+        assert_eq!(existing_dirs(), 1, "first mailer creates one migration dir");
+        let original_dir = fs::read_dir(&migrations_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .unwrap();
+
+        // A second list mailer must reuse the existing suppression table:
+        // its plan still carries the migration's actions (so `autumn
+        // destroy` can find it later), but they all target the SAME
+        // already-existing directory, and executing must not create a
+        // second migration directory or error.
         let second =
             plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false).unwrap();
+        let migration_paths: Vec<_> = second
+            .actions
+            .iter()
+            .map(super::super::emit::Action::path)
+            .filter(|p| p.to_string_lossy().contains("mail_unsubscribes"))
+            .collect();
         assert!(
-            !second
-                .actions
-                .iter()
-                .any(|a| a.path().to_string_lossy().contains("mail_unsubscribes")),
-            "must not plan a duplicate suppression migration"
+            !migration_paths.is_empty(),
+            "the plan must still carry the migration's actions so `autumn destroy` can find it"
+        );
+        for path in &migration_paths {
+            assert_eq!(
+                path.parent().unwrap(),
+                original_dir,
+                "migration action must target the existing on-disk directory, not a fresh timestamp"
+            );
+        }
+
+        second.execute(Flags::default()).unwrap();
+        assert_eq!(
+            existing_dirs(),
+            1,
+            "must not plan or create a duplicate suppression migration"
+        );
+    }
+
+    #[test]
+    fn destroying_one_of_two_list_unsubscribe_mailers_keeps_the_shared_migration() {
+        let tmp = project_with_main(default_main());
+        let migrations_dir = tmp.path().join("migrations");
+        let migration_dir_exists =
+            || fs::read_dir(&migrations_dir).is_ok_and(|mut d| d.next().is_some());
+
+        plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"), false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(migration_dir_exists());
+
+        // Destroying WeeklyDigest alone must NOT remove the shared
+        // mail_unsubscribes migration — ProductUpdates still opts into
+        // --list-unsubscribe and needs the suppression table.
+        plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"), false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/mailers/weekly_digest.rs").exists());
+        assert!(tmp.path().join("src/mailers/product_updates.rs").exists());
+        assert!(
+            migration_dir_exists(),
+            "shared mail_unsubscribes migration must survive — ProductUpdates still needs it"
+        );
+
+        // Now destroy the last remaining list-unsubscribe mailer — the
+        // migration must finally go too.
+        plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+        assert!(!tmp.path().join("src/mailers/product_updates.rs").exists());
+        assert!(
+            !migration_dir_exists(),
+            "mail_unsubscribes migration must be removed once no mailer uses list_unsubscribe anymore"
+        );
+    }
+
+    #[test]
+    fn destroying_the_only_mailer_keeps_mail_feature_auth_still_needs() {
+        // Codex PR review (issue #1048): "mail" is needed by BOTH `generate
+        // auth` (password reset/confirmation emails) and `generate mailer` —
+        // two entirely different generators, so the mailer's own
+        // `src/mailers` owner_dir sibling check alone can't see that auth
+        // still needs the feature.
+        // `generate auth` (issue #1353) requires a shared 4-arg `pub fn layout`
+        // in src/main.rs so its views can render through `crate::layout`, so this
+        // project's main.rs must expose one (as `autumn new` emits).
+        let tmp = project_with_main(
+            "use autumn_web::prelude::*;\n\n\
+             pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {\n\
+             \x20   let _ = (current_path, flash);\n\
+             \x20   maud::html! { title { (title) } (content) }\n\
+             }\n\n\
+             #[get(\"/\")]\n\
+             async fn index() -> &'static str { \"ok\" }\n\n\
+             #[autumn_web::main]\n\
+             async fn main() {\n\
+             \x20   autumn_web::app().routes(routes![index]).run().await;\n\
+             }\n",
+        );
+        let cargo_path = tmp.path().join("Cargo.toml");
+
+        crate::generate::auth::plan_auth(tmp.path(), "User", "20260508000000")
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        assert!(
+            fs::read_to_string(&cargo_path)
+                .unwrap()
+                .contains("\"mail\"")
+        );
+
+        // Destroying the only mailer must NOT strip "mail" — auth's routes
+        // still call `Mail::builder()`.
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap();
+
+        assert!(!tmp.path().join("src/mailers/welcome.rs").exists());
+        let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+        assert!(
+            cargo_after.contains("\"mail\""),
+            "mail feature must survive — auth still uses Mail::builder(): {cargo_after}"
         );
     }
 
@@ -752,6 +1269,81 @@ async fn main() {
         );
         // With layout, per-mailer template is body-only; full document is in _layout.html.
         assert!(!html.is_empty(), "html template must not be empty");
+    }
+
+    #[test]
+    fn html_template_shows_style_block_example_relying_on_inlining() {
+        // AC6 (issue #1254): the scaffolded per-mailer template demonstrates the
+        // `<style>`-block + CSS-class happy path that inlining resolves.
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let html = fs::read_to_string(tmp.path().join("templates/mailers/welcome.html")).unwrap();
+        assert!(
+            html.contains("<style>"),
+            "with-layout template must show a <style>-block example: {html}"
+        );
+        assert!(
+            html.contains("class=\"btn\""),
+            "template must reference a CSS class that inlining resolves: {html}"
+        );
+    }
+
+    #[test]
+    fn generated_mailer_enables_css_inlining() {
+        // AC6 (issue #1254): the generated mailer opts into inlining so the
+        // `<style>`-block template renders styled end to end.
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let mailer = fs::read_to_string(tmp.path().join("src/mailers/welcome.rs")).unwrap();
+        assert!(
+            mailer.contains(".inline_css(true)"),
+            "generated mailer must enable CSS inlining: {mailer}"
+        );
+    }
+
+    #[test]
+    fn generated_preview_enables_css_inlining() {
+        // AC6 (issue #1254): the generated preview fixture must carry the same
+        // `.inline_css(true)` opt-in the production mailer has, so a scaffolded
+        // mailer's preview is inlined regardless of the app's `mail.inline_css`
+        // config default (the preview route resolves per-message-override-or-
+        // config-default, so without the override a `false` default would show
+        // RAW `<style>` CSS even though a real send is inlined).
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let preview =
+            fs::read_to_string(tmp.path().join("src/mailers/previews/welcome.rs")).unwrap();
+        assert!(
+            preview.contains(".inline_css(true)"),
+            "generated preview fixture must enable CSS inlining to match the mailer: {preview}"
+        );
+    }
+
+    #[test]
+    fn no_layout_template_also_shows_style_block() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, true)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let html = fs::read_to_string(tmp.path().join("templates/mailers/welcome.html")).unwrap();
+        assert!(
+            html.contains("<style>"),
+            "--no-layout template must also show a <style>-block example: {html}"
+        );
     }
 
     #[test]

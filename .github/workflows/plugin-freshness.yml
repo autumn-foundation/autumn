@@ -1,0 +1,44 @@
+name: Plugin Freshness
+
+# Keeps the Claude plugin (skills/, agents/, .claude-plugin/) from drifting
+# behind the framework: a PR that adds entries to CHANGELOG.md's Unreleased
+# Added/Changed sections must also touch the plugin, carry a [no-plugin]
+# token (per-bullet in the changelog, or PR-wide in the PR body), or wear
+# the `plugin-exempt` label (which bypasses only the drift gate).
+# Also sanity-checks that plugin.json parses and every docs/guide/*.md path
+# referenced from skills/ and agents/ exists — these static checks always
+# run, even on a `plugin-exempt`-labeled PR.
+#
+# Single fast job, no Rust toolchain. Logic lives in
+# scripts/check-plugin-freshness.sh (run `--self-test` locally).
+
+on:
+  pull_request:
+    branches: [trunk, trunk-dev]
+    # Beyond the defaults (opened/synchronize/reopened): labeled/unlabeled so
+    # adding or removing `plugin-exempt` re-evaluates the gate, and edited so
+    # adding a [no-plugin] marker to the PR body does too — a plain re-run
+    # would reuse the stale event payload.
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin-freshness:
+    name: Plugin freshness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check plugin freshness
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PLUGIN_EXEMPT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'plugin-exempt') }}
+        run: bash scripts/check-plugin-freshness.sh

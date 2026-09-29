@@ -12,6 +12,24 @@ description: >
 Reference `skills/autumn-web/SKILL.md` for the API quick guide. This file
 covers patterns and design decisions that apply across an Autumn app.
 
+**First rule: prefer the framework idiom.** Before hand-rolling validation,
+CRUD queries, pagination, forms, auth checks, background threads, or caching,
+check the "Prefer framework idioms over raw Diesel/Axum" table in
+`skills/autumn-web/SKILL.md`. Raw Axum/Diesel is allowed but is a last resort.
+
+## Status fields: `#[state_machine]`, not hand-rolled checks
+
+When a model has a status/phase column with legal transitions, declare them
+with `#[state_machine(transitions(...))]` on the field and enforce with the
+generated `transition_{field}_to` in `before_update` — never write your own
+`match (old, new)` validation in hooks or handlers. To reuse one transition
+graph across fields/models, define a `#[lifecycle]` enum and reference it with
+`#[state_machine(lifecycle = Enum)]` (trunk-dev, #1916). The macro proves the
+graph sound at compile time — an unreachable state or a non-terminal dead-end
+does not compile (#1675); `autumn lifecycle check` re-proves it project-wide
+and `autumn lifecycle diagram` emits a DOT/Mermaid state diagram. See `docs/guide/state-machines.md` and the worked
+example in `skills/autumn-web/references/examples.md`.
+
 ## Testing with TestApp and TestClient
 
 The `test-support` feature ships an in-process test client. No running
@@ -19,7 +37,7 @@ server is needed. Add the feature for tests only:
 
 ```toml
 [dev-dependencies]
-autumn-web = { version = "0.5", features = ["test-support"] }
+autumn-web = { version = "0.7", features = ["test-support"] }
 ```
 
 ```rust
@@ -45,6 +63,114 @@ async fn create_post_returns_redirect() {
 
 Always use `TestApp` in tests — never spin up a real server or hit a live
 database in unit tests.
+
+### Assert a route's query budget — catch N+1 (trunk-dev)
+
+Pin the SQL a route is allowed to run so an accidental N+1 fails the test:
+
+```rust
+client.get("/posts").send().await
+    .assert_status(200)
+    .assert_max_queries(3);   // panics naming the route if the count exceeds 3
+```
+
+`TestResponse::query_count()` returns the observed count (from the
+`Server-Timing` query counter); `assert_max_queries(n)` chains and returns
+`&Self` (issue #1262).
+
+### Prove a route's query budget at compile time (trunk-dev)
+
+`assert_max_queries` catches an N+1 only on the path a test exercises.
+`#[query_budget(N)]` fails the **build** when any statically reachable path
+can exceed `N` — every branch, tested or not:
+
+```rust
+#[get("/posts")]
+#[query_budget(2)]
+pub async fn index(repo: PgPostRepository) -> AutumnResult<Markup> {
+    let posts = repo.find_all().await?;                                // 1
+    let posts = repo.preload(posts, Post::preload().author()).await?;  // 2
+    Ok(render(&posts))
+}
+```
+
+Written with a per-row `repo.find_author(...)` inside a `for` loop instead, the
+build fails with a diagnostic naming the loop and the call. Straight-line
+statements sum; `if`/`match` arms take the worst arm; a handle-rooted chain is
+one query; `preload` costs one query per association. Anything the analysis
+cannot read — a helper handed the `Db` handle, a macro body naming it, a
+closure that may run per element — is reported, not assumed query-free.
+
+Escape hatches: `#[query_budget(unbounded, reason = "…")]` on the handler,
+`#[query_cost(N)]` / `#[query_exempt(reason = "…")]` on a statement. Use the
+two together: the compile-time gate for the upper bound, `assert_max_queries`
+for the SQL actually issued (issue #1667). See `docs/guide/query-budgets.md`.
+
+### Prove an agent's authority envelope at compile time (trunk-dev)
+
+An endpoint tagged `#[api_doc(mcp)]` is an action an autonomous agent can take.
+Declare what it is allowed to do, and let the build prove nothing in the body
+exceeds it (#1691):
+
+```rust
+use autumn_web::prelude::*;
+
+authority_grant! {
+    pub RefundDrafter {
+        writes: [Refund],
+        tenant_scope: scoped,
+        outbound: ["https://api.stripe.com/v1/refunds"],
+        jobs: [NotifyFinanceJob],
+        rate: "10/min",
+        spend: "500.00 USD",
+        reversibility: compensable,
+    }
+}
+
+#[post("/api/refunds")]
+#[api_doc(mcp, summary = "Draft a refund")]
+#[agent_operable(grant = RefundDrafter)]
+pub async fn draft_refund(repo: PgRefundRepository, client: Client, Json(body): Json<NewRefund>)
+    -> AutumnResult<Json<Refund>> { /* … */ }
+```
+
+The analysis derives the handler's effect set — bounded and unbounded writes
+(`delete_all`, `truncate`, an unfiltered `diesel::update`), cross-tenant reach
+(`across_tenants()`, `for_tenant(..)`, a raw diesel query on the request's
+connection), literal outbound URLs and `named("alias")` clients, webhook
+topics, and job enqueues — and emits one const-eval assertion per effect, so
+`payouts.delete_all()` in that body fails `cargo build` at the call. Effects
+are a set over every branch; a job, webhook, outbound call or unbounded write
+cannot be declared `reversible`. Anything opaque (a helper handed a handle, a
+`format!`-built URL, a non-literal job name, `tokio::spawn`, a `dyn`/`impl`
+handle) is refused, never assumed harmless; discharge it with
+`#[agent_effect(writes(Refund), reason = "…")]` or
+`#[agent_effect(none, reason = "…")]` on the statement — declared effects are
+checked against the grant exactly like proved ones.
+
+`autumn agents manifest --check agent-authority.json` writes the diffable
+record and fails on drift or on an ungoverned mutating MCP tool. Every MCP
+`tools/call` writes attempt and outcome audit events carrying a correlation
+id, the grant, the compile-known reversibility and the proved effects, with no
+per-handler wiring. `rate`/`spend` are declared and published, not enforced.
+See `docs/guide/agent-authority.md`.
+
+### Fake-data factories and bulk seeding (trunk-dev)
+
+Don't hand-build model fixtures. `#[model]` generates a `{Model}Factory`; fill
+the rest with realistic fake data inferred from each field's name + type:
+
+```rust
+let post = Post::factory().title("Fixed").fake().build();  // NewPost, unset fields faked
+let posts = Post::factory().fake().build_many(10);         // Vec<NewPost>, each row re-drawn
+let saved = Post::factory().fake().create(&pool).await;    // persist (panics on failure)
+```
+
+Generators live in `autumn_web::fake` (`name`, `email`, `sentence`,
+`int_range`, `uuid`, …); seed deterministically with `AUTUMN_FAKE_SEED` or
+`autumn_web::fake::reseed(seed)`. For bulk data outside tests,
+`autumn seed --count N --model <Name>` (both flags together) inserts N faked rows
+via the model's factory (issue #1343). See `docs/guide/seeding.md`.
 
 ## Repository design
 
@@ -104,9 +230,16 @@ async fn publish_post(Path(id): Path<i64>, mut db: Db) -> AutumnResult<Redirect>
 Use `#[job]` for request-triggered work with retries. Keep jobs idempotent —
 they may run more than once.
 
-The `#[job]` macro requires exactly two arguments: `AppState` and a typed
-args struct (serializable). The macro generates a `PascalCaseJob` struct with
-a static `enqueue` method.
+The `#[job]` macro takes `AppState` and a typed args struct (serializable).
+The macro generates a `PascalCaseJob` struct with a static `enqueue` method.
+On trunk-dev (unreleased — not in published 0.5.0) a job may also accept an
+optional third `JobContext` argument for progress reporting on tracked jobs,
+and a `queue = "name"` attribute for named priority queues.
+
+Published 0.5.0 also supports idempotency/backpressure attributes:
+`#[job(unique)]`, `unique_by = "field"`, `unique_for_ms = N`,
+`concurrency = N`, `concurrency_key = "field"` — prefer these over
+hand-rolled dedupe tables or semaphores.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]

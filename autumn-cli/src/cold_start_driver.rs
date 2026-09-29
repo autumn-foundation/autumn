@@ -323,7 +323,7 @@ fn cached_host_target_triple() -> Option<String> {
 /// app can bind it. There is a tiny race between release and the child's bind,
 /// but the per-iteration `try_wait()` and the response-body check make a
 /// mis-attributed sample impossible even if the port is lost.
-fn reserve_free_port() -> Result<u16, String> {
+pub fn reserve_free_port() -> Result<u16, String> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|e| format!("failed to reserve a free port: {e}"))?;
     let port = listener
@@ -333,10 +333,13 @@ fn reserve_free_port() -> Result<u16, String> {
     Ok(port)
 }
 
-/// Stop a scaffolded cold-start server, preferring a graceful SIGTERM so the
+/// Stop a scaffolded benchmark server, preferring a graceful SIGTERM so the
 /// app runs its shutdown hooks (e.g. stopping a bundled Postgres cluster) before
 /// falling back to SIGKILL if it does not exit in time.
-fn stop_child(child: &mut std::process::Child) {
+///
+/// Shared by every live driver that spawns a scaffolded app (cold-start,
+/// overload) so they all shut down their child processes identically.
+pub fn stop_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         // Graceful SIGTERM first (via the shared helper) so the app's on_shutdown

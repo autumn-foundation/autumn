@@ -42,8 +42,13 @@
 //!
 //! ## Dev-mode bypass
 //!
-//! Set `dev_bypass = true` (the default when no `secret_key` is configured)
-//! to skip verification in local development:
+//! Omitting `secret_key` does **not** bypass verification — the real provider
+//! is still constructed, and every *challenged* submission (non-exempt path,
+//! `application/x-www-form-urlencoded`) fails closed (rejected, with a
+//! warning logged), since an empty secret can never verify a token. Exempt
+//! paths and non-urlencoded requests (JSON, multipart) are unaffected — see
+//! [`BotProtectionLayer`]'s own docs for exactly what's challenged. Set
+//! `dev_bypass = true` explicitly to skip verification in local development:
 //!
 //! ```toml
 //! [bot_protection]
@@ -691,14 +696,12 @@ where
         // Webhook/API paths that cannot carry a CAPTCHA token are exempt.
         // Require an exact match or a path-segment boundary (trailing `/`) so
         // that exempting `/inbound/mailgun` does not accidentally exempt
-        // `/inbound/mailgun-settings` or other adjacent routes.
-        if self.settings.exempt_paths.iter().any(|ep| {
-            let path = req.uri().path();
-            let e = ep.as_str();
-            path == e
-                || path.starts_with(e)
-                    && (e.ends_with('/') || path.as_bytes().get(e.len()) == Some(&b'/'))
-        }) {
+        // `/inbound/mailgun-settings` or other adjacent routes. Match against
+        // the normalized path so dot-segment tricks like
+        // `/inbound/mailgun/../other` cannot satisfy an exemption prefix
+        // while targeting another route.
+        let clean = crate::security::path::clean_path(req.uri().path());
+        if crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths) {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -1106,6 +1109,39 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "adjacent route must not be exempt"
         );
+    }
+
+    #[tokio::test]
+    async fn dot_segment_path_does_not_match_exemption() {
+        // `/webhook/../protected` normalizes to `/protected`, which is not
+        // exempt, so the CAPTCHA check must still run (and reject the request
+        // because no token is present). Same for percent-encoded dot-segments.
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")))
+            .with_exempt_paths(vec!["/webhook/".to_string()]);
+        let app = Router::new()
+            .route("/webhook/inbound", post(ok_handler))
+            .route("/protected", post(ok_handler))
+            .layer(layer);
+
+        for uri in ["/webhook/../protected", "/webhook/%2e%2e/protected"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .body(Body::from("field=value"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "dot-segment path {uri} must not be treated as exempt"
+            );
+        }
     }
 
     #[tokio::test]

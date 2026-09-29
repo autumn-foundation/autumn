@@ -1,368 +1,42 @@
+/*
+ * Autumn — Tailwind CSS input file
+ *
+ * Widget component CSS (autumn-field, autumn-submit, autumn-nav, etc.) ships
+ * from the framework itself — see autumn_web::ui::WIDGETS_CSS_PATH, linked in
+ * this app's layout. Add only this app's own custom styles below.
+ */
+
 @import "tailwindcss";
 
-/* ── Wizard progress stepper ──────────────────────────────────────────────── */
-
-.wizard-progress {
-    display: flex;
-    align-items: flex-start;
-    list-style: none;
-    padding: 0;
-    margin: 0 0 1.5rem 0;
-}
-
-.wizard-step {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-shrink: 0;
-}
-
-.wizard-step + .wizard-step {
-    flex: 1;
-}
-
-.wizard-step + .wizard-step::before {
-    content: '';
-    flex: 1;
-    height: 2px;
-    background-color: #e5e7eb;
-}
-
-.wizard-step--completed + .wizard-step::before {
-    background-color: #4f46e5;
-}
-
-.wizard-step__number {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 2rem;
-    height: 2rem;
-    border-radius: 9999px;
-    font-size: 0.8125rem;
-    font-weight: 600;
-    flex-shrink: 0;
-    background-color: #e5e7eb;
-    color: #6b7280;
-}
-
-.wizard-step__label {
-    font-size: 0.875rem;
-    color: #9ca3af;
-    text-transform: capitalize;
-    white-space: nowrap;
-}
-
-.wizard-step--completed .wizard-step__number {
-    background-color: #4f46e5;
-    color: #fff;
-}
-
-.wizard-step--completed .wizard-step__label {
-    color: #4f46e5;
-}
-
-.wizard-step--current .wizard-step__number {
-    background-color: #4f46e5;
-    color: #fff;
-    box-shadow: 0 0 0 3px #c7d2fe;
-}
-
-.wizard-step--current .wizard-step__label {
-    color: #1e1b4b;
-    font-weight: 600;
-}
-
-.wizard-progress__summary {
-    font-size: 0.75rem;
-    color: #9ca3af;
-    margin-top: 0.5rem;
-}
-
-/* ── Form fields (autumn-field) ───────────────────────────────────────────── */
-
-.autumn-field {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
-}
-
-.autumn-field__label {
-    font-size: 0.875rem;
-    font-weight: 500;
-    color: #374151;
-}
-
-.autumn-field__input {
-    width: 100%;
-    padding: 0.5rem 0.75rem;
-    border: 1px solid #d1d5db;
-    border-radius: 0.375rem;
-    font-size: 0.875rem;
-    line-height: 1.5;
-    color: #111827;
-    background-color: #fff;
-    outline: none;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.autumn-field__input:focus {
-    border-color: #6366f1;
-    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
-}
-
-.autumn-field__input--invalid {
-    border-color: #ef4444;
-}
-
-.autumn-field__input--invalid:focus {
-    border-color: #ef4444;
-    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.15);
-}
-
-.autumn-field__errors {
-    display: flex;
-    flex-direction: column;
-    gap: 0.125rem;
-}
-
-.autumn-field__error {
-    font-size: 0.8125rem;
-    color: #ef4444;
-    margin: 0;
-}
-
-/* ── Submit button (autumn-submit) ────────────────────────────────────────── */
-
-.autumn-submit {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0.5rem 1.25rem;
-    background-color: #4f46e5;
-    color: #fff;
-    border: none;
-    border-radius: 0.375rem;
-    font-size: 0.875rem;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background-color 0.15s ease;
-}
-
-.autumn-submit:hover {
-    background-color: #4338ca;
-}
-
-.autumn-submit:focus {
-    outline: none;
-    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.35);
-}
-
-.autumn-submit:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-/* ── Active search input (autumn-search) ──────────────────────────────────── */
-
-.autumn-search {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
-}
-
-.autumn-search__label {
-    font-size: 0.875rem;
-    font-weight: 500;
-    color: #374151;
-}
-
-.autumn-search__input {
-    width: 100%;
-    padding: 0.5rem 0.75rem 0.5rem 2.25rem;
-    border: 1px solid #d1d5db;
-    border-radius: 0.375rem;
-    font-size: 0.875rem;
-    color: #111827;
-    background-color: #fff;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: 0.625rem center;
-    background-size: 1rem 1rem;
-    outline: none;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.autumn-search__input:focus {
-    border-color: #6366f1;
-    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
-}
-
-/* ── Autocomplete (autumn-autocomplete) ───────────────────────────────────── */
-
-.autumn-autocomplete {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
-}
-
-.autumn-autocomplete__label {
-    font-size: 0.875rem;
-    font-weight: 500;
-    color: #374151;
-}
-
-.autumn-autocomplete__input {
-    width: 100%;
-    padding: 0.5rem 0.75rem;
-    border: 1px solid #d1d5db;
-    border-radius: 0.375rem;
-    font-size: 0.875rem;
-    color: #111827;
-    background-color: #fff;
-    outline: none;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.autumn-autocomplete__input:focus {
-    border-color: #6366f1;
-    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
-}
-
-.autumn-autocomplete__options {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    right: 0;
-    z-index: 50;
-    background-color: #fff;
-    border: 1px solid #d1d5db;
-    border-radius: 0.375rem;
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-    max-height: 15rem;
-    overflow-y: auto;
-    list-style: none;
-    margin: 0.25rem 0 0 0;
-    padding: 0.25rem 0;
-}
-
-.autumn-autocomplete__option {
-    padding: 0.5rem 0.75rem;
-    font-size: 0.875rem;
-    color: #111827;
-    cursor: pointer;
-}
-
-.autumn-autocomplete__option:hover,
-.autumn-autocomplete__option[aria-selected="true"] {
-    background-color: #ede9fe;
-    color: #4f46e5;
-}
-
-/* ── Breadcrumb navigation (autumn-breadcrumb) ────────────────────────────── */
-
-.autumn-breadcrumb {
-    margin-bottom: 1rem;
-}
-
-.autumn-breadcrumb__list {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    gap: 0.25rem;
-    font-size: 0.875rem;
-}
-
-.autumn-breadcrumb__item {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-}
-
-.autumn-breadcrumb__link {
-    color: #4f46e5;
-    text-decoration: none;
-}
-
-.autumn-breadcrumb__link:hover {
-    text-decoration: underline;
-}
-
-.autumn-breadcrumb__separator {
-    color: #9ca3af;
-    user-select: none;
-}
-
-.autumn-breadcrumb__current {
-    color: #6b7280;
-}
-
-.autumn-breadcrumb__text {
-    color: #374151;
-}
-
-/* ── Hero banner (autumn-hero) ─────────────────────────────────────────────── */
-
+/*
+ * Blog's hero theme: left-aligned, stone/amber accent — overrides the
+ * shared widget defaults (autumn_web::ui::WIDGETS_CSS_PATH, linked before
+ * this stylesheet in posts.rs's layout) rather than forking the widget CSS.
+ */
 .autumn-hero {
+    padding: 0;
+    text-align: left;
     margin-bottom: 2.5rem;
 }
 
 .autumn-hero__title {
-    font-size: 1.875rem;
-    font-weight: 700;
-    letter-spacing: -0.025em;
-    color: var(--color-stone-900, #1c1917);
-    margin: 0 0 0.5rem 0;
+    color: #1c1917;
 }
 
 .autumn-hero__subtitle {
-    color: var(--color-stone-600, #57534e);
-    margin: 0;
+    color: #57534e;
 }
 
 .autumn-hero__actions {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    margin-top: 1.25rem;
-}
-
-.autumn-hero__cta {
-    display: inline-flex;
-    align-items: center;
-    padding: 0.625rem 1.25rem;
-    border-radius: 0.5rem;
-    font-size: 0.875rem;
-    font-weight: 500;
-    text-decoration: none;
-    transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.autumn-hero__cta:focus-visible {
-    outline: none;
-    box-shadow: 0 0 0 3px rgba(180, 83, 9, 0.35);
+    justify-content: flex-start;
 }
 
 .autumn-hero__cta--primary {
-    background-color: var(--color-amber-700, #b45309);
-    color: #fff;
+    background-color: #b45309;
+    border-color: #b45309;
 }
 
 .autumn-hero__cta--primary:hover {
-    background-color: var(--color-amber-800, #92400e);
-}
-
-.autumn-hero__cta--secondary {
-    color: var(--color-stone-600, #57534e);
-}
-
-.autumn-hero__cta--secondary:hover {
-    color: var(--color-stone-800, #292524);
+    background-color: #92400e;
+    border-color: #92400e;
 }

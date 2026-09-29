@@ -9,7 +9,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::SystemTime;
+use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -384,6 +386,58 @@ impl BlobStore for LocalBlobStore {
         })
     }
 
+    fn get_stream<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ByteStream<'static>> {
+        Box::pin(async move {
+            let path = self.safe_path_for_key(key).await?;
+            let file = match tokio::fs::File::open(&path).await {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobStoreError::NotFound(key.to_owned()));
+                }
+                Err(err) => return Err(BlobStoreError::io(err)),
+            };
+            // `ReaderStream` owns the open file handle, so the resulting
+            // stream is `'static` (it does not borrow `self`) and reads the
+            // object incrementally rather than buffering it all in memory.
+            let stream = tokio_util::io::ReaderStream::new(file)
+                .map(|chunk| chunk.map_err(BlobStoreError::io));
+            let boxed: ByteStream<'static> = Box::pin(stream);
+            Ok(boxed)
+        })
+    }
+
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        start: u64,
+        end: u64,
+    ) -> BlobFuture<'a, ByteStream<'static>> {
+        Box::pin(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+            let path = self.safe_path_for_key(key).await?;
+            let mut file = match tokio::fs::File::open(&path).await {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BlobStoreError::NotFound(key.to_owned()));
+                }
+                Err(err) => return Err(BlobStoreError::io(err)),
+            };
+            // Seek to the start offset and cap the read at the inclusive slice
+            // length so only `[start, end]` is read off disk — a slice of a
+            // large file never buffers the whole object in memory.
+            file.seek(std::io::SeekFrom::Start(start))
+                .await
+                .map_err(BlobStoreError::io)?;
+            let len = end.saturating_sub(start).saturating_add(1);
+            let limited = file.take(len);
+            let stream = tokio_util::io::ReaderStream::new(limited)
+                .map(|chunk| chunk.map_err(BlobStoreError::io));
+            let boxed: ByteStream<'static> = Box::pin(stream);
+            Ok(boxed)
+        })
+    }
+
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             let path = self.safe_path_for_key(key).await?;
@@ -442,7 +496,7 @@ impl BlobStore for LocalBlobStore {
             } else {
                 expires_in
             };
-            let exp_at = SystemTime::now()
+            let exp_at = crate::time::ambient_system_time()
                 .checked_add(expires_in)
                 .unwrap_or(UNIX_EPOCH)
                 .duration_since(UNIX_EPOCH)
@@ -477,7 +531,7 @@ impl BlobStore for LocalBlobStore {
             } else {
                 expires_in
             };
-            let exp_at = SystemTime::now()
+            let exp_at = crate::time::ambient_system_time()
                 .checked_add(expires_in)
                 .unwrap_or(UNIX_EPOCH)
                 .duration_since(UNIX_EPOCH)
@@ -547,7 +601,7 @@ pub fn verify_upload(
     expires_at: u64,
     signature: &str,
 ) -> Result<(), BlobStoreError> {
-    let now = SystemTime::now()
+    let now = crate::time::ambient_system_time()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     verify_upload_with_now(
@@ -741,7 +795,7 @@ pub fn verify(
     expires_at: u64,
     signature: &str,
 ) -> Result<(), BlobStoreError> {
-    let now = SystemTime::now()
+    let now = crate::time::ambient_system_time()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     verify_with_now(signing_key, blob_key, expires_at, signature, now)
@@ -1156,7 +1210,7 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
                 return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
 
-            let limit = state.config().security.upload.max_request_size_bytes;
+            let limit = state.config_arc().security.upload.max_request_size_bytes;
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let stream = body.into_data_stream();

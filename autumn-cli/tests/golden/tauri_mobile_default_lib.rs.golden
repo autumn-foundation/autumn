@@ -1,0 +1,289 @@
+//! Tauri mobile shell for golden-app — in-process backend + remote Postgres.
+//!
+//! Mobile sandboxes (iOS and Android) forbid spawning child processes, so the
+//! desktop sidecar model cannot work here. Instead the Autumn Axum server runs
+//! on a background thread INSIDE this app process:
+//!
+//!   1. Bind loopback:0 to find a free ephemeral port.
+//!   2. Configure the server through environment variables at the top of
+//!      run(), before tauri::Builder starts any platform threads.
+//!   3. std::thread::spawn a dedicated tokio runtime that block_on()s
+//!      golden_app::serve() — the app entry extracted into src/lib.rs by
+//!      `autumn generate tauri-mobile`.
+//!   4. Poll GET /health in a background thread until the server is ready,
+//!      then open the webview at http://127.0.0.1:<port>.
+//!
+//! The database is a REMOTE Postgres reached over the device network. The env
+//! defaults below (small pool, short connect timeout) are tuned for flaky
+//! mobile networks — see docs/guide/tauri-mobile-in-process.md for the full
+//! rationale, reconnection semantics, security notes, and App Store
+//! compliance notes.
+
+use std::net::TcpListener;
+use tauri::Manager;
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    // 1. Find a free loopback port: bind :0, read the assigned port, then drop
+    //    the listener so the in-process server can bind that same address.
+    //    (The port is briefly unbound until the server thread claims it — see
+    //    the security section of docs/guide/tauri-mobile-in-process.md.)
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind a loopback port");
+        listener
+            .local_addr()
+            .expect("failed to read the loopback port")
+            .port()
+    };
+
+    // 2. Configure the server via environment variables. The server runs in
+    //    THIS process, so std::env::set_var is the whole config story — no
+    //    staged config files (an autumn.toml in the app repo is NOT read by
+    //    this shell). This block runs at the top of run(), BEFORE
+    //    tauri::Builder starts platform runtimes: set_var is only sound while
+    //    no foreign threads may call getenv concurrently. Only the values
+    //    that need the app sandbox path are deferred to setup().
+    std::env::set_var("AUTUMN_SERVER__HOST", "127.0.0.1");
+    std::env::set_var("AUTUMN_SERVER__PORT", port.to_string());
+    // ── Remote Postgres over a mobile network ───────────────────────────────
+    // Point the app at your remote database (require TLS in production):
+    // std::env::set_var(
+    //     "AUTUMN_DATABASE__URL",
+    //     "postgres://app_user:PASSWORD@db.example.com:5432/app?sslmode=require",
+    // );
+    //
+    // Conservative pool defaults for flaky mobile networks: a phone gets one
+    // user's traffic, so a large server-style pool only holds open sockets
+    // that die on every network transition (Wi-Fi ⇄ cellular, backgrounding).
+    // The deadpool-backed pool re-checks connections on checkout and
+    // re-establishes broken ones automatically, so a small pool recovers
+    // faster and wastes fewer half-dead connections.
+    std::env::set_var("AUTUMN_DATABASE__POOL_SIZE", "2");
+    // Fail fast on NEW connection attempts when the radio is off or asleep.
+    // (5 is also the framework default — pinned here so the mobile posture
+    // survives future framework default changes.)
+    std::env::set_var("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "5");
+    // ────────────────────────────────────────────────────────────────────────
+    // The webview loads the app over plain HTTP on loopback; Secure cookies
+    // would be silently dropped by the webview, breaking sessions and CSRF.
+    // Loopback never leaves the device — but other apps ON the device can
+    // reach it too (see the security section of the docs page).
+    std::env::set_var("AUTUMN_SESSION__SECURE", "false");
+    // Loopback-only server: accept Host: 127.0.0.1 from the webview even when
+    // production config pins trusted hosts to a public domain.
+    std::env::set_var("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS", "127.0.0.1,localhost");
+    // Local blob storage backend rooted in the app sandbox; the root path is
+    // set in setup() once the sandbox data dir is known.
+    std::env::set_var("AUTUMN_STORAGE__BACKEND", "local");
+    std::env::set_var("AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION", "true");
+    // No load balancer drains connections to an in-process loopback server;
+    // skip the prestop grace so shutdown hooks run immediately.
+    std::env::set_var("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0");
+    // Profile selection: dev config during `cargo tauri [ios|android] dev`,
+    // prod config in release builds. Set explicitly — running serve()
+    // in-process bypasses the #[autumn_web::main] entry point that would
+    // otherwise bake the release/debug signal into profile detection, so
+    // without this a release build would silently run the dev profile.
+    if cfg!(debug_assertions) {
+        std::env::set_var("AUTUMN_ENV", "dev");
+    } else {
+        std::env::set_var("AUTUMN_ENV", "prod");
+    }
+    // Clear inherited one-off mode flags and desktop-only settings: any of
+    // these would make AppBuilder::run() exit before binding the HTTP port
+    // (build-static/dump-routes/task modes), bind a Unix socket the health
+    // probe can't reach, or attach a foreign managed-Postgres cluster.
+    for var in [
+        "AUTUMN_PROFILE",
+        "AUTUMN_BUILD_STATIC",
+        "AUTUMN_DUMP_ROUTES",
+        "AUTUMN_LIST_TASKS",
+        "AUTUMN_RUN_TASK",
+        "AUTUMN_SERVER__UNIX_SOCKET",
+        "AUTUMN_SERVE_FORCE_UNIX_SOCKET",
+        "AUTUMN_MANAGED_PG_ATTACH_URL",
+    ] {
+        std::env::remove_var(var);
+    }
+
+    tauri::Builder::default()
+        .setup(move |app| setup(app, port))
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+fn setup(app: &mut tauri::App, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    // 3. Per-app data directories (inside the mobile app sandbox). These two
+    //    set_var calls are the only ones that must wait for the tauri App
+    //    handle (the sandbox path is not known before the Builder runs); they
+    //    still execute before the server thread reads the environment.
+    let data_root = app.path().app_data_dir()?;
+    std::fs::create_dir_all(&data_root)?;
+    // Local blob storage in blobs/ (the only writable filesystem location).
+    let blobs_dir = data_root.join("blobs");
+    std::fs::create_dir_all(&blobs_dir)?;
+    std::env::set_var(
+        "AUTUMN_STORAGE__LOCAL__ROOT",
+        blobs_dir.to_string_lossy().as_ref(),
+    );
+    // Per-install signing secret: autumn requires one in prod mode. Generate
+    // 32 random bytes on first launch and persist them so sessions survive
+    // restarts.
+    let signing_secret = load_or_generate_signing_secret(&data_root)?;
+    std::env::set_var("AUTUMN_SECURITY__SIGNING_SECRET", &signing_secret);
+
+    // 4. Spawn the Autumn server on a background thread with its own tokio
+    //    runtime. tauri's setup() is synchronous and must return quickly, so
+    //    the server gets a dedicated OS thread; block_on parks that thread on
+    //    the server future for the lifetime of the app. Mobile OSes reclaim
+    //    the whole process on exit — there is no separate child to clean up.
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime for the in-process autumn server");
+        runtime.block_on(golden_app::serve());
+    });
+
+    // 5. Poll for server readiness in a background thread so setup() returns
+    //    immediately and the Tauri event loop starts (blocking here can
+    //    trigger the mobile OS's app-startup watchdog). We probe GET /health —
+    //    the cheap readiness endpoint autumn always registers; any HTTP
+    //    response proves the server is up and routing.
+    let handle = app.handle().clone();
+    std::thread::spawn(move || {
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            port,
+        );
+        let poll_timeout = std::time::Duration::from_millis(200);
+        let mut ready = false;
+        // 300 × 200 ms = 60 s. No local Postgres cluster to initialise here
+        // (the DB is remote), so startup is fast; 60 s leaves headroom for
+        // slow first-launch migrations without hanging a broken install
+        // forever behind a blank screen.
+        for _ in 0..300 {
+            if let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, poll_timeout) {
+                let _ = stream.set_read_timeout(Some(poll_timeout));
+                use std::io::{Read, Write};
+                let req = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+                if stream.write_all(req.as_bytes()).is_ok() {
+                    let mut buf = [0u8; 8];
+                    // Any valid HTTP response (200, 404, …) means the server is
+                    // up and routing — accept the `HTTP/` prefix regardless of
+                    // status.
+                    if stream.read(&mut buf).is_ok() && buf.starts_with(b"HTTP/") {
+                        ready = true;
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(poll_timeout);
+        }
+        if !ready {
+            eprintln!("[golden-app] Server did not become ready within 60 s.");
+            show_startup_error(
+                &handle,
+                "The app's built-in server did not start in time. This is \
+                 usually a configuration problem — for example an unreachable \
+                 or misconfigured AUTUMN_DATABASE__URL. Check the device logs \
+                 for details.",
+            );
+            return;
+        }
+        if let Err(e) = tauri::WebviewWindowBuilder::new(
+            &handle,
+            "main",
+            tauri::WebviewUrl::External(
+                format!("http://127.0.0.1:{port}").parse().unwrap(),
+            ),
+        )
+        .title("golden-app")
+        .build()
+        {
+            eprintln!("[golden-app] Failed to open window: {e}");
+            show_startup_error(&handle, "The app window could not be opened.");
+        }
+    });
+
+    Ok(())
+}
+
+/// Surface a startup failure in a visible window instead of a silent exit or
+/// an endless blank screen. Falls back to exiting when even the error window
+/// cannot be built. Note: some framework-level startup failures (for example
+/// a database bootstrap error) call std::process::exit directly from the
+/// server thread and terminate the app before this can render — see the
+/// troubleshooting notes in docs/guide/tauri-mobile-in-process.md.
+fn show_startup_error(handle: &tauri::AppHandle, message: &str) {
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head>\
+         <body style=\"font-family:system-ui;margin:2rem\">\
+         <h1>golden-app could not start</h1>\
+         <p>{message}</p></body></html>"
+    );
+    let opened = format!("data:text/html,{}", percent_encode(&html))
+        .parse()
+        .ok()
+        .and_then(|url| {
+            tauri::WebviewWindowBuilder::new(handle, "startup-error", tauri::WebviewUrl::External(url))
+                .title("golden-app")
+                .build()
+                .ok()
+        })
+        .is_some();
+    if !opened {
+        handle.exit(1);
+    }
+}
+
+/// Minimal percent-encoding for embedding the error page in a data: URL
+/// (avoids pulling an extra dependency into the shell crate).
+fn percent_encode(input: &str) -> String {
+    input
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Generate a 32-byte random signing secret on first launch, persist it to
+/// `{data_root}/signing_secret.txt`, and return it as a hex string.
+/// Autumn requires a signing secret in prod mode to sign session tokens;
+/// without one the release build aborts before binding the HTTP port.
+fn load_or_generate_signing_secret(
+    data_root: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let path = data_root.join("signing_secret.txt");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim().to_owned();
+        if s.len() >= 32 {
+            return Ok(s);
+        }
+    }
+    let mut bytes = [0u8; 32];
+    // Propagate RNG failure — an all-zero secret would be trivially guessable.
+    getrandom::getrandom(&mut bytes)?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // The app sandbox is private to this app on iOS/Android, but restrict
+    // permissions anyway where the platform supports it.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(hex.as_bytes()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, &hex)?;
+    }
+    Ok(hex)
+}

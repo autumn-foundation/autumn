@@ -89,6 +89,14 @@ impl CspNonce {
     pub fn value(&self) -> &str {
         &self.0
     }
+
+    /// Construct a nonce with a known value for unit tests elsewhere in the
+    /// crate (e.g. the story gallery's nonce-threading tests); production
+    /// nonces are only ever minted by [`SecurityHeadersLayer`].
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 impl<S> FromRequestParts<S> for CspNonce
@@ -144,6 +152,28 @@ fn nonce_aware_default_csp() -> String {
      frame-ancestors 'none'; \
      base-uri 'self'"
         .to_owned()
+}
+
+/// Resolve the effective `Content-Security-Policy` string that responses carry,
+/// mirroring the resolution in [`ComputedHeaders::from_config`].
+///
+/// When per-request nonce injection is active (nonce enabled AND the CSP is the
+/// framework default), this returns the nonce-aware template containing
+/// [`NONCE_PLACEHOLDER`] tokens — i.e. what responses send *before* the
+/// per-request nonce is substituted in. Otherwise it returns the configured CSP
+/// verbatim.
+///
+/// The security-posture manifest reports this value (placeholder intact, not a
+/// live nonce) so the declared CSP matches what nonce-enabled apps emit while
+/// staying byte-deterministic across runs.
+pub fn resolved_content_security_policy(config: &HeadersConfig) -> String {
+    if config.csp_nonce.enabled
+        && config.content_security_policy == default_content_security_policy()
+    {
+        nonce_aware_default_csp()
+    } else {
+        config.content_security_policy.clone()
+    }
 }
 
 /// Pre-computed header pairs to inject into every response.
@@ -210,12 +240,16 @@ impl ComputedHeaders {
         // their custom value is used verbatim and the nonce is still generated
         // (for the extractor) but not written into the header.
         let using_default_csp = config.content_security_policy == default_content_security_policy();
+        // Single source of truth for the resolved CSP string (nonce-aware
+        // template when injection is active, configured value otherwise); the
+        // manifest dump reuses this same resolution.
+        let resolved_csp = resolved_content_security_policy(config);
         let nonce_csp_template = if config.csp_nonce.enabled && using_default_csp {
-            Some(Arc::from(nonce_aware_default_csp().as_str()))
+            Some(Arc::from(resolved_csp.as_str()))
         } else {
             // Static CSP (either custom, or nonce disabled).
-            if !config.content_security_policy.is_empty()
-                && let Ok(val) = HeaderValue::from_str(&config.content_security_policy)
+            if !resolved_csp.is_empty()
+                && let Ok(val) = HeaderValue::from_str(&resolved_csp)
             {
                 static_pairs.push((HeaderName::from_static("content-security-policy"), val));
             }

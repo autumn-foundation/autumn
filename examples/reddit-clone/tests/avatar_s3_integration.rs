@@ -11,8 +11,17 @@ use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
 };
 use bytes::Bytes;
+use testcontainers::ImageExt;
+use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::minio::MinIO;
+
+// Docker Hub no longer serves `minio/minio`, and `quay.io/minio/minio` refuses
+// anonymous pulls since 2026-09-24. Chainguard's free MinIO build runs the same
+// binary. Its free tier serves only `latest`, so pin the digest.
+const MINIO_IMAGE: &str = "cgr.dev/chainguard/minio";
+const MINIO_TAG: &str =
+    "latest@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1";
 
 const MINIO_USER: &str = "minioadmin";
 const MINIO_PASSWORD: &str = "minioadmin";
@@ -36,7 +45,14 @@ async fn make_admin_client(port: u16) -> Client {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn avatar_blob_store_roundtrip() {
-    let container = MinIO::default().start().await.expect("start MinIO");
+    let container = MinIO::default()
+        .with_name(MINIO_IMAGE)
+        .with_tag(MINIO_TAG)
+        // The image has no `EXPOSE`, so publish the API port by hand.
+        .with_mapped_port(0, 9000.tcp())
+        .start()
+        .await
+        .expect("start MinIO");
     let port = container
         .get_host_port_ipv4(9000)
         .await

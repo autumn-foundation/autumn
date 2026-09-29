@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use autumn_web::extract::Path;
+use autumn_web::lock::Lock;
 use autumn_web::prelude::*;
 use diesel::OptionalExtension;
 use diesel::QueryableByName;
 use diesel::prelude::*;
 use diesel::result::{Error as DieselError, QueryResult};
-use diesel::sql_types::{BigInt, Bool, Integer, Text};
+use diesel::sql_types::{Array, BigInt, Text};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use diesel_async::pooled_connection::deadpool::{Object, Pool};
+use diesel_async::pooled_connection::deadpool::Pool;
 
 use crate::models::{Bookmark, NewBookmark, UpdateBookmark};
 use crate::schema::bookmarks;
@@ -34,31 +35,9 @@ pub enum BookmarkOperation {
     Update,
     DeleteById,
     MarkDead,
-    /// Acquiring the link checker's per-shard advisory lock — needs a
-    /// primary connection like a write does, but isn't itself a write, so
-    /// it's kept out of `conn()`'s `mark_write()` set.
-    AcquireShardLease,
 }
 
 pub(crate) const LINK_CHECKER_SHARD_COUNT: u32 = 16;
-const LINK_CHECKER_LOCK_NAMESPACE: i32 = 0x4155_4C4B;
-
-pub(crate) struct ShardLease {
-    conn: AsyncPgConnection,
-    shard: u32,
-}
-
-#[derive(Debug, QueryableByName)]
-struct LockResult {
-    #[diesel(sql_type = Bool)]
-    acquired: bool,
-}
-
-#[derive(Debug, QueryableByName)]
-struct UnlockResult {
-    #[diesel(sql_type = Bool)]
-    released: bool,
-}
 
 #[derive(Debug, QueryableByName)]
 struct AliveBookmarkRow {
@@ -79,8 +58,7 @@ impl BookmarkRepository {
             BookmarkOperation::Save
             | BookmarkOperation::Update
             | BookmarkOperation::DeleteById
-            | BookmarkOperation::MarkDead
-            | BookmarkOperation::AcquireShardLease => PoolRole::Primary,
+            | BookmarkOperation::MarkDead => PoolRole::Primary,
         }
     }
 
@@ -89,12 +67,23 @@ impl BookmarkRepository {
         0..LINK_CHECKER_SHARD_COUNT
     }
 
+    /// The distributed-lock name that guards a single link-checker shard.
+    ///
+    /// Each shard runs on exactly one replica at a time; the name is stable per
+    /// shard so every replica contends on the same lock.
     #[must_use]
-    pub(crate) fn link_checker_lock_key(shard: u32) -> (i32, i32) {
-        (
-            LINK_CHECKER_LOCK_NAMESPACE,
-            i32::try_from(shard).expect("shard id must fit in i32"),
-        )
+    pub(crate) fn shard_lock_name(shard: u32) -> String {
+        format!("link-checker:shard:{shard}")
+    }
+
+    /// Build the [`Lock`] that guards link-checker `shard`.
+    ///
+    /// Advisory locks must be taken on the primary so all replicas contend on
+    /// the same server; this uses the primary pool accordingly.
+    pub(crate) fn shard_lock(shard: u32) -> AutumnResult<Lock> {
+        let state = Self::distributed_state()?;
+        let pool = Self::pool(&state, PoolRole::Primary).clone();
+        Ok(Lock::new(pool, Self::shard_lock_name(shard)))
     }
 
     fn distributed_state() -> AutumnResult<Arc<DistributedState>> {
@@ -133,10 +122,7 @@ impl BookmarkRepository {
 
     /// Whether `operation` is a genuine write that should call `mark_write()`.
     ///
-    /// `AcquireShardLease` also targets the primary (see [`Self::role_for`])
-    /// but taking an advisory lock isn't a write, so it's deliberately
-    /// excluded — split out from [`Self::conn`] so that's testable without a
-    /// live pool.
+    /// Split out from [`Self::conn`] so that's testable without a live pool.
     const fn is_write(operation: BookmarkOperation) -> bool {
         matches!(
             operation,
@@ -175,63 +161,6 @@ impl BookmarkRepository {
             DieselError::NotFound => Self::missing_bookmark_error("update", id),
             other => AutumnError::from(other),
         })
-    }
-
-    fn finish_mark_dead_result(affected: usize, id: i64) -> AutumnResult<bool> {
-        if affected == 0 {
-            // Replica lag or a concurrent delete can make this row disappear after the
-            // task observed it alive. Treat that as a benign no-op so one stale row does
-            // not abort the whole task run.
-            tracing::debug!(
-                bookmark_id = id,
-                "link-checker skipped stale dead-link update"
-            );
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    async fn try_acquire_shard_lease(shard: u32) -> AutumnResult<Option<ShardLease>> {
-        let mut conn = Self::conn(BookmarkOperation::AcquireShardLease).await?;
-        let (namespace, shard_key) = Self::link_checker_lock_key(shard);
-        let result = diesel::sql_query("SELECT pg_try_advisory_lock($1, $2) AS acquired")
-            .bind::<Integer, _>(namespace)
-            .bind::<Integer, _>(shard_key)
-            .get_result::<LockResult>(&mut conn)
-            .await
-            .map_err(AutumnError::from)?;
-
-        if result.acquired {
-            Ok(Some(ShardLease {
-                conn: Object::take(conn),
-                shard,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn unlock_shard_lease(lease: ShardLease) -> AutumnResult<()> {
-        let ShardLease { mut conn, shard } = lease;
-        let (namespace, shard_key) = Self::link_checker_lock_key(shard);
-        let result = diesel::sql_query("SELECT pg_advisory_unlock($1, $2) AS released")
-            .bind::<Integer, _>(namespace)
-            .bind::<Integer, _>(shard_key)
-            .get_result::<UnlockResult>(&mut conn)
-            .await;
-
-        match result {
-            Ok(result) if result.released => Ok(()),
-            Ok(_) | Err(_) => {
-                // Advisory locks are session-scoped. By the time we get here, the lease is
-                // already detached from the pool, so dropping the raw connection closes the
-                // session instead of recycling a lock-bearing object.
-                drop(conn);
-                Err(AutumnError::service_unavailable_msg(format!(
-                    "failed to release advisory lock for shard {shard_key}"
-                )))
-            }
-        }
     }
 
     pub async fn find_all(&self) -> AutumnResult<Vec<Bookmark>> {
@@ -305,22 +234,34 @@ impl BookmarkRepository {
         Ok(())
     }
 
-    pub async fn mark_dead(&self, id: i64) -> AutumnResult<bool> {
+    /// Mark every `(id, url)` in `dead` dead, in one round trip -- but only
+    /// the rows whose *current* `url` still matches the URL that was probed.
+    ///
+    /// A row is skipped, silently, when: it's already dead (replica lag, a
+    /// concurrent probe, or a concurrent delete can make a row disappear
+    /// from `alive = true` after the task observed it), or its `url` has
+    /// changed since the probe -- `PUT /api/bookmarks/{id}` can repair a
+    /// bookmark's URL mid-scan (it never touches `alive`, so the row is
+    /// still a candidate `alive = true` match by id alone), and a repaired
+    /// URL was never itself probed, so it must not be the one this batch
+    /// marks dead. The caller gets back how many rows it actually flipped.
+    pub async fn mark_dead_many(&self, dead: &[(i64, String)]) -> AutumnResult<usize> {
+        if dead.is_empty() {
+            return Ok(0);
+        }
         let mut conn = Self::conn(BookmarkOperation::MarkDead).await?;
-        let affected = diesel::update(bookmarks::table.find(id))
-            .set(bookmarks::alive.eq(false))
-            .execute(&mut conn)
-            .await
-            .map_err(AutumnError::from)?;
-        Self::finish_mark_dead_result(affected, id)
-    }
-
-    pub(crate) async fn acquire_shard_lease(shard: u32) -> AutumnResult<Option<ShardLease>> {
-        Self::try_acquire_shard_lease(shard).await
-    }
-
-    pub(crate) async fn release_shard_lease(lease: ShardLease) -> AutumnResult<()> {
-        Self::unlock_shard_lease(lease).await
+        let ids: Vec<i64> = dead.iter().map(|(id, _)| *id).collect();
+        let urls: Vec<&str> = dead.iter().map(|(_, url)| url.as_str()).collect();
+        diesel::sql_query(
+            "UPDATE bookmarks AS b SET alive = false \
+             FROM unnest($1::bigint[], $2::text[]) AS d(id, url) \
+             WHERE b.id = d.id AND b.url = d.url AND b.alive = true",
+        )
+        .bind::<Array<BigInt>, _>(ids)
+        .bind::<Array<Text>, _>(urls)
+        .execute(&mut conn)
+        .await
+        .map_err(AutumnError::from)
     }
 
     pub async fn count_all(&self) -> AutumnResult<i64> {
@@ -447,19 +388,6 @@ mod tests {
             BookmarkRepository::role_for(BookmarkOperation::MarkDead),
             PoolRole::Primary
         );
-        assert_eq!(
-            BookmarkRepository::role_for(BookmarkOperation::AcquireShardLease),
-            PoolRole::Primary
-        );
-    }
-
-    #[test]
-    fn acquire_shard_lease_targets_primary_but_is_not_a_write() {
-        assert!(
-            !BookmarkRepository::is_write(BookmarkOperation::AcquireShardLease),
-            "taking an advisory lock must not call mark_write(), even though it \
-             needs a primary connection like a write does"
-        );
     }
 
     #[test]
@@ -568,20 +496,22 @@ mod tests {
     }
 
     #[test]
-    fn advisory_lock_keys_are_stable_per_shard() {
-        let shard_0 = BookmarkRepository::link_checker_lock_key(0);
-        let shard_15 = BookmarkRepository::link_checker_lock_key(15);
-
-        assert_eq!(shard_0, BookmarkRepository::link_checker_lock_key(0));
-        assert_eq!(shard_15, BookmarkRepository::link_checker_lock_key(15));
-        assert_ne!(shard_0, shard_15);
+    fn shard_lock_names_are_stable_and_distinct_per_shard() {
+        assert_eq!(
+            BookmarkRepository::shard_lock_name(0),
+            BookmarkRepository::shard_lock_name(0)
+        );
+        assert_ne!(
+            BookmarkRepository::shard_lock_name(0),
+            BookmarkRepository::shard_lock_name(15)
+        );
     }
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
-    async fn advisory_lock_is_exclusive_and_reacquirable() {
+    async fn shard_lock_is_exclusive_and_reacquirable() {
         let db = TestDb::shared().await;
-        let config = DistributedConfig::from_urls(db.url(), db.url()).with_pool_sizes(1, 1);
+        let config = DistributedConfig::from_urls(db.url(), db.url()).with_pool_sizes(2, 2);
         let pools = create_dual_pools(&config).expect("test pools should build");
         let state = Arc::new(DistributedState::new(config, pools));
         state
@@ -589,36 +519,34 @@ mod tests {
             .expect("distributed state should install");
 
         let shard = 3;
-        let lease = BookmarkRepository::acquire_shard_lease(shard)
+        let guard = BookmarkRepository::shard_lock(shard)
+            .expect("shard lock should build")
+            .try_lock()
             .await
-            .expect("first shard lease should be acquired")
-            .expect("first shard lease should exist");
+            .expect("first acquire should not error")
+            .expect("first acquire should obtain the lock");
 
-        let second_attempt = BookmarkRepository::acquire_shard_lease(shard)
+        let second_attempt = BookmarkRepository::shard_lock(shard)
+            .expect("shard lock should build")
+            .try_lock()
             .await
-            .expect("second shard lease attempt should not error");
+            .expect("second acquire should not error");
         assert!(
             second_attempt.is_none(),
             "the shard lock should remain exclusive while held"
         );
 
-        BookmarkRepository::release_shard_lease(lease)
-            .await
-            .expect("leasing release should succeed");
+        guard.release().await.expect("release should succeed");
 
-        let reacquired = BookmarkRepository::acquire_shard_lease(shard)
+        let reacquired = BookmarkRepository::shard_lock(shard)
+            .expect("shard lock should build")
+            .try_lock()
             .await
             .expect("shard should be reacquirable after release");
         assert!(
             reacquired.is_some(),
             "the shard lock should be available again after release"
         );
-
-        if let Some(lease) = reacquired {
-            BookmarkRepository::release_shard_lease(lease)
-                .await
-                .expect("cleanup release should succeed");
-        }
     }
 
     #[test]
@@ -632,20 +560,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mark_dead_missing_rows_are_tolerated() {
-        let updated = BookmarkRepository::finish_mark_dead_result(0, 99)
-            .expect("replica lag and concurrent deletes should not abort the task");
+    #[tokio::test]
+    async fn mark_dead_many_short_circuits_on_empty_ids_without_touching_the_pool() {
+        // No `DistributedState::global()` is installed in this test, so a
+        // real attempt to acquire a connection would panic with "distributed
+        // state is not installed". Reaching `Ok(0)` instead proves the empty
+        // case returns before `Self::conn(...)` is ever called.
+        let updated = BookmarkRepository
+            .mark_dead_many(&[])
+            .await
+            .expect("an empty batch must not error");
 
-        assert!(!updated);
-    }
-
-    #[test]
-    fn mark_dead_reports_success_when_a_row_was_updated() {
-        let updated = BookmarkRepository::finish_mark_dead_result(1, 99)
-            .expect("affected rows should be reported as an applied update");
-
-        assert!(updated);
+        assert_eq!(updated, 0);
     }
 
     #[test]
