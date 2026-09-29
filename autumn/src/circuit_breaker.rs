@@ -194,12 +194,17 @@ impl CircuitBreakerPolicy {
 /// Represents an error resulting from a circuit breaker operation.
 #[derive(Debug, Error)]
 pub enum CircuitBreakerError<E> {
-    /// The circuit is currently in the [`CircuitState::Open`] state.
-    /// The request was rejected without executing the underlying code.
+    /// The breaker rejected the request without executing the underlying
+    /// code: either the circuit is [`CircuitState::Open`], or it is
+    /// [`CircuitState::HalfOpen`] and every probe slot
+    /// (`half_open_trial_count`) is already taken. Do not read this variant
+    /// as proof of the `Open` state; call [`CircuitBreaker::state`] for that.
     #[error("circuit breaker is open")]
     Open,
-    /// The circuit allowed the request to execute, but the underlying
-    /// operation failed and returned an error.
+    /// The underlying operation or service returned an error. Usually the
+    /// breaker admitted the request and it failed; through
+    /// [`CircuitBreakerService`] this also carries an inner `poll_ready`
+    /// error, reported before any request was admitted.
     #[error("execution failed: {0}")]
     Execution(E),
 }
@@ -733,7 +738,9 @@ pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A `tower::Layer` that wraps a service with a [`CircuitBreaker`].
 ///
-/// It will trip the circuit if the inner service's `Future` resolves to an `Err`.
+/// Each inner `Future` resolving to `Err` is recorded as a failure; the
+/// circuit trips only once the policy's `minimum_sample_count` and
+/// `failure_ratio_threshold` are both met within the sample window.
 #[derive(Clone)]
 pub struct CircuitBreakerLayer {
     breaker: CircuitBreaker,
