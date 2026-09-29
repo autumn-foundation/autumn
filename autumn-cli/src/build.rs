@@ -880,6 +880,7 @@ fn read_cargo_metadata() -> serde_json::Value {
 
     if !output.status.success() {
         eprintln!("\u{2717} Failed to read cargo metadata");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
         std::process::exit(1);
     }
 
