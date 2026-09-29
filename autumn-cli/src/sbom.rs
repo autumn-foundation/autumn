@@ -1868,6 +1868,13 @@ mod tests {
         // Issue #2385, defect 2: `cargo metadata --manifest-path m1/Cargo.toml`
         // on a virtual workspace reports `resolve.root: null`, but the SBOM
         // must describe the named member, not the whole workspace.
+        //
+        // The manifest paths must be absolute on the host: `/tmp/...` has no
+        // drive letter on Windows, so `manifest_matches` would resolve the
+        // requested path against the cwd and never match the package's.
+        let ws = std::env::temp_dir().join("autumn-sbom-2385-ws");
+        let m1_manifest = ws.join("m1").join("Cargo.toml");
+        let m2_manifest = ws.join("m2").join("Cargo.toml");
         let m1_id = "path+file:///tmp/ws/m1#m1@0.3.0";
         let m2_id = "path+file:///tmp/ws/m2#m2@0.3.0";
         let serde_id = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228";
@@ -1879,7 +1886,7 @@ mod tests {
             "license": "MIT",
             "repository": serde_json::Value::Null,
             "source": serde_json::Value::Null,
-            "manifest_path": "/tmp/ws/m1/Cargo.toml",
+            "manifest_path": m1_manifest.to_str().unwrap(),
         });
         let m2 = json!({
             "id": m2_id,
@@ -1888,7 +1895,7 @@ mod tests {
             "license": "MIT",
             "repository": serde_json::Value::Null,
             "source": serde_json::Value::Null,
-            "manifest_path": "/tmp/ws/m2/Cargo.toml",
+            "manifest_path": m2_manifest.to_str().unwrap(),
         });
         let md = metadata_with_resolve(
             &json!([m1, m2, pkg("serde", "1.0.228"), pkg("rand", "0.9.2")]),
@@ -1900,13 +1907,7 @@ mod tests {
                 node(rand_id, &[]),
             ]),
         );
-        let bom = bom_from_cargo_metadata(
-            &md,
-            &fallback(),
-            "0.7.0",
-            Some(Path::new("/tmp/ws/m1/Cargo.toml")),
-        )
-        .unwrap();
+        let bom = bom_from_cargo_metadata(&md, &fallback(), "0.7.0", Some(&m1_manifest)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         assert_eq!(v["metadata"]["component"]["name"], "m1");
         assert_eq!(v["metadata"]["component"]["version"], "0.3.0");
