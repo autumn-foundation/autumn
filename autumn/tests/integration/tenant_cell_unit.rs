@@ -792,3 +792,19 @@ fn touch_does_not_regress_timestamp() {
         "an out-of-order sequence must not regress the recorded access sequence"
     );
 }
+
+/// Regression: each resident cell also owns an accounting-domain index entry
+/// with its own copy of the tenant id, so the structural lower bound must count
+/// three id copies per cell (registry key, domain key, the cell's own id).
+#[test]
+fn structural_overhead_counts_domain_index_entries() {
+    let registry = TenantCellRegistry::new();
+    let ids: Vec<String> = (0..10).map(|i| format!("tenant-{i:04}")).collect();
+    for id in &ids {
+        drop(registry.get_or_create(id, 0));
+    }
+    let id_bytes: usize = ids.iter().map(String::len).sum();
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, ids.len());
+    assert_eq!(structural.tenant_id_capacity_bytes, 3 * id_bytes);
+}

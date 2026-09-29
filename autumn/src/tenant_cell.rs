@@ -236,9 +236,11 @@ pub struct TenantCellStructuralOverhead {
     /// Payloads of the `Arc<TenantCellInner>` allocations. This includes the
     /// atomics, scratch-map header, mutex, and global-gauge `Arc` pointer.
     pub tenant_cell_inner_bytes: usize,
-    /// Inline `String` and `Arc<TenantCell>` values in occupied map buckets.
+    /// Inline values in occupied map buckets: each resident `(String,
+    /// Arc<TenantCell>)` entry plus its `(String, Weak<_>)` domain-index entry.
     pub registry_entry_bytes: usize,
-    /// Heap capacity of both copies of every tenant id (registry key and cell).
+    /// Heap capacity of every copy of each resident tenant id (registry key,
+    /// domain-index key, and the cell's own id).
     pub tenant_id_capacity_bytes: usize,
     /// Two strong/weak counter pairs: one for each per-cell `Arc` allocation.
     pub arc_header_bytes: usize,
@@ -250,8 +252,8 @@ pub struct TenantCellStructuralOverhead {
     /// `SwissTable` implementation's power-of-two backing bucket estimate.
     pub registry_bucket_count: usize,
     /// Lower bound for unoccupied backing slots plus one control byte per
-    /// bucket. This excludes the implementation's trailing control group and
-    /// allocation padding.
+    /// bucket, across the registry map and the domain index. This excludes
+    /// the implementation's trailing control group and allocation padding.
     pub registry_bucket_bytes: usize,
     /// Sum of all deterministic lower-bound structural components.
     pub total_bytes: usize,
@@ -1061,7 +1063,7 @@ impl TenantCellRegistry {
     ///
     /// # Panics
     ///
-    /// Panics if the registry lock is poisoned.
+    /// Panics if the registry lock or the domain index lock is poisoned.
     #[must_use]
     pub fn structural_overhead(&self) -> TenantCellStructuralOverhead {
         // `ArcInner` contains one strong and one weak reference counter before
@@ -1069,6 +1071,7 @@ impl TenantCellRegistry {
         // the stable structural model used here, not an allocator measurement.
         const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
         type RegistryEntry = (String, Arc<TenantCell>);
+        type DomainEntry = (String, Weak<TenantCellInner>);
 
         let cells = self
             .inner
@@ -1081,11 +1084,34 @@ impl TenantCellRegistry {
             + 2 * ARC_HEADER;
         let tenant_cell_bytes = resident_cells * std::mem::size_of::<TenantCell>();
         let tenant_cell_inner_bytes = resident_cells * std::mem::size_of::<TenantCellInner>();
-        let registry_entry_bytes = resident_cells * std::mem::size_of::<RegistryEntry>();
+        // Every resident cell also has an accounting-domain index entry (its
+        // own tenant-id key plus a `Weak`). Lock order matches
+        // `get_or_create`: `cells` first, then `domains`. Entries for evicted
+        // or dead domains are not resident and are omitted (lower bound).
+        let domains = self
+            .inner
+            .domains
+            .lock()
+            .expect("tenant cell domain index lock poisoned");
+        let resident_domain_key_capacities: Vec<usize> = cells
+            .keys()
+            .filter_map(|id| domains.get_key_value(id.as_str()))
+            .map(|(key, _)| key.capacity())
+            .collect();
+        // Current capacity (not a high-water mark) is a lower bound on the
+        // domain index's backing buckets.
+        let domain_bucket_count = Self::estimated_bucket_count(domains.capacity());
+        let domain_bucket_bytes = domain_bucket_count.saturating_sub(domains.len())
+            * std::mem::size_of::<DomainEntry>()
+            + domain_bucket_count;
+        drop(domains);
+        let registry_entry_bytes = resident_cells * std::mem::size_of::<RegistryEntry>()
+            + resident_domain_key_capacities.len() * std::mem::size_of::<DomainEntry>();
         let tenant_id_capacity_bytes = cells
             .iter()
             .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
-            .sum();
+            .sum::<usize>()
+            + resident_domain_key_capacities.iter().sum::<usize>();
         let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
         let registry_element_capacity = cells.capacity();
         // Read allocation history while the map's read guard is still held.
@@ -1100,7 +1126,8 @@ impl TenantCellRegistry {
         drop(cells);
         let registry_bucket_bytes = (registry_bucket_count - resident_cells)
             * std::mem::size_of::<RegistryEntry>()
-            + registry_bucket_count;
+            + registry_bucket_count
+            + domain_bucket_bytes;
         let total_bytes = registry_fixed_bytes
             + tenant_cell_bytes
             + tenant_cell_inner_bytes
