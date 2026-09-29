@@ -1632,6 +1632,7 @@ pub fn plan_add(
     entry: &CatalogEntry,
     version: &str,
 ) -> Result<AddOutcome, PluginError> {
+    refuse_virtual_workspace(root)?;
     app_autumn_web(root)?;
     let app = resolved_app_version(root, entry.crate_name)?;
     // A range (`>=0.8, <0.9`) has no single series to compare, but one that
@@ -1690,12 +1691,6 @@ pub fn plan_add(
 
     let manifest = manifest_path(root);
     let manifest_src = std::fs::read_to_string(&manifest)?;
-    // A virtual workspace root has no `[package]` table: `ensure_cargo_dependencies`
-    // would append a `[dependencies]` section to a manifest that cannot own
-    // dependencies. Refuse before planning anything (issue #2381).
-    if !has_package_table(&manifest_src) {
-        return Err(PluginError::NoPackageTable);
-    }
     let main_path = root.join("src").join("main.rs");
     let main_src = std::fs::read_to_string(&main_path).unwrap_or_default();
 
@@ -1779,6 +1774,7 @@ pub fn plan_add_community(
     crate_name: &str,
     version: &str,
 ) -> Result<AddOutcome, PluginError> {
+    refuse_virtual_workspace(root)?;
     app_autumn_web(root)?;
     // `=` pins a listed crate to its verified version (issue #1625).
     if !is_plausible_version(version.strip_prefix('=').unwrap_or(version)) {
@@ -1796,12 +1792,6 @@ pub fn plan_add_community(
     }
     let manifest = manifest_path(root);
     let manifest_src = std::fs::read_to_string(&manifest)?;
-    // A virtual workspace root has no `[package]` table: `ensure_cargo_dependencies`
-    // would append a `[dependencies]` section to a manifest that cannot own
-    // dependencies. Refuse before planning anything (issue #2381).
-    if !has_package_table(&manifest_src) {
-        return Err(PluginError::NoPackageTable);
-    }
     let snippet = super::catalog::community_mount_snippet(crate_name)
         .unwrap_or_else(|| "        .plugin(/* see the crate's README */)".to_owned());
 
@@ -1939,6 +1929,24 @@ pub fn manifest_path(root: &Path) -> PathBuf {
 /// Whether the manifest text declares a `[package]` table — i.e. it is a
 /// package manifest that can own a `[dependencies]` section, not a virtual
 /// workspace root (issue #2381).
+/// A virtual workspace root has no `[package]` table: `ensure_cargo_dependencies`
+/// would append a `[dependencies]` section to a manifest that cannot own
+/// dependencies (issue #2381). Checked before any dependency resolution, so a
+/// real virtual manifest — `[workspace]` plus `[workspace.dependencies]`, no
+/// top-level `[dependencies]` — gets this diagnostic rather than
+/// [`PluginError::NoAutumnWeb`].
+fn refuse_virtual_workspace(root: &Path) -> Result<(), PluginError> {
+    let manifest = manifest_path(root);
+    if !manifest.is_file() {
+        return Err(PluginError::NotInProject);
+    }
+    if has_package_table(&std::fs::read_to_string(&manifest)?) {
+        Ok(())
+    } else {
+        Err(PluginError::NoPackageTable)
+    }
+}
+
 fn has_package_table(manifest_src: &str) -> bool {
     toml::from_str::<toml::Table>(manifest_src)
         .is_ok_and(|table| table.get("package").is_some_and(toml::Value::is_table))
@@ -3718,6 +3726,26 @@ autumn-web = "0.7.0"
             std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
             VIRTUAL_WORKSPACE_CARGO,
             "a refused install must leave the manifest byte-identical"
+        );
+    }
+
+    /// A real virtual manifest declares `autumn-web` only under
+    /// `[workspace.dependencies]`, so `app_autumn_web` alone would report
+    /// `NoAutumnWeb`: the package-table guard must run first.
+    #[test]
+    fn both_add_paths_name_a_real_virtual_workspace_root() {
+        const REAL_VIRTUAL_CARGO: &str = "[workspace]\nmembers = [\"app\"]\n\n\
+                                          [workspace.dependencies]\nautumn-web = \"0.7.0\"\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, REAL_VIRTUAL_CARGO);
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::NoPackageTable),
+            "plan_add: {err}"
+        );
+        let err = plan_add_community(tmp.path(), "autumn-plugin-x", "=0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::NoPackageTable),
+            "plan_add_community: {err}"
         );
     }
 
