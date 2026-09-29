@@ -159,6 +159,7 @@ Looking for the API reference instead? That is
 - [Money and the Ledger](money.md) — holding amounts without rounding them away, and moving money without double-charging or losing it
 - [A/B Experiments](experiments.md) — assigning users to variants and reading the results
 - [Feature Flags](feature-flags.md) — turning a feature on for some users and not others
+- [SLA Obligations and Business Calendars](sla.md) — deadlines in business time that pause on weekends and holidays and escalate once (`sla` feature)
 - [Admin Panel](admin.md) — the generated CRUD backoffice, and restricting who reaches it
 
 ## Content, SEO and localization
