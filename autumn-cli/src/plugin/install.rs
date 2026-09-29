@@ -1941,8 +1941,7 @@ pub fn manifest_path(root: &Path) -> PathBuf {
 /// workspace root (issue #2381).
 fn has_package_table(manifest_src: &str) -> bool {
     toml::from_str::<toml::Table>(manifest_src)
-        .ok()
-        .is_some_and(|table| table.get("package").is_some_and(toml::Value::is_table))
+        .is_ok_and(|table| table.get("package").is_some_and(toml::Value::is_table))
 }
 
 #[cfg(test)]
