@@ -5,7 +5,7 @@
 //! from a [`crate::entropy::SeededEntropy`], as it does under
 //! [`#[sim_test]`](crate::sim_test) — reproducible.
 //!
-//! Five gates run before the sample rate is even consulted, cheapest first:
+//! Six gates run before the sample rate is even consulted, cheapest first:
 //!
 //! 1. **Method.** Only [`MIRRORABLE_METHODS`] (`GET`/`HEAD`). This slice
 //!    mirrors idempotent traffic only, and the set is a constant rather than a
@@ -22,11 +22,22 @@
 //!    request than the live build answered and record the manufactured
 //!    difference as a divergence. Until the mutating-traffic follow-up
 //!    brings real request-body replay, these requests sit out quietly.
-//! 4. **Exempt paths.** The actuator prefix and the platform probe paths. A
+//! 4. **Conditional requests.** A `GET`/`HEAD` carrying `If-None-Match`,
+//!    `If-Modified-Since`, `If-Range` (or `If-Match`/`If-Unmodified-Since`)
+//!    is a cache revalidation, and a validator is scoped to the build that
+//!    issued it. Replaying the primary's validator to the candidate makes the
+//!    two builds answer differently for reasons that have nothing to do with a
+//!    regression — the primary returns `304` while the candidate, whose
+//!    validator differs, returns `200` — and when both *do* revalidate, the
+//!    differ compares two empty `304` bodies and records a vacuous `match`
+//!    that masks a genuine body regression. Conditional traffic is never
+//!    mirrored (issue #2335); the skip is counted separately so the report
+//!    shows how much coverage this costs on cache-heavy routes.
+//! 5. **Exempt paths.** The actuator prefix and the platform probe paths. A
 //!    load balancer's health checks are the highest-rate, least-interesting
 //!    traffic an app serves; mirroring them buys nothing and drowns the
 //!    candidate.
-//! 5. **Route allowlist.** Empty means "every eligible route".
+//! 6. **Route allowlist.** Empty means "every eligible route".
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
@@ -89,6 +100,12 @@ pub enum SkipReason {
     /// candidate a different request than the live build answered and record
     /// the manufactured difference as a divergence.
     HasRequestBody,
+    /// A conditional request (`If-None-Match`, `If-Modified-Since`,
+    /// `If-Range`, `If-Match`, `If-Unmodified-Since`): a cache revalidation
+    /// whose validator belongs to the primary's build, so mirroring it would
+    /// compare the primary's `304` against the candidate's `200` — or compare
+    /// two empty `304` bodies and report a vacuous match (issue #2335).
+    Conditional,
     /// An actuator or probe path.
     ExemptPath,
     /// A route allowlist is configured and this path is not on it.
@@ -105,6 +122,7 @@ impl SkipReason {
             Self::Method => "method",
             Self::LoopGuard => "loop_guard",
             Self::HasRequestBody => "has_request_body",
+            Self::Conditional => "conditional",
             Self::ExemptPath => "exempt_path",
             Self::RouteNotOptedIn => "route_not_opted_in",
             Self::NotSampled => "not_sampled",
@@ -210,7 +228,7 @@ impl MirrorSelector {
     /// the request sits out: a skipped mirror costs coverage, a mirrored
     /// body-carrying request manufactures divergences.
     ///
-    /// `roll` is a **thunk**, not a value: it is called only once the five
+    /// `roll` is a **thunk**, not a value: it is called only once the six
     /// cheap gates above have passed. On an app with mirroring enabled this
     /// runs on every inbound request, and the entropy source behind
     /// [`roll_from`] takes a lock — so drawing eagerly would put a lock
@@ -237,6 +255,9 @@ impl MirrorSelector {
         // end-of-stream signal. Fails closed: doubt means no mirror.
         if !body_known_empty || request_carries_body(headers) {
             return MirrorDecision::Skip(SkipReason::HasRequestBody);
+        }
+        if is_conditional(headers) {
+            return MirrorDecision::Skip(SkipReason::Conditional);
         }
 
         let path = path_of(target);
@@ -333,6 +354,25 @@ fn request_carries_body(headers: &HeaderMap) -> bool {
     })
 }
 
+/// Whether the request is a conditional one — a cache revalidation carrying a
+/// validator (`If-None-Match`, `If-Modified-Since`, `If-Range`), or a
+/// conditional write guard (`If-Match`, `If-Unmodified-Since`) which cannot
+/// appear on mirrored traffic anyway but is excluded for completeness (issue
+/// #2335).
+///
+/// Only header *presence* is tested: the value is the primary's validator and
+/// is never meaningful to the candidate.
+fn is_conditional(headers: &HeaderMap) -> bool {
+    use axum::http::header::{
+        IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
+    };
+    headers.contains_key(IF_NONE_MATCH)
+        || headers.contains_key(IF_MODIFIED_SINCE)
+        || headers.contains_key(IF_RANGE)
+        || headers.contains_key(IF_MATCH)
+        || headers.contains_key(IF_UNMODIFIED_SINCE)
+}
+
 /// Draw a sampling roll in `[0, 1)` from an entropy source.
 ///
 /// Uses the top 53 bits so every draw is exactly representable as an `f64`, and
@@ -421,6 +461,42 @@ mod tests {
         assert_eq!(
             selector.decide(&Method::HEAD, "/api/orders", &headers, true, || 0.0),
             MirrorDecision::Skip(SkipReason::HasRequestBody)
+        );
+    }
+
+    #[test]
+    fn conditional_requests_are_never_mirrored() {
+        use axum::http::header::{
+            HeaderName, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
+        };
+        let selector = selector();
+        let conditionals: [(&HeaderName, &str); 5] = [
+            (&IF_NONE_MATCH, "\"abc123\""),
+            (&IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT"),
+            (&IF_RANGE, "\"abc123\""),
+            (&IF_MATCH, "\"abc123\""),
+            (&IF_UNMODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ];
+        for (name, value) in conditionals {
+            for method in [Method::GET, Method::HEAD] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name, HeaderValue::from_str(value).expect("header value"));
+                assert_eq!(
+                    selector.decide(&method, "/api/orders", &headers, true, || 0.0),
+                    MirrorDecision::Skip(SkipReason::Conditional),
+                    "{method} with {name} must not be mirrored"
+                );
+            }
+        }
+        // An unconditional request carrying other headers still mirrors.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Mirror
         );
     }
 
@@ -656,9 +732,16 @@ mod tests {
             0.0
         };
 
-        // Wrong method, exempt path, and un-opted-in route must all decide
-        // without touching the entropy source.
+        // Wrong method, conditional request, exempt path, and un-opted-in route
+        // must all decide without touching the entropy source.
         let _ = selector.decide(&Method::POST, "/api/orders", &HeaderMap::new(), true, roll);
+        assert_eq!(draws.get(), 0);
+        let mut conditional = HeaderMap::new();
+        conditional.insert(
+            axum::http::header::IF_NONE_MATCH,
+            HeaderValue::from_static("\"x\""),
+        );
+        let _ = selector.decide(&Method::GET, "/api/orders", &conditional, true, roll);
         assert_eq!(draws.get(), 0);
         let _ = selector.decide(
             &Method::GET,
@@ -694,6 +777,7 @@ mod tests {
         assert_eq!(SkipReason::Method.as_str(), "method");
         assert_eq!(SkipReason::LoopGuard.as_str(), "loop_guard");
         assert_eq!(SkipReason::HasRequestBody.as_str(), "has_request_body");
+        assert_eq!(SkipReason::Conditional.as_str(), "conditional");
         assert_eq!(SkipReason::ExemptPath.as_str(), "exempt_path");
         assert_eq!(SkipReason::RouteNotOptedIn.as_str(), "route_not_opted_in");
         assert_eq!(SkipReason::NotSampled.as_str(), "not_sampled");
