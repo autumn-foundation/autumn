@@ -23,6 +23,9 @@ presence = ["ws"]
 # The hub half additionally needs `presence`; the CRDT, the marker and the
 # offline-sync resolver compile without it.
 collab = []
+# Calendar-aware SLA obligations (issue #1826). Adds `autumn_web::sla` and
+# `#[obligation]`. Zero new dependencies.
+sla = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
@@ -68,7 +71,8 @@ constela = ["maud"]
 # constructed, used and dropped only on those threads, never inside the async
 # runtime.
 db = [
-    "autumn-macros/db",
+    "dep:autumn-macros-model",
+    "dep:autumn-macros-repository",
     "reqwest?/blocking",
     "dep:deadpool",
     "dep:diesel",
@@ -76,6 +80,7 @@ db = [
     "dep:diesel_migrations",
     "dep:libsqlite3-sys",
     "dep:pq-sys",
+    "dep:pq-src",
     "dep:scoped-futures",
     "dep:tokio-postgres",
     "dep:tokio-postgres-rustls",
@@ -292,12 +297,17 @@ autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
 # floor); licensed MIT OR Apache-2.0.
 wasmi = { version = "0.40", optional = true }
-# `default-features = false` drops the `#[model]` / `#[repository]` codegen from
-# the macro crate; the `db` feature above forwards it back on. A no-database app
-# could never reach either macro anyway (both re-exports are `#[cfg(feature =
-# "db")]` in `src/lib.rs`), and skipping them cuts the macro crate's own compile
-# time by ~90% on the no-DB onboarding path (issue #2309).
+# `default-features = false` drops the database-layer macros from the core
+# macro crate; the `db` feature above pulls them back in through the
+# `autumn-macros-model` / `autumn-macros-repository` crates. A no-database app
+# could never reach those macros anyway (their re-exports are `#[cfg(feature =
+# "db")]` in `src/lib.rs`), and skipping them cuts macro compile time by ~90%
+# on the no-DB onboarding path (issue #2309).
 autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
+# Database-layer proc macros, split out of `autumn-macros` so a no-database
+# build never compiles their codegen. Optional: enabled by the `db` feature.
+autumn-macros-model = { version = "0.7.0", path = "../autumn-macros-model", optional = true }
+autumn-macros-repository = { version = "0.7.0", path = "../autumn-macros-repository", optional = true }
 axum.workspace = true
 # 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
 # sandbox concurrency permit and release it exactly when the last handle drops.
@@ -317,6 +327,8 @@ bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
 pq-sys = { workspace = true, optional = true }
+# Direct only to hold the version. See the workspace `Cargo.toml`.
+pq-src = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1.4", optional = true }
@@ -326,7 +338,7 @@ tokio-postgres = { version = "0.7", optional = true }
 # setup callback. `ring` (not the aws-lc default) keeps cross-compilation
 # to mobile targets working; `webpki-roots` provides a deterministic root
 # store on platforms without an accessible native one.
-tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
 rustls-pki-types = { version = "1", features = ["std"], optional = true }
 webpki-roots = { version = "1", optional = true }
@@ -431,7 +443,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
-infer = { version = "0.16", optional = true }
+infer = { version = "0.22", optional = true }
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
 # `zeroize` wipes the AES round-key schedule and the GHASH subkey when a cipher
@@ -543,6 +555,9 @@ features = [
   # `tls` module (TlsListener, CertReloader, load_certified_key) is missing
   # from the published docs.
   "tls",
+  # SLA obligations (#1826). Zero new dependencies. Without it, the `sla`
+  # module and `#[obligation]` are missing from the published docs.
+  "sla",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -601,6 +616,17 @@ name = "pdf_render"
 harness = false
 required-features = ["pdf"]
 
+# User-submitted rich-text workload for profilers, driving
+# `markdown::render_user_content_html` through the real pulldown-cmark parse +
+# `SafeEvents` filter + `ammonia` allowlist-sanitizer pipeline (issue #1255) —
+# the comment/post/wiki-body render path no other committed bench touches.
+# `required-features` since `markdown` is an opt-in feature, unlike most of
+# the other benches in this crate.
+[[bench]]
+name = "markdown_render"
+harness = false
+required-features = ["markdown"]
+
 # Signed-CSRF-cookie workload for profilers: drives real POST traffic through
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
 # attributable in a profiler. Asserts nothing — see the file header for the
@@ -629,6 +655,23 @@ harness = false
 [[bench]]
 name = "throttle_check"
 harness = false
+
+# Drives `money::ledger::post` (issue #1837) against an in-memory SQLite
+# database — no Docker needed, unlike `repository_crud`/`money_ledger_postgres`.
+# See the file header for the exact commands.
+[[bench]]
+name = "ledger_post"
+harness = false
+required-features = ["sqlite"]
+
+# Live-typing workload for the collaborative text CRDT (issue #1806): drives
+# `CollabText::insert_after` one keystroke at a time, the same call
+# `CollabHub`'s message loop makes per op. See the file header for the exact
+# commands.
+[[bench]]
+name = "collab_edit"
+harness = false
+required-features = ["collab"]
 
 # W6 PR3 seed-sweep runner (issue #1797): CI-facing driver for
 # `sim::sweep::sweep_proptest`. `required-features` (not a `#![cfg(...)]` file
@@ -869,7 +912,7 @@ path = "tests/sqlite_json_field_conversion.rs"
 # tenant A's row untouched (no cross-tenant leak) and (Bug 2, lock) a stale
 # `lock_version` upsert surfaces a 409 — matching Postgres. Runs on an in-memory
 # SQLite pool with no Docker. Bug 1 (advisory-lock cfg-gate) is pinned by the
-# autumn-macros expansion test. Only meaningful under `--features sqlite`; the
+# autumn-macros-repository expansion test. Only meaningful under `--features sqlite`; the
 # file is `#![cfg(feature = "sqlite")]` so a default `cargo test` compiles it to
 # an empty (passing) binary. Run explicitly:
 # `cargo test -p autumn-web --features sqlite --test sqlite_upsert_isolation`.
@@ -1053,6 +1096,15 @@ path = "tests/sqlite_statement_timeout_fail_closed.rs"
 [[test]]
 name = "sqlite_dependent_destroy"
 path = "tests/sqlite_dependent_destroy.rs"
+
+# `#[commentable]` hard-delete on SQLite (Snag charter, issue #2275 follow-up).
+# `docs/guide/commentable.md` claims "Both backends are supported", but the
+# feature's only live-DB suite is Postgres-only (testcontainers). Runs
+# explicitly: `cargo test -p autumn-web --features sqlite --test
+# sqlite_commentable`.
+[[test]]
+name = "sqlite_commentable"
+path = "tests/sqlite_commentable.rs"
 
 # SQLite read-only-transaction safety proof (issue #1614, Codex P2). The SQLite
 # arm of `Db::tx_with` cannot enforce `READ ONLY`, so a `TxOptions::read_only()`
@@ -1280,6 +1332,15 @@ path = "tests/cache_global_integration.rs"
 [[test]]
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
+
+# Isolated: reads/writes the process-global cache backend via
+# `cache_fragment_global`, which `TestApp::build` clears unconditionally and
+# which a concurrently running consolidated-binary test could otherwise
+# stomp on — same reason as `cache_global_integration`/`cached_global_backend`
+# above (Warden 2026-09-21, docs/security/2026-09-21-fragment-cache-tenant-key/).
+[[test]]
+name = "cache_fragment_tenant_scope"
+path = "tests/cache_fragment_tenant_scope.rs"
 
 # Isolated: installs a process-global cache backend and depends on it surviving
 # across two requests, which any concurrent `TestApp::build` would clear.

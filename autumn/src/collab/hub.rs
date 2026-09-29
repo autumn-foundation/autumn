@@ -303,9 +303,10 @@ pub enum CollabServerMessage {
         /// for one ([`CollabSession::snapshot`]).
         ///
         /// A client needs it to recognise its own operations coming back. It
-        /// sends an edit and waits for the echo before diffing again; without
-        /// a way to tell "my edit landed" from "somebody else typed", a second
-        /// keystroke inside one round trip would re-send the first.
+        /// holds a placeholder for each character it sent and drops the
+        /// placeholder when the echo names it; without a way to tell "my edit
+        /// landed" from "somebody else typed", a second keystroke inside one
+        /// round trip would re-send the first.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<String>,
     },

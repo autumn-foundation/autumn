@@ -1232,27 +1232,42 @@ async fn load_account(
         .transpose()
 }
 
-/// Read one account and hold its row until the enclosing transaction ends.
+/// Read every account in `ids` and hold its row until the enclosing
+/// transaction ends, in one round trip.
 ///
 /// The lock is what makes the negative-balance check exact: two concurrent
-/// postings against one account are serialized behind it, so neither can read a
-/// balance the other is about to change.
-async fn lock_account(
+/// postings against one account are serialized behind it, so neither can read
+/// a balance the other is about to change.
+///
+/// `ORDER BY id` runs before `FOR UPDATE` locks are taken (on Postgres, the
+/// planner puts `LockRows` above the `Sort` that satisfies the `ORDER BY`, so
+/// rows are locked in the order they come out of the sort) — the same
+/// ascending order the caller's loop took them in one at a time before, which
+/// is what keeps two posts over overlapping accounts from deadlocking. An
+/// account named more than once by `ids` is harmless: `IN` matches it once.
+async fn lock_accounts(
     conn: &mut RuntimeConnection,
-    account_id: &str,
-) -> Result<Option<Account>, LedgerError> {
+    ids: &[&str],
+) -> Result<BTreeMap<String, Account>, LedgerError> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = (1..=ids.len()).map(ph).collect::<Vec<_>>().join(", ");
     let sql = format!(
-        "SELECT id, currency, allow_negative FROM {ACCOUNTS_TABLE} WHERE id = {}{FOR_UPDATE}",
-        ph(1)
+        "SELECT id, currency, allow_negative FROM {ACCOUNTS_TABLE} \
+         WHERE id IN ({placeholders}) ORDER BY id{FOR_UPDATE}"
     );
-    let rows: Vec<AccountRow> = diesel::sql_query(sql)
-        .bind::<Text, _>(account_id)
-        .load(conn)
-        .await?;
+    let mut query = diesel::sql_query(sql).into_boxed();
+    for id in ids {
+        query = query.bind::<Text, _>((*id).to_owned());
+    }
+    let rows: Vec<AccountRow> = query.load(conn).await?;
     rows.into_iter()
-        .next()
-        .map(AccountRow::into_account)
-        .transpose()
+        .map(|row| {
+            row.into_account()
+                .map(|account| (account.id.clone(), account))
+        })
+        .collect()
 }
 
 /// Post `transfer` to the ledger, exactly once.
@@ -1336,21 +1351,21 @@ pub async fn post(
     for posting in transfer.postings() {
         wanted.insert(posting.account_id());
     }
-    let mut accounts: BTreeMap<String, Account> = BTreeMap::new();
+    let ids: Vec<&str> = wanted.iter().copied().collect();
+    let accounts = lock_accounts(conn, &ids).await?;
     for id in &wanted {
-        let account = lock_account(conn, id)
-            .await?
+        let account = accounts
+            .get(*id)
             .ok_or_else(|| LedgerError::UnknownAccount {
                 id: (*id).to_owned(),
             })?;
         if account.currency != checked.currency {
             return Err(LedgerError::AccountCurrency {
-                account: account.id,
+                account: account.id.clone(),
                 expected: account.currency.code(),
                 found: checked.currency.code(),
             });
         }
-        accounts.insert((*id).to_owned(), account);
     }
 
     // Already posted? Then the money moved once and this call is the retry.
@@ -1439,34 +1454,55 @@ fn transaction_depth(conn: &mut RuntimeConnection) -> Result<u32, LedgerError> {
 }
 
 /// Write one transaction's postings, in the order they were supplied.
+///
+/// One multi-row `INSERT`, not one per posting (#1837 follow-up). Each
+/// `execute()` is its own parse-prepare-exec round trip, and a transaction can
+/// carry dozens of legs — a payroll run, a marketplace revenue split — that
+/// all belong to the same `INSERT`; the loop was paying that round-trip cost
+/// once per leg instead of once per transaction.
 async fn write_postings(
     conn: &mut RuntimeConnection,
     transaction_id: &str,
     transfer: &Transaction,
 ) -> Result<(), LedgerError> {
+    let postings = transfer.postings();
+    // Bounded by `MAX_POSTINGS`, already enforced by `Transaction::validate`
+    // (which `post` calls before this), so the string this builds is bounded
+    // too.
+    let mut values = String::with_capacity(postings.len().saturating_mul(24));
+    for i in 0..postings.len() {
+        if i > 0 {
+            values.push_str(", ");
+        }
+        let base = i.saturating_mul(5);
+        let _ = write!(
+            values,
+            "({}, {}, {}, {}, {}, {NOW})",
+            ph(base.saturating_add(1)),
+            ph(base.saturating_add(2)),
+            ph(base.saturating_add(3)),
+            ph(base.saturating_add(4)),
+            ph(base.saturating_add(5)),
+        );
+    }
     let sql = format!(
         "INSERT INTO {POSTINGS_TABLE} \
            (transaction_id, seq, account_id, amount_minor, currency, posted_at) \
-         VALUES ({}, {}, {}, {}, {}, {NOW})",
-        ph(1),
-        ph(2),
-        ph(3),
-        ph(4),
-        ph(5)
+         VALUES {values}"
     );
-    for (index, posting) in transfer.postings().iter().enumerate() {
+    let mut query = diesel::sql_query(sql).into_boxed();
+    for (index, posting) in postings.iter().enumerate() {
         let seq = i64::try_from(index).map_err(|_| LedgerError::PostingCount {
-            count: transfer.postings().len(),
+            count: postings.len(),
         })?;
-        diesel::sql_query(sql.clone())
-            .bind::<Text, _>(transaction_id)
+        query = query
+            .bind::<Text, _>(transaction_id.to_owned())
             .bind::<BigInt, _>(seq)
-            .bind::<Text, _>(posting.account_id())
+            .bind::<Text, _>(posting.account_id().to_owned())
             .bind::<BigInt, _>(posting.signed_minor()?)
-            .bind::<Text, _>(posting.amount().currency().code())
-            .execute(conn)
-            .await?;
+            .bind::<Text, _>(posting.amount().currency().code());
     }
+    query.execute(conn).await?;
     Ok(())
 }
 

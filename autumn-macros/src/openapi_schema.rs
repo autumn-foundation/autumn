@@ -9,7 +9,7 @@
 //! `{"type":"object","title":"X"}` placeholder.
 //!
 //! For structs this mirrors the schema `#[model]` already generates
-//! (`crate::schema::emit_schema_fn_body_full`): each field becomes a JSON-schema
+//! (`autumn_macros_support::schema::emit_schema_fn_body_full`): each field becomes a JSON-schema
 //! property and every non-`Option` field is `required`. For enums it emits the
 //! closed-set form (`{"type":"string","enum":[…]}`) that serde's default
 //! externally-tagged representation produces for unit variants — the shape a
@@ -54,20 +54,25 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 let field_refs: Vec<&syn::Field> = named
                     .named
                     .iter()
-                    .filter(|f| crate::schema::serde_bare_word(&f.attrs, &["skip"]).is_none())
+                    .filter(|f| {
+                        autumn_macros_support::schema::serde_bare_word(&f.attrs, &["skip"])
+                            .is_none()
+                    })
                     .collect();
                 let field_ref_refs: Vec<&&syn::Field> = field_refs.iter().collect();
                 // Honor a container `#[serde(rename_all = "...")]` — the split
                 // form is refused above, so this side is the only side.
-                let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
+                let rename_all_rule =
+                    autumn_macros_support::schema::serde_rename_all_serialize_rule(&input.attrs);
                 // A container `#[serde(default)]` (bare or `= "path"`) lets
                 // EVERY field be absent from a request, filled from the struct
                 // default. Nothing is required then. Safe in both directions:
                 // a response still carries every field, so a client that does
                 // not demand them is not misled, while a request client is no
                 // longer forced to send what the handler does not need.
-                let container_default = crate::schema::has_serde_default(&input.attrs);
-                let body = crate::schema::emit_schema_fn_body_full(
+                let container_default =
+                    autumn_macros_support::schema::has_serde_default(&input.attrs);
+                let body = autumn_macros_support::schema::emit_schema_fn_body_full(
                     &field_ref_refs,
                     container_default,
                     &[],
@@ -76,7 +81,7 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                     // and is always present in a response, so "not required" is
                     // true of both directions — no conflict, unlike the
                     // directional attributes refused above.
-                    &|f: &syn::Field| crate::schema::has_serde_default(&f.attrs),
+                    &|f: &syn::Field| autumn_macros_support::schema::has_serde_default(&f.attrs),
                 );
                 // `#[serde(deny_unknown_fields)]` makes deserialization REJECT
                 // any key not listed above. Without `additionalProperties:
@@ -89,7 +94,11 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
                 // a response built from this struct never carries a key outside
                 // the listed set either, so the closed object is true of the
                 // serialize side as well.
-                if crate::schema::serde_bare_word(&input.attrs, &["deny_unknown_fields"]).is_some()
+                if autumn_macros_support::schema::serde_bare_word(
+                    &input.attrs,
+                    &["deny_unknown_fields"],
+                )
+                .is_some()
                 {
                     quote! {{
                         let mut __autumn_closed = { #body };
@@ -166,21 +175,24 @@ fn enum_schema_body(
 ) -> syn::Result<proc_macro2::TokenStream> {
     reject_undescribable_enum(input, data)?;
 
-    let rename_all_rule = crate::schema::serde_rename_all_serialize_rule(&input.attrs);
+    let rename_all_rule =
+        autumn_macros_support::schema::serde_rename_all_serialize_rule(&input.attrs);
     let values: Vec<String> = data
         .variants
         .iter()
-        .filter(|v| !crate::schema::variant_is_serde_skipped(v))
+        .filter(|v| !autumn_macros_support::schema::variant_is_serde_skipped(v))
         .map(|v| {
             let raw = v.ident.to_string();
             let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
             // Precedence mirrors serde: a variant-level `#[serde(rename)]` wins
             // over the container `#[serde(rename_all)]`, which wins over the
             // raw identifier.
-            crate::schema::variant_serde_serialize_rename(v)
+            autumn_macros_support::schema::variant_serde_serialize_rename(v)
                 .or_else(|| {
                     rename_all_rule.as_deref().and_then(|rule| {
-                        crate::schema::apply_serde_rename_all_rule_to_variant(rule, &raw)
+                        autumn_macros_support::schema::apply_serde_rename_all_rule_to_variant(
+                            rule, &raw,
+                        )
                     })
                 })
                 .unwrap_or(raw)
@@ -258,9 +270,9 @@ fn reject_undescribable_conditional_skip(
     // attribute, and it is a NO-OP for a real `Option` — serde already
     // fills a missing one with `None` — so the suggestion is correct
     // whichever of the two the type turns out to be.
-    if crate::schema::field_has_skip_serializing_if(field)
-        && !crate::schema::has_serde_default(&field.attrs)
-        && !crate::schema::has_serde_default(container_attrs)
+    if autumn_macros_support::schema::field_has_skip_serializing_if(field)
+        && !autumn_macros_support::schema::has_serde_default(&field.attrs)
+        && !autumn_macros_support::schema::has_serde_default(container_attrs)
     {
         return Err(syn::Error::new_spanned(
             field,
@@ -280,7 +292,9 @@ fn reject_undescribable_conditional_skip(
 
 fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) -> syn::Result<()> {
     // ── Container ────────────────────────────────────────────────────
-    if let Some(word) = crate::schema::serde_bare_word(&input.attrs, &["transparent", "untagged"]) {
+    if let Some(word) =
+        autumn_macros_support::schema::serde_bare_word(&input.attrs, &["transparent", "untagged"])
+    {
         return Err(syn::Error::new_spanned(
             input,
             format!(
@@ -292,9 +306,10 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
             ),
         ));
     }
-    if let Some(key) =
-        crate::schema::serde_valued_key(&input.attrs, &["into", "from", "try_from", "tag"])
-    {
+    if let Some(key) = autumn_macros_support::schema::serde_valued_key(
+        &input.attrs,
+        &["into", "from", "try_from", "tag"],
+    ) {
         return Err(syn::Error::new_spanned(
             input,
             format!(
@@ -305,13 +320,16 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
             ),
         ));
     }
-    if let Some(key) = crate::schema::serde_split_rename(&input.attrs, "rename_all") {
+    if let Some(key) = autumn_macros_support::schema::serde_split_rename(&input.attrs, "rename_all")
+    {
         return Err(syn::Error::new_spanned(input, split_rename_message(key)));
     }
 
     // ── Fields ───────────────────────────────────────────────────────
     for field in &named.named {
-        if let Some(word) = crate::schema::serde_bare_word(&field.attrs, &["flatten"]) {
+        if let Some(word) =
+            autumn_macros_support::schema::serde_bare_word(&field.attrs, &["flatten"])
+        {
             return Err(syn::Error::new_spanned(
                 field,
                 format!(
@@ -330,7 +348,7 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
         // the serialize half: this schema serves requests AND responses, so an
         // adapter on either side can make it wrong for that side. `with` sets
         // both at once.
-        if let Some(key) = crate::schema::serde_valued_key(
+        if let Some(key) = autumn_macros_support::schema::serde_valued_key(
             &field.attrs,
             &["with", "serialize_with", "deserialize_with"],
         ) {
@@ -345,7 +363,8 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
                 ),
             ));
         }
-        if let Some(word) = crate::schema::variant_directional_skip_on_field(field) {
+        if let Some(word) = autumn_macros_support::schema::variant_directional_skip_on_field(field)
+        {
             return Err(syn::Error::new_spanned(
                 field,
                 format!(
@@ -365,7 +384,7 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
         // sharpens it into a contradiction: the alias key is then forbidden as
         // an additional property AND the canonical one demanded, so no request
         // satisfies the schema and the handler at once.
-        if crate::schema::has_serde_alias(&field.attrs) {
+        if autumn_macros_support::schema::has_serde_alias(&field.attrs) {
             return Err(syn::Error::new_spanned(
                 field,
                 "#[derive(OpenApiSchema)] cannot describe a field with `#[serde(alias = \"…\")]`: \
@@ -376,7 +395,8 @@ fn reject_undescribable_struct(input: &DeriveInput, named: &syn::FieldsNamed) ->
                  hand and register it with `OpenApiConfig::register_schema`.",
             ));
         }
-        if let Some(key) = crate::schema::serde_split_rename(&field.attrs, "rename") {
+        if let Some(key) = autumn_macros_support::schema::serde_split_rename(&field.attrs, "rename")
+        {
             return Err(syn::Error::new_spanned(field, split_rename_message(key)));
         }
     }
@@ -416,7 +436,7 @@ fn reject_untagged_variants(data: &syn::DataEnum) -> syn::Result<()> {
     if let Some(variant) = data
         .variants
         .iter()
-        .find(|v| crate::schema::serde_bare_word(&v.attrs, &["untagged"]).is_some())
+        .find(|v| autumn_macros_support::schema::serde_bare_word(&v.attrs, &["untagged"]).is_some())
     {
         return Err(syn::Error::new_spanned(
             variant,
@@ -447,7 +467,7 @@ fn reject_aliased_variants(data: &syn::DataEnum) -> syn::Result<()> {
     if let Some(variant) = data
         .variants
         .iter()
-        .find(|v| crate::schema::serde_bare_word(&v.attrs, &["other"]).is_some())
+        .find(|v| autumn_macros_support::schema::serde_bare_word(&v.attrs, &["other"]).is_some())
     {
         return Err(syn::Error::new_spanned(
             variant,
@@ -469,7 +489,7 @@ fn reject_aliased_variants(data: &syn::DataEnum) -> syn::Result<()> {
     if let Some(variant) = data
         .variants
         .iter()
-        .find(|v| crate::schema::variant_has_serde_alias(v))
+        .find(|v| autumn_macros_support::schema::variant_has_serde_alias(v))
     {
         return Err(syn::Error::new_spanned(
             variant,
@@ -507,7 +527,7 @@ fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::
     // `null` — a generated client built from the string enum would send a bare
     // string to a handler that accepts neither. Refuse rather than guess, on
     // the same reasoning that refuses data-carrying variants.
-    if let Some(repr) = crate::schema::serde_enum_representation(&input.attrs) {
+    if let Some(repr) = autumn_macros_support::schema::serde_enum_representation(&input.attrs) {
         // `untagged` is a bare word; `tag` / `content` take a value. Render each
         // the way it is actually written, so the diagnostic quotes real syntax.
         let (written, becomes) = match repr {
@@ -547,9 +567,9 @@ fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::
     if let Some(variant) = data
         .variants
         .iter()
-        .find(|v| crate::schema::variant_directional_skip(v).is_some())
+        .find(|v| autumn_macros_support::schema::variant_directional_skip(v).is_some())
     {
-        let attribute = crate::schema::variant_directional_skip(variant)
+        let attribute = autumn_macros_support::schema::variant_directional_skip(variant)
             .expect("the find predicate just matched it");
         let consequence = if attribute == "skip_deserializing" {
             "it is still serialized, so advertising it would tell a client it may send a \
@@ -576,11 +596,12 @@ fn reject_undescribable_enum(input: &DeriveInput, data: &syn::DataEnum) -> syn::
     // two disagreeing wire spellings. Advertising the serialize side would have
     // a generated client send `in_progress` to a handler whose `Deserialize`
     // accepts `inProgress`.
-    let split = crate::schema::serde_split_rename(&input.attrs, "rename_all")
+    let split = autumn_macros_support::schema::serde_split_rename(&input.attrs, "rename_all")
         .map(|key| (key, None))
         .or_else(|| {
             data.variants.iter().find_map(|v| {
-                crate::schema::serde_split_rename(&v.attrs, "rename").map(|key| (key, Some(v)))
+                autumn_macros_support::schema::serde_split_rename(&v.attrs, "rename")
+                    .map(|key| (key, Some(v)))
             })
         });
     if let Some((key, variant)) = split {
