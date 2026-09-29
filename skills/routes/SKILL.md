@@ -56,9 +56,12 @@ renders directly in GitHub Markdown:
 autumn routes --format mermaid --user-only
 ```
 
+Mermaid output is not JSON: skip the JSON handling below and return stdout
+verbatim inside a ` ```mermaid ` fenced block.
+
 ## Output handling
 
-Parse the JSON array and present a clean table grouped by handler file or
+For `--format json` (the default here), parse the JSON array and present a clean table grouped by handler file or
 resource:
 
 ```
