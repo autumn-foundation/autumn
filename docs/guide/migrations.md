@@ -1,7 +1,7 @@
 # Migrations
 
 Autumn embeds [Diesel](https://diesel.rs/) migrations in the compiled binary and
-runs them at startup (dev) or via `autumn migrate run` (production). This guide
+runs them at startup (dev) or via `autumn migrate` (production). This guide
 covers the advisory-lock serialisation that prevents schema divergence during
 rolling deploys, how to monitor contention, and what to expect on non-Postgres
 backends.
@@ -10,7 +10,7 @@ backends.
 
 ## Advisory lock serialisation
 
-When several replicas boot at the same time or when `autumn migrate run` is
+When several replicas boot at the same time or when `autumn migrate` is
 called from multiple deployment steps concurrently, every instance would
 naively race to apply the same pending migrations. Diesel wraps each migration
 in a transaction, so two processes applying the same migration can deadlock,
@@ -24,7 +24,48 @@ re-read the migration table, find no pending work, and exit successfully.
 The lock covers:
 
 * The embedded application migrations run by `AppBuilder::migrations(…)`.
-* The Autumn framework migrations run by `autumn migrate run`.
+* The Autumn framework migrations run by `autumn migrate`.
+
+---
+
+## Version collisions
+
+Diesel records applied migrations **by version** — the leading
+`YYYYMMDDHHMMSS` prefix of a migration directory's name — in a single shared
+table, with no notion of which registered set (the framework, a plugin, the
+app's own `migrations/`) a version came from. When two differently-named
+migrations share one version, the framework detects it automatically at boot
+and gives the losing one a deterministic substitute version, so both still
+apply — logged at `INFO`
+("Migration version collision resolved automatically"), never a silently
+skipped migration. The one exception is a narrow, unrecoverable case on
+`SQLite`: adopting a pre-fork database whose already-applied history can't be
+safely rewritten fails loudly instead of guessing.
+
+Auto-resolution means a collision is never silently lost, but the substitute
+is still a generated, less-readable version stamp on an otherwise ordinary
+migration. Prefer to avoid the collision in the first place, most likely when
+two branches each add a migration around the same time and one picks a
+round, hand-typed timestamp (midnight, on the hour) instead of the actual
+current second — two people reaching for `00:00:00` on the same day collide;
+two people reaching for the real current second, to the second, essentially
+never do. Two tools help:
+
+* **`autumn migrate new <name>`** creates
+  `migrations/<version>_<name>/{up,down}.sql` with a version guaranteed free
+  across the working tree, every local and remote-tracking git branch this
+  checkout has fetched, and the framework's own compiled-in migrations. Use
+  this instead of hand-creating a migration directory.
+* **`autumn migrate check-collisions`** is the CI-time backstop for a
+  collision `migrate new` could not see — a branch pushed after, or a
+  teammate's concurrent PR. It fails when a version this checkout introduces
+  is already claimed by a different directory on the default branch, another
+  pushed branch, or the framework's own migrations, and is silent about a
+  collision between two *other* branches (that is their gate to fail on, not
+  this checkout's). It needs the full branch history
+  (`actions/checkout@v7` with `fetch-depth: 0`, or a local `git fetch
+  origin`); without it, it degrades to a working-tree-only check and prints a
+  loud warning rather than failing closed.
 
 ---
 
@@ -97,7 +138,7 @@ run_pending_locked(database_url, MIGRATIONS, None)?;
 run_pending_locked(database_url, MIGRATIONS, Some(Duration::from_secs(120)))?;
 ```
 
-For the `autumn migrate run` CLI the timeout is always the default.
+For the `autumn migrate` CLI the timeout is always the default.
 
 ---
 
@@ -115,7 +156,7 @@ let _guard = hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT)?;
 // Lock is released when `_guard` drops.
 ```
 
-This is exactly what `autumn migrate run` does internally before shelling out
+This is exactly what `autumn migrate` does internally before shelling out
 to the `diesel` CLI.
 
 ---
@@ -167,15 +208,15 @@ never delete or rename an applied migration; add a new migration instead.
 > **Note:** startup auto-migrate validation is **best-effort** and requires the
 > `migrations/` directory to be present on disk at runtime (production binaries
 > often ship without the source tree, in which case startup validation is
-> skipped rather than failing); authoritative enforcement is `autumn migrate
-> run` / `autumn migrate status` in CI or your deploy job, which check against
+> skipped rather than failing); authoritative enforcement is `autumn migrate` /
+> `autumn migrate status` in CI or your deploy job, which check against
 > an explicit migrations directory.
 >
 > Startup auto-migrate only **validates** on-disk content against recorded
 > hashes; it does **not** record new checksums. It applies the embedded SQL
 > compiled into the binary, which may differ from the on-disk files, so
 > recording those disk bytes could store a hash for content that was never
-> applied. Authoritative recording happens via `autumn migrate run` and `autumn
+> applied. Authoritative recording happens via `autumn migrate` and `autumn
 > migrate baseline`, where the applied bytes are exactly the on-disk `up.sql`.
 > An app that only ever startup-auto-migrates will therefore leave its
 > migrations `unrecorded` until one of those CLI commands runs.

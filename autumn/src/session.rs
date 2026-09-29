@@ -61,6 +61,31 @@
 //! `AUTUMN_SESSION__COOKIE_NAME`, `AUTUMN_SESSION__MAX_AGE_SECS`,
 //! `AUTUMN_SESSION__REDIS__URL`, etc.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -76,6 +101,7 @@ use http::request::Parts;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tower::{Layer, Service};
+#[cfg(test)]
 use uuid::Uuid;
 
 // ── Session data ────────────────────────────────────────────────
@@ -90,6 +116,10 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct Session {
     inner: Arc<RwLock<SessionInner>>,
+    /// Entropy source used to mint rotated session ids. Defaults to
+    /// [`crate::entropy::OsEntropy`]; the session layer threads the app's seeded
+    /// source in so id rotation replays deterministically under a fixed seed.
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 #[derive(Debug)]
@@ -137,7 +167,18 @@ impl Session {
                 dirty: false,
                 destroyed: false,
             })),
+            entropy: Arc::new(crate::entropy::OsEntropy),
         }
+    }
+
+    /// Attach the entropy source used to mint rotated session ids.
+    ///
+    /// The session layer calls this with the app's injected source so a
+    /// simulation replays session-id rotation deterministically.
+    #[must_use]
+    fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
+        self.entropy = entropy;
+        self
     }
 
     /// Returns the session ID.
@@ -204,8 +245,8 @@ impl Session {
     /// This is critical to call during privilege elevation (e.g., login)
     /// to prevent Session Fixation attacks.
     pub async fn rotate_id(&self) {
+        let new_id = self.entropy.uuid_v4().to_string();
         let mut inner = self.inner.write().await;
-        let new_id = Uuid::new_v4().to_string();
         if inner.old_id.is_none() {
             inner.old_id = Some(inner.id.clone());
         }
@@ -238,6 +279,10 @@ where
         parts: &mut Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        #[allow(
+            clippy::expect_used,
+            reason = "misconfiguration: missing SessionLayer is a setup error, surfaced eagerly"
+        )]
         let session = parts
             .extensions
             .get::<Self>()
@@ -329,7 +374,7 @@ impl SessionStore for MemoryStore {
 // `SessionStore` uses RPIT (`-> impl Future + Send`) and is therefore not
 // dyn-compatible. To let `AppBuilder::with_session_store(impl SessionStore)`
 // erase the concrete type into something `AppBuilder` can store and
-// `apply_session_layer` can wrap into a `SessionLayer`, we keep a
+// `build_session_layer` can wrap into a `SessionLayer`, we keep a
 // pub(crate) dyn-compatible `BoxedSessionStore` shadow trait with a blanket
 // impl over any `SessionStore`, plus an `ArcSessionStore` newtype that
 // satisfies `SessionStore` by delegating through the trait object. Users
@@ -570,7 +615,7 @@ impl SessionConfig {
 
                 #[cfg(feature = "redis")]
                 {
-                    if let Err(error) = redis::Client::open(url.clone()) {
+                    if let Err(error) = crate::redis_tls::open_client(&url) {
                         return Err(SessionBackendConfigError::InvalidRedisUrl(
                             error.to_string(),
                         ));
@@ -630,6 +675,28 @@ pub(crate) fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String
     found_token
 }
 
+/// Fuzzing seam: exercise the cookie-header parser plus the signed-session
+/// cookie verification path (`{session_id}.{hmac_hex}` split + HMAC verify)
+/// over arbitrary bytes. Mirrors the decode performed by `SessionLayer`.
+///
+/// Compiled only under `--cfg fuzzing`, so the published crate is unaffected.
+/// See `fuzz/fuzz_targets/session.rs`.
+#[cfg(fuzzing)]
+pub fn __fuzz_decode_cookie(
+    cookie_header: &[u8],
+    cookie_name: &str,
+    secret: &[u8],
+) -> Option<String> {
+    let mut headers = http::HeaderMap::new();
+    if let Ok(value) = http::HeaderValue::from_bytes(cookie_header) {
+        headers.append(COOKIE, value);
+    }
+    let raw = get_cookie(&headers, cookie_name)?;
+    let keys = crate::security::config::ResolvedSigningKeys::new(secret.to_vec(), Vec::new());
+    let (id, sig) = raw.split_once('.')?;
+    keys.verify(id.as_bytes(), sig).then(|| id.to_owned())
+}
+
 /// Build a Set-Cookie header value.
 fn build_set_cookie(config: &SessionConfig, session_id: &str) -> String {
     use std::fmt::Write;
@@ -675,6 +742,8 @@ pub struct SessionLayer<S: SessionStore> {
     store: Arc<S>,
     config: Arc<SessionConfig>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
+    tenancy_session_key: Option<Arc<str>>,
 }
 
 impl<S: SessionStore> SessionLayer<S> {
@@ -684,7 +753,20 @@ impl<S: SessionStore> SessionLayer<S> {
             store: Arc::new(store),
             config: Arc::new(config),
             signing_keys: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
+            tenancy_session_key: None,
         }
+    }
+
+    /// Inject the entropy source used to mint new and rotated session ids.
+    ///
+    /// Defaults to [`crate::entropy::OsEntropy`]; the framework threads the
+    /// app's seeded source here so session ids replay deterministically under a
+    /// fixed simulation seed.
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
+        self.entropy = entropy;
+        self
     }
 
     /// Attach signing keys so session cookies are HMAC-signed.
@@ -701,6 +783,31 @@ impl<S: SessionStore> SessionLayer<S> {
         self.signing_keys = Some(keys);
         self
     }
+
+    /// Name of the session key `[tenancy] source = "session"` reads to
+    /// resolve the tenant (`[tenancy] session_key`, e.g. `"tenant_id"`).
+    ///
+    /// `AppBuilder` sets this automatically when `[tenancy] source ==
+    /// "session"`. An app that composes `SessionLayer`,
+    /// [`crate::tenancy::tenancy_middleware`] and
+    /// [`crate::idempotency::IdempotencyLayer`] directly as plain tower
+    /// layers, rather than through `AppBuilder`, must set it too if it also
+    /// uses session-sourced tenancy — otherwise this composition is
+    /// indistinguishable from one that doesn't use tenancy, and the deferred
+    /// idempotency alias falls back to the tenant captured before the handler
+    /// ran.
+    ///
+    /// When set, a request that mutates this key — an org switch, a
+    /// tenant-scoped login — has its deferred idempotency replay alias keyed
+    /// by the *finalized* value rather than the tenant resolved before the
+    /// handler ran. Without this, a retry presenting the rotated session
+    /// lands in the pre-mutation tenant's storage slot, misses the cached
+    /// response, and re-executes the mutation.
+    #[must_use]
+    pub fn with_tenancy_session_key(mut self, key: Option<Arc<str>>) -> Self {
+        self.tenancy_session_key = key;
+        self
+    }
 }
 
 impl<S: SessionStore + Clone, Inner> Layer<Inner> for SessionLayer<S> {
@@ -712,6 +819,8 @@ impl<S: SessionStore + Clone, Inner> Layer<Inner> for SessionLayer<S> {
             store: Arc::clone(&self.store),
             config: Arc::clone(&self.config),
             signing_keys: self.signing_keys.clone(),
+            entropy: self.entropy.clone(),
+            tenancy_session_key: self.tenancy_session_key.clone(),
         }
     }
 }
@@ -723,6 +832,8 @@ pub struct SessionService<S: SessionStore, Inner> {
     store: Arc<S>,
     config: Arc<SessionConfig>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+    entropy: Arc<dyn crate::entropy::Entropy>,
+    tenancy_session_key: Option<Arc<str>>,
 }
 
 /// `true` when the response was produced by the request-timeout layer
@@ -762,6 +873,8 @@ where
         let store = Arc::clone(&self.store);
         let config = Arc::clone(&self.config);
         let signing_keys = self.signing_keys.clone();
+        let entropy = self.entropy.clone();
+        let tenancy_session_key = self.tenancy_session_key.clone();
         let mut inner = self.inner.clone();
         // Swap to ensure correct poll_ready semantics
         std::mem::swap(&mut self.inner, &mut inner);
@@ -792,12 +905,12 @@ where
                     Ok(Some(data)) => (id.clone(), data),
                     Ok(None) => {
                         stale_cookie_session_id = Some(id.clone());
-                        (Uuid::new_v4().to_string(), HashMap::new())
+                        (entropy.uuid_v4().to_string(), HashMap::new())
                     }
                     Err(error) => return Ok(session_store_unavailable_response(&error)),
                 }
             } else {
-                (Uuid::new_v4().to_string(), HashMap::new())
+                (entropy.uuid_v4().to_string(), HashMap::new())
             };
 
             // 2. Create session handle and insert into extensions
@@ -806,7 +919,8 @@ where
                 Session::new_cookie_backed(session_id.clone(), data)
             } else {
                 Session::new(session_id.clone(), data)
-            };
+            }
+            .with_entropy(entropy.clone());
             let current_session_scope = cookie_backed.then(|| session_id.clone());
             req.extensions_mut()
                 .insert(crate::idempotency::IdempotencySessionScope::new(
@@ -837,12 +951,21 @@ where
                     &response,
                     None,
                     inner_guard.cookie_backed,
+                    None,
                 );
             } else if inner_guard.dirty {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
                 let primary_replay_after_guard_denial =
                     inner_guard.cookie_backed && inner_guard.old_id.is_some();
+                // The tenant `[tenancy] source = "session"` will resolve for a
+                // retry presenting this finalized session — read live from the
+                // data just written rather than reusing the tenant captured
+                // before the handler ran, which a handler like an org switch
+                // may have just changed.
+                let finalized_tenant = tenancy_session_key
+                    .as_deref()
+                    .and_then(|key| data.get(key).cloned());
                 if let Some(ref old_id) = inner_guard.old_id
                     && let Err(error) = store.destroy(old_id).await
                 {
@@ -867,6 +990,7 @@ where
                     &response,
                     Some(&sid),
                     primary_replay_after_guard_denial,
+                    finalized_tenant.as_deref(),
                 );
             }
 
@@ -884,22 +1008,76 @@ fn session_store_unavailable_response(error: &SessionStoreError) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable").into_response()
 }
 
-pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
-    router: axum::Router<S>,
+/// Build the configured session layer, **monomorphized to a single type** by
+/// erasing every backend behind [`ArcSessionStore`].
+///
+/// # Why the store type is erased here
+///
+/// Each backend produces a differently-typed `SessionLayer<Store>`, so before
+/// this the session had to be applied through its own `Router::layer` call —
+/// nothing else in a `tower-layer` tuple can have a type that varies at
+/// runtime. Returning one concrete `SessionLayer<ArcSessionStore>` lets the
+/// caller fold the session into `apply_middleware`'s single merged
+/// `Router::layer((..))` application (issues #2193, #2198).
+///
+/// # What that costs, and why it is worth it
+///
+/// The `Arc<dyn BoxedSessionStore>` bridge adds one `Box::pin` per store
+/// operation — 1-2 per request (a `load`, plus a `save` or `destroy` only when
+/// the session is dirty). In exchange it removes one whole `Router::layer`
+/// nesting level, and a nesting level is not a one-off cost: `Route::call`
+/// deep-clones everything below it on *every* request, so each level is
+/// re-cloned by every level above it. One boxed future per store call is
+/// strictly cheaper than that.
+///
+/// The custom-store arm already paid this cost (a user store arrives as
+/// `Arc<dyn BoxedSessionStore>` and has always been wrapped); the memory and
+/// Redis arms now wrap their concrete store the same way.
+///
+/// # Errors
+///
+/// Returns [`SessionBackendConfigError`] when the configured backend cannot be
+/// built: a Redis backend requested without the `redis` feature compiled in, an
+/// unparseable Redis URL, or the production in-memory guard rejecting the
+/// configuration.
+pub(crate) fn build_session_layer(
     config: &SessionConfig,
     profile: Option<&str>,
     custom_store: Option<Arc<dyn BoxedSessionStore>>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
-) -> Result<axum::Router<S>, SessionBackendConfigError> {
+    entropy: &Arc<dyn crate::entropy::Entropy>,
+    tenancy_session_key: Option<Arc<str>>,
+) -> Result<SessionLayer<ArcSessionStore>, SessionBackendConfigError> {
+    // Shared tail of all three arms: entropy is always injected (determinism
+    // seam, #1797), signing keys only when the app configured a secret.
+    fn finish(
+        store: ArcSessionStore,
+        config: &SessionConfig,
+        signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+        entropy: &Arc<dyn crate::entropy::Entropy>,
+        tenancy_session_key: Option<Arc<str>>,
+    ) -> SessionLayer<ArcSessionStore> {
+        let mut layer = SessionLayer::new(store, config.clone())
+            .with_entropy(Arc::clone(entropy))
+            .with_tenancy_session_key(tenancy_session_key);
+        if let Some(keys) = signing_keys {
+            layer = layer.with_signing_keys(keys);
+        }
+        layer
+    }
+
     if let Some(store) = custom_store {
         tracing::debug!(
             "Custom session store installed via with_session_store(); skipping config-driven backend selection"
         );
-        let mut layer = SessionLayer::new(ArcSessionStore(store), config.clone());
-        if let Some(keys) = signing_keys {
-            layer = layer.with_signing_keys(keys);
-        }
-        return Ok(router.layer(layer));
+        // Already an `Arc<dyn BoxedSessionStore>` — no second Arc.
+        return Ok(finish(
+            ArcSessionStore(store),
+            config,
+            signing_keys,
+            entropy,
+            tenancy_session_key,
+        ));
     }
 
     match config.backend_plan(profile)? {
@@ -910,26 +1088,29 @@ pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
                      session.allow_memory_in_production=true to acknowledge the risk"
                 );
             }
-            let mut layer = SessionLayer::new(MemoryStore::new(), config.clone());
-            if let Some(keys) = signing_keys {
-                layer = layer.with_signing_keys(keys);
-            }
-            Ok(router.layer(layer))
+            Ok(finish(
+                ArcSessionStore(Arc::new(MemoryStore::new())),
+                config,
+                signing_keys,
+                entropy,
+                tenancy_session_key,
+            ))
         }
         SessionBackendPlan::Redis { .. } => {
             #[cfg(feature = "redis")]
             {
                 let store = crate::session_redis::RedisStore::from_config(config)?;
-                let mut layer = SessionLayer::new(store, config.clone());
-                if let Some(keys) = signing_keys {
-                    layer = layer.with_signing_keys(keys);
-                }
-                Ok(router.layer(layer))
+                Ok(finish(
+                    ArcSessionStore(Arc::new(store)),
+                    config,
+                    signing_keys,
+                    entropy,
+                    tenancy_session_key,
+                ))
             }
 
             #[cfg(not(feature = "redis"))]
             {
-                let _ = router;
                 Err(SessionBackendConfigError::RedisFeatureDisabled)
             }
         }
@@ -963,6 +1144,33 @@ mod tests {
             session.id().await,
             "fresh-id",
             "touch() must not change the id"
+        );
+    }
+
+    /// W3 (issue #1797): a rotated session id is minted from the injected
+    /// entropy source, so a fixed seed reproduces the exact rotated id and a
+    /// different seed diverges.
+    #[tokio::test]
+    async fn rotate_id_is_deterministic_under_seeded_entropy() {
+        async fn rotated(seed: u64) -> String {
+            let session = Session::new_for_test_without_cookie("orig".to_owned(), HashMap::new())
+                .with_entropy(crate::entropy::SeededEntropy::shared(seed));
+            session.rotate_id().await;
+            session.id().await
+        }
+
+        let first = rotated(0x5eed).await;
+        assert_ne!(first, "orig", "rotation changes the id");
+        assert!(Uuid::parse_str(&first).is_ok(), "rotated id is a v4 UUID");
+        assert_eq!(
+            first,
+            rotated(0x5eed).await,
+            "same seed ⇒ identical rotated session id"
+        );
+        assert_ne!(
+            rotated(1).await,
+            rotated(2).await,
+            "a different seed ⇒ different rotated id"
         );
     }
 
@@ -1253,40 +1461,7 @@ mod tests {
             "ok".to_owned()
         }
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            app_id: crate::state::AppState::next_app_id(),
-        };
+        let state = AppState::test_default();
 
         let app = Router::new()
             .route("/", get(handler))
@@ -1311,38 +1486,7 @@ mod tests {
     }
 
     fn test_state() -> crate::state::AppState {
-        crate::state::AppState {
-            extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-            app_id: crate::state::AppState::next_app_id(),
-        }
+        crate::state::AppState::test_default()
     }
 
     #[tokio::test]

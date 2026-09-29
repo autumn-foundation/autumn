@@ -1,0 +1,4324 @@
+//! `autumn a11y verify` — a build-time accessibility audit of raw `html!`
+//! markup.
+//!
+//! The typed primitives in [`autumn_web::a11y`] discharge every accessible-name
+//! obligation **at compile time**: an alt-less image or an unlabeled field
+//! written through them does not compile. Code that uses those primitives is
+//! therefore already proven and is intentionally *not* re-scanned here.
+//!
+//! This pass covers the escape hatch the type system cannot see: raw markup
+//! written directly in a `maud::html! { … }` block, which bypasses the typed
+//! primitives entirely. There is no walkable widget tree at runtime, so this is
+//! an honest best-effort **static** scan of the `html!` token streams found in
+//! the project's `.rs` files — the same token-descent strategy `autumn i18n
+//! check` uses to find `t!` calls nested inside `html!`.
+//!
+//! # Scope and limitations
+//!
+//! `verify` is a build-time **static** scanner over raw `maud::html!` bodies
+//! that applies the WCAG rules below (`image-alt` 1.1.1, `label` 1.3.1 / 3.3.2,
+//! `button-name` / `link-name` 4.1.2). It is **best-effort and advisory**: it
+//! parses maud markup heuristically at the token level and deliberately errs
+//! toward *not* failing on anything it cannot statically resolve — unresolved
+//! splices, complex Rust expressions, and non-maud `html!` macros are skipped
+//! rather than guessed at. It should never fail valid markup, but it can
+//! therefore *miss* a defect in exotic markup (a miss is acceptable by design),
+//! so its raw-`html!` findings are advisory-grade signal, not a proof of
+//! accessibility. The complete, by-construction guarantee lives in the typed
+//! primitives in [`autumn_web::a11y`], where an accessible
+//! name is a compile-time type obligation proven by `trybuild`; this scanner is
+//! only the escape-hatch net over raw hand-written `html!`.
+//!
+//! # Ruleset (first slice)
+//!
+//! Findings reuse the WCAG success-criterion numbers, rule identifiers, and
+//! [`Severity`] semantics of the runtime [`autumn check --a11y`](crate::check)
+//! lint, applied to static source instead of rendered HTML:
+//!
+//! - **`image-alt`** — an `<img>` with no `alt` attribute (WCAG 1.1.1, Serious).
+//! - **`label`** — an `<input>`/`<select>`/`<textarea>` with no associated
+//!   `<label for=…>`, `aria-label`, or `aria-labelledby` (WCAG 1.3.1 / 3.3.2 /
+//!   4.1.2, Serious).
+//! - **`button-name`** — a `<button>` with no text content and no
+//!   `aria-label`/`aria-labelledby` (WCAG 4.1.2, Serious).
+//! - **`link-name`** — an `<a>` with an `href` but no text content and no
+//!   `aria-label`/`aria-labelledby` (WCAG 2.4.4 / 4.1.2, Serious).
+//!
+//! # Route attribution
+//!
+//! A file and a line say where a defect is; a route says which page it breaks.
+//! The scan reads the route attribute macros (`#[get("/settings")]`,
+//! `#[post(..)]`, …) out of the same token stream, indexes every function and
+//! the free functions it calls, then walks out from each handler to the markup
+//! it reaches — so a defect in a shared partial names the routes that reach it. The manifest carries the result three ways: a `routes` array of
+//! per-route `pass`/`fail`, a `routes` list on each finding, and a `wcag`
+//! rollup keyed by success criterion.
+//!
+//! The walk is as conservative as the scanner: a call is followed only when the
+//! called name is defined exactly once across the scan **as a free item**;
+//! method calls, type-qualified associated calls, functions passed by name and
+//! names a parameter or local shadows are not resolved; and the path is the one
+//! **declared** on the handler (mount-time
+//! prefixes are applied at runtime). So `status: "pass"` means no finding was
+//! attributed to that route, not that the page is proven clean — the summary's
+//! `unrouted` count qualifies it. An unattributed finding is still a finding:
+//! the exit code is computed from severities alone, so attribution reports and
+//! never gates.
+//!
+//! # Known heuristic limits
+//!
+//! Like `autumn i18n check`, the scanner reads tokens rather than a
+//! type-resolved AST, and deliberately errs toward *not* flagging anything it
+//! cannot statically resolve — so it never breaks CI on a false positive:
+//!
+//! - A **spliced** value (`(expr)`) is unknowable, so an element whose relevant
+//!   attribute/content is a splice is skipped. In particular a typed primitive
+//!   spliced in as `(Img::new(src, alt))` is a `(expr)` group, not an `img`
+//!   element, and is never flagged.
+//! - Markup inside a `@if` / `@for` / `@match` control block is still scanned
+//!   for elements, but a `<label for=…>`/`id` association that a splice makes
+//!   unresolvable suppresses the corresponding `label` finding rather than
+//!   risking a false positive.
+//! - Only maud/autumn `html!` markup is analyzed. A different `html!` macro
+//!   (e.g. a Yew/JSX island using `<tag>…</tag>` angle-bracket syntax) is
+//!   detected and skipped wholesale — maud never uses JSX tags, so parsing such
+//!   a body as maud would misread `<button></button>` as an empty `button` and
+//!   fire a false `button-name`.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
+
+use proc_macro2::{Delimiter, Literal, TokenStream, TokenTree};
+use serde::Serialize;
+
+use crate::check::Severity;
+
+/// Output format for `autumn a11y verify`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Human-readable text (default).
+    Text,
+    /// Machine-readable JSON conformance manifest.
+    Json,
+}
+
+/// Options parsed from CLI flags.
+#[derive(Debug, Clone, Copy)]
+pub struct A11yVerifyOptions {
+    pub format: OutputFormat,
+    /// Lower the failure threshold so any finding (Moderate and above) fails.
+    /// The current ruleset only emits Serious findings, so a clean run stays
+    /// green either way; the flag is honored for forward compatibility and CI
+    /// consistency with `autumn i18n check` / `autumn check --a11y`.
+    pub strict: bool,
+}
+
+/// An accessibility rule in the raw-`html!` catalog. Each maps to a runtime
+/// [`autumn check --a11y`](crate::check) rule id and a WCAG success criterion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    /// `<img>` with no `alt` attribute.
+    ImageAlt,
+    /// Form control with no associated label or accessible name.
+    Label,
+    /// `<button>` with no accessible name.
+    ButtonName,
+    /// `<a href>` with no accessible name.
+    LinkName,
+}
+
+impl Rule {
+    /// axe-core-style rule id, shared with the runtime lint in [`crate::check`].
+    const fn rule_id(self) -> &'static str {
+        match self {
+            Self::ImageAlt => "image-alt",
+            Self::Label => "label",
+            Self::ButtonName => "button-name",
+            Self::LinkName => "link-name",
+        }
+    }
+
+    /// The WCAG 2.1 success criterion (or criteria) this rule enforces.
+    const fn wcag(self) -> &'static str {
+        match self {
+            Self::ImageAlt => "1.1.1",
+            Self::Label => "1.3.1 / 3.3.2 / 4.1.2",
+            Self::ButtonName => "4.1.2",
+            Self::LinkName => "2.4.4 / 4.1.2",
+        }
+    }
+
+    /// Human-readable description of the violation.
+    const fn message(self) -> &'static str {
+        match self {
+            Self::ImageAlt => "raw <img> has no alt attribute",
+            Self::Label => {
+                "raw form control has no associated <label for=…>, aria-label, or aria-labelledby"
+            }
+            Self::ButtonName => {
+                "raw <button> has no text content and no aria-label/aria-labelledby"
+            }
+            Self::LinkName => "raw <a href> has no link text and no aria-label/aria-labelledby",
+        }
+    }
+
+    /// The typed primitive that discharges this obligation at compile time.
+    const fn hint(self) -> &'static str {
+        match self {
+            Self::ImageAlt => "use autumn_web::a11y::Img::new(src, alt) / Img::decorative(src)",
+            Self::Label => "use autumn_web::a11y::TextField::new(..).label(..)",
+            Self::ButtonName => {
+                "use autumn_web::a11y::Button::new(name) / Button::icon(icon, name)"
+            }
+            Self::LinkName => "use autumn_web::a11y::Link::new(href, text) / Link::icon(..)",
+        }
+    }
+}
+
+/// A single accessibility finding, keyed to a WCAG success criterion.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Finding {
+    /// Source file, relative to the project root.
+    pub file: String,
+    /// 1-based line number of the offending element.
+    pub line: usize,
+    /// The HTML element that triggered the finding (e.g. `img`, `button`).
+    pub element: String,
+    /// axe-core-style rule id, shared with `autumn check --a11y`.
+    pub rule_id: &'static str,
+    /// WCAG 2.1 success criterion (or criteria).
+    pub wcag: &'static str,
+    /// Violation severity.
+    #[serde(serialize_with = "serialize_severity")]
+    pub severity: Severity,
+    /// Human-readable description of what is wrong.
+    pub message: &'static str,
+    /// The typed primitive that fixes it at compile time.
+    pub hint: &'static str,
+    /// Routes that statically reach this markup, as `"METHOD /path"`. Empty
+    /// when no route handler reaches it (a partial nothing renders, or a call
+    /// chain the scan could not resolve). Always serialized, empty included:
+    /// an unattributed finding is the one a reader most needs to notice.
+    pub routes: Vec<String>,
+    /// 0-based column of the element, for attribution only.
+    #[serde(skip)]
+    column: usize,
+}
+
+fn serialize_severity<S>(severity: &Severity, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&severity.to_string())
+}
+
+/// Aggregate counts by severity, plus route coverage.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub struct Summary {
+    pub critical: usize,
+    pub serious: usize,
+    pub moderate: usize,
+    pub total: usize,
+    /// Routes declared in the scanned source. A handler carrying two route
+    /// attributes declares two.
+    pub routes: usize,
+    /// Routes carrying at least one finding.
+    pub routes_failing: usize,
+    /// Findings no route statically reaches.
+    pub unrouted: usize,
+}
+
+/// Per-route conformance, one entry per declared route handler.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteConformance {
+    /// HTTP method from the route attribute (`GET`, `POST`, …).
+    pub method: String,
+    /// Path **as declared** on the handler. Mount-time prefixes (a `scope`, a
+    /// nested router) are applied at runtime and are not resolved here.
+    pub path: String,
+    /// Handler function name.
+    pub handler: String,
+    /// Source file, relative to the project root.
+    pub file: String,
+    /// 1-based line of the handler.
+    pub line: usize,
+    /// Findings in markup this route statically reaches.
+    pub findings: usize,
+    /// `"pass"` when the route reaches no finding, else `"fail"`.
+    pub status: &'static str,
+}
+
+/// Findings rolled up by WCAG success criterion — the conformance view.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WcagCriterion {
+    /// WCAG 2.1 success criterion, e.g. `"1.1.1"`.
+    pub criterion: String,
+    /// Rule ids that breached it, sorted.
+    pub rules: Vec<&'static str>,
+    /// Findings breaching it.
+    pub findings: usize,
+}
+
+/// The full result of a verify run — the JSON conformance manifest.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Report {
+    /// Number of `.rs` files scanned.
+    pub files_scanned: usize,
+    /// Number of `html!` blocks discovered and analyzed.
+    pub html_blocks: usize,
+    /// Declared routes with their conformance status, sorted by path.
+    pub routes: Vec<RouteConformance>,
+    /// Findings, sorted by file then line.
+    pub findings: Vec<Finding>,
+    /// Findings rolled up by WCAG success criterion, sorted by criterion.
+    pub wcag: Vec<WcagCriterion>,
+    pub summary: Summary,
+}
+
+impl Report {
+    /// Build a report from a completed scan, sorting findings deterministically.
+    fn from_scan(mut scan: Scan) -> Self {
+        scan.findings
+            .sort_by(|a, b| (a.file.as_str(), a.line).cmp(&(b.file.as_str(), b.line)));
+        let graph = RouteGraph::build(&scan.fns);
+        let reaching: Vec<Vec<usize>> = scan
+            .findings
+            .iter()
+            .map(|f| graph.routes_reaching(&f.file, (f.line, f.column)))
+            .collect();
+        for (finding, hit) in scan.findings.iter_mut().zip(&reaching) {
+            finding.routes = graph.display_keys(hit);
+        }
+        let routes = graph.conformance(&reaching);
+
+        let mut summary = Summary::default();
+        for finding in &scan.findings {
+            match finding.severity {
+                Severity::Critical => summary.critical += 1,
+                Severity::Serious => summary.serious += 1,
+                Severity::Moderate => summary.moderate += 1,
+            }
+            if finding.routes.is_empty() {
+                summary.unrouted += 1;
+            }
+        }
+        summary.total = scan.findings.len();
+        summary.routes = routes.len();
+        summary.routes_failing = routes.iter().filter(|r| r.findings > 0).count();
+
+        Self {
+            files_scanned: scan.files_scanned,
+            html_blocks: scan.html_blocks,
+            routes,
+            wcag: roll_up_wcag(&scan.findings),
+            findings: scan.findings,
+            summary,
+        }
+    }
+
+    /// Process exit code. Non-zero when any finding meets the failure
+    /// threshold — Serious by default, lowered to Moderate under `--strict`.
+    #[must_use]
+    pub fn exit_code(&self, strict: bool) -> i32 {
+        let threshold = if strict {
+            Severity::Moderate
+        } else {
+            Severity::Serious
+        };
+        i32::from(self.findings.iter().any(|f| f.severity >= threshold))
+    }
+}
+
+// ── Scanner ────────────────────────────────────────────────────────────────
+
+/// Accumulator threaded through the source scan.
+#[derive(Debug, Default)]
+struct Scan {
+    findings: Vec<Finding>,
+    files_scanned: usize,
+    html_blocks: usize,
+    /// Every function declaration seen, for route attribution.
+    fns: Vec<FnDecl>,
+}
+
+impl Scan {
+    fn push(&mut self, rule: Rule, element: &str, line: usize, column: usize, file: &str) {
+        self.findings.push(Finding {
+            file: file.to_owned(),
+            line,
+            element: element.to_owned(),
+            rule_id: rule.rule_id(),
+            wcag: rule.wcag(),
+            severity: Severity::Serious,
+            message: rule.message(),
+            hint: rule.hint(),
+            routes: Vec::new(),
+            column,
+        });
+    }
+}
+
+/// Walk `root` recursively and scan every `.rs` file for raw-`html!` markup.
+///
+/// The scan ROOT read is fatal: a misspelled/unreadable/nonexistent path must
+/// fail hard, not silently yield zero findings — a zero-findings run prints
+/// PASS and would let a CI typo disable the whole audit. `std::fs::read_dir`
+/// surfaces all three failure modes (path absent, path is not a directory, or
+/// the directory is unreadable). A genuinely empty-but-readable directory reads
+/// fine here and legitimately produces an empty file list (zero findings, exit
+/// 0). Nested subdir read errors *during recursion* remain best-effort
+/// (swallowed by [`collect_rs_files`]), mirroring `autumn i18n check`.
+fn scan_project(root: &Path) -> std::io::Result<Scan> {
+    std::fs::read_dir(root)?;
+    let mut scan = Scan::default();
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    files.sort();
+    for path in files {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        scan_source(&src, &rel, &mut scan);
+        scan.files_scanned += 1;
+    }
+    Ok(scan)
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // Never follow symlinks: a symlinked directory cycle would otherwise
+        // recurse forever and hang this CI tool.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if file_type.is_dir() {
+            // Skip build output, dot-dirs, and any `tests` directory. Test code
+            // (integration tests, system-test scaffolding, committed fixtures)
+            // is not shipped product markup, so a raw-`html!` defect there is not
+            // a product accessibility bug (issue #1934). The skip is scan-root
+            // RELATIVE: the a11y-verify integration test passes a fixture dir as
+            // the scan root itself, so no `tests` path component exists below
+            // that root and the fixture is still scanned/flagged there.
+            if name == "target" || name == "tests" || name.starts_with('.') {
+                continue;
+            }
+            collect_rs_files(&path, out);
+        } else if file_type.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Tokenize one source string and analyze every `html!` block within it.
+fn scan_source(src: &str, file: &str, scan: &mut Scan) {
+    let Ok(stream) = TokenStream::from_str(src) else {
+        return;
+    };
+    find_html_blocks(&stream, file, scan);
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    collect_fns(&trees, file, &mut scan.fns);
+}
+
+/// Recursively walk a token stream, analyzing each `html! { … }` macro body and
+/// descending into every group so nested `html!` invocations (e.g. spliced into
+/// another block) are found too.
+fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    let mut i = 0;
+    while i < trees.len() {
+        // A `#[cfg(test)]`-annotated item (`mod tests { … }`, a test `fn`) is
+        // test-only scaffolding, not shipped product markup — an inline
+        // `html!` defect inside it is intentional test data, not a product
+        // accessibility bug (issue #1934, the #1930 `form.rs` case). Skip the
+        // whole item without descending into its body.
+        if is_cfg_test_attr(&trees, i) {
+            i = skip_cfg_test_item(&trees, i + 2);
+            continue;
+        }
+        if let TokenTree::Ident(ident) = &trees[i]
+            && *ident == "html"
+            && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+            && let Some(TokenTree::Group(group)) = trees.get(i + 2)
+        {
+            let body: Vec<TokenTree> = group.stream().into_iter().collect();
+            // Only maud/autumn `html!` markup is analyzed. A project may define a
+            // DIFFERENT `html!` (e.g. a Yew/JSX island using `<tag>…</tag>`
+            // syntax); handing such a body to the maud parser would strip the
+            // angle brackets and misread `<button></button>` as an empty maud
+            // `button`, a false `button-name`. maud never uses JSX angle-bracket
+            // tags, so a body that does is a different macro — skip it entirely.
+            if looks_like_jsx(&body) {
+                i += 3;
+                continue;
+            }
+            let nodes = parse_nodes(&body);
+            scan.html_blocks += 1;
+            analyze_block(&nodes, file, scan);
+            // Descend into the body for nested `html!` splices.
+            find_html_blocks(&group.stream(), file, scan);
+            i += 3;
+            continue;
+        }
+        if let TokenTree::Group(group) = &trees[i] {
+            find_html_blocks(&group.stream(), file, scan);
+        }
+        i += 1;
+    }
+}
+
+/// Whether `trees[i]` begins a `#[cfg(test)]` outer attribute — a `#` punct
+/// immediately followed by a `[cfg(test)]` bracket group. Such an attribute
+/// precedes a test-only item whose body is scaffolding the scanner must not
+/// descend into (issue #1934). Matching is deliberately precise (`cfg` then a
+/// parenthesized single `test` ident): it never fires on `#[cfg(not(test))]`
+/// (production code) or `#[cfg(feature = "…")]`, so it can only ever exclude a
+/// genuine test item.
+fn is_cfg_test_attr(trees: &[TokenTree], i: usize) -> bool {
+    let Some(TokenTree::Punct(p)) = trees.get(i) else {
+        return false;
+    };
+    if p.as_char() != '#' {
+        return false;
+    }
+    let Some(TokenTree::Group(g)) = trees.get(i + 1) else {
+        return false;
+    };
+    if g.delimiter() != Delimiter::Bracket {
+        return false;
+    }
+    let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+    matches!(inner.first(), Some(TokenTree::Ident(id)) if *id == "cfg")
+        && matches!(
+            inner.get(1),
+            Some(TokenTree::Group(paren))
+                if paren.delimiter() == Delimiter::Parenthesis
+                    && is_single_test_ident(&paren.stream())
+        )
+}
+
+/// Whether a token stream is exactly the single ident `test` (the body of a
+/// `cfg(test)` predicate).
+fn is_single_test_ident(stream: &TokenStream) -> bool {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    trees.len() == 1 && matches!(&trees[0], TokenTree::Ident(id) if *id == "test")
+}
+
+/// Advance past a `#[cfg(test)]`-annotated item without descending into its
+/// body, starting at `start` (the token just past the attribute's bracket
+/// group). The item body is the first top-level brace group (`mod tests { … }`,
+/// `fn … { … }`); a body-less item (`#[cfg(test)] use …;`) ends at its `;`.
+/// Not descending into that brace is the whole point — any `html!` markup
+/// inside is intentionally excluded from the scan.
+fn skip_cfg_test_item(trees: &[TokenTree], start: usize) -> usize {
+    let mut i = start;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => return i + 1,
+            TokenTree::Punct(p) if p.as_char() == ';' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// Whether an `html!` body is JSX/Yew-style angle-bracket markup rather than
+/// maud. Detection keys ONLY on token pairs that maud never emits but that every
+/// JSX/Yew element carries: a closing tag `</…>` (a `<` immediately followed by
+/// `/`) or a self-closing tag `<…/>` (a `/` immediately followed by `>`). maud
+/// markup uses `{}`/`;`, never angle-bracket tags, so neither pair can appear in
+/// valid maud. A bare `<`/`>` is NOT treated as JSX: it is an ordinary Rust
+/// comparison inside a control head (`@if count < limit { … }`, `@if a > b { … }`),
+/// and misreading it as JSX would skip — and thus stop analyzing — the entire
+/// `html!` body. A JSX body is skipped rather than parsed as maud, which would
+/// drop the angle brackets and misread `<button></button>` as an empty maud
+/// `button` (a false `button-name`). When in doubt we do NOT classify as JSX: a
+/// missed check on non-maud markup is acceptable, disabling the scanner on valid
+/// maud is not.
+fn looks_like_jsx(trees: &[TokenTree]) -> bool {
+    for (idx, tree) in trees.iter().enumerate() {
+        let TokenTree::Punct(p) = tree else {
+            continue;
+        };
+        let next_is =
+            |c: char| matches!(trees.get(idx + 1), Some(TokenTree::Punct(q)) if q.as_char() == c);
+        match p.as_char() {
+            // `</…>` — a closing tag. maud never emits `<` followed by `/`.
+            '<' if next_is('/') => return true,
+            // `<…/>` — a self-closing tag. maud never emits `/` followed by `>`.
+            '/' if next_is('>') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+// ── Route attribution ──────────────────────────────────────────────────────
+//
+// A finding is only actionable if the developer knows which page it breaks.
+// Autumn declares routes with attribute macros on the handler
+// (`#[get("/settings")] async fn settings()`), so the routes a piece of markup
+// serves can be read from the same token stream the scanner already walks: index
+// every `fn`, record the free functions each one calls, then walk out from each
+// handler to the markup it reaches.
+//
+// The walk is deliberately conservative, like the scanner itself. It resolves a
+// call only when the called name is defined EXACTLY once across the whole scan;
+// two functions sharing a name cannot be told apart from tokens, and guessing
+// would key a defect to a route that never renders it. Method calls
+// (`page.sidebar()`) are not resolved at all. Attribution is therefore a
+// best-effort lower bound: an unattributed finding is still a finding.
+
+/// Route declared by an attribute macro on a handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteDecl {
+    method: &'static str,
+    /// Path as written in the attribute; mount-time prefixes are not resolved.
+    path: String,
+}
+
+/// A function declaration and the call edges leaving it.
+#[derive(Debug)]
+struct FnDecl {
+    name: String,
+    file: String,
+    /// `(line, column)` of the `fn` keyword and of the body's closing brace.
+    start: (usize, usize),
+    end: (usize, usize),
+    /// Names of free functions called in the body, unresolved.
+    calls: BTreeSet<String>,
+    /// Route attributes on this function, if any.
+    routes: Vec<RouteDecl>,
+    /// Whether a bare `name()` elsewhere can reach this function. A nested item
+    /// is visible only inside its enclosing block, and an associated function
+    /// is reached through a receiver or a type-qualified path — neither of
+    /// which this scan resolves — so neither is a target.
+    callable: bool,
+}
+
+/// Route attribute macros that serve markup. `#[static_get]` is one of them —
+/// it pre-renders a page, so an alt-less image in it is as broken as in any
+/// other. `#[ws]` is not: a WebSocket upgrade serves no document.
+const ROUTE_ATTRS: [(&str, &str); 6] = [
+    ("get", "GET"),
+    ("post", "POST"),
+    ("put", "PUT"),
+    ("patch", "PATCH"),
+    ("delete", "DELETE"),
+    ("static_get", "GET"),
+];
+
+/// Rust keywords that can precede a parenthesized group without being a call.
+const CALL_KEYWORDS: [&str; 6] = ["if", "while", "match", "return", "for", "in"];
+
+/// Item keywords whose following identifier is a declaration, not a call.
+const DECL_KEYWORDS: [&str; 6] = ["fn", "struct", "enum", "union", "trait", "mod"];
+
+/// Index every function in `trees`, recording its span, call edges, and any
+/// route attributes, appending to `out`.
+///
+/// `#[cfg(test)]` items are skipped wholesale, mirroring the scanner: test
+/// scaffolding is neither a route nor a rendering path, and indexing it would
+/// only create name collisions that suppress real attribution.
+fn collect_fns(trees: &[TokenTree], file: &str, out: &mut Vec<FnDecl>) {
+    collect_fns_in(trees, file, true, out);
+}
+
+/// [`collect_fns`], carrying whether items at this level are reachable by a
+/// bare name. Free items in a module are; items inside a function body or an
+/// `impl`/`trait` block are not.
+fn collect_fns_in(trees: &[TokenTree], file: &str, callable: bool, out: &mut Vec<FnDecl>) {
+    let mut pending: Vec<RouteDecl> = Vec::new();
+    // Set when an `impl`/`trait` head is seen, so its block is descended as
+    // associated items.
+    let mut assoc_block = false;
+    let mut i = 0;
+    while i < trees.len() {
+        if is_cfg_test_attr(trees, i) {
+            i = skip_cfg_test_item(trees, i + 2);
+            pending.clear();
+            continue;
+        }
+        if let Some((route, next)) = read_attr(trees, i) {
+            pending.extend(route);
+            i = next;
+            continue;
+        }
+        // A `macro_rules!` body holds templates, not definitions. Indexing the
+        // `fn` inside one would make a real helper of the same name look
+        // defined twice, and every call edge to it would be dropped.
+        if let TokenTree::Ident(ident) = &trees[i]
+            && *ident == "macro_rules"
+            && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+        {
+            pending.clear();
+            i = skip_cfg_test_item(trees, i + 2);
+            continue;
+        }
+        if let TokenTree::Ident(ident) = &trees[i] {
+            if *ident == "fn"
+                && let Some(TokenTree::Ident(name)) = trees.get(i + 1)
+                && let Some(body_at) = find_fn_body(trees, i + 2)
+                && let TokenTree::Group(body) = &trees[body_at]
+            {
+                let inner: Vec<TokenTree> = body.stream().into_iter().collect();
+                let mut calls = BTreeSet::new();
+                collect_calls(&inner, &mut calls);
+                // A name bound in this function — a parameter, a local, a
+                // closure argument — shadows any free function that shares it,
+                // so calling it does not reach that function.
+                let mut bound = BTreeSet::new();
+                // The parameter list is the first parenthesized group after the
+                // name; a return type or a `where` clause can sit between it
+                // and the body.
+                if let Some(params) = trees[i + 2..body_at].iter().find_map(|tree| match tree {
+                    TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => Some(g),
+                    _ => None,
+                }) {
+                    collect_idents(&params.stream().into_iter().collect::<Vec<_>>(), &mut bound);
+                }
+                collect_bindings(&inner, &mut bound);
+                calls.retain(|call| !bound.contains(call));
+                let start = trees[i].span().start();
+                let end = body.span().end();
+                out.push(FnDecl {
+                    name: name.to_string(),
+                    file: file.to_owned(),
+                    start: (start.line, start.column),
+                    end: (end.line, end.column),
+                    calls,
+                    routes: std::mem::take(&mut pending),
+                    callable,
+                });
+                collect_fns_in(&inner, file, false, out);
+                i = body_at + 1;
+                continue;
+            }
+            // An attribute binds to the next item. If that item is not a
+            // function, the route attributes seen so far are not ours.
+            if matches!(ident.to_string().as_str(), "impl" | "trait") {
+                assoc_block = true;
+            }
+            if !matches!(
+                ident.to_string().as_str(),
+                "pub" | "async" | "unsafe" | "extern"
+            ) {
+                pending.clear();
+            }
+        }
+        match &trees[i] {
+            // A brace group reached here closes an item that was not a
+            // function (an `extern "C" { … }` block, a `struct` body), so a
+            // route attribute seen before it was not ours.
+            TokenTree::Group(group) => {
+                let brace = group.delimiter() == Delimiter::Brace;
+                if brace {
+                    pending.clear();
+                }
+                let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                collect_fns_in(&inner, file, callable && !(brace && assoc_block), out);
+                if brace {
+                    assoc_block = false;
+                }
+            }
+            // Likewise a literal: `extern "C"` leads with one.
+            TokenTree::Literal(_) => pending.clear(),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Read the attribute starting at `trees[i]` (a `#` followed by a bracket
+/// group), returning any route it declares and the index just past it.
+fn read_attr(trees: &[TokenTree], i: usize) -> Option<(Option<RouteDecl>, usize)> {
+    let TokenTree::Punct(p) = trees.get(i)? else {
+        return None;
+    };
+    if p.as_char() != '#' {
+        return None;
+    }
+    let TokenTree::Group(group) = trees.get(i + 1)? else {
+        return None;
+    };
+    if group.delimiter() != Delimiter::Bracket {
+        return None;
+    }
+    Some((route_from_attr(&group.stream()), i + 2))
+}
+
+/// Parse a route attribute body (`get("/settings", …)`, or a path-qualified
+/// `autumn_web::get("/settings")`) into a [`RouteDecl`].
+fn route_from_attr(stream: &TokenStream) -> Option<RouteDecl> {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    // The macro name is the last ident before the argument group.
+    let group_at = trees.iter().position(
+        |t| matches!(t, TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis),
+    )?;
+    let TokenTree::Ident(name) = trees.get(group_at.checked_sub(1)?)? else {
+        return None;
+    };
+    let name = name.to_string();
+    let method = ROUTE_ATTRS
+        .iter()
+        .find(|(attr, _)| *attr == name)
+        .map(|(_, method)| *method)?;
+    let TokenTree::Group(args) = &trees[group_at] else {
+        return None;
+    };
+    // The path is the first POSITIONAL string literal: `#[get(crate = "…",
+    // "/a")]` is accepted by the route macros, so a literal that follows `=` is
+    // a named argument's value, not the path.
+    let arg_trees: Vec<TokenTree> = args.stream().into_iter().collect();
+    let path = arg_trees.iter().enumerate().find_map(|(at, tree)| {
+        let TokenTree::Literal(lit) = tree else {
+            return None;
+        };
+        let named = matches!(
+            at.checked_sub(1).and_then(|prev| arg_trees.get(prev)),
+            Some(TokenTree::Punct(p)) if p.as_char() == '='
+        );
+        if named {
+            None
+        } else {
+            string_literal_value(lit)
+        }
+    })?;
+    Some(RouteDecl { method, path })
+}
+
+/// Index of the brace group holding a function body, searching from `start`
+/// (just past the function name). Returns `None` for a body-less declaration
+/// (a trait method signature), whose `;` is reached first.
+fn find_fn_body(trees: &[TokenTree], start: usize) -> Option<usize> {
+    for (offset, tree) in trees.iter().enumerate().skip(start) {
+        match tree {
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => return Some(offset),
+            TokenTree::Punct(p) if p.as_char() == ';' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Collect the names of free functions called anywhere in `trees`.
+///
+/// A call is an identifier immediately followed by a parenthesized group, which
+/// already excludes a macro (`html!(…)`, whose `!` sits between the two). Four
+/// shapes that match that pattern are still not calls this scan can resolve,
+/// and each is skipped rather than guessed at:
+///
+/// - `page.sidebar()` — a method on a receiver whose type is unknown.
+/// - `Widget::new()` — an associated function on a type. Rust names types in
+///   `UpperCamelCase` and modules in `snake_case`, so an upper-case qualifier
+///   marks the call as type-qualified; `views::sidebar()` stays resolvable.
+/// - `fn helper(…)` / `struct Row(…)` — a declaration, not a call.
+/// - a nested `fn` item — its body belongs to that function, which is indexed
+///   in its own right; folding its calls into the enclosing one would attribute
+///   markup to a function that never calls it.
+///
+/// Attribute bodies are skipped for the same reason: `#[cfg(test)]` would
+/// otherwise register a call to `cfg`.
+fn collect_calls(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    let mut i = 0;
+    while i < trees.len() {
+        // Skip a nested `fn NAME … { … }` item whole, name included.
+        if let TokenTree::Ident(ident) = &trees[i]
+            && *ident == "fn"
+            && matches!(trees.get(i + 1), Some(TokenTree::Ident(_)))
+        {
+            i = find_fn_body(trees, i + 2).map_or(trees.len(), |body| body + 1);
+            continue;
+        }
+        // Skip an attribute (`#` + bracket group) without descending into it.
+        if let TokenTree::Punct(p) = &trees[i]
+            && p.as_char() == '#'
+            && matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket)
+        {
+            i += 2;
+            continue;
+        }
+        if let TokenTree::Ident(ident) = &trees[i]
+            && matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+            && is_resolvable_call(trees, i)
+        {
+            let name = ident.to_string();
+            if !CALL_KEYWORDS.contains(&name.as_str()) {
+                out.insert(name);
+            }
+        }
+        if let TokenTree::Group(group) = &trees[i] {
+            let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+            collect_calls(&inner, out);
+        }
+        i += 1;
+    }
+}
+
+/// Every identifier in `trees`, at any depth.
+///
+/// Used on a parameter list, where the binding names are mixed with type names.
+/// Collecting both over-approximates what is shadowed, which only ever drops a
+/// call edge — the safe direction — and type names are `UpperCamelCase` while
+/// function names are `snake_case`, so they rarely collide in practice.
+fn collect_idents(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    for tree in trees {
+        match tree {
+            TokenTree::Ident(ident) => {
+                out.insert(ident.to_string());
+            }
+            TokenTree::Group(group) => {
+                collect_idents(&group.stream().into_iter().collect::<Vec<_>>(), out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Names bound by a `let` statement or a closure argument list anywhere in
+/// `trees`.
+///
+/// Both are read loosely — every identifier between `let` and the `=`/`;` that
+/// ends its pattern, and every identifier between a pair of `|` — because
+/// over-collecting only drops a call edge, while under-collecting would let a
+/// shadowed name resolve to an unrelated function.
+fn collect_bindings(trees: &[TokenTree], out: &mut BTreeSet<String>) {
+    let mut i = 0;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Ident(ident) if *ident == "let" => {
+                i += 1;
+                while let Some(tree) = trees.get(i) {
+                    match tree {
+                        TokenTree::Punct(p) if p.as_char() == '=' || p.as_char() == ';' => break,
+                        TokenTree::Ident(id) => {
+                            out.insert(id.to_string());
+                        }
+                        TokenTree::Group(group) => {
+                            collect_idents(&group.stream().into_iter().collect::<Vec<_>>(), out);
+                        }
+                        TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+                    }
+                    i += 1;
+                }
+            }
+            // A closure argument list. A lone `|` (a bitwise or, a match-arm
+            // alternative) has no closing pipe on this level and collects
+            // nothing.
+            TokenTree::Punct(p) if p.as_char() == '|' => {
+                let mut j = i + 1;
+                let mut names = BTreeSet::new();
+                let closed = loop {
+                    match trees.get(j) {
+                        Some(TokenTree::Punct(q)) if q.as_char() == '|' => break true,
+                        Some(TokenTree::Ident(id)) => {
+                            names.insert(id.to_string());
+                        }
+                        Some(TokenTree::Punct(_) | TokenTree::Literal(_)) => {}
+                        Some(TokenTree::Group(_)) | None => break false,
+                    }
+                    j += 1;
+                };
+                if closed {
+                    out.extend(names);
+                    i = j;
+                }
+            }
+            TokenTree::Group(group) => {
+                collect_bindings(&group.stream().into_iter().collect::<Vec<_>>(), out);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Whether the identifier at `trees[i]` names a free function this scan can
+/// resolve by name — see [`collect_calls`] for the shapes this rejects.
+fn is_resolvable_call(trees: &[TokenTree], i: usize) -> bool {
+    let Some(prev) = i.checked_sub(1).and_then(|at| trees.get(at)) else {
+        return true;
+    };
+    match prev {
+        // `page.sidebar()`.
+        TokenTree::Punct(p) if p.as_char() == '.' => false,
+        // `fn helper(…)`, `struct Row(…)`.
+        TokenTree::Ident(id) if DECL_KEYWORDS.contains(&id.to_string().as_str()) => false,
+        // A path: resolvable only when the qualifier is a module.
+        TokenTree::Punct(p) if p.as_char() == ':' => qualifier_is_module(trees, i),
+        _ => true,
+    }
+}
+
+/// Whether the path segment before the `::` at `trees[i - 2]` is a module
+/// rather than a type. Rust names modules in `snake_case` and types in
+/// `UpperCamelCase`, so the leading character decides. Anything that is not a
+/// plain identifier (a turbofish, `<Foo as Bar>::baz`) is not resolvable.
+fn qualifier_is_module(trees: &[TokenTree], i: usize) -> bool {
+    let qualifier = i.checked_sub(3).and_then(|at| trees.get(at));
+    matches!(
+        qualifier,
+        Some(TokenTree::Ident(id))
+            if id.to_string().chars().next().is_some_and(char::is_lowercase)
+    ) && !matches!(qualifier, Some(TokenTree::Ident(id)) if *id == "Self")
+}
+
+/// The call graph rooted at each declared route.
+struct RouteGraph<'a> {
+    fns: &'a [FnDecl],
+    /// One entry per route: its declaration, its handler, and every function it
+    /// statically reaches.
+    routes: Vec<(RouteDecl, usize, BTreeSet<usize>)>,
+}
+
+impl<'a> RouteGraph<'a> {
+    fn build(fns: &'a [FnDecl]) -> Self {
+        // A name defined more than once is unresolvable, so it is not indexed.
+        let mut by_name: std::collections::HashMap<&str, Option<usize>> =
+            std::collections::HashMap::new();
+        for (index, decl) in fns.iter().enumerate().filter(|(_, d)| d.callable) {
+            by_name
+                .entry(decl.name.as_str())
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(index));
+        }
+
+        let mut routes = Vec::new();
+        for (index, decl) in fns.iter().enumerate() {
+            for route in &decl.routes {
+                let mut reached = BTreeSet::new();
+                let mut stack = vec![index];
+                while let Some(current) = stack.pop() {
+                    if !reached.insert(current) {
+                        continue;
+                    }
+                    for call in &fns[current].calls {
+                        if let Some(Some(target)) = by_name.get(call.as_str()) {
+                            stack.push(*target);
+                        }
+                    }
+                }
+                routes.push((route.clone(), index, reached));
+            }
+        }
+        Self { fns, routes }
+    }
+
+    /// The innermost function whose span contains `file:line:column`.
+    ///
+    /// Position is compared with the column, not the line alone: two functions
+    /// can share a line (`fn a() { … } fn b() { … }`), and a line-only
+    /// comparison would hand one of them the other's markup.
+    fn enclosing_fn(&self, file: &str, at: (usize, usize)) -> Option<usize> {
+        self.fns
+            .iter()
+            .enumerate()
+            .filter(|(_, decl)| decl.file == file && decl.start <= at && at <= decl.end)
+            .min_by_key(|(_, decl)| (decl.end.0 - decl.start.0, decl.end.1))
+            .map(|(index, _)| index)
+    }
+
+    /// Indices of the routes reaching the markup at `file:line:column`.
+    ///
+    /// Routes are identified by index, not by their `"METHOD /path"` key: paths
+    /// are declared rather than mounted, so two handlers can legitimately
+    /// declare the same one, and keying by the string would report a clean
+    /// handler as failing for its namesake's defect.
+    fn routes_reaching(&self, file: &str, at: (usize, usize)) -> Vec<usize> {
+        let Some(target) = self.enclosing_fn(file, at) else {
+            return Vec::new();
+        };
+        self.routes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, reached))| reached.contains(&target))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The display keys for a set of route indices, sorted and deduplicated.
+    fn display_keys(&self, indices: &[usize]) -> Vec<String> {
+        let mut keys: Vec<String> = indices
+            .iter()
+            .map(|index| route_key(&self.routes[*index].0))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// Per-route conformance, sorted by path then method. `reaching` holds the
+    /// route indices of each finding, in finding order.
+    fn conformance(&self, reaching: &[Vec<usize>]) -> Vec<RouteConformance> {
+        let mut out: Vec<RouteConformance> = self
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(index, (route, handler, _))| {
+                let count = reaching.iter().filter(|hit| hit.contains(&index)).count();
+                RouteConformance {
+                    method: route.method.to_owned(),
+                    path: route.path.clone(),
+                    handler: self.fns[*handler].name.clone(),
+                    file: self.fns[*handler].file.clone(),
+                    line: self.fns[*handler].start.0,
+                    findings: count,
+                    status: if count == 0 { "pass" } else { "fail" },
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.path, &a.method, &a.handler).cmp(&(&b.path, &b.method, &b.handler)));
+        out
+    }
+}
+
+/// `"GET /settings"` — the display key a finding and a route agree on.
+fn route_key(route: &RouteDecl) -> String {
+    format!("{} {}", route.method, route.path)
+}
+
+/// Roll findings up by WCAG success criterion, splitting the multi-criterion
+/// rules (`label` covers 1.3.1, 3.3.2 and 4.1.2) so each criterion reports on
+/// its own — the view a conformance claim is written against.
+fn roll_up_wcag(findings: &[Finding]) -> Vec<WcagCriterion> {
+    let mut by_criterion: std::collections::BTreeMap<&str, (BTreeSet<&'static str>, usize)> =
+        std::collections::BTreeMap::new();
+    for finding in findings {
+        for criterion in finding.wcag.split('/').map(str::trim) {
+            let entry = by_criterion.entry(criterion).or_default();
+            entry.0.insert(finding.rule_id);
+            entry.1 += 1;
+        }
+    }
+    by_criterion
+        .into_iter()
+        .map(|(criterion, (rules, findings))| WcagCriterion {
+            criterion: criterion.to_owned(),
+            rules: rules.into_iter().collect(),
+            findings,
+        })
+        .collect()
+}
+
+// ── Maud markup model ──────────────────────────────────────────────────────
+
+/// A parsed attribute value.
+#[derive(Debug, Clone)]
+enum AttrValue {
+    /// A static string literal, e.g. `alt="logo"` → `logo`.
+    Literal(String),
+    /// A spliced/runtime value, e.g. `alt=(expr)` — unresolvable.
+    Dynamic,
+    /// A boolean/presence-only or optional attribute, e.g. `disabled`,
+    /// `required[cond]`.
+    Boolean,
+}
+
+/// A parsed HTML attribute.
+#[derive(Debug, Clone)]
+struct Attr {
+    name: String,
+    value: AttrValue,
+}
+
+/// A parsed HTML element (best-effort).
+#[derive(Debug, Clone)]
+struct Element {
+    name: String,
+    line: usize,
+    /// 0-based column of the element, used only to pick the innermost enclosing
+    /// function when two of them share a line.
+    column: usize,
+    attrs: Vec<Attr>,
+    children: Vec<Node>,
+}
+
+impl Element {
+    /// The value of the first attribute named `name` (ASCII-case-insensitive).
+    fn attr(&self, name: &str) -> Option<&AttrValue> {
+        self.attrs
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(name))
+            .map(|a| &a.value)
+    }
+
+    /// Whether an attribute named `name` is present in any form.
+    fn has_attr(&self, name: &str) -> bool {
+        self.attr(name).is_some()
+    }
+
+    /// Whether this element carries a non-empty `aria-label`/`aria-labelledby`.
+    /// A spliced value counts as a name (unresolvable → assume present).
+    fn has_aria_name(&self) -> bool {
+        ["aria-label", "aria-labelledby"]
+            .iter()
+            .any(|n| attr_is_present_name(self.attr(n)))
+    }
+
+    /// Whether this element carries a non-empty `title`. Per the ARIA
+    /// accessible-name computation `title` is a last-resort name source, so a
+    /// control (or descendant) with a non-empty/dynamic `title` is named. A
+    /// spliced `title=(…)` counts (unresolvable → assume present).
+    fn has_title_name(&self) -> bool {
+        attr_is_present_name(self.attr("title"))
+    }
+}
+
+/// Whether an element is removed from the accessibility tree by an explicit
+/// presentational role (`role="presentation"`/`role="none"`). A spliced
+/// `role=(…)` is unresolvable and could be one of those, so it is treated as
+/// presentational (non-failing convention — skip rather than misfire). Note this
+/// is only honored for non-focusable elements (e.g. `<img>`): ARIA conflict
+/// resolution restores the implicit role on focusable controls, so it is not
+/// applied to `<button>`/`<a href>`/form controls.
+fn is_presentational(el: &Element) -> bool {
+    match el.attr("role") {
+        Some(AttrValue::Dynamic) => true,
+        Some(AttrValue::Literal(r)) => {
+            let r = r.to_ascii_lowercase();
+            r == "presentation" || r == "none"
+        }
+        _ => false,
+    }
+}
+
+/// Whether an attribute value supplies a non-empty accessible name: a spliced
+/// value (unresolvable → assume present) or a string literal that is non-blank
+/// after `.trim()`. A whitespace-only literal (`aria-label="   "`, `title=" "`,
+/// `alt="  "`) collapses to an empty accessible name — mirroring how text nodes
+/// are trimmed — so it does NOT count as a present name.
+fn attr_is_present_name(value: Option<&AttrValue>) -> bool {
+    match value {
+        Some(AttrValue::Dynamic) => true,
+        Some(AttrValue::Literal(s)) => !s.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether an `<img>` carries an `alt` that is a valid decorative marker or a
+/// real textual name. An explicitly empty `alt=""` is the accepted decorative
+/// marker (kept clean). A literal `alt` counts as a name only when it is
+/// non-blank after `.trim()`: a whitespace-only `alt="   "` collapses to an
+/// empty accessible name and is neither a name nor a valid decorative marker, so
+/// it does NOT satisfy the check. A dynamic/boolean `alt` is unresolvable and
+/// treated as present (non-failing convention).
+fn has_alt_marker(el: &Element) -> bool {
+    match el.attr("alt") {
+        None => false,
+        // Exact-empty is decorative; otherwise it must be non-blank after trim.
+        Some(AttrValue::Literal(s)) => s.is_empty() || !s.trim().is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// A parsed markup node.
+#[derive(Debug, Clone)]
+enum Node {
+    Element(Element),
+    /// A non-empty static text node.
+    Text(String),
+    /// A splice `(expr)` or a control block — an unresolvable dynamic value.
+    /// `splice` records whether it is a genuine `(expr)`/`[..]` splice (which
+    /// could render a `<label>` fragment beside a control) rather than an
+    /// `@`-control head; only the former marks a block as possibly-labeled.
+    Dynamic {
+        splice: bool,
+    },
+}
+
+/// Parse a maud markup token stream into a best-effort node list.
+fn parse_markup(stream: &TokenStream) -> Vec<Node> {
+    let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+    parse_nodes(&trees)
+}
+
+fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    let mut i = 0;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Ident(_) => {
+                let (element, next) = parse_element(trees, i);
+                nodes.push(Node::Element(element));
+                i = next;
+            }
+            TokenTree::Literal(lit) => {
+                let text = literal_text(lit);
+                if !text.trim().is_empty() {
+                    nodes.push(Node::Text(text));
+                }
+                i += 1;
+            }
+            // A leading `.`/`#` shorthand with NO explicit tag name is maud's
+            // implicit `div`: `.input { … }` renders `<div class="input">` and
+            // `#button { … }` renders `<div id="button">`. The class/id token is
+            // a VALUE, not a tag, so parse it as a `div` element (which triggers
+            // no rule) rather than letting the next iteration read `input`/`button`
+            // as a phantom element (false positive).
+            TokenTree::Punct(p) if matches!(p.as_char(), '#' | '.') => {
+                let (element, next) = parse_element(trees, i);
+                nodes.push(Node::Element(element));
+                i = next;
+            }
+            TokenTree::Punct(p) if p.as_char() == '@' => {
+                // Control flow (`@if`/`@for`/`@match`/`@let`): dynamic, but still
+                // descend into any block so elements inside are analyzed. Not a
+                // spliced fragment, so it never marks the block as possibly-labeled.
+                nodes.push(Node::Dynamic { splice: false });
+                if matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "match") {
+                    // `@match` is special: the brace group after the scrutinee is
+                    // an arm LIST, not markup. Parsing it as markup would treat
+                    // each arm's pattern (e.g. `input => …`) as an element and
+                    // fire a false positive. Skip past `@match`, then parse arms.
+                    i = skip_match(trees, i + 2, &mut nodes);
+                } else if matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "let") {
+                    // `@let` is special: it binds a Rust expression, so any brace
+                    // group in its initializer (`Field { input: true }`) is
+                    // struct-literal syntax, NEVER markup. Unlike `@if`/`@for`,
+                    // descending into it would misread a Rust field named `input`
+                    // as an `<input>`. Skip the whole binding up to its `;`.
+                    i = skip_let(trees, i + 2);
+                } else {
+                    i = skip_control(trees, i + 1, &mut nodes);
+                }
+            }
+            TokenTree::Group(g) => {
+                if g.delimiter() == Delimiter::Brace {
+                    nodes.extend(parse_markup(&g.stream()));
+                } else {
+                    // A `(expr)` splice or `[..]` — an unresolvable dynamic value
+                    // that could render a `<label>` fragment beside a control.
+                    nodes.push(Node::Dynamic { splice: true });
+                }
+                i += 1;
+            }
+            TokenTree::Punct(_) => i += 1,
+        }
+    }
+    nodes
+}
+
+/// Skip a `@if`/`@for`/`@while` head and fold each body block's children into
+/// `nodes` as siblings, following a trailing `@else` chain.
+///
+/// The body of these controls is a brace `Block`, but a brace can also appear in
+/// the HEAD and must NOT be parsed as markup:
+///
+/// - a `let`/`for` **pattern** may be a struct/enum-struct pattern
+///   (`@for Foo { x } in xs`, `@if let Foo { x } = e`); its braces are pattern
+///   syntax, and
+/// - the condition/iterator is parsed with `parse_without_eager_brace`, which
+///   accepts a **block-expression** condition (`@if { cond } { body }`); the
+///   leading brace is then the condition, not the body.
+///
+/// The body is the FINAL top-level brace of the clause. Two kinds of earlier
+/// brace are part of the condition and must NOT be parsed as markup:
+///
+/// - a **leading** block-expression condition (`@if { cond } { body }`): a brace
+///   seen before any condition token, immediately followed by the body brace, and
+/// - a **block-bearing keyword** expression inside the condition — `match`/`loop`/
+///   `unsafe` (`@if match s { … } { body }`): the keyword owns the next top-level
+///   brace (its block), which belongs to the condition, not the body.
+///
+/// A plain `@if a { body } { sibling }` is different: `a` is a complete condition,
+/// `{ body }` is the markup body, and `{ sibling }` is a following sibling block —
+/// both are scanned. So a brace-followed-by-brace is only skipped when it is a
+/// leading block condition or a pending keyword block; otherwise it is the body.
+fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usize {
+    let mut i = start;
+    // Inside a `let`/`for` pattern region, where braces are pattern syntax.
+    let mut in_pattern = false;
+    // Whether a non-brace condition token has been seen (so a following brace is
+    // the body, not a leading block-expression condition).
+    let mut saw_cond = false;
+    // A `match`/`loop`/`unsafe` expression in the condition owns the next
+    // top-level brace (its block), which is part of the condition, not the body.
+    let mut pending_block = false;
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Ident(id) => {
+                // A Rust macro call in the condition: `ident! { … }` /
+                // `ident!(…)` / `ident![…]` (e.g. `@if ready! { input } { body }`).
+                // The condition is parsed with `parse_without_eager_brace`, which
+                // accepts a macro invocation, so the `!`-delimited group is macro
+                // input — part of the condition, NOT markup. Skip the ident, the
+                // `!`, and the group together (any delimiter), the same way
+                // `match`/`loop`/`unsafe` keep their block out of the body;
+                // otherwise the macro's brace group is misparsed as markup (a
+                // phantom `<input>`) and the real body brace is missed. Requiring a
+                // delimiter group right after `!` excludes the `!=` operator (whose
+                // `!` is followed by `=`, not a group).
+                if !in_pattern
+                    && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                    && matches!(trees.get(i + 2), Some(TokenTree::Group(_)))
+                {
+                    saw_cond = true;
+                    i += 3;
+                    continue;
+                }
+                match id.to_string().as_str() {
+                    // Leading control keywords: not condition tokens.
+                    "if" | "while" | "else" => {}
+                    // `let`/`for` open a pattern region.
+                    "let" | "for" => in_pattern = true,
+                    // `in` closes a `@for pat in …` pattern region.
+                    "in" if in_pattern => in_pattern = false,
+                    // A block-bearing keyword expression in the condition: the
+                    // next top-level brace is its block, part of the condition.
+                    "match" | "loop" | "unsafe" if !in_pattern => {
+                        saw_cond = true;
+                        pending_block = true;
+                    }
+                    // Any other ident is part of the condition/iterator expression.
+                    _ => {
+                        if !in_pattern {
+                            saw_cond = true;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            // `=` closes a `@if let pat = …` / `@while let pat = …` pattern region.
+            TokenTree::Punct(p) if in_pattern && p.as_char() == '=' => {
+                in_pattern = false;
+                i += 1;
+            }
+            // `@let x = …;` (defensive) ends at a semicolon with no block.
+            TokenTree::Punct(p) if p.as_char() == ';' => {
+                i += 1;
+                break;
+            }
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
+                if in_pattern {
+                    // Struct/enum-struct pattern brace — skip, not markup.
+                    i += 1;
+                    continue;
+                }
+                if pending_block {
+                    // The block of a `match`/`loop`/`unsafe` condition expression
+                    // (e.g. the arm-list of `@if match s { … } { body }`). Part of
+                    // the condition — skip; the body is a later brace.
+                    pending_block = false;
+                    i += 1;
+                    continue;
+                }
+                if !saw_cond
+                    && matches!(trees.get(i + 1), Some(TokenTree::Group(n)) if n.delimiter() == Delimiter::Brace)
+                {
+                    // Leading block-expression condition; body is the next brace.
+                    i += 1;
+                    continue;
+                }
+                nodes.extend(parse_markup(&g.stream()));
+                i += 1;
+                // Only `@else` continues this chain. Any other `@`-control
+                // (`@let`/`@if`/`@for`/`@match`) is a sibling that must be
+                // returned to `parse_nodes` so it hits its proper handler —
+                // consuming it here would misparse e.g. a following `@let`'s
+                // struct-literal initializer as markup.
+                if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '@')
+                    && matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "else")
+                {
+                    i += 1;
+                    // Reset for the `@else` / `@else if …` continuation.
+                    in_pattern = false;
+                    saw_cond = false;
+                    pending_block = false;
+                    continue;
+                }
+                break;
+            }
+            // Any other token (paren/bracket group, operator, literal) is part of
+            // the condition/iterator expression.
+            _ => {
+                if !in_pattern {
+                    saw_cond = true;
+                }
+                i += 1;
+            }
+        }
+    }
+    i
+}
+
+/// Skip an `@let` binding, consuming every token up to and including its
+/// terminating top-level `;`. Unlike `@if`/`@for`/`@match` — whose braces are
+/// markup — an `@let` binds a Rust expression, so any brace group in its
+/// initializer (`Field { input: true }`) is struct-literal syntax and must NOT
+/// be parsed as markup; descending into it would misread a Rust field named
+/// `input` as an `<input>` element and fire a false positive. `start` points
+/// just past `@let`. Group token trees are atomic, so the `;` seen at this
+/// level is always the binding terminator, never one nested in a brace.
+fn skip_let(trees: &[TokenTree], start: usize) -> usize {
+    let mut i = start;
+    while i < trees.len() {
+        if matches!(&trees[i], TokenTree::Punct(p) if p.as_char() == ';') {
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Skip a `@match` head and scan only the arm BODIES. `start` points just past
+/// `@match`, at the scrutinee expression. The arm list is the brace group after
+/// the scrutinee; its contents are handed to [`parse_match_arms`].
+///
+/// A bare struct-literal scrutinee needs parens (a paren group, skipped), but the
+/// scrutinee is parsed with `parse_without_eager_brace`, so it MAY be a leading
+/// block expression (`@match { x } { arms }`). In that case the first brace is
+/// the scrutinee and the arm list is the next brace: skip a leading brace that is
+/// immediately followed by another brace when no scrutinee token precedes it.
+fn skip_match(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usize {
+    let mut i = start;
+    let mut saw_scrut = false;
+    while i < trees.len() {
+        if let TokenTree::Group(g) = &trees[i]
+            && g.delimiter() == Delimiter::Brace
+        {
+            if !saw_scrut
+                && matches!(trees.get(i + 1), Some(TokenTree::Group(n)) if n.delimiter() == Delimiter::Brace)
+            {
+                // Leading block-expression scrutinee; the arm list is next.
+                i += 1;
+                continue;
+            }
+            let arms: Vec<TokenTree> = g.stream().into_iter().collect();
+            parse_match_arms(&arms, nodes);
+            return i + 1;
+        }
+        saw_scrut = true;
+        i += 1;
+    }
+    i
+}
+
+/// Parse a maud `@match` arm list. For each arm, skip the pattern tokens (and
+/// any `if <guard>`) up to and including `=>`, then scan ONLY the arm body as
+/// markup. This keeps arm patterns from being misread as elements while still
+/// analyzing the real markup each arm renders.
+fn parse_match_arms(trees: &[TokenTree], nodes: &mut Vec<Node>) {
+    let mut i = 0;
+    while i < trees.len() {
+        // Locate the `=>` that separates this arm's pattern/guard from its body.
+        // A fat arrow is two joined puncts `=` `>`; the first one after the arm
+        // start delimits the body (guards use `>=`/`==`, never `=>`).
+        let Some(arrow) = find_fat_arrow(trees, i) else {
+            break;
+        };
+        i = parse_arm_body(trees, arrow + 2, nodes);
+    }
+}
+
+/// The index of the `=` token of the first `=>` at or after `start`, if any.
+fn find_fat_arrow(trees: &[TokenTree], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < trees.len() {
+        if let TokenTree::Punct(p) = &trees[i]
+            && p.as_char() == '='
+            && matches!(trees.get(i + 1), Some(TokenTree::Punct(q)) if q.as_char() == '>')
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Scan a single `@match` arm body starting at `start` (just past `=>`) and
+/// return the index of the next arm. A brace-group body is parsed as markup; any
+/// other shape (`(splice)`, string literal, single element) is collected up to
+/// the next top-level comma and parsed as markup. An unrecognized/ambiguous
+/// shape is simply skipped — a missed check is acceptable here, a false positive
+/// is not.
+fn parse_arm_body(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usize {
+    if let Some(TokenTree::Group(g)) = trees.get(start)
+        && g.delimiter() == Delimiter::Brace
+    {
+        nodes.extend(parse_markup(&g.stream()));
+        let mut next = start + 1;
+        if matches!(trees.get(next), Some(TokenTree::Punct(p)) if p.as_char() == ',') {
+            next += 1;
+        }
+        return next;
+    }
+    // Non-brace body: collect up to the next top-level comma (group contents are
+    // atomic token trees, so any comma seen here is an arm separator).
+    let mut j = start;
+    while j < trees.len() {
+        if matches!(&trees[j], TokenTree::Punct(p) if p.as_char() == ',') {
+            break;
+        }
+        j += 1;
+    }
+    nodes.extend(parse_nodes(&trees[start..j]));
+    if j < trees.len() { j + 1 } else { j }
+}
+
+/// Parse a single element starting at `trees[start]` (an ident, or a leading
+/// `.`/`#` shorthand denoting maud's implicit `div`). Returns the element and the
+/// index just past it.
+fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
+    let line = trees[start].span().start().line;
+    let column = trees[start].span().start().column;
+    // A leading `.`/`#` with no explicit tag name is an implicit `div`; the
+    // shorthand class/id begins AT `start` and the tag is `div`. Otherwise the
+    // tag name is a full maud `HtmlName` (`Punctuated<HtmlNameFragment, '-' | ':'>`),
+    // so a custom/namespaced tag like `x-input`, `x-button`, or `svg:rect` must be
+    // read via the SAME `read_name` logic used for attribute names — consuming only
+    // the first identifier would leave the `-`/`:` + suffix in the stream, where the
+    // next pass would misread the `input`/`button`/`rect` suffix as a separate plain
+    // control element and fire a false `label`/`button-name`. Shorthands begin just
+    // past the whole name.
+    let (name, shorthand_start) = match &trees[start] {
+        TokenTree::Punct(p) if matches!(p.as_char(), '#' | '.') => ("div".to_owned(), start),
+        _ => read_name(trees, start),
+    };
+    let mut attrs = Vec::new();
+    let mut i = parse_shorthand(trees, shorthand_start, &mut attrs);
+    let mut children = Vec::new();
+    while i < trees.len() {
+        match &trees[i] {
+            TokenTree::Punct(p) if p.as_char() == ';' => {
+                i += 1;
+                break;
+            }
+            TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
+                children = parse_markup(&g.stream());
+                i += 1;
+                break;
+            }
+            TokenTree::Punct(p) if matches!(p.as_char(), '#' | '.') => {
+                i = parse_shorthand(trees, i, &mut attrs);
+            }
+            TokenTree::Ident(_) => {
+                let (attr, next) = parse_attr(trees, i);
+                attrs.push(attr);
+                i = next;
+            }
+            // A quoted (string-literal) attribute name, e.g.
+            // `button "@click"="save" { … }` or `input "aria-label"="Search";`.
+            // maud accepts a `LitStr` as an attribute-name fragment, so route it
+            // through `parse_attr` like an ident name: its `="value"` (or bare /
+            // `[toggler]`) is consumed and the element body that follows is still
+            // parsed. `read_name` records the unquoted text, so a quoted
+            // accessible-name source (`"aria-label"`, `"title"`, `"alt"`) counts
+            // toward the accessible name exactly like the ident form. A non-string
+            // literal is not a valid name here and ends the element (best-effort:
+            // a missed check is acceptable, a false positive is not).
+            TokenTree::Literal(lit) if string_literal_value(lit).is_some() => {
+                let (attr, next) = parse_attr(trees, i);
+                attrs.push(attr);
+                i = next;
+            }
+            // Anything else (a stray splice, operator, …) ends the element.
+            _ => break,
+        }
+    }
+    (
+        Element {
+            name,
+            line,
+            column,
+            attrs,
+            children,
+        },
+        i,
+    )
+}
+
+/// Parse maud `#id` / `.class` shorthands, recording `#id` as an `id` attribute.
+///
+/// Each shorthand's value is a maud `HtmlNameOrMarkup`: a static name (`#bar`,
+/// `.foo`), a dynamic splice (`#(expr)`, `.(expr)` — a paren-group Markup), a
+/// braced markup group (`.{ … }`), or a MARKUP control value
+/// (`.@if primary { "primary" }`); a class may then carry a `[cond]` toggler
+/// (`.foo[active]`). A dynamic/markup id value is recorded as `Dynamic`
+/// (unresolvable, like `id=(expr)`). Consuming the value and toggler is
+/// essential: leaving a `(expr)`/`{ … }`/`@…`/`[cond]` group unconsumed ends the
+/// element early, orphaning its real `{ … }` body and firing false positives on
+/// the parent (e.g. `button.(cls) { "Save" }` or `button.@if c { "x" } { "Save" }`
+/// losing its text).
+fn parse_shorthand(trees: &[TokenTree], start: usize, attrs: &mut Vec<Attr>) -> usize {
+    let mut i = start;
+    while let Some(TokenTree::Punct(p)) = trees.get(i) {
+        let sym = p.as_char();
+        if sym != '#' && sym != '.' {
+            break;
+        }
+        let is_id = sym == '#';
+        i += 1; // consume the `#`/`.` — guarantees progress even with no name.
+        match trees.get(i) {
+            // Dynamic shorthand value: `#(expr)` / `.(expr)`, or a braced markup
+            // group `#{ … }` / `.{ … }` — an unresolvable markup value. (A body
+            // brace never follows a `#`/`.` directly, so this is the class/id
+            // value, never the element body.)
+            Some(TokenTree::Group(g))
+                if matches!(g.delimiter(), Delimiter::Parenthesis | Delimiter::Brace) =>
+            {
+                if is_id {
+                    attrs.push(Attr {
+                        name: "id".to_owned(),
+                        value: AttrValue::Dynamic,
+                    });
+                }
+                i += 1;
+            }
+            // Markup-valued shorthand via a maud control:
+            // `.@if c { "x" }` / `#@match … { … }`. Fully consume the control
+            // (head + brace group(s) + any `@else` chain) so the element's real
+            // body that follows is still parsed. The value is unresolvable, so an
+            // id records as `Dynamic`.
+            Some(TokenTree::Punct(q)) if q.as_char() == '@' => {
+                if is_id {
+                    attrs.push(Attr {
+                        name: "id".to_owned(),
+                        value: AttrValue::Dynamic,
+                    });
+                }
+                i = skip_shorthand_control(trees, i + 1);
+            }
+            // Static shorthand value: `#bar` / `.foo` (possibly hyphenated).
+            _ => {
+                let (name, next) = read_name(trees, i);
+                if next > i {
+                    if is_id {
+                        attrs.push(Attr {
+                            name: "id".to_owned(),
+                            value: AttrValue::Literal(name),
+                        });
+                    }
+                    i = next;
+                }
+            }
+        }
+        // Optional `[cond]` toggler (`.foo[active]`).
+        if matches!(trees.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket)
+        {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Consume a markup-valued class/id control value (`.@if c { "x" }`), returning
+/// the index just past it. `start` points just past the `@`, at the control
+/// keyword. Reuses the same control/match/let skippers as node parsing; any
+/// markup they descend into is discarded — a class/id value is a maud
+/// `NoElement` context and can render no element to scan.
+fn skip_shorthand_control(trees: &[TokenTree], start: usize) -> usize {
+    let mut discard = Vec::new();
+    if matches!(trees.get(start), Some(TokenTree::Ident(id)) if *id == "match") {
+        skip_match(trees, start + 1, &mut discard)
+    } else if matches!(trees.get(start), Some(TokenTree::Ident(id)) if *id == "let") {
+        skip_let(trees, start + 1)
+    } else {
+        skip_control(trees, start, &mut discard)
+    }
+}
+
+/// Parse one attribute (`name`, `name="v"`, `name=(expr)`, `name[cond]`, …).
+fn parse_attr(trees: &[TokenTree], start: usize) -> (Attr, usize) {
+    let (name, i) = read_name(trees, start);
+    match trees.get(i) {
+        Some(TokenTree::Punct(p)) if p.as_char() == '=' => {
+            let (value, next) = read_attr_value(trees, i + 1);
+            (Attr { name, value }, next)
+        }
+        Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket => (
+            Attr {
+                name,
+                value: AttrValue::Boolean,
+            },
+            i + 1,
+        ),
+        Some(TokenTree::Punct(p)) if p.as_char() == '?' => {
+            let next = if matches!(trees.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Bracket)
+            {
+                i + 2
+            } else {
+                i + 1
+            };
+            (
+                Attr {
+                    name,
+                    value: AttrValue::Boolean,
+                },
+                next,
+            )
+        }
+        _ => (
+            Attr {
+                name,
+                value: AttrValue::Boolean,
+            },
+            i,
+        ),
+    }
+}
+
+/// Read an attribute value token following `=`.
+fn read_attr_value(trees: &[TokenTree], i: usize) -> (AttrValue, usize) {
+    match trees.get(i) {
+        Some(TokenTree::Literal(lit)) => string_literal_value(lit)
+            .map_or((AttrValue::Dynamic, i + 1), |v| {
+                (AttrValue::Literal(v), i + 1)
+            }),
+        Some(TokenTree::Group(_) | TokenTree::Ident(_)) => (AttrValue::Dynamic, i + 1),
+        // A control-flow / markup value: `attr=@if c { "x" }`,
+        // `attr=@match s { _ => "c" }`. maud allows an attribute value to be a
+        // `Markup` control; consume the control head + its brace group(s) (via the
+        // same skipper the shorthand path uses) so the element body that follows
+        // is still parsed rather than orphaned (which would fire a false
+        // `button-name`/`link-name` on the parent). The value is unresolvable, so
+        // it is recorded as `Dynamic` (non-failing).
+        Some(TokenTree::Punct(p)) if p.as_char() == '@' => {
+            (AttrValue::Dynamic, skip_shorthand_control(trees, i + 1))
+        }
+        _ => (AttrValue::Dynamic, i),
+    }
+}
+
+/// Read a (possibly hyphenated or colon-qualified) name — `aria-label`,
+/// `hx-post`, `x-on:click`, `svg:path`, `for` — starting at `start`. Returns the
+/// joined name and the index just past it. maud names are a
+/// `Punctuated<HtmlNameFragment, ':' | '-'>`, so both `-` and `:` continue the
+/// name; consuming the whole name (including a colon-qualified suffix like
+/// `x-on:click`) is essential — otherwise the leftover `:` ends the element
+/// early and orphans its real `{ … }` body, firing a false `button-name`/
+/// `link-name` on the parent.
+fn read_name(trees: &[TokenTree], start: usize) -> (String, usize) {
+    let Some(mut name) = name_segment(trees.get(start)) else {
+        return (String::new(), start);
+    };
+    let mut i = start + 1;
+    while let Some(TokenTree::Punct(p)) = trees.get(i) {
+        let sep = p.as_char();
+        if sep != '-' && sep != ':' {
+            break;
+        }
+        let Some(seg) = name_segment(trees.get(i + 1)) else {
+            break;
+        };
+        name.push(sep);
+        name.push_str(&seg);
+        i += 2;
+    }
+    (name, i)
+}
+
+/// The text of a single name segment. maud's `HtmlNameFragment` is an
+/// identifier, an integer literal, or a string literal (`.col-12`, `data-1`,
+/// `x-2` all use the integer variant), so all three continue a name. A
+/// non-integer non-string literal (e.g. a float) is not a valid fragment and
+/// ends the name.
+fn name_segment(tree: Option<&TokenTree>) -> Option<String> {
+    match tree {
+        Some(TokenTree::Ident(id)) => Some(id.to_string()),
+        Some(TokenTree::Literal(lit)) => {
+            string_literal_value(lit).or_else(|| int_literal_text(lit))
+        }
+        _ => None,
+    }
+}
+
+/// The digits of an integer literal (e.g. the `12` in `.col-12`), or `None` if
+/// the literal is not an integer. maud accepts an integer as an `HtmlName`
+/// fragment, so it must be consumed as part of the name.
+fn int_literal_text(lit: &Literal) -> Option<String> {
+    syn::parse2::<syn::LitInt>(TokenStream::from(TokenTree::Literal(lit.clone())))
+        .ok()
+        .map(|n| n.base10_digits().to_string())
+}
+
+/// The unescaped value of a string literal, or `None` for a non-string literal.
+fn string_literal_value(lit: &Literal) -> Option<String> {
+    syn::parse2::<syn::LitStr>(TokenStream::from(TokenTree::Literal(lit.clone())))
+        .ok()
+        .map(|s| s.value())
+}
+
+/// The text of a literal node — the string value if it is a string literal,
+/// otherwise its raw token text (e.g. a bare number).
+fn literal_text(lit: &Literal) -> String {
+    string_literal_value(lit).unwrap_or_else(|| lit.to_string())
+}
+
+// ── Analysis ───────────────────────────────────────────────────────────────
+
+/// Analyze one `html!` block's node tree, applying every rule.
+fn analyze_block(nodes: &[Node], file: &str, scan: &mut Scan) {
+    let mut label_fors = BTreeSet::new();
+    let mut dynamic_label_for = false;
+    collect_labels(nodes, &mut label_fors, &mut dynamic_label_for);
+    walk(nodes, file, &label_fors, dynamic_label_for, false, scan);
+}
+
+/// Gather every `<label for="…">` literal in the block, and note whether any
+/// label's `for` is a splice (which makes association unresolvable).
+fn collect_labels(nodes: &[Node], fors: &mut BTreeSet<String>, dynamic: &mut bool) {
+    for node in nodes {
+        match node {
+            Node::Element(el) => {
+                // A `<label>` inside an `aria-hidden="true"` (or natively
+                // `hidden`) subtree is not in the accessibility tree, so its
+                // `for` association contributes no accessible name — skip the
+                // element and its subtree entirely, consistent with `walk`'s
+                // name derivation. A dynamic/spliced `aria-hidden=(…)`/`hidden=(…)`
+                // stays non-hidden (conservative).
+                if is_hidden(el) {
+                    continue;
+                }
+                if el.name.eq_ignore_ascii_case("label") {
+                    match el.attr("for") {
+                        // Only a label that actually provides a name satisfies the
+                        // association: an empty `<label for=..>` contributes no
+                        // accessible name, so recording it would let an unlabeled
+                        // control pass. A dynamic (spliced) body still counts, per
+                        // the non-failing-splice convention (`label_provides_name`).
+                        Some(AttrValue::Literal(v)) if label_provides_name(el) => {
+                            fors.insert(v.clone());
+                        }
+                        Some(AttrValue::Dynamic) if label_provides_name(el) => *dynamic = true,
+                        _ => {}
+                    }
+                }
+                collect_labels(&el.children, fors, dynamic);
+            }
+            // A spliced fragment `(expr)` could render a `<label for=..>`, but
+            // only one that is a DIRECT SIBLING of a control can label it. That
+            // sibling-scoped suppression is handled in `walk`; recording it here
+            // would (wrongly) mark the WHOLE block possibly-labeled, so an
+            // unrelated nested splice like `p { (user.name) }` would suppress the
+            // rule for every control in the block (false negative).
+            Node::Dynamic { .. } | Node::Text(_) => {}
+        }
+    }
+}
+
+/// Label-association context threaded through the rule walk.
+struct LabelCtx<'a> {
+    /// Static `<label for="…">` ids collected across the block.
+    fors: &'a BTreeSet<String>,
+    /// A `<label for=(…)>` with a dynamic (spliced) target exists somewhere in
+    /// the block — it could associate with any control, so it is block-wide.
+    dynamic_for: bool,
+    /// A splice that is a DIRECT SIBLING of the control could render a `<label>`
+    /// fragment for it — sibling-scoped, recomputed per node list.
+    sibling_splice: bool,
+    /// We are inside a `<label>` that provides a name (which wraps the control).
+    in_named_label: bool,
+}
+
+/// Recursively apply rules, tracking whether we are inside a `<label>` that
+/// provides a name (so a control it wraps is considered labeled).
+fn walk(
+    nodes: &[Node],
+    file: &str,
+    fors: &BTreeSet<String>,
+    dynamic_for: bool,
+    in_named_label: bool,
+    scan: &mut Scan,
+) {
+    // A splice that is a DIRECT SIBLING of a control could render a `<label>`
+    // fragment for it, so its presence in THIS sibling list makes the
+    // association unresolvable. A splice nested inside another element belongs to
+    // a different sibling list and must not suppress controls here.
+    let sibling_splice = nodes
+        .iter()
+        .any(|n| matches!(n, Node::Dynamic { splice: true }));
+    let ctx = LabelCtx {
+        fors,
+        dynamic_for,
+        sibling_splice,
+        in_named_label,
+    };
+    for node in nodes {
+        let Node::Element(el) = node else {
+            continue;
+        };
+        // An element removed from the accessibility tree by `aria-hidden="true"`
+        // or a native boolean `hidden` on ITSELF needs no accessible name, and
+        // neither does its subtree — skip both rule application and recursion.
+        if is_hidden(el) {
+            continue;
+        }
+        apply_rules(el, file, &ctx, scan);
+        let child_named_label =
+            in_named_label || (el.name.eq_ignore_ascii_case("label") && label_provides_name(el));
+        walk(
+            &el.children,
+            file,
+            fors,
+            dynamic_for,
+            child_named_label,
+            scan,
+        );
+    }
+}
+
+fn apply_rules(el: &Element, file: &str, ctx: &LabelCtx, scan: &mut Scan) {
+    match el.name.to_ascii_lowercase().as_str() {
+        // An `<img>` is named by `alt` (even empty `alt=""`, the decorative
+        // marker), or — per the axe `image-alt` checks — by an
+        // `aria-label`/`aria-labelledby`, a non-empty `title`, or an explicit
+        // presentational role. Only a bare image with none of these is flagged.
+        "img"
+            if !has_alt_marker(el)
+                && !el.has_aria_name()
+                && !el.has_title_name()
+                && !is_presentational(el) =>
+        {
+            scan.push(Rule::ImageAlt, "img", el.line, el.column, file);
+        }
+        name @ ("input" | "select" | "textarea") => {
+            check_field(el, name, file, ctx, scan);
+        }
+        "button" if !named_content(el) => {
+            scan.push(Rule::ButtonName, "button", el.line, el.column, file);
+        }
+        "a" if el.has_attr("href") && !named_content(el) => {
+            scan.push(Rule::LinkName, "a", el.line, el.column, file);
+        }
+        _ => {}
+    }
+}
+
+/// Rule 2: a form control needs an associated label or accessible name.
+fn check_field(el: &Element, name: &str, file: &str, ctx: &LabelCtx, scan: &mut Scan) {
+    // `<input type=…>` handling. Literal submit/hidden/button/reset/image
+    // controls need no visible label. A spliced `type=(…)` is unresolvable —
+    // it could be one of those non-labeling types, so skip rather than misfire
+    // on valid markup (per the non-failing-splice convention).
+    if name == "input" {
+        match el.attr("type") {
+            Some(AttrValue::Literal(ty))
+                if ["hidden", "submit", "button", "reset", "image"]
+                    .contains(&ty.to_ascii_lowercase().as_str()) =>
+            {
+                return;
+            }
+            Some(AttrValue::Dynamic) => return,
+            _ => {}
+        }
+    }
+    if el.has_aria_name() || el.has_title_name() || ctx.in_named_label {
+        return;
+    }
+    match el.attr("id") {
+        // A static id resolves against the collected `<label for>` set. A
+        // dynamic `<label for=(…)>` elsewhere (`dynamic_for`) could target it,
+        // and a splice that is a DIRECT SIBLING of this control could render a
+        // `<label for=..>` fragment for it — either makes the association
+        // unresolvable, so skip rather than risk a false positive.
+        Some(AttrValue::Literal(id)) => {
+            if ctx.fors.contains(id) || ctx.dynamic_for || ctx.sibling_splice {
+                return;
+            }
+        }
+        // A spliced id cannot be matched to a label — skip rather than misfire.
+        Some(AttrValue::Dynamic) => return,
+        _ => {}
+    }
+    scan.push(Rule::Label, name, el.line, el.column, file);
+}
+
+/// Whether an element has an accessible name from its own attributes or content:
+/// an `aria-label`/`aria-labelledby` on the control itself, or — among the
+/// descendants that are not hidden from the accessibility tree — visible text, a
+/// dynamic (spliced) body, or a named child image. A dynamic subtree is
+/// unresolvable, so it is treated as named (skip rather than misfire).
+fn named_content(el: &Element) -> bool {
+    el.has_aria_name() || el.has_title_name() || content_provides_name(&el.children)
+}
+
+/// Whether an element is hidden from the accessibility tree, either via a
+/// literal `aria-hidden="true"` or via the native boolean `hidden` attribute.
+/// Per ARIA/HTML such a subtree contributes nothing to an ancestor's accessible
+/// name and its controls need no name. A dynamic/spliced `aria-hidden=(…)` or
+/// `hidden=(…)` is unresolvable and treated as *not* hidden (conservative —
+/// don't suppress a name on an unresolved splice); `aria-hidden="false"` or an
+/// absent attribute are likewise not hidden. A present static `hidden` — bare
+/// (`hidden`) or with any literal value (`hidden="until-found"`) — counts as
+/// hidden, matching HTML's boolean-attribute semantics.
+fn is_hidden(el: &Element) -> bool {
+    let aria_hidden = matches!(
+        el.attr("aria-hidden"),
+        Some(AttrValue::Literal(v)) if v.eq_ignore_ascii_case("true")
+    );
+    let native_hidden = matches!(
+        el.attr("hidden"),
+        Some(AttrValue::Boolean | AttrValue::Literal(_))
+    );
+    aria_hidden || native_hidden
+}
+
+/// Whether descendant content contributes an accessible name to an enclosing
+/// control: a dynamic (spliced) node, non-empty visible text, or a named
+/// `<img>`. Subtrees hidden via a literal `aria-hidden="true"` or a native
+/// boolean `hidden` are excluded — per ARIA/HTML their text does not count
+/// toward the ancestor's accessible name.
+fn content_provides_name(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        // Only a genuine `(expr)`/`[..]` splice renders text that could name the
+        // control; an `@`-control head (`splice: false`) renders nothing itself
+        // (its branch bodies were already parsed out), so it is not a name.
+        Node::Dynamic { splice } => *splice,
+        Node::Text(t) => !t.trim().is_empty(),
+        Node::Element(e) if is_hidden(e) => false,
+        Node::Element(e) => {
+            // A descendant contributes a name via its own `aria-label`/
+            // `aria-labelledby`/`title` (used during the name-from-content
+            // traversal), a named child `<img alt>`, or its own descendants.
+            e.has_aria_name()
+                || e.has_title_name()
+                || (e.name.eq_ignore_ascii_case("img") && attr_is_present_name(e.attr("alt")))
+                || content_provides_name(&e.children)
+        }
+    })
+}
+
+/// Whether a `<label>` provides an accessible name to a control (whether it
+/// wraps the control or associates via `for`). This uses the SAME accessible-
+/// name walk as buttons and links (`content_provides_name`): visible text or a
+/// dynamic (spliced) body counts, a named child `<img alt>` counts, and an
+/// `aria-hidden="true"` subtree does NOT — its text is not an accessible name.
+fn label_provides_name(el: &Element) -> bool {
+    content_provides_name(&el.children)
+}
+
+// ── Output ─────────────────────────────────────────────────────────────────
+
+const PRIMITIVE_NOTE: &str = "Note: code using the typed autumn_web::a11y primitives is proven \
+accessible at compile time and is intentionally not re-scanned. This pass \
+targets raw html! markup that bypasses those primitives.";
+
+/// Verify `root`, print a report, and return the process exit code (non-zero
+/// when findings meet the failure threshold). The `autumn a11y verify` command
+/// calls this with the resolved project path and `std::process::exit`s on it.
+#[must_use]
+pub fn run_in(root: &Path, opts: A11yVerifyOptions) -> i32 {
+    // An unreadable scan root is a hard failure, not an empty (PASS) audit:
+    // surface the io error on stderr and exit non-zero so a CI path typo cannot
+    // silently disable the whole check.
+    let scan = match scan_project(root) {
+        Ok(scan) => scan,
+        Err(err) => {
+            eprintln!("error: cannot read scan path '{}': {err}", root.display());
+            return 1;
+        }
+    };
+    let report = Report::from_scan(scan);
+    match opts.format {
+        OutputFormat::Json => print_json(&report),
+        OutputFormat::Text => print_text(&report, opts.strict),
+    }
+    report.exit_code(opts.strict)
+}
+
+fn print_json(report: &Report) {
+    match serde_json::to_string_pretty(report) {
+        Ok(json) => println!("{json}"),
+        Err(err) => eprintln!("autumn a11y verify: failed to serialize report: {err}"),
+    }
+}
+
+fn print_text(report: &Report, strict: bool) {
+    print!("{}", format_text(report, strict));
+}
+
+/// Render the human-readable report.
+fn format_text(report: &Report, strict: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "autumn a11y verify");
+    let _ = writeln!(
+        out,
+        "  scanned {} html! block(s) across {} .rs file(s)",
+        report.html_blocks, report.files_scanned
+    );
+    let _ = writeln!(
+        out,
+        "  {} route(s) discovered, {} carrying findings",
+        report.summary.routes, report.summary.routes_failing
+    );
+    let _ = writeln!(out, "  {PRIMITIVE_NOTE}");
+
+    if report.findings.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nResult: PASS — no accessibility violations in raw html! markup."
+        );
+        return out;
+    }
+
+    let _ = writeln!(out, "\n  findings:");
+    for f in &report.findings {
+        let _ = writeln!(
+            out,
+            "    {}:{}: <{}> [WCAG {}] {} — {}",
+            f.file, f.line, f.element, f.wcag, f.severity, f.message
+        );
+        if !f.routes.is_empty() {
+            let _ = writeln!(out, "        routes: {}", f.routes.join(", "));
+        }
+        let _ = writeln!(out, "        hint: {}", f.hint);
+    }
+
+    let failing: Vec<&RouteConformance> = report.routes.iter().filter(|r| r.findings > 0).collect();
+    if !failing.is_empty() {
+        let _ = writeln!(out, "\n  failing routes:");
+        for route in failing {
+            let _ = writeln!(
+                out,
+                "    {} {} ({}) — {} finding(s)",
+                route.method, route.path, route.handler, route.findings
+            );
+        }
+    }
+
+    let _ = writeln!(out, "\n  WCAG success criteria breached:");
+    for criterion in &report.wcag {
+        let _ = writeln!(
+            out,
+            "    WCAG {} — {} finding(s) [{}]",
+            criterion.criterion,
+            criterion.findings,
+            criterion.rules.join(", ")
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "\n  summary: {} Critical, {} Serious, {} Moderate ({} total, {} not reached by any route)",
+        report.summary.critical,
+        report.summary.serious,
+        report.summary.moderate,
+        report.summary.total,
+        report.summary.unrouted,
+    );
+    if report.exit_code(strict) == 0 {
+        let _ = writeln!(
+            out,
+            "Result: PASS with findings — below the failure threshold."
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "Result: FAIL — fix the accessibility violations above (or use the typed primitives)."
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scan a single `html!`-bearing source snippet and return its findings.
+    fn findings_for(src: &str) -> Vec<Finding> {
+        let mut scan = Scan::default();
+        scan_source(src, "view.rs", &mut scan);
+        scan.findings
+    }
+
+    /// The set of rule ids flagged for a snippet.
+    fn rule_ids(src: &str) -> Vec<&'static str> {
+        let mut ids: Vec<&'static str> = findings_for(src).iter().map(|f| f.rule_id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn wrap(markup: &str) -> String {
+        format!("fn view() {{ let _ = html! {{ {markup} }}; }}")
+    }
+
+    // ── Rule 1: image-alt ──────────────────────────────────────────────────
+
+    #[test]
+    fn alt_less_img_is_flagged() {
+        let src = wrap(r#"img src="x.png";"#);
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "image-alt");
+        assert_eq!(f[0].wcag, "1.1.1");
+        assert_eq!(f[0].severity, Severity::Serious);
+    }
+
+    #[test]
+    fn img_with_alt_is_clean() {
+        let src = wrap(r#"img src="x.png" alt="A logo";"#);
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn img_with_empty_alt_is_clean() {
+        // An explicit decorative alt="" is a valid accessible marker.
+        let src = wrap(r#"img src="divider.png" alt="";"#);
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn img_with_dynamic_alt_is_clean() {
+        let src = wrap(r#"img src="x.png" alt=(caption);"#);
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn img_with_whitespace_alt_is_flagged() {
+        // A whitespace-only `alt="  "` collapses to an empty accessible name and
+        // is not a valid decorative marker (only exact `alt=""` is) — flagged.
+        let src = wrap(r#"img src="x" alt="  ";"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["image-alt"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn button_with_whitespace_aria_label_is_flagged() {
+        // A whitespace-only static `aria-label="   "` supplies no accessible name.
+        let src = wrap(r#"button aria-label="   " { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn button_with_real_aria_label_is_clean() {
+        // A non-blank static `aria-label` is a present accessible name — clean.
+        let src = wrap(r#"button aria-label="Close" { }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_whitespace_title_and_no_label_is_flagged() {
+        // A whitespace-only `title=" "` is not a name; with no label the field is
+        // flagged.
+        let src = wrap(r#"input title=" " id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── Rule 2: label ──────────────────────────────────────────────────────
+
+    #[test]
+    fn unlabeled_input_is_flagged() {
+        let src = wrap(r#"input type="text" id="name";"#);
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "label");
+        assert_eq!(f[0].wcag, "1.3.1 / 3.3.2 / 4.1.2");
+        assert_eq!(f[0].element, "input");
+    }
+
+    #[test]
+    fn input_with_matching_label_for_is_clean() {
+        let src = wrap(r#"label for="name" { "Name" } input type="text" id="name";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_aria_label_is_clean() {
+        let src = wrap(r#"input type="text" aria-label="Search";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_empty_aria_label_is_flagged() {
+        let src = wrap(r#"input type="text" aria-label="";"#);
+        assert_eq!(rule_ids(&src), vec!["label"]);
+    }
+
+    #[test]
+    fn wrapped_label_with_text_is_clean() {
+        let src = wrap(r#"label { "Name" input type="text"; }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn hidden_input_needs_no_label() {
+        let src = wrap(r#"input type="hidden" name="_csrf";"#);
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn unlabeled_select_and_textarea_are_flagged() {
+        let src = wrap(r#"select id="role" { } textarea id="bio" { }"#);
+        assert_eq!(rule_ids(&src), vec!["label", "label"]);
+    }
+
+    #[test]
+    fn input_with_dynamic_id_is_not_flagged() {
+        // A spliced id cannot be matched to a label — skip rather than misfire.
+        let src = wrap(r#"input type="text" id=(field_id);"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn empty_label_for_does_not_satisfy_association() {
+        // An empty `<label for=..>` provides no accessible name, so the
+        // associated control must still be flagged (regression: false negative).
+        let src = wrap(r#"label for="email" { } input type="text" id="email";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn labeled_input_via_for_with_text_is_clean() {
+        // A `<label for=..>` with real text satisfies the association.
+        let src = wrap(r#"label for="email" { "Email" } input type="text" id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_for_with_dynamic_body_is_clean() {
+        // A spliced label body is unresolvable and counts as providing a name.
+        let src = wrap(r#"label for="email" { (title) } input type="text" id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn dynamic_for_label_with_empty_body_does_not_satisfy_association() {
+        // A spliced-`for` label with a statically EMPTY body provides no
+        // accessible name, so a static-id control must still be flagged. The
+        // dynamic-`for` marker must carry the same `label_provides_name` guard as
+        // the literal-`for` path (regression: false negative).
+        let src = wrap(r#"label for=(id) { } input type="text" id="email";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn dynamic_for_label_with_dynamic_body_is_clean() {
+        // A spliced-`for` label with a dynamic (spliced) body counts as providing
+        // a name, per the non-failing-splice convention.
+        let src = wrap(r#"label for=(id) { (title) } input type="text" id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn dynamic_for_label_with_text_body_is_clean() {
+        // A spliced-`for` label with real text provides a name.
+        let src = wrap(r#"label for=(id) { "Email" } input type="text" id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_dynamic_type_is_not_flagged() {
+        // A spliced `type=(…)` is unresolvable — it may be a non-labeling type
+        // like submit/button, so skip rather than misfire (regression: false
+        // positive).
+        let src = wrap(r#"input type=(kind) value="Save";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_literal_text_type_still_flagged() {
+        // A literal text-like type with no label is still flagged.
+        let src = wrap(r#"input type="text";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn spliced_label_fragment_beside_control_is_not_flagged() {
+        // A label composed as a separate fragment and spliced next to the raw
+        // control could render a `<label for=..>`; the association is
+        // unresolvable, so per the non-failing-splice convention the control is
+        // treated as possibly-labeled (regression: false positive).
+        let src = wrap(r#"(field_label) input id="email";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn unlabeled_input_with_no_splice_is_still_flagged() {
+        // With no spliced fragment anywhere in the block, an unlabeled control
+        // must still be flagged — the fragment marker must not suppress unrelated
+        // static controls.
+        let src = wrap(r#"input id="x";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── Rule 3: button-name ────────────────────────────────────────────────
+
+    #[test]
+    fn empty_button_is_flagged() {
+        let src = wrap(r"button { }");
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "button-name");
+        assert_eq!(f[0].wcag, "4.1.2");
+    }
+
+    #[test]
+    fn button_with_text_is_clean() {
+        let src = wrap(r#"button { "Save" }"#);
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn button_with_aria_label_is_clean() {
+        let src = wrap(r#"button aria-label="Close" { }"#);
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn icon_button_with_alt_image_is_clean() {
+        let src = wrap(r#"button { img src="trash.svg" alt="Delete"; }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_with_dynamic_content_is_not_flagged() {
+        let src = wrap(r"button { (label_text) }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_with_only_control_head_is_flagged() {
+        // The only child is an `@if` control HEAD (`splice: false`), whose branch
+        // bodies were parsed out — it renders no accessible text. A definitively
+        // nameless button must still be flagged (regression: false negative — a
+        // control head was wrongly counted as a name).
+        let src = wrap(r"button { @if disabled { } }");
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "button-name");
+    }
+
+    #[test]
+    fn button_with_real_splice_content_is_clean() {
+        // A genuine `(expr)` splice body could render the button's name, so it is
+        // treated as named (unchanged; guards against over-correcting the head fix).
+        let src = wrap(r"button { (label) }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    // ── Rule 4: link-name ──────────────────────────────────────────────────
+
+    #[test]
+    fn textless_anchor_is_flagged() {
+        let src = wrap(r#"a href="/x" { }"#);
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "link-name");
+        assert_eq!(f[0].wcag, "2.4.4 / 4.1.2");
+    }
+
+    #[test]
+    fn anchor_with_text_is_clean() {
+        let src = wrap(r#"a href="/x" { "About us" }"#);
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn anchor_without_href_is_not_flagged() {
+        // Rule 4 only fires for anchors that carry an href.
+        let src = wrap(r"a { }");
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn icon_anchor_with_aria_label_is_clean() {
+        let src = wrap(r#"a href="https://example.com" aria-label="GitHub" { }"#);
+        assert!(findings_for(&src).is_empty());
+    }
+
+    // ── aria-hidden subtrees don't count toward the accessible name ─────────
+
+    #[test]
+    fn icon_button_with_aria_hidden_glyph_is_flagged() {
+        // The only content is an `aria-hidden="true"` glyph, which per ARIA does
+        // not contribute an accessible name — the button is effectively nameless.
+        let src = wrap(r#"button { span aria-hidden="true" { "×" } }"#);
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "button-name");
+    }
+
+    #[test]
+    fn icon_anchor_with_aria_hidden_glyph_is_flagged() {
+        let src = wrap(r#"a href="/x" { span aria-hidden="true" { "🔍" } }"#);
+        let f = findings_for(&src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "link-name");
+    }
+
+    #[test]
+    fn button_with_hidden_glyph_and_visible_text_is_clean() {
+        // The visible "Close" text still provides an accessible name.
+        let src = wrap(r#"button { span aria-hidden="true" { "×" } "Close" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_with_hidden_glyph_and_aria_label_is_clean() {
+        // The `aria-label` on the control itself provides the name.
+        let src = wrap(r#"button aria-label="Close" { span aria-hidden="true" { "×" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_with_dynamic_aria_hidden_glyph_is_not_flagged() {
+        // A spliced `aria-hidden=(…)` is unresolvable, so the subtree is treated
+        // as not hidden and its text still counts — conservative, no new false
+        // positive on valid dynamic markup.
+        let src = wrap(r#"button { span aria-hidden=(flag) { "×" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_with_only_aria_hidden_text_does_not_satisfy_association() {
+        // The `<label>` body is entirely `aria-hidden="true"`, which per ARIA
+        // contributes no accessible name — the label check must use the same
+        // hidden-excluding name walk as buttons/links, so the field is FLAGGED
+        // (regression: false negative — hidden text was wrongly accepted).
+        let src = wrap(r#"label for="q" { span aria-hidden="true" { "Search" } } input id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_with_only_control_head_does_not_satisfy_association() {
+        // The `<label>` body is only an `@if` control HEAD (`splice: false`),
+        // which renders no accessible name — so the associated field must still be
+        // FLAGGED (regression: false negative — a control head was wrongly counted
+        // as a name).
+        let src = wrap(r#"label for="q" { @if show { } } input id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_with_alt_image_satisfies_association() {
+        // A `<label>` whose only content is an `<img alt=..>` has an accessible
+        // name via the alt text, so the associated field is CLEAN (regression:
+        // false positive — the img alt was previously ignored).
+        let src = wrap(r#"label for="q" { img src="s.svg" alt="Search"; } input id="q";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_with_plain_text_still_satisfies_association() {
+        // Unchanged: a `<label for=..>` with real visible text names the field.
+        let src = wrap(r#"label for="e" { "Email" } input id="e";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn empty_label_body_still_does_not_satisfy_association() {
+        // Unchanged: an empty `<label for=..>` provides no accessible name, so
+        // the associated field is FLAGGED.
+        let src = wrap(r#"label for="e" { } input id="e";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_in_aria_hidden_container_does_not_satisfy_association() {
+        // Regression (false negative): a `<label for=..>` that only exists inside
+        // an `aria-hidden="true"` subtree is not in the accessibility tree, so it
+        // provides no accessible name. `collect_labels` must stop descending into
+        // hidden subtrees (like `walk`), so the visible input is FLAGGED.
+        let src = wrap(r#"div aria-hidden="true" { label for="q" { "Search" } } input id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn label_in_visible_container_satisfies_association() {
+        // Unchanged: a `<label for=..>` inside a visible container is in the
+        // accessibility tree and names the associated input, so it is CLEAN.
+        let src = wrap(r#"div { label for="q" { "Search" } } input id="q";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    // ── Escape-hatch / dynamic limits ──────────────────────────────────────
+
+    #[test]
+    fn typed_primitive_splice_is_not_flagged() {
+        // `(Img::new(..))` is a splice, not an `img` element, so the compile-time
+        // guarantee is respected and nothing is re-scanned.
+        let src = wrap(r"(autumn_web::a11y::Img::new(src, alt))");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn fully_dynamic_splice_is_not_flagged() {
+        let src = wrap(r"(rendered_widget)");
+        assert!(findings_for(&src).is_empty());
+    }
+
+    #[test]
+    fn element_inside_control_block_is_still_scanned() {
+        let src = wrap(r#"@if show { img src="x.png"; }"#);
+        assert_eq!(rule_ids(&src), vec!["image-alt"]);
+    }
+
+    #[test]
+    fn match_arm_pattern_named_input_is_not_flagged() {
+        // Regression: an `@match` arm whose PATTERN is named `input` must not be
+        // read as an `<input>` element. Parsing the arm list as markup produced a
+        // false `label` finding on valid views.
+        let src = wrap(r#"@match field { input => { "text" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn match_arm_body_real_input_is_still_flagged() {
+        // The arm PATTERN is skipped, but the arm BODY is still scanned: a real
+        // unlabeled `<input>` inside an arm body must still be flagged.
+        let src = wrap(r"@match x { A => { input; } }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn match_arm_with_guard_does_not_misparse() {
+        // A guard (`Pattern if cond => …`) sits between the pattern and `=>` and
+        // must be skipped along with the pattern — no crash, no false finding.
+        let src = wrap(r#"@match x { A if ready => { "ok" } B => { "no" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn match_multiple_arms_scan_each_body() {
+        // Several arms, mixed body shapes: only the real markup in bodies counts.
+        // The `input` pattern must not flag; the alt-less `<img>` body must.
+        let src = wrap(r#"@match k { input => { "a" } other => { img src="x.png"; } }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["image-alt"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn let_initializer_struct_literal_is_not_parsed_as_markup() {
+        // Regression: `@let props = Field { input: true };` binds a Rust
+        // expression, so its brace group is struct-literal syntax, not markup.
+        // Parsing it as markup misread the Rust field `input` as an `<input>`
+        // element and fired a false `label` finding on valid views.
+        let src = wrap(r#"@let props = Field { input: true }; div { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn let_binding_does_not_suppress_real_input_elsewhere() {
+        // The `@let` initializer is skipped wholesale, but a real unlabeled
+        // `<input>` later in the same markup must still be flagged.
+        let src = wrap(r#"@let props = Field { input: true }; input type="text" id="name";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn let_with_plain_initializer_does_not_crash() {
+        // A plain (non-struct) `@let` initializer parses without panicking.
+        let src = wrap(r#"@let x = foo(); div { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn let_after_control_reaches_its_skip_handler() {
+        // Regression: only `@else` continues a control chain. A `@let` following a
+        // parsed control block must be returned to `parse_nodes` so it hits
+        // `skip_let` — otherwise its `Field { input: true }` struct literal is
+        // misparsed as markup and fires a bogus `<input>` finding (false positive).
+        let src = wrap(r#"@if show { "ok" } @let props = Field { input: true };"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_else_chain_still_parses_and_flags_real_input() {
+        // A genuine `@if … @else …` chain still parses across the `@else`, and a
+        // real unlabeled `<input>` in the `@if` body is still flagged.
+        let src = wrap(r#"@if c { input; } @else { "x" }"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn while_body_element_is_scanned() {
+        // `@while cond { body }`: the body is markup and is scanned, so a real
+        // unlabeled `<input>` in a `@while` body is still flagged.
+        let src = wrap(r"@while more { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn for_struct_pattern_is_not_parsed_as_markup() {
+        // Regression (false positive): a `@for` loop destructuring a struct
+        // pattern (`@for Field { input, .. } in fields`) has BRACES in the
+        // pattern that are NOT markup. Parsing them misread the Rust field
+        // `input` as an `<input>` element.
+        let src = wrap(r#"@for Field { input, label } in fields { "row" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn for_body_real_input_is_still_flagged() {
+        // The `@for` pattern is skipped, but the body is still scanned.
+        let src = wrap(r"@for x in items { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_let_struct_pattern_is_not_parsed_as_markup() {
+        // Regression (false positive): `@if let Field { input } = props { .. }`
+        // has a struct PATTERN brace that is not markup.
+        let src = wrap(r#"@if let Field { input } = props { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn while_let_struct_pattern_is_not_parsed_as_markup() {
+        let src = wrap(r#"@while let Field { input } = next() { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_let_body_real_input_is_still_flagged() {
+        // The `if let` pattern is skipped, but the body is scanned.
+        let src = wrap(r"@if let Some(x) = maybe { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_block_expression_condition_is_not_parsed_as_markup() {
+        // Regression (false positive): maud parses the condition with
+        // `parse_without_eager_brace`, so a block-expression condition
+        // (`@if { input } { body }`) is valid — the FIRST brace is the condition,
+        // the LAST is the markup body. The condition must NOT be parsed as markup.
+        let src = wrap(r#"@if { input } { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_block_expression_condition_body_is_still_scanned() {
+        // The block-expression condition is skipped, but the body IS scanned: a
+        // real unlabeled `<input>` in the body must still be flagged.
+        let src = wrap(r"@if { ready } { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn else_if_block_expression_condition_is_not_parsed_as_markup() {
+        // The block-expression handling also applies across an `@else if` chain.
+        let src = wrap(r#"@if a { "a" } @else if { input } { "b" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_body_then_sibling_block_still_scans_body() {
+        // `@if a { body } { sibling }`: the first brace is the body (a condition
+        // token `a` precedes it), the second is a sibling markup block. Both are
+        // scanned, so a real `<input>` in EITHER is flagged.
+        let src = wrap(r"@if a { input; } { button { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name", "label"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn match_block_expression_scrutinee_is_not_parsed_as_markup() {
+        // Regression (false positive): a `@match` scrutinee is parsed with
+        // `parse_without_eager_brace`, so a block-expression scrutinee
+        // (`@match { input } { arms }`) is valid — the first brace is the
+        // scrutinee, the second is the arm list. The scrutinee must not be markup.
+        let src = wrap(r#"@match { input } { A => { "a" } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn match_block_expression_scrutinee_arm_body_still_scanned() {
+        let src = wrap(r"@match { flag } { A => { input; } }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_match_condition_arm_list_is_not_parsed_as_markup() {
+        // Regression (false positive): a `match` expression IN the `@if` condition
+        // owns its arm-list brace — that brace is part of the condition, and the
+        // real markup body is the FINAL `{ "ok" }`. The arm pattern `input` must
+        // NOT be misread as an `<input>`, and the body must be scanned.
+        let src = wrap(r#"@if match state { input => true, _ => false } { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_simple_condition_body_input_still_flagged() {
+        // A plain `@if cond { body }` still parses the body: a real unlabeled
+        // `<input>` is flagged (no match brace to confuse the head).
+        let src = wrap(r"@if cond { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn while_comparison_condition_body_is_scanned() {
+        // `@while x > 0 { button { } }`: the comparison is the condition and the
+        // body is scanned — the empty button is flagged.
+        let src = wrap(r"@while x > 0 { button { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn if_macro_condition_is_not_parsed_as_markup() {
+        // Regression (false positive): a Rust macro call in the `@if` condition
+        // (`@if ready! { input } { "ok" }`) owns its `!`-delimited brace group —
+        // that group is macro input, part of the condition, and the real markup
+        // body is the FINAL `{ "ok" }`. The macro's `input` token must NOT be
+        // misread as a phantom `<input>`, and the body must be scanned.
+        let src = wrap(r#"@if ready! { input } { "ok" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_macro_condition_body_is_still_scanned() {
+        // The macro condition is skipped, but the body IS scanned: an empty
+        // `<button>` in the body is still flagged (the body brace was correctly
+        // identified past the macro's group).
+        let src = wrap(r"@if ready! { input } { button { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn if_non_macro_condition_body_input_still_flagged() {
+        // A plain `@if cond { input; }` (no macro) still parses the body, so a
+        // real unlabeled `<input>` is flagged — the macro handling does not
+        // change the macro-free path.
+        let src = wrap(r"@if cond { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── element tag names: custom `-` / namespaced `:` ──────────────────────
+
+    #[test]
+    fn custom_hyphenated_tag_is_not_flagged() {
+        // Regression (false positive): a maud element name is a full `HtmlName`
+        // (`Punctuated<HtmlNameFragment, '-' | ':'>`), so `x-input` is ONE custom
+        // tag that matches no rule. Reading only the first ident (`x`) would leave
+        // `-input` in the stream and misfire a `label` on a phantom `<input>`.
+        let src = wrap(r"x-input;");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn custom_hyphenated_tag_with_body_is_not_flagged() {
+        // `x-button { }` is a single custom tag (no `button-name` rule applies),
+        // not a `<button>` — its `{ }` body is parsed normally.
+        let src = wrap(r"x-button { }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn namespaced_colon_tag_is_not_flagged() {
+        // A colon-namespaced tag `svg:rect` is one `HtmlName`, matching no rule.
+        let src = wrap(r"svg:rect;");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn plain_input_tag_is_still_flagged() {
+        // A plain `input;` (no `-`/`:` continuation) is a real `<input>` and is
+        // still flagged — the full-name read does not affect simple tag names.
+        let src = wrap(r"input;");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn plain_button_tag_is_still_flagged() {
+        // A plain empty `button { }` is still flagged for a missing name.
+        let src = wrap(r"button { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── maud class/id shorthand (dynamic + toggled) ─────────────────────────
+
+    #[test]
+    fn dynamic_class_shorthand_does_not_orphan_body() {
+        // Regression (false positive): a dynamic class shorthand `.(expr)` must
+        // be consumed, else the element ends early and its `{ … }` body is
+        // orphaned — here the button would lose its "Save" text and be flagged.
+        let src = wrap(r#"button.(cls) { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn dynamic_class_shorthand_empty_button_still_flagged() {
+        // The shorthand is consumed, but a genuinely empty button is still caught.
+        let src = wrap(r"button.(cls) { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn toggled_class_shorthand_does_not_orphan_body() {
+        // A toggled class `.name[cond]` must be consumed along with its bracket.
+        let src = wrap(r#"a.icon[active] href="/x" { "Home" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn toggled_class_shorthand_empty_link_still_flagged() {
+        let src = wrap(r#"a.icon[active] href="/x" { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["link-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn dynamic_id_shorthand_is_treated_as_dynamic() {
+        // A dynamic id `#(expr)` cannot be matched to a label — skip like
+        // `id=(expr)` rather than misfire.
+        let src = wrap(r#"input#(field_id) type="text";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn static_id_shorthand_matches_label_for() {
+        // A static `#id` shorthand records an id that a `<label for>` can match.
+        let src = wrap(r#"label for="name" { "Name" } input#name type="text";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn unlabeled_id_shorthand_input_is_flagged() {
+        // A static `#id` shorthand with no matching label is still flagged.
+        let src = wrap(r#"input#name type="text";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── maud implicit-div leading shorthand (no explicit tag) ───────────────
+
+    #[test]
+    fn leading_class_shorthand_is_implicit_div_not_input() {
+        // Regression (false positive): `.input { }` is an implicit `<div
+        // class="input">`, NOT an `<input>` element — the class token is a VALUE,
+        // not a tag. A `<div>` triggers no rule, so nothing is flagged.
+        let src = wrap(r".input { }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn leading_id_shorthand_is_implicit_div_not_button() {
+        // `#button { }` is an implicit `<div id="button">`, not a `<button>`.
+        let src = wrap(r"#button { }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn leading_class_shorthand_with_text_is_implicit_div() {
+        // `.input { "x" }` is still an implicit `<div>`; its text body is not a
+        // control name obligation.
+        let src = wrap(r#".input { "x" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn implicit_div_wrapping_real_input_still_flags_inner_input() {
+        // The implicit `<div class="card">` triggers no rule itself, but its body
+        // is still scanned: a real unlabeled `<input>` inside is STILL flagged.
+        let src = wrap(r".card { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── maud markup-valued class shorthand (`.@if c { "x" }`) ────────────────
+
+    #[test]
+    fn markup_valued_class_shorthand_does_not_truncate_button() {
+        // Regression (false positive): `.@if primary { "primary" }` is a
+        // MARKUP-valued class value; the button's real body is the FOLLOWING
+        // `{ "Save" }`. The class control must be fully consumed so the body is
+        // parsed — otherwise the button is analyzed as empty and falsely flagged.
+        let src = wrap(r#"button.@if primary { "primary" } { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn markup_valued_class_shorthand_empty_button_still_flagged() {
+        // The markup class value is consumed, but a genuinely empty body is still
+        // caught (no over-correction into a false negative).
+        let src = wrap(r#"button.@if primary { "primary" } { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn markup_valued_class_shorthand_before_attr_and_body_is_clean() {
+        // A markup class value followed by a real attribute and body: the anchor
+        // keeps its `href` and its `{ "Link" }` text, so it is not flagged.
+        let src = wrap(r#"a.@if c { "x" } href="/y" { "Link" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn splice_valued_class_shorthand_stays_clean() {
+        // A splice-valued class `.(dynamic_class)` was already handled; it must
+        // stay clean (the button keeps its "Save" body).
+        let src = wrap(r#"button.(dynamic_class) { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    // ── colon-qualified maud names (x-on:click, data:foo, svg:path) ─────────
+
+    #[test]
+    fn colon_qualified_attr_name_does_not_orphan_button_body() {
+        // Regression (false positive): maud names allow `:` (and `-`), so an
+        // Alpine/Vue-style `x-on:click` attribute must be read as ONE name. If the
+        // scanner stopped at the `:`, the leftover token ends the element early and
+        // orphans its `{ "Save" }` body — the button is analyzed as empty and
+        // falsely flagged.
+        let src = wrap(r#"button x-on:click="save" { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn colon_qualified_attr_name_empty_button_still_flagged() {
+        // The colon-qualified name is consumed, but a genuinely empty button is
+        // still caught (no over-correction into a false negative).
+        let src = wrap(r#"button x-on:click="save" { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn colon_qualified_attr_on_link_is_clean() {
+        // A colon-qualified `data:foo` attribute must not truncate the anchor: it
+        // keeps its `href` and its `{ "Link" }` text, so it is not flagged.
+        let src = wrap(r#"a href="/x" data:foo="y" { "Link" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    // ── numeric maud name fragments (.col-12, data-1, x-2) ──────────────────
+
+    #[test]
+    fn numeric_class_shorthand_does_not_orphan_button_body() {
+        // Regression (false positive): maud `HtmlName` fragments may be integers,
+        // so `.col-12` is ONE class name. If the reader stopped at the numeric
+        // fragment the leftover `-12` ends the element early and orphans its
+        // `{ "Save" }` body — the button is analyzed as empty and falsely flagged.
+        let src = wrap(r#"button.col-12 { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn numeric_attr_name_does_not_orphan_button_body() {
+        // A numeric attribute-name fragment (`data-1`) must be read as one name so
+        // the button's `{ "Save" }` body is still parsed.
+        let src = wrap(r#"button data-1="x" { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn numeric_class_shorthand_on_link_is_clean() {
+        // An anchor with a numeric class shorthand keeps its `href` and `{ "Link" }`
+        // text, so it is not flagged.
+        let src = wrap(r#"a.col-6 href="/x" { "Link" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn numeric_class_shorthand_empty_button_still_flagged() {
+        // The numeric class name is consumed correctly, but a genuinely empty body
+        // is still caught (no over-correction into a false negative).
+        let src = wrap(r"button.col-12 { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn plain_empty_button_without_numeric_name_still_flagged() {
+        // A plain nameless button is unaffected by the numeric-fragment fix.
+        let src = wrap(r"button { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── quoted (string-literal) attribute names ─────────────────────────────
+
+    #[test]
+    fn quoted_attr_name_does_not_orphan_button_body() {
+        // Regression (false positive): maud accepts a STRING-LITERAL attribute
+        // name (`"@click"`). If it is not recognized as an attribute name the
+        // element ends early and orphans its `{ "Save" }` body — the button is
+        // analyzed as empty and falsely flagged.
+        let src = wrap(r#"button "@click"="save" { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn quoted_aria_label_provides_accessible_name() {
+        // A quoted `"aria-label"` name is recorded like the ident form, so its
+        // static value supplies the accessible name — a labelless `<input>` with
+        // an `aria-label` is not flagged.
+        let src = wrap(r#"input "aria-label"="Search";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn quoted_non_name_attr_consumed_empty_button_still_flagged() {
+        // The quoted attribute is consumed, but it supplies no accessible name and
+        // the body is empty — a genuinely nameless button is still caught.
+        let src = wrap(r#"button "data-x"="y" { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── control-valued / markup-valued attributes (`attr=@if …`) ────────────
+
+    #[test]
+    fn match_valued_attr_does_not_truncate_button() {
+        // Regression (false positive): a maud attribute value may be a control
+        // (`class=@match state { _ => "primary" }`). The control must be fully
+        // consumed so the button's real `{ "Save" }` body is parsed — otherwise
+        // the button is analyzed as empty and falsely flagged.
+        let src = wrap(r#"button class=@match state { _ => "primary" } { "Save" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_valued_attr_after_real_attr_stays_clean() {
+        // An `@if`-valued attribute following a real `href` must not truncate the
+        // anchor: it keeps its `{ "Link" }` text, so it is not flagged.
+        let src = wrap(r#"a href="/x" class=@if hot { "hot" } { "Link" }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn if_valued_attr_empty_button_still_flagged() {
+        // The control value is consumed, but a genuinely empty body is still
+        // caught (no over-correction into a false negative).
+        let src = wrap(r#"button class=@if c { "x" } { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn match_valued_attr_then_id_unlabeled_input_still_flagged() {
+        // The control value is consumed and the following `id="q"` attribute is
+        // parsed, but with no matching label the input is still flagged.
+        let src = wrap(r#"input class=@match s { _ => "c" } id="q";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── aria-hidden on the control itself ───────────────────────────────────
+
+    #[test]
+    fn aria_hidden_button_needs_no_name() {
+        // A `<button aria-hidden="true">` is removed from the accessibility tree,
+        // so it needs no accessible name (regression: false positive).
+        let src = wrap(r#"button aria-hidden="true" { }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn aria_hidden_link_needs_no_name() {
+        let src = wrap(r#"a href="/x" aria-hidden="true" { }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn aria_hidden_img_needs_no_alt() {
+        let src = wrap(r#"img src="x.png" aria-hidden="true";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn aria_hidden_subtree_control_is_exempt() {
+        // A control nested inside an `aria-hidden="true"` subtree is hidden too.
+        let src = wrap(r#"div aria-hidden="true" { input type="text"; }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn visible_sibling_of_aria_hidden_control_still_flagged() {
+        // The hidden button is exempt; the visible empty button beside it is not.
+        let src = wrap(r#"button aria-hidden="true" { } button { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn dynamic_aria_hidden_control_is_still_checked() {
+        // A spliced `aria-hidden=(…)` is unresolvable → treated as NOT hidden, so
+        // a nameless button is still flagged (no new false negative).
+        let src = wrap(r"button aria-hidden=(flag) { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── native boolean `hidden` attribute ───────────────────────────────────
+
+    #[test]
+    fn native_hidden_button_needs_no_name() {
+        // A `<button hidden>` is removed from the accessibility tree, so it needs
+        // no accessible name (regression: false positive on valid markup).
+        let src = wrap(r"button hidden { }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn native_hidden_subtree_control_is_exempt() {
+        // A control nested inside a natively `hidden` subtree is hidden too, so its
+        // subtree is skipped and the inner input is not flagged.
+        let src = wrap(r"div hidden { input; }");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn native_hidden_with_literal_value_needs_no_name() {
+        // `hidden="until-found"` is a present static boolean `hidden` (HTML treats
+        // any value as hidden), so the button is exempt.
+        let src = wrap(r#"button hidden="until-found" { }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_without_hidden_still_flagged() {
+        // A nameless button with no `hidden` attribute is unaffected by the fix.
+        let src = wrap(r"button { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn visible_subtree_control_without_hidden_still_flagged() {
+        // A `<div>` without `hidden` does not hide its input — the labelless input
+        // is still flagged (no new false negative).
+        let src = wrap(r"div { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn dynamic_hidden_control_is_still_checked() {
+        // A spliced `hidden=(…)` is unresolvable → treated as NOT hidden, so a
+        // nameless button is still flagged (conservative, no new false negative).
+        let src = wrap(r"button hidden=(flag) { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── title as a last-resort accessible name ──────────────────────────────
+
+    #[test]
+    fn button_with_title_is_clean() {
+        // Per the ARIA accessible-name computation `title` is a last-resort name.
+        let src = wrap(r#"button title="Close" { }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_with_empty_title_is_flagged() {
+        // An empty `title` provides no name, so the button is still flagged.
+        let src = wrap(r#"button title="" { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn link_with_title_is_clean() {
+        let src = wrap(r#"a href="/x" title="Home" { }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_title_is_clean() {
+        let src = wrap(r#"input type="text" title="Full name";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn input_with_empty_title_is_flagged() {
+        let src = wrap(r#"input type="text" title="";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    // ── img named via aria/title/role, not just alt ─────────────────────────
+
+    #[test]
+    fn img_with_aria_label_is_clean() {
+        // An `<img>` named by `aria-label` has an accessible name (regression:
+        // false positive — only `alt` was previously accepted).
+        let src = wrap(r#"img src="x.png" aria-label="Logo";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn img_with_presentation_role_is_clean() {
+        // A decorative `role="presentation"`/`role="none"` image needs no alt.
+        let src = wrap(r#"img src="divider.png" role="presentation";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+        let src = wrap(r#"img src="divider.png" role="none";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn img_with_dynamic_role_is_clean() {
+        // A spliced `role=(…)` is unresolvable and could be presentational — skip.
+        let src = wrap(r"img src=(s) role=(r);");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn img_with_title_is_clean() {
+        let src = wrap(r#"img src="x.png" title="Logo";"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn img_with_no_name_source_is_still_flagged() {
+        // Baseline: an image with a non-presentational role and no name is caught.
+        let src = wrap(r#"img src="x.png" role="img";"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["image-alt"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── name from a descendant's aria-label ──────────────────────────────────
+
+    #[test]
+    fn button_named_by_child_aria_label_is_clean() {
+        // A descendant's `aria-label` contributes to the name-from-content walk.
+        let src = wrap(r#"button { span aria-label="Close" { } }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn button_with_nameless_child_is_still_flagged() {
+        // A child with no name of its own leaves the button nameless.
+        let src = wrap(r"button { span { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    // ── sibling-scoped splice suppression (not block-wide) ──────────────────
+
+    #[test]
+    fn nested_splice_does_not_suppress_unrelated_control() {
+        // Regression (false negative): a splice nested inside another element
+        // (`p { (user.name) }`) is unrelated to labeling and must NOT suppress the
+        // unlabeled-control rule for a control elsewhere in the block.
+        let src = wrap(r#"p { (user.name) } input type="text" id="email";"#);
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn direct_sibling_splice_still_suppresses_nested_control() {
+        // A splice that is a DIRECT SIBLING of the control (even nested one level
+        // deep) could render a `<label>` fragment for it — still suppressed.
+        let src = wrap(r#"div { (field_label) input type="text" id="email"; }"#);
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn multiple_findings_across_one_block() {
+        let src = wrap(r#"img src="a.png"; button { } a href="/x" { }"#);
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name", "image-alt", "link-name"]
+        );
+    }
+
+    #[test]
+    fn json_report_is_keyed_to_wcag() {
+        let src = wrap(r#"img src="x.png";"#);
+        let mut scan = Scan::default();
+        scan_source(&src, "view.rs", &mut scan);
+        let report = Report::from_scan(scan);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"wcag\":\"1.1.1\""), "{json}");
+        assert!(json.contains("\"severity\":\"Serious\""), "{json}");
+        assert!(json.contains("\"rule_id\":\"image-alt\""), "{json}");
+    }
+
+    // ── non-maud html! (JSX/Yew island) is skipped, not misparsed ───────────
+
+    #[test]
+    fn jsx_html_button_is_skipped() {
+        // Regression (false positive): a DIFFERENT `html!` (e.g. a Yew/JSX island)
+        // uses `<tag>…</tag>` angle-bracket syntax that maud never uses. Parsing it
+        // as maud would strip the brackets and misread `<button></button>` as an
+        // empty maud `button`. The body is detected as JSX and skipped — no finding.
+        let src = wrap(r"<button>{label}</button>");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn jsx_html_div_input_is_skipped() {
+        // A JSX island with self-closing tags (`<input/>`) is likewise skipped.
+        let src = wrap(r"<div><input/></div>");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn real_maud_button_still_analyzed_after_jsx_skip() {
+        // The JSX skip must not silence real maud: an empty maud `button { }` (no
+        // angle brackets) is STILL parsed and flagged.
+        let src = wrap(r"button { }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn maud_comparison_in_if_head_is_not_misread_as_jsx() {
+        // Regression (false negative): a `<`/`>` comparison in a control head is a
+        // normal Rust comparison, NOT a JSX tag start. Misreading it as JSX would
+        // skip the WHOLE `html!` body. The body must still be scanned — a real
+        // unlabeled `<input>` inside `@if count < limit { … }` is still flagged.
+        let src = wrap(r"@if count < limit { input; }");
+        assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn maud_greater_than_comparison_is_not_misread_as_jsx() {
+        // `@if a > b { button { } }`: `>` is a comparison, not a self-closing tag.
+        // The body is scanned and the empty button flagged.
+        let src = wrap(r"@if a > b { button { } }");
+        assert_eq!(
+            rule_ids(&src),
+            vec!["button-name"],
+            "{:?}",
+            findings_for(&src)
+        );
+    }
+
+    #[test]
+    fn jsx_close_tag_is_still_skipped() {
+        // A JSX closing tag `</button>` marks the body as non-maud — skipped.
+        let src = wrap(r"<button>{label}</button>");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    #[test]
+    fn jsx_self_closing_tag_is_still_skipped() {
+        // A JSX self-closing tag `<input/>` marks the body as non-maud — skipped.
+        let src = wrap(r"<input/>");
+        assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
+    }
+
+    // ── End-to-end: red project → fix → green ──────────────────────────────
+
+    #[test]
+    fn end_to_end_red_then_green() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = dir.path().join("view.rs");
+
+        // Red: an alt-less image in raw html! ships silently until now.
+        std::fs::write(&view, wrap(r#"img src="/logo.png";"#)).unwrap();
+        let opts = A11yVerifyOptions {
+            format: OutputFormat::Text,
+            strict: false,
+        };
+        assert_eq!(run_in(dir.path(), opts), 1, "red project must fail CI");
+
+        // Fix: add the alt attribute (or switch to Img::new).
+        std::fs::write(&view, wrap(r#"img src="/logo.png" alt="Logo";"#)).unwrap();
+        assert_eq!(run_in(dir.path(), opts), 0, "fixed project must pass CI");
+    }
+
+    #[test]
+    fn exit_code_zero_when_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("view.rs"), wrap(r#"button { "Ok" }"#)).unwrap();
+        let opts = A11yVerifyOptions {
+            format: OutputFormat::Json,
+            strict: false,
+        };
+        assert_eq!(run_in(dir.path(), opts), 0);
+    }
+
+    #[test]
+    fn nonexistent_scan_root_fails_hard() {
+        // A misspelled/unreadable scan root must be a hard non-zero failure, not
+        // a zero-findings PASS — otherwise a CI path typo silently disables the
+        // whole audit.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let opts = A11yVerifyOptions {
+            format: OutputFormat::Text,
+            strict: false,
+        };
+        assert_eq!(
+            run_in(&missing, opts),
+            1,
+            "an unreadable scan root must fail, not report an empty clean audit"
+        );
+    }
+
+    #[test]
+    fn empty_but_readable_root_passes() {
+        // A genuinely empty-but-readable directory has no findings and must still
+        // pass (exit 0) — distinct from the unreadable-root failure above.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = A11yVerifyOptions {
+            format: OutputFormat::Text,
+            strict: false,
+        };
+        assert_eq!(run_in(dir.path(), opts), 0);
+    }
+
+    // ── Test-scaffolding skips (issue #1934) ───────────────────────────────
+
+    #[test]
+    fn defect_in_inline_cfg_test_module_is_not_flagged() {
+        // A raw-`html!` defect inside a `#[cfg(test)] mod tests { … }` is test
+        // scaffolding, not shipped product markup, so it must not be flagged —
+        // while a real product defect in the same file still is (issue #1934,
+        // the #1930 `form.rs` case).
+        let src = r#"
+            fn view() { let _ = html! { img src="product.png"; }; }
+            #[cfg(test)]
+            mod tests {
+                fn t() { let _ = html! { img src="scaffold.png"; }; }
+            }
+        "#;
+        let f = findings_for(src);
+        assert_eq!(f.len(), 1, "only the product defect should flag: {f:?}");
+        assert_eq!(f[0].rule_id, "image-alt");
+    }
+
+    #[test]
+    fn defect_in_inline_cfg_test_fn_is_not_flagged() {
+        // The `#[cfg(test)]` skip also covers a bare test `fn`, not just `mod`.
+        let src = r"
+            #[cfg(test)]
+            fn helper() { let _ = html! { button { } }; }
+        ";
+        assert!(findings_for(src).is_empty(), "{:?}", findings_for(src));
+    }
+
+    #[test]
+    fn cfg_not_test_module_is_still_scanned() {
+        // The skip is precise: `#[cfg(not(test))]` is production code and its
+        // defects must still be flagged (only a literal `cfg(test)` is skipped).
+        let src = r#"
+            #[cfg(not(test))]
+            mod prod {
+                fn v() { let _ = html! { img src="x.png"; }; }
+            }
+        "#;
+        let f = findings_for(src);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule_id, "image-alt");
+    }
+
+    #[test]
+    fn defect_under_tests_subdir_is_skipped_but_flagged_at_root() {
+        // The `tests/`-directory skip is scan-root RELATIVE: the SAME defect is
+        // ignored under a `tests/` subdir of the scan root but flagged when it
+        // sits at the root — proving the skip never neuters the fixture-dir
+        // integration test, which passes a fixture dir AS the scan root
+        // (issue #1934).
+        let dir = tempfile::tempdir().unwrap();
+        let opts = A11yVerifyOptions {
+            format: OutputFormat::Text,
+            strict: false,
+        };
+
+        let tests_dir = dir.path().join("tests");
+        std::fs::create_dir(&tests_dir).unwrap();
+        std::fs::write(tests_dir.join("view.rs"), wrap(r#"img src="x.png";"#)).unwrap();
+        assert_eq!(
+            run_in(dir.path(), opts),
+            0,
+            "a defect under a tests/ subdir must not be flagged",
+        );
+
+        std::fs::write(dir.path().join("view.rs"), wrap(r#"img src="x.png";"#)).unwrap();
+        assert_eq!(
+            run_in(dir.path(), opts),
+            1,
+            "the same defect at the scan root must be flagged",
+        );
+    }
+
+    // ── Route attribution (issue #1706, AC3) ───────────────────────────────
+
+    /// Build a full report from one or more in-memory `(file, source)` pairs.
+    fn report_for(files: &[(&str, &str)]) -> Report {
+        let mut scan = Scan::default();
+        for (name, src) in files {
+            scan_source(src, name, &mut scan);
+            scan.files_scanned += 1;
+        }
+        Report::from_scan(scan)
+    }
+
+    /// The routes attributed to the single finding of a one-file report.
+    fn routes_of_only_finding(files: &[(&str, &str)]) -> Vec<String> {
+        let report = report_for(files);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        report.findings[0].routes.clone()
+    }
+
+    #[test]
+    fn finding_in_a_route_handler_is_keyed_to_that_route() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn finding_in_a_called_helper_inherits_the_route() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup {
+                html! { main { (sidebar()) } }
+            }
+
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn attribution_crosses_files() {
+        let handler = r#"
+            #[post("/settings")]
+            async fn save() -> Markup {
+                html! { main { (sidebar()) } }
+            }
+        "#;
+        let partial = r#"
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("routes.rs", handler), ("partials.rs", partial)]),
+            vec!["POST /settings".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_helper_reached_from_two_routes_lists_both() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+
+            #[get("/b")]
+            async fn b() -> Markup { html! { (sidebar()) } }
+
+            fn sidebar() -> Markup {
+                html! { img src="/logo.png"; }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned(), "GET /b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_helper_name_is_not_traversed() {
+        // Two functions share a name, so a bare `sidebar()` call cannot be
+        // resolved to one of them. Guessing would key the finding to a route
+        // that never renders it, so the call edge is dropped instead.
+        let handler = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+        "#;
+        let one = r#"
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let two = r#"
+            fn sidebar() -> Markup { html! { span { "hi" } } }
+        "#;
+        assert!(
+            routes_of_only_finding(&[("a.rs", handler), ("one.rs", one), ("two.rs", two)])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_finding_outside_any_route_has_no_route() {
+        let src = r#"
+            fn orphan() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        assert!(
+            report.findings[0].routes.is_empty(),
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(report.summary.unrouted, 1);
+    }
+
+    #[test]
+    fn mutually_recursive_helpers_terminate() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (left()) } }
+
+            fn left() -> Markup { html! { (right()) } }
+
+            fn right() -> Markup { html! { (left()) img src="/logo.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn method_calls_are_not_resolved_as_helpers() {
+        // `self.sidebar()` is a method call, not a call to the free function
+        // `sidebar`; treating it as one would attribute the finding to a route
+        // that cannot reach it.
+        let src = r#"
+            #[get("/a")]
+            async fn a(page: Page) -> Markup { html! { (page.sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn routes_section_reports_per_route_status() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup { html! { img src="/logo.png"; } }
+
+            #[get("/about")]
+            async fn about() -> Markup { html! { img src="/logo.png" alt="Logo"; } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        let paths: Vec<_> = report
+            .routes
+            .iter()
+            .map(|r| (r.path.as_str(), r.findings, r.status))
+            .collect();
+        assert_eq!(paths, vec![("/about", 0, "pass"), ("/settings", 1, "fail")]);
+        assert_eq!(report.routes[1].method, "GET");
+        assert_eq!(report.routes[1].handler, "settings");
+        assert_eq!(report.routes[1].file, "views.rs");
+        assert_eq!(report.summary.routes, 2);
+        assert_eq!(report.summary.routes_failing, 1);
+    }
+
+    #[test]
+    fn a_route_without_markup_is_still_listed_as_passing() {
+        let src = r#"
+            #[get("/api/todos")]
+            async fn list() -> Json<Vec<Todo>> { Json(vec![]) }
+        "#;
+        let report = report_for(&[("api.rs", src)]);
+        assert_eq!(report.routes.len(), 1);
+        assert_eq!(report.routes[0].status, "pass");
+    }
+
+    #[test]
+    fn a_nested_fn_is_not_a_target_for_a_bare_call() {
+        // Rust makes a nested item visible only inside its enclosing block, so
+        // an unrelated route's bare `render()` cannot reach it.
+        let src = r#"
+            fn outer() -> Markup {
+                fn render() -> Markup { html! { img src="/x.png"; } }
+                html! { span { "hi" } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (render()) } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn an_associated_fn_is_not_a_target_for_a_bare_call() {
+        // A method is reached through a receiver or a type-qualified path,
+        // neither of which this scan resolves.
+        let src = r#"
+            impl Card {
+                fn render(&self) -> Markup { html! { img src="/x.png"; } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (render()) } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_module_level_fn_is_still_a_target_for_a_bare_call() {
+        // Items in a module are reachable by a bare name through a `use`, so
+        // scoping must not cost the ordinary case.
+        let src = r#"
+            mod views {
+                fn sidebar() -> Markup { html! { img src="/x.png"; } }
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_route_on_an_associated_fn_is_still_a_route() {
+        let src = r#"
+            impl Dashboard {
+                #[get("/a")]
+                async fn show(&self) -> Markup { html! { img src="/x.png"; } }
+            }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_shadowing_parameter_is_not_resolved_as_a_helper() {
+        // The handler calls its own parameter, not the free function that
+        // happens to share the name.
+        let src = r#"
+            #[get("/a")]
+            async fn a(view: impl Fn() -> Markup) -> Markup { html! { (view()) } }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_shadowing_local_is_not_resolved_as_a_helper() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                let view = || html! { span { "local" } };
+                html! { (view()) }
+            }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_shadowing_closure_parameter_is_not_resolved_as_a_helper() {
+        let src = r#"
+            #[get("/a")]
+            async fn a(rows: Vec<Row>) -> Markup {
+                html! { @for row in rows { (rows.iter().map(|view| view()).count()) } }
+            }
+
+            fn view() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn shadowing_in_one_handler_does_not_hide_a_real_call_in_another() {
+        // Bindings are per function: `b` really does call the free `sidebar`.
+        let src = r#"
+            #[get("/a")]
+            async fn a(sidebar: impl Fn() -> Markup) -> Markup { html! { (sidebar()) } }
+
+            #[get("/b")]
+            async fn b() -> Markup { html! { (sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn type_qualified_associated_calls_are_not_resolved_as_helpers() {
+        // `Metrics::render()` is an associated function on a type this scan
+        // cannot see. Resolving its bare name would blame the route for markup
+        // in an unrelated free `render`.
+        let src = r#"
+            #[get("/dash")]
+            async fn dash() -> Markup { html! { (Metrics::render()) } }
+
+            fn render() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn module_qualified_calls_are_resolved_as_helpers() {
+        // A module path is the ordinary way to reach a view helper, so it must
+        // still resolve — only type-qualified calls are dropped.
+        let src = r#"
+            #[get("/dash")]
+            async fn dash() -> Markup { html! { (crate::views::sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /dash".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_nested_fn_declaration_is_not_a_call_edge() {
+        // Declaring a function inside a handler is not calling it, and neither
+        // is it calling what that function calls.
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                fn never_called() -> Markup { sidebar() }
+                html! { span { "hi" } }
+            }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_macro_rules_template_is_not_an_ambiguous_definition() {
+        // A `fn` inside a `macro_rules!` body is a template, not a definition.
+        // Indexing it would make the real helper look defined twice and drop
+        // the call edge to it.
+        let src = r#"
+            macro_rules! decl {
+                () => { fn sidebar() -> Markup { html! { span { "gen" } } } };
+            }
+
+            #[get("/a")]
+            async fn a() -> Markup { html! { (sidebar()) } }
+
+            fn sidebar() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn two_handlers_sharing_a_path_do_not_share_findings() {
+        // Paths are declared, not mounted, so two handlers can legitimately
+        // declare the same one. Counting by the display key would report the
+        // clean handler as failing.
+        let src = r#"
+            #[get("/a")]
+            async fn one() -> Markup { html! { img src="/logo.png"; } }
+
+            #[get("/a")]
+            async fn two() -> Markup { html! { span { "ok" } } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        let rows: Vec<_> = report
+            .routes
+            .iter()
+            .map(|r| (r.handler.as_str(), r.findings, r.status))
+            .collect();
+        assert_eq!(rows, vec![("one", 1, "fail"), ("two", 0, "pass")]);
+        assert_eq!(report.summary.routes_failing, 1);
+    }
+
+    #[test]
+    fn two_fns_on_one_line_do_not_steal_each_others_findings() {
+        // Line-range containment alone ties on single-line functions; the
+        // finding belongs to whichever function actually encloses its column.
+        let src = concat!(
+            "#[get(\"/a\")] fn a() -> Markup { html! { span {} } } ",
+            "fn b() -> Markup { html! { img src=\"/x.png\"; } }",
+        );
+        assert!(routes_of_only_finding(&[("views.rs", src)]).is_empty());
+    }
+
+    #[test]
+    fn a_route_attribute_does_not_leak_past_a_non_fn_item() {
+        // An attribute binds to the item that follows it. When that item is not
+        // a function, the route must not attach to the next function instead.
+        let src = r#"
+            #[get("/a")]
+            extern "C" { }
+
+            pub async fn helper() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        assert!(report.routes.is_empty(), "{:?}", report.routes);
+        assert!(
+            report.findings[0].routes.is_empty(),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_leading_crate_override_is_not_read_as_the_path() {
+        // `#[get(crate = "…", "/a")]` puts a string literal before the path.
+        let src = r#"
+            #[get(crate = "autumn_web", "/a")]
+            async fn a() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn every_http_route_macro_is_recognised() {
+        let src = r#"
+            #[get("/a")] async fn a() -> Markup { html! { span {} } }
+            #[post("/b")] async fn b() -> Markup { html! { span {} } }
+            #[put("/c")] async fn c() -> Markup { html! { span {} } }
+            #[patch("/d")] async fn d() -> Markup { html! { span {} } }
+            #[delete("/e")] async fn e() -> Markup { html! { span {} } }
+            #[static_get("/f")] async fn f() -> Markup { html! { span {} } }
+        "#;
+        let keys: Vec<String> = report_for(&[("views.rs", src)])
+            .routes
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "GET /a",
+                "POST /b",
+                "PUT /c",
+                "PATCH /d",
+                "DELETE /e",
+                "GET /f",
+            ]
+        );
+    }
+
+    #[test]
+    fn one_handler_can_serve_several_routes() {
+        let src = r#"
+            #[get("/a")]
+            #[post("/a")]
+            async fn a() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert_eq!(
+            routes_of_only_finding(&[("views.rs", src)]),
+            vec!["GET /a".to_owned(), "POST /a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn route_conformance_points_at_the_handler_line() {
+        let src = "\n\n#[get(\"/a\")]\nasync fn a() -> Markup { html! { span {} } }\n";
+        let report = report_for(&[("views.rs", src)]);
+        assert_eq!(report.routes[0].line, 4);
+    }
+
+    #[test]
+    fn an_unrouted_finding_still_fails_the_build() {
+        // Attribution reports; it never gates. A defect in a partial no route
+        // reaches must still fail CI.
+        let src = r#"fn orphan() -> Markup { html! { img src="/l.png"; } }"#;
+        let report = report_for(&[("partials.rs", src)]);
+        assert_eq!(report.summary.unrouted, 1);
+        assert_ne!(report.exit_code(false), 0, "{report:?}");
+    }
+
+    #[test]
+    fn unrouted_findings_serialize_an_empty_route_list() {
+        // The key must not vanish for exactly the findings a consumer most
+        // needs to notice.
+        let src = r#"fn orphan() -> Markup { html! { img src="/l.png"; } }"#;
+        let json = serde_json::to_string(&report_for(&[("partials.rs", src)])).unwrap();
+        assert!(json.contains(r#""routes":[]"#), "{json}");
+    }
+
+    #[test]
+    fn wcag_rollup_splits_multi_criterion_rules() {
+        let src = r#"
+            fn view() -> Markup {
+                html! { img src="/logo.png"; input type="text" name="email"; }
+            }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        let rollup: Vec<_> = report
+            .wcag
+            .iter()
+            .map(|c| (c.criterion.as_str(), c.findings))
+            .collect();
+        // `label` maps to three criteria; each is reported on its own.
+        assert_eq!(
+            rollup,
+            vec![("1.1.1", 1), ("1.3.1", 1), ("3.3.2", 1), ("4.1.2", 1),]
+        );
+        assert_eq!(report.wcag[0].rules, vec!["image-alt"]);
+        for criterion in &report.wcag[1..] {
+            assert_eq!(criterion.rules, vec!["label"], "{criterion:?}");
+        }
+    }
+
+    #[test]
+    fn wcag_rollup_is_empty_when_clean() {
+        let src = r#"fn view() -> Markup { html! { img src="/l.png" alt="Logo"; } }"#;
+        assert!(report_for(&[("views.rs", src)]).wcag.is_empty());
+    }
+
+    #[test]
+    fn text_output_names_failing_routes_and_criteria() {
+        let src = r#"
+            #[get("/settings")]
+            async fn settings() -> Markup { html! { img src="/logo.png"; } }
+        "#;
+        let text = format_text(&report_for(&[("views.rs", src)]), false);
+        assert!(
+            text.contains("1 route(s) discovered, 1 carrying findings"),
+            "{text}"
+        );
+        assert!(text.contains("\n  failing routes:\n"), "{text}");
+        assert!(
+            text.contains("    GET /settings (settings) — 1 finding(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  WCAG success criteria breached:\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("    WCAG 1.1.1 — 1 finding(s) [image-alt]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 total, 0 not reached by any route"),
+            "{text}"
+        );
+        assert!(text.contains("Result: FAIL"), "{text}");
+    }
+
+    #[test]
+    fn text_output_passes_clean() {
+        let src = r#"fn view() -> Markup { html! { img src="/l.png" alt="Logo"; } }"#;
+        let text = format_text(&report_for(&[("views.rs", src)]), false);
+        assert!(
+            text.contains("0 route(s) discovered, 0 carrying findings"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Result: PASS — no accessibility violations in raw html! markup."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn route_attribution_ignores_cfg_test_handlers() {
+        // A `#[cfg(test)]` handler is test scaffolding: it must not appear in
+        // the route manifest, mirroring the scanner's cfg(test) skip.
+        let src = r#"
+            #[cfg(test)]
+            mod tests {
+                #[get("/fixture")]
+                async fn fixture() -> Markup { html! { img src="/logo.png"; } }
+            }
+        "#;
+        let report = report_for(&[("views.rs", src)]);
+        assert!(report.routes.is_empty(), "{:?}", report.routes);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+}

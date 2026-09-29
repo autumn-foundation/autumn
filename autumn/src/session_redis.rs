@@ -3,6 +3,24 @@
 //! Provides the [`RedisStore`] implementation for the [`SessionStore`] trait,
 //! using the `redis` crate to persist session data in a Redis database.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::collections::HashMap;
 
 use redis::AsyncCommands;
@@ -25,7 +43,7 @@ impl RedisStore {
             .clone()
             .filter(|url| !url.trim().is_empty())
             .ok_or(SessionBackendConfigError::MissingRedisUrl)?;
-        let client = redis::Client::open(url)
+        let client = crate::redis_tls::open_client(&url)
             .map_err(|error| SessionBackendConfigError::InvalidRedisUrl(error.to_string()))?;
         let connection =
             ConnectionManager::new_lazy_with_config(client, ConnectionManagerConfig::new())
@@ -149,7 +167,7 @@ mod tests {
     async fn redis_store_key_for() {
         let store = RedisStore {
             connection: ConnectionManager::new_lazy_with_config(
-                redis::Client::open("redis://127.0.0.1/").unwrap(),
+                crate::redis_tls::open_client("redis://127.0.0.1/").unwrap(),
                 ConnectionManagerConfig::new(),
             )
             .unwrap(),
