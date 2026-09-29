@@ -544,6 +544,7 @@ fn cache_coherence_compile_fail_tests() {
 
 /// SLA obligations (#1826): `#[obligation]` checks its arguments at compile
 /// time.
+#[cfg(feature = "sla")]
 #[test]
 fn obligation_compile_fail_tests() {
     let t = trybuild::TestCases::new();
