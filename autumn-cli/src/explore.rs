@@ -2,7 +2,7 @@ use std::io;
 use std::process::Command;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::Terminal;
@@ -166,6 +166,10 @@ fn run_loop(
         {
             match key.code {
                 KeyCode::Esc => return Ok(()),
+                // Raw mode swallows SIGINT, so Ctrl-C arrives as a key event.
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
                 KeyCode::Down => state.next(),
                 KeyCode::Up => state.previous(),
                 KeyCode::Backspace => {
@@ -183,18 +187,55 @@ fn run_loop(
 }
 
 fn draw(frame: &mut ratatui::Frame, state: &mut ExploreState) {
+    let area = frame.area();
+    let detail_lines = selected_detail_lines(state);
+    // Size the panel to its wrapped content (plus borders) so long source or
+    // middleware text cannot push later fields out of view; cap it at half
+    // the screen so the table stays usable.
+    let inner_width = area.width.saturating_sub(2);
+    let wanted = wrapped_height(&detail_lines, inner_width).saturating_add(2);
+    let details_height = wanted.clamp(3, (area.height / 2).max(3));
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Search bar
-            Constraint::Min(5),    // Table
-            Constraint::Length(8), // Details panel
+            Constraint::Length(3),              // Search bar
+            Constraint::Min(5),                 // Table
+            Constraint::Length(details_height), // Details panel
+            Constraint::Length(1),              // Key help
         ])
-        .split(frame.area());
+        .split(area);
 
     draw_search_bar(frame, chunks[0], state);
     draw_table(frame, chunks[1], state);
-    draw_details_panel(frame, chunks[2], state);
+    draw_details_panel(frame, chunks[2], detail_lines);
+    draw_help(frame, chunks[3]);
+}
+
+/// Rows `lines` occupy when wrapped to `width` columns.
+fn wrapped_height(lines: &[Line<'_>], width: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let rows: usize = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum();
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+fn selected_detail_lines(state: &ExploreState) -> Vec<Line<'static>> {
+    state
+        .table_state
+        .selected()
+        .and_then(|idx| state.filtered_routes.get(idx))
+        .map_or_else(
+            || {
+                vec![Line::from(Span::styled(
+                    "No route selected",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            },
+            build_detail_lines,
+        )
 }
 
 fn draw_search_bar(frame: &mut ratatui::Frame, area: Rect, state: &ExploreState) {
@@ -271,7 +312,7 @@ fn draw_table(frame: &mut ratatui::Frame, area: Rect, state: &mut ExploreState) 
     frame.render_stateful_widget(table, area, &mut state.table_state);
 }
 
-fn draw_details_panel(frame: &mut ratatui::Frame, area: Rect, state: &ExploreState) {
+fn draw_details_panel(frame: &mut ratatui::Frame, area: Rect, lines: Vec<Line<'static>>) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -282,47 +323,24 @@ fn draw_details_panel(frame: &mut ratatui::Frame, area: Rect, state: &ExploreSta
                 .add_modifier(Modifier::BOLD),
         ));
 
-    let mut lines = Vec::new();
-
-    if let Some(selected_idx) = state.table_state.selected() {
-        if let Some(route) = state.filtered_routes.get(selected_idx) {
-            lines = build_detail_lines(route);
-        }
-    } else {
-        lines.push(Line::from(Span::styled(
-            "No route selected",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-
-    // Add help text at the bottom of the details panel
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "Esc",
-            Style::default()
-                .fg(Color::Rgb(204, 120, 50))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "↑/↓",
-            Style::default()
-                .fg(Color::Rgb(204, 120, 50))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "Type",
-            Style::default()
-                .fg(Color::Rgb(204, 120, 50))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" to search", Style::default().fg(Color::DarkGray)),
-    ]));
-
     let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(p, area);
+}
+
+fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
+    let key = Style::default()
+        .fg(Color::Rgb(204, 120, 50))
+        .add_modifier(Modifier::BOLD);
+    let hint = Style::default().fg(Color::DarkGray);
+    let help = Line::from(vec![
+        Span::styled(" Esc/Ctrl-C", key),
+        Span::styled(" quit  ", hint),
+        Span::styled("↑/↓", key),
+        Span::styled(" select  ", hint),
+        Span::styled("Type", key),
+        Span::styled(" to search", hint),
+    ]);
+    frame.render_widget(Paragraph::new(help), area);
 }
 
 pub fn build_detail_lines(route: &RouteInfo) -> Vec<Line<'static>> {
@@ -409,6 +427,15 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect::<String>();
         assert!(middleware_line.contains("Middleware: auth"));
+    }
+
+    #[test]
+    fn test_wrapped_height_counts_wrapped_rows() {
+        let lines = vec![Line::raw("a".repeat(25)), Line::raw(""), Line::raw("short")];
+        // 25 chars at width 10 wrap onto 3 rows; the blank line still takes 1.
+        assert_eq!(wrapped_height(&lines, 10), 5);
+        // A zero width is treated as 1 column: 25 + 1 + 5 rows.
+        assert_eq!(wrapped_height(&lines, 0), 31);
     }
 
     #[test]

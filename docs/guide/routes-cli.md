@@ -153,7 +153,7 @@ autumn explore -p blog --bin blog-server
 Type to filter incrementally — the query matches method, path, handler,
 source, and middleware. Use the up/down arrow keys to move through the
 matches; the detail panel shows the selected route's source, middleware, API
-version, and sunset status. `Backspace` edits the query and `Esc` exits. It
+version, and sunset status. `Backspace` edits the query; `Esc` or `Ctrl-C` exits. It
 takes the same `--package` / `--bin` options as `autumn routes`.
 
 ## How it works
