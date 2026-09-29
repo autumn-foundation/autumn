@@ -443,6 +443,7 @@ async fn tenant_propagating_body_sets_context_during_poll() {
     let mut wrapped = TenantPropagatingBody {
         inner: body,
         tenant_id: "acme".to_string(),
+        handle: None,
     };
     // Poll it outside any CURRENT_TENANT scope (which would fail without the wrapper)
     let waker = futures::task::noop_waker();

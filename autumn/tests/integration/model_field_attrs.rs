@@ -20,6 +20,7 @@ diesel::table! {
         email -> Text,
         password_hash -> Text,
         display_name -> Text,
+        bio -> Text,
     }
 }
 
@@ -33,6 +34,11 @@ pub struct Account {
     pub password_hash: String,
     #[normalize(squish)]
     pub display_name: String,
+    // #2423: a free-text column fed by paste-prone input. Postgres cannot
+    // store `0x00` in a TEXT column, so the byte is dropped on the way in
+    // rather than failing the write.
+    #[normalize(strip_nul)]
+    pub bio: String,
 }
 
 // ── #1374: `#[private]` hides a column from JSON ─────────────────────────
@@ -44,6 +50,7 @@ fn private_column_is_absent_from_json() {
         email: "user@example.com".into(),
         password_hash: "argon2-super-secret".into(),
         display_name: "Ada".into(),
+        bio: "Countess of Lovelace".into(),
     };
     let value = serde_json::to_value(&account).unwrap();
     let obj = value.as_object().unwrap();
@@ -72,9 +79,10 @@ fn private_column_still_deserializes_and_writes() {
         email: "x@y.com".into(),
         password_hash: "hash-to-store".into(),
         display_name: "Grace".into(),
+        bio: "Rear Admiral".into(),
     };
     // Deserialize round-trip into the query struct still accepts the field.
-    let json = r#"{"id":1,"email":"x@y.com","password_hash":"h","display_name":"g"}"#;
+    let json = r#"{"id":1,"email":"x@y.com","password_hash":"h","display_name":"g","bio":"b"}"#;
     let decoded: Account = serde_json::from_str(json).unwrap();
     assert_eq!(decoded.password_hash, "h");
     assert_eq!(new.password_hash, "hash-to-store");
@@ -104,10 +112,12 @@ fn normalize_runs_on_the_write_struct() {
         email: "  Foo@X.COM ".into(),
         password_hash: "h".into(),
         display_name: "  Grace   Hopper  ".into(),
+        bio: "before\u{0}after".into(),
     };
     new.normalize();
     assert_eq!(new.email, "foo@x.com", "trim+downcase on write");
     assert_eq!(new.display_name, "Grace Hopper", "squish on write");
+    assert_eq!(new.bio, "beforeafter", "strip_nul on write (#2423)");
 }
 
 #[test]
@@ -133,6 +143,7 @@ fn normalize_is_idempotent() {
             email: "  Foo@X.COM ".into(),
             password_hash: "h".into(),
             display_name: "  a   b ".into(),
+            bio: "x\u{0}y".into(),
         };
         n.normalize();
         n
@@ -142,6 +153,8 @@ fn normalize_is_idempotent() {
         n.normalize();
         n
     };
+    assert_eq!(once.bio, twice.bio, "strip_nul is idempotent (#2423)");
+    assert_eq!(once.bio, "xy");
     assert_eq!(once.email, twice.email);
     assert_eq!(once.display_name, twice.display_name);
     assert_eq!(twice.email, "foo@x.com");

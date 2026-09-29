@@ -4,6 +4,14 @@
 //! core set is vetted and shipped with `autumn-cli` (issue #993). Each starter's
 //! template tree is embedded via [`include_dir!`]; the tree's root contains an
 //! `autumn-starter.toml` manifest plus the template files.
+//!
+//! The project manifest is committed as `Cargo.toml.tmpl` (not a literal
+//! `Cargo.toml`): `cargo package` treats any subdirectory holding a `Cargo.toml`
+//! as a nested crate and drops that whole subtree from the published tarball,
+//! which would leave this `include_dir!` with nothing to embed at `cargo publish`
+//! verify time. The scaffolder strips the `.tmpl` suffix on emit (see
+//! `starters::emit_rel_path`), so generated projects still get a real
+//! `Cargo.toml`.
 
 use include_dir::{Dir, include_dir};
 
@@ -14,6 +22,13 @@ use include_dir::{Dir, include_dir};
 /// so it cannot rot silently. The `starter_matches_example` test pins the two
 /// together.
 pub static SAAS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src/starters/saas");
+
+/// The content-management starter.
+///
+/// Like [`SAAS`], its rendered form (project name `cms`) is committed at
+/// `examples/cms/`, where it participates in the examples drift gate; the
+/// `embedded_cms_matches_example_cms` test pins the two together.
+pub static CMS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src/starters/cms");
 
 /// A built-in starter: the `--starter` name, its one-line description, and the
 /// embedded template tree.
@@ -28,11 +43,18 @@ pub struct Builtin {
 }
 
 /// The full set of curated built-in starters.
-pub static BUILTINS: &[Builtin] = &[Builtin {
-    name: "saas",
-    description: "Multi-tenant SaaS: session auth + row-level tenancy + tenant-scoped dashboard",
-    dir: &SAAS,
-}];
+pub static BUILTINS: &[Builtin] = &[
+    Builtin {
+        name: "saas",
+        description: "Multi-tenant SaaS: session auth + row-level tenancy + tenant-scoped dashboard",
+        dir: &SAAS,
+    },
+    Builtin {
+        name: "cms",
+        description: "WordPress-parity CMS: posts/pages, taxonomies, media, moderated comments, roles, themes, plugins",
+        dir: &CMS,
+    },
+];
 
 /// Look up a built-in starter by its `--starter` name.
 #[must_use]
@@ -63,5 +85,32 @@ mod tests {
                 .is_some(),
             "embedded saas starter must ship an autumn-starter.toml manifest"
         );
+    }
+
+    #[test]
+    fn cms_is_registered() {
+        let b = find("cms").expect("cms built-in should be registered");
+        assert_eq!(b.name, "cms");
+        assert!(!b.description.is_empty());
+    }
+
+    #[test]
+    fn cms_tree_contains_manifest() {
+        assert!(
+            CMS.get_file(super::super::manifest::MANIFEST_FILE)
+                .is_some(),
+            "embedded cms starter must ship an autumn-starter.toml manifest"
+        );
+    }
+
+    /// Every built-in name is distinct — `find` returns the first match, so a
+    /// duplicate would silently shadow.
+    #[test]
+    fn builtin_names_are_unique() {
+        let mut names: Vec<&str> = BUILTINS.iter().map(|b| b.name).collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate built-in starter name");
     }
 }

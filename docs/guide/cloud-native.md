@@ -33,14 +33,19 @@ The scaffold now includes:
 That is container scaffolding, not a full cluster deployment. You still need to
 decide your runtime topology.
 
-## Probes
+## Probes: liveness, readiness, and startup
 
-Autumn mounts:
+Autumn mounts four probe endpoints. The paths below are the defaults; each is
+configurable under `[health]` (`live_path`, `ready_path`, `startup_path`,
+`path`), and `[health] enabled = false` suppresses all four so an app can own
+those paths itself.
 
-- `/live`
-- `/ready`
-- `/startup`
-- `/health`
+| Endpoint | Probe | What it reflects |
+| --- | --- | --- |
+| `/live` | liveness | Only that the process is up. Ignores startup and dependency state, so it answers `200` whenever the process is running. |
+| `/ready` | readiness | Startup completion, shutdown draining, connection-pool saturation, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
+| `/startup` | startup | Stays unavailable until startup hooks complete. |
+| `/health` | — | Compatibility alias for readiness: same checks and same status as `/ready`. |
 
 Recommended use:
 
@@ -49,6 +54,23 @@ Recommended use:
 - startup probe -> `/startup`
 
 Do not point all three at `/health` just because it was easy in older apps.
+`/health` is a readiness answer, so it returns `503` for conditions a restart
+does not fix: a saturated connection pool, a read replica that cannot safely
+serve reads, a readiness indicator of your own reporting down, or a drain
+already in progress. A *liveness* probe reading one of those has the
+orchestrator kill a process that was working — a busy minute becomes a restart
+loop, which is the failure mode separate probes exist to prevent. Point
+liveness at `/live`, which reports on the process and nothing else.
+
+Readiness does **not** ping the primary database. The built-in `db` indicator
+reports pool *availability* — whether a connection is free, or nobody is queued
+for one — so a primary that has become unreachable while the pool still holds
+idle connections can leave `/ready` at `200`. A configured read replica is
+different: it is probed with a real `SELECT 1`. If you need readiness to gate
+on primary connectivity, register an indicator that runs a query.
+
+For readiness that also reflects your own subsystems, see
+[Health Indicators](health-indicators.md).
 
 ## Telemetry
 
@@ -126,7 +148,7 @@ delivery remain correlated with the request that triggered them.
 change, run the migration before deploying new workers:
 
 ```shell
-autumn migrate run
+autumn migrate
 ```
 
 or apply it manually:
@@ -200,6 +222,9 @@ key_prefix = "my-app:sessions"
 The `prod` profile warns when you keep `backend = "memory"` without explicitly
 acknowledging it via `session.allow_memory_in_production = true`.
 
+A managed Redis that only exposes a TLS port takes a `rediss://` URL here —
+see [Redis over TLS](#redis-over-tls-rediss).
+
 ## Mail
 
 The `mail` cargo feature gives apps a `Mailer` extractor and log/file/SMTP
@@ -225,12 +250,16 @@ tls = "starttls"
 For durable retries across replicas, register a durable
 [`MailDeliveryQueue`](mail.md#deferred-delivery-deliver_later) via
 `AppBuilder::with_mail_delivery_queue` before `.run()` (see the Mail Guide
-for the trait definition and an outbox example). Without one, `prod` startup
-fails unless you explicitly set
+for the trait definition and an outbox example). Without one,
+`try_deliver_later`/`try_deliver_later_eager` return
+`MailError::NoDurableQueueInProduction` in `prod` unless you explicitly set
 `mail.allow_in_process_deliver_later_in_production = true`, which
-acknowledges the in-process Tokio fallback. The fallback is fine for local
-development and small single-process deployments but is not durable across
-restarts or replicas.
+acknowledges the in-process Tokio fallback (the plain `deliver_later`/
+`deliver_later_eager` methods only log that error, so a caller using them
+can't observe it). The fallback is fine for local development and small
+single-process deployments but is not durable across restarts or replicas.
+Apps that only call `mailer.send(...)` never reach this guard and need
+neither a queue nor the flag.
 
 When email dispatch is coordinated with DB writes, use
 [`Db::tx`](transactions.md) for the database side so the write set commits or
@@ -256,6 +285,84 @@ Use Harvest when:
 - retries and visibility matter
 - work should be coordinated across replicas
 - you are really describing a workflow, not a cron callback
+
+## Split web/worker topology
+
+The same image can run as two deployments: **web** replicas that serve HTTP and
+enqueue jobs, and **worker** replicas that drain jobs and run the scheduler.
+Pick the role per deployment with `AUTUMN_ROLE` — no app code or image changes.
+This is the standard "web tier + separately scaled worker tier" production shape
+(Rails/Sidekiq, Laravel Horizon, Django/Celery, Loco.rs `--worker`); scale,
+deploy, and drain each tier on its own.
+
+Requirements:
+
+- **A durable jobs backend** — `jobs.backend = "postgres"` or `"redis"` here,
+  because this page's topology spans hosts. (`"sqlite"` is durable too, but its
+  queue is a table in one file, so it only backs a split whose processes share a
+  host.) The `local` backend is in-process, so a web replica would enqueue where
+  no worker can drain. Autumn rejects a split role on `local` at startup and
+  `autumn doctor --strict` flags it. See
+  [Web and worker process roles](jobs.md#web-and-worker-process-roles).
+- **The same migration gate** — both tiers share one backend, so run the
+  dedicated migration job (below) once before either tier starts.
+- **Probes on the worker tier** — a `worker` replica serves no user routes but
+  still binds `/live`, `/ready`, `/startup`, and `/actuator/*`, so wire the same
+  liveness/readiness probes you use for web.
+
+Docker Compose sketch — one image, two roles, shared Postgres backend:
+
+```yaml
+services:
+  # db + migrate: as in the Migration Jobs section below — migrate runs once, first.
+
+  web:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: web
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: worker
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+```
+
+On Kubernetes this is two `Deployment`s off the same image — one with
+`AUTUMN_ROLE=web`, one with `AUTUMN_ROLE=worker` — each with its own replica
+count and autoscaler, both pointing the readiness probe at `/ready` so the
+[rolling-deploy drain](#rolling-deploy-lifecycle) supervises worker rollouts the
+same way it does web.
+
+### Gating app-owned background work
+
+`AUTUMN_ROLE` gates the **framework's** `#[job]`/`#[scheduled]` workers, but not
+a background loop your app spawns itself in an `on_startup` hook — that runs on
+every replica, including the web tier, unless you gate it. The resolved role is
+exposed on `AppState` as the same value the framework used to gate its own
+workers, so self-gate app-owned loops instead of re-reading `AUTUMN_ROLE`:
+
+```rust
+use autumn_web::{AppState, ProcessRole};
+
+// on_startup hook: only start the embedded loop where workers run.
+if state.role().runs_workers() {
+    tokio::spawn(my_embedded_worker(state.clone()));
+}
+```
+
+`state.role()` returns a `ProcessRole` with `serves_http()` / `runs_workers()`
+predicates; see
+[Self-gating app-owned background work](jobs.md#self-gating-app-owned-background-work).
+Custom/named roles are unsupported today — for finer placement use per-queue
+worker pinning (#1623) plus app-level `state.role()` gating.
 
 ## Migration Jobs
 
@@ -347,10 +454,16 @@ autumn migrate check
 
 `autumn migrate check` reads every `migrations/*/up.sql` file from disk (no
 database connection required) and classifies each SQL statement by its risk for
-a rolling deploy. It exits **0** when all statements are fully safe and **1**
-when any finding is `potentially-blocking`, `destructive`, `irreversible`,
-`data-backfill`, or `manual-review`. Each finding includes a one-line reason and
-a concrete next action.
+a rolling deploy. It exits **0** when all `up.sql` statements are fully safe and
+**1** when any is `potentially-blocking`, `destructive`, `irreversible`,
+`data-backfill`, `manual-review`, or `unsupported`. `down.sql` is classified and
+reported too, but does not decide the exit code: it runs on `autumn migrate
+down`, not on deploy. Each finding includes a one-line reason and a concrete
+next action.
+
+Classification follows the app's own backend (#1906). The example below is a
+Postgres app; on SQLite the same command applies SQLite's rules — see
+[SQLite in production](./sqlite-in-production.md#migration-mechanics-on-sqlite).
 
 Example output:
 
@@ -374,6 +487,7 @@ Example output:
 | `irreversible` | Cannot be undone without a multi-step expand/contract cycle. |
 | `data-backfill` | Schema change is safe but requires a separate backfill job. |
 | `manual-review` | Autumn cannot auto-classify this statement; operator review required. |
+| `unsupported` | The backend has no syntax for this statement; it fails at apply time. SQLite only (#1906). |
 
 ### Adding `autumn migrate check` to CI
 
@@ -457,18 +571,30 @@ that fails while the replica has not replayed the latest Diesel migration.
 
 Autumn's default behavior routes all replica-eligible reads to the replica
 regardless of whether the same request performed a write. Add
-`read_your_writes` in `[database]` to pin post-write reads to the primary:
+`read_your_writes` in `[database]` to pin post-write reads to the primary.
+
+Pick **one** of the two options below. `read_your_writes` is a single key, so
+setting it twice in one `[database]` table is a TOML duplicate-key error and the
+app will not start.
+
+Option A — intra-request pin only (Laravel "sticky"):
 
 ```toml
+# autumn.toml
 [database]
-primary_url   = "postgres://user:pass@primary:5432/app"
-replica_url   = "postgres://user:pass@replica:5432/app"
-
-# Option A — intra-request pin only (Laravel "sticky")
+primary_url      = "postgres://user:pass@primary:5432/app"
+replica_url      = "postgres://user:pass@replica:5432/app"
 read_your_writes = "request"
+```
 
-# Option B — cross-request pin via signed cookie (Rails automatic role switching)
-read_your_writes = "session"
+Option B — cross-request pin via signed cookie (Rails automatic role switching):
+
+```toml
+# autumn.toml
+[database]
+primary_url          = "postgres://user:pass@primary:5432/app"
+replica_url          = "postgres://user:pass@replica:5432/app"
+read_your_writes     = "session"
 pin_after_write_secs = 5          # how long the cookie pins reads; default 5 s
 ```
 
@@ -535,7 +661,7 @@ autumn_web::app()
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-cache-redis = "0.4"
+autumn-cache-redis = "0.7"
 ```
 
 `CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the
@@ -550,6 +676,42 @@ recompute (in-process single-flight, plus an opt-in distributed fill lock and
 stale-while-revalidate on the Redis backend), see [Cache Stampede
 Protection](cache-stampede.md).
 
+## Redis over TLS (`rediss://`)
+
+Managed Redis usually speaks TLS and often speaks *only* TLS. Azure Cache for
+Redis provisioned by `autumn release init --target azure-container-apps` sets
+`non_ssl_port_enabled = false`, and ElastiCache with transit encryption on
+behaves the same way, so the only URL you get is a `rediss://` one.
+
+Every Redis-backed subsystem accepts it — sessions, channels, jobs, job
+tracking, idempotency, webhook replay, rate limiting, and the
+`autumn-cache-redis` cache:
+
+```toml
+[session.redis]
+url = "rediss://:<access-key>@my-cache.redis.cache.windows.net:6380"
+```
+
+Valkey's `valkeys://` scheme works the same way. No extra Cargo feature is
+needed; TLS support is compiled in.
+
+Certificates are validated against the public CA store. A managed Redis that
+presents a private or provider-internal CA — Google Memorystore, for instance
+— will not validate, which is why `autumn release init --target
+gcp-cloud-run` provisions Memorystore with `transit_encryption_mode =
+"DISABLED"` and keeps the connection inside the VPC instead.
+
+Autumn installs the process-wide rustls `CryptoProvider` (`ring`) that the
+`redis` crate's TLS transport requires, once and only for TLS URLs. If your
+application installs its own provider — for example `aws-lc-rs` — install it
+at the top of `main`, before the app builder runs: Autumn keeps whatever is
+already installed, and it may reach for one as early as config validation. A
+plaintext `redis://` URL never claims the default, so it cannot pre-empt that
+choice.
+
+Redis URLs carry credentials, so Autumn redacts the password from any URL it
+logs. Do the same in your own code — `autumn_web::redis_tls::redact_url`.
+
 ## Concurrent Writes
 
 ### The lost-update problem
@@ -561,6 +723,14 @@ the first. No error is raised, no conflict is detected, data is lost.
 ### Optimistic concurrency via `#[lock_version]`
 
 Add the attribute to any model field named `lock_version`:
+
+> **Generated apps get this for free.** Declaring a `lock_version` column
+> in `autumn generate model` / `autumn generate scaffold` emits the
+> attribute (and the column's `DEFAULT 0`) for you, and a scaffold
+> additionally wires the whole conflict-aware HTML edit flow — hidden
+> version field, guarded `UPDATE`, and a 409 re-render instead of a lost
+> update. See
+> [Concurrent edits: `lock_version`](./generators.md#concurrent-edits-lock_version-optimistic-locking).
 
 ```rust
 #[autumn_web::model]
@@ -774,8 +944,9 @@ concurrently during drain but is not awaited at shutdown.
 ### WebSocket drain contract
 
 Every `#[ws]` handler that uses `WithShutdown` receives a `CancellationToken`
-that is cancelled at phase 4. Handlers should send a close frame on
-cancellation:
+that is cancelled at phase 4. `#[ws]` is behind the non-default `ws` feature
+(`features = ["ws"]`); see [WebSockets](websockets.md). Handlers should send a
+close frame on cancellation:
 
 ```rust
 #[ws("/chat")]
@@ -835,6 +1006,7 @@ Before calling an Autumn app "cloud ready", verify:
 - migrations run before web rollout via a dedicated migration job
 - destructive/irreversible migrations follow the expand/contract pattern
 - background jobs use the right runtime model
+- a split web/worker topology (`AUTUMN_ROLE=web` / `worker`) runs on a durable jobs backend (`postgres`/`redis` across hosts, `sqlite` within one, never `local`), with worker replicas exposing `/live` + `/ready`
 - `autumn_jobs` has `traceparent` / `tracestate` columns if using the Postgres backend with `telemetry-otlp`
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery
