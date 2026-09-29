@@ -58,10 +58,13 @@ autumn routes --format postman --user-only > autumn.postman_collection.json
 It emits a Postman v2.1 collection (`{param}` path segments become `:param`,
 URLs start with a `{{base_url}}` variable defaulting to
 `http://localhost:3000`). `#[ws]` routes are skipped, with a note on stderr.
+The output is a collection to save, not a route list: skip the JSON table
+handling below, confirm the file was written, and relay the stderr note if
+present.
 
 ## Output handling
 
-Parse the JSON array and present a clean table grouped by handler file or
+For `--format json` (the default here), parse the JSON array and present a clean table grouped by handler file or
 resource:
 
 ```
