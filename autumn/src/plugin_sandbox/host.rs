@@ -7266,7 +7266,13 @@ path = "/hello/greet"
         )
         .expect("the fixture is valid WAT");
 
-        let at = u32::try_from(MAX_CODE_BYTES).expect("fits");
+        // The fixture's own code section counts toward the same ceiling, so
+        // the global section fills exactly what it leaves.
+        let code_bytes = refuse_unbounded_shape(&wasm)
+            .expect("the fixture passes the gate")
+            .code_bytes;
+        let global_len = MAX_CODE_BYTES - code_bytes;
+        let at = u32::try_from(global_len).expect("fits");
         let mut header = vec![6u8]; // the global section id
         let mut size = at;
         loop {
@@ -7287,7 +7293,7 @@ path = "/hello/greet"
         let shape = refuse_unbounded_shape(&wasm)
             .expect("a global section at exactly the ceiling must pass the gate");
         assert_eq!(
-            shape.global_bytes, MAX_CODE_BYTES,
+            shape.global_bytes, global_len,
             "the gate must see the section's full size"
         );
         assert_eq!(
