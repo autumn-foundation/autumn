@@ -278,29 +278,35 @@ pub fn print_mermaid(routes: &[RouteInfo]) {
 }
 
 /// Build the Mermaid string (extracted for testability).
+///
+/// Routes are grouped into one `subgraph` per source; `:` and `-` in a source
+/// (`plugin:autumn-admin`) become `_` so the subgraph id stays a valid
+/// Mermaid identifier.
 pub fn format_mermaid(routes: &[RouteInfo]) -> String {
-    let mut out = String::new();
-    out.push_str("flowchart LR\n");
+    use std::fmt::Write as _;
 
-    // Group routes by source
-    let mut by_source: std::collections::BTreeMap<&str, Vec<&RouteInfo>> = std::collections::BTreeMap::new();
+    let mut by_source: std::collections::BTreeMap<&str, Vec<&RouteInfo>> =
+        std::collections::BTreeMap::new();
     for route in routes {
         by_source.entry(&route.source).or_default().push(route);
     }
 
-    let mut node_id = 0;
-
+    let mut out = String::from("flowchart LR\n");
+    let mut node_id = 0_usize;
     for (source, source_routes) in by_source {
-        out.push_str(&format!("    subgraph {}\n", source.replace(':', "_").replace('-', "_")));
-
+        let subgraph = source.replace([':', '-'], "_");
+        // Writing into a `String` cannot fail.
+        let _ = writeln!(out, "    subgraph {subgraph}");
         for route in source_routes {
             node_id += 1;
-            let current_node = format!("route{}", node_id);
-            out.push_str(&format!("        {}(\"<b>{}</b> {}\")\n", current_node, route.method, route.path));
+            let _ = writeln!(
+                out,
+                "        route{node_id}(\"<b>{}</b> {}\")",
+                route.method, route.path
+            );
         }
         out.push_str("    end\n");
     }
-
     out
 }
 
