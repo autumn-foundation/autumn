@@ -36,6 +36,16 @@ pub struct QueueFilter {
     pub page: Option<usize>,
 }
 
+/// The last page of a moderation queue holding `total` comments.
+///
+/// `total` is the already-loaded count for the *selected* status — the queue
+/// the pager belongs to — never an all-statuses sum, which would strand the
+/// links on pages past the queue's end. Pure so the arithmetic is unit-tested
+/// without a database.
+fn queue_last_page(total: i64, per_page: i64) -> i64 {
+    ((total + per_page - 1) / per_page).max(1)
+}
+
 #[get("/admin/comments")]
 pub async fn list(
     repos: Repos,
@@ -55,7 +65,31 @@ pub async fn list(
     // per comment — so the screen needed to clear a spam flood was the one that
     // stopped working first.
     let per_page = 50_i64;
-    let page = i64::try_from(filter.page.unwrap_or(1).clamp(1, 100_000)).unwrap_or(1);
+    // Propagated for the same reason the dashboard's are: a queue badge reading
+    // zero because the database was unreachable tells a moderator the queue is
+    // clear.
+    //
+    // Loaded before the rows: the selected queue's count also drives the
+    // pager, and clamping the requested page to the last page needs it before
+    // the query runs — otherwise a stale `?page=9` link keeps fetching an
+    // empty page forever.
+    let mut counts = Vec::new();
+    for (value, label) in QUEUES {
+        counts.push((
+            *value,
+            *label,
+            repos.comments.count_by_status((*value).to_owned()).await?,
+        ));
+    }
+    let selected_total = counts
+        .iter()
+        .find(|(value, _, _)| *value == status.as_str())
+        .map(|(_, _, count)| *count)
+        .unwrap_or(0);
+    let last_page = queue_last_page(selected_total, per_page);
+    let page = i64::try_from(filter.page.unwrap_or(1).clamp(1, 100_000))
+        .unwrap_or(1)
+        .min(last_page);
     let entries = {
         let mut conn = repos.conn().await?;
         let rows =
@@ -68,18 +102,6 @@ pub async fn list(
             .collect();
         entries
     };
-
-    // Propagated for the same reason the dashboard's are: a queue badge reading
-    // zero because the database was unreachable tells a moderator the queue is
-    // clear.
-    let mut counts = Vec::new();
-    for (value, label) in QUEUES {
-        counts.push((
-            *value,
-            *label,
-            repos.comments.count_by_status((*value).to_owned()).await?,
-        ));
-    }
 
     let body = html! {
         nav aria-label="Comment queues" class="mb-4" {
@@ -155,6 +177,28 @@ pub async fn list(
                 p class="p-10 text-center text-gray-400" { "Nothing in this queue." }
             }
         }
+
+        // The queues are the only admin list without one: a spam flood the
+        // screen was built for is exactly when a single page stops being
+        // enough. The selected queue's count is already loaded above, so the
+        // last page is exact and both links preserve the queue.
+        @if last_page > 1 {
+            nav aria-label="Queue pages" class="flex items-center justify-between mt-6 text-sm" {
+                @if page > 1 {
+                    a href=(format!("/admin/comments?status={status}&page={}", page - 1))
+                      class="text-indigo-700 hover:underline" { "← Previous" }
+                } @else {
+                    span {}
+                }
+                span class="text-gray-500" { "Page " (page) " of " (last_page) }
+                @if page < last_page {
+                    a href=(format!("/admin/comments?status={status}&page={}", page + 1))
+                      class="text-indigo-700 hover:underline" { "Next →" }
+                } @else {
+                    span {}
+                }
+            }
+        }
     };
 
     Ok(layout(&user, &csrf, "/admin/comments", "Comments", body).into_response())
@@ -228,4 +272,21 @@ pub async fn delete(
     content::delete_comment(&mut conn, id).await?;
 
     Ok(Redirect::to("/admin/comments?status=trash").into_response())
+}
+
+#[cfg(test)]
+mod queue_pager_tests {
+    use super::queue_last_page;
+
+    #[test]
+    fn last_page_counts_the_selected_queue() {
+        // Empty and partial queues still render page one, not page zero.
+        assert_eq!(queue_last_page(0, 50), 1);
+        assert_eq!(queue_last_page(1, 50), 1);
+        assert_eq!(queue_last_page(50, 50), 1);
+        // A full page plus one spills onto page two.
+        assert_eq!(queue_last_page(51, 50), 2);
+        assert_eq!(queue_last_page(100, 50), 2);
+        assert_eq!(queue_last_page(125, 50), 3);
+    }
 }
