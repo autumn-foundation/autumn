@@ -1,0 +1,86 @@
+type Mutation {
+	"""
+	Create a note. Trimming and the 1–120 character rule come from the
+	model, not from this resolver.
+	"""
+	createNote(input: NewNoteInput!): Note!
+	"""
+	Flip a note's pinned flag atomically. Errors (`404`) if the id is
+	unknown.
+	
+	A read-then-`update` would race: two overlapping toggles could both
+	read `false` and both write `true`. `with_lock` is the repository's
+	pessimistic helper — `SELECT … FOR UPDATE` on the row inside a
+	transaction, then the closure with the locked record and the
+	transaction connection — so each toggle observes the previous one.
+	The write inside is plain Diesel on that connection, which is the
+	documented shape for `with_lock` closures. A missing row is refused by
+	`with_lock` itself with a `404` `AutumnError`, mapped like every other.
+	"""
+	togglePinned(id: ID!): Note!
+	"""
+	Delete a note. Returns whether anything was deleted. A pinned note is
+	refused by the repository's `before_delete` hook, which surfaces here
+	as a field error.
+	
+	One statement, not exists-then-delete: two overlapping deletes of the
+	same note would both pass an existence check and the loser would see
+	a `404` instead of `false`. `delete_by_id` reports a missing row as a
+	`404` `AutumnError`, which is exactly the "nothing to delete" answer.
+	"""
+	deleteNote(id: ID!): Boolean!
+}
+
+"""
+Input for `createNote`. The model's `#[normalize(trim)]` trims both fields
+and its `#[validate]` rejects an empty title; this type just carries them.
+"""
+input NewNoteInput {
+	title: String!
+	body: String! = ""
+}
+
+"""
+The GraphQL `Note` object, resolved straight off the `#[model]` struct.
+
+An `#[Object]` impl block turns an existing type into a GraphQL object
+without changing its definition, which keeps `models.rs` free of any
+GraphQL vocabulary. The `BIGSERIAL` key is exposed as the `ID` scalar (a
+string on the wire): GraphQL `Int` is a signed 32-bit contract, so an
+`i64` published as `Int` would break standards-compliant clients once
+the sequence passes 2³¹.
+"""
+type Note {
+	id: ID!
+	title: String!
+	body: String!
+	pinned: Boolean!
+	"""
+	RFC 3339 UTC timestamp, so the client needs no date library.
+	"""
+	createdAt: String!
+}
+
+type Query {
+	"""
+	All notes, newest first. `pinnedOnly: true` narrows to pinned notes.
+	"""
+	notes(pinnedOnly: Boolean! = false): [Note!]!
+	"""
+	One note by id, or `null`.
+	"""
+	note(id: ID!): Note
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: Query
+	mutation: Mutation
+}

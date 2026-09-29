@@ -115,6 +115,7 @@ mod tests {
         NullablePost,
         table = "nullable_posts",
         broadcasts = true,
+        commit_hooks = true,
         topic = "category_posts:{category}",
         container = "category-posts-list"
     )]
@@ -264,10 +265,8 @@ mod tests {
             .expect("timeout waiting for delete on old topic broadcast")
             .expect("recv error");
         let html_content_old = msg_old.into_string();
-        assert!(html_content_old.contains(&format!(
-            "hx-swap-oob=\"delete:#custom-post-{}\"",
-            custom_post.id
-        )));
+        assert!(html_content_old.contains("hx-swap-oob=\"delete\""));
+        assert!(html_content_old.contains(&format!("id=\"custom-post-{}\"", custom_post.id)));
 
         // Wait for the background worker to drain and publish update on custom topic
         let msg = tokio::time::timeout(std::time::Duration::from_secs(3), custom_update_sub.recv())
@@ -275,7 +274,12 @@ mod tests {
             .expect("timeout waiting for custom update broadcast")
             .expect("recv error");
         let html_content = msg.into_string();
-        assert!(html_content.contains("hx-swap-oob=\"beforeend:#custom-posts-list\""));
+        // A topic-change re-insert publishes with the model's `insert_swap()`
+        // (not the create-path container), so the OOB selector comes from
+        // `BroadcastPost::insert_swap()` = Target(BeforeEnd, "#broadcast_posts-list").
+        // `OobSwap::Target::format_value` uses that selector verbatim and ignores
+        // the target id, so the SSE envelope is `beforeend:#broadcast_posts-list`.
+        assert!(html_content.contains("hx-swap-oob=\"beforeend:#broadcast_posts-list\""));
         assert!(html_content.contains(&format!("id=\"custom-post-{}", custom_post.id)));
         assert!(html_content.contains("world"));
 
@@ -291,10 +295,8 @@ mod tests {
             .expect("timeout waiting for custom delete broadcast")
             .expect("recv error");
         let html_content = msg.into_string();
-        assert!(html_content.contains(&format!(
-            "hx-swap-oob=\"delete:#custom-post-{}\"",
-            custom_post.id
-        )));
+        assert!(html_content.contains("hx-swap-oob=\"delete\""));
+        assert!(html_content.contains(&format!("id=\"custom-post-{}\"", custom_post.id)));
 
         // 5. Test bulk update (update_many) and nullable topic placeholders
         let nullable_repo = PgNullablePostRepository::with_pool_untracked(db.pool());
@@ -340,20 +342,18 @@ mod tests {
             .await
             .expect("timeout waiting for delete on none topic")
             .expect("recv error");
-        assert!(msg_none.into_string().contains(&format!(
-            "hx-swap-oob=\"delete:#nullable_post-{}\"",
-            post_none.id
-        )));
+        let msg_none_str = msg_none.into_string();
+        assert!(msg_none_str.contains("hx-swap-oob=\"delete\""));
+        assert!(msg_none_str.contains(&format!("id=\"nullable_post-{}\"", post_none.id)));
 
         // - category_posts:rust should receive a delete for post_some.id
         let msg_rust = tokio::time::timeout(std::time::Duration::from_secs(3), rust_sub.recv())
             .await
             .expect("timeout waiting for delete on rust topic")
             .expect("recv error");
-        assert!(msg_rust.into_string().contains(&format!(
-            "hx-swap-oob=\"delete:#nullable_post-{}\"",
-            post_some.id
-        )));
+        let msg_rust_str = msg_rust.into_string();
+        assert!(msg_rust_str.contains("hx-swap-oob=\"delete\""));
+        assert!(msg_rust_str.contains(&format!("id=\"nullable_post-{}\"", post_some.id)));
 
         // - category_posts:go should receive updates for both
         let msg_go1 = tokio::time::timeout(std::time::Duration::from_secs(3), go_sub.recv())

@@ -421,7 +421,20 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// and carriage return) are dropped, since they cannot appear in a well-formed
 /// XML document even when escaped. Escaping `>` also neutralises any `]]>`
 /// sequence so untrusted titles/bodies cannot break out of the document.
+///
+/// Real titles/bodies are overwhelmingly plain ASCII text containing none of
+/// the five special characters, but the byte-by-byte `chars()` loop below
+/// pays a full UTF-8 decode + 5-way match per character even for that common
+/// case. `needs_escaping` does one cheap byte scan to detect it and returns
+/// the input unchanged (one allocation, one memcpy) instead of rebuilding it
+/// one `char` at a time. Any non-ASCII byte falls straight through to the
+/// per-`char` path unconditionally, so `is_xml_char`'s
+/// `U+FFFE`/`U+FFFF`-filtering — which only matters for non-ASCII code
+/// points — is never bypassed.
 fn escape(s: &str) -> String {
+    if !needs_escaping(s) {
+        return s.to_owned();
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if !is_xml_char(c) {
@@ -439,6 +452,20 @@ fn escape(s: &str) -> String {
     out
 }
 
+/// Whether `s` contains anything `escape` would change: a byte outside the
+/// ASCII range (conservatively routed to the full per-`char` path, since only
+/// non-ASCII code points can be `U+FFFE`/`U+FFFF` or otherwise need
+/// `is_xml_char`'s multi-byte-aware filtering), one of the five characters
+/// `escape` turns into an entity, or an ASCII control byte `is_xml_char`
+/// drops (below `0x20`, excluding tab/newline/carriage return).
+fn needs_escaping(s: &str) -> bool {
+    s.bytes().any(|b| {
+        !b.is_ascii()
+            || matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')
+            || (b < 0x20 && !matches!(b, 0x9 | 0xA | 0xD))
+    })
+}
+
 /// Whether `c` is a valid XML 1.0 character (XML 1.0 §2.2 `Char` production).
 /// Rust `char` already excludes surrogates, so only the low control range and
 /// the two non-characters `U+FFFE`/`U+FFFF` need filtering here.
@@ -450,4 +477,104 @@ const fn is_xml_char(c: char) -> bool {
             | '\u{E000}'..='\u{FFFD}'
             | '\u{10000}'..='\u{10FFFF}'
     )
+}
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based invariants for XML escaping and feed rendering. `escape`
+    //! is private, so it is exercised in-crate here.
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Reverse the five entities `escape` emits. `&amp;` is decoded LAST so a
+    /// payload like `&lt;` is not double-decoded.
+    fn unescape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn escape_takes_the_fast_path_on_clean_ascii() {
+        let clean = "Named futures and readable stack traces";
+        assert_eq!(escape(clean), clean);
+        assert!(!needs_escaping(clean));
+    }
+
+    #[test]
+    fn escape_takes_the_slow_path_on_special_ascii_bytes() {
+        assert_eq!(escape("Rust & WebAssembly"), "Rust &amp; WebAssembly");
+        assert_eq!(escape("it's <ok>"), "it&apos;s &lt;ok&gt;");
+        assert!(needs_escaping("Rust & WebAssembly"));
+    }
+
+    #[test]
+    fn escape_drops_control_bytes_on_an_otherwise_clean_ascii_string() {
+        // A bare control byte (below 0x20, not tab/newline/CR) has no special
+        // ASCII characters, so the fast path's own scan — not just the
+        // non-ASCII check — must still catch it.
+        assert_eq!(escape("a\u{1}b"), "ab");
+    }
+
+    #[test]
+    fn escape_still_filters_noncharacters_in_non_ascii_input() {
+        // U+FFFE is dropped by `is_xml_char`; the fast path must route any
+        // non-ASCII input to the full per-char path so this still happens.
+        assert_eq!(escape("café\u{FFFE}!"), "café!");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `escape` never emits a raw `<` or `>`: these are always turned into
+        /// entities, so an escaped value can never open or close a tag. This is
+        /// the core XML-injection-safety invariant.
+        #[test]
+        fn escape_has_no_raw_angle_brackets(s in ".*") {
+            let out = escape(&s);
+            prop_assert!(!out.contains('<'));
+            prop_assert!(!out.contains('>'));
+        }
+
+        /// Escaping is a lossless, reversible transform over the XML-legal
+        /// characters of the input: un-escaping the output recovers exactly the
+        /// input with non-XML characters dropped.
+        #[test]
+        fn escape_round_trips_over_xml_chars(s in ".*") {
+            let filtered: String = s.chars().filter(|&c| is_xml_char(c)).collect();
+            prop_assert_eq!(unescape(&escape(&s)), filtered);
+        }
+
+        /// `Feed::render` (both formats) never panics on arbitrary field values,
+        /// always produces the XML prolog, and never lets an injected `<` from a
+        /// field body appear raw in the output.
+        #[test]
+        fn render_never_panics_and_escapes_fields(
+            title in ".*",
+            body in ".*",
+            rss in any::<bool>(),
+        ) {
+            // Salt the fields with tag-like markers to prove they are escaped.
+            let marked_title = format!("<x>{title}");
+            let marked_body = format!("</feed>{body}");
+            let feed = if rss {
+                Feed::rss(marked_title, "https://example.com/", "https://example.com/feed.xml")
+            } else {
+                Feed::atom(marked_title, "https://example.com/", "https://example.com/feed.xml")
+            }
+            .description("d")
+            .entry(FeedEntry::new("id-1", "entry title", "https://example.com/1").content(marked_body));
+
+            let out = feed.render();
+            prop_assert!(out.starts_with("<?xml version=\"1.0\""));
+            // The injected markers must not survive as raw tags.
+            prop_assert!(!out.contains("<x>"));
+            // Structural `</feed>` appears exactly once (Atom) / zero times
+            // (RSS) — the injected copy in the body must not add another.
+            let expected_close = usize::from(!rss);
+            prop_assert_eq!(out.matches("</feed>").count(), expected_close);
+        }
+    }
 }

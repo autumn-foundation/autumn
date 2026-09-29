@@ -42,13 +42,13 @@ pub trait ProvideProbeState {
     #[cfg(feature = "db")]
     fn pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>;
 
     /// Returns an optional read-replica pool for readiness checks.
     #[cfg(feature = "db")]
     fn replica_pool(
         &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
     {
         None
     }
@@ -77,7 +77,7 @@ pub trait ProvideProbeState {
     ///     fn profile(&self) -> &str { "dev" }
     ///     fn uptime_display(&self) -> String { String::new() }
     ///     #[cfg(feature = "db")]
-    ///     fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> { None }
+    ///     fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<autumn_web::db::RuntimeConnection>> { None }
     /// }
     ///
     /// let state = MyState { probes: ProbeState::pending_startup() };
@@ -446,10 +446,18 @@ async fn refresh_replica_readiness<S: ProvideProbeState + Sync>(state: &S) {
     };
 
     match replica_pool.get().await {
-        Ok(conn) => {
+        Ok(mut conn) => {
+            let alive = crate::db::probe_connection_alive(&mut conn).await;
             drop(conn);
-            state.probes().mark_replica_connection_ready();
-            refresh_replica_migration_readiness(state).await;
+            match alive {
+                Ok(()) => {
+                    state.probes().mark_replica_connection_ready();
+                    refresh_replica_migration_readiness(state).await;
+                }
+                Err(error) => state
+                    .probes()
+                    .mark_replica_connection_unready(format!("replica connection failed: {error}")),
+            }
         }
         Err(error) => state
             .probes()
@@ -625,7 +633,7 @@ mod tests {
         #[cfg(feature = "db")]
         fn pool(
             &self,
-        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
         {
             None
         }
@@ -885,7 +893,7 @@ mod tests {
         #[cfg(feature = "db")]
         fn pool(
             &self,
-        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
         {
             None
         }

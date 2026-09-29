@@ -36,6 +36,24 @@
 //! are the only blessed way to obtain real client identity from request
 //! handlers and middleware.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -421,6 +439,59 @@ impl ProxyResolver {
     }
 }
 
+// ── Fuzzing seams ───────────────────────────────────────────────────────────
+// These `#[cfg(fuzzing)]` wrappers expose the private trusted-proxy parsing
+// surface (`TrustedProxy::parse`, `ProxyResolver::parse_forwarded_ip`, and the
+// full `X-Forwarded-*` resolver) to the `fuzz/` crate. They are compiled out of
+// every normal build (including `cargo package`), so the published crate is
+// byte-identical. See `fuzz/fuzz_targets/headers.rs`.
+
+/// Fuzzing seam: parse a single `[security.trusted_proxies]` range/IP entry.
+#[cfg(fuzzing)]
+pub fn __fuzz_parse_trusted_proxy(value: &str) -> bool {
+    TrustedProxy::parse(value).is_some()
+}
+
+/// Fuzzing seam: parse a single `X-Forwarded-For` entry into an IP.
+#[cfg(fuzzing)]
+#[must_use]
+pub fn __fuzz_parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    ProxyResolver::parse_forwarded_ip(value)
+}
+
+/// Fuzzing seam: run the full trusted-proxy resolver over arbitrary
+/// `X-Forwarded-*` / `X-Real-IP` / `Host` header values.
+#[cfg(fuzzing)]
+pub fn __fuzz_resolve_forwarded(
+    xff: &str,
+    x_real_ip: &str,
+    x_forwarded_proto: &str,
+    x_forwarded_host: &str,
+    host: &str,
+) {
+    use axum::http::HeaderValue;
+    let resolver = ProxyResolver::loopback_only();
+    let mut req = Request::new(());
+    // Give the request a loopback peer so the trusted path is exercised.
+    req.extensions_mut()
+        .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))));
+    let headers = req.headers_mut();
+    for (name, value) in [
+        ("x-forwarded-for", xff),
+        ("x-real-ip", x_real_ip),
+        ("x-forwarded-proto", x_forwarded_proto),
+        ("x-forwarded-host", x_forwarded_host),
+        ("host", host),
+    ] {
+        if let Ok(v) = HeaderValue::from_str(value) {
+            headers.insert(name, v);
+        }
+    }
+    let _ = resolver.resolve_client_addr(&req);
+    let _ = resolver.resolve_client_host(&req);
+    let _ = resolver.resolve_client_scheme(&req);
+}
+
 /// Resolved client identity, injected into request extensions by the
 /// framework's proxy-resolver middleware.  Extractors read from this.
 #[derive(Debug, Clone)]
@@ -491,17 +562,56 @@ where
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
-        let identity = ResolvedClientIdentity {
-            addr: self.resolver.resolve_client_addr(&req),
-            host: self.resolver.resolve_client_host(&req),
-            scheme: self.resolver.resolve_client_scheme(&req),
-        };
-        req.extensions_mut().insert(identity);
+        // An identity already present was put there by in-process code —
+        // extensions never arrive off the wire — today only the capsule
+        // replay driver, restoring the resolution the failing request had.
+        // Honor it rather than re-resolving against a synthetic peer that
+        // would (correctly, but uselessly) distrust the recorded forwarded
+        // headers (issue #1598).
+        if req.extensions().get::<ResolvedClientIdentity>().is_none() {
+            let identity = ResolvedClientIdentity {
+                addr: self.resolver.resolve_client_addr(&req),
+                host: self.resolver.resolve_client_host(&req),
+                scheme: self.resolver.resolve_client_scheme(&req),
+            };
+            req.extensions_mut().insert(identity);
+        }
 
-        let mut inner = self.inner.clone();
-        std::mem::swap(&mut self.inner, &mut inner);
+        // A failure capsule records the *resolved* client identity, so replay
+        // can restore `ClientAddr`/`ClientHost`/`ClientScheme` without
+        // re-running trust evaluation against a peer socket it does not have
+        // (issue #1598).
+        //
+        // Recorded from the request's extensions rather than from the branch
+        // above, because the two are not the same instance. `App::run` wraps
+        // the finished router in an *outer* `TrustedProxiesLayer`, which
+        // resolves before the capture scope exists — so by the time this inner
+        // instance runs inside the scope, the identity is already present and
+        // the branch above is skipped. Recording only what this instance
+        // resolved would therefore leave every capsule written by the real
+        // server without a client identity, while the test harness (which has
+        // no outer layer) recorded one.
+        #[cfg(feature = "reporting")]
+        if let Some(scope) = crate::capsule::current_scope()
+            && let Some(identity) = req.extensions().get::<ResolvedClientIdentity>()
+        {
+            scope.set_client_identity(crate::capsule::CapturedClientIdentity {
+                addr: identity.addr,
+                host: identity.host.clone(),
+                scheme: identity.scheme.clone(),
+            });
+        }
 
-        Box::pin(inner.call(req))
+        // No `.await` happens in this middleware itself — everything above is
+        // synchronous prep on `req` — so the `Self::Future`'s `'static` bound
+        // is satisfied by `self.inner.call(req)` directly: no need to clone
+        // `self.inner` into an owned value first. `inner`'s previous
+        // clone-then-swap dance cloned `self.inner` (a
+        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
+        // impl allocates a fresh box) on every request purely to satisfy a
+        // move that was never required, since nothing here captures `self`
+        // past this statement.
+        Box::pin(self.inner.call(req))
     }
 }
 
@@ -980,5 +1090,79 @@ mod tests {
 
         let host = resolver.resolve_client_host(&req).unwrap();
         assert_eq!(host, "real.example.com");
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based invariants for the private trusted-proxy parsers.
+    //! `TrustedProxy::parse` and `ProxyResolver::parse_forwarded_ip` are
+    //! private, so they are fuzzed in-crate here rather than from an
+    //! integration test.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `TrustedProxy::parse` never panics on arbitrary input.
+        #[test]
+        fn parse_range_never_panics(s in ".*") {
+            let _ = TrustedProxy::parse(&s);
+        }
+
+        /// A bare valid IP parses, and (per the CIDR contract) `contains`
+        /// treats it as trusting exactly itself among same-family addresses.
+        #[test]
+        fn parse_bare_ipv4_round_trips(a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>()) {
+            let ip = std::net::Ipv4Addr::new(a, b, c, d);
+            let parsed = TrustedProxy::parse(&ip.to_string());
+            prop_assert!(parsed.is_some());
+            let range = parsed.unwrap();
+            prop_assert!(range.contains(std::net::IpAddr::V4(ip)));
+        }
+
+        /// Surrounding whitespace is trimmed, so a padded IP parses to the same
+        /// range as the unpadded one (normalisation idempotence at the parse
+        /// boundary).
+        #[test]
+        fn parse_is_whitespace_insensitive(
+            a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>(),
+            pad in "[ \t]{0,4}",
+        ) {
+            let ip = std::net::Ipv4Addr::new(a, b, c, d).to_string();
+            let padded = format!("{pad}{ip}{pad}");
+            let bare = TrustedProxy::parse(&ip);
+            let padded_parsed = TrustedProxy::parse(&padded);
+            prop_assert_eq!(bare.is_some(), padded_parsed.is_some());
+        }
+
+        /// A prefix length wider than the address family's maximum is rejected
+        /// (never a panic, never an over-wide accept).
+        #[test]
+        fn parse_rejects_over_wide_prefix(a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>(), prefix in 33u16..=255) {
+            let s = format!("{a}.{b}.{c}.{d}/{prefix}");
+            prop_assert!(TrustedProxy::parse(&s).is_none());
+        }
+
+        /// `parse_forwarded_ip` never panics on arbitrary input.
+        #[test]
+        fn parse_forwarded_ip_never_panics(s in ".*") {
+            let _ = ProxyResolver::parse_forwarded_ip(&s);
+        }
+
+        /// Port-suffix normalisation: `ip:port` yields the same address as the
+        /// bare `ip` (the port is stripped), for a valid IPv4 + port.
+        #[test]
+        fn parse_forwarded_ip_strips_port(
+            a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>(),
+            port in any::<u16>(),
+        ) {
+            let ip = std::net::Ipv4Addr::new(a, b, c, d);
+            let bare = ProxyResolver::parse_forwarded_ip(&ip.to_string());
+            let with_port = ProxyResolver::parse_forwarded_ip(&format!("{ip}:{port}"));
+            prop_assert_eq!(bare, Some(std::net::IpAddr::V4(ip)));
+            prop_assert_eq!(with_port, Some(std::net::IpAddr::V4(ip)));
+        }
     }
 }

@@ -105,6 +105,8 @@ impl<'de> Deserialize<'de> for TimeZoneConfig {
         #[serde(untagged)]
         enum Repr {
             Scalar(String),
+            // NOTE: keep MANUAL_SCHEMA_SECTIONS in config.rs in sync with these
+            // table fields (schema walker can't see untagged variant fields).
             Table {
                 #[serde(default = "default_time_zone_identifier")]
                 identifier: String,
@@ -237,7 +239,8 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for TimeZone {
         parts: &mut axum::http::request::Parts,
         state: &crate::state::AppState,
     ) -> Result<Self, Self::Rejection> {
-        let cfg = state.config().time_zone;
+        let config = state.config_arc();
+        let cfg = &config.time_zone;
         let sources = cfg.sources.clone();
         let default_tz = cfg.default_tz();
 
