@@ -241,10 +241,11 @@ pub struct TenantCellStructuralOverhead {
     /// atomics, scratch-map header, mutex, and global-gauge `Arc` pointer.
     pub tenant_cell_inner_bytes: usize,
     /// Inline values in occupied map buckets: each resident `(String,
-    /// Arc<TenantCell>)` entry plus its `(String, Weak<_>)` domain-index entry.
+    /// Arc<TenantCell>)` entry plus every `(String, Weak<_>)` domain-index
+    /// entry (resident, evicted-but-live, or awaiting the dead-entry sweep).
     pub registry_entry_bytes: usize,
-    /// Heap capacity of every copy of each resident tenant id (registry key,
-    /// domain-index key, and the cell's own id).
+    /// Heap capacity of the tenant-id copies: each resident cell's registry
+    /// key and own id, plus every domain-index key.
     pub tenant_id_capacity_bytes: usize,
     /// Two strong/weak counter pairs: one for each per-cell `Arc` allocation.
     pub arc_header_bytes: usize,
@@ -1101,20 +1102,17 @@ impl TenantCellRegistry {
             + 2 * ARC_HEADER;
         let tenant_cell_bytes = resident_cells * std::mem::size_of::<TenantCell>();
         let tenant_cell_inner_bytes = resident_cells * std::mem::size_of::<TenantCellInner>();
-        // Every resident cell also has an accounting-domain index entry (its
-        // own tenant-id key plus a `Weak`). Lock order matches
-        // `get_or_create`: `cells` first, then `domains`. Entries for evicted
-        // or dead domains are not resident and are omitted (lower bound).
+        // Count every occupied domain-index entry and its owned key: resident
+        // cells', evicted-but-live domains', and dead entries awaiting the
+        // next sweep — all are allocated structure. Lock order matches
+        // `get_or_create`: `cells` first, then `domains`.
         let domains = self
             .inner
             .domains
             .lock()
             .expect("tenant cell domain index lock poisoned");
-        let resident_domain_key_capacities: Vec<usize> = cells
-            .keys()
-            .filter_map(|id| domains.get_key_value(id.as_str()))
-            .map(|(key, _)| key.capacity())
-            .collect();
+        let index_entries = domains.len();
+        let index_key_capacity: usize = domains.keys().map(String::capacity).sum();
         // Sweeps lower the index's `capacity()` without shrinking its
         // allocation, so read the high-water mark inserts maintain.
         let domain_bucket_count = self.inner.domain_bucket_high_water.load(Ordering::Relaxed);
@@ -1123,12 +1121,12 @@ impl TenantCellRegistry {
             + domain_bucket_count;
         drop(domains);
         let registry_entry_bytes = resident_cells * std::mem::size_of::<RegistryEntry>()
-            + resident_domain_key_capacities.len() * std::mem::size_of::<DomainEntry>();
+            + index_entries * std::mem::size_of::<DomainEntry>();
         let tenant_id_capacity_bytes = cells
             .iter()
             .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
             .sum::<usize>()
-            + resident_domain_key_capacities.iter().sum::<usize>();
+            + index_key_capacity;
         let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
         let registry_element_capacity = cells.capacity();
         // Read allocation history while the map's read guard is still held.

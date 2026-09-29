@@ -834,3 +834,17 @@ fn domain_index_stays_bounded_under_tenant_churn() {
     drop(charge);
     drop((live, evicted, rejoined));
 }
+
+/// Regression: an evicted-but-live domain's domain-index entry is still allocated
+/// structure, so its key keeps counting after the cell leaves the resident map.
+#[test]
+fn structural_overhead_counts_non_resident_domain_entries() {
+    let registry = TenantCellRegistry::new();
+    let held = registry.get_or_create("tenant-held", 0);
+    let evicted = registry.evict("tenant-held").expect("was resident");
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, 0);
+    assert_eq!(structural.tenant_id_capacity_bytes, "tenant-held".len());
+    assert!(structural.registry_entry_bytes > 0);
+    drop((held, evicted));
+}

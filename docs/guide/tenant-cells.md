@@ -215,9 +215,10 @@ every entry.
 
 The lower-bound estimate sums the current platform's `size_of` layouts for `TenantCell` and
 `TenantCellInner` (including atomics, the scratch-map header, and mutex), both
-per-cell `Arc` counter headers, occupied registry entries plus each resident
-cell's accounting-domain index entry, all three tenant-id allocation capacities
-(registry key, domain-index key, and the cell's own id), and amortized spare
+per-cell `Arc` counter headers, occupied registry entries plus every
+accounting-domain index entry (resident, evicted-but-live, or awaiting the
+dead-entry sweep), the tenant-id allocation capacities (each resident cell's
+registry key and own id, and every domain-index key), and amortized spare
 buckets plus control bytes for both the registry and the domain index.
 Because `HashMap::capacity()` is an **element capacity**, not a bucket count,
 the model rounds it up to the current SwissTable implementation's power-of-two
