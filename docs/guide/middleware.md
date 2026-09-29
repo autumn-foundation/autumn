@@ -1,7 +1,7 @@
 # Middleware in Autumn
 
 Autumn ships a curated stack of built-in middleware — request IDs, security
-headers, CSRF, CORS, sessions, metrics, exception filters. That covers the
+headers, CSRF, [CORS](cors.md), sessions, metrics, exception filters. That covers the
 boring-but-critical concerns most applications share. When you need something
 off the beaten path (a timeout, a rate limiter, a custom tracing span, a
 legacy header injector), you have several places to put it.

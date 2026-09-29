@@ -29,19 +29,30 @@
 //! [`Sim::crash_schedule`](crate::sim::Sim::crash_schedule) /
 //! [`Sim::crash_point`](crate::sim::Sim::crash_point).
 //!
-//! # Representative crash point (scope, stated plainly)
+//! # Crash at any await
 //!
-//! This wave injects a **single representative deterministic crash point** — the
-//! `await` boundary **after** a repository write has enqueued its durable
-//! commit-hook row but **before** that hook drains — rather than a fully-general
-//! "between ANY two `await`s" injector. That representative boundary is the
-//! sharpest test of durable recovery: the durable row is committed, the in-flight
-//! work is not, so a correct recovery re-runs it exactly-once/idempotently on
-//! restart. The schedule API is shaped generally (an ordered sequence of
-//! [`CrashPoint`]s, each carrying a seed-derived `await_index`), so a later wave
-//! can realize more of the enumerated boundaries without a breaking change; today
-//! the harness realizes the first one. This is documented representativeness, not
-//! faked generality.
+//! [`crash_at`] runs an operation and drops it at its N-th suspension point, so
+//! a test can crash between any two awaits. [`CrashPoint::await_index`] is the
+//! seeded N. Pair it with [`Sim::kill`](crate::sim::Sim::kill) and
+//! [`Sim::restart`](crate::sim::Sim::restart) to model the process dying there.
+//!
+//! ```rust,ignore
+//! let point = sim.crash_point().unwrap();
+//! let outcome = crash_at(point.await_index, sim.client().post("/pay").send()).await;
+//! if outcome.is_crashed() {
+//!     sim.crash_and_restart(app_on_same_db());
+//!     sim.run_to_idle().await;
+//! }
+//! ```
+//!
+//! A suspension point is an await that returns `Pending`. An await whose value
+//! is ready at once does not suspend, so it is not a crash point.
+
+use std::future::Future;
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
 
 use crate::entropy::SeededEntropy;
 
@@ -51,18 +62,12 @@ use crate::entropy::SeededEntropy;
 /// An arbitrary fixed non-zero constant.
 pub(crate) const CRASH_STREAM_SALT: u64 = 0xC7A5_4EAD_C7A5_4EAD;
 
-/// The number of enumerated `await` boundaries in the representative durable
-/// write → enqueue → drain path a crash can target. A seed-derived draw is taken
-/// `% CRASH_AWAIT_BOUNDARIES` to pick one. The realized representative crash
-/// always fires at the "commit-hook enqueued, pre-drain" boundary; this modulus
-/// only shapes the (general) recorded schedule so it stays a small, stable index
-/// space across runs.
+/// The seeded `await_index` is drawn in `[0, CRASH_AWAIT_BOUNDARIES)`. A small
+/// bound keeps the seeded crash inside short operations. To reach a later
+/// await, pass a larger index to [`crash_at`].
 pub(crate) const CRASH_AWAIT_BOUNDARIES: u64 = 4;
 
 /// Default number of crash decisions the derived schedule records for a sim.
-/// Generous relative to the single representative crash the harness realizes; the
-/// extra entries exist only so the recorded schedule is a non-trivial seeded
-/// sequence the Definition-of-Done can compare across two same-seed runs.
 pub(crate) const DEFAULT_CRASH_SCHEDULE_LEN: usize = 8;
 
 /// One seed-derived crash decision in a [`CrashSchedule`].
@@ -75,10 +80,8 @@ pub(crate) const DEFAULT_CRASH_SCHEDULE_LEN: usize = 8;
 pub struct CrashPoint {
     /// The crash sequence number, starting at 0.
     pub seq: u64,
-    /// The seed-derived `await`-boundary index this crash targets, in
-    /// `[0, CRASH_AWAIT_BOUNDARIES)`. Representative: the harness realizes the
-    /// crash at the "commit-hook enqueued, pre-drain" boundary regardless of this
-    /// index; it exists so the recorded schedule is a genuine seeded sequence.
+    /// The seeded suspension point to crash at, in `[0, 4)`. Pass it to
+    /// [`crash_at`].
     pub await_index: u64,
 }
 
@@ -118,11 +121,122 @@ impl CrashSchedule {
         &self.points
     }
 
-    /// The first (representative, realized) crash point, or `None` for an empty
-    /// schedule.
+    /// The first crash point, or `None` for an empty schedule.
     #[must_use]
     pub fn first(&self) -> Option<&CrashPoint> {
         self.points.first()
+    }
+}
+
+/// What happened to an operation run under [`crash_at`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrashOutcome<T> {
+    /// The operation finished before it reached the crash point.
+    Completed(T),
+    /// The operation was dropped at this suspension point.
+    Crashed {
+        /// The suspension point, counted from 0.
+        await_index: u64,
+    },
+}
+
+impl<T> CrashOutcome<T> {
+    /// `true` when the operation was dropped before it finished.
+    #[must_use]
+    pub const fn is_crashed(&self) -> bool {
+        matches!(self, Self::Crashed { .. })
+    }
+
+    /// The output, or `None` when the operation crashed.
+    #[must_use]
+    pub fn completed(self) -> Option<T> {
+        match self {
+            Self::Completed(value) => Some(value),
+            Self::Crashed { .. } => None,
+        }
+    }
+}
+
+/// Run `op` and drop it at its `await_index`-th suspension point.
+///
+/// Index 0 drops `op` the first time it returns `Pending`. The work `op` did
+/// before that point stays done; the work after it never runs. If `op` finishes
+/// first, the result is [`CrashOutcome::Completed`].
+///
+/// A suspension counts once, however often the caller polls: `op` is polled
+/// again only after it wakes itself. So `crash_at` inside
+/// [`Sim::interleave`](crate::sim::Sim::interleave) or `join!` counts the same
+/// awaits as it does alone.
+///
+/// This drops only `op`. Call [`Sim::kill`](crate::sim::Sim::kill) after a
+/// crash to also stop the app's background work.
+pub async fn crash_at<F: Future>(await_index: u64, op: F) -> CrashOutcome<F::Output> {
+    let mut op = pin!(op);
+    let wake = Arc::new(WakeFlag::default());
+    let waker = Waker::from(Arc::clone(&wake));
+    let mut suspensions = 0_u64;
+    let mut polled = false;
+    std::future::poll_fn(move |cx| {
+        wake.set_parent(cx.waker());
+        // Poll `op` first, and then only after its own waker fired.
+        if polled && !wake.take() {
+            return Poll::Pending;
+        }
+        polled = true;
+        match op.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(value) => Poll::Ready(CrashOutcome::Completed(value)),
+            Poll::Pending if suspensions == await_index => {
+                Poll::Ready(CrashOutcome::Crashed { await_index })
+            }
+            Poll::Pending => {
+                suspensions += 1;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+/// The waker [`crash_at`] gives `op`: it records the wake and passes it on.
+#[derive(Default)]
+struct WakeFlag {
+    woken: AtomicBool,
+    parent: Mutex<Option<Waker>>,
+}
+
+impl WakeFlag {
+    fn set_parent(&self, waker: &Waker) {
+        let mut parent = self.parent.lock().unwrap_or_else(PoisonError::into_inner);
+        if !parent
+            .as_ref()
+            .is_some_and(|current| current.will_wake(waker))
+        {
+            *parent = Some(waker.clone());
+        }
+    }
+
+    /// Whether `op` woke since the last call.
+    fn take(&self) -> bool {
+        self.woken.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::Release);
+        let parent = self
+            .parent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(parent) = parent {
+            parent.wake();
+        }
     }
 }
 
