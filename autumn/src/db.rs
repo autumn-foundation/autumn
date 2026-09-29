@@ -1581,11 +1581,11 @@ fn sqlite_target_is_shared_cache(target: &str) -> bool {
     sqlite_uri_has_query_pair(target, "cache", "shared")
 }
 
-/// Whether `target` is a `SQLite` URI filename whose query carries exactly
-/// `key=value`, read the way `SQLite` reads it: only a `file:` URI has query
-/// parameters (a plain path containing `?` is just a filename), the
-/// `#fragment` is ignored, and names and values are percent-decoded before the
-/// case-sensitive comparison. `target` may be a raw configured URL
+/// Whether `target` is a `SQLite` URI filename whose effective `key` query
+/// parameter is exactly `value`, read the way `SQLite` reads it: only a `file:`
+/// URI has query parameters (a plain path containing `?` is just a filename),
+/// the `#fragment` is ignored, names and values are percent-decoded before the
+/// case-sensitive comparison, and a repeated parameter takes its last value. `target` may be a raw configured URL
 /// (`sqlite:file:...`) or an already-normalized one.
 #[cfg(feature = "sqlite")]
 fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
@@ -1599,10 +1599,11 @@ fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
     let Some((_, query)) = without_fragment.split_once('?') else {
         return false;
     };
-    query.split('&').any(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        percent_decode(k) == key.as_bytes() && percent_decode(v) == value.as_bytes()
-    })
+    query
+        .split('&')
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+        .rfind(|(k, _)| percent_decode(k) == key.as_bytes())
+        .is_some_and(|(_, v)| percent_decode(v) == value.as_bytes())
 }
 
 /// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
@@ -5177,6 +5178,13 @@ mod tests {
         // an ordinary filename.
         assert!(!sqlite_target_is_shared_cache("app.db?cache=shared"));
         assert!(!sqlite_target_is_shared_cache("sqlite:app.db?cache=shared"));
+        // A repeated parameter takes its last value.
+        assert!(!sqlite_target_is_shared_cache(
+            "file:app.db?cache=shared&cache=private"
+        ));
+        assert!(sqlite_target_is_shared_cache(
+            "file:app.db?cache=private&cache=shared"
+        ));
     }
 
     // `sqlite_target_is_any_in_memory` is the broader predicate the
