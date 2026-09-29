@@ -1475,7 +1475,10 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
         // control and formatting checks so those keep their more specific
         // refusals for the non-ASCII characters they cover.
         if !is_capture_segment(segment) && segment.bytes().any(|b| !b.is_ascii()) {
-            return refuse("a literal route segment must be ASCII; write `café` as `caf%C3%A9`");
+            return refuse(
+                "a literal route segment must be ASCII; percent-encode each non-ASCII \
+                 character as its upper-case UTF-8 bytes (e.g. `café` as `caf%C3%A9`)",
+            );
         }
         // axum 0.8 spells captures `{name}` / `{*rest}` and *panics* on a
         // segment starting with the 0.7 spelling, before matchit ever sees it.
@@ -1866,13 +1869,16 @@ max_concurrency = 8
             );
         }
 
-        // The refusal names the working spelling, so the author is not left
-        // guessing how to write the route they meant.
-        let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/café""#);
+        // The refusal says how to write the working spelling, so the author is
+        // not left guessing. The message is input-independent (it cannot
+        // name the rejected segment's own encoding), so it states the rule and
+        // labels its `café` spelling as an example.
+        let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/中文""#);
         let err = SandboxManifest::parse(&src).expect_err("must be refused");
+        let message = format!("{err}");
         assert!(
-            format!("{err}").contains("caf%C3%A9"),
-            "the refusal should suggest the encoded spelling: {err}"
+            message.contains("percent-encode") && message.contains("e.g. `café` as `caf%C3%A9`"),
+            "the refusal should explain the encoded spelling: {err}"
         );
     }
 
