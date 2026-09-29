@@ -2244,7 +2244,7 @@ fn plan_scaffold_with_options_impl(
     if !options_with_key.api || metadata.has_validator_rules() {
         combined.push((
             "validator",
-            "{ version = \"0.20\", features = [\"derive\"] }",
+            "{ version = \"0.21\", features = [\"derive\"] }",
         ));
     }
     // Not re-checked for missing features here: `plan` above *is* the
