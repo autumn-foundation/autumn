@@ -213,6 +213,7 @@ async fn appearance_page(
         && !pages.iter().any(|page| page.id == id)
         && let Some(page) = repos.posts.find_by_id(id).await?
         && page.post_type == "page"
+        && page.is_public()
     {
         pages.insert(0, page);
     }
