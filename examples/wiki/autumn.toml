@@ -1,17 +1,22 @@
 [server]
 port = 3001
 
-[jobs]
-# The autumn-search plugin's reindex job (src/lib.rs::search_plugin) is this
-# example's only job. commit_hooks = true (src/repositories.rs) already
-# stages its enqueue durably in Postgres, inside the mutation's own
-# transaction — but that guarantee stops at the commit-hook queue. The
-# default `backend = "local"` runs enqueued jobs in-process with no
-# persistence, so a process exit between the commit hook's ack and the local
-# worker draining it would still lose the reindex. `postgres` closes that gap
-# with no new dependency (wiki already runs on Postgres), matching
-# examples/reddit-clone's own [jobs] backend.
-backend = "postgres"
+# No [jobs] section: the autumn-search plugin's reindex job
+# (src/lib.rs::search_plugin) runs on the default `backend = "local"`
+# in-process queue, like every other example that uses #[job] without opting
+# into a durable backend (todo-app, bookmarks). commit_hooks = true
+# (src/repositories.rs) still makes the *enqueue* durable — staged in
+# Postgres, inside the mutation's own transaction, auto-migrated at startup
+# — so a rolled-back save never reindexes and a crash before the commit-hook
+# queue drains is recovered by the queue. The remaining gap is narrower than
+# that: a crash between the queue draining and the local job finishing can
+# still delay a reindex, self-healing on the next edit or a manual `autumn
+# search reindex --package wiki` (see README's "Backfill"). Switching to
+# `backend = "postgres"` (matching examples/reddit-clone) would close that
+# gap, but its migrations also bring in `00000000000000_create_api_tokens`,
+# which collides on version with this crate's own
+# `00000000000000_create_wiki` — see the comment on
+# `.migrations(MIGRATIONS)` in src/main.rs.
 
 [log]
 level = "info"
