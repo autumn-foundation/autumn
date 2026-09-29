@@ -1418,20 +1418,27 @@ fn builder_anchor(main_rs: &str) -> Option<usize> {
     let lines = crate::rust_source::code_lines(main_rs);
     // The mask blanks strings and comments, so only real code braces move the
     // depth; a brace inside a string or comment cannot shift it.
+    let step = |depth: usize, text: &str| {
+        text.bytes().fold(depth, |depth, byte| match byte {
+            b'{' => depth + 1,
+            b'}' => depth.saturating_sub(1),
+            _ => depth,
+        })
+    };
     let mut depth = 0usize;
     let mut main_at = None;
     for (index, (line, _)) in lines.iter().enumerate() {
-        if depth == 0 && crate::rust_source::declares_async_main(line) {
+        // The depth at the declaration itself, not at the start of its line:
+        // `impl Server { async fn main() {` opens the impl on the same line.
+        if crate::rust_source::declares_async_main(line)
+            && line
+                .find("async fn main")
+                .is_some_and(|at| step(depth, &line[..at]) == 0)
+        {
             main_at = Some(index);
             break;
         }
-        for byte in line.bytes() {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
+        depth = step(depth, line);
     }
     let main_at = main_at?;
     // The body ends at the first code line that closes a brace at column 0 —
@@ -3225,6 +3232,23 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(
             mount_at > real_main_at,
             "the mount landed before the real entry point — it was spliced into the impl helper"
+        );
+    }
+
+    /// The same guard when the `impl` opens on the helper's own line: the
+    /// depth that matters is the one at the declaration, not at the start of
+    /// its line.
+    #[test]
+    fn insert_mount_ignores_a_same_line_impl_helper_named_main() {
+        let source = "use autumn_web::prelude::*;\n\nimpl Server { async fn main() {\n        let app = autumn_web::app()\n            .routes(routes![]);\n    }\n}\n\n#[autumn_web::main]\nasync fn main() {\n    let app = autumn_web::app()\n        .routes(routes![index]);\n\n    app.run().await;\n}\n";
+        let updated = insert_mount(source, admin().mount).expect("anchor on the real main");
+        let real_main_at = updated.find("#[autumn_web::main]").expect("real main kept");
+        let mount_at = updated
+            .find(admin().mount.trim_end_matches('\n'))
+            .expect("mount spliced");
+        assert!(
+            mount_at > real_main_at,
+            "the mount landed in the same-line impl helper, not the real entry point"
         );
     }
 
