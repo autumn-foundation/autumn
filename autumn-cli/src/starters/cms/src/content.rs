@@ -5555,6 +5555,19 @@ pub async fn unrendered_approved_replies(
     if approved_comment_count(conn, post_id).await? <= MAX_THREAD_COMMENTS {
         return Ok(Vec::new());
     }
+    let replies: Vec<i64> = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"))
+        .filter(comments::parent_id.is_not_null())
+        .order(comments::id.asc())
+        .select(comments::id)
+        .load(conn)
+        .await?;
+    // No approved reply, nothing a page can truncate: a root always fits. A
+    // popular root-only discussion skips the page replay entirely.
+    if replies.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut rendered: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut offset = 0_i64;
     loop {
@@ -5565,14 +5578,6 @@ pub async fn unrendered_approved_replies(
             break;
         }
     }
-    let replies: Vec<i64> = comments::table
-        .filter(comments::post_id.eq(post_id))
-        .filter(comments::status.eq("approved"))
-        .filter(comments::parent_id.is_not_null())
-        .order(comments::id.asc())
-        .select(comments::id)
-        .load(conn)
-        .await?;
     Ok(replies
         .into_iter()
         .filter(|id| !rendered.contains(id))
