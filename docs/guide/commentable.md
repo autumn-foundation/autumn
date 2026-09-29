@@ -165,6 +165,13 @@ carries `deleted_at`) and decrements the counter by the number of rows it
 actually moved — so a double-submit removes nothing the second time and cannot
 drive the count negative.
 
+With `soft_delete = false`, the delete removes the rows. The `parent_id`
+foreign key then cascades to every reply, on any record. If a reply in the
+subtree belongs to another record, the delete returns `422` and removes
+nothing. The framework cannot write such a reply, but imported data or raw SQL
+can. To fix it, set that reply's `parent_id` to `NULL` or to a comment on its
+own record. Then delete again.
+
 ### `comment_count` is maintained, not computed
 
 `posts.comment_count` moves with the same

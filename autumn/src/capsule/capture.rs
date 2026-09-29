@@ -1093,7 +1093,7 @@ pub async fn capture_job<T>(
         // Persisting is blocking (a directory scan and a file write), and this
         // runs on a worker thread serving other jobs.
         let scope = Arc::clone(&scope);
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = crate::time::spawn_blocking(move || {
             let _ = crate::capsule::persist(&scope, outcome);
         })
         .await;

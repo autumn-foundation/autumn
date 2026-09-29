@@ -1268,6 +1268,46 @@ both crates for you and keeps the paths you already write.
 that no codemod may add on the reader's behalf, and the right answer for most
 readers is to depend on `autumn-web` instead, which is a design decision.
 
+### Widgets: widget CSS classes are now `autumn-`-prefixed (#2354)
+
+**Why:** several widgets emitted unprefixed class hooks (`card`,
+`card-header`, `stat-card`, `active`, …) that the widget stylesheet
+(`/static/css/autumn-widgets.css`) never styled — so the `/_stories`
+previews and any app linking only the bundle rendered those widgets
+unstyled, and generic hooks like `active` collided with app CSS. Every
+widget-emitted class now lives in the `autumn-*` namespace and is backed by
+a rule in the widget stylesheet.
+
+**You are affected only if your own CSS or JS targets the old hooks.**
+Widget output is unchanged apart from the class names.
+
+**Before (`{X.Y}`):**
+
+```css
+.card { border: 1px solid #e5e7eb; }
+.card-header { font-weight: 600; }
+a.active { color: red; }
+```
+
+**After (`{(X+1).0}`):**
+
+```css
+.autumn-card { border: 1px solid #e5e7eb; }
+.autumn-card__header { font-weight: 600; }
+a.autumn-active { color: red; }
+```
+
+Full mapping: `card` → `autumn-card`, `card-header` →
+`autumn-card__header`, `card-title` → `autumn-card__title`, `card-body` →
+`autumn-card__body`, `card-footer` → `autumn-card__footer`, `stat-card` →
+`autumn-stat-card`, `stat-label` → `autumn-stat-card__label`, `stat-value` →
+`autumn-stat-card__value`, `stat-link` → `autumn-stat-card__link`,
+`search-empty` → `autumn-search-empty`, `autocomplete-empty` →
+`autumn-autocomplete-empty`, `alert__icon-svg` → `autumn-alert__icon-svg`,
+`active` → `autumn-active` (on `nav_link()` output only).
+
+**Automation:** `manual` — the selectors live in the reader's own
+stylesheets, which no codemod may rewrite on their behalf.
 ### autumn-billing: `Customer.user_id` is tenant-scoped under tenancy
 
 **Why:** `SessionUser`/`Entitled<R>` keyed every `autumn-billing` store lookup
@@ -1369,6 +1409,59 @@ turned on or has been running alongside billing all along — needs the
 `recipient_for` implementation, `SessionUser`/`Entitled<R>`, and every other
 consumer of `Customer.user_id` need no change.
 
+
+### http_client: `ClientError` is `#[non_exhaustive]` and gains `SimNetwork` (#2967)
+
+**Why:** the simulated network (`sim::SimNet`) fails calls with drops,
+partitions, timeouts and unknown hosts. A real `reqwest::Error` cannot be built
+for these, so they need their own variant. The enum is now
+`#[non_exhaustive]`, so the next new variant is not a breaking change.
+
+You are affected only if you `match` on `ClientError` with no wildcard arm.
+Outside a `Sim` with a `SimNet`, the variant never occurs.
+
+**Before (`{X.Y}`):**
+
+```rust
+match error {
+    ClientError::Request(_) => retry(),
+    ClientError::Json(_) => bad_payload(),
+    // … every other variant, no `_` arm
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match error {
+    ClientError::Request(_) | ClientError::SimNetwork(_) => retry(),
+    ClientError::Json(_) => bad_payload(),
+    _ => give_up(), // required: the enum is `#[non_exhaustive]`
+}
+```
+
+**Automation:** `manual` — the right arm depends on what your code does with a
+network failure.
+
+### Sim: `SimClock` and `SimApp` are no longer public (#2967)
+
+**Why:** no public API returned either type, so no code could hold one.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::sim::{Sim, SimApp, SimClock};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::sim::Sim;
+// Reach the app with `sim.client()` and time with `sim.advance(..)`.
+```
+
+**Automation:** `manual` — delete the import; nothing else can have used the
+types.
 
 ## Plugin authors
 
@@ -1615,6 +1708,23 @@ Other changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+### Sim: framework code reads the sim clock (#2967)
+
+Inside a `Sim`, framework code with no clock in scope now reads the sim's
+virtual clock (`time::ambient_now` and its siblings), not the OS clock. This
+covers about 55 modules and the `deleted_at` stamp `#[repository]` writes for a
+soft delete. Wall time starts at the sim epoch, `2020-01-01T00:00:00Z`. A sim
+test that compares such a value with `Utc::now()` fails; compare it with the
+sim clock instead. Outside a `Sim`, nothing changes.
+
+### Sim: `run_to_idle` panics when the drain does not settle (#2967)
+
+Before, `Sim::run_to_idle` stopped after its step bound and gave no signal.
+Now, when work still runs in the last rounds of the drain (for example, a job
+that enqueues itself again), it panics with a `sim drain stall` message and
+the seed. A test that relied on the silent stop fails with that message. Fix
+the endless work, or call `Sim::try_run_to_idle` and handle the `SimStall`.
 
 ## Deprecations retained from `{X.Y}`
 
