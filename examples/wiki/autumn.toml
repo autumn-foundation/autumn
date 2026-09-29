@@ -1,6 +1,18 @@
 [server]
 port = 3001
 
+[jobs]
+# The autumn-search plugin's reindex job (src/lib.rs::search_plugin) is this
+# example's only job. commit_hooks = true (src/repositories.rs) already
+# stages its enqueue durably in Postgres, inside the mutation's own
+# transaction — but that guarantee stops at the commit-hook queue. The
+# default `backend = "local"` runs enqueued jobs in-process with no
+# persistence, so a process exit between the commit hook's ack and the local
+# worker draining it would still lose the reindex. `postgres` closes that gap
+# with no new dependency (wiki already runs on Postgres), matching
+# examples/reddit-clone's own [jobs] backend.
+backend = "postgres"
+
 [log]
 level = "info"
 
