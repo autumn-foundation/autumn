@@ -4,7 +4,7 @@
 //! assert the produced filesystem matches the documented contract — covering
 //! the user-facing flow described in [Issue #493].
 //!
-//! [Issue #493]: https://github.com/madmax983/autumn/issues/493
+//! [Issue #493]: https://github.com/autumn-foundation/autumn/issues/493
 
 use std::fmt::Write as _;
 use std::fs;
@@ -770,17 +770,24 @@ fn generate_scaffold_full_e2e_post() {
     for needle in [
         "#[get(\"/posts\")]",
         "#[get(\"/posts/{id}\")]",
-        "#[get(\"/posts/new\")]",
+        "#[get(\"/posts/new\", name = \"new\")]",
         "#[post(\"/posts\")]",
-        "#[get(\"/posts/{id}/edit\")]",
+        "#[get(\"/posts/{id}/edit\", name = \"edit\")]",
         "#[post(\"/posts/{id}/update\")]",
         "pub async fn index",
         "pub async fn show",
         "pub async fn new_form(",
         "pub async fn update",
-        "use autumn_web::security::{CsrfFormField, CsrfToken};",
+        "use autumn_web::security::{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken};",
         "input type=\"hidden\" name=(csrf_field_name)",
         "(csrf_input(csrf.as_ref(), csrf_field.as_ref()))",
+        // Issue #1360: one-time submit token wired into create/update forms.
+        // The hidden field name follows the configured
+        // `security.submit_token.field_name` (via the `SubmitFormField`
+        // extractor), not a hardcoded `_submit_token`.
+        "fn submit_token_input(",
+        "input type=\"hidden\" name=(submit_field_name) value=(submit_token.token());",
+        "submit_token: Option<SubmitToken>",
     ] {
         assert!(routes.contains(needle), "routes file missing: {needle}");
     }
@@ -809,6 +816,12 @@ fn generate_scaffold_full_e2e_post() {
         "routes::posts::create",
         "routes::posts::edit_form",
         "routes::posts::update",
+        // Issue #1312: the bulk delete-selected route is mounted alongside the
+        // per-row destroy for every non-live, non-sharded HTML scaffold.
+        "routes::posts::bulk_delete",
+        // Issue #1315: the CSV export route is mounted for every scaffold whose
+        // index row set is a repository call the export can reuse verbatim.
+        "routes::posts::export_csv",
         "repositories::post::post_api_list",
         "repositories::post::post_api_get",
     ] {
@@ -1136,14 +1149,34 @@ fn generate_scaffold_api_only() {
     // No HTML routes file
     assert!(!project.join("src/routes/posts.rs").is_file());
 
-    // Smoke test: real, in-process, DB-backed read test (issue #1023).
+    // Smoke test: real, in-process, DB-backed read test (issue #1023),
+    // paginated per issue #1237 — asserts the `Page` envelope + page 2 advance.
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(test.contains("posts_api_list_returns_ok_against_a_real_database"));
+    assert!(test.contains("posts_api_list_paginates_against_a_real_database"));
     assert!(test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"));
     assert!(!test.contains("TcpStream"));
     assert!(!test.contains("AUTUMN_TEST_BASE_URL"));
     assert!(test.contains("#[ignore = \"requires Docker"));
     assert!(test.contains("/api/posts"));
+    assert!(
+        test.contains("PageRequest") && test.contains("Page::new"),
+        "the --api smoke test must paginate via the Page envelope: {test}"
+    );
+    assert!(
+        test.contains("page 2 must differ from page 1"),
+        "the --api smoke test must assert pages advance: {test}"
+    );
+    // Required-column seed drives 25 rows off a single `generate_series` and
+    // must not fall back to `INSERT ... DEFAULT VALUES` (which cannot satisfy
+    // the NOT NULL `title`/`published` columns).
+    assert!(
+        test.contains("FROM generate_series(1, 25) AS g"),
+        "required-column --api seed must use generate_series: {test}"
+    );
+    assert!(
+        !test.contains("INSERT INTO posts DEFAULT VALUES"),
+        "required-column --api seed must not fall back to DEFAULT VALUES: {test}"
+    );
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
@@ -1230,8 +1263,20 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(routes.contains("<Bookmark as autumn_web::form::FormModel>::form_fields()"));
     assert!(routes.contains("autumn_web::form::form_for(changeset, action, \"post\")"));
     assert!(!routes.contains("autumn_web::form::required_text_input(&changeset"));
-    // `alive` is defaulted → excluded from the form entirely.
-    assert!(!routes.contains("\"alive\""));
+    // `alive` is defaulted → excluded from the FORM entirely. Scoped to the
+    // generated form struct + its `form_fields` descriptors rather than the whole
+    // file: since issue #1315 the module also carries a `CsvSchema` impl, whose
+    // column list is the MODEL's columns (what `show` renders), not the form's —
+    // a defaulted column is still data an author downloading a spreadsheet wants.
+    // The ONE remaining `"alive"` string in the module is that CSV header; the
+    // form struct, its descriptors and every rendered control are free of it.
+    assert_eq!(
+        routes.matches("\"alive\"").count(),
+        1,
+        "`alive` is defaulted: its only quoted mention may be the CSV header:\n{routes}"
+    );
+    assert!(routes.contains(r#"&["id", "url", "title", "tag", "alive", "created_at"]"#));
+    assert!(routes.contains("self.alive.to_string(),"));
     assert!(routes.contains("bookmarks::tag.eq(new.tag.clone())"));
     assert!(!routes.contains("bookmarks::alive.eq("));
     assert!(!routes.contains("new.alive"));
@@ -1358,6 +1403,73 @@ fn destroy_scaffold_round_trip_leaves_cargo_check_green() {
     );
 }
 
+/// Start a Postgres testcontainer and return it (alive for as long as the
+/// binding lives) alongside its connection URL.
+async fn start_postgres() -> (
+    testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    String,
+) {
+    use testcontainers::runners::AsyncRunner as _;
+
+    let postgres = testcontainers_modules::postgres::Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres testcontainer");
+    let host = postgres.get_host().await.expect("postgres host");
+    let pg_port = postgres
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("postgres port");
+    let url = format!("postgres://postgres:postgres@{host}:{pg_port}/postgres");
+    (postgres, url)
+}
+
+/// Migrate, `cargo build`, and boot a freshly generated project against
+/// `database_url`, returning the running server (kept alive by the returned
+/// guard) and its base URL.
+///
+/// Shared by the live-HTTP gates so they cannot drift on how the app under test
+/// is brought up; a build failure surfaces the full compiler output, since these
+/// gates are the only place the generated app is ever compiled AND run.
+async fn migrate_build_and_boot(
+    project: &Path,
+    database_url: &str,
+    client: &reqwest::Client,
+) -> (ServerGuard, String) {
+    run_autumn_with_env(
+        project,
+        &["migrate"],
+        &[("AUTUMN_DATABASE__URL", database_url)],
+    );
+
+    let build = Command::new("cargo")
+        .args(["build"])
+        .current_dir(project)
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        build.status.success(),
+        "cargo build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let port = free_port();
+    let child = Command::new("cargo")
+        .args(["run", "--quiet"])
+        .current_dir(project)
+        .env("AUTUMN_SERVER__PORT", port.to_string())
+        .env("AUTUMN_DATABASE__URL", database_url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn generated server");
+
+    let base = format!("http://127.0.0.1:{port}");
+    let server = wait_for_server_ready_async(child, client, &base).await;
+    (server, base)
+}
+
 /// Slow live-HTTP check: scaffold a fresh project, run migrations against a
 /// real Postgres testcontainer, boot the generated server, and assert the
 /// generated HTML and JSON routes actually respond.
@@ -1367,9 +1479,6 @@ fn destroy_scaffold_round_trip_leaves_cargo_check_green() {
 #[tokio::test]
 #[ignore = "slow: starts Postgres, runs diesel migrations, builds and boots a generated app"]
 async fn generated_scaffold_serves_posts_index_and_json_api() {
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::postgres::Postgres;
-
     let (_tmp, project) = fresh_project("scaffold-live");
     patch_generated_cargo_toml(&project);
 
@@ -1385,49 +1494,9 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
         ],
     );
 
-    let postgres = Postgres::default()
-        .start()
-        .await
-        .expect("failed to start Postgres testcontainer");
-    let host = postgres.get_host().await.expect("postgres host");
-    let pg_port = postgres
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("postgres port");
-    let database_url = format!("postgres://postgres:postgres@{host}:{pg_port}/postgres");
-
-    run_autumn_with_env(
-        &project,
-        &["migrate"],
-        &[("AUTUMN_DATABASE__URL", database_url.as_str())],
-    );
-
-    let build = Command::new("cargo")
-        .args(["build"])
-        .current_dir(&project)
-        .output()
-        .expect("failed to run cargo build");
-    assert!(
-        build.status.success(),
-        "cargo build failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr),
-    );
-
-    let port = free_port();
-    let child = Command::new("cargo")
-        .args(["run", "--quiet"])
-        .current_dir(&project)
-        .env("AUTUMN_SERVER__PORT", port.to_string())
-        .env("AUTUMN_DATABASE__URL", &database_url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn generated server");
-
+    let (_postgres, database_url) = start_postgres().await;
     let client = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{port}");
-    let _server = wait_for_server_ready_async(child, &client, &base).await;
+    let (_server, base) = migrate_build_and_boot(&project, &database_url, &client).await;
 
     let response = client
         .get(format!("{base}/posts"))
@@ -1448,7 +1517,481 @@ async fn generated_scaffold_serves_posts_index_and_json_api() {
         .expect("GET /api/posts failed");
     assert_eq!(response.status(), 200, "GET /api/posts status");
     let body = response.text().await.expect("GET /api/posts body");
-    assert_eq!(body.trim(), "[]", "empty JSON index body");
+    let envelope: serde_json::Value =
+        serde_json::from_str(body.trim()).expect("GET /api/posts must return a JSON Page envelope");
+    let content = envelope["content"]
+        .as_array()
+        .expect("Page envelope must carry a content array");
+    assert!(content.is_empty(), "empty JSON index body: {body}");
+    assert_eq!(
+        envelope["total_elements"], 0,
+        "empty JSON index total_elements"
+    );
+}
+
+/// Give a freshly generated app a test-only session sign-in route.
+///
+/// A scaffold's `new`/`edit` forms and every mutating route are `#[secured]`,
+/// so an anonymous client is answered 401 and never reaches the validation path
+/// under test. `#[secured]` is satisfied by the configured auth session key
+/// (`auth.session_key`, default `user_id`) being present in the session, so
+/// this splices exactly one `#[public]` route into the generated `src/main.rs`
+/// that sets it — the smallest stand-in for `autumn generate auth`'s real
+/// sign-in flow, which is a separate generator with its own coverage.
+fn add_session_signin_stub(project: &Path) {
+    const HANDLER: &str = "\n// Test-only sign-in stub (see `add_session_signin_stub`).\n\
+                           #[get(\"/__signin\")]\n\
+                           #[public]\n\
+                           async fn signin_stub(session: autumn_web::session::Session) -> &'static str {\n    \
+                           session.insert(\"user_id\", \"1\").await;\n    \
+                           \"signed in\"\n\
+                           }\n\n\
+                           #[autumn_web::main]\n";
+
+    let main_rs = project.join("src/main.rs");
+    let source = fs::read_to_string(&main_rs).expect("read generated src/main.rs");
+
+    assert_eq!(
+        source.matches("\n#[autumn_web::main]\n").count(),
+        1,
+        "expected exactly one `#[autumn_web::main]` in the generated src/main.rs"
+    );
+    let patched = source.replacen("\n#[autumn_web::main]\n", HANDLER, 1);
+
+    assert_eq!(
+        patched.matches("routes![index,").count(),
+        1,
+        "expected the generated `routes![index, …]` list in src/main.rs"
+    );
+    let patched = patched.replacen("routes![index,", "routes![signin_stub, index,", 1);
+
+    fs::write(&main_rs, patched).expect("write patched src/main.rs");
+}
+
+/// Slice the rendered `<input …>` tag whose `name="…"` attribute matches
+/// `name`, so a field-scoped attribute assertion can never accidentally match a
+/// sibling control. `name="…"` appears only on the control itself — the
+/// `<label>` uses `for=`, and the inline-error `<div>` uses `id="…-error"` — so
+/// the match is unambiguous.
+fn input_tag<'a>(html: &'a str, name: &str) -> &'a str {
+    let needle = format!("name=\"{name}\"");
+    let at = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no control named `{name}` in the rendered form:\n{html}"));
+    let start = html[..at]
+        .rfind('<')
+        .unwrap_or_else(|| panic!("control `{name}` has no opening tag:\n{html}"));
+    let end = html[start..]
+        .find('>')
+        .map_or(html.len(), |rel| start + rel + 1);
+    &html[start..end]
+}
+
+/// Every `<input type="hidden" name=… value=…>` inside the `<form>` whose
+/// `action` matches, as name/value pairs ready to re-submit.
+///
+/// Collected wholesale rather than named one at a time so the POST legs below
+/// carry whatever the framework's own form rendering decided to inject — today
+/// the one-time `_submit_token`, and the `_csrf` field whenever the CSRF layer
+/// is active — instead of hard-coding a list that silently rots. Scoped to the
+/// resource's own form so the layout's consent-banner form can't leak in.
+fn hidden_form_fields(html: &str, action: &str) -> Vec<(String, String)> {
+    let marker = format!("action=\"{action}\"");
+    let at = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no <form {marker}> in:\n{html}"));
+    let start = html[..at].rfind('<').expect("form opening tag");
+    let end = html[start..]
+        .find("</form>")
+        .map_or(html.len(), |rel| start + rel);
+    let form = &html[start..end];
+
+    // Matched as "an `<input>` tag that carries `type=\"hidden\"`" rather than
+    // the literal prefix `<input type="hidden"`: attribute ORDER is a maud
+    // rendering detail, and a helper that ever emitted `name` first would
+    // otherwise drop its field here silently — the POST would then fail CSRF /
+    // submit-token checks and surface as a baffling 403 instead of the 422 the
+    // leg is actually asserting.
+    let mut fields = Vec::new();
+    let mut rest = form;
+    while let Some(at) = rest.find("<input") {
+        let tag_end = rest[at..].find('>').map_or(rest.len(), |rel| at + rel + 1);
+        let tag = &rest[at..tag_end];
+        if tag.contains("type=\"hidden\"")
+            && let (Some(name), Some(value)) = (attr_value(tag, "name"), attr_value(tag, "value"))
+        {
+            fields.push((name, value));
+        }
+        rest = &rest[tag_end..];
+    }
+    assert!(
+        !fields.is_empty(),
+        "the create form must carry at least the one-time submit token:\n{form}"
+    );
+    fields
+}
+
+/// The value of `attr` on a single rendered tag, un-escaping the entities maud
+/// emits inside an attribute value.
+fn attr_value(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let at = tag.find(&needle)? + needle.len();
+    let end = at + tag[at..].find('"')?;
+    Some(
+        tag[at..end]
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Fetch `GET {base}/posts/new` and return the rendered create form plus the
+/// hidden fields a subsequent `POST /posts` must echo back.
+///
+/// Re-fetched before every POST leg: the submit token is one-time, so a stale
+/// pair would be rejected before the validation path under test is reached.
+async fn fetch_new_post_form(
+    client: &reqwest::Client,
+    base: &str,
+) -> (String, Vec<(String, String)>) {
+    let response = client
+        .get(format!("{base}/posts/new"))
+        .send()
+        .await
+        .expect("GET /posts/new failed");
+    assert_eq!(response.status(), 200, "GET /posts/new status");
+    let html = response.text().await.expect("GET /posts/new body");
+    let hidden = hidden_form_fields(&html, "/posts");
+    (html, hidden)
+}
+
+/// `POST /posts` carrying the form's own hidden fields plus the submitted
+/// columns, returning `(status, body)`.
+async fn submit_post(
+    client: &reqwest::Client,
+    base: &str,
+    hidden: &[(String, String)],
+    columns: &[(&str, &str)],
+) -> (u16, String) {
+    let mut form: Vec<(String, String)> = hidden.to_vec();
+    form.extend(
+        columns
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+    );
+    let response = client
+        .post(format!("{base}/posts"))
+        .form(&form)
+        .send()
+        .await
+        .expect("POST /posts failed");
+    let status = response.status().as_u16();
+    let body = response.text().await.expect("POST /posts body");
+    (status, body)
+}
+
+/// `GET /api/posts` -> the `total_elements` count of the generated JSON index.
+async fn stored_post_count(client: &reqwest::Client, base: &str) -> u64 {
+    let response = client
+        .get(format!("{base}/api/posts"))
+        .send()
+        .await
+        .expect("GET /api/posts failed");
+    assert_eq!(response.status(), 200, "GET /api/posts status");
+    let body = response.text().await.expect("GET /api/posts body");
+    let envelope: serde_json::Value =
+        serde_json::from_str(body.trim()).expect("GET /api/posts must return a JSON Page envelope");
+    envelope["total_elements"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("Page envelope must carry total_elements:\n{body}"))
+}
+
+/// Assert the rendered `Post` form carries the HTML5 constraints its DSL
+/// modifiers declared (issue #1388 AC3/AC4/AC6), and that the pre-existing
+/// `required` (derived from non-nullability) survives alongside them rather
+/// than being displaced by them.
+///
+/// Shared by the initial `GET /posts/new` render and the 422 re-render, so a
+/// field that sheds its client-side guards on the way back from a rejection is
+/// caught as readily as one that never had them.
+fn assert_constrained_controls_render_html5(html: &str) {
+    // The BOOLEAN `required` attribute, not the `aria-required="true"` that sits
+    // beside it: `contains("required")` would be satisfied by the ARIA hint
+    // alone, so a regression that dropped the browser-enforced attribute while
+    // keeping the screen-reader one would sail through. `required` is rendered
+    // last on the tag (`autumn_web::a11y::TextField`), so the closing angle
+    // bracket pins it.
+    const REQUIRED: &str = " required>";
+
+    let title = input_tag(html, "title");
+    for attr in ["minlength=\"3\"", "maxlength=\"120\"", REQUIRED] {
+        assert!(
+            title.contains(attr),
+            "`title` input must carry `{attr}` (issue #1388 AC4): {title}"
+        );
+    }
+    let contact = input_tag(html, "contact");
+    for attr in ["type=\"email\"", REQUIRED] {
+        assert!(
+            contact.contains(attr),
+            "`contact` input must carry `{attr}` (issue #1388 AC4): {contact}"
+        );
+    }
+    let homepage = input_tag(html, "homepage");
+    for attr in ["type=\"url\"", REQUIRED] {
+        assert!(
+            homepage.contains(attr),
+            "`homepage` input must carry `{attr}` (issue #1388 AC3): {homepage}"
+        );
+    }
+    let age = input_tag(html, "age");
+    for attr in ["type=\"number\"", "min=\"0\"", "max=\"130\"", REQUIRED] {
+        assert!(
+            age.contains(attr),
+            "`age` input must carry `{attr}` (issue #1388 AC6): {age}"
+        );
+    }
+}
+
+/// Assert the 422 re-render carries an inline, `role="alert"` error block for
+/// `field` specifically.
+///
+/// Scoped to the field's own `id="{field}-error"` container rather than checking
+/// `role="alert"` anywhere on the page: a sibling field's error block (or a
+/// flash region) would otherwise satisfy a document-wide search, so the
+/// assertion would keep passing after the alert role was dropped from the very
+/// element a screen reader needs it on.
+fn assert_inline_field_error(html: &str, field: &str) {
+    let marker = format!("id=\"{field}-error\"");
+    let at = html
+        .find(&marker)
+        .unwrap_or_else(|| panic!("the 422 must re-render an inline error for `{field}`:\n{html}"));
+    let start = html[..at].rfind('<').expect("error element opening tag");
+    let end = html[start..]
+        .find('>')
+        .map_or(html.len(), |rel| start + rel + 1);
+    let tag = &html[start..end];
+    assert!(
+        tag.contains("role=\"alert\""),
+        "`{field}`'s inline error must be announced with role=\"alert\": {tag}"
+    );
+}
+
+/// A booted, signed-in generated app under test, with everything that must
+/// outlive the assertions held alive.
+///
+/// Field order IS the teardown order (struct fields drop in declaration order):
+/// the server dies before the Postgres container it talks to, which dies before
+/// the tempdir holding the project it was built from.
+struct LiveApp {
+    _server: ServerGuard,
+    _postgres: testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
+    _tmp: tempfile::TempDir,
+    client: reqwest::Client,
+    base: String,
+}
+
+/// Scaffold a `Post` whose columns carry the full issue #1388 constraint mix,
+/// boot it against a real Postgres, and sign in — the shared setup for the
+/// runtime round-trip below.
+async fn boot_constrained_post_app() -> LiveApp {
+    let (tmp, project) = fresh_project("scaffold-constraints-live");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String{min=3,max=120}",
+            "contact:String{email}",
+            "homepage:String{url}",
+            "age:i32{min=0,max=130}",
+        ],
+    );
+    add_session_signin_stub(&project);
+
+    let (postgres, database_url) = start_postgres().await;
+
+    // A cookie jar carries the session the `#[secured]` form routes need (and
+    // the CSRF cookie whenever that layer is active); redirects are NOT
+    // followed, so the create handler's 303-vs-422 answer is observable
+    // directly rather than through whatever it redirects to. The per-request
+    // timeout keeps a wedged handler failing the test instead of hanging the CI
+    // job until the runner's own deadline.
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build reqwest client");
+    let (server, base) = migrate_build_and_boot(&project, &database_url, &client).await;
+
+    // The sign-in stub must be load-bearing: assert the form route really is
+    // `#[secured]` FIRST. Without this, a regression that made the scaffold's
+    // whole write surface public would leave every assertion below green, and
+    // the stub would quietly become dead weight.
+    let anonymous = client
+        .get(format!("{base}/posts/new"))
+        .send()
+        .await
+        .expect("anonymous GET /posts/new failed");
+    assert_eq!(
+        anonymous.status(),
+        401,
+        "the scaffold's create form must be `#[secured]`"
+    );
+
+    let signin = client
+        .get(format!("{base}/__signin"))
+        .send()
+        .await
+        .expect("GET /__signin failed");
+    assert_eq!(signin.status(), 200, "test sign-in stub must succeed");
+
+    LiveApp {
+        _server: server,
+        _postgres: postgres,
+        _tmp: tmp,
+        client,
+        base,
+    }
+}
+
+/// Issue #1388 AC4/AC6, proven at RUNTIME rather than by string-matching the
+/// generated source: scaffold a resource whose fields carry `{…}` constraint
+/// modifiers, migrate it against a real Postgres, boot the generated server,
+/// and drive the actual HTTP surface.
+///
+/// Every other test for the `{…}` block asserts on generated *text* — that the
+/// model carries `#[validate(length(min = 3, max = 120))]`, that the routes
+/// module builds an `a11y::TextField` with `.minlength(3u32)`. None of them
+/// proves the fan-out actually *works*: that the emitted `#[validate]` rules
+/// reach the `Validated`/changeset path and answer **422** (never a 500, never
+/// a silent store), that the emitted builder calls render the promised HTML5
+/// attributes into the browser's markup, or that a valid submission still gets
+/// through. This is the acceptance criterion's "scaffold-to-runtime round-trip
+/// test", end to end:
+///
+/// * `GET /posts/new` renders `title` with `minlength="3" maxlength="120"
+///   required`, `contact` as `type="email"`, and `age` as `type="number"
+///   min="0" max="130"` — AC3, AC4's client half, AC6's typed-input half;
+/// * an empty `title` and a malformed `contact` are rejected **server-side**
+///   with a 422 whose body re-renders the form with inline `role="alert"`
+///   errors and the submitted input preserved — AC2, AC4's server half, and
+///   composition with the #1124 error re-render;
+/// * an out-of-range `age` surfaces its `range` rejection inline the same way
+///   — AC6's server half;
+/// * neither rejected submission stores a row — the Success Metric's "zero
+///   successful inserts of an empty title or a malformed email";
+/// * a valid submission still redirects (303) and persists, so the constraints
+///   reject bad input without blocking good input.
+///
+/// `age:i32{min=0,max=130}` is scaffolded alongside the acceptance criterion's
+/// own `title`/`contact` pair (rather than in a second test) deliberately: it
+/// is the issue's own AC1/AC6 numeric example, and booting a freshly compiled
+/// app is the expensive part — one boot covers both halves. The extra column
+/// changes nothing about the `title`/`contact` assertions.
+///
+/// Ignored by default; requires Docker and `diesel` CLI on PATH. Run with:
+/// `cargo test -p autumn-cli --test generate generated_constrained_scaffold_enforces_validation_end_to_end -- --ignored --exact`
+#[tokio::test]
+#[ignore = "slow: starts Postgres, runs diesel migrations, builds and boots a constrained scaffold"]
+async fn generated_constrained_scaffold_enforces_validation_end_to_end() {
+    let app = boot_constrained_post_app().await;
+    let (client, base) = (&app.client, app.base.as_str());
+
+    // ── AC3/AC4 (client half) + AC6: the rendered form carries the HTML5
+    // attributes the DSL declared, and the pre-existing `required` (from
+    // non-null) survives alongside them. ────────────────────────────────────
+    let (form_html, hidden) = fetch_new_post_form(client, base).await;
+    assert_constrained_controls_render_html5(&form_html);
+
+    // ── AC2/AC4 (server half): an empty title and a malformed email are
+    // rejected with a 422 that re-renders inline errors and preserves input —
+    // not a 500, not a redirect, not a silent store. ────────────────────────
+    let (status, body) = submit_post(
+        client,
+        base,
+        &hidden,
+        &[
+            ("title", ""),
+            ("contact", "not-an-email"),
+            ("homepage", "not-a-url"),
+            ("age", "42"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 422,
+        "an empty title + malformed email must be a 422, never a 500 or a redirect:\n{body}"
+    );
+    for field in ["title", "contact", "homepage"] {
+        assert_inline_field_error(&body, field);
+    }
+    assert!(
+        input_tag(&body, "contact").contains("value=\"not-an-email\""),
+        "the 422 must preserve the submitted input (issue #1124):\n{body}"
+    );
+    // The constraints still render on the re-rendered form, so a corrected
+    // resubmit keeps its client-side guards.
+    assert_constrained_controls_render_html5(&body);
+
+    // ── AC6 (server half): a numeric `range` rejection surfaces inline the
+    // same way. ─────────────────────────────────────────────────────────────
+    let (_, hidden) = fetch_new_post_form(client, base).await;
+    let (status, body) = submit_post(
+        client,
+        base,
+        &hidden,
+        &[
+            ("title", "A valid title"),
+            ("contact", "author@example.com"),
+            ("homepage", "https://example.com"),
+            ("age", "999"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 422,
+        "an out-of-range `age` must be a 422 (issue #1388 AC6):\n{body}"
+    );
+    assert_inline_field_error(&body, "age");
+
+    // ── Success Metric: neither rejected submission stored a row. ───────────
+    assert_eq!(
+        stored_post_count(client, base).await,
+        0,
+        "a rejected submission must never be stored"
+    );
+
+    // ── And the constraints reject bad input without blocking good input: a
+    // valid submission still redirects (303) and persists. ──────────────────
+    let (_, hidden) = fetch_new_post_form(client, base).await;
+    let (status, body) = submit_post(
+        client,
+        base,
+        &hidden,
+        &[
+            ("title", "A valid title"),
+            ("contact", "author@example.com"),
+            ("homepage", "https://example.com"),
+            ("age", "42"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 303,
+        "a valid submission must redirect, not re-render:\n{body}"
+    );
+    assert_eq!(
+        stored_post_count(client, base).await,
+        1,
+        "the valid submission must persist"
+    );
 }
 
 #[test]
@@ -1504,6 +2047,109 @@ fn generate_model_help_shows_example() {
     assert!(stdout.contains("autumn generate model Post"));
     assert!(stdout.contains("--dry-run"));
     assert!(stdout.contains("--force"));
+}
+
+/// The `SQLite` counterpart of [`generated_scaffold_cargo_checks`], and the only
+/// machine proof of issue #1924: a `SQLite`-configured app scaffolded with every
+/// field kind that needed a `SQLite` conversion — `Uuid`, `Option<Uuid>`,
+/// `decimal{p,s}`, `enum{…}`, `DateTime<Utc>`, `Attachment`, `json` — actually
+/// compiles.
+///
+/// Two halves have to be right for this to pass, and neither is visible to a
+/// unit test over the emitted strings:
+///
+/// 1. The dependency set. A `SQLite` app's `Cargo.toml` must carry diesel on its
+///    `sqlite` feature, the bundled `libsqlite3-sys`, and `autumn-web/sqlite` —
+///    and must NOT carry `pq-sys`.
+/// 2. The Rust types. `Uuid` and `decimal` render
+///    `autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}`, and the
+///    generated `enum` carries `Text`/`Sqlite` (not `Pg`) conversions.
+///
+/// `cargo check`, not `--all-targets`: the scaffold's `tests/<model>.rs` smoke
+/// test still uses `autumn_web::test::TestDb`, a Postgres-only testcontainer.
+/// A `SQLite` `TestDb` lands with the runtime slice (#1905) — see
+/// `docs/guide/sqlite-in-production.md`.
+///
+/// Ignored by default; run with:
+/// `cargo test -p autumn-cli --test generate generated_sqlite_scaffold_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_sqlite_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("sqlite-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    // Point the app at SQLite BEFORE generating: the generator resolves the
+    // backend from this file.
+    fs::write(
+        project.join("autumn.toml"),
+        "[database]\nprimary_url = \"sqlite://./app.db\"\n",
+    )
+    .unwrap();
+
+    // `run_autumn_with_env`, not `run_autumn`: backend detection gives the
+    // environment precedence over `autumn.toml`, so a developer running this
+    // with `DATABASE_URL=postgres://…` exported would silently get Postgres
+    // output and an opaque assertion failure below. Pinning both spellings to
+    // the same SQLite URL makes the run independent of the ambient shell.
+    run_autumn_with_env(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Widget",
+            "name:String",
+            "token:Uuid",
+            "owner:Option<Uuid>",
+            "price:decimal{10,2}",
+            "balance:Option<decimal>",
+            "status:enum{draft,published}",
+            "mood:Option<enum{happy,sad}>",
+            "at:DateTime",
+            "seen_at:Option<NaiveDateTime>",
+            "payload:json",
+            "cover:Attachment",
+        ],
+        &[
+            ("DATABASE_URL", "sqlite://./app.db"),
+            ("AUTUMN_DATABASE__URL", "sqlite://./app.db"),
+        ],
+    );
+
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("libsqlite3-sys"),
+        "SQLite app must link the bundled SQLite amalgamation:\n{cargo}"
+    );
+    assert!(
+        !cargo.contains("pq-sys"),
+        "SQLite app must not link libpq:\n{cargo}"
+    );
+
+    let model = fs::read_to_string(project.join("src/models/widget.rs")).unwrap();
+    assert!(
+        model.contains("autumn_web::db::sqlite_types::SqliteUuid"),
+        "Uuid must render the SQLite newtype:\n{model}"
+    );
+    assert!(
+        model.contains("autumn_web::db::sqlite_types::SqliteDecimal"),
+        "decimal must render the SQLite newtype:\n{model}"
+    );
+    assert!(
+        !model.contains("diesel::pg::Pg"),
+        "the generated enum must carry Sqlite, not Pg, conversions:\n{model}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo check");
+    assert!(
+        check.status.success(),
+        "cargo check failed on the generated SQLite scaffold:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
 }
 
 /// Slow end-to-end check: scaffold a fresh project, run `autumn generate
@@ -1610,6 +2256,541 @@ fn generated_scaffold_cargo_checks() {
     assert!(
         check.status.success(),
         "cargo check on generated scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1323: a `--belongs-to` scaffold compiles against the real framework
+/// AND its generated nested write-path test passes.
+///
+/// This is the only machine proof that the nested surface type-checks: the
+/// nested handlers, the shared `children_section` helper, the `exclude_parent_fk`
+/// form flag, the `paths::nested_index`/`nested_create` helpers, AND — critically
+/// — the *injected* edit to the parent's already-generated `show` handler, which
+/// is a textual patch to a file this invocation does not own. A `cargo check`
+/// here is what catches that patch going stale if the flat `show` template ever
+/// changes shape.
+///
+/// The generated nested test needs no database (its rows are in-process), so it
+/// is run for real rather than just compiled.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_nested_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("nested-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Comment",
+            "body:Text",
+            "post:references",
+            "--belongs-to",
+            "Post",
+        ],
+    );
+
+    let child = fs::read_to_string(project.join("src/routes/comments.rs")).unwrap();
+    assert!(
+        child.contains("#[get(\"/posts/{post_id}/comments\", name = \"nested_index\")]"),
+        "missing the nested read route:\n{child}"
+    );
+    assert!(
+        child.contains("#[post(\"/posts/{post_id}/comments\", name = \"nested_create\")]"),
+        "missing the nested create route:\n{child}"
+    );
+    let parent = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        parent.contains("crate::routes::comments::children_section("),
+        "the parent show must render its children:\n{parent}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on the nested scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+
+    // AC7: create child under parent -> appears in that parent's list -> does
+    // NOT appear under a different parent. DB-free, so run it here.
+    let output = Command::new("cargo")
+        .args(["test", "--test", "comment", "comments_nested_under_parent"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the generated nested write-path test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test result: ok"),
+        "expected the generated nested test to pass:\n{stdout}"
+    );
+}
+
+/// Issue #2431: `--belongs-to <Parent> --counter-cache` must produce a child
+/// model that actually compiles. Before this fix, `add_counter_cache_to_model_source`
+/// inserted the generated `#[belongs_to(Post, counter_cache)]` attribute ABOVE
+/// `#[autumn_web::model]` instead of below it — `#[belongs_to]` is a helper
+/// attribute only `#[model]`'s own expansion understands, so rustc rejected it
+/// outright with `cannot find attribute belongs_to in this scope` on every
+/// first-time use of the documented, only invocation of this flag. No prior
+/// test ever ran `cargo check` on a `--counter-cache` scaffold (the unit test
+/// covering the rewrite only asserted the attribute's text was present, not
+/// its position), so this compile break shipped invisibly.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_counter_cache_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("counter-cache-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "body:Text"],
+    );
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Comment",
+            "post:references",
+            "body:Text",
+            "--belongs-to",
+            "Post",
+            "--counter-cache",
+        ],
+    );
+
+    // The generated attribute must sit below `#[autumn_web::model]`, not
+    // above it — this is the assertion the pre-fix unit test was missing.
+    let model = fs::read_to_string(project.join("src/models/comment.rs")).unwrap();
+    let model_pos = model
+        .find("#[autumn_web::model]")
+        .expect("model attribute present");
+    let belongs_to_pos = model
+        .find("#[belongs_to(Post, counter_cache)]")
+        .expect("belongs_to attribute present");
+    assert!(
+        model_pos < belongs_to_pos,
+        "#[belongs_to] must be emitted below #[autumn_web::model]:\n{model}"
+    );
+
+    // The parent-side warning names the two lines the scaffold cannot own
+    // (schema.rs + the model struct) — paste them in by hand before `cargo
+    // check`, matching what a real user following the warning would do.
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    let patched_schema = schema.replacen(
+        "posts (id) {",
+        "posts (id) {\n        comment_count -> Int8,",
+        1,
+    );
+    assert_ne!(schema, patched_schema, "expected to find the posts table");
+    fs::write(project.join("src/schema.rs"), patched_schema).unwrap();
+
+    let post_model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    let patched_post_model = post_model.replacen(
+        "pub struct Post {",
+        "pub struct Post {\n    #[default]\n    pub comment_count: i64,",
+        1,
+    );
+    assert_ne!(post_model, patched_post_model, "expected the Post struct");
+    fs::write(project.join("src/models/post.rs"), patched_post_model).unwrap();
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on the --counter-cache scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1125: a scaffold WITH an owner column generates a record-level
+/// `Policy`/`Scope`, authorizes the mutating HTML handlers, scopes the index,
+/// and emits a cross-user 403 smoke test. `cargo check --tests` proves the
+/// whole thing (policy file, authorize wiring, scoped index, cross-user test)
+/// type-checks against the real framework; the generated cross-user test needs
+/// no database, so we also run it directly to prove the 403 semantics hold end
+/// to end.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one compile gate covering the policy scaffold plus the two CSV \
+              surfaces that ride on it; each block is a separate assertion set"
+)]
+fn generated_policy_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("policy-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "author_id:i64",
+            // Issue #1393: the CSV import surface rides along on this scaffold
+            // rather than a fourth compile gate of its own. This is the
+            // owner-scoped shape, so it also puts the import's `authorize_create`
+            // call, its `Multipart` extractor, and the `save_many_skip_invalid`
+            // write through a real `cargo check --tests` — and the generated
+            // import test is run below.
+            "--import",
+        ],
+    );
+
+    // The generated policy, its registration, and the authorize wiring exist.
+    let policy = fs::read_to_string(project.join("src/policies/post.rs")).unwrap();
+    assert!(
+        policy.contains("impl Policy<Post> for PostPolicy"),
+        "policy file must define PostPolicy:\n{policy}"
+    );
+    assert!(
+        policy.contains("Some(post.author_id)"),
+        "owner check must use author_id:\n{policy}"
+    );
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains(".policy::<crate::models::post::Post, _>"),
+        "main.rs must register the policy:\n{main_rs}"
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize::<Post>"),
+        "routes must authorize mutating handlers:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated policy scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+
+    // The cross-user 403 test needs no database — run it and prove it passes.
+    let cross_user = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_cross_user_mutations_are_forbidden",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        cross_user.status.success(),
+        "generated cross-user 403 test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&cross_user.stdout),
+        String::from_utf8_lossy(&cross_user.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&cross_user.stdout).contains("test result: ok"),
+        "expected the cross-user test to pass:\n{}",
+        String::from_utf8_lossy(&cross_user.stdout)
+    );
+
+    // Issue #1315: the generated CSV download test needs no database either.
+    // Running it here is the only place the repo proves the emitted test
+    // actually passes against the real `export_csv` + `Download` pair, rather
+    // than merely type-checking.
+    let export_csv = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_export_csv_downloads_a_spreadsheet",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        export_csv.status.success(),
+        "generated CSV export test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&export_csv.stdout),
+        String::from_utf8_lossy(&export_csv.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&export_csv.stdout).contains("1 passed"),
+        "expected the CSV export test to run and pass:\n{}",
+        String::from_utf8_lossy(&export_csv.stdout)
+    );
+
+    // Issue #1393: the same for the import. This is the only place the repo
+    // proves the emitted import test really passes against the real `Multipart`
+    // extractor + `import_csv` + `ImportReport` — that a dry run writes nothing
+    // and a confirmed commit writes exactly the valid row — rather than merely
+    // type-checking.
+    let import_csv = Command::new("cargo")
+        .args([
+            "test",
+            "--test",
+            "post",
+            "posts_csv_import_previews_then_commits",
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        import_csv.status.success(),
+        "generated CSV import test failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&import_csv.stdout),
+        String::from_utf8_lossy(&import_csv.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&import_csv.stdout).contains("1 passed"),
+        "expected the CSV import test to run and pass:\n{}",
+        String::from_utf8_lossy(&import_csv.stdout)
+    );
+}
+
+/// Companion to [`generated_policy_scaffold_cargo_checks`] proving the
+/// *nullable* owner-column path compiles (PR #1831 review): a `user:references?`
+/// owner is `Option<i64>`, so the generated `can_update`/`can_delete` must
+/// compare it option-to-option (`ctx.user_id_i64() == post.user_id`) rather
+/// than wrapping it in `Some(...)` (which would compare `Option<i64>` to
+/// `Option<Option<i64>>` and fail to build), and the scope must still `.eq()`
+/// the nullable diesel column.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_nullable_owner_policy_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("policy-nullable-owner-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Note",
+            "title:String",
+            "body:Text",
+            "user:references?",
+        ],
+    );
+
+    let policy = fs::read_to_string(project.join("src/policies/note.rs")).unwrap();
+    assert!(
+        policy.contains("ctx.user_id_i64() == note.user_id"),
+        "nullable owner must compare option-to-option:\n{policy}"
+    );
+    assert!(
+        !policy.contains("Some(note.user_id)"),
+        "nullable owner must not wrap in Some(...):\n{policy}"
+    );
+    assert!(
+        policy.contains("notes::user_id.eq(owner_id)"),
+        "scope must filter on the nullable owner column:\n{policy}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated nullable-owner policy scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1830 companion to [`generated_policy_scaffold_cargo_checks`] for the
+/// `--live` variant: an owner column on a `--live` scaffold now record-authorizes
+/// the mutating handlers (loading the current row through the *repository*, not
+/// raw diesel) and owner-scopes the index while keeping the SSE `<ul>` island.
+/// `cargo check --tests` proves the repository-based authorize wiring compiles
+/// against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_live_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("live-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "--live",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize::<Post>"),
+        "live routes must authorize mutating handlers:\n{routes}"
+    );
+    assert!(
+        routes.contains("let current: Post = repo.find_by_id(*id).await?"),
+        "live variant must load the current row via the repository:\n{routes}"
+    );
+    assert!(
+        routes.contains("posts::author_id.eq(owner_id)"),
+        "live index must be owner-scoped:\n{routes}"
+    );
+    assert!(
+        routes.contains("sse-connect=(paths::events())"),
+        "live owner index must keep the SSE list contract:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated live-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1830 companion for the `--sharded` variant: an owner column on a
+/// `--sharded` scaffold record-authorizes the mutating handlers (loading the
+/// current row through a `from_shard` repository) and owner-scopes the index on
+/// the `ShardedDb` connection. `cargo check --tests` proves the sharded
+/// authorize wiring compiles against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_sharded_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("sharded-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "--sharded",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize::<Post>"),
+        "sharded routes must authorize mutating handlers:\n{routes}"
+    );
+    assert!(
+        routes.contains(
+            "let current: Post = PgPostRepository::from_shard(&db).find_by_id(*id).await?"
+        ),
+        "sharded variant must load the current row via from_shard:\n{routes}"
+    );
+    assert!(
+        routes.contains("posts::author_id.eq(owner_id)"),
+        "sharded index must be owner-scoped:\n{routes}"
+    );
+    assert!(
+        !routes.contains("mut db: Db"),
+        "sharded handlers must use ShardedDb, not a bare Db extractor:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated sharded-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1830 companion for the attachment variant: an owner column on an
+/// attachment scaffold record-authorizes the mutating handlers by REUSING the
+/// `state: State<AppState>` wrapper the multipart upload already threads
+/// (`&*state`) rather than injecting a second, conflicting `State` extractor —
+/// the exact case #1125 excluded. `cargo check --tests` proves the deref-based
+/// authorize wiring compiles against the real framework.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_attachment_owner_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("attachment-owner-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "author_id:i64",
+            "avatar:Attachment",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("autumn_web::authorization::authorize_create::<Post>(&*state, &session)"),
+        "attachment create must authorize_create via the reused &*state wrapper:\n{routes}"
+    );
+    assert!(
+        routes.contains(
+            "autumn_web::authorization::authorize::<Post>(&*state, &session, \"update\", &current)"
+        ),
+        "attachment update must authorize via &*state:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated attachment-owner scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
@@ -2114,8 +3295,14 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
 
     // The violation-branch re-render (spliced into `update`) preserves the
     // *submitted* edits by rebuilding the changeset from the decoded form via
-    // `Changeset::from_errors` — no stale `row` refetch (issue #1124).
-    let update_body = &routes[update_start..];
+    // `Changeset::from_errors` — no stale `row` refetch (issue #1124). Scope to
+    // the `update` handler only (the trailing `destroy` handler also loads its
+    // row for the authorize preamble).
+    let update_only = &routes[update_start..];
+    let destroy_off = update_only
+        .find("pub async fn destroy")
+        .expect("destroy handler after update");
+    let update_body = &update_only[..destroy_off];
     assert!(
         update_body.contains("Changeset::from_errors(changeset.into_inner(), errors)"),
         "got:\n{update_body}"
@@ -2126,9 +3313,20 @@ fn generate_scaffold_unique_field_update_violation_form_preserves_submitted_valu
         update_body.contains("user_form_for(&changeset"),
         "got:\n{update_body}"
     );
+    // Issue #1830: the mutating handlers now record-authorize the actor, which
+    // loads the target row ONCE up front (`.first(&mut *db)` → `authorize`). That
+    // load feeds the policy check, NOT the 422 re-render — the violation branch
+    // still rebuilds the changeset from the submitted `form`, never a refetched
+    // row. So the only row load in `update` is the authorize preamble.
+    assert_eq!(
+        update_body.matches(".first(&mut *db)").count(),
+        1,
+        "the update violation path must not re-fetch the row for its re-render; \
+         the only load is the authorize preamble; got:\n{update_body}"
+    );
     assert!(
-        !update_body.contains(".first(&mut *db)"),
-        "the update violation path must not re-fetch the row; got:\n{update_body}"
+        update_body.contains("authorize::<User>(&state, &session, \"update\", &current)"),
+        "the single row load must be the authorize preamble; got:\n{update_body}"
     );
 }
 
@@ -2569,6 +3767,61 @@ fn generate_scaffold_unique_attachment_field_is_skipped_in_smoke_test() {
     );
 }
 
+/// PR #1867 review (Finding 2): destroying the last attachment *model* must
+/// not strip `autumn-web/multipart` or `autumn-web/storage` from Cargo.toml
+/// when a hand-written route still uses those APIs — otherwise the project
+/// stops compiling. The `Revert::CargoAutumnWebFeature` bookkeeping alone
+/// would strip them (its `owner_dir` sibling check only sees the scaffold's
+/// own `src/models`), so `autumn_web_feature_markers` must retain them via a
+/// whole-project marker scan.
+#[test]
+fn destroy_attachment_scaffold_keeps_features_used_by_handwritten_route() {
+    let (_tmp, project) = fresh_project("destroy-attachment-features-app");
+
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Document", "file:Attachment"],
+    );
+
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo_before.contains("\"multipart\"") && cargo_before.contains("\"storage\""),
+        "attachment scaffold must enable multipart+storage, got:\n{cargo_before}"
+    );
+
+    // A hand-written route that uses both the multipart extractor and the
+    // blob store directly — unrelated to the scaffold's generated files. It
+    // imports through `use autumn_web::prelude::*;` and names `Multipart`
+    // UNQUALIFIED (the prelude re-exports it), the shape the earlier
+    // `extract::Multipart` marker would have missed — so destroy would have
+    // wrongly stripped `multipart`. The blob store stays a
+    // `autumn_web::storage::` path since the prelude re-exports no storage type.
+    fs::write(
+        project.join("src/routes/manual.rs"),
+        "use autumn_web::prelude::*;\n\n\
+         pub async fn manual_upload(\n    \
+         mut multipart: Multipart,\n    \
+         store: autumn_web::storage::BlobStoreState,\n\
+         ) {\n    let _ = (&mut multipart, &store);\n}\n",
+    )
+    .unwrap();
+
+    run_autumn(
+        &project,
+        &["destroy", "scaffold", "Document", "file:Attachment"],
+    );
+
+    let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo_after.contains("\"multipart\""),
+        "multipart must be retained while a hand-written route uses the Multipart extractor, got:\n{cargo_after}"
+    );
+    assert!(
+        cargo_after.contains("\"storage\""),
+        "storage must be retained while a hand-written route references autumn_web::storage::, got:\n{cargo_after}"
+    );
+}
+
 #[test]
 fn generate_scaffold_without_unique_field_omits_unique_constraints() {
     // A scaffold with NO unique fields emits no UNIQUE_CONSTRAINTS const, but
@@ -2579,9 +3832,11 @@ fn generate_scaffold_without_unique_field_omits_unique_constraints() {
 
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(!routes.contains("UNIQUE_CONSTRAINTS"), "got:\n{routes}");
+    // Issue #1830: no-owner scaffolds record-authorize their handlers too, so
+    // `State`/`Session` are threaded in before the last `body: Bytes` extractor.
     assert!(
         routes.contains(
-            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, mut db: Db, body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
+            "pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, \n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n    body: Bytes) -> AutumnResult<autumn_web::reexports::axum::response::Response>"
         ),
         "got:\n{routes}"
     );
@@ -2614,6 +3869,103 @@ fn generate_scaffold_help_documents_unique_field() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("unique"), "got:\n{stdout}");
     assert!(stdout.contains("--unique"), "got:\n{stdout}");
+}
+
+/// Issue #1340: the `{encrypted}` modifier must be discoverable from the help
+/// of the two subcommands that actually accept it. Documenting it only on the
+/// parent `autumn generate --help` is not enough — clap builds each
+/// subcommand's long help from its own doc block, and `model`/`scaffold` are
+/// what a user checking "how do I declare this field?" actually runs.
+#[test]
+fn generate_model_help_documents_the_encrypted_modifier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "model", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("{encrypted}"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("{encrypted:deterministic}"),
+        "got:\n{stdout}"
+    );
+    // The one manual step the generator cannot do for the user.
+    assert!(stdout.contains("autumn credentials edit"), "got:\n{stdout}");
+}
+
+#[test]
+fn generate_scaffold_help_documents_the_encrypted_modifier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "scaffold", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("{encrypted}"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("{encrypted:deterministic}"),
+        "got:\n{stdout}"
+    );
+    assert!(stdout.contains("autumn credentials edit"), "got:\n{stdout}");
+}
+
+/// The advertised examples must survive a copy-paste into bash/zsh: an
+/// unquoted `{…}` is brace-expanded by the shell before `autumn` ever sees it,
+/// so every `String{encrypted…}` token shown in help must be single-quoted.
+///
+/// Checked positionally rather than per-line, so it holds whichever way clap
+/// wraps the block (`verbatim_doc_comment` or reflowed) and for examples given
+/// inline in a paragraph as well as in an `Examples:` list.
+#[test]
+fn generate_help_encrypted_examples_are_shell_quoted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    for args in [
+        vec!["generate", "--help"],
+        vec!["generate", "model", "--help"],
+        vec!["generate", "scaffold", "--help"],
+    ] {
+        let label = args.join(" ");
+        let output = Command::new(autumn_bin)
+            .args(&args)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut checked = 0usize;
+        for (idx, _) in stdout.match_indices("String{encrypted") {
+            // Walk back to the start of the `name:String{encrypted…}` token.
+            let token_start = stdout[..idx]
+                .rfind(|c: char| c.is_whitespace())
+                .map_or(0, |i| i + 1);
+            // Only the runnable examples need quoting — a bare mention of the
+            // syntax in prose is wrapped in markdown backticks instead.
+            let is_example = stdout[..token_start].ends_with("autumn generate ")
+                || stdout[..token_start]
+                    .rsplit('\n')
+                    .next()
+                    .is_some_and(|line| line.contains("autumn generate "));
+            if !is_example {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                stdout[token_start..].starts_with('\''),
+                "`{label}` shows an unquoted example — bash/zsh would \
+                 brace-expand it before `autumn` sees it: {}",
+                &stdout[token_start
+                    ..stdout[token_start..]
+                        .find(char::is_whitespace)
+                        .map_or(stdout.len(), |i| token_start + i)]
+            );
+        }
+        // `generate --help` and both subcommands each advertise at least one.
+        assert!(checked > 0, "`{label}` shows no runnable encrypted example");
+    }
 }
 
 #[test]
@@ -2704,6 +4056,49 @@ fn generated_unique_scaffold_cargo_checks() {
     assert!(
         check.status.success(),
         "cargo check on generated unique scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check (issue #1260): scaffold a `slug` field and `cargo
+/// check` the result. The rekeyed `show`/`edit`/`update`/`delete` handlers
+/// (`Path<String>` instead of `Path<i64>`, `.filter(...)` instead of
+/// `.find(*id)`, the create-time collision-suffix loop) are hand-templated
+/// string codegen with no compiler feedback at generation time — this is the
+/// one test that actually compiles that generated code, catching any
+/// template/escaping/borrow mistake a string-content assertion alone would
+/// miss.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+// `"slug:slug{from:title}"` is a literal DSL token passed to the CLI, not a
+// format string — the `{…}` is the scaffold's own constraint-modifier syntax.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn generated_slug_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("slug-scaffold-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            r"slug:slug{from:title}",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated slug scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
@@ -2992,6 +4387,312 @@ fn generated_channel_smoke_test_passes() {
     );
 }
 
+// ── autumn generate webhook integration tests (issue #1366) ───────────────────
+
+#[test]
+fn generate_webhook_creates_all_expected_files() {
+    let (_tmp, project) = fresh_project("webhook-app");
+    let (stdout, stderr) = run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    assert!(
+        stdout.contains("Created") && stdout.contains("payments.rs"),
+        "output should list the created handler: {stdout}"
+    );
+
+    assert!(project.join("src/webhooks/payments.rs").is_file());
+    assert!(project.join("src/webhooks/mod.rs").is_file());
+
+    let handler = fs::read_to_string(project.join("src/webhooks/payments.rs")).unwrap();
+    assert!(
+        handler.contains("#[post(\"/webhooks/stripe\")]"),
+        "handler must own the provider route path:\n{handler}"
+    );
+    assert!(
+        handler.contains("webhook: SignedWebhook"),
+        "handler must take the shipped extractor:\n{handler}"
+    );
+    assert!(
+        handler.contains("webhook.event_type()")
+            && handler.contains("\"payment_intent.succeeded\""),
+        "handler must dispatch on the event type:\n{handler}"
+    );
+
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("mod webhooks;"), "got:\n{main_rs}");
+    assert!(
+        main_rs.contains("webhooks::payments::payments_webhook"),
+        "the route must be registered in routes![...]:\n{main_rs}"
+    );
+
+    let autumn_toml = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    assert!(
+        autumn_toml.contains("[[security.webhooks.endpoints]]"),
+        "got:\n{autumn_toml}"
+    );
+    assert!(
+        autumn_toml.contains("secret_env = \"STRIPE_WEBHOOK_SECRET\""),
+        "the endpoint must reference a secret env var, never an inline secret:\n{autumn_toml}"
+    );
+    assert!(
+        autumn_toml.contains("replay_protection = true"),
+        "replay protection must be on by default:\n{autumn_toml}"
+    );
+    // No CSRF/CAPTCHA exemption copies: the framework derives those from the
+    // endpoint block on every boot, so a literal copy would only go stale.
+    assert!(
+        !autumn_toml.contains("exempt_paths"),
+        "path exemptions are derived from the endpoint block, not copied:\n{autumn_toml}"
+    );
+
+    // The printed next steps name the secret env var, the dashboard target, and
+    // how to fire a test delivery — on stdout, not as warnings.
+    assert!(
+        stdout.contains("Next steps:") && stdout.contains("STRIPE_WEBHOOK_SECRET"),
+        "the secret env var must be part of the printed next steps:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("autumn webhook sim stripe"),
+        "the next steps should show how to fire a signed test delivery:\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("Warning:"),
+        "a clean run must not print warnings:\n{stderr}"
+    );
+}
+
+#[test]
+fn generate_webhook_supports_every_provider_preset() {
+    let (_tmp, project) = fresh_project("webhook-presets");
+    for (provider, name, snake) in [
+        ("stripe", "Payments", "payments"),
+        ("github", "Repo", "repo"),
+        ("slack", "Events", "events"),
+        ("generic", "Partner", "partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+        let handler = fs::read_to_string(project.join(format!("src/webhooks/{snake}.rs"))).unwrap();
+        assert!(
+            handler.contains(&format!("#[post(\"/webhooks/{provider}\")]")),
+            "{provider}: wrong route path:\n{handler}"
+        );
+    }
+    let autumn_toml = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    assert_eq!(
+        autumn_toml
+            .matches("[[security.webhooks.endpoints]]")
+            .count(),
+        4,
+        "each preset must add its own endpoint:\n{autumn_toml}"
+    );
+}
+
+#[test]
+fn generate_webhook_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("webhook-dry-run");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    let (stdout, _stderr) = run_autumn(
+        &project,
+        &["generate", "webhook", "stripe", "Payments", "--dry-run"],
+    );
+
+    assert!(stdout.contains("Dry run"), "got:\n{stdout}");
+    assert!(stdout.contains("Would create"), "got:\n{stdout}");
+    assert!(
+        !project.join("src/webhooks").exists(),
+        "--dry-run must not write any file"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "--dry-run must not touch autumn.toml"
+    );
+}
+
+#[test]
+fn generate_webhook_rejects_an_unknown_provider() {
+    let (_tmp, project) = fresh_project("webhook-bad-provider");
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["generate", "webhook", "twilio", "Sms"]);
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("twilio") && stderr.contains("generic"),
+        "got:\n{stderr}"
+    );
+    assert!(!project.join("src/webhooks").exists());
+}
+
+#[test]
+fn generate_webhook_rejects_hostile_path_and_secret_env_overrides() {
+    let (_tmp, project) = fresh_project("webhook-hostile-input");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+
+    // A quote would break out of the generated `#[post("…")]` attribute.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Payments",
+            "--path",
+            "/a\")]pub fn evil(){}//",
+        ],
+    );
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+
+    // A newline in --secret-env used to smuggle a whole endpoint block, with a
+    // plaintext secret and replay protection off, into autumn.toml.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Payments",
+            "--secret-env",
+            "X\n\n[[security.webhooks.endpoints]]\nname = \"evil\"\npath = \"/evil\"\nprovider = \"generic\"\nsecret = \"attacker-known\"\nreplay_protection = false\n# ",
+        ],
+    );
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("secret environment variable"),
+        "got:\n{stderr}"
+    );
+
+    assert!(!project.join("src/webhooks").exists());
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "a rejected invocation must not touch autumn.toml"
+    );
+}
+
+#[test]
+fn generate_webhook_rejects_a_second_endpoint_on_the_same_path() {
+    let (_tmp, project) = fresh_project("webhook-dup-path");
+    run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["generate", "webhook", "stripe", "Billing"]);
+    assert_eq!(code, Some(1), "got:\n{stderr}");
+    assert!(
+        stderr.contains("/webhooks/stripe") && stderr.contains("--path"),
+        "the duplicate-path error must suggest --path:\n{stderr}"
+    );
+
+    // …and the override succeeds.
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "webhook",
+            "stripe",
+            "Billing",
+            "--path",
+            "/webhooks/stripe-billing",
+        ],
+    );
+    let handler = fs::read_to_string(project.join("src/webhooks/billing.rs")).unwrap();
+    assert!(
+        handler.contains("#[post(\"/webhooks/stripe-billing\")]"),
+        "got:\n{handler}"
+    );
+}
+
+#[test]
+fn destroy_webhook_removes_the_generated_files_and_config() {
+    let (_tmp, project) = fresh_project("webhook-destroy");
+    let toml_before = fs::read_to_string(project.join("autumn.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    run_autumn(&project, &["generate", "webhook", "stripe", "Payments"]);
+    run_autumn(&project, &["destroy", "webhook", "stripe", "Payments"]);
+
+    assert!(
+        !project.join("src/webhooks").exists(),
+        "the handler module must be gone"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("autumn.toml")).unwrap(),
+        toml_before,
+        "autumn.toml must be restored exactly"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before,
+        "src/main.rs must be restored exactly"
+    );
+}
+
+/// Slow end-to-end check: scaffold a fresh project, generate every provider
+/// preset, and `cargo check --tests` it — the acceptance-criterion proof that
+/// generated webhook code compiles with no hand-editing.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_webhook_cargo_checks() {
+    let (_tmp, project) = fresh_project("webhook-build");
+    patch_generated_cargo_toml(&project);
+
+    for (provider, name) in [
+        ("stripe", "Payments"),
+        ("github", "Repo"),
+        ("slack", "Events"),
+        ("generic", "Partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+    }
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated webhooks failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check: actually RUN the generated webhook tests. This is the
+/// acceptance-criterion proof that a valid signature is accepted, a
+/// missing/invalid signature is rejected, and a replayed delivery is rejected —
+/// on first run, with no manual edits beyond the ones the issue allows.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: builds and runs a fresh project's test suite — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_webhook_tests_pass() {
+    let (_tmp, project) = fresh_project("webhook-smoke");
+    patch_generated_cargo_toml(&project);
+
+    for (provider, name) in [
+        ("stripe", "Payments"),
+        ("github", "Repo"),
+        ("slack", "Events"),
+        ("generic", "Partner"),
+    ] {
+        run_autumn(&project, &["generate", "webhook", provider, name]);
+    }
+
+    let test_run = Command::new("cargo")
+        .args(["test", "webhooks::"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&test_run.stdout);
+    assert!(
+        test_run.status.success(),
+        "generated webhook tests failed:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&test_run.stderr),
+    );
+    assert!(
+        stdout.contains("16 passed"),
+        "expected all four presets' four cases to pass; got:\n{stdout}"
+    );
+}
+
 // ── autumn generate auth integration tests ────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -3120,8 +4821,10 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
     );
     assert_eq!(
         routes.matches("session.insert(\"user_id\"").count(),
-        3,
-        "User auth routes should only write user_id as the generated account id key"
+        4,
+        "User auth routes should only write user_id as the generated account id key \
+         (login, reset_password, confirm_email, and the remember-me restore path \
+         establish_remember_login, which must set the same identity keys as a fresh login)"
     );
     assert!(
         routes.contains("email.split_once('@')"),
@@ -3130,6 +4833,28 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
     assert!(
         !routes.contains("email.find('@').unwrap()"),
         "signup email validation should not search for @ repeatedly"
+    );
+    // Issue #1353: auth views render through the app's shared `crate::layout`
+    // (nav/header/footer shell) rather than a private bare-DOCTYPE `fn layout`
+    // stub, and pending flashes are threaded to the layout's 3rd argument via
+    // the accessible `flash_messages()` helper (not the old `flash.render()`).
+    assert!(
+        !routes.contains("fn layout(title: &str, content: Markup)"),
+        "the private 2-arg layout stub must be removed"
+    );
+    assert!(
+        routes.contains("crate::layout("),
+        "auth views must render through crate::layout"
+    );
+    assert!(
+        routes.contains(
+            "crate::layout(\"Log In\", \"/login\", flash_messages(&flash.consume().await),"
+        ),
+        "login must render through crate::layout with /login + flash"
+    );
+    assert!(
+        !routes.contains("flash.render().await"),
+        "auth views must not use the old in-content flash.render() path"
     );
 
     // routes/mod.rs
@@ -3437,6 +5162,114 @@ fn generated_auth_passkeys_cargo_checks() {
     assert!(
         check.status.success(),
         "cargo check on generated --passkeys auth failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+// ── autumn generate auth --magic-link (issue #1328) ───────────────────────────
+
+#[test]
+fn generate_auth_magic_link_creates_expected_files() {
+    let (_tmp, project) = fresh_project("auth-magic-link-app");
+    run_autumn(&project, &["generate", "auth", "User", "--magic-link"]);
+
+    // Migration: dedicated magic_link_tokens table with single-use marker.
+    let up = fs::read_to_string(
+        fs::read_dir(project.join("migrations"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+            .unwrap()
+            .path()
+            .join("up.sql"),
+    )
+    .unwrap();
+    assert!(up.contains("CREATE TABLE magic_link_tokens"));
+    assert!(up.contains("token_digest TEXT NOT NULL UNIQUE"));
+    assert!(up.contains("consumed_at TIMESTAMP NULL"));
+
+    // Model file + module declaration.
+    assert!(project.join("src/models/magic_link_token.rs").exists());
+    let mod_rs = fs::read_to_string(project.join("src/models/mod.rs")).unwrap();
+    assert!(mod_rs.contains("pub mod magic_link_token;"));
+
+    // Routes: request/email/verify handlers + throttle.
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    for needle in [
+        "#[get(\"/login/magic\")]",
+        "#[post(\"/login/magic\")]",
+        "#[get(\"/login/magic/verify\")]",
+        "#[throttle(",
+        "pub async fn magic_link_verify",
+        "async fn send_magic_link_email",
+    ] {
+        assert!(routes.contains(needle), "routes/auth.rs missing: {needle}");
+    }
+
+    // Routes registered in main.rs.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("routes::auth::magic_link_verify"));
+
+    // Docs document the flow.
+    let docs = fs::read_to_string(project.join("docs/guide/authentication.md")).unwrap();
+    assert!(docs.contains("Passwordless Magic-Link Login"));
+}
+
+#[test]
+fn generate_auth_without_magic_link_emits_no_magic_link_artifacts() {
+    let (_tmp, project) = fresh_project("auth-no-magic-link-app");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    assert!(!project.join("src/models/magic_link_token.rs").exists());
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    assert!(!routes.contains("/login/magic"));
+}
+
+/// Slow: scaffold `generate auth --magic-link` and `cargo check --tests` the
+/// result against the local `autumn-web` crate, proving the generated
+/// magic-link app and its test suite type-check with zero edits (issue #1328).
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_auth_magic_link_cargo_checks() {
+    let (_tmp, project) = fresh_project("auth-magic-link-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(&project, &["generate", "auth", "User", "--magic-link"]);
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated --magic-link auth failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow: prove `--magic-link` composes with `--totp` in a single generated app
+/// that still type-checks (issue #1328 composability AC1).
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_auth_magic_link_with_totp_cargo_checks() {
+    let (_tmp, project) = fresh_project("auth-magic-totp-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &["generate", "auth", "User", "--totp", "--magic-link"],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated --totp --magic-link auth failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
     );
@@ -3802,19 +5635,31 @@ fn generate_scaffold_index_uses_paginated_repo_method() {
         routes.contains("pagination_nav") || routes.contains("pagination"),
         "scaffold index must render a pagination nav partial: {routes}"
     );
+    // Since #1126 the default (non-live) index calls the paginated, sort/filter
+    // `list(&ListQuery, &PageRequest)` method instead of the bare `page()`;
+    // either paginated repository method satisfies issue #681 (both take a
+    // `PageRequest` and return a `Page`, never loading every row).
     assert!(
-        routes.contains(".page("),
-        "scaffold index must call the repository page() method: {routes}"
+        routes.contains(".page(") || routes.contains(".list("),
+        "scaffold index must call a paginated repository method (page()/list()): {routes}"
     );
+    // Scoped to the `index` handler body: since issue #1312 the module also
+    // emits a `bulk_delete` handler whose SELECT is bounded by the submitted id
+    // list (`WHERE id = ANY($1)`), which is not an unpaginated index load.
+    let index = routes
+        .split_once("pub async fn index(")
+        .expect("scaffold must emit an index handler")
+        .1;
+    let index = index.split("pub async fn ").next().unwrap_or(index);
     assert!(
-        !routes.contains(".load(&mut *db)"),
-        "scaffold index must not load every row without pagination: {routes}"
+        !index.contains(".load(&mut *db)"),
+        "scaffold index must not load every row without pagination: {index}"
     );
-    // The repository trait must be imported so `repo.page()` (a trait method)
-    // resolves at compile time — without it the generated code fails with E0599.
+    // The repository trait must be imported so `repo.list()`/`repo.page()` (trait
+    // methods) resolve at compile time — without it the generated code fails with E0599.
     assert!(
         routes.contains("PostRepository"),
-        "scaffold routes must import the PostRepository trait (needed to call repo.page()): {routes}"
+        "scaffold routes must import the PostRepository trait (needed to call repo.list()): {routes}"
     );
 }
 
@@ -4036,6 +5881,214 @@ fn generate_mailer_preview_registry_wired_into_main() {
     assert!(
         main.contains("mailers::welcome::WelcomeMailer"),
         "preview registry must reference the generated mailer type"
+    );
+}
+
+// ── autumn generate teams (issue #1261) ────────────────────────────────────
+
+#[test]
+fn generate_teams_emits_organization_membership_invitation_models() {
+    let (_tmp, project) = fresh_project("teams-app");
+    let (stdout, _stderr) = run_autumn(&project, &["generate", "teams"]);
+    assert!(
+        stdout.contains("Created") || stdout.contains("teams"),
+        "output should mention created files: {stdout}"
+    );
+
+    // Models: Organization, Membership, Invitation.
+    assert!(project.join("src/teams/models.rs").is_file());
+    let models = fs::read_to_string(project.join("src/teams/models.rs")).unwrap();
+    assert!(models.contains("pub struct Organization"), "{models}");
+    assert!(models.contains("pub struct Membership"), "{models}");
+    assert!(models.contains("pub struct Invitation"), "{models}");
+
+    // Role enum + require_role guard.
+    assert!(project.join("src/teams/role.rs").is_file());
+    let role = fs::read_to_string(project.join("src/teams/role.rs")).unwrap();
+    assert!(role.contains("pub enum Role"), "{role}");
+    assert!(role.contains("Owner"), "{role}");
+    assert!(role.contains("Admin"), "{role}");
+    assert!(role.contains("Member"), "{role}");
+    assert!(role.contains("pub async fn require_role"), "{role}");
+    assert!(
+        role.contains("pub async fn establish_org_session"),
+        "{role}"
+    );
+
+    // Repositories, tenant_scoped.
+    assert!(project.join("src/teams/repositories.rs").is_file());
+    let repos = fs::read_to_string(project.join("src/teams/repositories.rs")).unwrap();
+    assert!(repos.contains("tenant_scoped"), "{repos}");
+
+    // InvitationMailer.
+    assert!(
+        project
+            .join("src/teams/mailers/invitation_mailer.rs")
+            .is_file()
+    );
+    let mailer =
+        fs::read_to_string(project.join("src/teams/mailers/invitation_mailer.rs")).unwrap();
+    assert!(mailer.contains("pub struct InvitationMailer"), "{mailer}");
+    assert!(mailer.contains("#[mailer]"), "{mailer}");
+
+    // Route handlers.
+    assert!(project.join("src/teams/routes/organizations.rs").is_file());
+    assert!(project.join("src/teams/routes/invitations.rs").is_file());
+    assert!(project.join("src/teams/routes/members.rs").is_file());
+
+    // Migration: organizations, memberships, invitations tables.
+    let migrations_root = project.join("migrations");
+    let teams_migration_dir = fs::read_dir(&migrations_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_create_teams"))
+        .expect("a *_create_teams migration must be generated")
+        .path();
+    let up = fs::read_to_string(teams_migration_dir.join("up.sql")).unwrap();
+    assert!(up.contains("CREATE TABLE organizations"), "{up}");
+    assert!(up.contains("CREATE TABLE memberships"), "{up}");
+    assert!(up.contains("CREATE TABLE invitations"), "{up}");
+
+    // main.rs wiring.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("mod teams;"), "{main}");
+    assert!(
+        main.contains("teams::routes::organizations::create_organization"),
+        "{main}"
+    );
+    assert!(
+        main.contains("teams::routes::invitations::accept_invitation"),
+        "{main}"
+    );
+    assert!(
+        main.contains("teams::routes::members::list_members"),
+        "{main}"
+    );
+
+    // Cargo.toml: mail feature enabled.
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"mail\""),
+        "Cargo.toml must include the mail feature: {cargo}"
+    );
+}
+
+#[test]
+fn generate_teams_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("teams-dry-app");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let (stdout, _) = run_autumn(&project, &["generate", "teams", "--dry-run"]);
+    assert!(
+        stdout.contains("Dry run"),
+        "dry run must print Dry run header: {stdout}"
+    );
+    assert!(
+        !project.join("src/teams").exists(),
+        "dry run must not create the src/teams directory"
+    );
+    let has_teams_migration = fs::read_dir(project.join("migrations")).is_ok_and(|rd| {
+        rd.filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with("_create_teams"))
+    });
+    assert!(
+        !has_teams_migration,
+        "dry run must not create a *_create_teams migration"
+    );
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        !main.contains("mod teams;"),
+        "dry run must not touch main.rs: {main}"
+    );
+    let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert_eq!(
+        cargo_after, cargo_before,
+        "dry run must not touch Cargo.toml"
+    );
+}
+
+#[test]
+fn generate_teams_invite_accept_routes_use_invite_prefix_not_invitations() {
+    let (_tmp, project) = fresh_project("teams-invite-prefix-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+
+    // Invitee-facing accept flow lives under its own `/invite` prefix so
+    // `[tenancy] public_paths = ["/invite"]` doesn't also exempt the
+    // Admin-only routes below from tenant resolution.
+    assert!(
+        invitations.contains(r#"#[get("/invite/{token}")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invite/{token}/accept")]"#),
+        "{invitations}"
+    );
+    assert!(
+        !invitations.contains(r#"#[get("/invitations/{token}")]"#),
+        "{invitations}"
+    );
+    assert!(
+        !invitations.contains(r#"#[post("/invitations/{token}/accept")]"#),
+        "{invitations}"
+    );
+
+    // Admin-only create/revoke/resend stay under `/invitations`.
+    assert!(
+        invitations.contains(r#"#[post("/invitations")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invitations/{id}/revoke")]"#),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains(r#"#[post("/invitations/{id}/resend")]"#),
+        "{invitations}"
+    );
+}
+
+#[test]
+fn generate_teams_sends_invite_mail_synchronously_not_deliver_later() {
+    let (_tmp, project) = fresh_project("teams-sync-mail-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+    assert!(
+        invitations.contains(".send_invite("),
+        "invite mail must be sent synchronously: {invitations}"
+    );
+    assert!(
+        !invitations.contains(".deliver_later_invite("),
+        "invite mail must not be a fire-and-forget background send: {invitations}"
+    );
+}
+
+#[test]
+fn generate_teams_guards_against_admin_self_promotion_to_owner() {
+    let (_tmp, project) = fresh_project("teams-owner-guard-app");
+    run_autumn(&project, &["generate", "teams"]);
+
+    // create_invitation: an Admin cannot mint a fresh Owner invite.
+    let invitations = fs::read_to_string(project.join("src/teams/routes/invitations.rs")).unwrap();
+    assert!(
+        invitations.contains("role == Role::Owner && caller_role != Role::Owner"),
+        "{invitations}"
+    );
+    assert!(
+        invitations.contains("Only an owner can invite someone as owner"),
+        "{invitations}"
+    );
+
+    // change_role: an Admin cannot promote an existing member to Owner.
+    let members = fs::read_to_string(project.join("src/teams/routes/members.rs")).unwrap();
+    assert!(
+        members.contains("new_role == Role::Owner && caller_role != Role::Owner"),
+        "{members}"
+    );
+    assert!(
+        members.contains("Only an owner can grant the owner role"),
+        "{members}"
     );
 }
 
@@ -4264,7 +6317,13 @@ fn generate_auth_confirmation_tests_cover_required_flows() {
         "confirm_with_expired_token_fails",
         "confirm_with_replayed_token_fails",
         "resend_confirmation_rate_limit",
-        "email_change_reenters_unconfirmed",
+        // The old `email_change_reenters_unconfirmed` stub was replaced by the
+        // #1396 account-flow tests: `email_change_confirm_invalid_token_fails`
+        // guards the confirm endpoint, and `password_and_email_change_end_to_end`
+        // exercises the full pending-email change (old address stays usable until
+        // the new-address token is confirmed, then the new address signs in).
+        "email_change_confirm_invalid_token_fails",
+        "password_and_email_change_end_to_end",
     ] {
         assert!(tests.contains(flow), "tests/auth.rs missing test: {flow}");
     }
@@ -4745,9 +6804,9 @@ fn live_validation_emits_hx_post_and_error_slot() {
     // `required_text_input_htmx` variant.
     assert!(
         routes.contains(
-            "autumn_web::form::required_text_input_htmx(&changeset, \"title\", \"Title\", \"/posts/validate/title\")"
+            "autumn_web::form::required_text_input_htmx(&changeset, \"title\", \"Title\", &paths::validate_title())"
         ),
-        "create form must render the validated title input via required_text_input_htmx:\n{routes}"
+        "create form must render the validated title input via required_text_input_htmx with a typed path helper:\n{routes}"
     );
     // body field (not validated, but required) must use required_text_input.
     assert!(
@@ -4917,9 +6976,10 @@ fn live_scaffold_emits_live_fragment_and_broadcasts() {
         "LiveFragment impl must override insert_swap() with BeforeEnd targeting the list container:\n{repo}"
     );
     // render_fragment must include a show-page link so live rows are navigable.
+    // The URL goes through the routes module's typed path helper (issue #1133).
     assert!(
-        repo.contains("a href=(format!(\"/posts/"),
-        "render_fragment must include a show link href:\n{repo}"
+        repo.contains("a href=(crate::routes::posts::paths::show(self.id))"),
+        "render_fragment must include a show link href via the typed path helper:\n{repo}"
     );
 }
 
@@ -4940,8 +7000,8 @@ fn live_scaffold_index_uses_sse_list_and_stream_route() {
         "index list must have hx-ext=\"sse\" under --live:\n{routes}"
     );
     assert!(
-        routes.contains("sse-connect=\"/posts/events\""),
-        "index list must connect to the SSE stream endpoint:\n{routes}"
+        routes.contains("sse-connect=(paths::events())"),
+        "index list must connect to the SSE stream endpoint via the typed path helper:\n{routes}"
     );
     assert!(
         routes.contains("pub async fn events"),
@@ -5809,6 +7869,236 @@ fn generated_sharded_scaffold_cargo_checks() {
     );
 }
 
+/// Slow end-to-end check: scaffold a `--searchable` (full-text search) project,
+/// patch Cargo.toml to the local autumn-web, and `cargo check --tests` the
+/// result. Verifies that the merged FTS codegen (issue #1319/#1825) compiles:
+/// the `#[searchable]` model attributes, the `searchable` repository option,
+/// the generated `{Model}SearchQuery` extractor type, and the `search_vector`
+/// migration all typecheck against this workspace's `autumn-web`.
+///
+/// Uses a plain searchable model (no owner scoping). The owner-scoped +
+/// searchable combination is covered separately by
+/// [`generated_owner_searchable_scaffold_cargo_checks`] (issue #1841).
+///
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_searchable_scaffold_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1841: the critical proof that lifting the owner-scoped `--searchable`
+/// rejection produces a COMPILING app whose search/index are safely owner-scoped.
+///
+/// Scaffolds `Post title:String body:Text author_id:i64 --searchable` — an owner
+/// column (`author_id`) AND full-text search, the exact combination the
+/// generator REJECTED before #1841. The repository macro now emits owner-filtered
+/// `list_scoped` / `search_page_scoped`, and the generated owner-scoped index +
+/// `/search` handlers call ONLY those scoped methods. `cargo check --tests`
+/// proves the whole owner-scoped FTS codegen (the macro's three-phase
+/// owner-filtered `search_page_scoped`, `list_scoped`, and the scoped handlers)
+/// type-checks against this workspace's `autumn-web`.
+///
+/// The security invariant — the owner branch never calls the unscoped
+/// `repo.search_page`/`repo.page` — is asserted directly on the generated source
+/// here and in the `scaffold.rs` unit tests; this test proves it also COMPILES.
+///
+/// Run with:
+/// `cargo test -p autumn-cli --test generate generated_owner_searchable_scaffold_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh owner-scoped searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_owner_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("owner-searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "author_id:i64",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    // The repository carries `owner = author_id` (→ the macro's scoped codegen).
+    let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
+    assert!(
+        repo.contains(", owner = author_id"),
+        "owner-scoped searchable repository must carry `owner = author_id`:\n{repo}"
+    );
+    // Warden 2026-09-13: `owner = <col>` alone does not gate the generated
+    // `api = "..."` CRUD routes (`#[repository]` now refuses that combination
+    // at compile time) — the scaffold must also wire in the `PostPolicy` it
+    // already generates and registers on the app.
+    assert!(
+        repo.contains(", policy = PostPolicy)")
+            && repo.contains("use crate::policies::post::PostPolicy;"),
+        "owner-scoped repository must also carry `policy = ...` or it no longer compiles:\n{repo}"
+    );
+
+    // The owner-scoped /search + index call ONLY the scoped methods — never the
+    // unscoped `repo.search_page(`/`repo.page(` (the cross-user leak guard).
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("repo.search_page_scoped(owner_id, q, &page_req)")
+            && routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
+        "owner-scoped search/index must call the scoped repository methods:\n{routes}"
+    );
+    assert!(
+        !routes.contains("repo.search_page(") && !routes.contains("repo.page("),
+        "SECURITY: owner-scoped searchable routes must NEVER call the unscoped \
+         repo.search_page(/repo.page( (cross-user leak):\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated owner-scoped searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Issue #1841 companion proving the *nullable* owner-column + searchable path
+/// compiles: a `user:references?` owner is `Option<i64>`, so the macro's scoped
+/// `.eq(owner_id)` filter (typed hydration) and the raw-SQL owner bind must
+/// compile against a `Nullable<BigInt>` column. A nullable owner never matches
+/// NULL (unowned) rows — semantically correct (unowned rows stay hidden).
+///
+/// Run with:
+/// `cargo test -p autumn-cli --test generate generated_nullable_owner_searchable_scaffold_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh nullable-owner searchable project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_nullable_owner_searchable_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("nullable-owner-searchable-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Note",
+            "title:String",
+            "body:Text",
+            "user:references?",
+            "--searchable",
+            "title,body",
+        ],
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/note.rs")).unwrap();
+    assert!(
+        repo.contains(", owner = user_id"),
+        "nullable-owner searchable repository must carry `owner = user_id`:\n{repo}"
+    );
+    // Warden 2026-09-13: same requirement as the non-nullable owner case —
+    // `owner = ...` alone does not gate `api = "..."`'s CRUD routes.
+    assert!(
+        repo.contains(", policy = NotePolicy)")
+            && repo.contains("use crate::policies::note::NotePolicy;"),
+        "nullable-owner repository must also carry `policy = ...` or it no longer compiles:\n{repo}"
+    );
+    let routes = fs::read_to_string(project.join("src/routes/notes.rs")).unwrap();
+    assert!(
+        !routes.contains("repo.search_page(") && !routes.contains("repo.page("),
+        "SECURITY: nullable-owner searchable routes must NEVER call the unscoped \
+         repo.search_page(/repo.page(:\n{routes}"
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated nullable-owner searchable scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+/// Slow end-to-end check: scaffold a `--live` project, patch Cargo.toml to the
+/// local autumn-web, and `cargo check --tests` the result. Regression coverage
+/// for issue #1853: `--live` sets `broadcasts = true` on the `#[repository]`,
+/// which makes the macro synthesize internal hooks whose generated `update`
+/// body expands an unqualified `{Pascal}DraftExt::from_patch(...)`. The
+/// generated repository file must import `{Pascal}DraftExt` alongside the other
+/// model types, or the scaffold fails to compile with
+/// `error[E0405]: cannot find trait PostDraftExt in this scope`.
+///
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_live_scaffold_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh live scaffold — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_live_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("live-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--live",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated live scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 /// Slow end-to-end check: scaffold a `--soft-delete` project, patch Cargo.toml
 /// to the local autumn-web, and `cargo check --tests` the result. Regression
 /// coverage for a bug where the generated model's `deleted_at` field lacked
@@ -6588,4 +8878,1728 @@ fn controller_api_generates_json() {
             "autumn routes must list {path}:\n{stdout}"
         );
     }
+}
+
+// ── `autumn plugin add` / `autumn plugin list` (issue #1606) ────────────────
+
+/// Every first-party plugin the install catalog ships, in `plugin list` order.
+const FIRST_PARTY_PLUGINS: [&str; 6] = [
+    "autumn-admin-plugin",
+    "autumn-billing",
+    "autumn-cache-redis",
+    "autumn-media-plugin",
+    "autumn-search",
+    "autumn-storage-s3",
+];
+
+/// Repoint every first-party plugin crate — and `autumn-web` itself — at this
+/// workspace, so a generated project resolves the versions under test rather
+/// than whatever is published on crates.io.
+fn patch_generated_cargo_toml_for_plugins(project_dir: &Path) {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    content.push_str("\n[patch.crates-io]\n");
+    for crate_name in std::iter::once("autumn-web").chain(FIRST_PARTY_PLUGINS) {
+        // `autumn-web` lives in `autumn/`; the plugin crates are named after
+        // their own directories.
+        let dir = if crate_name == "autumn-web" {
+            "autumn"
+        } else {
+            crate_name
+        };
+        writeln!(
+            content,
+            "{crate_name} = {{ path = \"{}\" }}",
+            workspace_root
+                .join(dir)
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        )
+        .unwrap();
+    }
+    fs::write(&cargo_toml_path, content).unwrap();
+}
+
+/// AC #1: the listing names every first-party plugin, with a description and
+/// the version compatible with the app's `autumn-web`.
+#[test]
+fn plugin_list_shows_every_first_party_plugin() {
+    let (_tmp, project) = fresh_project("plugin-list");
+    let (stdout, _) = run_autumn(&project, &["plugin", "list", "--offline"]);
+    for plugin in FIRST_PARTY_PLUGINS {
+        assert!(stdout.contains(plugin), "{plugin} missing from:\n{stdout}");
+    }
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")), "{stdout}");
+    assert!(stdout.contains("autumn plugin add"), "{stdout}");
+}
+
+/// The same listing, machine-readable.
+#[test]
+fn plugin_list_json_is_parseable() {
+    let (_tmp, project) = fresh_project("plugin-list-json");
+    let (stdout, _) = run_autumn(&project, &["plugin", "list", "--json", "--offline"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let plugins = value["plugins"].as_array().expect("plugins array");
+    for plugin in FIRST_PARTY_PLUGINS {
+        assert!(
+            plugins.iter().any(|p| p["name"] == plugin),
+            "{plugin} missing from {stdout}"
+        );
+    }
+}
+
+/// AC #2 (edits) + AC #4 (idempotency), without paying for a compile.
+#[test]
+fn plugin_add_writes_the_dependency_and_the_mount_then_is_idempotent() {
+    let (_tmp, project) = fresh_project("plugin-add");
+    let (stdout, _) = run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert!(stdout.contains("Installed autumn-admin-plugin"), "{stdout}");
+    assert!(stdout.contains("autumn generate admin"), "{stdout}");
+
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-admin-plugin ="), "{cargo}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains(".plugin(autumn_admin_plugin::AdminPlugin::new())"),
+        "{main_rs}"
+    );
+
+    let (stdout, _) = run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert!(stdout.contains("already installed"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_rs
+    );
+}
+
+/// AC #2: `--dry-run` reports the same edits without applying any of them.
+#[test]
+fn plugin_add_dry_run_changes_nothing() {
+    let (_tmp, project) = fresh_project("plugin-add-dry");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    run_autumn(
+        &project,
+        &[
+            "plugin",
+            "add",
+            "autumn-cache-redis",
+            "--dry-run",
+            "--offline",
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC #3: an incompatible `autumn-web` fails before any file is modified, and
+/// the diagnostic names both versions.
+#[test]
+fn plugin_add_refuses_an_incompatible_autumn_web_without_editing() {
+    let (_tmp, project) = fresh_project("plugin-add-incompat");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap().replace(
+        &format!("autumn-web = \"{}\"", env!("CARGO_PKG_VERSION")),
+        "autumn-web = \"0.1.0\"",
+    );
+    fs::write(&cargo_path, &cargo).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("0.1.0"), "{stderr}");
+    assert!(stderr.contains(env!("CARGO_PKG_VERSION")), "{stderr}");
+
+    assert_eq!(fs::read_to_string(&cargo_path).unwrap(), cargo);
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC #5: a `main.rs` whose builder chain cannot be found is left completely
+/// alone, and the command prints what to apply by hand.
+#[test]
+fn plugin_add_degrades_on_a_customized_main() {
+    let (_tmp, project) = fresh_project("plugin-add-custom");
+    let main_path = project.join("src/main.rs");
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    my_bootstrap().await;\n}\n";
+    fs::write(&main_path, custom).unwrap();
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    // A refusal, not a result: it goes to stderr and exits 2 so a script
+    // cannot read "I changed nothing" as a successful install.
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("No files were changed"), "{stderr}");
+    assert!(stderr.contains("autumn-admin-plugin = \""), "{stderr}");
+    assert!(stderr.contains("AdminPlugin::new()"), "{stderr}");
+
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// AC #5, the shape that used to slip through: a `main.rs` that factors its
+/// builder into a helper. Splicing there mounts the plugin into a function the
+/// binary never calls — and for `autumn-storage-s3`, whose mount awaits, into a
+/// synchronous fn, which does not compile.
+#[test]
+fn plugin_add_degrades_when_the_builder_lives_in_a_helper() {
+    let (_tmp, project) = fresh_project("plugin-add-helper");
+    let main_path = project.join("src/main.rs");
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    build_app().run().await;\n}\n\n\
+                  fn build_app() -> autumn_web::app::AppBuilder {\n    autumn_web::app()\n        \
+                  .routes(routes![index])\n}\n";
+    fs::write(&main_path, custom).unwrap();
+
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "add", "autumn-storage-s3", "--offline"],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+}
+
+/// An unknown name is refused with a pointer at `plugin list`.
+#[test]
+fn plugin_add_rejects_an_unknown_crate() {
+    let (_tmp, project) = fresh_project("plugin-add-unknown");
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["plugin", "add", "tokio", "--offline"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("autumn plugin list"), "{stderr}");
+}
+
+// ── The curated plugin index (issue #1625) ─────────────────────────────────
+
+/// Run `autumn` with env overrides and return stdout, stderr and the code.
+fn run_autumn_env_status(
+    dir: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (String, String, Option<i32>) {
+    let output = Command::new(env!("CARGO_BIN_EXE_autumn"))
+        .args(args)
+        .current_dir(dir)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("failed to run autumn");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code(),
+    )
+}
+
+/// One community listing for a fixture index.
+fn index_listing(name: &str, extra: &str, status: &str, result: &str) -> String {
+    format!(
+        "[[plugin]]\nname = \"{name}\"\ndescription = \"{name} for tests\"\n\
+         origin = \"community\"\nrepository = \"https://example.com/{name}\"\n\
+         version = \"0.3.0\"\nautumn_web = \"{series}\"\nstatus = \"{status}\"\n\
+         prefix = \"/{name}\"\n{extra}\n\
+         [plugin.conformance]\nresult = \"{result}\"\nautumn_web = \"{release}\"\n\
+         checked = \"2026-09-27\"\n\n",
+        series = env!("CARGO_PKG_VERSION")
+            .rsplit_once('.')
+            .map_or(env!("CARGO_PKG_VERSION"), |(series, _)| series),
+        release = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// A fixture index: one experimental listing, one flagged, one sandboxed.
+fn write_fixture_index(dir: &Path) -> std::path::PathBuf {
+    let surface = autumn_web::plugin_contract::experimental_surface_names()
+        .next()
+        .expect("an experimental surface");
+    let mut src = String::from("schema = 1\n\n");
+    src.push_str(&index_listing(
+        "autumn-plugin-live-feed",
+        &format!(
+            "tier = \"experimental\"\nexperimental_surfaces = [\"{surface}\"]\ntrust = \"native\""
+        ),
+        "listed",
+        "pass",
+    ));
+    src.push_str(&index_listing(
+        "autumn-plugin-broken",
+        "tier = \"stable\"\ntrust = \"native\"\nnote = \"route-collision on re-verification\"",
+        "incompatible",
+        "fail",
+    ));
+    // A sandboxed listing carries every quota and limit `inspect` emits.
+    let quotas: Vec<String> = autumn_web::plugin_sandbox::CapabilityQuotas::default()
+        .fields()
+        .iter()
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect();
+    let limits: Vec<String> = autumn_web::plugin_sandbox::ResourceLimits::default()
+        .fields()
+        .iter()
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect();
+    src.push_str(&index_listing(
+        "autumn-plugin-hello",
+        &format!(
+            "tier = \"stable\"\ntrust = \"sandboxed\"\ncapabilities = [\"http-request\", \"kv\"]\n\
+             artifact_sha256 = \"{}\"\nquotas = {{ {} }}\nlimits = {{ {} }}",
+            "ab".repeat(32),
+            quotas.join(", "),
+            limits.join(", ")
+        ),
+        "listed",
+        "pass",
+    ));
+    let path = dir.join("fixture-index.toml");
+    fs::write(&path, src).unwrap();
+    path
+}
+
+/// AC 1 + AC 6: `plugin list` shows each listing's trust class, tier and
+/// conformance result at discovery time.
+#[test]
+fn plugin_list_shows_the_index_trust_facts() {
+    let (_tmp, project) = fresh_project("plugin-index-list");
+    let (stdout, _) = run_autumn(&project, &["plugin", "list", "--offline"]);
+    assert!(
+        stdout.contains("Listed in the Autumn plugin index"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("full trust: native code"), "{stdout}");
+    assert!(stdout.contains("stable API"), "{stdout}");
+    assert!(
+        stdout.contains("plugin-check pass on autumn-web"),
+        "{stdout}"
+    );
+    for plugin in FIRST_PARTY_PLUGINS {
+        assert!(stdout.contains(plugin), "{plugin} missing from:\n{stdout}");
+    }
+}
+
+/// AC 2 + AC 4 + AC 5: listings from an index file: experimental and
+/// flagged listings are marked, a sandboxed one shows its capabilities.
+#[test]
+fn plugin_list_marks_experimental_flagged_and_sandboxed_listings() {
+    let (tmp, project) = fresh_project("plugin-index-list-fixture");
+    let index = write_fixture_index(tmp.path());
+    let index = index.to_str().unwrap();
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "list", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index)],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let line = |name: &str| {
+        stdout
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("{name} missing from:\n{stdout}"))
+            .to_owned()
+    };
+    assert!(
+        line("autumn-plugin-live-feed").contains("[EXPERIMENTAL API]"),
+        "{stdout}"
+    );
+    assert!(
+        line("autumn-plugin-broken").contains("[incompatible: failed re-verification]"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("sandboxed: capability manifest grants http-request, kv"),
+        "{stdout}"
+    );
+    // The fixture does not list the first-party crates, so they fall back
+    // to unlisted and are marked.
+    assert!(
+        line("autumn-admin-plugin").contains("[unlisted: not verified]"),
+        "{stdout}"
+    );
+}
+
+/// AC 6: the trust review is printed before any file is modified.
+#[test]
+fn plugin_add_prints_the_trust_review_before_any_edit() {
+    let (_tmp, project) = fresh_project("plugin-index-add-order");
+    let (stdout, _) = run_autumn(
+        &project,
+        &[
+            "plugin",
+            "add",
+            "autumn-admin-plugin",
+            "--dry-run",
+            "--offline",
+        ],
+    );
+    let review = stdout
+        .find("Trust review for autumn-admin-plugin")
+        .expect(&stdout);
+    let plan = stdout.find("Dry run").expect(&stdout);
+    assert!(review < plan, "{stdout}");
+    assert!(stdout.contains("full trust: native code"), "{stdout}");
+
+    let (stdout, _) = run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    let review = stdout.find("Trust review").expect(&stdout);
+    let installed = stdout.find("Installed autumn-admin-plugin").expect(&stdout);
+    assert!(review < installed, "{stdout}");
+}
+
+/// AC 2: a listed community plugin resolves from the index: its verified
+/// version is written, with no crates.io lookup (so `--offline` works).
+#[test]
+fn plugin_add_installs_a_listed_community_plugin_at_its_verified_version() {
+    let (tmp, project) = fresh_project("plugin-index-add-listed");
+    let index = write_fixture_index(tmp.path());
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn-plugin-live-feed", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("(Autumn plugin index)"), "{stdout}");
+    assert!(stdout.contains("EXPERIMENTAL"), "{stdout}");
+    assert!(stdout.contains("Using the plugin index at"), "{stdout}");
+    // Pinned with `=`: a caret would admit unverified patch releases.
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("autumn-plugin-live-feed = \"=0.3.0\""),
+        "{cargo}"
+    );
+}
+
+/// A case or `-`/`_` variant of a flagged name is the same crate on
+/// crates.io, so it must hit the same refusal.
+#[test]
+fn plugin_add_refuses_a_name_variant_of_a_flagged_listing() {
+    let (tmp, project) = fresh_project("plugin-index-add-variant");
+    let index = write_fixture_index(tmp.path());
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn_plugin_BROKEN", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("failed re-verification"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// `--index` wins over `AUTUMN_PLUGIN_INDEX`, and the JSON names the file.
+#[test]
+fn plugin_index_check_prefers_the_index_flag_over_the_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = tmp.path().join("bad.toml");
+    fs::write(&bad, "not toml at all [").unwrap();
+    let good = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin-index/index.toml");
+    let args = [
+        "plugin",
+        "index",
+        "check",
+        "--index",
+        good.to_str().unwrap(),
+        "--format",
+        "json",
+    ];
+    let (stdout, stderr, code) = run_autumn_env_status(
+        tmp.path(),
+        &args,
+        &[("AUTUMN_PLUGIN_INDEX", bad.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(value["passed"], true);
+    assert_eq!(value["findings"].as_array().map(Vec::len), Some(0));
+
+    // Without the flag, the broken env file is an error, not a fall back.
+    let (_stdout, stderr, code) = run_autumn_env_status(
+        tmp.path(),
+        &["plugin", "index", "check"],
+        &[("AUTUMN_PLUGIN_INDEX", bad.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+}
+
+/// AC 4: a listing that failed re-verification is refused before any edit.
+#[test]
+fn plugin_add_refuses_a_flagged_listing_without_editing() {
+    let (tmp, project) = fresh_project("plugin-index-add-flagged");
+    let index = write_fixture_index(tmp.path());
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn-plugin-broken", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("failed re-verification"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// AC 6: a sandboxed listing shows its capabilities and changes no file.
+#[test]
+fn plugin_add_shows_a_sandboxed_manifest_and_changes_nothing() {
+    let (tmp, project) = fresh_project("plugin-index-add-sandboxed");
+    let index = write_fixture_index(tmp.path());
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    let (stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn-plugin-hello", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", index.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("http-request, kv"), "{stdout}");
+    assert!(stderr.contains("autumn plugin inspect"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC 2: an unlisted crate is marked unverified before anything else.
+#[test]
+fn plugin_add_marks_an_unlisted_crate_before_anything_else() {
+    let (_tmp, project) = fresh_project("plugin-index-add-unlisted");
+    let (stdout, _stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "add", "autumn-plugin-nobody-listed", "--offline"],
+        &[],
+    );
+    // `--offline` cannot resolve an unlisted version, so it still refuses.
+    assert_eq!(code, Some(1));
+    assert!(stdout.contains("UNLISTED"), "{stdout}");
+    assert!(stdout.contains("not verified"), "{stdout}");
+}
+
+/// An index that breaks an admission rule is refused, not rendered.
+#[test]
+fn plugin_list_refuses_an_index_that_breaks_the_rules() {
+    let (tmp, project) = fresh_project("plugin-index-bad");
+    let path = tmp.path().join("bad-index.toml");
+    let bad = index_listing(
+        "autumn-plugin-liar",
+        "tier = \"stable\"\ntrust = \"native\"",
+        "listed",
+        "fail",
+    );
+    fs::write(&path, format!("schema = 1\n\n{bad}")).unwrap();
+    let (_stdout, stderr, code) = run_autumn_env_status(
+        &project,
+        &["plugin", "list", "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", path.to_str().unwrap())],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("admission rule"), "{stderr}");
+    assert!(stderr.contains("autumn-plugin-liar"), "{stderr}");
+}
+
+/// Repoint `autumn-web` and every first-party crate in `names` at this
+/// workspace.
+fn patch_first_party(project_dir: &Path, names: &[&str]) {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    content.push_str("\n[patch.crates-io]\n");
+    for name in std::iter::once("autumn-web").chain(names.iter().copied()) {
+        let dir = if name == "autumn-web" { "autumn" } else { name };
+        writeln!(
+            content,
+            "{name} = {{ path = \"{}\" }}",
+            workspace_root
+                .join(dir)
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        )
+        .unwrap();
+    }
+    fs::write(&cargo_toml_path, content).unwrap();
+}
+
+/// Mount a community plugin by the naming convention, as its README would.
+/// `plugin add` prints this line; it never writes it.
+fn mount_community(project_dir: &Path, name: &str) {
+    let module = name.replace('-', "_");
+    let plugin: String = name
+        .trim_start_matches("autumn-plugin-")
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        })
+        .collect();
+    let main_path = project_dir.join("src/main.rs");
+    let main = fs::read_to_string(&main_path).unwrap();
+    let mounted = main.replacen(
+        "autumn_web::app()",
+        &format!("autumn_web::app()\n        .plugin({module}::{plugin}Plugin::new())"),
+        1,
+    );
+    assert_ne!(main, mounted, "no builder chain to mount {name} in");
+    fs::write(&main_path, mounted).unwrap();
+}
+
+/// Install `listing` through a one-listing index that admits the release
+/// under test. The consumer gate refuses a flagged listing and one whose range
+/// stops before this release, but those are exactly the listings that must be
+/// re-tested, to relist, flag or delist them.
+fn add_unflagged(tmp: &Path, project: &Path, listing: &toml::Value) -> Result<(), String> {
+    let name = listing["name"].as_str().unwrap();
+    let release = env!("CARGO_PKG_VERSION");
+    let series = autumn_web::plugin_contract::lockstep_range(release);
+    let mut unflagged = listing.clone();
+    let table = unflagged.as_table_mut().unwrap();
+    table.insert("status".into(), "listed".into());
+    table.insert("autumn_web".into(), series.as_str().into());
+    // A first-party install is always this release, and `plugin add` refuses
+    // a first-party listing that pins another one (after a version bump, the
+    // committed listing still names the last).
+    if table.get("origin").and_then(toml::Value::as_str) == Some("first-party") {
+        table.insert("version".into(), release.into());
+    }
+    table.remove("note");
+    let conformance = table["conformance"].as_table_mut().unwrap();
+    conformance.insert("result".into(), "pass".into());
+    conformance.insert("autumn_web".into(), release.into());
+    let mut one = toml::Table::new();
+    one.insert("schema".into(), 1.into());
+    one.insert("plugin".into(), toml::Value::Array(vec![unflagged]));
+    let one_path = tmp.join("one-listing.toml");
+    fs::write(&one_path, toml::to_string(&one).unwrap()).unwrap();
+    let (stdout, stderr, code) = run_autumn_env_status(
+        project,
+        &["plugin", "add", name, "--offline"],
+        &[("AUTUMN_PLUGIN_INDEX", one_path.to_str().unwrap())],
+    );
+    if code == Some(0) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}: `plugin add` failed ({code:?}):\n{stdout}\n{stderr}"
+        ))
+    }
+}
+
+/// A failing `plugin-check`-shaped report for a run that never produced one,
+/// so `record` can still flag or delist the listing.
+fn failed_install_report(name: &str, message: &str, output: &str) -> serde_json::Value {
+    let lines: Vec<&str> = output.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(20)..];
+    serde_json::json!({
+        "plugin_name": name,
+        "checks": [{
+            "name": "installability",
+            "status": "fail",
+            "message": message,
+            "diagnostics": tail,
+        }],
+        "autumn_web": env!("CARGO_PKG_VERSION"),
+    })
+}
+
+/// Whether `listing` is verified by its install compiling, not plugin-check:
+/// `exempt`, or a failure that kept its exemption `reason`.
+/// The same rule as `curate::require_exempt_class`: an empty `reason` on a
+/// normal listing does not skip plugin-check.
+fn is_exempt(listing: &toml::Value) -> bool {
+    let conformance = &listing["conformance"];
+    let reason = conformance
+        .get("reason")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|r| !r.trim().is_empty());
+    match conformance["result"].as_str() {
+        Some("exempt") => true,
+        Some("fail") => reason,
+        _ => false,
+    }
+}
+
+/// `cargo check` an exempt listing's install. `Err` carries cargo's stderr.
+fn check_exempt_install(project: &Path, target: &str) -> Result<(), String> {
+    let check = Command::new("cargo")
+        .args(["check", "--all-targets"])
+        .current_dir(project)
+        .env("CARGO_TARGET_DIR", target)
+        .output()
+        .expect("cargo check");
+    if check.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&check.stderr).into_owned())
+    }
+}
+
+/// Delete one checked app's own binaries from the shared target dir. The
+/// dependency artifacts stay, so the next listing still builds warm.
+fn remove_app_binaries(target: &Path, app: &str) {
+    let debug = target.join("debug");
+    let _ = fs::remove_file(debug.join(app));
+    if let Ok(entries) = fs::read_dir(debug.join("deps")) {
+        for entry in entries.flatten() {
+            let file = entry.file_name();
+            if file.to_string_lossy().starts_with(&format!("{app}-")) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Run `autumn plugin-check --format json` with the listing's prefix and
+/// sensitive routes. With no JSON (the app did not build or boot), return a
+/// failing report, so `record` can still flag it.
+fn plugin_check_report(project: &Path, listing: &toml::Value, target: &str) -> serde_json::Value {
+    let name = listing["name"].as_str().unwrap();
+    let mut args = vec!["plugin-check", "--plugin-name", name, "--format", "json"];
+    if listing.get("no_routes").and_then(toml::Value::as_bool) == Some(true) {
+        args.push("--no-routes");
+    }
+    if let Some(prefix) = listing.get("prefix").and_then(toml::Value::as_str) {
+        args.extend(["--prefix", prefix]);
+    }
+    for route in listing
+        .get("sensitive_routes")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+    {
+        args.extend(["--sensitive-route", route]);
+    }
+    // No debug info: five linked apps in one target dir otherwise outgrow a
+    // runner's disk (media alone pulls the AWS SDK). `plugin-check`'s cargo
+    // inherits the env.
+    let (stdout, stderr, _) = run_autumn_env_status(
+        project,
+        &args,
+        &[
+            ("CARGO_TARGET_DIR", target),
+            ("CARGO_PROFILE_DEV_DEBUG", "0"),
+        ],
+    );
+    serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        failed_install_report(
+            name,
+            "plugin-check gave no report: the app did not build or boot",
+            &stderr,
+        )
+    })
+}
+
+/// Write the proposed index next to the reports: `record` applied to a copy.
+/// A maintainer commits it; flags and delistings need no hand edit.
+fn write_proposed_index(
+    dir: &Path,
+    src: &str,
+    reports: &[std::path::PathBuf],
+    exempt: &[String],
+    exempt_failed: &[String],
+) -> Result<(), String> {
+    let proposed = dir.join("index.toml");
+    fs::write(&proposed, src).unwrap();
+    let mut args = vec![
+        "plugin".to_owned(),
+        "index".to_owned(),
+        "record".to_owned(),
+        "--index".to_owned(),
+        proposed.display().to_string(),
+    ];
+    if !reports.is_empty() {
+        args.push("--report".to_owned());
+        args.extend(reports.iter().map(|p| p.display().to_string()));
+    }
+    for name in exempt {
+        args.extend(["--exempt".to_owned(), name.clone()]);
+    }
+    for name in exempt_failed {
+        args.extend(["--exempt-failed".to_owned(), name.clone()]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (stdout, stderr, code) = run_autumn_env_status(dir, &args, &[]);
+    if code == Some(0) {
+        Ok(())
+    } else {
+        Err(format!("`plugin index record` failed:\n{stdout}\n{stderr}"))
+    }
+}
+
+/// Every listing whose recorded fields differ between the committed index and
+/// the one `record` proposes, ignoring `conformance.checked` (the run date).
+fn index_drift(committed: &str, proposed: &str) -> Vec<String> {
+    let listings = |text: &str| -> Vec<toml::Value> {
+        let table: toml::Table = toml::from_str(text).unwrap();
+        let mut plugins = table["plugin"].as_array().cloned().unwrap_or_default();
+        for plugin in &mut plugins {
+            if let Some(conformance) = plugin
+                .get_mut("conformance")
+                .and_then(toml::Value::as_table_mut)
+            {
+                conformance.remove("checked");
+            }
+        }
+        plugins
+    };
+    let (before, after) = (listings(committed), listings(proposed));
+    before
+        .iter()
+        .zip(&after)
+        .filter(|(b, a)| b != a)
+        .map(|(b, a)| {
+            format!(
+                "{}: the committed listing differs from what re-verification records.\n\
+                 committed: {b}\nrecorded:  {a}",
+                b["name"].as_str().unwrap_or("?")
+            )
+        })
+        .chain(
+            (before.len() != after.len())
+                .then(|| "the proposed index has another listing count".to_owned()),
+        )
+        .collect()
+}
+
+/// How an exempt listing's install result differs from its recorded result,
+/// if it does. `record --exempt-failed` commits a failing install as `fail`,
+/// so only a change from what is recorded is drift.
+fn exempt_drift(name: &str, recorded: &str, result: &Result<(), String>) -> Option<String> {
+    match result {
+        Ok(()) => (recorded != "exempt").then(|| {
+            format!("{name}: the index records `{recorded}`, but its install now compiles")
+        }),
+        Err(stderr) => (recorded != "fail")
+            .then(|| format!("{name}: exempt, but its install does not compile:\n{stderr}")),
+    }
+}
+
+/// Issue #1625, AC 4: re-verify every live listing in the bundled index.
+///
+/// For each listing: scaffold an app, `plugin add` it, then run
+/// `autumn plugin-check --format json`. The result must agree with the
+/// recorded one. An exempt listing must `cargo check` instead. A sandboxed
+/// listing is skipped: `autumn plugin inspect` verifies its artifact. With
+/// `$PLUGIN_INDEX_REPORTS` set, the reports and the proposed index go there.
+///
+/// Ignored by default (it compiles one app per listing). CI runs it in the
+/// `plugin-install` job of `.github/workflows/generator-conformance.yml`.
+#[test]
+#[ignore = "compiles one generated app per plugin index listing (slow)"]
+fn plugin_index_reverify_listings() {
+    let src =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin-index/index.toml"))
+            .unwrap();
+    let index: toml::Table = toml::from_str(&src).unwrap();
+    let listings = index["plugin"].as_array().expect("[[plugin]] listings");
+    let first_party: Vec<&str> = listings
+        .iter()
+        .filter(|l| l["origin"].as_str() == Some("first-party"))
+        .filter_map(|l| l["name"].as_str())
+        .collect();
+    // The reports and the proposed index are always written; without
+    // `$PLUGIN_INDEX_REPORTS` they go to a scratch dir.
+    let scratch = tempfile::tempdir().expect("reports dir");
+    let reports = std::env::var_os("PLUGIN_INDEX_REPORTS")
+        .map_or_else(|| scratch.path().to_path_buf(), std::path::PathBuf::from);
+    fs::create_dir_all(&reports).unwrap();
+    let shared_target = tempfile::tempdir().expect("shared target dir");
+    let target = shared_target.path().to_str().unwrap();
+    let mut failures = Vec::new();
+    let mut written_reports = Vec::new();
+    let mut exempt_ok = Vec::new();
+    let mut exempt_failed = Vec::new();
+
+    for listing in listings {
+        let name = listing["name"].as_str().unwrap();
+        if listing["status"].as_str() == Some("delisted") {
+            continue;
+        }
+        if listing["trust"].as_str() == Some("sandboxed") {
+            eprintln!("{name}: sandboxed; re-verify it with `autumn plugin inspect`");
+            continue;
+        }
+        let recorded = listing["conformance"]["result"].as_str().unwrap();
+        let (tmp, project) = fresh_project(&name.replace('-', "_"));
+        patch_first_party(&project, &first_party);
+        if let Err(failure) = add_unflagged(tmp.path(), &project, listing) {
+            // A failed install is a failed run: record it, so the listing is
+            // flagged or delisted rather than left as it was.
+            if is_exempt(listing) {
+                exempt_failed.push(name.to_owned());
+            } else {
+                let path = reports.join(format!("{name}.json"));
+                let report = failed_install_report(name, "`plugin add` failed", &failure);
+                fs::write(&path, report.to_string()).unwrap();
+                written_reports.push(path);
+            }
+            // A failure the index already records is not drift.
+            if recorded != "fail" {
+                failures.push(failure);
+            }
+            continue;
+        }
+        if listing["origin"].as_str() == Some("community") {
+            mount_community(&project, name);
+        }
+
+        if is_exempt(listing) {
+            let result = check_exempt_install(&project, target);
+            failures.extend(exempt_drift(name, recorded, &result));
+            if result.is_ok() {
+                exempt_ok.push(name.to_owned());
+            } else {
+                exempt_failed.push(name.to_owned());
+            }
+            continue;
+        }
+
+        let report = plugin_check_report(&project, listing, target);
+        remove_app_binaries(Path::new(target), &name.replace('-', "_"));
+        let path = reports.join(format!("{name}.json"));
+        fs::write(&path, report.to_string()).unwrap();
+        written_reports.push(path);
+        let passed = report["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .all(|c| c["status"] != "fail");
+        if passed != (recorded == "pass") {
+            failures.push(format!(
+                "{name}: the index records `{recorded}`, but plugin-check now says {}:\n{report}",
+                if passed { "pass" } else { "fail" }
+            ));
+        }
+    }
+    // The index `record` proposes must be the committed one (the run date
+    // aside): a hand-edited range, version, tier or status is drift, even
+    // when every check still passes.
+    if let Err(failure) =
+        write_proposed_index(&reports, &src, &written_reports, &exempt_ok, &exempt_failed)
+    {
+        failures.push(failure);
+    } else {
+        let proposed = fs::read_to_string(reports.join("index.toml")).unwrap();
+        failures.extend(index_drift(&src, &proposed));
+    }
+    assert!(
+        failures.is_empty(),
+        "plugin index re-verification failed. Commit the proposed index from the \
+         `plugin-index-reports` artifact, or record by hand (see \
+         autumn-cli/plugin-index/README.md):\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+/// The Success Metric for issue #1606: `autumn plugin add` for **every**
+/// first-party plugin against a fresh `autumn new` scaffold, each of which
+/// must then `cargo check` green — the machine proof that the generated mount
+/// compiles on the first try.
+///
+/// Ignored by default (it compiles five generated projects); run in CI by the
+/// `plugin-install` job in `.github/workflows/generator-conformance.yml`. The
+/// five projects share one `CARGO_TARGET_DIR` so the framework is built once
+/// rather than five times.
+#[test]
+#[ignore = "compiles generated projects against the local workspace (slow)"]
+fn plugin_add_first_party_scaffolds_cargo_check() {
+    let shared_target = tempfile::tempdir().expect("shared target dir");
+    for plugin in FIRST_PARTY_PLUGINS {
+        let (_tmp, project) = fresh_project(&plugin.replace('-', "_"));
+        patch_generated_cargo_toml_for_plugins(&project);
+
+        let (stdout, _) = run_autumn(&project, &["plugin", "add", plugin, "--offline"]);
+        assert!(stdout.contains(&format!("Installed {plugin}")), "{stdout}");
+
+        // Re-running must be a no-op, so the compile below is of a
+        // singly-installed project (AC #4).
+        let (stdout, _) = run_autumn(&project, &["plugin", "add", plugin, "--offline"]);
+        assert!(stdout.contains("already installed"), "{stdout}");
+
+        let check = Command::new("cargo")
+            .args(["check", "--all-targets"])
+            .current_dir(&project)
+            .env("CARGO_TARGET_DIR", shared_target.path())
+            .output()
+            .expect("failed to run cargo check");
+        assert!(
+            check.status.success(),
+            "`autumn plugin add {plugin}` produced a project that does not compile:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr),
+        );
+    }
+}
+
+// ── `autumn plugin remove` / `autumn new --with` (issue #1631) ──────────────
+
+/// AC #1 + AC #5: `add` then `remove` returns the app to exactly what it was,
+/// and a second `remove` is an idempotent no-op.
+#[test]
+fn plugin_remove_reverses_both_wires_and_is_idempotent() {
+    let (_tmp, project) = fresh_project("plugin-remove");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    assert_ne!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert!(stdout.contains("Removed autumn-admin-plugin"), "{stdout}");
+
+    // Byte-identical: the marker comment, the mount, and the dependency line
+    // all came back out, and nothing else moved.
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert!(stdout.contains("not installed"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// AC #3: `--dry-run` writes nothing, and its exit code distinguishes "would
+/// change something" (3) from "nothing to do" (0).
+#[test]
+fn plugin_remove_dry_run_reports_without_writing_and_signals_pending_changes() {
+    let (_tmp, project) = fresh_project("plugin-remove-dry");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    let (stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "remove", "autumn-admin-plugin", "--dry-run"],
+    );
+    assert_eq!(code, Some(3), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("Dry run"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+
+    // Nothing to do is a plain success, so a script can branch on the code.
+    let (stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &["plugin", "remove", "autumn-search", "--dry-run"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+}
+
+/// AC #2: removal never touches the database, and says exactly what it left
+/// behind plus the flag that would remove it.
+#[test]
+fn plugin_remove_lists_the_data_it_leaves_in_place() {
+    let (_tmp, project) = fresh_project("plugin-remove-data");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-media-plugin"]);
+    assert!(stdout.contains("media_rooms"), "{stdout}");
+    assert!(stdout.contains("20260720000000_media_rooms"), "{stdout}");
+    assert!(stdout.contains("--drop-data"), "{stdout}");
+    assert!(stdout.contains("database was not touched"), "{stdout}");
+}
+
+/// AC #4: a dependency added by hand with no mount (the `README` install path)
+/// is unwired as far as it goes, and the missing half is reported.
+#[test]
+fn plugin_remove_handles_a_dependency_with_no_mount() {
+    let (_tmp, project) = fresh_project("plugin-remove-partial");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        cargo.replace(
+            "[dependencies]",
+            "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+        ),
+    )
+    .unwrap();
+
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert!(stdout.to_lowercase().contains("could not find"), "{stdout}");
+    let cargo_after = fs::read_to_string(&cargo_path).unwrap();
+    assert!(
+        !cargo_after.contains("autumn-admin-plugin"),
+        "{cargo_after}"
+    );
+}
+
+/// AC #4: a builder chain this command cannot read is left completely alone,
+/// and the exact lines to delete are printed. The app never stops compiling.
+#[test]
+fn plugin_remove_degrades_on_an_unexcisable_mount() {
+    let (_tmp, project) = fresh_project("plugin-remove-custom");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    let main_path = project.join("src/main.rs");
+    // A mount built into a variable: a real mount whose type this command
+    // cannot see inside the `.plugin(...)` call.
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    let configured = autumn_admin_plugin::AdminPlugin::new();\n    autumn_web::app()\n        .plugin(configured)\n        .run()\n        .await;\n}\n";
+    fs::write(&main_path, custom).unwrap();
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    let (_stdout, stderr, code) =
+        run_autumn_failing(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("No files were changed"), "{stderr}");
+    assert!(stderr.contains("AdminPlugin"), "{stderr}");
+
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// A dependency the app still names elsewhere survives the removal, and the
+/// report says which file kept it alive.
+#[test]
+fn plugin_remove_keeps_a_dependency_the_app_still_uses() {
+    let (_tmp, project) = fresh_project("plugin-remove-inuse");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-admin-plugin", "--offline"],
+    );
+    fs::write(
+        project.join("src/support.rs"),
+        "pub fn panel() -> autumn_admin_plugin::AdminPlugin { todo!() }\n",
+    )
+    .unwrap();
+
+    let (stdout, _) = run_autumn(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert!(stdout.contains("support.rs"), "{stdout}");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-admin-plugin"), "{cargo}");
+    // The mount still came out — only the dependency was held back.
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(!main_rs.contains("AdminPlugin::new()"), "{main_rs}");
+}
+
+/// AC #6: `autumn new --with` scaffolds an app with the plugin already wired.
+#[test]
+fn new_with_scaffolds_an_app_with_the_plugin_wired() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (stdout, _) = run_autumn(
+        tmp.path(),
+        &[
+            "new",
+            "with-app",
+            "--with",
+            "autumn-admin-plugin",
+            "--with",
+            "autumn-search",
+        ],
+    );
+    assert!(stdout.contains("Installed autumn-admin-plugin"), "{stdout}");
+    assert!(stdout.contains("Installed autumn-search"), "{stdout}");
+
+    let project = tmp.path().join("with-app");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-admin-plugin ="), "{cargo}");
+    assert!(cargo.contains("autumn-search ="), "{cargo}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(
+        main_rs.contains(".plugin(autumn_admin_plugin::AdminPlugin::new())"),
+        "{main_rs}"
+    );
+    assert!(
+        main_rs.contains(".plugin(autumn_search::SearchPlugin::new())"),
+        "{main_rs}"
+    );
+}
+
+/// AC #6: name resolution and version compatibility are checked BEFORE any
+/// file is written — an unknown plugin leaves no project behind at all.
+#[test]
+fn new_with_rejects_an_unknown_plugin_before_scaffolding() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_stdout, stderr, code) =
+        run_autumn_failing(tmp.path(), &["new", "doomed-app", "--with", "tokio"]);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("autumn plugin list"), "{stderr}");
+    assert!(
+        !tmp.path().join("doomed-app").exists(),
+        "a rejected --with must not leave a half-scaffolded project"
+    );
+}
+
+/// AC #7: `autumn doctor` reports orphaned plugin residue under the existing
+/// `--json` contract.
+#[test]
+fn doctor_reports_a_dependency_with_no_mount_as_residue() {
+    let (_tmp, project) = fresh_project("doctor-residue");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        cargo.replace(
+            "[dependencies]",
+            "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+        ),
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "warn", "{stdout}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("autumn-admin-plugin")),
+        "{stdout}"
+    );
+}
+
+/// A clean scaffold has no residue at all — the check must not warn on every
+/// project that simply has no plugins.
+#[test]
+fn doctor_reports_no_residue_for_a_plain_scaffold() {
+    let (_tmp, project) = fresh_project("doctor-no-residue");
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "pass", "{stdout}");
+}
+
+/// The Success Metric for issue #1631, for every first-party plugin:
+/// `autumn new --with <plugin>` compiles, `autumn plugin remove <plugin>`
+/// returns the app to a state that compiles, and `autumn doctor` finds no
+/// residue afterwards.
+///
+/// Ignored by default (it compiles a generated project per plugin); run in CI
+/// by the `plugin-install` job in `.github/workflows/generator-conformance.yml`.
+/// The projects share one `CARGO_TARGET_DIR` so the framework is built once.
+#[test]
+#[ignore = "compiles generated projects against the local workspace (slow)"]
+fn plugin_new_with_then_remove_round_trips_cargo_check() {
+    let shared_target = tempfile::tempdir().expect("shared target dir");
+    for plugin in FIRST_PARTY_PLUGINS {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let name = plugin.replace('-', "_");
+        run_autumn(tmp.path(), &["new", &name, "--with", plugin]);
+        let project = tmp.path().join(&name);
+        patch_generated_cargo_toml_for_plugins(&project);
+
+        let cargo_check = |stage: &str| {
+            let check = Command::new("cargo")
+                .args(["check", "--all-targets"])
+                .current_dir(&project)
+                .env("CARGO_TARGET_DIR", shared_target.path())
+                .output()
+                .expect("failed to run cargo check");
+            assert!(
+                check.status.success(),
+                "{plugin} does not compile {stage}:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&check.stdout),
+                String::from_utf8_lossy(&check.stderr),
+            );
+        };
+        cargo_check("after `autumn new --with`");
+
+        let (stdout, _) = run_autumn(&project, &["plugin", "remove", plugin]);
+        assert!(stdout.contains(&format!("Removed {plugin}")), "{stdout}");
+        cargo_check("after `autumn plugin remove`");
+
+        let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+        let value: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        let check = value["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "plugin_residue")
+            .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+        assert_eq!(check["status"], "pass", "{plugin}: {stdout}");
+    }
+}
+
+/// AC #2: `--drop-data` never drops without a confirmation, and a
+/// non-interactive stdin is a refusal — never an assumed yes. Nothing is
+/// changed: not the code, not the database.
+#[test]
+fn plugin_remove_drop_data_refuses_without_a_confirmation() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-noconfirm");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    // A reachable-looking Postgres URL so the command gets as far as the
+    // confirmation instead of stopping at "no database configured".
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["plugin", "remove", "autumn-media-plugin", "--drop-data"])
+        .current_dir(&project)
+        .env("DATABASE_URL", "postgres://localhost/definitely-not-here")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run autumn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("needs a confirmation"), "{stderr}");
+    assert!(stderr.contains("Aborted"), "{stderr}");
+
+    // The confirmation comes BEFORE the edits, so a refusal leaves the app
+    // exactly as it was.
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC #2/#3: `--drop-data --dry-run` prints the exact statements and touches
+/// neither the files nor the database.
+#[test]
+fn plugin_remove_drop_data_dry_run_prints_the_statements_and_writes_nothing() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-dry");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let main_before = fs::read_to_string(project.join("src/main.rs")).unwrap();
+
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args([
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--dry-run",
+        ])
+        .current_dir(&project)
+        .env("DATABASE_URL", "postgres://localhost/definitely-not-here")
+        .output()
+        .expect("failed to run autumn");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("DROP TABLE IF EXISTS media_rooms"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("__diesel_schema_migrations"), "{stdout}");
+    assert!(stdout.contains("database was not touched"), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        main_before
+    );
+}
+
+/// AC #2: with no database configured there is nothing to connect to, so the
+/// statements are printed instead — and the exit code says so, since a script
+/// must not read "printed for you" as "dropped".
+#[test]
+fn plugin_remove_drop_data_without_a_database_prints_the_statements() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-nodb");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--yes",
+        ],
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("DROP TABLE IF EXISTS media_rooms"),
+        "{stderr}"
+    );
+    // Nothing at all was changed — not the database, and not the code either.
+    assert!(stderr.contains("database is untouched"), "{stderr}");
+    assert!(stderr.contains("still\nwired"), "{stderr}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main_rs.contains("MediaPlugin::new()"), "{main_rs}");
+}
+
+/// `--drop-data` needs a declared migration/table list, which only first-party
+/// plugins carry. A community crate is refused before anything is planned.
+#[test]
+fn plugin_remove_drop_data_refuses_a_community_crate_before_editing() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-community");
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    let (_stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "plugin",
+            "remove",
+            "autumn-plugin-live-feed",
+            "--drop-data",
+            "--yes",
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("community crate"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// AC #4: a dependency declared in a shape the manifest rewriter will not
+/// touch is left alone, said so, and exits with the "there is still work for
+/// you" code rather than a bare success.
+#[test]
+fn plugin_remove_leaves_an_uneditable_dependency_and_says_so() {
+    let (_tmp, project) = fresh_project("plugin-remove-subtable");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        format!("{cargo}\n[dependencies.autumn-admin-plugin]\nversion = \"0.7.0\"\n"),
+    )
+    .unwrap();
+    let cargo_before = fs::read_to_string(&cargo_path).unwrap();
+
+    let (stdout, stderr, code) =
+        run_autumn_failing(&project, &["plugin", "remove", "autumn-admin-plugin"]);
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("Delete it by hand"), "{stdout}");
+    // Left byte-identical rather than half-rewritten into something Cargo
+    // cannot parse.
+    assert_eq!(fs::read_to_string(&cargo_path).unwrap(), cargo_before);
+}
+
+/// AC #7: a community `autumn-plugin-*` dependency with no mount is residue
+/// too, and gets advice that matches how community plugins actually install.
+#[test]
+fn doctor_reports_an_unmounted_community_dependency_as_residue() {
+    let (_tmp, project) = fresh_project("doctor-residue-community");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        cargo.replace(
+            "[dependencies]",
+            "[dependencies]\nautumn-plugin-live-feed = \"0.3.1\"",
+        ),
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "warn", "{stdout}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("autumn-plugin-live-feed") && d.contains("README")),
+        "{stdout}"
+    );
+}
+
+/// A builder that lives outside `src/main.rs` — the shape `plugin add`'s own
+/// manual fallback tells users to write — is a correctly wired app, and must
+/// not be warned at (which under `--strict` would fail their CI).
+#[test]
+fn doctor_finds_no_residue_when_the_builder_lives_outside_main_rs() {
+    let (_tmp, project) = fresh_project("doctor-residue-elsewhere");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        cargo.replace(
+            "[dependencies]",
+            "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/app_builder.rs"),
+        "pub fn build() {\n    autumn_web::app().plugin(autumn_admin_plugin::AdminPlugin::new());\n}\n",
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "pass", "{stdout}");
+}
+
+/// Codex review (AC #6): a `--starter` brings its own `Cargo.toml`, which may
+/// pin a different `autumn-web` series than this CLI. That pin is not knowable
+/// until the starter is fetched, so the version answer arrives after the app
+/// exists — and it must read as "the app was created, the plugin was not
+/// wired", not as a bare failure. The starter itself is left complete and
+/// untouched.
+#[test]
+fn new_with_on_an_incompatible_starter_reports_an_unwired_plugin() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let starter = tmp.path().join("old-starter");
+    fs::create_dir_all(starter.join("src")).unwrap();
+    fs::write(
+        starter.join("autumn-starter.toml"),
+        "[starter]\nname = \"old\"\ndescription = \"pins an older autumn-web\"\n",
+    )
+    .unwrap();
+    fs::write(
+        starter.join("Cargo.toml.tmpl"),
+        "[package]\nname = \"{{project_name}}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nautumn-web = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(
+        starter.join("src/main.rs"),
+        "#[autumn_web::main]\nasync fn main() {\n    let app = autumn_web::app()\n        .routes(routes![index]);\n    app.run().await;\n}\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_autumn_failing(
+        tmp.path(),
+        &[
+            "new",
+            "starter-app",
+            "--starter",
+            starter.to_str().unwrap(),
+            "--yes",
+            "--with",
+            "autumn-admin-plugin",
+        ],
+    );
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("was not wired"), "{stderr}");
+    assert!(stderr.contains("autumn plugin add"), "{stderr}");
+
+    // The starter scaffolded completely; only the plugin is absent.
+    let project = tmp.path().join("starter-app");
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("autumn-web = \"0.1.0\""), "{cargo}");
+    assert!(!cargo.contains("autumn-admin-plugin"), "{cargo}");
+    let main_rs = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(!main_rs.contains("AdminPlugin"), "{main_rs}");
+}
+
+/// An unknown `--with` name is still refused before the starter is fetched:
+/// that half of the preflight does not need the starter's manifest.
+#[test]
+fn new_with_rejects_an_unknown_plugin_before_fetching_a_starter() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_stdout, stderr, code) = run_autumn_failing(
+        tmp.path(),
+        &[
+            "new",
+            "doomed-starter-app",
+            "--starter",
+            "saas",
+            "--yes",
+            "--with",
+            "tokio",
+        ],
+    );
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("autumn plugin list"), "{stderr}");
+    assert!(
+        !tmp.path().join("doomed-starter-app").exists(),
+        "a rejected --with must not leave a scaffolded project"
+    );
+}
+
+/// Codex review: a mount that cannot be excised means the plugin is still
+/// wired. Dropping the tables it is about to read would break a running app —
+/// and confirming a destructive step that then silently does nothing is worse.
+/// Nothing is asked, and nothing is changed.
+#[test]
+fn plugin_remove_drop_data_is_not_confirmed_when_the_mount_cannot_be_excised() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-manual");
+    run_autumn(
+        &project,
+        &["plugin", "add", "autumn-media-plugin", "--offline"],
+    );
+    let main_path = project.join("src/main.rs");
+    // A mount built into a variable: real, and not excisable by this command.
+    let custom = "#[autumn_web::main]\nasync fn main() {\n    let configured = autumn_media_plugin::MediaPlugin::new();\n    autumn_web::app()\n        .plugin(configured)\n        .run()\n        .await;\n}\n";
+    fs::write(&main_path, custom).unwrap();
+    let cargo_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    let (stdout, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--yes",
+        ],
+    );
+    assert_eq!(code, Some(2), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("No files were changed"), "{stderr}");
+    assert!(stderr.contains("--drop-data was not applied"), "{stderr}");
+    // The SQL must never have been presented as something about to run.
+    assert!(
+        !stdout.contains("will run these"),
+        "a drop must not be announced on this path:\n{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&main_path).unwrap(), custom);
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        cargo_before
+    );
+}
+
+/// Codex review (AC #3): the plugin is already unwired but its tables remain.
+/// No file would move, so the file-level check alone would exit 0 — telling a
+/// script the cleanup is finished while a real run still drops data.
+#[test]
+fn plugin_remove_drop_data_dry_run_exits_three_for_database_only_work() {
+    let (_tmp, project) = fresh_project("plugin-remove-drop-dbonly");
+    // Never installed: nothing to unwire, but the plugin owns tables.
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args([
+            "plugin",
+            "remove",
+            "autumn-media-plugin",
+            "--drop-data",
+            "--dry-run",
+        ])
+        .current_dir(&project)
+        .env("DATABASE_URL", "postgres://localhost/definitely-not-here")
+        .output()
+        .expect("failed to run autumn");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(3), "{stdout}");
+    assert!(stdout.contains("not installed"), "{stdout}");
+    assert!(
+        stdout.contains("DROP TABLE IF EXISTS media_rooms"),
+        "{stdout}"
+    );
+}
+
+/// Codex review (AC #7): an app whose builder lives in an explicitly-pathed
+/// Cargo target is correctly wired. Reporting it as "declared but never
+/// mounted" would fail `autumn doctor --strict` on a valid project.
+#[test]
+fn doctor_finds_no_residue_when_the_builder_lives_in_a_custom_target() {
+    let (_tmp, project) = fresh_project("doctor-residue-custom-target");
+    let cargo_path = project.join("Cargo.toml");
+    let cargo = fs::read_to_string(&cargo_path).unwrap();
+    fs::write(
+        &cargo_path,
+        format!(
+            "{}\n[[bin]]\nname = \"server\"\npath = \"cmd/server.rs\"\n",
+            cargo.replace(
+                "[dependencies]",
+                "[dependencies]\nautumn-admin-plugin = \"0.7.0\"",
+            )
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(project.join("cmd")).unwrap();
+    fs::write(
+        project.join("cmd/server.rs"),
+        "fn main() {\n    autumn_web::app().plugin(autumn_admin_plugin::AdminPlugin::new());\n}\n",
+    )
+    .unwrap();
+
+    let (stdout, _stderr, _code) = run_autumn_failing(&project, &["doctor", "--json"]);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let check = value["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "plugin_residue")
+        .unwrap_or_else(|| panic!("plugin_residue missing from {stdout}"));
+    assert_eq!(check["status"], "pass", "{stdout}");
 }
