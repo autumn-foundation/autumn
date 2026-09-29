@@ -153,6 +153,10 @@ READER_VOCABULARY = (
      (r'\bsign[- ]?up\b',)),
     ('password reset', 'docs/guide/authentication.md',
      (r'\bforgot[- ]password\b', r'\bpassword reset\b|\breset password\b')),
+    ('passwordless sign-in (magic link)', 'docs/guide/authentication.md',
+     (r'\bpasswordless\b', r'\bmagic[- ]link\b', r'\bmagic link\b')),
+    ('passkeys / WebAuthn', 'docs/guide/authentication.md',
+     (r'\bpasskey', r'\bwebauthn\b')),
     ('OAuth sign-in', 'docs/guide/oauth.md', (r'\boauth\b',)),
     ('CSRF protection', 'docs/guide/middleware.md', (r'\bcsrf\b',)),
     ('CORS', 'docs/guide/middleware.md', (r'\bcors\b',)),
@@ -167,6 +171,8 @@ READER_VOCABULARY = (
     ('database migrations', 'docs/guide/migrations.md', (r'\bmigration',)),
     ('testing', 'docs/guide/testing.md', (r'\btest',)),
     ('deployment', 'docs/guide/deployment.md', (r'\bdeploy',)),
+    ('liveness / readiness probes', 'docs/guide/cloud-native.md',
+     (r'\bliveness probe\b', r'\breadiness probe\b', r'\bstartup probe\b')),
 )
 
 PERCENT_ESCAPE = re.compile(r'%[0-9A-Fa-f]{2}')

@@ -46,7 +46,7 @@ quarantine, per the rule above.
 
 ## Open entries
 
-_None as of 2026-09-05._
+None.
 
 ## Closed entries
 
@@ -1380,6 +1380,38 @@ _None as of 2026-09-05._
   Match the harness to how CI actually runs the binary before reading a clean
   result as evidence.
 
+- **2026-09-24 verification — fix holding, 0 new recurrences.** Sampled
+  `ci.yml` `pull_request` runs across the ~14.2h following PR #2925's merge
+  (2026-09-23T19:33:05Z through 2026-09-24T09:42:24Z — the tail end of the
+  broader ~37.85h window described in the `live_upgrade` entry's 2026-09-24
+  dated update below, most of which predates the merge). One hit of this
+  test's own failure signature was found in that broader window (run
+  35866381449, branch `claude/sleepy-brown-7ke3xk`, job completed
+  2026-09-23T13:36:52Z), but that completion time is ~6 hours **before** the
+  fix's merge, and outside the ~14.2h post-merge window this verification
+  actually covers — it is the same pre-fix occurrence this entry's own
+  reproduction campaign already accounts for, not a new recurrence. Zero
+  hits among the `success`/`failure`-concluded runs in the ~14.2h sampled
+  after the merge.
+  **Correction (post-review, via a Codex review comment on PR #2942): an
+  earlier version of this note and the corresponding `live_upgrade` update
+  below misstated the post-merge verification interval as "~38h," which was
+  the full sampling window's span, not the portion after the merge.**
+  **Second correction (post-review, via a further Codex review comment on PR
+  #2942): the "zero hits" claim was not scoped to what was actually
+  inspected.** `ci.yml`'s `concurrency.cancel-in-progress: true` (lines 9-11)
+  means a job inside a `cancelled`-overall run can still have completed with
+  a failing test before the run itself was marked cancelled by a superseding
+  push. The cancelled runs inside the post-merge window were not inspected
+  at job level this pass, so this verification covers only the
+  `success`/`failure`-concluded runs in that window, not an exhaustive sweep
+  of every job that ran.
+- **2026-09-25 verification — still holding, 0 new recurrences.** All 6
+  `Test (Docker)`-family failures found in this pass's sampling (see the
+  `live_upgrade` entry's 2026-09-25 dated update, and the new **Open
+  entries** section above) are the newly-quarantined `quay.io/minio/minio`
+  outage; none carry this test's own signature. Same cancelled-run and
+  reliable-window caveats as every prior verification note apply.
 
 ## Under active investigation, not yet quarantined
 
@@ -2103,6 +2135,138 @@ without also filling in the intake form above.
   2026-09-22T~10:1xZ — **14th** straight idle pass (now ~330.5 hours idle,
   past 13.75 days). Still needs a human sign-off for new macOS CI spend;
   not dispatched this pass for that reason.
+- **2026-09-23 update — 15th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs from the 2026-09-22 report's own cutoff
+  (2026-09-22T06:24:50Z, exclusive) to 2026-09-23T07:37:08Z (~25.2h, one
+  no-filter `status=completed` query, `perPage=100`/page 1, span
+  2026-09-21T18:16:27Z–2026-09-23T07:37:08Z, fully covering the window with
+  margin) — 58 `pull_request` runs in-window: 27 success, 24 cancelled, 7
+  failure. All 7 triaged (full detail in the `sqlite_jobs_scheduler_e2e`
+  entry's own 2026-09-23 update below, not repeated here): one
+  `dependabot/github_actions/dtolnay/rust-toolchain-1.120.0` repeat of its
+  already-documented action-pin break; five ordinary branch-owned `Lint`/
+  `MSRV`/`Diesel migration version collisions` WIP failures across five
+  `vesper/bugbash-*` branches (2312, 2363, 2419, 2331, 2311 — see the
+  `sqlite_jobs_scheduler_e2e` entry's own update for the corrected
+  per-branch breakdown); and one genuine new organic
+  hit — but on `sqlite_jobs_scheduler_e2e`, not on any `live_upgrade`,
+  `cache_stampede`, or `sim_fault_plan` signature. None of the 7 match this
+  entry. **Coverage gap, flagged post-review (via a Codex review comment on
+  this update, after the next day's #2942 pass had already established the
+  same gap for its own sample): this "zero new hits" finding is scoped to
+  the 34 runs that resolved to `success`/`failure` and were actually
+  triaged, not a proven-exhaustive zero-hit finding across the full 58-run
+  window.** `ci.yml`'s `concurrency.cancel-in-progress: true` means a job
+  inside one of the 24 `cancelled`-overall runs could still have completed
+  with a failing test before the run itself was marked cancelled by a
+  superseding push; those runs' job-level logs were not inspected this
+  pass. `manual-macos-contention-check.yml`: still `total_count: 0`,
+  checked 2026-09-23T~07:5xZ — **15th** straight idle pass (now ~352.9
+  hours idle, past 14.7 days). Still needs a human sign-off for new macOS
+  CI spend; not dispatched this pass for that reason.
+- **2026-09-24 update — 15th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures.** Sampled
+  `ci.yml` `pull_request` runs, page 1 of `list_workflow_runs`
+  (`event=pull_request`, `status=completed`, `perPage=100`): 100 runs
+  spanning 2026-09-22T19:51:14Z–2026-09-24T09:42:24Z (~37.85h) — 64
+  cancelled, 32 success, 4 failure. **Coverage gap, recorded rather than
+  hidden**: page 2 of the identical query returned runs from
+  2026-09-07–2026-09-09 instead of continuing backward from page 1's start,
+  and `total_count` itself differed between the two calls (9315 vs. 7616) —
+  the API's pagination did not behave as a stable continuation this pass, so
+  the ~13.4h gap between this window's start and the 2026-09-22 report's own
+  cutoff (2026-09-22T06:24:50Z–19:51:14Z) was not independently sampled.
+  **Second coverage gap (post-review, via a Codex review comment on PR
+  #2942): only the runs that resolved to `failure` were triaged.** `ci.yml`'s
+  `concurrency.cancel-in-progress: true` (lines 9-11) means a job inside one
+  of the 64 `cancelled`-overall runs could still have completed with a
+  failing test before the run itself was marked cancelled by a superseding
+  push. Those 64 runs' job-level logs were not inspected this pass, so the
+  "zero new hits" findings below are scoped to the 36 runs that resolved to
+  `success`/`failure` and were actually checked — not a proven-exhaustive
+  zero-hit finding across the full 100-run window (the same caveat this
+  ledger's 2026-09-15 update already established as this role's working
+  standard when cancelled-run job-level sampling isn't repeated).
+  All 4 in-window failures triaged at job/log level:
+  - Run 35909966810 (`vesper/bugbash-2881-busy-timeout-shared-cache`,
+    `SQLite runtime (feature=sqlite)`, 2026-09-23T19:32:07Z): `E0061`,
+    `reject_sqlite_statement_timeout` called with 1 argument instead of 2 at
+    `autumn/src/app.rs:11164` and `:11248` — that branch's own in-progress
+    statement-timeout work, unmerged, not a flake.
+  - Run 35894739084 (`vesper/bugbash-2921-create-project-submit-token`,
+    `Lint`/`Test suite`, 2026-09-23T17:18:51Z): `E0308`,
+    `extract_submit_token` expects `&str`, given `String`, at
+    `examples/saas/tests/integration_test.rs:574` — that branch's own
+    submit-token test helper, unmerged, not a flake.
+  - Run 35866381449 (`claude/sleepy-brown-7ke3xk`, `SQLite runtime
+    (feature=sqlite)`, 2026-09-23T13:20:28Z):
+    `sqlite_job_backend_tracks_job_status_durably` FAILED — the exact
+    signature closed above, but this job completed 2026-09-23T13:36:52Z, ~6
+    hours **before** PR #2925's merge (`ff406e0`, 2026-09-23T19:33:05Z). The
+    same pre-fix occurrence the closed entry's own campaign already
+    accounts for, not a new recurrence.
+  - Run 35806829348
+    (`dependabot/github_actions/dtolnay/rust-toolchain-1.120.0`,
+    `MSRV`/`Test (macos-latest)`/`Test (ubuntu-latest)`/
+    `Test (windows-latest)`/`Test suite`, 2026-09-23T01:34:17Z): `rustup`
+    failed installing toolchain `1.120.0` itself — that PR's own subject
+    matter (the pin bump), unmerged.
+
+  None of the 4 match `live_upgrade`, `cache_stampede`, `sim_fault_plan`, or
+  any other tracked signature. **`sqlite_job_backend_tracks_job_status_durably`'s
+  fix (PR #2925) is holding**: zero recurrences among the `success`/
+  `failure`-concluded runs in the ~14.2h of PR traffic sampled since its
+  2026-09-23T19:33:05Z merge, out of this pass's broader ~37.85h window (see
+  the closed entry's own 2026-09-24 verification note above, including its
+  cancelled-run caveat).
+
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-24T~09:5xZ — **15th** straight
+  idle pass since it became dispatchable 2026-09-08T15:07:44Z (now ~378.6
+  hours idle, past 15.77 days). Still needs a human sign-off for new macOS CI
+  spend; not dispatched this pass for that reason.
+- **2026-09-25 update — 16th consecutive pass, harness still undispatched;
+  zero new hits on any of the three `live_upgrade` signatures, but this
+  pass's sampling was dominated by a single unrelated infra outage.**
+  `list_workflow_runs(event=pull_request)` at `perPage=100` (with or without
+  `status=completed`) consistently returned a stale page (runs from
+  2026-09-03/04, not current) this pass, worse than the prior pass's
+  page-2 issue — reducing `perPage` to 30 with no `status` filter returned
+  current data reliably, at page 1 only (page 2 again jumped back to
+  2026-09-03). Sampled that reliable window: 30 `ci.yml` `pull_request`
+  runs spanning 2026-09-24T20:21:13Z-2026-09-25T08:05:14Z (~11.7h) — 5
+  failures, all 5 triaged at job/log level. **Coverage gap, recorded rather
+  than hidden**: the ~10.6h between this window's start and the prior
+  pass's own cutoff (2026-09-24T09:42:24Z-20:21:13Z) was not independently
+  sampled — the `perPage=100`/`status=completed` staleness left no reliable
+  way to reach it this pass. Cancelled runs inside the sampled window were
+  also not inspected at job level (same caveat as every prior pass since
+  2026-09-15).
+
+  **All 5 failures — plus this repo's own `trunk-dev` push of the prior
+  pass's PR (#2942, run 36004498723, completed 2026-09-24T15:32:51Z) — hit
+  the identical new signature**, a total, deterministic `quay.io/minio/minio`
+  anonymous-pull outage recurring against the fallback registry the closed
+  MinIO/Docker-Hub entry's own fix (#2740) switched to; see the new **Open
+  entries** section above for the full diagnosis, evidence, and this pass's
+  quarantine fix. None of the 6 failures match `live_upgrade`,
+  `cache_stampede`, `sim_fault_plan`, `job_tracking_stores_integration`, or
+  `sqlite_job_backend_tracks_job_status_durably` — this pass found zero
+  organic hits on any of those, but the sample is unusually uninformative
+  for that purpose: with `Test (Docker)` failing on essentially every run
+  that reached it, a live_upgrade/cache_stampede/sim_fault_plan hit inside
+  the same run would still show as a `Test (Docker)`-attributed failure
+  unless separately checked — and the failing runs sampled here reached
+  their MinIO panic well before the point in the suite those three
+  Linux/coverage-shaped signatures fire from, so a concurrent hit hiding
+  behind this outage in-window cannot be ruled out from these 6 alone.
+
+  `manual-macos-contention-check.yml`: still `total_count: 0` against
+  `workflow_dispatch` runs, checked 2026-09-25T~10:2xZ — **16th** straight
+  idle pass since it became dispatchable 2026-09-08T15:07:44Z (now ~403
+  hours idle, past 16.8 days). Still needs a human sign-off for new macOS CI
+  spend; not dispatched this pass for that reason.
 - **Next step**: the Tier 1 load-faithful rerun campaign (10+ fresh
   `macos-latest` VMs, pinned commit, unfiltered `cargo test --workspace`) —
   committed as `.github/workflows/manual-macos-contention-check.yml`, gated
@@ -2144,6 +2308,21 @@ without also filling in the intake form above.
   address the new line-567 signature above regardless (different assertion
   entirely). Track it against the rerun campaign above before treating this
   entry as resolved — "merged" is not the same as "verified."
+- **2026-09-28 update — another organic hit, same tracked line-686
+  signature, `Coverage (workspace)`/Linux.** Run 36393954592
+  (`claude/busy-cerf-qydnb2`, PR #2987, job id 108869635633, completed
+  2026-09-28T09:46:33Z): `test result: FAILED. 5 passed; 1 failed` in
+  `live_upgrade.rs`, panic at
+  `examples/hot-upgrade/tests/live_upgrade.rs:686:5` (the exact site
+  already tracked above, run through `MultiThread::block_on` this time —
+  the triggering PR's own commit switched an unrelated test,
+  `search_plugin_integration`, to a multi-thread runtime to fix a
+  different, already-diagnosed deadlock; `live_upgrade`'s own harness was
+  untouched by that PR and this is a coincidental same-day neighbor, not a
+  side effect of that fix). Not campaigned this pass (still no
+  CI-native rerun harness dispatched for this signature — same gap the
+  2026-09-10 update above already named). Recorded as a data point only;
+  no new mechanism claim beyond what is already tracked.
 
 ### `cache_stampede::swr_serves_stale_and_refreshes_in_background`
 
@@ -2185,6 +2364,16 @@ without also filling in the intake form above.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method).
+- **2026-09-23 update**: no repeat in the ~25.2h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-23 dated update above for the
+- **2026-09-24 update**: no repeat in the ~37.85h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-24 dated update above for the
+  window and method).
+- **2026-09-25 update**: no repeat in the ~11.7h reliable window sampled this
+  pass (see the `live_upgrade` entry's 2026-09-25 dated update above for the
+  window, method, and the caveat that a `quay.io/minio/minio` outage
+  dominated every in-window failure and left the sample less informative
+  than usual for this signature specifically).
 
 ### `sim_fault_plan::same_seed_replays_a_byte_identical_outcome_100_times`
 
@@ -2218,6 +2407,17 @@ without also filling in the intake form above.
 - **2026-09-22 update**: no repeat in the ~20.5h window sampled this pass
   (see the `live_upgrade` entry's 2026-09-22 dated update above for the
   window and method). Still n=1, still not campaigned.
+- **2026-09-23 update**: no repeat in the ~25.2h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-23 dated update above for the
+- **2026-09-24 update**: no repeat in the ~37.85h window sampled this pass
+  (see the `live_upgrade` entry's 2026-09-24 dated update above for the
+  window and method). Still n=1, still not campaigned.
+- **2026-09-25 update**: no repeat in the ~11.7h reliable window sampled this
+  pass (see the `live_upgrade` entry's 2026-09-25 dated update above for the
+  window, method, and the caveat that a `quay.io/minio/minio` outage
+  dominated every in-window failure and left the sample less informative
+  than usual for this signature specifically). Still n=1, still not
+  campaigned.
 
 `sqlite_jobs_scheduler_e2e::sqlite_job_backend_tracks_job_status_durably` was
 opened here 2026-09-21 and **closed 2026-09-23** — see its entry under "Closed
@@ -2228,4 +2428,283 @@ repeated here.
 opened here 2026-09-21 (n=1, mechanism unconfirmed) and **closed the same
 week** — see its entry under "Closed entries" above for the full diagnosis,
 measured fix, and verification; not repeated here.
+
+
+### (quay.io, 2026-09-25) `offsite_backup::offsite_backup_upload_then_restore_round_trips` / `offsite_backup::offsite_backup_uploads_large_artifact_via_multipart` / `sqlite_replication_s3::replicates_to_and_restores_from_a_real_s3_endpoint`
+
+- **Quarantined**: 2026-09-25 in #2953.
+- **Owner**: @madmax983 (repo owner) — the fix needs a business/infra decision
+  (pay for authenticated `quay.io` pulls, or stand up and maintain a
+  self-hosted/mirrored MinIO image) that this role cannot make unilaterally
+  per its own "ask before: new CI spend" rule. Not the person who diagnosed
+  it (this pass); the person on the hook for the remediation decision.
+- **Diagnose-by**: N/A — mechanism is confirmed, not pending (see below).
+  **Revisit-by**: 2026-10-02 — check whether `quay.io/minio/minio` anonymous
+  pulls have been restored, or whether a decision has been made, before this
+  entry goes stale.
+- **Rerun-rate baseline**: not applicable in the stochastic sense — this is a
+  deterministic, 100% external-dependency outage, not a flake. 6/6 `Test
+  (Docker)` failures carry the identical signature in the ~12h window sampled
+  before this quarantine (2026-09-24T20:21:13Z-2026-09-25T09:09Z): 5
+  independent PRs (`claude/tender-galileo-q43orv`, `claude/busy-cerf-0i7k5y`,
+  `claude/friendly-ritchie-nv7uw7`, `claude/wizardly-wright-dyva9u`,
+  `claude/brave-goldberg-h3c4cr`) plus this repo's own `trunk-dev` push of the
+  2026-09-24 Semaphore follow-up (#2942, run 36004498723, a docs-only ledger
+  PR with zero code changes — confirming the failure tracks the external
+  dependency, not any PR's own diff). No PR in the sampled window that
+  reached the `Test (Docker)` job passed it.
+- **Failure signature**: panic `` start MinIO — is Docker running?:
+  Client(PullImage { descriptor: "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z",
+  err: DockerResponseServerError { status_code: 500, message: "unauthorized:
+  access to the requested resource is not authorized" } }) `` at
+  `autumn-cli/tests/integration/offsite_backup.rs:82:10` (and the identical
+  shape at `autumn/tests/integration/sqlite_replication_s3.rs`'s own
+  `MinIO::default()` call site).
+- **Mechanism**: unpinned/vanished external dependency — the same category as
+  the closed MinIO/Docker-Hub entry above, recurring against the fallback
+  that entry's own fix (#2740) switched to. Confirmed directly, not inferred
+  from the CI error text alone: an anonymous `quay.io/v2/auth` token request
+  for `repository:minio/minio:pull` succeeds (200) but the returned JWT's
+  `access` grant carries `"actions":[]` — empty, no `pull` — and a manifest
+  GET against `quay.io/v2/minio/minio/manifests/RELEASE.2025-09-07T16-13-09Z`
+  with that token still 401s (`www-authenticate: Bearer ...`). The identical
+  probe against an unrelated public quay.io repo, `quay.io/prometheus/prometheus`,
+  returns a normal 200 with a real manifest — so this is scoped to
+  `minio/minio` specifically, not a quay.io-wide policy change or outage.
+  MinIO Inc.'s own repository page (`quay.io/repository/minio/minio`, the web
+  UI, not the registry API) still returns 200, so the repository exists and
+  is browsable; only anonymous registry pulls are cut off. This is the same
+  vendor that deleted its Docker Hub org outright in October 2025 (see the
+  closed entry above) now also closing off the last public registry this
+  repo's tests depended on.
+- **Test-vs-product**: neither — pure external CI/test infrastructure
+  dependency (a third-party vendor's container distribution policy), no
+  product code path is implicated, the same classification as every other
+  "unpinned external service" entry in this ledger.
+- **Remediation attempted, not found**: searched for a still-anonymously-pullable
+  MinIO-compatible replacement image before quarantining rather than after.
+  `docker.io/minio/minio` remains gone (the October 2025 org deletion, see
+  above — not re-checked in depth this pass since nothing suggests it
+  returned). `docker.io/bitnami/minio`: Docker Hub's own repository API
+  reports it `"is_private": false` and `"status": "active"` with 58M+
+  historical pulls, but its registry tags list (`GET
+  /v2/bitnami/minio/tags/list`, both with and without a token, and via
+  `hub.docker.com`'s own tags API) returns zero tags — consistent with
+  Broadcom's 2025 Bitnami Secure Images move, which pulled free-tier tags
+  behind a paid catalog while leaving the repository shell/description in
+  place. `ghcr.io/minio/minio` and `public.ecr.aws/minio/minio` both 401.
+  No further candidates were tried this pass. A working replacement, if one
+  exists, was not found by registry-probing alone — this may need the
+  vendor's own current documentation (unavailable to check further in this
+  pass) or a self-hosted mirror.
+- **Fix, not applied — quarantined instead, per the "ask before: new CI
+  spend" rule and because no Docker daemon is available in this sandbox to
+  verify a replacement image's compatibility with `testcontainers_modules::minio::MinIO`'s
+  wait strategy and env-var expectations before committing to one.** Swapping
+  registries blind, a second time, risks repeating the multi-PR collision
+  the first swap caused (see the escape entry above) — and this time there
+  is no confirmed working target to swap to. Instead: `--skip
+  offsite_backup_upload_then_restore_round_trips --skip
+  offsite_backup_uploads_large_artifact_via_multipart` added to `ci.yml`'s
+  `cli_tests` bare `--ignored` sweep, and `--skip
+  replicates_to_and_restores_from_a_real_s3_endpoint` added to the
+  `integration_tests` sweep — both by exact test name, the same convention
+  this repo already uses for the non-Docker generator-conformance skips in
+  the same block (CLAUDE.md's "Docker / testcontainer DB tests run
+  automatically in CI" section). This is quarantine, not deletion: the tests
+  are untouched, still compile, and still run for anyone with Docker and
+  working `quay.io` credentials locally.
+- **Not covered by this quarantine**: `examples/reddit-clone/tests/avatar_s3_integration.rs`'s
+  `avatar_blob_store_roundtrip` — same `MinIO::default().with_name(MINIO_IMAGE)`
+  call site, same outage, but (per the closed MinIO entry above) this test
+  was never part of either CI Docker sweep to begin with, so no `ci.yml`
+  change is needed to stop it from failing CI; it simply fails identically
+  whenever anyone runs it directly.
+- **Impact while open**: this fails the required `Test (Docker)` job — and
+  therefore the required `Test suite` (`test-gate`) aggregator — on every PR
+  whose run reaches that job, independent of the PR's own diff, until this
+  quarantine merges. Given the ~12h/6-for-6 sampling above, that was
+  effectively every PR reaching the Docker sweep in that window.
+- **Linked issue/PR**: none filed separately — tracked here and in #2953,
+  which is the fix (the quarantine) as well as the diagnosis.
+- **Skip mechanism**: `ci.yml`'s `cli_tests` and `integration_tests` bare
+  `--ignored` sweeps, `--skip <exact test name>`, chosen over `#[ignore]`ing
+  the test bodies themselves so the quarantine is visible and reversible in
+  one place (this ledger entry names both `ci.yml` lines) rather than
+  scattered across test source files.
+- **Resolution**: switched every `MinIO` call site to Chainguard's free
+  `cgr.dev/chainguard/minio` image, pinned by digest, and removed the three
+  `--skip` lines. It is the upstream `minio` binary with the same entrypoint,
+  so `testcontainers_modules::minio::MinIO`'s command, `minioadmin`
+  credentials and wait strategy work unchanged. The image has no `EXPOSE`, so
+  each call site publishes port 9000 with `.with_mapped_port(0, 9000.tcp())`.
+  Anonymous pulls need no
+  account or secret. Chainguard's free tier serves only the `latest` tag, but
+  it keeps old digests pullable, so the pin holds. Verified by running all
+  three tests plus the reddit-clone avatar test against a local Docker daemon
+  before the push. Candidates that failed an anonymous pull on 2026-09-26:
+  `quay.io/minio/minio` (401), `docker.io/minio/minio` (gone),
+  `ghcr.io/minio/minio` (denied), `mirror.gcr.io/minio/minio` (not found).
+  `docker.io/bitnamilegacy/minio` pulls, but it is frozen and has a different
+  entrypoint.
+- **Closed**: 2026-09-26, in the PR that restores the tests.
+### `Windows Tier 1 journey`: `autumn setup` fails "✗ Failed to read cargo metadata" against a freshly-scaffolded app
+
+- **New, 2026-09-27. n=2 organic, identical signature, ~32h apart, on two
+  unrelated branches.** Run 108204416273 (`vesper/bugbash-2288-commentable-author-name`,
+  2026-09-25T18:52:29Z) and run 108534929493 (`vesper/bugbash-2415-multipart-type-case`,
+  2026-09-27T02:41:46Z) both fail the `Windows Tier 1 journey` job's `autumn
+  setup` step against the scaffolded `tier1_app`, immediately after the
+  preceding `autumn doctor` step completed normally (29 passed/4 warned/1
+  failed — only the expected pre-setup `tailwind_binary` warning). Identical
+  output both times: `✗ Failed to read cargo metadata`, then the PowerShell
+  wrapper's `if ($LASTEXITCODE -ne 0) { throw "autumn setup failed with
+  $LASTEXITCODE" }` step throws `autumn setup failed with 1`. Neither
+  triggering branch's own diff touches Windows-specific code, `autumn setup`,
+  or `autumn-cli`'s cargo-metadata helpers — both are unrelated feature
+  branches (a `commentable` author-name fix, a multipart type-case fix).
+- **Mechanism: unconfirmed — this is itself the finding.** `autumn setup`
+  (via `autumn-cli/src/build.rs:875`'s `read_cargo_metadata`, and the near-
+  identical helpers at `autumn-cli/src/routes.rs:280`/`autumn-cli/src/dev.rs:1916`)
+  ran `cargo metadata --format-version=1 --no-deps`, got a non-zero exit, and
+  the CI log shows only the helper's own generic `"✗ Failed to read cargo
+  metadata"` — **`cargo`'s own stderr was never captured or printed**, so
+  neither occurrence's actual cause (network/index-fetch failure resolving
+  the scaffolded app's fresh `Cargo.toml`, a disk/permission issue on the
+  Windows runner, a stale/inconsistent lockfile, or something else) is
+  visible in either run's log. This is the same class of gap the ledger
+  already flagged once before for this exact job (2026-09-22 update to the
+  `live_upgrade` entry's neighbor list: `claude/intelligent-wright-vvhnue`'s
+  `Windows Tier 1 journey` failure, whose logs 404'd and were "not
+  investigated further" — a different proximate cause, but the same
+  "Windows Tier 1 journey failed and nobody could see why" shape) — except
+  this time the log is readable and the helper itself, not log retention, is
+  what's hiding the cause.
+- **Test-vs-product: not yet renderable — the missing stderr is exactly what
+  a verdict needs.** `cargo metadata` failing against a scaffold this job
+  generates fresh every run could be a real product defect (something the
+  scaffolded `autumn.toml`/`Cargo.toml` template produces that `cargo`
+  rejects only intermittently, e.g. under Windows path-length or antivirus-
+  lock contention) or pure CI/runner infrastructure (a transient crates.io-
+  index fetch failure, disk pressure) — the two are indistinguishable from
+  the generic message alone, and guessing which is exactly the folklore this
+  role's own rules ban ("CI is flaky" is not a mechanism).
+- **Treatment, this pass: an observability fix, not a flake fix — the
+  distinction this role's own gate exists to enforce.** No rerun campaign, no
+  tolerance change, no retry. `read_cargo_metadata`/`find_binary_in_profile`/
+  `cargo_metadata` (`build.rs`, `routes.rs`, `dev.rs`) now print
+  `String::from_utf8_lossy(&output.stderr)` alongside the existing message
+  before exiting, so the next occurrence's actual `cargo` error lands in the
+  CI log instead of being discarded. `try_cargo_metadata`
+  (`dev.rs:1933`, the deliberately-silent best-effort path used by lifecycle
+  commands like `autumn serve stop`) is untouched — printing there would
+  defeat its own documented purpose of staying quiet on a broken manifest.
+  Verified with `cargo check -p autumn-cli`, `cargo fmt -p autumn-cli --
+  --check`, and `cargo clippy -p autumn-cli --all-targets -- -D warnings`,
+  all clean; no Windows runner available in this sandbox to reproduce the
+  original failure directly.
+- **Status**: open, n=2, mechanism unconfirmed. Not quarantined — `Windows
+  Tier 1 journey` keeps running on every PR unchanged; this only changes
+  what the next failure's log shows. Revisit once a third occurrence lands
+  with the new stderr output captured, or after ~2 weeks with zero repeats.
+- **Linked issue/PR**: none filed separately yet — the observability fix
+  lands directly in this ledger's own tracking PR, per this repo's
+  established convention for a diagnosability gap found mid-triage.
+- **Skip mechanism**: none — this is a tracked signature, not a quarantine.
+- **2026-09-28 update — mechanism confirmed, n=2→n=4, fix applied this
+  pass.** The stderr fix (#2973, merged 2026-09-27) paid off immediately:
+  two more organic occurrences, run 108821476268
+  (`vesper/bugbash-2662-parent-pk-override`, 2026-09-28T07:08:33Z) and run
+  108842089677 (`vesper/bugbash-2445-capacity-probe-count`,
+  2026-09-28T08:18:57Z), ~70 minutes apart on two unrelated branches, both
+  now show the actual `cargo` error the generic message was hiding:
+  ```
+  ✗ Failed to read cargo metadata
+  error: the 'cargo.exe' binary, normally provided by the 'cargo' component, is not applicable to the '1.88.0-x86_64-pc-windows-msvc' toolchain
+  ```
+  Identical text both times.
+
+  **Mechanism, confirmed by source, not just the error string.** Every
+  scaffolded app's `rust-toolchain.toml` pins `channel = "1.88.0"`
+  literally — `autumn-cli/src/templates/rust-toolchain.toml.tmpl`:
+  `channel = "{{rust_version}}"`, substituted from `Cargo.toml`'s
+  `rust-version = "1.88.0"` (`autumn-cli/src/new.rs:227`,
+  `option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0")`) — a
+  *different* rustup toolchain identity than `"stable"`. The
+  `windows-tier1` job's own toolchain-install step
+  (`.github/workflows/ci.yml`, before this pass's fix) was
+  `dtolnay/rust-toolchain@stable`, which installs and names the toolchain
+  `stable-x86_64-pc-windows-msvc`, not `1.88.0-x86_64-pc-windows-msvc` —
+  even though `stable` currently resolves to rustc 1.88.0 (confirmed by
+  both failing runs' own `autumn doctor` output immediately above the
+  failure: `"rust_toolchain"` check passes with `"rustc 1.88.0 ≥ MSRV
+  1.88.0"`), rustup treats them as two distinct named toolchains. The
+  first `cargo`/`autumn` invocation inside the freshly-scaffolded
+  `tier1_app` directory (`autumn setup`, which shells out to `cargo
+  metadata` per `autumn-cli/src/build.rs:875`'s `read_cargo_metadata`) hits
+  that directory's `rust-toolchain.toml` override and makes rustup
+  auto-install the separate `1.88.0-x86_64-pc-windows-msvc` toolchain on
+  the fly — a network operation happening implicitly mid-command, with no
+  dedicated CI step, no retry, and no log visibility of its own. The `msrv`
+  job elsewhere in `ci.yml` avoids exactly this by installing
+  `dtolnay/rust-toolchain@1.88.0` directly; `windows-tier1` never did.
+  `"cargo.exe binary... not applicable to the toolchain"` is a known
+  rustup failure shape for a toolchain whose on-disk contents don't match
+  what its manifest claims — consistent with an on-demand install that
+  raced or partially completed under the same job that is simultaneously
+  building the full `autumn-web`/`managed-pg-bundled` dependency graph
+  (the LNK4318/PDB-limit comments already in this job's `env:` block
+  describe how resource-constrained this exact job already runs).
+
+  **Test-vs-product verdict: CI/build infrastructure, not a product or
+  test defect.** Nothing about `autumn setup`'s own logic, the scaffold's
+  generated `rust-toolchain.toml`, or the app it builds is wrong — pinning
+  the exact MSRV in every scaffolded project is deliberate, correct
+  behavior (the same file the `rust_toolchain_pins_channel_to_msrv` unit
+  test in `autumn-cli/src/new.rs` guards). The defect is entirely in this
+  one CI job's own toolchain provisioning: it installs `stable` for
+  itself and then lets a *different* pinned toolchain get resolved
+  implicitly, mid-journey, with no explicit install step.
+
+  **Fix, applied this pass**: `windows-tier1`'s toolchain step changed from
+  `dtolnay/rust-toolchain@stable` to `dtolnay/rust-toolchain@1.88.0` —
+  installing the exact toolchain the scaffolded app's own
+  `rust-toolchain.toml` will later request, so rustup never needs to
+  auto-install anything once the journey begins. This mirrors the `msrv`
+  job's own existing pattern one line above it in the same file, not a new
+  convention. No retry, no timeout change, no tolerance widened — the
+  on-demand install path is removed rather than made more forgiving.
+  Comment added at the change site records this diagnosis and the four
+  run IDs for the next person who touches this job.
+  **Verification**: `python3 -c "import yaml; yaml.safe_load(...)"`
+  confirms the edited `ci.yml` is still valid YAML; `actionlint` was not
+  available in this sandbox. No Windows runner available locally to
+  reproduce the original failure or to pre-verify the fix, so **CI-native
+  verification was pending this PR's own `Windows Tier 1 journey` run**,
+  the same posture already used for the `postgresql_embedded`
+  `GITHUB_TOKEN` entry above. Revert check: not applicable in the rerun
+  sense (nothing about the scaffolded app's behavior changes on the
+  success path), but reverting the toolchain-pin edit would restore the
+  exact on-demand-install path all four occurrences hit.
+
+  **CI-native confirmation, same day**: PR #2994's own `Windows Tier 1
+  journey` run (job 108894563658, part of workflow run 36409451738)
+  completed `success` at 2026-09-28T11:05:23Z against head `6f47775` — the
+  first run of this job to install `@1.88.0` up front. No on-demand
+  toolchain install, no `cargo.exe`/toolchain error, journey completed
+  clean end to end. Separately, a Codex review comment on #2994 caught a
+  real gap in this fix's own durability: `scripts/check-msrv.sh` only
+  checked that *some* line in `ci.yml` pinned the canonical MSRV (already
+  satisfied by the `msrv` job alone), so a future MSRV bump could update
+  `Cargo.toml` and the `msrv` job while leaving `windows-tier1` on a stale
+  pin, silently reopening this exact race. Fixed in the same PR
+  (`6f47775`): the script now checks `windows-tier1`'s own job block for
+  the canonical pin specifically, verified to fail when that pin is
+  reverted to `@stable` and to pass on the current file.
+  **Status**: n=4 organic, mechanism confirmed by source + stderr, fix
+  applied and **CI-natively confirmed** on #2994's own head (open, CI-green,
+  awaiting human review/merge as of this update). Drift-guard added to
+  `check-msrv.sh` so a future MSRV bump can't silently reopen the race.
+  Treat as closed once #2994 merges; revisit only if a fifth occurrence
+  lands on `trunk-dev` after that.
 

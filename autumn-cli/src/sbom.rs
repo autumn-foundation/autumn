@@ -26,7 +26,7 @@
 //! byte-identical for a given source tree and CLI version regardless of the
 //! order `cargo metadata` happens to emit packages in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
