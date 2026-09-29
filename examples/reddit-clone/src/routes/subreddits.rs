@@ -136,6 +136,14 @@ fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
 /// changeset round-trip: the author's typed name and description come back in
 /// the fields alongside a message per field, instead of the framework's
 /// generic 422 page silently discarding the draft.
+///
+/// The name input carries no native HTML constraints: the server rule is
+/// "2-32 Unicode characters, any script, with at least one letter or number",
+/// and no `pattern` expresses the content check while `minlength`/`maxlength`
+/// count UTF-16 code units instead of characters (#2838) — so any of them
+/// would silently block server-valid names before the round trip below runs.
+/// The input stays hand-written rather than `autumn_web::a11y::TextField`;
+/// swapping to it is a separate variable and out of scope here.
 fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
     let input_class = "flex-1 border border-gray-300 rounded px-3 py-2 text-sm \
                        focus:outline-none focus:ring-2 focus:ring-orange-400";
@@ -601,12 +609,11 @@ mod tests {
         }
     }
 
-    /// These are the *server's* rules. `create_form`'s input no longer
-    /// carries a `pattern` attribute narrower than them (issue #2441/#2454
-    /// item 3: the old `pattern="[a-zA-Z0-9_]+"` silently rejected
-    /// `"web dev"` and `"日本語"` client-side, with no server round trip
-    /// and no error message — while `"__"` passed the pattern but failed
-    /// this very rule), so these names now reach `create` at all.
+    /// These are the *server's* rules, and the shipped form no longer narrows
+    /// them: the name input carries no native constraints (#2838), so these
+    /// names now reach `create` instead of dying on client-side validation.
+    /// What matters here is that the server does not reject real text out
+    /// of hand.
     #[test]
     fn a_community_name_with_a_letter_or_number_in_any_script_is_accepted() {
         for name in ["rust", "web dev", "42", "日本語", "Привет"] {
