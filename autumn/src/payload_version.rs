@@ -324,12 +324,12 @@ pub fn is_payload_version_error(message: &str) -> bool {
 /// Decode a stored payload into `T`, applying the declared upgrade chain.
 ///
 /// Reads the stored version `v` (missing marker → [`DEFAULT_VERSION`]). Then:
-/// - `v > expected_version` → [`VersionErrorKind::TooNew`] error;
+/// - `v > expected_version` → `VersionErrorKind::TooNew` error;
 /// - while `v < expected_version`: if no `upgrade` hook, a
-///   [`VersionErrorKind::NoUpgradePath`] error; otherwise apply the hook one
+///   `VersionErrorKind::NoUpgradePath` error; otherwise apply the hook one
 ///   step (`v -> v+1`);
 /// - finally `serde_json::from_value::<T>`; a failure here is a shape mismatch
-///   reported as [`VersionErrorKind::DecodeFailed`] (never a bare serde error).
+///   reported as `VersionErrorKind::DecodeFailed` (never a bare serde error).
 ///
 /// For the common un-versioned case (`expected_version == 1`, no marker, no
 /// upgrade) this reduces to a plain `from_value` — identical to the pre-#1205

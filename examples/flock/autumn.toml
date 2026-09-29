@@ -1,0 +1,17 @@
+# Minimal config for the `flock` example.
+#
+# Everything else uses framework defaults. The only opt-in here is a custom
+# Content-Security-Policy for the Yew WASM island served at GET /.
+#
+# This is the framework's DEFAULT policy (see
+# `autumn::security::config::default_content_security_policy`) with a single
+# token added: `'wasm-unsafe-eval'` in `script-src`. That token is what lets the
+# browser compile/instantiate the island's WebAssembly module. Autumn ships NO
+# wasm flag or primitive — emitting this policy is entirely the app's choice.
+# Setting an explicit `content_security_policy` makes Autumn emit it verbatim.
+#
+# Security note: `'wasm-unsafe-eval'` permits WebAssembly compilation ONLY; it
+# does NOT enable JavaScript `eval()` (that would be `'unsafe-eval'`). Every
+# other directive is byte-for-byte the framework default.
+[security.headers]
+content_security_policy = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'"

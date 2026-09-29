@@ -173,3 +173,12 @@ enumerable and are omitted from this listing
 If your application relies heavily on merged/nested raw routers, use `autumn
 routes` output as a partial snapshot and supplement it with manual
 documentation for those routes.
+
+## See also
+
+- [Route Auth Coverage — the Default-Deny Posture Model](route-auth-coverage.md)
+  — the `audit` subcommand: default-deny classification, the three route
+  kinds (`gated`, `public`, `framework`), and CI wiring.
+- [Security Posture Manifest — Provenance Classes](security-posture-manifest.md)
+  — how `autumn routes audit` tags each manifest dimension as `provable`,
+  `declared`, or `runtime-only`.

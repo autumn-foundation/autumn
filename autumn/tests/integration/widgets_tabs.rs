@@ -11,10 +11,20 @@ mod tabs_tests {
 
     // ── structure ───────────────────────────────────────────────────────
 
+    // Helper: assert the `<a>` tag immediately preceding `label`'s text carries
+    // (or does not carry) the active class. Mirrors the DOM shape the widget
+    // emits (`<a ...class="...">Label</a>`).
+    fn tab_for_label_is_active(html: &str, label: &str) -> bool {
+        let label_start = html.find(label).unwrap();
+        let preceding = &html[..label_start];
+        let last_tag_start = preceding.rfind('<').unwrap();
+        preceding[last_tag_start..].contains("autumn-tabs__tab--active")
+    }
+
     #[test]
     fn renders_root_container_with_id_and_class() {
         let panels = [("overview", "Overview", html! { p { "a" } })];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert!(html.contains(r#"id="post-tabs""#), "{html}");
         assert!(html.contains(r#"class="autumn-tabs""#), "{html}");
     }
@@ -22,7 +32,7 @@ mod tabs_tests {
     #[test]
     fn renders_tablist_role() {
         let panels = [("overview", "Overview", html! { p { "a" } })];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert!(html.contains(r#"role="tablist""#), "{html}");
         assert!(html.contains("autumn-tabs__list"), "{html}");
     }
@@ -34,7 +44,7 @@ mod tabs_tests {
             ("comments", "Comments", html! { p { "Comments body" } }),
             ("activity", "Activity", html! { p { "Activity body" } }),
         ];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert_eq!(html.matches(r#"role="tab""#).count(), 3, "{html}");
         assert_eq!(html.matches(r#"role="tabpanel""#).count(), 3, "{html}");
         assert!(html.contains("Overview"), "{html}");
@@ -48,7 +58,7 @@ mod tabs_tests {
     #[test]
     fn tabs_use_semantic_class_names() {
         let panels = [("overview", "Overview", html! { p { "a" } })];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert!(html.contains("autumn-tabs__tab"), "{html}");
         assert!(html.contains("autumn-tabs__panel"), "{html}");
     }
@@ -61,7 +71,7 @@ mod tabs_tests {
             ("overview", "Overview", html! { p { "a" } }),
             ("comments", "Comments", html! { p { "b" } }),
         ];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert_eq!(html.matches("aria-selected=\"true\"").count(), 1, "{html}");
         assert_eq!(html.matches("aria-selected=\"false\"").count(), 1, "{html}");
     }
@@ -73,7 +83,7 @@ mod tabs_tests {
             ("comments", "Comments", html! { p { "b" } }),
             ("activity", "Activity", html! { p { "c" } }),
         ];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert_eq!(
             html.matches("autumn-tabs__tab--active").count(),
             1,
@@ -92,15 +102,77 @@ mod tabs_tests {
             ("overview", "Overview", html! { p { "a" } }),
             ("comments", "Comments", html! { p { "b" } }),
         ];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         // First tab's markup (contains "Overview") should be the one with --active.
-        let first_tab_start = html.find("Overview").unwrap();
-        let preceding = &html[..first_tab_start];
-        let last_tag_start = preceding.rfind('<').unwrap();
-        assert!(
-            preceding[last_tag_start..].contains("autumn-tabs__tab--active"),
+        assert!(tab_for_label_is_active(&html, "Overview"), "{html}");
+    }
+
+    // ── active_id parameter (#1316) ─────────────────────────────────────
+
+    #[test]
+    fn active_id_selects_matching_panel_and_tab() {
+        let panels = [
+            ("overview", "Overview", html! { p { "a" } }),
+            ("comments", "Comments", html! { p { "b" } }),
+            ("activity", "Activity", html! { p { "c" } }),
+        ];
+        let html = tabs("post-tabs", Some("comments"), &panels).into_string();
+
+        // Exactly one active tab/panel, and it's the second one.
+        assert_eq!(
+            html.matches("autumn-tabs__tab--active").count(),
+            1,
             "{html}"
         );
+        assert_eq!(
+            html.matches("autumn-tabs__panel--active").count(),
+            1,
+            "{html}"
+        );
+        assert!(tab_for_label_is_active(&html, "Comments"), "{html}");
+        assert!(!tab_for_label_is_active(&html, "Overview"), "{html}");
+
+        // aria-selected="true" belongs to the Comments tab, not Overview.
+        let comments_at = html.find("Comments").unwrap();
+        let comments_tag = &html[..comments_at][html[..comments_at].rfind('<').unwrap()..];
+        assert!(comments_tag.contains(r#"aria-selected="true""#), "{html}");
+
+        // The active class sits on the second panel (Comments' body).
+        let panel_at = html.find(r#"id="comments""#).unwrap();
+        let panel_tag = &html[panel_at..html[panel_at..].find('>').unwrap() + panel_at];
+        assert!(panel_tag.contains("autumn-tabs__panel--active"), "{html}");
+    }
+
+    #[test]
+    fn active_id_none_defaults_to_first_panel() {
+        let panels = [
+            ("overview", "Overview", html! { p { "a" } }),
+            ("comments", "Comments", html! { p { "b" } }),
+        ];
+        let html = tabs("post-tabs", None, &panels).into_string();
+        assert_eq!(
+            html.matches("autumn-tabs__tab--active").count(),
+            1,
+            "{html}"
+        );
+        assert!(tab_for_label_is_active(&html, "Overview"), "{html}");
+        assert!(!tab_for_label_is_active(&html, "Comments"), "{html}");
+    }
+
+    #[test]
+    fn active_id_no_match_falls_back_to_first_panel() {
+        let panels = [
+            ("overview", "Overview", html! { p { "a" } }),
+            ("comments", "Comments", html! { p { "b" } }),
+        ];
+        let html = tabs("post-tabs", Some("does-not-exist"), &panels).into_string();
+        assert_eq!(
+            html.matches("autumn-tabs__tab--active").count(),
+            1,
+            "{html}"
+        );
+        assert!(tab_for_label_is_active(&html, "Overview"), "{html}");
+        assert!(!tab_for_label_is_active(&html, "Comments"), "{html}");
     }
 
     // ── ARIA wiring ─────────────────────────────────────────────────────
@@ -108,7 +180,7 @@ mod tabs_tests {
     #[test]
     fn tab_aria_controls_matches_panel_id() {
         let panels = [("security", "Security", html! { p { "a" } })];
-        let html = tabs("settings-tabs", &panels).into_string();
+        let html = tabs("settings-tabs", None, &panels).into_string();
         assert!(html.contains(r#"aria-controls="security""#), "{html}");
         assert!(html.contains(r#"id="security""#), "{html}");
     }
@@ -116,7 +188,7 @@ mod tabs_tests {
     #[test]
     fn panel_aria_labelledby_matches_tab_id() {
         let panels = [("security", "Security", html! { p { "a" } })];
-        let html = tabs("settings-tabs", &panels).into_string();
+        let html = tabs("settings-tabs", None, &panels).into_string();
         assert!(
             html.contains(r#"id="settings-tabs-tab-security""#),
             "{html}"
@@ -130,14 +202,14 @@ mod tabs_tests {
     #[test]
     fn panels_have_tabindex_zero() {
         let panels = [("security", "Security", html! { p { "a" } })];
-        let html = tabs("settings-tabs", &panels).into_string();
+        let html = tabs("settings-tabs", None, &panels).into_string();
         assert!(html.contains(r#"tabindex="0""#), "{html}");
     }
 
     #[test]
     fn panels_have_role_tabpanel_and_tabs_have_role_tab() {
         let panels = [("security", "Security", html! { p { "a" } })];
-        let html = tabs("settings-tabs", &panels).into_string();
+        let html = tabs("settings-tabs", None, &panels).into_string();
         assert!(html.contains(r#"role="tab""#), "{html}");
         assert!(html.contains(r#"role="tabpanel""#), "{html}");
     }
@@ -147,14 +219,14 @@ mod tabs_tests {
     #[test]
     fn tab_href_points_at_raw_panel_id_fragment() {
         let panels = [("billing", "Billing", html! { p { "a" } })];
-        let html = tabs("settings-tabs", &panels).into_string();
+        let html = tabs("settings-tabs", None, &panels).into_string();
         assert!(html.contains(r##"href="#billing""##), "{html}");
     }
 
     #[test]
     fn panel_id_is_raw_tuple_id_for_fragment_targeting() {
         let panels = [("billing", "Billing", html! { p { "a" } })];
-        let html = tabs("settings-tabs", &panels).into_string();
+        let html = tabs("settings-tabs", None, &panels).into_string();
         // The panel element itself must carry id="billing" (not namespaced)
         // so `#billing` in the URL can :target it directly.
         assert!(html.contains(r#"id="billing""#), "{html}");
@@ -165,14 +237,14 @@ mod tabs_tests {
     #[test]
     fn no_script_tag_emitted() {
         let panels = [("overview", "Overview", html! { p { "a" } })];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert!(!html.contains("<script"), "{html}");
     }
 
     #[test]
     fn no_inline_event_handlers_or_htmx_attrs() {
         let panels = [("overview", "Overview", html! { p { "a" } })];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert!(!html.contains("onclick"), "{html}");
         assert!(!html.contains("hx-"), "{html}");
     }
@@ -182,7 +254,7 @@ mod tabs_tests {
     #[test]
     fn label_html_is_escaped() {
         let panels = [("overview", "<script>alert(1)</script>", html! { p { "a" } })];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert!(html.contains("&lt;script&gt;"), "{html}");
         assert!(!html.contains("<script>alert"), "{html}");
     }
@@ -190,7 +262,7 @@ mod tabs_tests {
     #[test]
     fn id_containing_quote_does_not_break_out_of_attribute() {
         let panels = [("a\"b", "Label", html! { p { "x" } })];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert!(!html.contains(r#"id="a"b""#), "{html}");
         assert!(
             html.contains("a&quot;b") || html.contains("a%22b"),
@@ -203,7 +275,7 @@ mod tabs_tests {
     #[test]
     fn empty_panel_list_renders_container_without_panic() {
         let panels: [(&str, &str, maud::Markup); 0] = [];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert!(html.contains(r#"class="autumn-tabs""#), "{html}");
         assert!(!html.contains(r#"role="tab""#), "{html}");
         assert!(!html.contains(r#"role="tabpanel""#), "{html}");
@@ -217,7 +289,7 @@ mod tabs_tests {
             ("dup", "First", html! { p { "first body" } }),
             ("dup", "Second", html! { p { "second body" } }),
         ];
-        let html = tabs("post-tabs", &panels).into_string();
+        let html = tabs("post-tabs", None, &panels).into_string();
         assert_eq!(html.matches(r#"role="tabpanel""#).count(), 2, "{html}");
         assert!(html.contains("first body"), "{html}");
         assert!(html.contains("second body"), "{html}");
@@ -246,7 +318,7 @@ mod test_client_integration {
         ];
         html! {
             h1 { "Post " (id) }
-            (tabs("post-tabs", &panels))
+            (tabs("post-tabs", None, &panels))
         }
     }
 

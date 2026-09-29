@@ -18,6 +18,8 @@ diesel::table! {
         description -> Text,
         creator_id -> Int8,
         subscriber_count -> Int8,
+        // The second `#[commentable]` model's counter (#1367).
+        comment_count -> Int8,
         created_at -> Timestamp,
     }
 }
@@ -44,10 +46,15 @@ diesel::table! {
         id -> Int8,
         body -> Text,
         author_id -> Int8,
-        post_id -> Int8,
+        // Polymorphic parent (#1367): the model's name plus its primary key,
+        // so one table serves `Post`, `Subreddit`, and anything else that
+        // declares `#[commentable]`.
+        commentable_type -> Text,
+        commentable_id -> Int8,
         parent_id -> Nullable<Int8>,
         score -> Int8,
         created_at -> Timestamp,
+        deleted_at -> Nullable<Timestamp>,
     }
 }
 
@@ -85,7 +92,6 @@ diesel::table! {
 diesel::joinable!(posts -> users (author_id));
 diesel::joinable!(posts -> subreddits (subreddit_id));
 diesel::joinable!(comments -> users (author_id));
-diesel::joinable!(comments -> posts (post_id));
 diesel::joinable!(subreddits -> users (creator_id));
 
 diesel::allow_tables_to_appear_in_same_query!(

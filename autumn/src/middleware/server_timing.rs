@@ -39,6 +39,14 @@
 //! `docs/guide/observability/server-timing.md` in the repository for a
 //! browser `DevTools` walk-through.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
@@ -142,7 +150,7 @@ const fn read_db_snapshot(_timings: &DbTimings) -> (Option<f64>, usize) {
 static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 
 /// Shared sentinel coordinating the primary and fallback `Server-Timing`
-/// layers, mirroring [`AccessLogEmitted`](crate::middleware::access_log).
+/// layers, mirroring `AccessLogEmitted`.
 ///
 /// The fallback inserts it into the **request** extensions on the way in, and
 /// the primary flips it once it appends its header, so the outermost fallback
@@ -175,7 +183,7 @@ impl ServerTimingEmitted {
 /// served response.
 ///
 /// Applied automatically by the framework router when
-/// [`server_timing_enabled`](crate::config::server_timing_enabled) resolves
+/// `server_timing_enabled` resolves
 /// to `true` for the active configuration/profile.
 #[derive(Clone, Debug)]
 pub struct ServerTimingLayer {
@@ -265,7 +273,7 @@ where
         };
         let (timings, inner) = scope_inner(self.inner.call(req));
         ServerTimingFuture::Enabled {
-            start: Instant::now(),
+            start: crate::time::ambient_instant(),
             timings,
             inner,
             fallback: self.fallback,
@@ -327,7 +335,10 @@ where
                             .as_ref()
                             .is_some_and(ServerTimingEmitted::is_marked);
                     if !already_emitted {
-                        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                        let total_ms = crate::time::ambient_instant()
+                            .saturating_duration_since(*start)
+                            .as_secs_f64()
+                            * 1000.0;
                         let (db_ms, query_count) = read_db_snapshot(timings);
                         let streaming = is_streaming_response(&response);
                         let value = build_header_value(total_ms, db_ms, query_count, streaming);

@@ -1522,7 +1522,7 @@ fn render_mobile_main_rs(package_name: &str) -> String {
 const SYNC_LIB_DOC: &str = "\
 //!
 //! OFFLINE SYNC (--offline-sync): app data lives in a local SyncStore-backed
-//! SQLite database inside the app sandbox, and a background SyncEngine
+//! `SQLite` database inside the app sandbox, and a background SyncEngine
 //! reconciles it with the remote deployment's /sync endpoints whenever the
 //! network allows — the device itself needs NO direct database connection.
 //! See docs/guide/tauri-mobile-offline-sync.md.
@@ -2819,12 +2819,12 @@ mod tests {
     #[test]
     fn offline_shell_dep_mirrors_git_source_with_rev() {
         let (dep, warnings) = shell_dep_for(
-            "autumn-web = { git = \"https://github.com/madmax983/autumn\", rev = \"abc123\" }",
+            "autumn-web = { git = \"https://github.com/autumn-foundation/autumn\", rev = \"abc123\" }",
             "",
         );
         assert_eq!(
             dep.dep_entry,
-            r#"autumn-web = { git = "https://github.com/madmax983/autumn", rev = "abc123", features = ["offline-sync"] }"#,
+            r#"autumn-web = { git = "https://github.com/autumn-foundation/autumn", rev = "abc123", features = ["offline-sync"] }"#,
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
     }
