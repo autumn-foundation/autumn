@@ -4,16 +4,17 @@
 //! repeated failures when calling external services or unreliable dependencies. Instead of
 //! continuously attempting operations that are likely to fail (and potentially exacerbating an
 //! ongoing outage by adding load to a struggling service), the circuit breaker monitors failure
-//! rates and temporarily halts traffic ("opens") when a threshold is exceeded.
+//! rates and temporarily halts traffic ("opens") when a threshold is reached.
 //!
 //! # Core Concepts
 //!
 //! - **Closed:** Normal operation. The breaker allows traffic through. If the failure rate over a
-//!   given `sample_window` exceeds the `failure_ratio_threshold` (and there are at least
+//!   given `sample_window` reaches the `failure_ratio_threshold` (and there are at least
 //!   `minimum_sample_count` attempts), the breaker transitions to the Open state.
-//! - **Open:** Protective state. The breaker immediately rejects all requests, returning an error
-//!   fast (usually [`CircuitBreakerError::Open`]), rather than executing the underlying operation.
-//!   It remains in this state for a defined `open_duration`.
+//! - **Open:** Protective state. The breaker rejects calls with [`CircuitBreakerError::Open`]
+//!   instead of executing the underlying operation. It remains in this state for a defined
+//!   `open_duration`. (Through [`CircuitBreakerService`], `poll_ready` still waits on the inner
+//!   service first; the rejection happens in `call`.)
 //! - **Half-Open:** Trial state. After the `open_duration` elapses, the breaker allows a limited
 //!   number of test requests (`half_open_trial_count`) through. If these succeed, the breaker
 //!   assumes the downstream service has recovered and transitions back to Closed. If they fail, it
@@ -437,8 +438,10 @@ impl CircuitBreaker {
 
 /// A RAII guard for manual circuit breaker state management.
 ///
-/// When dropped without calling `success()` or `failure()`, it automatically
-/// records a failure (useful for panics or early returns).
+/// Call `success()` or `failure()` to record the outcome. Dropping the guard
+/// without either (a panic, an early return, a cancelled future) records
+/// nothing; it only releases the half-open trial slot the call was holding, so
+/// the breaker can admit another trial.
 pub struct CircuitBreakerGuard {
     breaker: CircuitBreaker,
     completed: bool,
@@ -576,8 +579,10 @@ pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A `tower::Layer` that wraps services with a [`CircuitBreaker`].
 ///
-/// This allows you to apply circuit breaker semantics transparently to any
-/// `tower::Service`, such as HTTP clients or routing layers.
+/// Each `call` is gated by the breaker and its future's `Ok`/`Err` outcome is
+/// recorded as a success or failure. Errors from the inner service's
+/// `poll_ready` are passed through as [`CircuitBreakerError::Execution`] but
+/// are not counted toward the failure ratio.
 #[derive(Clone)]
 pub struct CircuitBreakerLayer {
     breaker: CircuitBreaker,
