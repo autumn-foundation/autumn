@@ -115,7 +115,7 @@ fn manifest_from_child(success: bool, code: Option<i32>, stdout: &[u8]) -> Resul
 /// emitter-side validator ([`validate_manifest`]) and doctor's consumer-side
 /// reader — one rule, one implementation, so the two sides cannot drift (#2419).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ManifestQueues {
+pub enum ManifestQueues {
     /// No `queues` key: the document says nothing about queues.
     Absent,
     /// A well-formed array of strings. Empty is a real answer — the app
@@ -125,7 +125,7 @@ pub(crate) enum ManifestQueues {
 
 /// Why a jobs manifest's `queues` reading failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ManifestQueuesError {
+pub enum ManifestQueuesError {
     /// The document did not parse as TOML at all (carries the parse error).
     NotToml(String),
     /// `queues` is present but is not an array of strings (carries the reason).
@@ -141,7 +141,7 @@ pub(crate) enum ManifestQueuesError {
 /// `declared_queues`); `BadQueuesArray` is corruption the emitter would have
 /// refused to write, so the caller must fail loudly rather than silently
 /// narrowing the declared set.
-pub(crate) fn parse_manifest_queues(contents: &str) -> Result<ManifestQueues, ManifestQueuesError> {
+pub fn parse_manifest_queues(contents: &str) -> Result<ManifestQueues, ManifestQueuesError> {
     let value: toml::Value = toml::from_str(contents)
         .map_err(|e| ManifestQueuesError::NotToml(format!("did not parse as TOML: {e}")))?;
     let Some(queues) = value.get("queues") else {

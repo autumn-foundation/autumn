@@ -5143,8 +5143,7 @@ fn check_queue_coverage_topology(
             )),
             hint: Some(
                 "Regenerate the manifest with `autumn jobs manifest`, or unset \
-                 `[jobs.fleet] manifest` to fall back to `declared_queues`"
-                    .to_string(),
+                 `[jobs.fleet] manifest` to fall back to `declared_queues`",
             ),
         };
     }
