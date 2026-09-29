@@ -2684,10 +2684,10 @@ previous_secrets = []
                 || content.contains("image = var.bootstrap_image"),
             "main.tf must set the container image to var.bootstrap_image: {content}"
         );
+        // The app's list also carries `ingress[0].external_enabled` (#2312),
+        // so match the image entry rather than a one-element list.
         assert_eq!(
-            content
-                .matches("ignore_changes = [template[0].container[0].image]")
-                .count(),
+            content.matches("template[0].container[0].image").count(),
             2,
             "both the app and the migration job must ignore image drift after bootstrap: {content}"
         );
@@ -2929,6 +2929,11 @@ previous_secrets = []
         assert!(
             ingress_block.contains("external_enabled = false"),
             "external ingress must stay disabled until the first real deploy: {ingress_block}"
+        );
+        assert!(
+            content.contains("ingress[0].external_enabled,"),
+            "the app's lifecycle must ignore external_enabled, or a later \
+             `terraform apply` closes the ingress the cutover opened"
         );
         assert!(
             !ingress_block.contains("external_enabled = true"),

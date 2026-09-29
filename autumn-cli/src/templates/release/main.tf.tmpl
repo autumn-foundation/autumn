@@ -493,8 +493,13 @@ resource "azurerm_container_app" "this" {
   lifecycle {
     # CI manages the real image after bootstrap (see the header comment);
     # without this, `terraform apply` would revert every live deploy back
-    # to `var.bootstrap_image`.
-    ignore_changes = [template[0].container[0].image]
+    # to `var.bootstrap_image`. CI also opens external ingress at the first
+    # cutover (#2312); ignoring it here stops a later `terraform apply` from
+    # closing it again and taking the live app offline.
+    ignore_changes = [
+      template[0].container[0].image,
+      ingress[0].external_enabled,
+    ]
   }
 }
 
