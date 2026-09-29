@@ -334,6 +334,14 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                     // never saw the source, its columns are unknown — present
                     // but not polymorphic, so generation stays loud instead of
                     // claiming a reuse it cannot verify.
+                    //
+                    // `RENAME TO` takes a bare relation name: the table stays
+                    // in its schema, so `archive.legacy_comments RENAME TO
+                    // comments` yields `archive.comments`, not `comments`.
+                    let to = TableRef {
+                        schema: to.schema.or_else(|| from.schema.clone()),
+                        name: to.name,
+                    };
                     let mut state = tables.remove(&from).unwrap_or_default();
                     state.exists = true;
                     tables.insert(to, state);
@@ -484,9 +492,14 @@ fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
 /// Paren-balanced, because a column can carry its own (`NUMERIC(10, 2)`).
 /// Unbalanced SQL yields the rest of the file rather than a silent "no such
 /// table" for a migration that does create one. `None` only when there is no
-/// opening paren at all (e.g. `CREATE TABLE x AS SELECT …`).
+/// opening paren in this statement (e.g. `CREATE TABLE x AS SELECT 1;`): the
+/// search stops at the statement's `;`, so a later statement's column list is
+/// never borrowed as this table's.
 fn create_table_body(sql: &str, from: usize) -> Option<&str> {
-    let open = sql[from..].find('(')? + from;
+    let open = sql[from..].find(['(', ';'])? + from;
+    if sql[open..].starts_with(';') {
+        return None;
+    }
     let mut depth = 0usize;
     for (offset, ch) in sql[open..].char_indices() {
         match ch {
@@ -1958,6 +1971,49 @@ mod tests {
         assert!(
             conflicting_comments_table(tmp.path()),
             "the name is taken, loudly, rather than silently reused"
+        );
+    }
+
+    /// `RENAME TO` keeps the table in its schema: a table renamed within
+    /// another schema is not the default-schema `comments`.
+    #[test]
+    fn a_rename_within_another_schema_stays_in_that_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE archive.legacy_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, \
+             parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, \
+             deleted_at TIMESTAMP);\n\
+             ALTER TABLE archive.legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the renamed table is archive.comments, not the shared comments table"
+        );
+    }
+
+    /// A parenthesis-free `CREATE TABLE … AS` does not borrow the column list of
+    /// a later statement.
+    #[test]
+    fn a_create_table_as_does_not_borrow_a_later_column_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments AS SELECT 1 AS id;\n\
+             CREATE TABLE other_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, \
+             parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, \
+             deleted_at TIMESTAMP);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "legacy_comments never had the discriminator columns"
         );
     }
 
