@@ -1607,6 +1607,7 @@ mod tests {
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
             deny_experimental: false,
+            no_routes: false,
         };
         let routes = vec![
             make_route("GET", "/admin", "plugin:admin"),
@@ -1637,6 +1638,7 @@ mod tests {
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
             deny_experimental: false,
+            no_routes: false,
         };
         let routes = vec![make_route("POST", "/webhook", "plugin:admin")];
         let report = build_report(&opts, &routes);
@@ -1669,6 +1671,7 @@ mod tests {
             format: ReportFormat::Text,
             contracts: &ContractDump::Absent,
             deny_experimental: false,
+            no_routes: false,
         };
         let routes = vec![
             make_route("GET", "/admin", "plugin:admin"),

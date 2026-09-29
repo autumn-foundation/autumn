@@ -5638,8 +5638,7 @@ fn run_command(command: Commands) {
                 package.as_deref(),
                 bin.as_deref(),
                 &plugin_name,
-                prefix.as_deref(),
-                &intentional_root,
+                (prefix.as_deref(), &intentional_root),
                 &sensitive_route,
                 &format,
                 (deny_experimental, no_routes),
@@ -5944,8 +5943,7 @@ fn run_plugin_check_command(
     package: Option<&str>,
     bin: Option<&str>,
     plugin_name: &str,
-    prefix: Option<&str>,
-    intentional_root: &[String],
+    (prefix, intentional_root): (Option<&str>, &[String]),
     sensitive_route_args: &[String],
     format: &str,
     (deny_experimental, no_routes): (bool, bool),
@@ -10226,11 +10224,13 @@ mod tests {
                 bin,
                 plugin_name,
                 prefix,
+                intentional_root,
                 sensitive_route,
                 format,
                 deny_experimental,
                 no_routes,
             } => {
+                assert!(intentional_root.is_empty(), "no root routes by default");
                 assert!(!deny_experimental, "the flag defaults off");
                 assert!(!no_routes, "the flag defaults off");
                 assert_eq!(package.as_deref(), Some("my-app"));
