@@ -1173,6 +1173,27 @@ pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
 /// Split out of [`check_client_auth_impl`] so each function stays readable; the
 /// caller has already handled every not-loadable state, so the fallthrough arm
 /// here is unreachable in practice.
+/// The `tls_client_auth` result when the CRL set leaves some bundle CAs
+/// uncovered (issue #2706): the runtime refuses to boot on this, so doctor
+/// warns (and fails under `--strict`).
+fn grade_crl_coverage_gaps(crl_coverage_gaps: &[String]) -> CheckResult {
+    CheckResult {
+        name: "tls_client_auth",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "the [server.tls.client_auth] revocation list has no CRL issued by {} — once any \
+             CRL is configured, the server refuses handshakes whose revocation status is \
+             unknown, so the clients of these CAs would be rejected, and the server refuses \
+             to boot on this",
+            crl_coverage_gaps.join(", ")
+        )),
+        hint: Some(
+            "Publish a CRL for each CA in the bundle, or remove the uncovered CA. Under \
+             `--strict` this warning fails the run, matching the runtime",
+        ),
+    }
+}
+
 fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
     match data {
         ClientAuthDoctorData::Healthy {
@@ -1195,21 +1216,7 @@ fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
         },
         ClientAuthDoctorData::Healthy {
             crl_coverage_gaps, ..
-        } if !crl_coverage_gaps.is_empty() => CheckResult {
-            name: "tls_client_auth",
-            status: CheckStatus::Warn,
-            detail: Some(format!(
-                "the [server.tls.client_auth] revocation list has no CRL issued by {} — once any \
-                 CRL is configured, the server refuses handshakes whose revocation status is \
-                 unknown, so the clients of these CAs would be rejected, and the server refuses \
-                 to boot on this",
-                crl_coverage_gaps.join(", ")
-            )),
-            hint: Some(
-                "Publish a CRL for each CA in the bundle, or remove the uncovered CA. Under \
-                 `--strict` this warning fails the run, matching the runtime",
-            ),
-        },
+        } if !crl_coverage_gaps.is_empty() => grade_crl_coverage_gaps(crl_coverage_gaps),
         ClientAuthDoctorData::Healthy {
             crl_stale: Some(true),
             ..

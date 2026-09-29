@@ -467,7 +467,7 @@ fn crl_coverage_gaps_in(
 /// Fail fast when the CRL set does not cover every CA in the bundle (issue
 /// #2706).
 ///
-/// The file-loading path ([`build_from_paths`]) enforces this against the same
+/// The file-loading path (`build_from_paths`) enforces this against the same
 /// snapshot it builds the verifier from, via the shared core; this public
 /// wrapper is for callers assembling a verifier from already-loaded files:
 /// once any CRL is present, rustls denies handshakes whose revocation status
