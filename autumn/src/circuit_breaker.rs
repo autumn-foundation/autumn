@@ -13,7 +13,8 @@
 //! use std::time::Duration;
 //!
 //! # async fn example() -> Result<(), CircuitBreakerError<std::io::Error>> {
-//! // Create a policy that trips if 50% of the last 10 requests fail
+//! // Trip once at least 10 requests have been recorded within the sample
+//! // window and 50% or more of them failed.
 //! let policy = CircuitBreakerPolicy {
 //!     failure_ratio_threshold: 0.5,
 //!     minimum_sample_count: 10,
@@ -75,7 +76,7 @@ use thiserror::Error;
 /// Represents the current operational state of a circuit breaker.
 ///
 /// The state machine transitions as follows:
-/// `Closed` -> (failures exceed threshold) -> `Open` -> (timeout expires) -> `HalfOpen` -> (successes/failures) -> `Closed` or `Open`.
+/// `Closed` -> (failure ratio reaches or exceeds threshold) -> `Open` -> (timeout expires) -> `HalfOpen` -> (successes/failures) -> `Closed` or `Open`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CircuitState {
