@@ -3089,6 +3089,71 @@ fn emit_association_items(
                     quote! { __child.#fk_ident }
                 };
 
+                // A belongs_to whose counter cache names the parent's key with
+                // `parent_pk = "<column>"` (#2662): the parent is not keyed on
+                // `id`, so neither `<parent>::id` nor `__child.id` exists. Filter
+                // on the named column and select it alongside each row, so the
+                // loader never needs the parent's Rust field name (which the
+                // child cannot see). Without the override the block below is
+                // emitted unchanged.
+                let overridden_pk = (assoc.kind == AssocKind::BelongsTo)
+                    .then(|| {
+                        assoc
+                            .counter_cache
+                            .as_ref()
+                            .and_then(|decl| decl.parent_pk.as_deref())
+                    })
+                    .flatten()
+                    .filter(|pk| *pk != "id")
+                    .map(column_ident);
+                if let Some(pk_col) = overridden_pk {
+                    loader_blocks.push(quote! {
+                        if let ::core::option::Option::Some(__child_spec) = &spec.#name_ident {
+                            let mut __keys: ::std::vec::Vec<i64> =
+                                records.iter().map(|__r| #key_expr).collect();
+                            __keys.sort_unstable();
+                            __keys.dedup();
+                            let __pairs: ::std::vec::Vec<(i64, #target)> = #target_table::table
+                                .filter(#target_table::#pk_col.eq_any(__keys))
+                                .select((
+                                    #target_table::#pk_col,
+                                    <#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::RuntimeBackend>>::as_select(),
+                                ))
+                                .load::<(i64, #target)>(&mut *conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            // Per-row scoping keeps each row paired with its key.
+                            let mut __pk_keys: ::std::vec::Vec<i64> = ::std::vec::Vec::new();
+                            let mut __children: ::std::vec::Vec<
+                                ::autumn_web::preload::Preloaded<#target>
+                            > = ::std::vec::Vec::new();
+                            for (__pk, __row) in __pairs {
+                                if let ::core::option::Option::Some(__row) =
+                                    #target::__autumn_preload_keep(__row)?
+                                {
+                                    __pk_keys.push(__pk);
+                                    __children.push(::autumn_web::preload::Preloaded::new(__row));
+                                }
+                            }
+                            <#target as ::autumn_web::preload::Preloadable>::load_associations(
+                                &mut __children, &**__child_spec, &mut *conn,
+                            ).await?;
+                            let mut __map: ::std::collections::HashMap<
+                                i64, ::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>
+                            > = __pk_keys
+                                .into_iter()
+                                .zip(__children)
+                                .map(|(__pk, __child)| (__pk, ::std::sync::Arc::new(__child)))
+                                .collect();
+                            for __r in records.iter_mut() {
+                                let __v: #stored_ty = __map.get(&(#key_expr)).map(::std::sync::Arc::clone);
+                                __r.associations_mut().insert::<#stored_ty>(#key, __v);
+                            }
+                        }
+                    });
+                    continue;
+                }
+
                 loader_blocks.push(quote! {
                     if let ::core::option::Option::Some(__child_spec) = &spec.#name_ident {
                         let mut __keys: ::std::vec::Vec<i64> =
@@ -3685,7 +3750,9 @@ fn emit_votable_items(
     // model whose `#[id]` field is named differently. `pk_column` is the
     // physical column — the caller resolves any `#[diesel(column_name)]`
     // rename (#2662) — so the `table!` declaration's SQL name is right.
-    let pk_column = format_ident!("{pk_column}");
+    // A keyword column (`#[id] pub r#type: i64`) must come back as the raw
+    // identifier `r#type`, or the hidden `diesel::table!` would not parse.
+    let pk_column = column_ident(pk_column);
     let trait_ident = format_ident!("{model_ident}Reactions");
     let is_sum = spec.aggregate == VoteAggregate::Sum;
 
@@ -5818,6 +5885,14 @@ fn diesel_column_name(field: &syn::Field) -> Option<String> {
         });
     }
     found
+}
+
+/// A Rust identifier for a SQL column name: the plain identifier, or the raw
+/// form (`r#type`) when the name is a Rust keyword, so a column recovered as an
+/// unrawed string can be spliced back into a `diesel::table!` or path.
+fn column_ident(name: &str) -> syn::Ident {
+    syn::parse_str::<syn::Ident>(name)
+        .unwrap_or_else(|_| syn::Ident::new_raw(name, proc_macro2::Span::call_site()))
 }
 
 /// The physical primary-key column for generated SQL: the `#[id]` field's
@@ -12709,6 +12784,59 @@ mod tests {
         );
     }
 
+    /// #2662: a counter-cached `belongs_to` whose parent is keyed on
+    /// `parent_pk` must preload through that column: neither `posts::id` nor
+    /// the parent's `.id` field exists on such a parent.
+    #[test]
+    fn belongs_to_preload_keys_on_an_overridden_parent_pk() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache, parent_pk = "post_uuid")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("posts :: post_uuid . eq_any (__keys)"),
+            "the preload must filter on the parent's key column: {generated}"
+        );
+        assert!(
+            !generated.contains("posts :: id . eq_any"),
+            "the hard-coded `id` filter must not survive the override: {generated}"
+        );
+        assert!(
+            !generated.contains("__child . id"),
+            "the loader must not read the parent's `.id` field: {generated}"
+        );
+    }
+
+    /// Without the override the preload is the historical `id`-keyed loader.
+    #[test]
+    fn belongs_to_preload_defaults_to_the_id_key() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("posts :: id . eq_any (__keys)"),
+            "{generated}"
+        );
+        assert!(generated.contains("__child . id"), "{generated}");
+    }
+
     #[test]
     fn model_counter_cache_cannot_maintain_the_parent_primary_key() {
         let generated = model_macro(
@@ -14703,6 +14831,33 @@ mod tests {
                 >= 3,
             "S1 (both backend arms) and S5 must filter the target table on \
              the physical primary key, got: {generated}"
+        );
+    }
+
+    #[test]
+    fn votable_target_projection_keeps_a_raw_keyword_primary_key_raw() {
+        // A keyword `#[id]` field (`r#type`) unraws to `type` for SQL; the
+        // hidden `diesel::table!` and its paths must splice it back as the raw
+        // identifier, or the projection does not parse.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub r#type: i64,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("posts (r#type)"),
+            "the projection key must stay a raw identifier, got: {generated}"
+        );
+        assert!(
+            generated.contains("posts :: r#type . eq (target_id)"),
+            "the S1/S5 filters must use the raw identifier, got: {generated}"
         );
     }
 

@@ -375,6 +375,12 @@ see the parent's fields — the same visibility limit that makes
 before. `#[derivation]` takes the same `parent_pk = "<column>"` key with the
 same default.
 
+The key also drives the `belongs_to` preload: the loader filters on and
+selects `parent_pk` instead of `<parent>::id`. Note that a `#[model]` parent
+still needs an `id` column today (#3033), so for a counter cache the override
+currently serves counting through an alternate unique key; derivations onto a
+parent that is not a `#[model]` are unaffected by that limit.
+
 ## Filtered and weighted counts
 
 `counter_cache` counts every live child. For a count restricted by a predicate,
