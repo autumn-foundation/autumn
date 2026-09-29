@@ -1578,10 +1578,56 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// parameter merely containing that text does not.
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_shared_cache(target: &str) -> bool {
-    let without_fragment = target.split_once('#').map_or(target, |(head, _)| head);
-    without_fragment
-        .split_once('?')
-        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "cache=shared"))
+    sqlite_uri_has_query_pair(target, "cache", "shared")
+}
+
+/// Whether `target` is a `SQLite` URI filename whose query carries exactly
+/// `key=value`, read the way `SQLite` reads it: only a `file:` URI has query
+/// parameters (a plain path containing `?` is just a filename), the
+/// `#fragment` is ignored, and names and values are percent-decoded before the
+/// case-sensitive comparison. `target` may be a raw configured URL
+/// (`sqlite:file:...`) or an already-normalized one.
+#[cfg(feature = "sqlite")]
+fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
+    let target = normalize_sqlite_target(target);
+    if !target.starts_with("file:") {
+        return false;
+    }
+    let without_fragment = target
+        .split_once('#')
+        .map_or(target.as_str(), |(head, _)| head);
+    let Some((_, query)) = without_fragment.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        percent_decode(k) == key.as_bytes() && percent_decode(v) == value.as_bytes()
+    })
+}
+
+/// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
+/// by two hex digits is kept literally.
+#[cfg(feature = "sqlite")]
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            // Two hex digits always fit in a byte.
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
@@ -5120,6 +5166,17 @@ mod tests {
         assert!(sqlite_target_is_shared_cache(
             "file:mem?mode=memory&cache=shared#tag"
         ));
+        // Percent-encoded names and values decode as SQLite decodes them.
+        assert!(sqlite_target_is_shared_cache("file:app.db?%63ache=shared"));
+        assert!(sqlite_target_is_shared_cache("file:app.db?cache=%73hared"));
+        // A raw configured URL is normalized first.
+        assert!(sqlite_target_is_shared_cache(
+            "sqlite:file:app?mode=memory&cache=shared"
+        ));
+        // Only a `file:` URI has query parameters; elsewhere `?` is part of
+        // an ordinary filename.
+        assert!(!sqlite_target_is_shared_cache("app.db?cache=shared"));
+        assert!(!sqlite_target_is_shared_cache("sqlite:app.db?cache=shared"));
     }
 
     // `sqlite_target_is_any_in_memory` is the broader predicate the
