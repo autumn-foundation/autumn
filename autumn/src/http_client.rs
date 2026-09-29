@@ -45,6 +45,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -60,6 +68,10 @@ use serde::de::DeserializeOwned;
 // ── Error ────────────────────────────────────────────────────────────────────
 
 /// Errors produced by [`Client`] and [`RequestBuilder`].
+///
+/// `#[non_exhaustive]`: match it with a `_` arm, so a new variant is not a
+/// breaking change.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// An underlying `reqwest` transport error.
@@ -139,6 +151,11 @@ pub enum ClientError {
     /// alone for guarded automatic per-hop pinning — not both.
     #[error("{0}")]
     PinNotAllowedWithSsrfSafe(&'static str),
+    /// The simulated network ([`crate::sim::SimNet`], issue #2967) failed the
+    /// call: a drop, a partition, a timeout, a host it does not know, or a
+    /// request or response it could not build.
+    #[error("simulated network: {0}")]
+    SimNetwork(String),
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -1124,6 +1141,9 @@ pub struct Client {
     mock: Option<Arc<MockRegistry>>,
     /// Resilience configuration for circuit breakers.
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    /// When present (a sim with a `SimNet`), calls go through the simulated
+    /// network instead of the real one.
+    sim_net: Option<Arc<crate::sim::SimNet>>,
 }
 
 impl Client {
@@ -1159,6 +1179,7 @@ impl Client {
             },
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -1199,6 +1220,7 @@ impl Client {
             },
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -1214,6 +1236,7 @@ impl Client {
             retry_policy: RetryPolicy::default(),
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -1280,6 +1303,7 @@ impl Client {
         if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
             client = client.with_mock(ext.0.clone());
         }
+        client.sim_net = state.extension::<crate::sim::SimNet>();
 
         client
     }
@@ -1305,6 +1329,7 @@ impl Client {
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -1319,6 +1344,7 @@ impl Client {
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -1352,6 +1378,7 @@ impl Client {
             ssrf_safe: false,
             discard_response_body: false,
             breaker_scoped: false,
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -1511,6 +1538,8 @@ pub struct RequestBuilder {
     /// the custom send path (`needs_custom_path()`). See
     /// [`RequestBuilder::breaker_scoped`].
     breaker_scoped: bool,
+    /// The simulated network, when the client came from a sim app state.
+    sim_net: Option<Arc<crate::sim::SimNet>>,
 }
 
 impl RequestBuilder {
@@ -1850,6 +1879,12 @@ impl RequestBuilder {
 
     /// [`send`](Self::send), minus the replay gate and the capture tee.
     async fn send_recorded(self) -> Result<Response, ClientError> {
+        // A sim network serves every send path, so nothing reaches the real
+        // network. Like mocks, it bypasses the process-global breaker.
+        if let Some(net) = self.sim_net.clone() {
+            return self.send_sim(&net).await;
+        }
+
         // Bypassing circuit breaker if a mock registry is present.
         if self.mock.is_some() {
             return self.send_inner(false).await;
@@ -1930,50 +1965,12 @@ impl RequestBuilder {
     async fn send_inner(self, suppress_retries: bool) -> Result<Response, ClientError> {
         // ── Mock short-circuit ──────────────────────────────────────────────
         if let Some(ref mock) = self.mock {
-            match mock.find_match(&self.method, &self.url, self.alias.as_deref()) {
-                Some(mock_resp) => {
-                    let status = reqwest::StatusCode::from_u16(mock_resp.status)
-                        .unwrap_or(reqwest::StatusCode::OK);
-                    let body_bytes = mock_resp
-                        .body
-                        .as_ref()
-                        .map(|v| serde_json::to_vec(v).unwrap_or_default())
-                        .unwrap_or_default();
-
-                    tracing::info!(
-                        http.method = %self.method,
-                        http.url = %self.url,
-                        http.status = mock_resp.status,
-                        "[mock] outbound request intercepted"
-                    );
-
-                    return Ok(Response {
-                        status,
-                        headers: HeaderMap::new(),
-                        body: Bytes::from(body_bytes),
-                        url: None,
-                    });
-                }
-                None => {
-                    // A mock registry is present but nothing matched — treat as
-                    // a test failure rather than falling through to the network.
-                    return Err(ClientError::NoMock(
-                        self.method.to_string(),
-                        self.url.clone(),
-                    ));
-                }
-            }
+            return self.mock_response(mock);
         }
 
         // ── Real network request with retries ───────────────────────────────
-        let start = Instant::now();
-        let max_attempts = if suppress_retries {
-            1
-        } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
-            self.retry_policy.max_retries.saturating_add(1)
-        } else {
-            1
-        };
+        let start = crate::time::ambient_instant();
+        let max_attempts = self.max_attempts(suppress_retries);
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -2005,13 +2002,7 @@ impl RequestBuilder {
 
                     // 429 → honour Retry-After and retry if attempts remain.
                     if status.as_u16() == 429 && attempt + 1 < max_attempts {
-                        let mut sleep_delay =
-                            parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
-                        sleep_delay = sleep_delay.min(self.retry_policy.max_retry_after);
-                        if let Some(req_timeout) = self.retry_policy.request_timeout {
-                            sleep_delay = sleep_delay.min(req_timeout);
-                        }
-                        tokio::time::sleep(sleep_delay).await;
+                        tokio::time::sleep(self.retry_after_delay(&headers)).await;
                         continue;
                     }
 
@@ -2028,7 +2019,7 @@ impl RequestBuilder {
                             .await
                             .map_err(|e| ClientError::Request(e.without_url()))?
                     };
-                    let elapsed = start.elapsed();
+                    let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
                         &url_used,
@@ -2053,6 +2044,149 @@ impl RequestBuilder {
 
         // The retry loop always returns inside the last attempt; this is unreachable.
         unreachable!("retry loop exited without returning a result — this is a bug")
+    }
+
+    /// How many attempts the retry policy allows for this request.
+    const fn max_attempts(&self, suppress_retries: bool) -> u32 {
+        if suppress_retries {
+            1
+        } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
+            self.retry_policy.max_retries.saturating_add(1)
+        } else {
+            1
+        }
+    }
+
+    /// The canned response for this request from `mock`, or
+    /// [`ClientError::NoMock`].
+    fn mock_response(&self, mock: &MockRegistry) -> Result<Response, ClientError> {
+        let Some(mock_resp) = mock.find_match(&self.method, &self.url, self.alias.as_deref())
+        else {
+            // A mock registry is present but nothing matched — treat as a test
+            // failure rather than falling through to the network.
+            return Err(ClientError::NoMock(
+                self.method.to_string(),
+                self.url.clone(),
+            ));
+        };
+        let status =
+            reqwest::StatusCode::from_u16(mock_resp.status).unwrap_or(reqwest::StatusCode::OK);
+        let body_bytes = mock_resp
+            .body
+            .as_ref()
+            .map(|v| serde_json::to_vec(v).unwrap_or_default())
+            .unwrap_or_default();
+
+        tracing::info!(
+            http.method = %self.method,
+            http.url = %self.url,
+            http.status = mock_resp.status,
+            "[mock] outbound request intercepted"
+        );
+
+        Ok(Response {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::from(body_bytes),
+            url: None,
+        })
+    }
+
+    /// The wait before a retry after a 429: `Retry-After`, capped by the policy.
+    fn retry_after_delay(&self, headers: &HeaderMap) -> Duration {
+        let mut delay = parse_retry_after(headers).unwrap_or(Duration::from_secs(1));
+        delay = delay.min(self.retry_policy.max_retry_after);
+        if let Some(req_timeout) = self.retry_policy.request_timeout {
+            delay = delay.min(req_timeout);
+        }
+        delay
+    }
+
+    /// Send through the simulated network (issue #2967), with the attempts,
+    /// backoff, 429 handling and per-attempt timeout of the real retry loop.
+    async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
+        let url = self.sim_url()?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| ClientError::InvalidUrl(format!("{}: no host", self.url)))?
+            .to_owned();
+        let max_attempts = self.max_attempts(false);
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                let exp = (attempt - 1).min(10);
+                tokio::time::sleep(Duration::from_millis(100 * (1_u64 << exp))).await;
+            }
+            let last = attempt + 1 == max_attempts;
+            let exchange = self.sim_attempt(net, &host, &url);
+            let outcome = match self.retry_policy.request_timeout {
+                Some(limit) => {
+                    tokio::time::timeout(limit, exchange)
+                        .await
+                        .unwrap_or_else(|_elapsed| {
+                            Err(SimAttemptError::Transient(format!(
+                                "request to {host} timed out after {limit:?}"
+                            )))
+                        })
+                }
+                None => exchange.await,
+            };
+            let response = match outcome {
+                Ok(response) => response,
+                // A drop or a timeout is transient, like a real connect or
+                // timeout error, so it is retried.
+                Err(SimAttemptError::Transient(_)) if !last => continue,
+                Err(SimAttemptError::Transient(message)) => {
+                    return Err(ClientError::SimNetwork(message));
+                }
+                Err(SimAttemptError::Fatal(error)) => return Err(error),
+            };
+            if response.status.as_u16() == 429 && !last {
+                tokio::time::sleep(self.retry_after_delay(&response.headers)).await;
+                continue;
+            }
+            if is_retryable_status(response.status.as_u16()) && !last {
+                continue;
+            }
+            return Ok(response);
+        }
+        unreachable!("the sim retry loop returns on its last attempt")
+    }
+
+    /// The absolute URL a sim call goes to. A relative URL on a named client
+    /// (`client.named("payments").get("/charge")`) goes to the host named by
+    /// the alias, as a named http mock would match it.
+    fn sim_url(&self) -> Result<reqwest::Url, ClientError> {
+        match (reqwest::Url::parse(&self.url), self.alias.as_deref()) {
+            (Ok(url), _) => Ok(url),
+            (Err(url::ParseError::RelativeUrlWithoutBase), Some(alias)) => {
+                let path = self.url.trim_start_matches('/');
+                reqwest::Url::parse(&format!("http://{alias}/{path}"))
+                    .map_err(|error| ClientError::InvalidUrl(format!("{}: {error}", self.url)))
+            }
+            (Err(error), _) => Err(ClientError::InvalidUrl(format!("{}: {error}", self.url))),
+        }
+    }
+
+    /// One attempt through the simulated network: the network, then the host
+    /// router or the http mocks.
+    async fn sim_attempt(
+        &self,
+        net: &crate::sim::SimNet,
+        host: &str,
+        url: &reqwest::Url,
+    ) -> Result<Response, SimAttemptError> {
+        net.transmit(host, self.retry_policy.request_timeout)
+            .await
+            .map_err(|fault| SimAttemptError::Transient(format!("request to {host} {fault}")))?;
+        match (net.service(host), self.mock.as_ref()) {
+            (Some(router), _) => serve_sim_host(router, self, url.clone())
+                .await
+                .map_err(SimAttemptError::Fatal),
+            (None, Some(mock)) => self.mock_response(mock).map_err(SimAttemptError::Fatal),
+            (None, None) => Err(SimAttemptError::Fatal(ClientError::SimNetwork(format!(
+                "no sim host named {host}"
+            )))),
+        }
     }
 
     /// `true` when any security-hardening option requires the custom send path.
@@ -2298,7 +2432,7 @@ impl RequestBuilder {
         timeout: Duration,
         is_half_open: bool,
     ) -> Result<Response, ClientError> {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = crate::time::ambient_instant() + timeout;
         let (follow, max) = self.ssrf_redirect_plan();
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -2409,7 +2543,7 @@ fn deadline_remaining_or_timeout(
     deadline: std::time::Instant,
     current: &str,
 ) -> Result<Duration, ClientError> {
-    let now = std::time::Instant::now();
+    let now = crate::time::ambient_instant();
     if now >= deadline {
         return Err(ssrf_safe_deadline_error(current));
     }
@@ -2460,6 +2594,76 @@ fn breaker_for_url(
 }
 
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
+
+/// Why one simulated attempt failed.
+enum SimAttemptError {
+    /// A drop, a partition or a timeout: retried while attempts remain.
+    Transient(String),
+    /// Not retried.
+    Fatal(ClientError),
+}
+
+/// Serve one request from a simulated host's router (issue #2967).
+async fn serve_sim_host(
+    router: axum::Router,
+    request: &RequestBuilder,
+    url: reqwest::Url,
+) -> Result<Response, ClientError> {
+    let target = url.query().map_or_else(
+        || url.path().to_owned(),
+        |query| format!("{}?{query}", url.path()),
+    );
+    let mut builder = axum::http::Request::builder()
+        .method(request.method.clone())
+        .uri(target);
+    if !request.extra_headers.contains_key(reqwest::header::HOST) {
+        // Host and port as the URL writes them, so an IPv6 host keeps its
+        // brackets (`[::1]:8080`).
+        let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        builder = builder.header(reqwest::header::HOST, authority);
+    }
+    // Trace context first, as on the real send path. A caller header of the
+    // same name wins.
+    for (name, value) in trace_context_headers() {
+        if !request.extra_headers.contains_key(name.as_str()) {
+            builder = builder.header(name, value);
+        }
+    }
+    // The real client sends a `Content-Length` for a known-size body. A
+    // caller header of the same name wins.
+    if let Some(body) = &request.body
+        && !request
+            .extra_headers
+            .contains_key(reqwest::header::CONTENT_LENGTH)
+    {
+        builder = builder.header(reqwest::header::CONTENT_LENGTH, body.len());
+    }
+    for (name, value) in &request.extra_headers {
+        builder = builder.header(name, value);
+    }
+    let body = request.body.clone().unwrap_or_default();
+    let http_request = builder
+        .body(axum::body::Body::from(body))
+        .map_err(|error| ClientError::SimNetwork(error.to_string()))?;
+    let response = tower::ServiceExt::oneshot(router, http_request)
+        .await
+        .unwrap_or_else(|never| match never {});
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = if request.discard_response_body {
+        Bytes::new()
+    } else {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| ClientError::SimNetwork(error.to_string()))?
+    };
+    Ok(Response {
+        status,
+        headers,
+        body,
+        url: Some(url),
+    })
+}
 
 /// Build a one-shot `reqwest::Client` for the custom send path, with the given
 /// redirect policy, per-request timeout, and optional DNS `resolve` override.
@@ -2555,7 +2759,7 @@ async fn send_one(
     deadline: Option<Instant>,
     suppress_retries: bool,
 ) -> Result<Response, ClientError> {
-    let start = Instant::now();
+    let start = crate::time::ambient_instant();
     let max_attempts = if suppress_retries {
         1
     } else if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
@@ -2578,16 +2782,16 @@ async fn send_one(
 
     for attempt in 0..max_attempts {
         if attempt > 0 {
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(deadline_exceeded_err(&mut last_transient_err));
             }
             let exp = (attempt - 1).min(10);
             let mut delay = Duration::from_millis(100 * (1_u64 << exp));
             if let Some(d) = deadline {
-                delay = delay.min(d.saturating_duration_since(Instant::now()));
+                delay = delay.min(d.saturating_duration_since(crate::time::ambient_instant()));
             }
             tokio::time::sleep(delay).await;
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(deadline_exceeded_err(&mut last_transient_err));
             }
         }
@@ -2599,7 +2803,7 @@ async fn send_one(
         // into a hop's budget would still get the full original per-attempt
         // timeout rather than what's actually left before `deadline`.
         if let Some(d) = deadline {
-            req = req.timeout(d.saturating_duration_since(Instant::now()));
+            req = req.timeout(d.saturating_duration_since(crate::time::ambient_instant()));
         }
         req = inject_trace_context(req);
         for (name, value) in extra_headers {
@@ -2623,10 +2827,11 @@ async fn send_one(
                         sleep_delay = sleep_delay.min(req_timeout);
                     }
                     if let Some(d) = deadline {
-                        sleep_delay = sleep_delay.min(d.saturating_duration_since(Instant::now()));
+                        sleep_delay = sleep_delay
+                            .min(d.saturating_duration_since(crate::time::ambient_instant()));
                     }
                     tokio::time::sleep(sleep_delay).await;
-                    if deadline.is_none_or(|d| Instant::now() < d) {
+                    if deadline.is_none_or(|d| crate::time::ambient_instant() < d) {
                         continue;
                     }
                     // Deadline exceeded during (or because of) the
@@ -2637,7 +2842,7 @@ async fn send_one(
                 }
                 if is_retryable_status(status.as_u16())
                     && attempt + 1 < max_attempts
-                    && deadline.is_none_or(|d| Instant::now() < d)
+                    && deadline.is_none_or(|d| crate::time::ambient_instant() < d)
                 {
                     continue;
                 }
@@ -2654,7 +2859,7 @@ async fn send_one(
                     method.as_str(),
                     &url_used,
                     status.as_u16(),
-                    start.elapsed(),
+                    crate::time::ambient_instant().saturating_duration_since(start),
                     extra_headers,
                 );
                 return Ok(Response {
@@ -2890,7 +3095,7 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     }
     // HTTP-date format per RFC 9110 (e.g. "Tue, 01 Jan 2030 00:00:00 GMT").
     let dt = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    let now = chrono::Utc::now();
+    let now = crate::time::ambient_now();
     let future = dt.with_timezone(&chrono::Utc);
     let secs = u64::try_from((future - now).num_seconds().max(0)).unwrap_or(0);
     Some(Duration::from_secs(secs))
@@ -2937,9 +3142,20 @@ fn log_request(
 /// when there is no active span with a valid context.
 #[allow(clippy::missing_const_for_fn)]
 fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let mut builder = builder;
+    for (name, value) in trace_context_headers() {
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
+/// The W3C trace-context headers for the active span. Empty when the
+/// `telemetry-otlp` feature is disabled or no span has a valid context.
+#[allow(clippy::missing_const_for_fn)]
+fn trace_context_headers() -> Vec<(String, HeaderValue)> {
     #[cfg(not(feature = "telemetry-otlp"))]
     {
-        builder
+        Vec::new()
     }
     #[cfg(feature = "telemetry-otlp")]
     {
@@ -2950,13 +3166,9 @@ fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBui
         opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.inject_context(&cx, &mut TraceHeaderInjector(&mut map));
         });
-        let mut builder = builder;
-        for (k, v) in map {
-            if let Ok(value) = HeaderValue::from_str(&v) {
-                builder = builder.header(k, value);
-            }
-        }
-        builder
+        map.into_iter()
+            .filter_map(|(name, value)| Some((name, HeaderValue::from_str(&value).ok()?)))
+            .collect()
     }
 }
 
@@ -3688,6 +3900,128 @@ mod tests {
         );
         // Should complete without panicking; authorization is redacted from span.
         log_request("POST", &url, 201, Duration::from_millis(12), &headers);
+    }
+
+    /// The sim `Host` header keeps IPv6 brackets and the port (issue #2967).
+    #[test]
+    fn sim_host_header_keeps_ipv6_brackets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().route(
+            "/status",
+            axum::routing::get(|headers: HeaderMap| async move {
+                headers
+                    .get(reqwest::header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            }),
+        );
+        runtime.block_on(async {
+            for (url, host) in [
+                ("http://[::1]:8080/status", "[::1]:8080"),
+                ("http://[::1]/status", "[::1]"),
+                ("http://payments:8443/status", "payments:8443"),
+            ] {
+                let request = Client::new().get(url);
+                let parsed = reqwest::Url::parse(url).unwrap();
+                let seen = serve_sim_host(echo.clone(), &request, parsed)
+                    .await
+                    .unwrap()
+                    .text();
+                assert_eq!(seen, host, "{url}");
+            }
+        });
+    }
+
+    /// A sim request with a body carries its `Content-Length`, as the real
+    /// client's does, and a caller value wins (issue #2967).
+    #[test]
+    fn sim_host_receives_content_length() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            headers
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_owned()
+        });
+        let url = "http://payments/charge";
+        let parsed = reqwest::Url::parse(url).unwrap();
+        runtime.block_on(async {
+            for (request, expected) in [
+                (Client::new().post(url).text_body("hello"), "5"),
+                (
+                    Client::new().post(url).json(&serde_json::json!({"a": 1})),
+                    "7",
+                ),
+                (Client::new().post(url).bytes_body(Bytes::new()), "0"),
+                (Client::new().get(url), "none"),
+            ] {
+                let seen = serve_sim_host(echo.clone(), &request, parsed.clone())
+                    .await
+                    .unwrap()
+                    .text();
+                assert_eq!(seen, expected);
+            }
+        });
+    }
+
+    /// A sim host sees the active span's `traceparent`, as a real upstream
+    /// does, and a caller header of the same name wins (issue #2967).
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn sim_host_receives_trace_context() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing_subscriber::prelude::*;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = || {
+            axum::Router::new().route(
+                "/echo",
+                axum::routing::get(|headers: HeaderMap| async move {
+                    headers
+                        .get("traceparent")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned()
+                }),
+            )
+        };
+        let url = reqwest::Url::parse("http://payments/echo").unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("sim_trace_test");
+            let _guard = span.enter();
+            runtime.block_on(async {
+                let request = Client::new().get("http://payments/echo");
+                let traceparent = serve_sim_host(echo(), &request, url.clone())
+                    .await
+                    .unwrap()
+                    .text();
+                assert!(traceparent.starts_with("00-"), "{traceparent}");
+
+                let request = Client::new()
+                    .get("http://payments/echo")
+                    .header("traceparent", "caller-value");
+                let response = serve_sim_host(echo(), &request, url.clone()).await.unwrap();
+                assert_eq!(response.text(), "caller-value");
+            });
+        });
     }
 
     // TEST 34: inject_trace_context passthrough (without telemetry-otlp feature).
