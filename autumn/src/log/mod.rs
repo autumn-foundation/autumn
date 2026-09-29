@@ -4,9 +4,9 @@
 //! on top of `tracing` to offer:
 //!
 //! - **Context Enrichment**: Attaching request IDs, tenant IDs, and user IDs to logs
-//!   automatically via `LogContextLayer`.
-//! - **Capturing**: Utilities like `capture::CapturedLogs` to assert against
-//!   emitted logs within unit tests, ensuring that critical events are recorded.
+//!   automatically via [`crate::middleware::LogContextLayer`] and [`context::LogContext`].
+//! - **Capturing**: [`capture::LogCaptureLayer`] records emitted events into a
+//!   [`capture::LogBuffer`], so tests can assert that critical events were logged.
 //! - **Filtering**: Configurable verbosity and component-level filters to manage
 //!   log volume.
 
