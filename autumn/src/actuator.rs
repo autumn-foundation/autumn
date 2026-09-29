@@ -7,6 +7,14 @@
 //! - **dev**: all endpoints enabled
 //! - **prod**: only health, info, and metrics
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -1440,6 +1448,11 @@ impl JobRegistry {
                 && !guard.pg_marks_by_job_id.contains_key(id)
             {
                 let registry_now = self.now_ms();
+                // Real-timeline marks follow Postgres's own clock, so read the real clock.
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "Real marks are measured by Postgres clock_timestamp(), a real clock"
+                )]
                 let real_now =
                     u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX);
                 // Walk oldest-first (ascending `seq`) and stop at the first
@@ -1825,7 +1838,7 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::time::ambient_now().to_rfc3339();
         task.last_run = Some(now.clone());
         task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
@@ -1843,7 +1856,7 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::time::ambient_now().to_rfc3339();
         task.last_run = Some(now.clone());
         task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
@@ -4413,7 +4426,7 @@ fn reset_webhook_replay_log(
     log.last_error = None;
     log.response_status = None;
     log.response_body = None;
-    log.timestamp = chrono::Utc::now();
+    log.timestamp = crate::time::ambient_now();
     log
 }
 

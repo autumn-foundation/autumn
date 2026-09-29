@@ -584,10 +584,11 @@ pub(crate) fn emit_retention(
     // `chrono::Duration::from_std` checks that a duration fits chrono's range,
     // but a value that fits — `after = "100000000d"`, about 274,000 years — can
     // still place the cutoff outside `NaiveDateTime`'s range once subtracted
-    // from a clock reading. That is checked against the real wall clock, not the
-    // test-mockable `ClockSource`, which `task_info()` — a plain
-    // `fn() -> TaskInfo` with no `state` parameter — cannot reach. It is a
-    // sanity bound: an `after` that large overflows whatever "now" turns out to be.
+    // from a clock reading. That is checked against the ambient clock
+    // (`time::ambient_now`, issue #2967), not the app's `ClockSource`, which
+    // `task_info()` — a plain `fn() -> TaskInfo` with no `state` parameter —
+    // cannot reach. It is a sanity bound: an `after` that large overflows
+    // whatever "now" turns out to be.
     let after_boot_validation = spec.after.as_ref().map_or_else(
         || quote! {},
         |after| {
@@ -607,7 +608,7 @@ pub(crate) fn emit_retention(
                                 #after,
                                 "\"))]"
                             ));
-                    ::autumn_web::reexports::chrono::Utc::now()
+                    ::autumn_web::time::ambient_now()
                         .naive_utc()
                         .checked_sub_signed(__chrono_duration)
                         .expect(concat!(
@@ -640,7 +641,7 @@ pub(crate) fn emit_retention(
                                     #purge_after,
                                     "\"))]"
                                 ));
-                        ::autumn_web::reexports::chrono::Utc::now()
+                        ::autumn_web::time::ambient_now()
                             .naive_utc()
                             .checked_sub_signed(__chrono_duration)
                             .expect(concat!(
