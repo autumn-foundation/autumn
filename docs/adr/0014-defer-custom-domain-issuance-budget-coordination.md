@@ -125,21 +125,25 @@ Reproduce with the commands in **Reproduce** below.
    the cluster" seam. A future option-3 implementation would reach for that
    primitive rather than inventing a fourth coordination mechanism.
 6. **No evidence of multi-replica custom-domain deployment exists in this
-   repository — but that is an absence of evidence, not evidence of
-   absence.** Per ADR 0012's Tier-2 finding, 89.4% of this repository's
+   repository — and item 7 shows that is stronger than an absence of
+   evidence.** Per ADR 0012's Tier-2 finding, 89.4% of this repository's
    commits are from one human author with no second team; nothing in the
    issue tracker, CI matrix, or example apps demonstrates an operator
    running ≥2 replicas of this feature concurrently, for the same domain or
    different ones (overlap does not matter — see item 7 and the Trigger
    section). Item 2 in #2644 is a real gap in what the code *claims*
    (`global_per_hour` "enforced per process-lifetime-hour, not per hour"),
-   and item 7 below shows that gap is worse than "more than advertised" —
-   but nothing in this repository's own record says whether anyone is
-   currently exposed to it. That is the thinnest link in this ADR's case
-   for deferral, which is why the revisit trigger is written to fire on the
-   first report, not on a pattern.
+   and item 7 below shows the exact arithmetic of that gap — but also
+   surfaces documented, positive evidence (not merely an absence) that this
+   deployment shape does not work at all today, for a reason unrelated to
+   the budget. That reclassifies this from "thinnest link, watch for a
+   report" to "not currently reachable" — see item 7 and Default path for
+   what that changes; the revisit trigger below still fires on the first
+   report regardless, since an operator can misconfigure past a
+   documented recommendation.
 7. **The limiter's own "well inside [the limit]" claim holds only for one
-   process, not for the account.** The shipped defaults are
+   process, not for the account — but one process is the only topology this
+   feature supports today.** The shipped defaults are
    `issuance_per_domain_per_day = 5` and `issuance_global_per_hour = 50`
    (`config.rs:10228-10235`). At 50/hour, one process can attempt 150 orders
    in any rolling 3-hour window — the same window Let's Encrypt measures
@@ -149,7 +153,18 @@ Reproduce with the commands in **Reproduce** below.
    orders in 3 hours: the account's entire quota, before counting a single
    order from any other source. Three replicas reach 450 — 1.5× over. "Well
    inside the limit... at the defaults" is true at N=1 and false starting
-   at N=2, not at some larger N a real deployment is unlikely to reach.
+   at N=2 — but `docs/guide/tls.md:894-899` and `:426-427` already document,
+   independently of this ADR, that custom domains are **single-host only**:
+   "the HTTP-01 token map and the certificate store are per-process, so
+   behind a load balancer the CA's validation request usually reaches a
+   replica that never published the token. Run custom domains on a single
+   host." A deployment cannot run this feature correctly on ≥2 replicas
+   today for a reason that has nothing to do with the issuance budget —
+   HTTP-01 validation itself breaks first, independent of `global_per_hour`.
+   N=2's arithmetic failure is real and worth recording, but it describes a
+   topology the framework does not yet support, not a live exposure in a
+   supported one (see Impact floor and Default path below for what that
+   changes).
 
 ## Do nothing / decide later — 12-month baseline
 
@@ -168,18 +183,24 @@ fleet-wide coordination (durable-state option 3) in the same pass.
 If durable-state option 3 is deferred and only items 1, 3, and 4 are
 fixed (via durable-state option 1 for item 1): a deployment running
 multiple replicas that are all actively issuing custom-domain certificates
-gets up to N× the advertised `global_per_hour` budget, same as today, where
-N is replica count. Per Evidence item 7, that is worse than "bounded by
-Let's Encrypt's own outer limit": at the shipped defaults, N=2 already
-*equals* that outer limit (300 orders/3h/account) and N=3 exceeds it by
-50%. This framework's own budget stops being a limit *inside* the vendor's
-backstop at exactly two replicas — it does not stay safely under it for a
-generously wide range of N. Nothing in the record shows a deployment
-currently running ≥2 replicas of this feature (Evidence item 6) — but the
-margin for error once one does is zero, not comfortable, so the fifth
-action item in Default path below (recalibrating the default) closes this
-now rather than waiting for the trigger to fire on a deployment that is
-already over budget the moment it exists.
+would get up to N× the advertised `global_per_hour` budget, same as today,
+where N is replica count — and per Evidence item 7, N=2 already *equals*
+Let's Encrypt's outer limit (300 orders/3h/account) rather than staying
+safely under it. That arithmetic is real, but "would" is the operative
+word: `docs/guide/tls.md` already documents custom domains as single-host
+only, for the independent reason that HTTP-01 validation itself does not
+survive a load balancer today. Nothing in the record shows a deployment
+currently running ≥2 replicas of this feature (Evidence item 6), and
+nothing *could* run it successfully today even if it tried — so the
+12-month baseline for the issuance-budget gap specifically is: nothing,
+because the prerequisite feature (multi-replica custom domains at all)
+does not exist yet. That is not true of items 1, 3, and 4, which are live
+single-instance bugs today regardless. The N=2 arithmetic is recorded here
+so that whoever eventually externalizes the HTTP-01 token map and
+certificate store — the actual multi-replica prerequisite,
+`docs/guide/tls.md:894-899`'s documented gap, with no tracked issue found
+for it in this pass — does not also have to rediscover that the issuance
+budget default needs the same trip.
 
 ## Impact floor check
 
@@ -187,9 +208,9 @@ Five of the six clearing conditions are not met for *building durable-state
 option 3*: no Tier-1 incident data (no reported case of multi-replica
 budget overrun); no cross-team change count to reduce (single-maintainer
 repository, per ADR 0012); no dated Tier-4 fact — Let's Encrypt's limit is
-real and, per Evidence item 7, is fully consumed by just two replicas at
-the shipped defaults, but it is a standing constraint with no date and no
-owner attached to closing it within two quarters; no removed cost exceeding
+real, but per Evidence item 7 the configuration that would consume it
+(≥2 replicas) is not one this feature supports today, and nothing assigns
+a date or an owner to closing that anyway; no removed cost exceeding
 a migration cost (no cost is currently being paid); no ≥3-data-point
 asymptotic trend (this is the first and only instance of a hand-rolled,
 non-pluggable "shared mutable runtime state" counter found in this pass —
@@ -199,30 +220,29 @@ structs, all of which are correctly request- or process-scoped by design,
 not mis-scoped copies of this same problem).
 
 **The sixth — a Tier-3 spike, or equivalent computed proof, showing the
-design fails a committed requirement — deserves a real look rather than a
-reflexive "not yet."** Evidence item 7 *is* such a proof: not "might
-struggle with," but an exact arithmetic failure, from the shipped default
-constant, of the limiter's own documented guarantee ("well inside [the
-limit]... at the defaults") at N=2. That is real, admissible evidence the
-floor asks for, and it would be dishonest to wave it off as unmet. It does
-not, however, clear the floor *for option 3*: the requirement that fails is
-that the **default value** of `global_per_hour` assumes one process, not
-that the architecture must become distributed to hold the guarantee.
-Lowering the default so it keeps a small number of replicas, not only
-N=1, inside the vendor limit closes the identical arithmetic gap at
-config/doc cost: no new call site, no new store, no coordination primitive,
-smaller even than durable-state option 1's own fix — see Default path
-below, which is explicit that this is not a "divide by N" feature (no such
-feature exists; see Evidence item 4). Per this framework's instruction to
-take the smallest decision that closes the question, that config/
-documentation fix — not option 3 — is what condition 4 actually calls for
-today; it is added to Default path below as a fifth action item rather
-than left to the trigger. With condition 4's immediate gap closed by that
-cheaper fix instead of by option 3, and none of the other five conditions
-met, this still does not clear the floor for *building option 3 now* — it
-is not RFC-worthy today, but per Evidence item 4 it is an explicit,
-evidence-gated exception to ADR 0004's Category 3 "must," not a claim that
-`IssuanceLimiter` never needs a pluggable backend.
+design fails a committed requirement — deserves a real look, and a first
+pass through this review concluded it was met. On closer reading it is
+not, which is worth recording rather than quietly dropping.** Evidence item
+7's arithmetic (N=2 replicas exactly consume Let's Encrypt's 3-hour limit)
+looked like exactly the proof condition 4 asks for: not "might struggle
+with," but an exact failure of the limiter's own documented guarantee at a
+specific, named N. But a "committed requirement" a design can fail has to
+describe a configuration the design is actually committed to supporting —
+and `docs/guide/tls.md:894-899` already documents, independently of this
+ADR and for an unrelated reason (HTTP-01 token-map and certificate-store
+locality), that custom domains run single-host only. The limiter's "well
+inside the limit... at the defaults" guarantee is implicitly scoped to the
+one topology this feature supports, N=1, where the arithmetic holds
+exactly as claimed. Item 7's N=2 case is real arithmetic about an
+unreachable configuration, not a proof the shipped, supported design fails
+its own requirement. Condition 4 is therefore **not** met after all — no
+Tier-3-equivalent proof exists against the design this feature is
+committed to today. Combined with the other five conditions above, none of
+the six are met: this does not clear the floor for durable-state option 3,
+and per Evidence item 4 that non-clearance is an explicit, evidence-gated
+exception to ADR 0004's Category 3 "must," not a claim that
+`IssuanceLimiter` never needs a pluggable backend — only that no evidenced,
+*reachable* need has reached it yet.
 
 ## Default path
 
@@ -242,20 +262,21 @@ per-process; do not add a Redis or Postgres-backed cross-replica layer for
 it in this pass — durability and cross-replica coordination are separate
 questions, and only the latter is what this ADR defers.
 
-A fifth action item, surfaced by this review rather than by #2644 itself:
-lower `default_custom_domains_global_per_hour` (`config.rs:10233`,
-currently `50`) so the shipped default keeps a small number of replicas —
-not only N=1 — inside Let's Encrypt's 300-orders-per-3-hours account limit
-(see Evidence item 7 and Impact floor condition 4), and document that an
-operator whose real replica count exceeds what the new default assumes has
-two honest options: lower `global_per_hour` further in their own config
-proportional to their replica count, or treat that as their trigger (below)
-to request the Redis-backed Category-3 backend `rate_limit.rs` already
-demonstrates the shape of. This is not a "divide by N" feature the limiter
-gains — no such feature exists, and inventing one here would be exactly the
-kind of new machinery Default path already declines to build. It is a
-config-default and documentation change; it needs no ADR of its own and
-rides the same PR as items 1/3/4.
+No fifth action item is added. An earlier pass through this review proposed
+lowering `default_custom_domains_global_per_hour` (`config.rs:10233`,
+currently `50`) to cover a multi-replica margin — but per Evidence item 7,
+custom domains are documented single-host only for a reason (HTTP-01
+token-map and certificate-store locality) this ADR's scope does not touch,
+so a deployment running ≥2 replicas of this feature does not exist to
+protect. Lowering the default today would only shrink issuance throughput
+for the one topology this feature actually supports, in exchange for
+guarding against a topology that cannot run it regardless — the same
+"narrows options for a benefit you could not measure" mistake this
+framework's own banned-changes list warns against. The right trigger for
+recalibrating `global_per_hour` is not this ADR's trigger below; it is
+whoever externalizes the HTTP-01 token map and certificate store to make
+multi-replica custom domains real, who should read Evidence item 7 before
+shipping that and pick a default that accounts for it then.
 
 ## Seam kept open
 
@@ -285,11 +306,19 @@ default path's ordinary bug fix, not as something option 3 must add later:
 ## Trigger to revisit
 
 Revisit the durable-state-option-3 (fleet-wide coordination) decision if
-either occurs:
+any of the following occurs:
 
+- **The HTTP-01 token map and certificate store are externalized**, making
+  multi-replica custom domains a supported topology for the first time
+  (`docs/guide/tls.md:894-899` is the documented gap this closes). At that
+  point Evidence item 7's N=2 arithmetic stops being about an unreachable
+  configuration and starts being about the one operators can actually run —
+  recalibrate `global_per_hour`'s default and re-open this decision before
+  declaring that support production-safe, not after.
 - An operator reports running ≥2 replicas that concurrently issue
-  custom-domain certificates — for the same hostname or different ones.
-  The fleet lease in `tenant_domains.rs::issue_one` is keyed per-hostname
+  custom-domain certificates today, despite the documented single-host
+  requirement — for the same hostname or different ones. The fleet lease in
+  `tenant_domains.rs::issue_one` is keyed per-hostname
   (`format!("custom-domain:{hostname}")`, "one replica per hostname
   orders"), so it excludes a second replica from racing the *same* domain
   but does nothing to stop two replicas issuing for *different* domains at
@@ -297,11 +326,13 @@ either occurs:
   `global_per_hour` allowance. Overlapping domain sets are not required for
   the per-process budget gap (#2644 item 2) to produce observed
   over-issuance — disjoint domains issued concurrently across replicas
-  already multiply the advertised budget by replica count.
+  already multiply the advertised budget by replica count, on top of
+  whatever HTTP-01 validation failures that unsupported topology already
+  causes.
 - A deployment is documented approaching Let's Encrypt's outer
-  300-orders-per-3-hours account limit, making this framework's own budget
-  (rather than the vendor's) the thing that needs to hold exactly, not just
-  approximately.
+  300-orders-per-3-hours account limit some other way, making this
+  framework's own budget (rather than the vendor's) the thing that needs to
+  hold exactly, not just approximately.
 
 ## Reproduce
 
@@ -344,6 +375,11 @@ grep -n "pub async fn remove_if" autumn/src/custom_domain.rs
 # The shipped default: 50/hour means 150 orders per process per 3-hour
 # window — two replicas already sum to Let's Encrypt's entire 300 limit
 grep -n "fn default_custom_domains_global_per_hour" -A 3 autumn/src/config.rs
+
+# But custom domains are documented single-host only, for a reason (HTTP-01
+# token-map/cert-store locality) unrelated to the issuance budget — the N=2
+# arithmetic above describes a topology this feature does not support today
+grep -n "single-host\|single host\|token map" docs/guide/tls.md
 
 # check() and record_attempt() are two separate calls with a real awaited
 # gap between them (try_acquire, record_issuing_for) that the per-hostname
