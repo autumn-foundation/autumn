@@ -266,7 +266,7 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
             let columns = REQUIRED_COLUMNS
                 .iter()
                 .copied()
-                .filter(|column| mentions_column(body, column))
+                .filter(|column| declares_column(body, column))
                 .collect();
             events.push((at, TableEvent::Create(table, columns)));
         }
@@ -610,6 +610,51 @@ fn table_rename_target(statement: &str) -> Option<TableRef> {
 /// reporting that it reused the table — with every helper then failing at
 /// runtime on columns that are not there. The same identifier-boundary rule the
 /// table name gets; columns had been left as substrings.
+/// Whether a `CREATE TABLE` column-list `body` DECLARES `column` — as the name
+/// at the head of one of its top-level elements — rather than merely
+/// mentioning it. A mention is not a declaration: `author_id BIGINT
+/// REFERENCES users(id)` names `id`, but the table has no `id` column, and
+/// reading it as one made a table lacking the key look like the shared
+/// comments table.
+///
+/// Elements split at top-level commas (not inside parens or a `'…'` literal);
+/// table constraints (`PRIMARY KEY (…)`, `CONSTRAINT …`, `FOREIGN KEY`, …)
+/// declare no column and are skipped.
+fn declares_column(body: &str, column: &str) -> bool {
+    const TABLE_CONSTRAINTS: &[&str] = &[
+        "constraint",
+        "primary",
+        "foreign",
+        "unique",
+        "check",
+        "exclude",
+        "like",
+    ];
+    let mut elements = Vec::new();
+    let (mut depth, mut in_literal, mut start) = (0usize, false, 0usize);
+    for (at, ch) in body.char_indices() {
+        match ch {
+            '\'' => in_literal = !in_literal,
+            '(' if !in_literal => depth += 1,
+            ')' if !in_literal => depth = depth.saturating_sub(1),
+            ',' if !in_literal && depth == 0 => {
+                elements.push(&body[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    elements.push(&body[start..]);
+    elements.into_iter().any(|element| {
+        let element = element.trim_start();
+        // A constraint keyword is only one when unquoted: `"check"` is a column.
+        let quoted = element.starts_with('"');
+        parse_ident_segment(element).is_some_and(|(name, _)| {
+            name == column && (quoted || !TABLE_CONSTRAINTS.contains(&name.as_str()))
+        })
+    })
+}
+
 fn mentions_column(haystack: &str, column: &str) -> bool {
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut base = 0usize;
@@ -2044,6 +2089,45 @@ mod tests {
         assert!(
             !already_migrated(tmp.path()),
             "the table only has `payload`, whatever its query mentions"
+        );
+    }
+
+    /// A column the body only REFERENCES is not declared: `REFERENCES
+    /// users(id)` does not give the table an `id` column.
+    #[test]
+    fn a_referenced_column_is_not_a_declared_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (commentable_type TEXT, commentable_id BIGINT, \
+             parent_id BIGINT, author_id BIGINT REFERENCES users(id), body TEXT, \
+             created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "legacy_comments has no `id` column of its own"
+        );
+    }
+
+    #[test]
+    fn declares_column_reads_element_heads_only() {
+        let body = "id BIGSERIAL PRIMARY KEY, \"check\" TEXT, note TEXT DEFAULT 'a, id', \
+                    CONSTRAINT body_fk FOREIGN KEY (body) REFERENCES t(body), \
+                    PRIMARY KEY (parent_id)";
+        assert!(declares_column(body, "id"));
+        assert!(declares_column(body, "check"));
+        assert!(declares_column(body, "note"));
+        assert!(
+            !declares_column(body, "body"),
+            "only named inside a constraint"
+        );
+        assert!(
+            !declares_column(body, "parent_id"),
+            "only named in PRIMARY KEY (…)"
         );
     }
 
