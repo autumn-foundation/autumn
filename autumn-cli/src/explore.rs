@@ -388,6 +388,8 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         };
 
         let lines = build_detail_lines(&route);
@@ -420,6 +422,8 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         };
         let route2 = RouteInfo {
             method: "POST".to_string(),
@@ -430,6 +434,8 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         };
 
         let mut state = ExploreState::new(vec![route1, route2]);
