@@ -1435,20 +1435,6 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
         if percent_escapes(segment).any(|(_, upper)| !upper) {
             return refuse("a route path must write a percent-escape in upper-case hex");
         }
-        // The router compares against the raw, percent-encoded path as it
-        // arrived on the wire, while the manifest is written in decoded text.
-        // A literal non-ASCII character can therefore never match: every
-        // ordinary client encodes it before sending, so a manifest declaring
-        // `/hello/café` mounts a route no client can reach while `plugin
-        // inspect` prints it as a route the plugin serves (#2481). Refuse
-        // rather than normalise, like every other rule in this function: the
-        // encoded spelling is already the working one, and the consent screen
-        // must show exactly what the router mounts. Captures (`{name}`,
-        // `{*rest}`) are matched by position at request time, so the rule
-        // applies to literal segments only.
-        if !is_capture_segment(segment) && segment.bytes().any(|b| !b.is_ascii()) {
-            return refuse("a literal route segment must be ASCII; write `café` as `caf%C3%A9`");
-        }
         if segment.chars().any(char::is_whitespace) {
             return refuse("a route path must not contain whitespace");
         }
@@ -1469,6 +1455,22 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
                 "a route path must not contain Unicode formatting characters; they change what \
                  the consent screen displays without changing what is mounted",
             );
+        }
+        // The router compares against the raw, percent-encoded path as it
+        // arrived on the wire, while the manifest is written in decoded text.
+        // A literal non-ASCII character can therefore never match: every
+        // ordinary client encodes it before sending, so a manifest declaring
+        // `/hello/café` mounts a route no client can reach while `plugin
+        // inspect` prints it as a route the plugin serves (#2481). Refuse
+        // rather than normalise, like every other rule in this function: the
+        // encoded spelling is already the working one, and the consent screen
+        // must show exactly what the router mounts. Captures (`{name}`,
+        // `{*rest}`) are matched by position at request time, so the rule
+        // applies to literal segments only. It runs after the whitespace,
+        // control and formatting checks so those keep their more specific
+        // refusals for the non-ASCII characters they cover.
+        if !is_capture_segment(segment) && segment.bytes().any(|b| !b.is_ascii()) {
+            return refuse("a literal route segment must be ASCII; write `café` as `caf%C3%A9`");
         }
         // axum 0.8 spells captures `{name}` / `{*rest}` and *panics* on a
         // segment starting with the 0.7 spelling, before matchit ever sees it.
