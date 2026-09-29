@@ -803,28 +803,26 @@ fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// Called after the opening `$tag$` delimiter has already been consumed.
 /// Uses a simple sliding-window match — sufficient for valid SQL.
 fn consume_dollar_quoted_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, tag: &str) {
-    let mut expected_chars = std::iter::once('$')
-        .chain(tag.chars())
-        .chain(std::iter::once('$'));
-    let mut expected = expected_chars.next().unwrap();
-
+    // Walk the closing `$tag$` delimiter lazily instead of collecting it into a
+    // `Vec<char>`: this runs once per dollar-quoted literal on the query path.
+    let closing = || {
+        std::iter::once('$')
+            .chain(tag.chars())
+            .chain(std::iter::once('$'))
+            .peekable()
+    };
+    let mut remaining = closing();
     for sc in chars.by_ref() {
-        if sc == expected {
-            if let Some(next) = expected_chars.next() {
-                expected = next;
-            } else {
+        if remaining.peek() == Some(&sc) {
+            remaining.next();
+            if remaining.peek().is_none() {
                 break; // Found the closing delimiter.
             }
         } else {
-            // Reset the state machine.
-            expected_chars = std::iter::once('$')
-                .chain(tag.chars())
-                .chain(std::iter::once('$'));
-            expected = expected_chars.next().unwrap();
-
-            // If the current character is '$', it might be the start of a new match.
-            if sc == expected {
-                expected = expected_chars.next().unwrap();
+            // Restart the match; the current char may begin a new one.
+            remaining = closing();
+            if remaining.peek() == Some(&sc) {
+                remaining.next();
             }
         }
     }
@@ -5446,6 +5444,16 @@ mod tests {
         assert_eq!(
             super::scrub_sql("SELECT $body$hello world$body$"),
             "SELECT '?'"
+        );
+    }
+
+    #[test]
+    fn scrub_sql_dollar_quoted_with_tag_restarts_after_partial_close() {
+        // A `$` inside the body, and a partial `$bo` of the closing tag, must
+        // not end the literal early: only the full `$body$` closes it.
+        assert_eq!(
+            super::scrub_sql("SELECT $body$a $5 $bo $$body$ FROM t"),
+            "SELECT '?' FROM t"
         );
     }
 
