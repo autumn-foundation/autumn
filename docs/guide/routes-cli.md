@@ -115,6 +115,18 @@ Each entry in the JSON array follows this schema:
 | `"plugin:<name>"` | Registered by a named Autumn plugin (e.g. `"plugin:autumn-admin"`) |
 | `"framework"` | Registered by the Autumn framework itself |
 
+## Mermaid output
+
+Emit a Mermaid `flowchart` for pasting into Markdown docs that render Mermaid
+(GitHub, most wikis):
+
+```bash
+autumn routes --format mermaid
+```
+
+Routes are grouped into one `subgraph` per `source` (`user`, `framework`,
+`plugin_<name>`), each route a node labelled with its method and path.
+
 ## WebSocket routes
 
 Routes registered with `#[ws]` appear with method `WS`:
