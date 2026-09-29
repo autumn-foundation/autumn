@@ -501,20 +501,22 @@ pub fn bom_from_cargo_metadata(
     // Walk the resolve graph so dev-dependencies — resolved but never linked
     // — stay out of the shipped document. With no resolve graph there is
     // nothing to walk; fall back to listing every package, as before.
-    let seeds: Vec<String> = match root_id.as_deref() {
-        Some(id) => vec![id.to_owned()],
+    let seeds: Vec<String> = root_id.as_deref().map_or_else(
         // No root (a virtual workspace without a named member): describe the
         // whole workspace's non-dev closure — every member's, unioned.
-        None => packages
-            .iter()
-            .filter(|p| p.get("source").is_none_or(serde_json::Value::is_null))
-            .filter_map(|p| {
-                p.get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect(),
-    };
+        || {
+            packages
+                .iter()
+                .filter(|p| p.get("source").is_none_or(serde_json::Value::is_null))
+                .filter_map(|p| {
+                    p.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect()
+        },
+        |id| vec![id.to_owned()],
+    );
     let root_id_str = root_id.as_deref();
     let components = match non_dev_reachable(metadata, &seeds) {
         Some(reachable) => packages
@@ -563,12 +565,11 @@ fn resolve_root_id(metadata: &serde_json::Value, manifest_path: Option<&Path>) -
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|m| manifest_matches(m, requested))
         })
-        .filter_map(|p| {
+        .find_map(|p| {
             p.get("id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         })
-        .next()
 }
 
 /// Whether a package's `manifest_path` (absolute, as `cargo metadata`
