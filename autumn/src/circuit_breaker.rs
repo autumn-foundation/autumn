@@ -798,7 +798,7 @@ mod tests {
                 async { Err::<&'static str, &'static str>("failed") },
                 |err| match err {
                     CircuitBreakerError::Execution(_) => Ok("fallback_success"),
-                    _ => Err("wrong_error"),
+                    CircuitBreakerError::Open => Err("wrong_error"),
                 },
             )
             .await;
@@ -819,7 +819,7 @@ mod tests {
                 async { Ok::<&'static str, &'static str>("won't run") },
                 |err| match err {
                     CircuitBreakerError::Open => Ok("fallback_from_open"),
-                    _ => Err("wrong_error"),
+                    CircuitBreakerError::Execution(_) => Err("wrong_error"),
                 },
             )
             .await;
