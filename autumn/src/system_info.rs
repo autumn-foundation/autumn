@@ -1,8 +1,11 @@
 //! System information plugin.
 //!
-//! Provides the underlying functionality to inspect basic host system information
-//! (like OS, architecture, and core counts) at runtime. This is primarily exposed
-//! via an actuator endpoint so administrators can check the server environment.
+//! Reports what the running binary was built for and how much parallelism it
+//! has: the target OS and CPU architecture (compile-time constants from
+//! [`std::env::consts`], so a binary running under emulation reports what it
+//! was compiled for, not the host kernel) and the logical cores available to
+//! the process (measured at runtime). It is exposed through the actuator
+//! endpoint when the `system-info` feature is enabled.
 //!
 //! This module exists to supply a standardized JSON payload detailing
 //! the environment, which is highly useful when operating multiple nodes
@@ -28,21 +31,23 @@ use std::thread;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-/// Represents the host system's hardware and operating system environment.
+/// The build target and available parallelism of the running process.
 ///
 /// This struct is serialized into JSON and returned by the crate-private `system_info_handler`.
 /// It contains basic metrics that do not change during the lifetime of the process.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
-    /// The operating system family (e.g., `"linux"`, `"macos"`, `"windows"`).
+    /// The target operating system the binary was compiled for
+    /// ([`std::env::consts::OS`], e.g. `"linux"`, `"macos"`, `"windows"`).
     pub os: String,
-    /// The CPU architecture (e.g., `"x86_64"`, `"aarch64"`).
+    /// The target CPU architecture the binary was compiled for
+    /// ([`std::env::consts::ARCH`], e.g. `"x86_64"`, `"aarch64"`).
     pub arch: String,
     /// The number of logical CPU cores available to the application.
     pub available_parallelism: usize,
 }
 
-/// An [`axum`] route handler that returns the host's [`SystemInfo`] as JSON.
+/// An [`axum`] route handler that returns the process's [`SystemInfo`] as JSON.
 ///
 /// This function exists to provide a lightweight diagnostic endpoint.
 /// The system info is computed once using a [`OnceLock`] and cached for all
