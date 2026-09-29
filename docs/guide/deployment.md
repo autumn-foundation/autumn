@@ -2124,12 +2124,14 @@ done
 az containerapp update \
   --name "$APP_NAME" \
   --resource-group "$RG" \
-  --image "$ACR/$APP_NAME:$TAG"
+  --image "$ACR/$APP_NAME:$TAG" &&
 
 # Open external ingress now that the real image is serving. Until this
 # point the app has been unreachable from the public FQDN by design
 # (#2312); the placeholder revision could never be woken by inbound
-# traffic with production secrets attached.
+# traffic with production secrets attached. The `&&` above matters: if the
+# image update fails, ingress must stay closed rather than expose the
+# placeholder.
 az containerapp ingress enable \
   --name "$APP_NAME" \
   --resource-group "$RG" \

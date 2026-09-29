@@ -2944,8 +2944,10 @@ previous_secrets = []
         // The cutover opens ingress once the real image is serving — after
         // the image update, never before.
         let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        // Match the invocation (with its line continuation), not the bare
+        // text an earlier concurrency comment also contains.
         let update_at = workflow
-            .find("az containerapp update")
+            .find("az containerapp update \\")
             .expect("workflow must cut over via az containerapp update");
         let enable_at = workflow
             .find("az containerapp ingress enable")
