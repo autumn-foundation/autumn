@@ -42,8 +42,7 @@
 //! ```
 //!
 //! The paused runtime (`start_paused(true)`) freezes the tokio virtual clock at
-//! start so W1 tests run deterministically; W2 will drive that clock through
-//! [`Sim`](../../autumn_web/sim/struct.Sim.html)'s `SimClock` handle.
+//! start so tests run deterministically. `Sim::advance` drives that clock.
 
 use proc_macro2::TokenStream;
 use quote::quote;

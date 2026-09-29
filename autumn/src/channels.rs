@@ -56,6 +56,10 @@ use tokio::sync::broadcast;
 /// by a previous epoch from a current-epoch id even though the per-epoch `seq`
 /// counter restarts at `1` every time.
 #[allow(clippy::cast_possible_truncation)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the seed must differ across real process restarts"
+)]
 fn next_topic_epoch() -> u64 {
     static SEED: OnceLock<u64> = OnceLock::new();
     static COUNTER: AtomicU64 = AtomicU64::new(0);
