@@ -59,6 +59,14 @@
 //! recorded under an older version is treated as undecided, so the banner
 //! reappears and the gate closes until the visitor re-decides.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::convert::Infallible;
 
 use axum::extract::FromRequestParts;
@@ -352,7 +360,7 @@ pub fn reject_non_essential_cookie(policy_version: u32) -> String {
 }
 
 fn build_consent_cookie(categories: &[&str], policy_version: u32) -> String {
-    let decided_at = chrono::Utc::now().to_rfc3339();
+    let decided_at = crate::time::ambient_now().to_rfc3339();
     let value = encode_cookie_value(policy_version, &decided_at, categories);
     format!(
         "{CONSENT_COOKIE_NAME}={value}; Path=/; Max-Age={MAX_AGE_SECS}; HttpOnly; Secure; SameSite=Lax"

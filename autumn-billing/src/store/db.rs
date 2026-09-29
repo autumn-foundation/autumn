@@ -537,7 +537,7 @@ impl BillingStore for DbBillingStore {
                         .first(conn)
                         .await
                         .optional()?;
-                    let Some(mut current) = existing else {
+                    let Some(current) = existing else {
                         let row = CustomerRow {
                             id: upsert.new_id,
                             user_id: upsert.user_id,
@@ -553,19 +553,60 @@ impl BillingStore for DbBillingStore {
                             .await?;
                         return Ok(row);
                     };
-                    // A link is set once; an email is replaced.
-                    if current.user_id.is_none() && upsert.user_id.is_some() {
-                        current.user_id = upsert.user_id;
-                    }
-                    if upsert.email.is_some() {
-                        current.email = upsert.email;
-                    }
-                    current.updated_at = to_naive(upsert.now);
-                    diesel::update(billing_customers::table.find(&current.id))
-                        .set(&current)
+                    // A link is set once; an email is replaced. Two scoped
+                    // UPDATEs, never a whole-row `.set(&current)`: `current`
+                    // is a snapshot read a moment earlier, and every billing
+                    // webhook reaches this upsert (even with nothing of its
+                    // own to change) — writing `current.user_id` back
+                    // unconditionally would silently undo a concurrent
+                    // `BillingStore::relink_customer` landing between this
+                    // read and this write, reverting an operator's migration
+                    // mid-flight. The `user_id IS NULL` filter is evaluated
+                    // by the database against the row's current state at
+                    // UPDATE time, not this snapshot, so it can only ever
+                    // link a row that is still actually unlinked; the email/
+                    // timestamp update never touches the `user_id` column at
+                    // all, so it can never be the write that reverts a
+                    // relink either.
+                    if let Some(new_user_id) = &upsert.user_id {
+                        diesel::update(
+                            billing_customers::table
+                                .filter(billing_customers::id.eq(&current.id))
+                                .filter(billing_customers::user_id.is_null()),
+                        )
+                        .set(billing_customers::user_id.eq(new_user_id))
                         .execute(conn)
                         .await?;
-                    Ok(current)
+                    }
+                    match &upsert.email {
+                        Some(email) => {
+                            diesel::update(
+                                billing_customers::table
+                                    .filter(billing_customers::id.eq(&current.id)),
+                            )
+                            .set((
+                                billing_customers::email.eq(email),
+                                billing_customers::updated_at.eq(to_naive(upsert.now)),
+                            ))
+                            .execute(conn)
+                            .await?;
+                        }
+                        None => {
+                            diesel::update(
+                                billing_customers::table
+                                    .filter(billing_customers::id.eq(&current.id)),
+                            )
+                            .set(billing_customers::updated_at.eq(to_naive(upsert.now)))
+                            .execute(conn)
+                            .await?;
+                        }
+                    }
+                    let final_row: CustomerRow = billing_customers::table
+                        .filter(billing_customers::id.eq(&current.id))
+                        .select(CustomerRow::as_select())
+                        .first(conn)
+                        .await?;
+                    Ok(final_row)
                 })
                 .await;
             match result {
@@ -640,6 +681,57 @@ impl BillingStore for DbBillingStore {
                 .optional()
                 .map_err(|err| db_err("customer_by_provider_id", &err))?;
             Ok(row.map(CustomerRow::into_model))
+        })
+    }
+
+    fn relink_customer<'a>(
+        &'a self,
+        id: &'a str,
+        user_id: String,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, Option<Customer>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            let result: Result<Option<CustomerRow>, TxError> = conn
+                .transaction(async move |conn| -> Result<Option<CustomerRow>, TxError> {
+                    let existing: Option<CustomerRow> = billing_customers::table
+                        .find(id)
+                        .select(CustomerRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(current) = existing else {
+                        return Ok(None);
+                    };
+                    // Column-scoped, symmetric to `upsert_customer`'s fix
+                    // above: a whole-row `.set(&current)` here would write
+                    // back this snapshot's `email` too, silently erasing a
+                    // concurrent webhook's `upsert_customer` email refresh
+                    // landing in the window between this read and this
+                    // write. Touch only the two columns this operation
+                    // actually intends to change.
+                    diesel::update(billing_customers::table.find(&current.id))
+                        .set((
+                            billing_customers::user_id.eq(&user_id),
+                            billing_customers::updated_at.eq(to_naive(now)),
+                        ))
+                        .execute(conn)
+                        .await?;
+                    let final_row: CustomerRow = billing_customers::table
+                        .find(&current.id)
+                        .select(CustomerRow::as_select())
+                        .first(conn)
+                        .await?;
+                    Ok(Some(final_row))
+                })
+                .await;
+            match result {
+                Ok(row) => Ok(row.map(CustomerRow::into_model)),
+                Err(TxError::Db(err)) if is_unique_violation(&err) => {
+                    Err(BillingError::Conflict(format!("relink_customer: {err}")))
+                }
+                Err(err) => Err(err.into_billing("relink_customer")),
+            }
         })
     }
 

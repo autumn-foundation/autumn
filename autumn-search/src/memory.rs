@@ -573,7 +573,14 @@ impl SearchBackend for MemorySearchBackend {
                 return Err(error);
             }
 
-            sort_hits(&mut hits);
+            // `query.limit` is always the number of hits the caller can ever
+            // see (there is no pagination window here, unlike
+            // `keyword_search`), so it is exactly the `k` `sort_top_k` needs
+            // — see `autumn-search/benches/vector_search.rs`, where profiling
+            // found the full `sort_hits` over the whole match set costing
+            // ~7.6% of the bench's own instructions to serve a 10-neighbour
+            // k-NN query.
+            sort_top_k(&mut hits, query.limit);
             hits.truncate(query.limit);
             Ok(hits)
         })
