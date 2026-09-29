@@ -11,6 +11,14 @@
 //! code is reachable from hot paths** — `is_pinned()` fast-returns `false`
 //! without touching the task-local, and no middleware layer is installed.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -155,10 +163,7 @@ fn parse_session_cookie(
     if !keys.verify(ts_str.as_bytes(), sig) {
         return false;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = crate::time::clock_unix_secs(&crate::time::AmbientClock);
     // Reject timestamps more than 5 s in the future so clock skew on a signing
     // server can't produce a cookie that is accepted indefinitely on other nodes.
     if ts > now {
@@ -186,10 +191,7 @@ pub fn session_cookie_value(
     if !pin.inner.wrote.load(Ordering::Relaxed) {
         return None;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = crate::time::clock_unix_secs(&crate::time::AmbientClock);
     let ts_str = now.to_string();
     let sig = keys.sign(ts_str.as_bytes());
     Some(format!("{ts_str}.{sig}"))
