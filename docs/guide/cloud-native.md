@@ -33,14 +33,19 @@ The scaffold now includes:
 That is container scaffolding, not a full cluster deployment. You still need to
 decide your runtime topology.
 
-## Probes
+## Probes: liveness, readiness, and startup
 
-Autumn mounts:
+Autumn mounts four probe endpoints. The paths below are the defaults; each is
+configurable under `[health]` (`live_path`, `ready_path`, `startup_path`,
+`path`), and `[health] enabled = false` suppresses all four so an app can own
+those paths itself.
 
-- `/live`
-- `/ready`
-- `/startup`
-- `/health`
+| Endpoint | Probe | What it reflects |
+| --- | --- | --- |
+| `/live` | liveness | Only that the process is up. Ignores startup and dependency state, so it answers `200` whenever the process is running. |
+| `/ready` | readiness | Startup completion, shutdown draining, connection-pool saturation, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
+| `/startup` | startup | Stays unavailable until startup hooks complete. |
+| `/health` | — | Compatibility alias for readiness: same checks and same status as `/ready`. |
 
 Recommended use:
 
@@ -49,6 +54,23 @@ Recommended use:
 - startup probe -> `/startup`
 
 Do not point all three at `/health` just because it was easy in older apps.
+`/health` is a readiness answer, so it returns `503` for conditions a restart
+does not fix: a saturated connection pool, a read replica that cannot safely
+serve reads, a readiness indicator of your own reporting down, or a drain
+already in progress. A *liveness* probe reading one of those has the
+orchestrator kill a process that was working — a busy minute becomes a restart
+loop, which is the failure mode separate probes exist to prevent. Point
+liveness at `/live`, which reports on the process and nothing else.
+
+Readiness does **not** ping the primary database. The built-in `db` indicator
+reports pool *availability* — whether a connection is free, or nobody is queued
+for one — so a primary that has become unreachable while the pool still holds
+idle connections can leave `/ready` at `200`. A configured read replica is
+different: it is probed with a real `SELECT 1`. If you need readiness to gate
+on primary connectivity, register an indicator that runs a query.
+
+For readiness that also reflects your own subsystems, see
+[Health Indicators](health-indicators.md).
 
 ## Telemetry
 

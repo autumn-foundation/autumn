@@ -1,0 +1,7 @@
+error: `#[obligation]` needs `starts = <field>`
+ --> tests/compile-fail/obligation_missing_starts.rs:5:1
+  |
+5 | #[obligation(name = first_response, within = "2 business days")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `obligation` (in Nightly builds, run with -Z macro-backtrace for more info)

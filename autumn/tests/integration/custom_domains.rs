@@ -15,8 +15,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use autumn_web::config::AutumnConfig;
 use autumn_web::custom_domain::{
     CustomDomainRegistry, CustomDomainStore as _, DnsInstructions, DomainStatus, ExpectedIngress,
-    IssuanceDecision, IssuanceLimiter, IssuedCertificate, MemoryCustomDomainStore, ObservedTarget,
-    RegisterError, VerificationOutcome, grade_dns_verification, normalize_hostname,
+    FsCustomDomainStore, IssuanceDecision, IssuanceLimiter, IssuedCertificate,
+    MemoryCustomDomainStore, ObservedTarget, ObservedTxt, RegisterError, RoutingRecord,
+    VERIFICATION_LABEL, VerificationOutcome, grade_dns_verification, grade_ownership,
+    normalize_hostname,
 };
 use autumn_web::tenancy::extract_tenant_from_parts_with_domains;
 use axum::http::Request;
@@ -106,33 +108,235 @@ fn hostnames_are_normalised_and_validated() {
     }
 }
 
-#[test]
-fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
-    let sub = DnsInstructions::for_hostname("app.clientco.com", &ingress()).unwrap();
-    match &sub {
-        DnsInstructions::Cname { name, value } => {
+#[tokio::test]
+async fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
+    let registry = registry();
+    let domain = registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    let sub = DnsInstructions::for_domain(&domain, &ingress()).unwrap();
+    match &sub.routing {
+        RoutingRecord::Cname { name, value } => {
             assert_eq!(name, "app.clientco.com");
             assert_eq!(value, "ingress.myapp.com");
         }
-        other @ DnsInstructions::Address { .. } => {
+        other @ RoutingRecord::Address { .. } => {
             panic!("expected a CNAME instruction, got {other:?}")
         }
     }
     assert!(sub.render().contains("CNAME"));
 
     // An apex domain cannot carry a CNAME, so it gets A/AAAA records.
-    let apex = DnsInstructions::for_hostname("clientco.com", &ingress()).unwrap();
-    match &apex {
-        DnsInstructions::Address { name, ipv4, ipv6 } => {
+    let apex_domain = registry
+        .register("clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    let apex = DnsInstructions::for_domain(&apex_domain, &ingress()).unwrap();
+    match &apex.routing {
+        RoutingRecord::Address { name, ipv4, ipv6 } => {
             assert_eq!(name, "clientco.com");
             assert_eq!(ipv4, &["203.0.113.10".to_owned()]);
             assert!(ipv6.is_empty());
         }
-        other @ DnsInstructions::Cname { .. } => {
+        other @ RoutingRecord::Cname { .. } => {
             panic!("expected address records, got {other:?}")
         }
     }
     assert!(apex.render().contains('A'));
+}
+
+// ── #2642: ownership proof by TXT token ──────────────────────────────────
+
+/// Both shapes render the TXT record that carries the registration's token,
+/// on its own line, after the routing record.
+#[tokio::test]
+async fn dns_instructions_carry_the_ownership_txt_record_for_both_shapes() {
+    let registry = registry();
+    for hostname in ["app.clientco.com", "clientco.com"] {
+        let domain = registry.register(hostname, "tenant-a", NOW).await.unwrap();
+        let token = domain
+            .verification_token
+            .clone()
+            .expect("a new record has a token");
+        let instructions = DnsInstructions::for_domain(&domain, &ingress()).unwrap();
+        let record = instructions.verification.as_ref().expect("a TXT record");
+        assert_eq!(record.name, format!("{VERIFICATION_LABEL}.{hostname}"));
+        assert_eq!(record.value, token);
+        let last = instructions.render().lines().last().unwrap().to_owned();
+        assert_eq!(last, format!("_autumn-challenge.{hostname}\tTXT\t{token}"));
+    }
+}
+
+/// Every registration mints its own token, so a TXT record a previous owner
+/// left behind proves nothing for the next one.
+#[tokio::test]
+async fn each_registration_mints_a_fresh_token() {
+    let registry = registry();
+    let first = registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    let token_a = first.verification_token.clone().unwrap();
+    assert_eq!(token_a.len(), 32);
+    assert!(token_a.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    // Idempotent re-registration keeps the token the tenant already published.
+    let again = registry
+        .register("app.clientco.com", "tenant-a", NOW + 1)
+        .await
+        .unwrap();
+    assert_eq!(again.verification_token.as_deref(), Some(token_a.as_str()));
+
+    registry.remove("app.clientco.com").await.unwrap();
+    let second = registry
+        .register("app.clientco.com", "tenant-b", NOW + 2)
+        .await
+        .unwrap();
+    assert_ne!(second.verification_token.as_deref(), Some(token_a.as_str()));
+}
+
+#[tokio::test]
+async fn ownership_passes_only_on_this_registrations_token() {
+    let registry = registry();
+    let domain = registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    let token = domain.verification_token.clone().unwrap();
+
+    assert_eq!(
+        grade_ownership(
+            &domain,
+            &ObservedTxt::Values(vec!["v=spf1 -all".to_owned(), token.clone()])
+        ),
+        VerificationOutcome::PointsHere
+    );
+    for (observed, says) in [
+        (ObservedTxt::Values(vec![]), "no TXT record"),
+        (
+            ObservedTxt::Values(vec!["an-earlier-tenants-token".to_owned()]),
+            "earlier registration",
+        ),
+        (
+            ObservedTxt::Unanswered("SERVFAIL".to_owned()),
+            "lookup failed",
+        ),
+    ] {
+        let outcome = grade_ownership(&domain, &observed);
+        assert!(!outcome.is_verified(), "{observed:?} must not verify");
+        let reason = outcome.reason().unwrap();
+        assert!(
+            reason.contains("_autumn-challenge.app.clientco.com"),
+            "{reason}"
+        );
+        assert!(reason.contains(says), "{reason}");
+    }
+
+    // A record with no token has proved nothing.
+    let mut legacy = domain;
+    legacy.verification_token = None;
+    assert!(!grade_ownership(&legacy, &ObservedTxt::Values(vec![token])).is_verified());
+}
+
+/// A verification graded against one registration must not promote the next
+/// registration of the same hostname.
+#[tokio::test]
+async fn a_verification_result_applies_only_to_the_registration_it_checked() {
+    let registry = registry();
+    let checked = registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry.remove("app.clientco.com").await.unwrap();
+    registry
+        .register("app.clientco.com", "tenant-b", NOW + 1)
+        .await
+        .unwrap();
+
+    let applied = autumn_web::custom_domain::apply_verification(
+        &registry,
+        &checked,
+        &VerificationOutcome::PointsHere,
+        NOW + 2,
+        300,
+    )
+    .await
+    .unwrap();
+    assert!(!applied);
+    let current = registry.get("app.clientco.com").unwrap();
+    assert_eq!(current.tenant, "tenant-b");
+    assert_eq!(current.status, DomainStatus::PendingDns);
+    assert!(registry.due_for_issuance(NOW + 3).is_empty());
+}
+
+/// A record written before tokens existed: `active` ones keep serving; the
+/// rest get a token at load and must prove ownership.
+#[tokio::test]
+async fn records_from_before_tokens_are_grandfathered_only_when_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsCustomDomainStore::new(dir.path()));
+    let writer = hydrate(CustomDomainRegistry::new(store.clone(), 10));
+    for (host, tenant) in [
+        ("live.clientco.com", "tenant-a"),
+        ("pending.clientco.com", "tenant-b"),
+        ("verified.clientco.com", "tenant-c"),
+    ] {
+        writer.register(host, tenant, NOW).await.unwrap();
+    }
+    writer
+        .record_active("live.clientco.com", NOW, NOW + 90 * 86_400)
+        .await
+        .unwrap();
+    writer
+        .record_verified("verified.clientco.com", NOW)
+        .await
+        .unwrap();
+    // Strip the tokens as a pre-upgrade store would hold them.
+    for mut record in writer.list() {
+        record.verification_token = None;
+        store.save(&record).await.unwrap();
+    }
+    for record in store.load_all().await.unwrap() {
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("verification_token"), "{json}");
+    }
+
+    let upgraded = hydrate(CustomDomainRegistry::new(store.clone(), 10));
+    let live = upgraded.get("live.clientco.com").unwrap();
+    assert_eq!(live.status, DomainStatus::Active);
+    assert!(
+        live.verification_token.is_none(),
+        "an active record is grandfathered"
+    );
+    assert_eq!(
+        upgraded.tenant_for_host("live.clientco.com").as_deref(),
+        Some("tenant-a")
+    );
+
+    for host in ["pending.clientco.com", "verified.clientco.com"] {
+        let record = upgraded.get(host).unwrap();
+        assert_eq!(record.status, DomainStatus::PendingDns, "{host}");
+        assert!(record.verification_token.is_some(), "{host}");
+        assert!(record.failure_reason.as_deref().unwrap().contains("TXT"));
+        // The retention window for an unproven connection starts again.
+        assert_ne!(record.registered_at_unix, NOW, "{host}");
+    }
+    assert!(upgraded.due_for_issuance(NOW + 1).is_empty());
+
+    // The token is durable: a second restart does not mint another.
+    let token = upgraded
+        .get("pending.clientco.com")
+        .unwrap()
+        .verification_token;
+    let again = hydrate(CustomDomainRegistry::new(store, 10));
+    assert_eq!(
+        again
+            .get("pending.clientco.com")
+            .unwrap()
+            .verification_token,
+        token
+    );
 }
 
 #[tokio::test]
@@ -263,15 +467,10 @@ async fn a_domain_pointing_elsewhere_never_reaches_the_acme_provider() {
     let outcome = VerificationOutcome::PointsElsewhere {
         detail: "resolves to 198.51.100.7".to_owned(),
     };
-    autumn_web::custom_domain::apply_verification(
-        &registry,
-        "app.clientco.com",
-        &outcome,
-        NOW,
-        300,
-    )
-    .await
-    .unwrap();
+    let domain = registry.get("app.clientco.com").unwrap();
+    autumn_web::custom_domain::apply_verification(&registry, &domain, &outcome, NOW, 300)
+        .await
+        .unwrap();
 
     let after = registry.get("app.clientco.com").unwrap();
     assert_eq!(after.status, DomainStatus::PendingDns);
@@ -1371,4 +1570,43 @@ async fn a_mounted_router_serves_an_active_custom_domain() {
         .send()
         .await
         .assert_status(400);
+}
+
+/// Codex review on #2936: a token upgrade that fails to persist at `load` is
+/// retried by the verification pass, so the domain is not stranded until the
+/// next restart.
+#[tokio::test]
+async fn a_token_upgrade_that_fails_to_persist_stays_in_the_verification_pass() {
+    let store = Arc::new(FailingSaveStore::default());
+    let writer = hydrate(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    ));
+    writer
+        .register("verified.clientco.com", "tenant-c", NOW)
+        .await
+        .unwrap();
+    writer
+        .record_verified("verified.clientco.com", NOW)
+        .await
+        .unwrap();
+    let mut record = writer.get("verified.clientco.com").unwrap();
+    record.verification_token = None;
+    store.inner.save(&record).await.unwrap();
+
+    store.fail_saves();
+    let upgraded = hydrate(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        10,
+    ));
+    let stranded = upgraded.get("verified.clientco.com").unwrap();
+    assert_eq!(stranded.status, DomainStatus::Verified);
+    assert!(stranded.verification_token.is_none());
+    assert!(upgraded.due_for_issuance(NOW + 1).is_empty());
+    let hosts: Vec<String> = upgraded
+        .pending_verification(NOW + 1)
+        .into_iter()
+        .map(|d| d.hostname)
+        .collect();
+    assert_eq!(hosts, vec!["verified.clientco.com".to_owned()]);
 }
