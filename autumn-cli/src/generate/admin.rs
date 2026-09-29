@@ -576,10 +576,8 @@ fn detect_translatable_fields(model_source: &str, pascal_name: &str) -> Vec<Stri
                     .last()
                     .is_some_and(|segment| segment.ident == "translatable")
             });
-            if carries_marker {
-                if let Some(name) = field.ident.as_ref().map(ToString::to_string) {
-                    out.push(name);
-                }
+            if carries_marker && let Some(name) = field.ident.as_ref().map(ToString::to_string) {
+                out.push(name);
             }
         }
     }
