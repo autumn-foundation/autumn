@@ -966,7 +966,7 @@ pub async fn moderate_comment(
 
         // Which approved replies the thread page already cannot show, so the
         // check after the update can tell what *this* approval evicted.
-        let unreadable_before: Vec<i64> = if target == "approved" && comment.parent_id.is_some() {
+        let unreadable_before: Vec<i64> = if target == "approved" {
             unrendered_approved_replies(conn, comment.post_id).await?
         } else {
             Vec::new()
@@ -987,7 +987,6 @@ pub async fn moderate_comment(
         // approved onto a full page sorts into the window and can evict a newer
         // one that was already showing.
         if target == "approved"
-            && saved.parent_id.is_some()
             && unrendered_approved_replies(conn, saved.post_id)
                 .await?
                 .iter()
@@ -1127,25 +1126,34 @@ pub async fn create_comment(
 
         let approved = new.status == "approved";
         let post_id = new.post_id;
+        // What the thread page already cannot show, so the check after the
+        // insert can tell what *this* comment evicted.
+        let unreadable_before: Vec<i64> = if approved {
+            unrendered_approved_replies(conn, post_id).await?
+        } else {
+            Vec::new()
+        };
         let saved: Comment = diesel::insert_into(comments::table)
             .values(&new)
             .returning(Comment::as_returning())
             .get_result(conn)
             .await?;
-        // A reply that cannot enter a renderable window must not be accepted.
-        // `approved_thread_page` caps a page at `MAX_THREAD_COMMENTS`,
+        // A comment that pushes another out of a renderable window must not be
+        // accepted. `approved_thread_page` caps a page at `MAX_THREAD_COMMENTS`,
         // keeping the oldest rows at the level where the budget runs out, so
-        // past the cap this reply would be counted in `comment_count` but
-        // appear on no page. Refusing here — inside the transaction, under the
-        // post's lock — rolls the insert back; the alternative is a comment
-        // the site counts but no reader can reach. Roots always fit (see the
-        // assertion above `approved_comment_is_rendered`), so only replies are
-        // checked. A pending reply is neither rendered nor counted until a
-        // moderator approves it; `moderate_comment` applies the same check
-        // then.
+        // past the cap an approved reply would be counted in `comment_count`
+        // but appear on no page — and so would an existing reply that a new
+        // root displaces, since a page loads every root before any descendant.
+        // Refusing here — inside the transaction, under the post's lock — rolls
+        // the insert back; the alternative is a comment the site counts but no
+        // reader can reach. The whole thread is re-checked, root or reply. A
+        // pending comment is neither rendered nor counted until a moderator
+        // approves it; `moderate_comment` applies the same check then.
         if approved
-            && saved.parent_id.is_some()
-            && !approved_reply_is_renderable(conn, saved.id).await?
+            && unrendered_approved_replies(conn, post_id)
+                .await?
+                .iter()
+                .any(|id| !unreadable_before.contains(id))
         {
             return Err(AutumnError::unprocessable_msg(
                 "This conversation has reached its display limit",
@@ -4819,11 +4827,21 @@ pub async fn import_comments(
         // row happened to be there already.
         //
         // The key is the row's whole identity as the restore would write it:
-        // resolved parent (its tree position), account, display name, status,
+        // resolved parent (its tree position), account, display name, contact
+        // email and URL, status,
         // trimmed body and timestamp (microseconds, Postgres' precision).
         // Siblings that differ in any of these are different comments and are
         // never swapped for one another. A visitor's comment never matches.
-        type LegacyKey = (Option<i64>, Option<i64>, String, String, String, i64);
+        type LegacyKey = (
+            Option<i64>,
+            Option<i64>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        );
         let mut existing: std::collections::HashMap<LegacyKey, Vec<i64>> =
             std::collections::HashMap::new();
         // Newest id first so `pop` hands out the oldest: identical siblings
@@ -4840,6 +4858,8 @@ pub async fn import_comments(
                     row.parent_id,
                     row.author_id,
                     row.author_name.trim().to_owned(),
+                    row.author_email.clone(),
+                    row.author_url.clone(),
                     row.status.clone(),
                     row.body.trim().to_owned(),
                     row.created_at.and_utc().timestamp_micros(),
@@ -4890,6 +4910,8 @@ pub async fn import_comments(
                         new.parent_id,
                         new.author_id,
                         new.author_name.clone(),
+                        new.author_email.clone(),
+                        new.author_url.clone(),
                         new.status.clone(),
                         new.body.clone(),
                         comment.created_at.and_utc().timestamp_micros(),
