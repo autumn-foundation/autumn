@@ -9,7 +9,7 @@
 //! The circuit breaker operates in three states:
 //!
 //! - **CLOSED**: Normal operation. Requests are allowed through. If the failure rate
-//!   exceeds the configured threshold, it transitions to OPEN.
+//!   meets or exceeds the configured threshold, it transitions to OPEN.
 //! - **OPEN**: Failing operation. Requests are immediately rejected (fast-fail) without
 //!   being sent to the upstream service. After the `open_duration` elapses, it
 //!   transitions to HALF-OPEN.
