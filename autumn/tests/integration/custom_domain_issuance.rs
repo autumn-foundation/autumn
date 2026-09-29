@@ -828,6 +828,7 @@ async fn the_prune_only_pruner_the_cli_installs_prunes_like_the_task() {
 async fn a_one_shot_prune_spares_what_the_serving_process_wrote_after_it_loaded() {
     use autumn_web::acme::tenant_domains::PruneOnlyCustomDomainPruner;
     use autumn_web::custom_domain::CustomDomainPruner as _;
+    use autumn_web::custom_domain::CustomDomainStore as _;
 
     let dir = tempfile::tempdir().unwrap();
     let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
@@ -901,7 +902,9 @@ async fn a_one_shot_prune_spares_what_the_serving_process_wrote_after_it_loaded(
     );
     assert!(
         shared
-            .load_all_blocking()
+            .load_all()
+            .await
+            .unwrap()
             .iter()
             .any(|d| d.hostname == "stalled.clientco.com"),
         "a domain verified after the one-shot loaded must not be offboarded"
@@ -935,7 +938,7 @@ async fn loading_without_migration_leaves_a_pre_token_record_untouched() {
     );
     assert_eq!(report.load_without_migration().await.unwrap(), 1);
     assert!(report.is_hydrated());
-    let stored = shared.load_all_blocking();
+    let stored = shared.load_all().await.unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].status, DomainStatus::Verified);
     assert_eq!(stored[0].registered_at_unix, NOW);
@@ -950,7 +953,11 @@ async fn loading_without_migration_leaves_a_pre_token_record_untouched() {
         100,
     );
     boot.load().await.unwrap();
-    assert!(shared.load_all_blocking()[0].verification_token.is_some());
+    assert!(
+        shared.load_all().await.unwrap()[0]
+            .verification_token
+            .is_some()
+    );
 }
 
 // ── AC5: health names the domain and the tenant ──────────────────────────
