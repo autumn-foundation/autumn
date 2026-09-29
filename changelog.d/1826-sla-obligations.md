@@ -6,4 +6,4 @@
   `Sla` extractor tracks, meets and reads obligations, and gives the
   remaining budget and the breach state. `#[obligation]` declares one on a
   model. On breach, Autumn puts one typed `SlaBreach` escalation job on the
-  queue. See `docs/guide/sla.md`.
+  queue. Enable the `sla` Cargo feature. See `docs/guide/sla.md`.

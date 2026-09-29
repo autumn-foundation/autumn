@@ -650,6 +650,7 @@ pub use slug::{contains_letter_or_number, slugify};
 pub(crate) mod session_redis;
 // Calendar-aware SLA obligations (issue #1826). A plain comment, not `///`:
 // the module header has intra-doc links that must resolve in the module.
+#[cfg(feature = "sla")]
 pub mod sla;
 pub mod sse;
 /// Static site generation support.
@@ -1814,6 +1815,7 @@ pub use autumn_macros::lifecycle;
 ///
 /// let obligation = ticket.first_response_obligation();
 /// ```
+#[cfg(feature = "sla")]
 pub use autumn_macros::obligation;
 
 /// Marker trait implemented by every `#[lifecycle]` enum, exposing that
