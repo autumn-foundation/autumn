@@ -4884,14 +4884,17 @@ pub async fn import_comments(
                 .collect();
 
         let mut created = 0usize;
-        let mut level: Vec<(Option<i64>, &ImportedComment)> =
-            incoming.iter().map(|c| (None, c)).collect();
+        // Each entry carries whether its parent is approved (roots have none
+        // to hide behind), so an approved reply is never restored under a
+        // parent no reader can see.
+        let mut level: Vec<(Option<i64>, bool, &ImportedComment)> =
+            incoming.iter().map(|c| (None, true, c)).collect();
         for _ in 0..=MAX_COMMENT_DEPTH {
             if level.is_empty() {
                 break;
             }
-            let mut next: Vec<(Option<i64>, &ImportedComment)> = Vec::new();
-            for (parent_id, comment) in level {
+            let mut next: Vec<(Option<i64>, bool, &ImportedComment)> = Vec::new();
+            for (parent_id, parent_approved, comment) in level {
                 let mut new = crate::models::NewComment {
                     post_id,
                     parent_id,
@@ -4933,10 +4936,22 @@ pub async fn import_comments(
                     ))
                     .and_then(Vec::pop)
                 {
+                    let approved = new.status == "approved";
                     for reply in &comment.replies {
-                        next.push((Some(id), reply));
+                        next.push((Some(id), approved, reply));
                     }
                     continue;
+                }
+                // `assemble_thread` builds from the roots down, so an approved
+                // reply under a parent that is pending, spam or trashed could
+                // never be attached — counted, but unreadable — and the
+                // per-comment paths refuse to create that state. Restored as
+                // `pending` instead: the moderator sees it, and approving the
+                // parent first is the order `moderate_comment` demands. Applied
+                // only to rows this call inserts; a row already on the post is
+                // matched as it stands.
+                if new.status == "approved" && !parent_approved {
+                    new.status = "pending".to_owned();
                 }
                 // `created_at` explicitly, not the column default. A thread
                 // restored with every timestamp set to the moment of the
@@ -4960,8 +4975,9 @@ pub async fn import_comments(
                     .get_result(conn)
                     .await?;
                 created += 1;
+                let approved = saved.status == "approved";
                 for reply in &comment.replies {
-                    next.push((Some(saved.id), reply));
+                    next.push((Some(saved.id), approved, reply));
                 }
             }
             level = next;

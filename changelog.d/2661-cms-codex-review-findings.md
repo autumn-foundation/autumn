@@ -32,3 +32,6 @@
     navigation with "Page X of Y", computed from the already-loaded count
     for the selected status; the requested page is clamped to the last page
     before querying, and both links preserve the `status` filter.
+  - *Hidden parents on restore:* an approved reply whose parent is not
+    approved in the backup is restored as `pending` rather than counted but
+    unreadable.
