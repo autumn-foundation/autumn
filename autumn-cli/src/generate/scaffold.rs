@@ -10601,7 +10601,7 @@ fn csv_unguard_cell<'a>(column: &str, value: &'a str) -> &'a str {
 /// the import cannot set, so editing the export's schema can never leave a
 /// stale baked requirement behind that rejects this app's own export (issue
 /// #2331).
-const CSV_REQUIRED_COLUMNS_FN: &str = r#"/// The columns an uploaded file must carry: every exported column
+const CSV_REQUIRED_COLUMNS_FN: &str = r"/// The columns an uploaded file must carry: every exported column
 /// `{Pascal}Form` can actually set.
 ///
 /// DERIVED from the live `CsvSchema::csv_columns()` minus the columns the
@@ -10623,7 +10623,7 @@ fn csv_required_columns() -> Vec<&'static str> {
         .collect()
 }
 
-"#;
+";
 
 const CSV_IMPORT_TEMPLATE: &str = r#"
 
