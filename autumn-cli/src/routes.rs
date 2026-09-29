@@ -274,10 +274,26 @@ pub fn print_mermaid(routes: &[RouteInfo]) {
     print!("{}", format_mermaid(routes));
 }
 
-/// Escape text for a quoted Mermaid label. Mermaid has no backslash escape in
-/// labels; `"` is written as the `#quot;` entity instead.
+/// Escape text for a quoted Mermaid label so route data renders literally.
+///
+/// Mermaid has no backslash escape in labels; it rewrites `#name;` entity
+/// codes into HTML entities, and with HTML labels (this formatter emits
+/// `<b>`) a raw `<`, `>` or `&` would be read as markup. So every label
+/// metacharacter becomes an entity code. `#` goes first, so a literal
+/// `#quot;` in a route cannot be mistaken for an entity code either.
 fn mermaid_label(text: &str) -> String {
-    text.replace('"', "#quot;")
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '#' => out.push_str("#35;"),
+            '"' => out.push_str("#quot;"),
+            '&' => out.push_str("#amp;"),
+            '<' => out.push_str("#lt;"),
+            '>' => out.push_str("#gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Build the Mermaid string (extracted for testability).
@@ -814,6 +830,15 @@ mod tests {
         assert!(mermaid.contains("\"<b>GET</b> /actuator/health\""));
         assert!(mermaid.contains("\"<b>POST</b> /posts\""));
         assert!(mermaid.contains("\"<b>GET</b> /posts/{id}\""));
+    }
+
+    #[test]
+    fn mermaid_label_encodes_every_metacharacter() {
+        assert_eq!(
+            mermaid_label(r#"sales <beta> & "x" #quot;"#),
+            "sales #lt;beta#gt; #amp; #quot;x#quot; #35;quot;"
+        );
+        assert_eq!(mermaid_label("/posts/{id}"), "/posts/{id}");
     }
 
     #[test]
