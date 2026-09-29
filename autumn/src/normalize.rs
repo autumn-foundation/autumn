@@ -76,9 +76,14 @@ pub fn upcase(s: &str) -> String {
 /// Trim and collapse every internal run of whitespace to a single ASCII space.
 #[must_use]
 pub fn squish(s: &str) -> String {
-    // One allocation sized to the input, instead of collecting a `Vec` of
-    // slices and joining it into a second `String`.
-    let mut result = String::with_capacity(s.len());
+    // One exactly-sized output allocation instead of collecting a `Vec` of
+    // slices and joining it into a second `String`. Sizing to the squished
+    // length (not `s.len()`) means leading, trailing or repeated whitespace is
+    // never retained as spare capacity; a blank input allocates nothing.
+    let (words, bytes) = s
+        .split_whitespace()
+        .fold((0_usize, 0_usize), |(n, len), w| (n + 1, len + w.len()));
+    let mut result = String::with_capacity(bytes + words.saturating_sub(1));
     for part in s.split_whitespace() {
         if !result.is_empty() {
             result.push(' ');
@@ -298,6 +303,10 @@ mod tests {
         assert_eq!(squish(""), "");
         assert_eq!(squish(" \t\n "), "");
         assert_eq!(squish("word"), "word");
+        // Whitespace-only input must not keep an input-sized buffer alive.
+        assert_eq!(squish(&" ".repeat(4096)).capacity(), 0);
+        let padded = format!("a{}b", " ".repeat(4096));
+        assert!(squish(&padded).capacity() < 64);
     }
 
     #[test]
