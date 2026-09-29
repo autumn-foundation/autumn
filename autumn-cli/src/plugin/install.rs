@@ -35,6 +35,16 @@ pub enum PluginError {
     )]
     NoPackageTable,
 
+    /// The project's `Cargo.toml` is not valid TOML, so whether it is a
+    /// package or a virtual workspace cannot be told.
+    #[error(
+        "Cargo.toml could not be parsed ({detail}) — fix the manifest and re-run `autumn plugin add`; no files were changed."
+    )]
+    ManifestParse {
+        /// The TOML parser's message.
+        detail: String,
+    },
+
     /// The plugin's supported `autumn-web` range excludes the app's version.
     #[error(
         "`{crate_name} {plugin_version}` supports autumn-web {supported}, but this app uses autumn-web {app_version} — no files were modified.\nUpgrade the app with `autumn upgrade`, or install a `{crate_name}` release built for autumn-web {app_version}."
@@ -1947,16 +1957,20 @@ fn refuse_virtual_workspace(root: &Path) -> Result<(), PluginError> {
     if !manifest.is_file() {
         return Err(PluginError::NotInProject);
     }
-    if has_package_table(&std::fs::read_to_string(&manifest)?) {
+    // A parse failure is reported as one, not as a virtual workspace: a
+    // package manifest mid-edit is the likelier cause, and "move into a
+    // member crate" would send the author the wrong way.
+    let table =
+        toml::from_str::<toml::Table>(&std::fs::read_to_string(&manifest)?).map_err(|error| {
+            PluginError::ManifestParse {
+                detail: error.message().to_owned(),
+            }
+        })?;
+    if table.get("package").is_some_and(toml::Value::is_table) {
         Ok(())
     } else {
         Err(PluginError::NoPackageTable)
     }
-}
-
-fn has_package_table(manifest_src: &str) -> bool {
-    toml::from_str::<toml::Table>(manifest_src)
-        .is_ok_and(|table| table.get("package").is_some_and(toml::Value::is_table))
 }
 
 #[cfg(test)]
@@ -3769,6 +3783,26 @@ autumn-web = "0.7.0"
         let err = plan_add_community(tmp.path(), "autumn-plugin-x", "=0.7.0").unwrap_err();
         assert!(
             matches!(err, PluginError::NoPackageTable),
+            "plan_add_community: {err}"
+        );
+    }
+
+    /// A malformed package manifest is a parse error, not a virtual
+    /// workspace: the diagnostic must not send the author to a member crate.
+    #[test]
+    fn a_malformed_manifest_is_reported_as_a_parse_error() {
+        let tmp = fake_project(
+            SCAFFOLD_MAIN,
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = { version = \"0.7.0\"\n",
+        );
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::ManifestParse { .. }),
+            "plan_add: {err}"
+        );
+        let err = plan_add_community(tmp.path(), "autumn-plugin-x", "=0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::ManifestParse { .. }),
             "plan_add_community: {err}"
         );
     }
