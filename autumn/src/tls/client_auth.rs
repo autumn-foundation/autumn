@@ -409,6 +409,8 @@ fn map_crl_pem_err(path: &Path, source: rustls_pki_types::pem::Error) -> TlsErro
 /// PKI whose bundle holds only the root — coverage cannot be read off the
 /// bundle (revocation is checked for the end-entity only, against its issuing
 /// intermediate), so no gap is reported rather than refusing a working setup.
+/// Likewise a bundle CA that signed another CA in the bundle (a root shipped
+/// with its intermediate) needs no CRL of its own: only the bottom tier does.
 ///
 /// Returns the empty vector when every CA in the bundle has at least one CRL.
 /// When the CRL file holds several CRLs, one per issuing CA, each CA needs
@@ -484,8 +486,21 @@ fn crl_coverage_gaps_in(
     // key, and rustls rejects the old key's CRL for it on signature, so a
     // name match alone would call the renewed CA covered and recreate the
     // #2706 outage.
+    //
+    // A bundle CA that signed another CA in the bundle is a parent in the
+    // hierarchy: with end-entity-only revocation its clients are checked
+    // against the child's CRL, so demanding one of its own would refuse a
+    // bundle that ships root + intermediate. Only the bottom tier needs cover.
+    let is_parent = |ca: &x509_parser::certificate::X509Certificate<'_>| {
+        cas.iter().any(|child| {
+            child.subject().as_raw() != ca.subject().as_raw()
+                && child.issuer().as_raw() == ca.subject().as_raw()
+                && child.verify_signature(Some(ca.public_key())).is_ok()
+        })
+    };
     Ok(cas
         .iter()
+        .filter(|ca| !is_parent(ca))
         .filter(|ca| {
             !parsed_crls.iter().any(|crl| {
                 crl.issuer().as_raw() == ca.subject().as_raw()
@@ -1767,6 +1782,30 @@ mod tests {
             &super::super::crypto_provider(),
         )
         .expect("an intermediate-based PKI still boots");
+    }
+
+    #[test]
+    fn a_bundled_root_that_signed_a_bundled_intermediate_needs_no_crl() {
+        // Root + its issuing intermediate in one bundle, CRL from the
+        // intermediate: leaves are checked against the intermediate's CRL, so
+        // a missing root CRL must not refuse the boot.
+        const BUNDLED_INTERMEDIATE_PEM: &str =
+            include_str!("../../tests/fixtures/tls/client/bundled-intermediate.cert.pem");
+        const BUNDLED_INTERMEDIATE_CRL_PEM: &str =
+            include_str!("../../tests/fixtures/tls/client/bundled-intermediate-crl.pem");
+        let (_bundle_dir, bundle) =
+            write_temp("ca.pem", &format!("{CA_PEM}{BUNDLED_INTERMEDIATE_PEM}"));
+        let (_crl_dir, crl) = write_temp("crl.pem", BUNDLED_INTERMEDIATE_CRL_PEM);
+        assert_eq!(
+            crl_coverage_gaps(&bundle, &crl).expect("coverage check runs"),
+            Vec::<String>::new()
+        );
+        // The intermediate itself is still bottom tier: without its CRL it
+        // is named.
+        let (_old_crl_dir, old_crl) = write_temp("crl.pem", CRL_PEM);
+        let gaps = crl_coverage_gaps(&bundle, &old_crl).expect("coverage check runs");
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("Bundled Intermediate"), "{gaps:?}");
     }
 
     #[test]

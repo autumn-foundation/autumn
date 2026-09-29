@@ -1167,7 +1167,9 @@ And one hard rule:
   that keeps its name under a new key needs a CRL from the new key. If your
   client certificates chain through an intermediate whose CRL you configure
   (the bundle holds only the root), the check stands down — revocation is
-  checked against the issuing intermediate, which the bundle cannot show.
+  checked against the issuing intermediate, which the bundle cannot show. A
+  root shipped in the bundle alongside its intermediate needs no CRL of its
+  own; the intermediate does.
 
 **OCSP and OCSP stapling are not supported.** CRL plus short-lived certificates
 first.
