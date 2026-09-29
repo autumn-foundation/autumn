@@ -18,6 +18,14 @@
 //!
 //! [`acme`]: crate::acme
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::{Arc, RwLock};
 
 use futures::future::BoxFuture;
@@ -78,11 +86,16 @@ impl Route53Provider {
     /// Build a provider signing with `credentials`.
     #[must_use]
     pub fn new(credentials: Route53Credentials, transport: Arc<dyn HttpTransport>) -> Self {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "SigV4 signs with the real date that the AWS server checks"
+        )]
+        let now: fn() -> std::time::SystemTime = std::time::SystemTime::now;
         Self {
             credentials,
             transport,
             zone_ids: RwLock::new(std::collections::HashMap::new()),
-            now: std::time::SystemTime::now,
+            now,
         }
     }
 

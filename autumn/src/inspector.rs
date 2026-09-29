@@ -16,9 +16,16 @@
 //! profile), the `InspectorLayer` is never mounted and the path is
 //! completely absent.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -455,12 +462,17 @@ where
         let query_list = RequestQueryList::new();
         req.extensions_mut().insert(query_list.clone());
 
-        let start = Instant::now();
+        let start = crate::time::ambient_instant();
         let fut = self.inner.call(req);
 
         Box::pin(async move {
             let mut response = fut.await?;
-            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let elapsed_ms = u64::try_from(
+                crate::time::ambient_instant()
+                    .saturating_duration_since(start)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
 
             let status = response.status().as_u16();
             let content_type = response
@@ -476,9 +488,7 @@ where
 
             let queries = query_list.snapshot();
             let n_plus_one = detect_n_plus_one(&queries, threshold);
-            let recorded_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
+            let recorded_at = crate::time::clock_unix_secs(&crate::time::AmbientClock);
 
             let record = RequestRecord {
                 id: 0, // assigned by InspectorBuffer::push

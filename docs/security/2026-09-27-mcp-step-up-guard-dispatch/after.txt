@@ -1,0 +1,38 @@
+$ cargo test -p autumn-web --test integration_tests --features mcp mcp_step_up_guard
+
+running 4 tests
+test integration::mcp_step_up_guard::step_up_guard_allows_an_mcp_tool_call_with_a_fresh_claim ... ok
+test integration::mcp_step_up_guard::step_up_guard_rejects_an_mcp_tool_call_with_no_session ... ok
+test integration::mcp_step_up_guard::step_up_guard_rejects_an_mcp_tool_call_with_a_session_but_no_fresh_claim ... ok
+test integration::mcp_step_up_guard::step_up_guard_rejects_an_mcp_tool_call_with_a_stale_claim ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2261 filtered out; finished in 0.35s
+
+--- After Codex review (PR #2974) ---
+
+Codex flagged two accuracy gaps in the first version of this test, both
+verified and fixed rather than dismissed:
+
+1. The "session but no fresh claim" test only ever exercised an *absent*
+   claim, never a genuinely stale (present but expired) one, so it didn't
+   prove the guard checks wall-clock recency rather than mere presence.
+   Fixed by adding `step_up_guard_rejects_an_mcp_tool_call_with_a_stale_claim`,
+   which backdates `last_strong_auth_at` by 600s (past the 300s default
+   `max_age`) and confirms rejection.
+2. The claim that MCP `tools/call` sends `Accept: application/json` (and
+   therefore exercises `#[step_up]`'s JSON rejection branch) was wrong:
+   `mcp::build_request`'s `FORWARDED_HEADERS` list does not forward `Accept`
+   at all, so every MCP-dispatched rejection actually takes the HTML
+   `/reauth` redirect branch. Confirmed by reading `FORWARDED_HEADERS` and
+   `build_request` directly (autumn/src/mcp.rs). This doesn't change the
+   negative result — a 302 is still correctly classified as `isError: true`
+   by `StatusCode::is_success()` — but the misleading comment/assertion
+   implying JSON-branch coverage was removed, and the module doc corrected
+   to state the actual (redirect-only, still safe) behavior.
+
+$ cargo clippy -p autumn-web --test integration_tests --features mcp -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12m 24s
+(no warnings attributed to mcp_step_up_guard.rs; exit code 0)
+
+$ cargo fmt --all -- --check
+(clean after `cargo fmt --all` applied once to the new file)

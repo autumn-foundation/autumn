@@ -424,7 +424,32 @@ fn check_primary_key_columns(defs: &[&DerivationDef]) -> AutumnResult<()> {
 /// spellings are one column and must collide.
 #[cfg(not(feature = "sqlite"))]
 fn ident_key(ident: &str) -> String {
-    ident.to_owned()
+    postgres_ident_key(ident)
+}
+
+/// The Postgres spelling of an identifier: the full spelling truncated to
+/// `NAMEDATALEN - 1` bytes (63 on a stock build; a `configure
+/// --with-namedatalen` build can move it).
+///
+/// Postgres truncates every identifier past that limit — quoting preserves
+/// case and punctuation but does not exempt an overlong name — so two
+/// maintained-column claims that agree on their first 63 bytes are one column
+/// in the database. The registry checks must compare the physical spelling,
+/// or they accept both maintainers and mutations double-apply deltas to a
+/// single column while backfills overwrite each other (issue #2664).
+/// Truncation stops on a char boundary, so a multi-byte identifier is never
+/// split.
+#[cfg(not(feature = "sqlite"))]
+fn postgres_ident_key(ident: &str) -> String {
+    const MAX_IDENTIFIER_BYTES: usize = 63;
+    if ident.len() <= MAX_IDENTIFIER_BYTES {
+        return ident.to_owned();
+    }
+    let mut end = MAX_IDENTIFIER_BYTES;
+    while !ident.is_char_boundary(end) {
+        end -= 1;
+    }
+    ident[..end].to_owned()
 }
 #[cfg(feature = "sqlite")]
 fn ident_key(ident: &str) -> String {
@@ -1707,6 +1732,69 @@ mod tests {
 
         // `check_registry` runs both checks, so it catches this one too.
         check_registry(&[&first, &second]).expect_err("the registry check covers columns");
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn postgres_ident_key_truncates_to_63_bytes_on_a_char_boundary() {
+        // Postgres truncates every identifier to `NAMEDATALEN - 1` (63 on a
+        // stock build) bytes; quoting does not exempt it. The registry key
+        // must be the physical spelling, or two names that agree on their
+        // first 63 bytes look distinct here and collide in the database.
+        let long_a = format!("{}{}", "a".repeat(63), "x");
+        let long_b = format!("{}{}", "a".repeat(63), "y");
+        assert_eq!(postgres_ident_key(&long_a), "a".repeat(63));
+        assert_eq!(postgres_ident_key(&long_a), postgres_ident_key(&long_b));
+        // Short names and names exactly at the bound are untouched.
+        assert_eq!(postgres_ident_key("score"), "score");
+        assert_eq!(postgres_ident_key(&"a".repeat(63)), "a".repeat(63));
+        // A multi-byte character at the boundary is not split: the key keeps
+        // whole characters up to the byte limit.
+        let multi = format!("{}{}", "é".repeat(31), "éé"); // 33 é = 66 bytes
+        let key = postgres_ident_key(&multi);
+        assert!(key.len() <= 63, "key is {key:?}");
+        assert!(key.chars().all(|c| c == 'é'), "key is {key:?}");
+        assert_eq!(key, "é".repeat(31));
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn overlong_derivation_columns_that_share_63_bytes_are_rejected() {
+        // Issue #2664: on Postgres these two spellings are one column, so the
+        // boot-time guard must refuse the pair instead of letting both
+        // maintainers double-apply deltas to the same physical column.
+        let mut first = count_def();
+        first.column = Box::leak(format!("{}{}", "a".repeat(63), "x").into_boxed_str());
+        let mut second = count_def();
+        second.name = "dv_posts.another_long_derivation";
+        second.model = "DvOtherComment";
+        second.module_path = "other::module";
+        second.column = Box::leak(format!("{}{}", "a".repeat(63), "y").into_boxed_str());
+        second.filter_sql = "";
+        let err = check_unique_columns(&[&first, &second], &[])
+            .expect_err("two names truncating to one column cannot both maintain it");
+        let message = err.to_string();
+        assert!(message.contains("count twice"), "{message}");
+
+        // Two distinct names that are each exactly 63 bytes are two columns.
+        let mut third = count_def();
+        third.column = Box::leak(format!("{}{}", "a".repeat(62), "x").into_boxed_str());
+        check_unique_columns(&[&first, &third], &[])
+            .expect("distinct 63-byte names are distinct columns");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_has_no_63_byte_identifier_limit_so_long_names_coexist() {
+        // The mirror of the Postgres truncation above: SQLite identifiers have
+        // no physical length cap, so the full spellings are compared and two
+        // names that differ only past byte 63 are two columns there.
+        let mut first = count_def();
+        first.column = Box::leak(format!("{}{}", "a".repeat(63), "x").into_boxed_str());
+        let mut second = count_def();
+        second.column = Box::leak(format!("{}{}", "a".repeat(63), "y").into_boxed_str());
+        check_unique_columns(&[&first, &second], &[])
+            .expect("on SQLite the full spellings are distinct columns");
     }
 
     #[test]

@@ -78,6 +78,14 @@
 //! newest-first. Unknown filters and sort keys are ignored, matching the
 //! repository `list()` contract.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -509,7 +517,7 @@ impl NotificationStore for MemoryNotificationStore {
             kind,
             payload,
             read_at: None,
-            created_at: Utc::now(),
+            created_at: crate::time::ambient_now(),
         };
         inner.rows.push(notification.clone());
         drop(inner);
@@ -570,7 +578,7 @@ impl NotificationStore for MemoryNotificationStore {
         id: i64,
         recipient_id: Option<i64>,
     ) -> Result<u64, NotificationStoreError> {
-        let now = Utc::now();
+        let now = crate::time::ambient_now();
         let mut inner = self.lock()?;
         let marked = inner
             .rows
@@ -585,7 +593,7 @@ impl NotificationStore for MemoryNotificationStore {
     }
 
     async fn mark_all_read(&self, recipient_id: i64) -> Result<u64, NotificationStoreError> {
-        let now = Utc::now();
+        let now = crate::time::ambient_now();
         let mut inner = self.lock()?;
         let marked = inner
             .rows
@@ -796,7 +804,7 @@ mod db_store {
                     recipient_id,
                     kind,
                     payload,
-                    created_at: Utc::now(),
+                    created_at: crate::time::ambient_now(),
                 })
                 .returning(NotificationRow::as_returning())
                 .get_result(&mut conn)
@@ -883,7 +891,7 @@ mod db_store {
         ) -> Result<u64, NotificationStoreError> {
             use notifications::dsl;
             let mut conn = self.conn().await?;
-            let now = Utc::now();
+            let now = crate::time::ambient_now();
             // `read_at IS NULL` in the predicate makes the update idempotent:
             // an already-read row matches zero rows and keeps its original
             // timestamp.
@@ -922,7 +930,7 @@ mod db_store {
                     .filter(dsl::recipient_id.eq(recipient_id))
                     .filter(dsl::read_at.is_null()),
             )
-            .set(dsl::read_at.eq(Some(Utc::now())))
+            .set(dsl::read_at.eq(Some(crate::time::ambient_now())))
             .execute(&mut conn)
             .await
             .map_err(|e| store_err(&e))?;

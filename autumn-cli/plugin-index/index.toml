@@ -1,0 +1,112 @@
+# The Autumn plugin index (issue #1625).
+#
+# `autumn plugin list` and `autumn plugin add` read this file first.
+# To add a listing, read README.md in this directory.
+#
+# Gate: `autumn plugin index check --index autumn-cli/plugin-index/index.toml`.
+# The CLI unit tests run the same gate against this release.
+
+schema = 1
+
+[[plugin]]
+name = "autumn-admin-plugin"
+description = "Out-of-the-box admin panel plugin for autumn-web applications"
+origin = "first-party"
+repository = "https://github.com/autumn-foundation/autumn/tree/trunk-dev/autumn-admin-plugin"
+version = "0.7.0"
+autumn_web = "0.7"
+tier = "stable"
+trust = "native"
+status = "listed"
+prefix = "/admin"
+sensitive_routes = ["/admin:Role: admin required via AdminPlugin::require_role"]
+
+[plugin.conformance]
+result = "pass"
+autumn_web = "0.7.0"
+checked = "2026-09-27"
+
+[[plugin]]
+name = "autumn-billing"
+description = "Subscription billing plugin (Stripe checkout, portal, webhook mirror, dunning) for autumn-web applications"
+origin = "first-party"
+repository = "https://github.com/autumn-foundation/autumn/tree/trunk-dev/autumn-billing"
+version = "0.7.0"
+autumn_web = "0.7"
+tier = "stable"
+trust = "native"
+status = "listed"
+prefix = "/billing"
+
+[plugin.conformance]
+result = "pass"
+autumn_web = "0.7.0"
+checked = "2026-09-27"
+
+[[plugin]]
+name = "autumn-cache-redis"
+description = "Redis-backed shared cache plugin for autumn-web applications"
+origin = "first-party"
+repository = "https://github.com/autumn-foundation/autumn/tree/trunk-dev/autumn-cache-redis"
+version = "0.7.0"
+autumn_web = "0.7"
+tier = "stable"
+trust = "native"
+status = "listed"
+no_routes = true
+
+[plugin.conformance]
+result = "pass"
+autumn_web = "0.7.0"
+checked = "2026-09-27"
+
+[[plugin]]
+name = "autumn-media-plugin"
+description = "Live-streaming media plugin (broadcast + rooms) for autumn-web applications"
+origin = "first-party"
+repository = "https://github.com/autumn-foundation/autumn/tree/trunk-dev/autumn-media-plugin"
+version = "0.7.0"
+autumn_web = "0.7"
+tier = "stable"
+trust = "native"
+status = "listed"
+no_routes = true
+
+[plugin.conformance]
+result = "pass"
+autumn_web = "0.7.0"
+checked = "2026-09-27"
+
+[[plugin]]
+name = "autumn-search"
+description = "Keyword and vector search plugin for autumn-web applications: mark a model searchable, get an index that stays in sync"
+origin = "first-party"
+repository = "https://github.com/autumn-foundation/autumn/tree/trunk-dev/autumn-search"
+version = "0.7.0"
+autumn_web = "0.7"
+tier = "stable"
+trust = "native"
+status = "listed"
+no_routes = true
+
+[plugin.conformance]
+result = "pass"
+autumn_web = "0.7.0"
+checked = "2026-09-27"
+
+[[plugin]]
+name = "autumn-storage-s3"
+description = "S3-compatible blob storage plugin for autumn-web applications"
+origin = "first-party"
+repository = "https://github.com/autumn-foundation/autumn/tree/trunk-dev/autumn-storage-s3"
+version = "0.7.0"
+autumn_web = "0.7"
+tier = "stable"
+trust = "native"
+status = "listed"
+
+[plugin.conformance]
+result = "exempt"
+autumn_web = "0.7.0"
+checked = "2026-09-27"
+reason = "a BlobStore, not a Plugin: plugin-check does not apply; the plugin-install gate compiles its mount"
