@@ -12,7 +12,7 @@ use crate::repositories::{
     MenuRepository as _, PgAttachmentRepository, PgCommentRepository, PgMenuItemRepository,
     PgMenuRepository, PgPostMetaRepository, PgPostRepository, PgSiteOptionRepository,
     PgTermRepository, PgUserRepository, PgWidgetRepository, PostRepository as _,
-    TermRepository as _, UserRepository as _,
+    UserRepository as _,
 };
 use crate::settings::{SITE_SCOPE, Settings, cached_settings};
 use crate::taxonomy::{PgPostTermLinkRepository, PostTermLinkRepository as _};
