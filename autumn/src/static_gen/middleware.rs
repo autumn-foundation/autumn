@@ -4,12 +4,20 @@
 //! pre-rendered HTML files from the `dist/` directory if they exist. It acts as a
 //! lightning-fast cache layer in front of your dynamic routes.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use super::StaticManifest;
 use super::isr_coordinator::{IsrCoordinator, LocalIsrCoordinator, isr_window_key};
@@ -693,6 +701,10 @@ async fn regenerate_page(
 
 /// Get the age of a file in seconds based on its modification time.
 /// Returns `None` if the file doesn't exist or metadata can't be read.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the OS stamps the file mtime with real time, so compare it with real time"
+)]
 fn file_mtime_age_secs(path: &Path) -> Option<u64> {
     let metadata = std::fs::metadata(path).ok()?;
     let mtime = metadata.modified().ok()?;
@@ -702,10 +714,7 @@ fn file_mtime_age_secs(path: &Path) -> Option<u64> {
 
 /// Current Unix timestamp in seconds.
 fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    crate::time::clock_unix_secs(&crate::time::AmbientClock)
 }
 
 #[cfg(test)]

@@ -96,3 +96,12 @@ path = "fuzz_targets/sandbox.rs"
 test = false
 doc = false
 bench = false
+
+# The sim demo scenario (issue #2967): the same `Op` vocabulary the
+# `sim-sweep` proptest sweep draws from.
+[[bin]]
+name = "sim_ops"
+path = "fuzz_targets/sim_ops.rs"
+test = false
+doc = false
+bench = false
