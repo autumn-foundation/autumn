@@ -4089,7 +4089,8 @@ where
 /// path verbatim: the raw executor error, no fleet vocabulary, no state table, no
 /// compensation (there is no other host to converge with, and its own boundary
 /// teardown already ran). That is AC-1, and it is why the `single` branches below
-/// are not cosmetic.
+/// are not cosmetic. One exception (#2276): when the binaries went back after
+/// `migrate`, the error gets one schema note ([`fleet::single_host_schema_note`]).
 #[allow(clippy::too_many_lines)]
 fn run_up_with<E, P, F>(input: &FleetUpInput<'_, P>, make_executor: F) -> Result<(), DeployError>
 where
@@ -4395,17 +4396,19 @@ where
                 }
             }
             Err(err) => {
-                // A one-host fleet keeps today's error verbatim: the per-host
-                // executor already told the whole story, and inventing a fleet
-                // vocabulary for one host would change pre-#1621 output. This
-                // returns BEFORE any classification, degrade-and-continue or
-                // compensation, so N = 1 is byte-identical on every failure shape,
-                // post-boundary ones included.
+                // A one-host fleet keeps today's error: no fleet vocabulary, no
+                // degrade-and-continue, no compensation. One exception (#2276): if
+                // the binaries went back after `migrate`, add the schema note. The
+                // fleet classifier decides this, so the two paths cannot diverge.
+                outcomes[index] = fleet::classify_host_outcome(&err);
                 if single {
-                    return Err(DeployError::Exec(err.to_string()));
+                    let message = fleet::single_host_schema_note(&plan, &outcomes).map_or_else(
+                        || err.to_string(),
+                        |note| format!("{err}\n\u{26A0}\u{FE0F}  {note}"),
+                    );
+                    return Err(DeployError::Exec(message));
                 }
                 let failed_step = fleet::failed_step_label(&err);
-                outcomes[index] = fleet::classify_host_outcome(&err);
                 // #2279: a live old slot runs workers and the scheduler, so work
                 // runs two times. Retry one time. Continue only on a proven stop.
                 if matches!(
@@ -9644,7 +9647,7 @@ mod tests {
             .expect("a bare host is prepared");
         let repair = labels
             .iter()
-            .position(|l| *l == "record-live-slot")
+            .position(|l| *l == exec::LIVE_SLOT_REPAIR_LABEL)
             .expect("a drifted marker is repaired");
         assert!(
             install < repair,
@@ -11545,13 +11548,160 @@ mod tests {
         );
     }
 
+    /// The `DeployError::Exec` message of a failed single-host deploy.
+    fn single_host_exec_message(err: &DeployError) -> &str {
+        match err {
+            DeployError::Exec(message) => message,
+            other => panic!("N = 1 must never produce fleet vocabulary, got: {other:?}"),
+        }
+    }
+
+    /// The executor error a one-host deploy returns when `failed_step` fails
+    /// before the cutover.
+    fn pre_cutover_error(mode: fleet::HostMode, failed_step: &'static str) -> String {
+        let source = Box::new(exec::DeployExecError::CommandFailed {
+            label: failed_step,
+            message: "scripted failure".to_owned(),
+        });
+        match mode {
+            fleet::HostMode::Redeploy => exec::DeployExecError::CandidateRolledBack {
+                failed_step,
+                source,
+            },
+            fleet::HostMode::First => exec::DeployExecError::FirstDeployTornDown {
+                failed_step,
+                source,
+            },
+        }
+        .to_string()
+    }
+
+    /// Run a one-host deploy in `mode` that fails at `failed_step`. Returns the
+    /// error message and the labels the host ran.
+    fn failed_single_host_deploy(
+        mode: fleet::HostMode,
+        failed_step: &'static str,
+    ) -> (String, Vec<&'static str>) {
+        let host = "203.0.113.10";
+        let recorder = fleet::test_support::FleetRecorder::new();
+        let recorder = match mode {
+            fleet::HostMode::Redeploy => script_redeploy(recorder, host),
+            fleet::HostMode::First => script_first_deploy(recorder, host),
+        }
+        .fail(host, failed_step);
+        let fleet = fleet_of(&[host]);
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("the scripted failure must fail the deploy");
+        (
+            single_host_exec_message(&err).to_owned(),
+            recorder.run_labels_for(host),
+        )
+    }
+
+    #[test]
+    fn a_single_host_redeploy_rolled_back_after_migrate_names_the_schema() {
+        // #2276: the candidate is torn down and the previous release serves, but the
+        // migration stays applied. The error must say so.
+        let (message, labels) =
+            failed_single_host_deploy(fleet::HostMode::Redeploy, "readiness-gate");
+
+        assert_eq!(
+            message,
+            format!(
+                "{}\n\u{26A0}\u{FE0F}  {}",
+                pre_cutover_error(fleet::HostMode::Redeploy, "readiness-gate"),
+                fleet::SINGLE_HOST_SCHEMA_AHEAD_NOTE
+            ),
+            "the executor error stays first; the schema note follows it"
+        );
+        assert!(
+            labels.contains(&"migrate") && !labels.contains(&"proxy-flip"),
+            "the deploy must migrate, then stop at the gate: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_host_marker_repair_failure_keeps_todays_error() {
+        // #2276: the live-slot marker repair runs before `migrate`. If it fails,
+        // the schema did not move, so the error gets no schema note.
+        let host = "203.0.113.10";
+        // The marker says blue (3001), but the proxy serves green (3002).
+        let drifted = "redeploy:blue\t3001\n\
+             ---autumn-kamal-proxy-list---\n\
+             Service   Host          Target            State    TLS\n\
+             myapp     example.com   127.0.0.1:3002   running  no\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 3000\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script(host, "proxy-compat-probe", compatible_deploy_help())
+            .script(host, "detect-current", drifted)
+            .script(host, "probe-release-dir", "absent")
+            .fail_on_occurrence(host, exec::LIVE_SLOT_REPAIR_LABEL, 1);
+        let fleet = fleet_of(&[host]);
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("the failed repair must fail the deploy");
+
+        let labels = recorder.run_labels_for(host);
+        assert!(
+            !labels.contains(&"migrate"),
+            "the repair runs before `migrate`: {labels:?}"
+        );
+        assert_eq!(
+            single_host_exec_message(&err),
+            pre_cutover_error(fleet::HostMode::Redeploy, exec::LIVE_SLOT_REPAIR_LABEL),
+        );
+    }
+
+    #[test]
+    fn a_single_host_first_deploy_torn_down_after_migrate_names_the_schema() {
+        // #2276: a first deploy migrates, then fails its gate. Nothing serves. The
+        // note must not claim a previous release.
+        let (message, labels) = failed_single_host_deploy(fleet::HostMode::First, "readiness-gate");
+
+        assert_eq!(
+            message,
+            format!(
+                "{}\n\u{26A0}\u{FE0F}  {}",
+                pre_cutover_error(fleet::HostMode::First, "readiness-gate"),
+                fleet::SINGLE_HOST_FIRST_DEPLOY_SCHEMA_NOTE
+            ),
+        );
+        assert!(
+            labels.contains(&"migrate"),
+            "the first deploy must migrate before the gate: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_host_failure_before_migrate_keeps_todays_error() {
+        // #2276: the deploy stopped before `migrate`, so the schema did not move.
+        for mode in [fleet::HostMode::Redeploy, fleet::HostMode::First] {
+            let (message, labels) = failed_single_host_deploy(mode, "daemon-reload");
+
+            assert_eq!(
+                message,
+                pre_cutover_error(mode, "daemon-reload"),
+                "{mode:?}: a failure before `migrate` keeps today's error verbatim"
+            );
+            assert!(
+                !labels.contains(&"migrate"),
+                "{mode:?}: the scripted failure must land before `migrate`: {labels:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_single_host_failure_keeps_todays_error_and_compensates_nothing() {
         // #1621 (AC-1). N = 1 is exempt from the whole fleet vocabulary: a
         // single-host deploy that fails must return the pre-#1621 error verbatim —
-        // no classification, no degrade-and-continue, no compensation, no state
-        // table. `prune` is the sharpest case: in a FLEET it degrades and the deploy
-        // succeeds, while for one host it must stay exactly today's failure.
+        // no degrade-and-continue, no compensation, no state table. `prune` is the
+        // sharpest case: in a FLEET it degrades and the deploy succeeds, while for
+        // one host it must stay exactly today's failure. (The #2276 note is only
+        // for a host whose binaries went back.)
         let fleet = fleet_of(&["203.0.113.10"]);
         let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "203.0.113.10")
             .fail("203.0.113.10", "prune");

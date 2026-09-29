@@ -847,6 +847,33 @@ pub(crate) fn schema_moved(plan: &FleetPlan, outcomes: &[HostOutcome]) -> bool {
     })
 }
 
+/// Single-host note: a redeploy rolled back at or after `migrate` (#2276).
+pub(crate) const SINGLE_HOST_SCHEMA_AHEAD_NOTE: &str = "any migration that ran was NOT rolled back. The previous release now runs on the \
+     migrated schema. Make sure that it works with that schema.";
+
+/// Single-host note: a first deploy torn down at or after `migrate` (#2276).
+pub(crate) const SINGLE_HOST_FIRST_DEPLOY_SCHEMA_NOTE: &str = "any migration that ran was NOT rolled back. No release is serving. Fix the cause, then \
+     run `autumn deploy up` again.";
+
+/// The schema note for a failed single-host deploy (#2276).
+///
+/// Uses [`schema_moved`], so the single-host and fleet paths use one rule. Gives a
+/// note only when the binaries went back. A host on the new release needs none:
+/// its binaries fit the migrated schema.
+pub(crate) fn single_host_schema_note(
+    plan: &FleetPlan,
+    outcomes: &[HostOutcome],
+) -> Option<&'static str> {
+    if !schema_moved(plan, outcomes) {
+        return None;
+    }
+    outcomes.iter().find_map(|outcome| match outcome {
+        HostOutcome::RolledBack { .. } => Some(SINGLE_HOST_SCHEMA_AHEAD_NOTE),
+        HostOutcome::TornDown { .. } => Some(SINGLE_HOST_FIRST_DEPLOY_SCHEMA_NOTE),
+        _ => None,
+    })
+}
+
 /// The exact by-hand recovery instructions for a host the fleet deliberately did
 /// NOT roll back (issue #1621, §4.7/§8.2).
 ///
@@ -4170,6 +4197,83 @@ mod tests {
             rendered.contains("r1") && rendered.contains("r2"),
             "version drift must show WHICH releases:\n{rendered}"
         );
+    }
+
+    // --- single-host schema note (#2276) ------------------------------------
+
+    /// A one-host plan in `mode`. The host carries the migration.
+    fn single_plan(mode: HostMode) -> FleetPlan {
+        plan_fleet(&fleet_of(&["web-a"]), &[mode]).expect("a one-host fleet plans")
+    }
+
+    #[test]
+    fn single_host_note_names_a_redeploy_rolled_back_after_migrate() {
+        let plan = single_plan(HostMode::Redeploy);
+        for failed_step in ["migrate", "readiness-gate", "proxy-flip"] {
+            assert_eq!(
+                single_host_schema_note(&plan, &[HostOutcome::RolledBack { failed_step }]),
+                Some(SINGLE_HOST_SCHEMA_AHEAD_NOTE),
+                "a rollback at `{failed_step}` leaves the schema ahead of the binaries"
+            );
+        }
+    }
+
+    #[test]
+    fn single_host_note_names_a_first_deploy_torn_down_after_migrate() {
+        let plan = single_plan(HostMode::First);
+        assert_eq!(
+            single_host_schema_note(
+                &plan,
+                &[HostOutcome::TornDown {
+                    failed_step: "readiness-gate"
+                }]
+            ),
+            Some(SINGLE_HOST_FIRST_DEPLOY_SCHEMA_NOTE),
+        );
+    }
+
+    #[test]
+    fn single_host_note_is_silent_before_migrate_and_on_the_new_release() {
+        let redeploy = single_plan(HostMode::Redeploy);
+        let first = single_plan(HostMode::First);
+        // The deploy stopped before `migrate`: the schema did not move.
+        for failed_step in ["upload-binary", "prepare-dirs", "start-candidate"] {
+            assert_eq!(
+                single_host_schema_note(&redeploy, &[HostOutcome::RolledBack { failed_step }]),
+                None,
+                "`{failed_step}` runs before `migrate`"
+            );
+            assert_eq!(
+                single_host_schema_note(&first, &[HostOutcome::TornDown { failed_step }]),
+                None,
+                "`{failed_step}` runs before `migrate`"
+            );
+        }
+        // The live-slot marker repair runs before `migrate` too.
+        assert_eq!(
+            single_host_schema_note(
+                &redeploy,
+                &[HostOutcome::RolledBack {
+                    failed_step: exec::LIVE_SLOT_REPAIR_LABEL
+                }]
+            ),
+            None,
+            "the marker repair runs before `migrate`"
+        );
+        // The new release serves: binaries and schema match.
+        for outcome in [
+            HostOutcome::LiveOnNew {
+                failed_step: "commit-markers",
+            },
+            HostOutcome::Degraded { label: "prune" },
+            HostOutcome::AmbiguousMarkers,
+        ] {
+            assert_eq!(
+                single_host_schema_note(&redeploy, std::slice::from_ref(&outcome)),
+                None,
+                "{outcome:?} keeps the new binaries on the new schema"
+            );
+        }
     }
 
     /// The table row for `host`. Rows come before every footer line.

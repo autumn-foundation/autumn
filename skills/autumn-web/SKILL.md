@@ -1902,10 +1902,21 @@ autumn plugin add autumn-admin-plugin   # dependency + mount + next steps
 autumn plugin add autumn-cache-redis --dry-run
 ```
 
-`list` covers the six first-party crates (`autumn-admin-plugin`,
+`list` reads the curated plugin index first (issue #1625), then crates.io.
+The index lists the six first-party crates (`autumn-admin-plugin`,
 `autumn-billing`, `autumn-cache-redis`, `autumn-media-plugin`, `autumn-search`,
-`autumn-storage-s3`) plus community crates found on crates.io under the
-documented `autumn-plugin-<name>` convention.
+`autumn-storage-s3`) and reviewed community crates. Each listing shows its
+trust class (`full trust: native code`, or a sandboxed capability manifest),
+its #1601 tier (`[EXPERIMENTAL API]` when it uses experimental surface), and
+its last `autumn plugin-check` result. A crates.io `autumn-plugin-<name>`
+result with no listing is shown under "Unlisted" and marked
+`[unlisted: not verified]`. `add` prints the same trust review before it
+changes a file. It installs a listed community crate at its verified version,
+pinned with `=`, so `--offline` works. It refuses a listing flagged by
+re-verification. For a sandboxed listing it changes no file and exits 2 with
+manual steps. Advise users to prefer a listed plugin. An unlisted one has no
+verified range and no conformance result.
+Authors submit a listing by pull request: `autumn-cli/plugin-index/README.md`.
 
 Four behaviours worth knowing before advising on it:
 
@@ -3747,10 +3758,10 @@ failed after `migrate` but before its cutover and tore its own candidate down �
 `no host is serving the new release, but the migration that already ran was NOT
 rolled back …`. A rollout that died BEFORE its migration (a failed host
 preparation or upload) prints none of them. **A failed SINGLE-host deploy prints
-no summary and so warns about none of this** (known gap, #2276) — if a user's
-one-host `deploy up` failed, tell them to check `autumn migrate status` before
-assuming nothing was applied. That now includes a failed FIRST deploy, which
-migrates before it starts the release.
+no summary.** If it failed at or after `migrate` and before the cutover, its
+error has one more line (#2276). A redeploy prints `… The previous release now
+runs on the migrated schema …`. A FIRST deploy prints `… No release is serving
+…`. A failure before `migrate` or after the cutover adds no line.
 `--only <HOST>` (repeatable, `up` and `rollback`) is a repair lever
 that warns about a mixed fleet; `--no-rollback` halts and freezes instead.
 `--only` narrowed to ONE host takes the single-host path: `deploy rollback --only

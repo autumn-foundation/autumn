@@ -87,6 +87,13 @@ on:
       - "autumn-media-plugin/**"
       - "autumn-search/**"
       - "autumn-storage-s3/**"
+      # The plugin index re-verification (#1625) runs `plugin-check` against
+      # every listing, so the index, the checker (and the route collection
+      # it reads) and every listed crate trigger it.
+      - "autumn-cli/plugin-index/**"
+      - "autumn-cli/src/plugin_check.rs"
+      - "autumn-cli/src/routes.rs"
+      - "autumn-billing/**"
       - "Cargo.toml"
   pull_request:
     branches: [trunk, trunk-dev]
@@ -162,6 +169,13 @@ on:
       - "autumn-media-plugin/**"
       - "autumn-search/**"
       - "autumn-storage-s3/**"
+      # The plugin index re-verification (#1625) runs `plugin-check` against
+      # every listing, so the index, the checker (and the route collection
+      # it reads) and every listed crate trigger it.
+      - "autumn-cli/plugin-index/**"
+      - "autumn-cli/src/plugin_check.rs"
+      - "autumn-cli/src/routes.rs"
+      - "autumn-billing/**"
       - "Cargo.toml"
   schedule:
     # Weekly on Monday at 04:00 UTC — catches rot from transitive dep updates
@@ -1227,9 +1241,10 @@ jobs:
     name: autumn plugin install/remove lifecycle gate
     needs: meta
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
-    # Two five-project compile sweeps now, not one; the second reuses the
-    # first's warm target dir but still runs its own `cargo check` per plugin.
-    timeout-minutes: 120
+    # Three compile sweeps: install, remove, and the plugin index
+    # re-verification (#1625). Each builds into its own target dir; only the
+    # cargo registry cache is warm.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7
 
@@ -1274,3 +1289,30 @@ jobs:
             | tee "$RUNNER_TEMP/conformance-plugin_new_with_then_remove_round_trips_cargo_check.log"
 
           assert_ran "$RUNNER_TEMP/conformance-plugin_new_with_then_remove_round_trips_cargo_check.log" plugin_new_with_then_remove_round_trips_cargo_check
+
+      # Issue #1625, AC 4: re-verify every plugin index listing. The test
+      # scaffolds an app, runs `plugin add`, then `autumn plugin-check --format
+      # json`. The result must agree with the recorded one. The job uploads the
+      # reports and the index with them recorded (`index.toml`).
+      - name: plugin_index_reverify_listings
+        env:
+          PLUGIN_INDEX_REPORTS: ${{ runner.temp }}/plugin-index-reports
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
+          cargo test -p autumn-cli --test generate \
+            plugin_index_reverify_listings -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-plugin_index_reverify_listings.log"
+
+          assert_ran "$RUNNER_TEMP/conformance-plugin_index_reverify_listings.log" plugin_index_reverify_listings
+
+      - name: Upload plugin index reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-index-reports
+          path: ${{ runner.temp }}/plugin-index-reports
+          if-no-files-found: ignore
