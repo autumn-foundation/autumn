@@ -48,6 +48,13 @@
 //!     .await;
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -936,10 +943,7 @@ pub(crate) fn parse_mailgun(
         tracing::warn!("inbound_mail.mailgun: missing or non-numeric timestamp");
         StatusCode::UNAUTHORIZED
     })?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-        .cast_signed();
+    let now = crate::time::clock_unix_secs(&crate::time::AmbientClock).cast_signed();
     // Use abs_diff to avoid signed overflow when `ts` is an extreme value
     // (e.g. i64::MIN), which would panic in debug builds before the rejection runs.
     if now.abs_diff(ts) > 300 {
