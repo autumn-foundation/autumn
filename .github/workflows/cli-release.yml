@@ -94,7 +94,7 @@ jobs:
 
       - name: Install cross
         if: ${{ matrix.cross }}
-        uses: taiki-e/install-action@v2.87.5
+        uses: taiki-e/install-action@v2.87.11
         with:
           tool: cross
 
@@ -170,7 +170,7 @@ jobs:
         # provenance record for bytes nobody can obtain is just noise in the
         # transparency log.
         if: ${{ inputs.tag != '' }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: autumn-${{ matrix.target }}.*
 

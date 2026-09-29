@@ -14735,6 +14735,50 @@ async fn a_menu_assigned_to_the_footer_is_rendered() {
     );
 }
 
+/// `Menu::name` declares `#[validate(length(min = 1, max = 200))]`, but
+/// `replace_menu_at_location` writes the row through a raw
+/// `diesel::insert_into` that never runs the model's generated
+/// `validator::Validate` — so `create_menu` was the only place left to
+/// enforce it, and it did not. A blank (including whitespace-only, which the
+/// browser's `required` attribute does not reject) or overlong name is now
+/// refused at 422, with the "New menu" card's location choice preserved,
+/// instead of being silently persisted — an empty name previously fell back
+/// to a hashed slug and inserted a menu with a blank display name.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_invalid_menu_name_is_refused_and_redisplayed() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for name in ["   ", &"x".repeat(201)] {
+        let resp = client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", name), ("location", "primary")]))
+            .send()
+            .await;
+        resp.assert_status(422);
+        assert!(
+            resp.header("location").is_none(),
+            "a rejected submission must not redirect"
+        );
+        resp.assert_body_contains("must be between 1 and 200 characters")
+            .assert_body_contains(r#"value="primary" selected"#);
+    }
+
+    let count: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::menus::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(count, 0, "neither invalid name may be persisted");
+}
+
 /// Only one menu can hold a theme location, under concurrency.
 ///
 /// The replacement cleared the incumbent and inserted, with nothing
@@ -15356,6 +15400,83 @@ async fn a_post_is_locked_before_its_terms() {
         .await
         .expect("commit");
     save.await.expect("the task").expect("the save succeeds");
+}
+
+/// A term id can go stale between when a caller resolved it and when
+/// `set_post_terms` actually runs — an editor's form round trip, or (the
+/// case that motivated this) an import that batch-resolves every post's
+/// term references up front and then assigns them one post at a time, so a
+/// term deleted midway through a long-running import is still in a later
+/// post's `wanted` list. `lock_terms` already tolerates a missing row for
+/// locking and recounting; `set_post_terms` must not then try to insert a
+/// `post_terms` row for it, which would violate the foreign key and abort
+/// the whole save (and, in the batched-import case, every post still to
+/// come) instead of just silently omitting that one stale reference —
+/// exactly what the old unbatched per-post lookup did by finding nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_term_deleted_after_resolution_is_dropped_not_a_hard_failure() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Tagged", "Body.", "publish").await;
+
+    for slug in ["kept", "vanishes"] {
+        client
+            .post("/admin/terms/category")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", slug), ("slug", slug)]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+    let (kept_id, vanishing_id): (i64, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let kept = cms::schema::terms::table
+            .filter(cms::schema::terms::slug.eq("kept"))
+            .select(cms::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the kept term");
+        let vanishing = cms::schema::terms::table
+            .filter(cms::schema::terms::slug.eq("vanishes"))
+            .select(cms::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the vanishing term");
+        (kept, vanishing)
+    };
+
+    // Stands in for another admin deleting the term between when a caller
+    // resolved `vanishing_id` and when this save runs.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::delete(cms::schema::terms::table.filter(cms::schema::terms::id.eq(vanishing_id)))
+            .execute(&mut conn)
+            .await
+            .expect("delete the term out from under the save");
+    }
+
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    cms::content::set_post_terms(&mut conn, post_id, vec![kept_id, vanishing_id])
+        .await
+        .expect(
+            "the save succeeds despite the stale reference, instead of failing its foreign key",
+        );
+
+    let filed: Vec<i64> = cms::schema::post_terms::table
+        .filter(cms::schema::post_terms::post_id.eq(post_id))
+        .select(cms::schema::post_terms::term_id)
+        .load(&mut conn)
+        .await
+        .expect("the post's filed terms");
+    assert_eq!(
+        filed,
+        vec![kept_id],
+        "the deleted term must be silently dropped, and the still-live one still filed"
+    );
 }
 
 /// The export reads every table from one snapshot.

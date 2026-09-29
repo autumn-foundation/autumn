@@ -2,7 +2,7 @@
 //!
 //! Autumn owns both ends of the staleness dependency: cached reads flow through
 //! [`#[cached]`](autumn_macros::cached), the fragment cache and the read-through
-//! cache; writes flow through [`#[repository]`](autumn_macros::repository).
+//! cache; writes flow through [`#[repository]`](autumn_macros_repository::repository).
 //! Until now nothing linked the two, so a cached value derived from `Post` rows
 //! kept being served after a `PostRepository::save` inserted a new one and the
 //! build said nothing.

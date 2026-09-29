@@ -38,6 +38,10 @@ use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{Attribute, Expr, ExprLit, Ident, Lit, LitBool, LitStr, Token};
 
+pub use autumn_macros_support::schema::{
+    last_segment_name, primitive_json_type, unwrap_single_generic,
+};
+
 /// Parsed `#[api_doc(...)]` attribute arguments.
 // Each bool models a distinct, orthogonal attribute flag (`hidden`, `mcp`,
 // `mcp = false`, `stream`); grouping them would obscure rather than clarify.
@@ -552,25 +556,6 @@ pub fn unwrap_result_ok(ty: &syn::Type) -> Option<syn::Type> {
     }
 }
 
-/// If `ty` is `Name<Inner>` (single generic argument), return `Inner`.
-/// The outermost segment of `ty`'s path must match `wrapper`.
-pub fn unwrap_single_generic(ty: &syn::Type, wrapper: &str) -> Option<syn::Type> {
-    let syn::Type::Path(path) = ty else {
-        return None;
-    };
-    let last = path.path.segments.last()?;
-    if last.ident != wrapper {
-        return None;
-    }
-    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
-        return None;
-    };
-    args.args.iter().find_map(|arg| match arg {
-        syn::GenericArgument::Type(t) => Some(t.clone()),
-        _ => None,
-    })
-}
-
 /// Emit a `::autumn_web::openapi::SchemaEntry` initializer for a type.
 ///
 /// Handles the following patterns:
@@ -646,28 +631,6 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
                 ),
             }
         }
-    }
-}
-
-/// Map a short Rust primitive name to its JSON-schema `type` keyword.
-pub fn primitive_json_type(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "String" | "str" => "string",
-        "bool" => "boolean",
-        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "isize" | "usize" => {
-            "integer"
-        }
-        "f32" | "f64" => "number",
-        _ => return None,
-    })
-}
-
-/// Return the final identifier in a type's path (e.g. `foo::Bar` → `"Bar"`).
-pub fn last_segment_name(ty: &syn::Type) -> Option<String> {
-    match ty {
-        syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
-        syn::Type::Reference(r) => last_segment_name(&r.elem),
-        _ => None,
     }
 }
 
@@ -1236,32 +1199,24 @@ mod tests {
 
     #[test]
     fn extract_path_params_returns_empty_for_static() {
-        assert!(extract_path_params("/hello").is_empty());
-        assert!(extract_path_params("/").is_empty());
+        assert_eq!(extract_path_params("/hello"), [] as [String; 0]);
+        assert_eq!(extract_path_params("/"), [] as [String; 0]);
     }
 
     #[test]
     fn extract_path_params_ignores_unclosed_braces() {
-        assert!(extract_path_params("/oops/{broken").is_empty());
+        assert_eq!(extract_path_params("/oops/{broken"), [] as [String; 0]);
     }
 
     #[test]
     fn extract_path_params_skips_escaped_braces() {
         // `{{hello}}` is a static route segment, not a path parameter.
-        assert!(extract_path_params("/{{hello}}").is_empty());
+        assert_eq!(extract_path_params("/{{hello}}"), [] as [String; 0]);
         // Escaped brace followed by a real param.
         assert_eq!(
             extract_path_params("/{{literal}}/{id}"),
             vec!["id".to_owned()]
         );
-    }
-
-    #[test]
-    fn primitive_json_type_matches_common() {
-        assert_eq!(primitive_json_type("String"), Some("string"));
-        assert_eq!(primitive_json_type("i64"), Some("integer"));
-        assert_eq!(primitive_json_type("bool"), Some("boolean"));
-        assert_eq!(primitive_json_type("Foo"), None);
     }
 
     #[test]
@@ -1349,7 +1304,7 @@ mod tests {
             .iter()
             .find(|a| a.path().is_ident("secured"))
             .unwrap();
-        assert!(extract_secured_scopes(attr).is_empty());
+        assert_eq!(extract_secured_scopes(attr), [] as [String; 0]);
     }
 
     #[test]

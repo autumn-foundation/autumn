@@ -1805,10 +1805,10 @@ impl UnsubscribeRuntime {
     }
 }
 
+/// Unix seconds for unsubscribe tokens. Signing and verifying both read the
+/// ambient clock, so the two always agree.
 fn current_unix_time() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+    i64::try_from(crate::time::clock_unix_secs(&crate::time::AmbientClock)).unwrap_or(i64::MAX)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2771,7 +2771,7 @@ fn file_transport_filename(mail: &Mail) -> String {
     let sequence = FILE_TRANSPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
         "{}-{}-{:016x}-{}.eml",
-        chrono::Utc::now().format("%Y%m%d%H%M%S%6f"),
+        crate::time::ambient_now().format("%Y%m%d%H%M%S%6f"),
         std::process::id(),
         sequence,
         sanitize_filename(mail.to.first().map_or("unknown", String::as_str))
@@ -2796,7 +2796,7 @@ fn render_eml(mail: &Mail) -> String {
         out.push('\n');
     }
     out.push_str("Date: ");
-    out.push_str(&chrono::Utc::now().to_rfc2822());
+    out.push_str(&crate::time::ambient_now().to_rfc2822());
     out.push('\n');
     out.push_str("Message-Id: <");
     out.push_str(&uuid::Uuid::new_v4().to_string());

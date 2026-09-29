@@ -148,7 +148,11 @@ mod fs_atomic;
 // not in scope (`-D rustdoc::broken_intra_doc_links` in `scripts/check-docs.sh`).
 // The module documents itself.
 pub mod classify;
+// A plain comment, not a doc comment: the module carries its own `//!` docs
+// and an outer `///` here would be merged with them.
 pub mod cluster;
+#[cfg(feature = "collab")]
+pub mod collab;
 pub mod config;
 pub mod consent;
 // Parse, validate and server-render Constela documents: the constrained JSON UI
@@ -418,9 +422,22 @@ pub mod read_your_writes;
 #[cfg(feature = "offline-sync")]
 pub mod sync;
 
+// Typed money and an append-only, double-entry money ledger (issue #1837).
+// Not to be confused with `ledger` below, which records the history of a
+// `#[repository]` row.
+//
+// A `//` comment, not `///`: an outer doc attribute here merges into the
+// module's own `//!` header and makes its unqualified intra-doc links resolve
+// in `lib.rs`'s scope instead of the module's. `Money`, `AnyMoney` and
+// `MoneyError` are deliberately not re-exported at the crate root — `Money` is
+// too plausible an application type name to take — so every one of those links
+// would break. Same reason as `data_retention` above.
+pub mod money;
+
 /// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
 ///
-/// See [`ledger`] module documentation for the full API (issue #1699).
+/// See [`ledger`] module documentation for the full API (issue #1699). This
+/// records the history of a row. For money, see [`money`].
 pub mod ledger;
 // The data types a caller handles. The two *evidence* enums the verification
 // entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are
@@ -631,6 +648,10 @@ pub mod slug;
 pub use slug::{contains_letter_or_number, slugify};
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
+// Calendar-aware SLA obligations (issue #1826). A plain comment, not `///`:
+// the module header has intra-doc links that must resolve in the module.
+#[cfg(feature = "sla")]
+pub mod sla;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
@@ -1084,6 +1105,10 @@ pub use autumn_macros::sim_test;
 #[cfg(feature = "maud")]
 pub use autumn_macros::story;
 
+/// Annotate an OAuth2/OIDC callback handler.
+///
+/// Convenience alias for `#[get(...)]` with callback-focused naming.
+pub use autumn_macros::oauth2_callback;
 /// Derive Diesel and Serde traits for a database model struct.
 ///
 /// Applies `Queryable`, `Selectable`, `Insertable`, `Serialize`, and
@@ -1154,17 +1179,13 @@ pub use autumn_macros::story;
 /// registry, backfill and status API, `GET /actuator/derivations` for state and
 /// drift, and `docs/guide/derivations.md` for the guide.
 #[cfg(feature = "db")]
-pub use autumn_macros::model;
-/// Annotate an OAuth2/OIDC callback handler.
-///
-/// Convenience alias for `#[get(...)]` with callback-focused naming.
-pub use autumn_macros::oauth2_callback;
+pub use autumn_macros_model::model;
 
 /// Derive a repository with CRUD operations and derived queries.
 ///
 /// See [`macro@repository`] for details.
 #[cfg(feature = "db")]
-pub use autumn_macros::repository;
+pub use autumn_macros_repository::repository;
 
 /// Define a service for cross-model orchestration and non-DB side effects.
 ///
@@ -1191,7 +1212,7 @@ pub use autumn_macros::repository;
 /// }
 /// ```
 #[cfg(feature = "db")]
-pub use autumn_macros::service;
+pub use autumn_macros_model::service;
 
 /// Mark a typed handler as a service endpoint (issue #1755).
 ///
@@ -1768,6 +1789,34 @@ pub use autumn_macros::edge_routes;
 /// pub enum ArticleState { Draft, Published, Archived }
 /// ```
 pub use autumn_macros::lifecycle;
+
+/// Declare a business-time obligation on a struct (issue #1826).
+///
+/// It adds a `<name>_obligation(&self)` method that returns an
+/// [`sla::Obligation`]. See the [`sla`] module.
+///
+/// ```rust,ignore
+/// use autumn_web::obligation;
+///
+/// #[obligation(
+///     name = first_response,
+///     within = "2 business days",
+///     calendar = "support",
+///     starts = opened_at,
+///     met = responded_at,
+///     zone = customer_zone,
+/// )]
+/// pub struct Ticket {
+///     pub id: i64,
+///     pub opened_at: chrono::DateTime<chrono::Utc>,
+///     pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+///     pub customer_zone: String,
+/// }
+///
+/// let obligation = ticket.first_response_obligation();
+/// ```
+#[cfg(feature = "sla")]
+pub use autumn_macros::obligation;
 
 /// Marker trait implemented by every `#[lifecycle]` enum, exposing that
 /// lifecycle's transition edges as a string-keyed table.

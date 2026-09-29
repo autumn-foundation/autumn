@@ -27,17 +27,41 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     active_search_input, active_search_results,
                 };
 
-                let config = ActiveSearchConfig::new("/search", "#post-search-results")
+                // A real, live-wired demo — unlike most story action URLs,
+                // which stay synthetic 404s on purpose (see e.g. the Confirm
+                // action or Bulk actions stories): a search box that visibly
+                // does nothing while typing reads as broken. The gallery
+                // itself serves this path (see `stories::demo_search`).
+                let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
                     .placeholder("Search posts…");
                 maud::html! {
+                    // The claim below only holds when htmx is actually on
+                    // the page — story_page only loads it under the `htmx`
+                    // feature (review follow-up: a maud-only, no-htmx build
+                    // still compiles this story, and its hx-* attributes
+                    // stay inert without htmx there to process them).
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, searching a small demo post list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
                     (active_search("post-search", "Search posts", &config))
-                    // What your handler returns when nothing matches:
+                    p { em { "For reference — not live — what your handler returns when nothing matches:" } }
                     (active_search_empty_state("No posts matched your search."))
                     // Compose the pieces yourself when you need custom layout
-                    // between the input and the results container:
+                    // between the input and the results container: this needs
+                    // its own config, targeting its own results container —
+                    // reusing `config` above would target
+                    // "#post-search-results" (the first demo's), leaving this
+                    // one empty on a successful response (review follow-up).
                     div {
-                        (active_search_input("post-search-split", "Search posts", &config))
-                        (active_search_results("post-search-split"))
+                        (active_search_input(
+                            "post-search-split",
+                            "Search posts",
+                            &ActiveSearchConfig::new("/_stories/demo/search", "#post-search-split-results")
+                                .placeholder("Search posts…"),
+                        ))
+                        (active_search_results("post-search-split-results"))
                     }
                 }
             }
@@ -51,10 +75,20 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     autocomplete_option,
                 };
 
-                let config = AutocompleteConfig::new("/tags/search", "tag_id")
+                // Real, live-wired demo — see the Active search story above
+                // for why (and `stories::demo_tag_search` for the handler).
+                let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
                     .placeholder("Start typing a tag…");
                 maud::html! {
+                    // See the Active search story above for why this is
+                    // conditional (review follow-up).
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, matching against a small demo tag list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
                     (autocomplete_input("tag-picker", "Tag", &config))
+                    p { em { "For reference — not live — the two shapes your handler returns:" } }
                     // One matching option, as your handler would render it:
                     (autocomplete_option("42", "rust"))
                     // And the empty state when nothing matches:
@@ -413,13 +447,19 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 let next = maud::html! {
                     article class="post" { h3 { "Third post" } }
                 };
-                let config = FeedConfig::new("/posts/feed").mode(FeedMode::Reveal);
+                // Reveal mode's sentinel fires on scroll-into-view with no
+                // click needed (`hx-trigger="revealed, click"`), so this
+                // points at a real demo backend rather than the synthetic
+                // 404 URLs most other stories use — otherwise the sentinel
+                // below would 404-swap the instant this page loads, not on
+                // any visitor action. See `stories::demo_infinite_feed`.
+                let config = FeedConfig::new("/_stories/demo/posts/feed").mode(FeedMode::Reveal);
                 maud::html! {
                     // Initial view: the feed container + an auto-loading sentinel.
                     (infinite_feed(items, Some("eyJpZCI6Mn0"), &config))
                     // The fragment a handler returns for each append (here the
                     // last page, so no further sentinel is emitted):
-                    (feed_page(next, None, &FeedConfig::new("/posts/feed").button()))
+                    (feed_page(next, None, &FeedConfig::new("/_stories/demo/posts/feed").button()))
                 }
             }
         },

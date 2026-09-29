@@ -9,6 +9,7 @@ use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::response::Response;
 use autumn_web::storage::{Transform, VariantBudget};
 use autumn_web::webhook_outbound::WebhookOutboundManager;
 use diesel::prelude::*;
@@ -57,23 +58,40 @@ pub fn mail_previews() -> Vec<MailPreview> {
 
 // ── Register ───────────────────────────────────────────────────
 
-#[get("/register")]
-pub async fn register_form(csrf: CsrfToken) -> Markup {
+/// Render the "create account" form, optionally re-filling `username` /
+/// `email` and showing validation `messages` inline.
+///
+/// Mirrors `examples/saas` and `examples/teams`'s `signup_page` (Wayfinder
+/// PR #2530/#2554): every failure in [`register`] below used to
+/// `Err(AutumnError::...)` straight to the framework's generic error page,
+/// which threw the user off the form entirely — losing everything they'd
+/// typed and giving no adjacent, actionable way to retry. `messages` renders
+/// as a list rather than a single line so more than one problem can be
+/// reported at once.
+fn register_page(username: &str, email: &str, messages: &[String], csrf_token: &str) -> Markup {
     layout(
         "Sign Up",
         None,
-        Some(csrf.token()),
+        Some(csrf_token),
         html! {
             div class="max-w-md mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Create an Account" }
+                @if !messages.is_empty() {
+                    ul class="mb-4 text-sm text-red-600 list-disc pl-5" role="alert" {
+                        @for message in messages {
+                            li { (message) }
+                        }
+                    }
+                }
                 form action="/register" method="post" class="space-y-4 bg-white rounded-lg shadow p-6" {
-                    input type="hidden" name="_csrf" value=(csrf.token());
+                    input type="hidden" name="_csrf" value=(csrf_token);
                     div {
                         label for="username" class="block text-sm font-medium text-gray-700 mb-1" {
                             "Username"
                         }
                         input type="text" id="username" name="username" required
                               autocomplete="username"
+                              value=(username)
                               placeholder="cool_rustacean"
                               class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
                                      focus:outline-none focus:ring-2 focus:ring-orange-400";
@@ -84,6 +102,7 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
                         }
                         input type="email" id="email" name="email" required
                               autocomplete="email"
+                              value=(email)
                               placeholder="you@example.com"
                               class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
                                      focus:outline-none focus:ring-2 focus:ring-orange-400";
@@ -113,6 +132,11 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
     )
 }
 
+#[get("/register")]
+pub async fn register_form(csrf: CsrfToken) -> Markup {
+    register_page("", "", &[], csrf.token())
+}
+
 #[derive(serde::Deserialize)]
 pub struct RegisterForm {
     pub username: String,
@@ -120,6 +144,7 @@ pub struct RegisterForm {
     pub password: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 #[post("/register")]
 pub async fn register(
     State(state): State<AppState>,
@@ -128,43 +153,80 @@ pub async fn register(
     session: Session,
     events: autumn_web::events::Events,
     flash: Flash,
+    csrf: CsrfToken,
     form: Form<RegisterForm>,
-) -> AutumnResult<Redirect> {
+) -> AutumnResult<Response> {
+    let username = form.0.username.trim().to_lowercase();
+    let email = form.0.email.trim().to_owned();
+    let password = form.0.password;
+
+    // Bounded copies for echoing back into the form on a rejected
+    // submission only. Validation, the DB lookup/insert, and the mailer
+    // below all use the full `username`/`email` above — truncating those
+    // (rather than just the echo) made the too-long checks below
+    // unreachable and would have created accounts under a different,
+    // silently-shortened username (Codex finding on this PR). The cap
+    // here exists only so an attacker can't turn a bounded error page
+    // into an up-to-32MiB response (the default request-body limit) by
+    // submitting an enormous value — the same amplification guard
+    // `examples/saas` and `examples/teams` apply to their own signup
+    // forms.
+    let echo_username: String = username.chars().take(32).collect();
+    let echo_email: String = email.chars().take(254).collect();
+
     let open = crate::config_svc()
         .get("registration_open")
         .ok()
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if !open {
-        return Err(AutumnError::unprocessable_msg(
-            "Registrations are currently closed",
-        ));
+        return Ok(register_page(
+            &echo_username,
+            &echo_email,
+            &["Registrations are currently closed".to_owned()],
+            csrf.token(),
+        )
+        .into_response());
     }
 
-    let username = form.0.username.trim().to_lowercase();
-    let email = form.0.email.trim().to_owned();
-    let password = form.0.password;
-
     if username.len() < 2 || username.len() > 32 {
-        return Err(AutumnError::unprocessable_msg(
-            "Username must be 2-32 characters",
-        ));
+        return Ok(register_page(
+            &echo_username,
+            &echo_email,
+            &["Username must be 2-32 characters".to_owned()],
+            csrf.token(),
+        )
+        .into_response());
     }
     if !username
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        return Err(AutumnError::unprocessable_msg(
-            "Username may only contain letters, numbers, and underscores",
-        ));
+        return Ok(register_page(
+            &echo_username,
+            &echo_email,
+            &["Username may only contain letters, numbers, and underscores".to_owned()],
+            csrf.token(),
+        )
+        .into_response());
     }
     if password.len() < 6 {
-        return Err(AutumnError::unprocessable_msg(
-            "Password must be at least 6 characters",
-        ));
+        return Ok(register_page(
+            &echo_username,
+            &echo_email,
+            &["Password must be at least 6 characters".to_owned()],
+            csrf.token(),
+        )
+        .into_response());
     }
     if !email.contains('@') {
-        return Err(AutumnError::unprocessable_msg("Email address is invalid"));
+        return Ok(register_page(
+            &echo_username,
+            &echo_email,
+            &["Email address is invalid".to_owned()],
+            csrf.token(),
+        )
+        .into_response());
     }
 
     // Check if username already taken
@@ -175,7 +237,13 @@ pub async fn register(
         .await?;
 
     if existing > 0 {
-        return Err(AutumnError::unprocessable_msg("Username already taken"));
+        return Ok(register_page(
+            &echo_username,
+            &echo_email,
+            &["Username already taken".to_owned()],
+            csrf.token(),
+        )
+        .into_response());
     }
 
     let hashed = hash_password(&password).await?;
@@ -184,15 +252,43 @@ pub async fn register(
         password_hash: hashed,
     };
 
-    let user = db
+    let email_for_tx = email.clone();
+    let tx_result = db
         .tx(move |conn| {
             async move {
-                let user: User = diesel::insert_into(users::table)
+                // A duplicate username hits the `users_username_key` UNIQUE
+                // constraint (Postgres's default name for an unnamed
+                // `UNIQUE` column — see `up.sql`'s `username TEXT NOT NULL
+                // UNIQUE` — the same convention `examples/saas` and
+                // `examples/teams` document for their own `users` table);
+                // classified here rather than folded into the blanket `?`
+                // below so the handler can redisplay the form inline
+                // instead of navigating to a generic error page (Wayfinder:
+                // error-path inventory) — see the match on `tx_result`
+                // below. Any other error, including a `UniqueViolation` on a
+                // different constraint, still propagates as the real
+                // 500/503 it is.
+                let insert_err_to_conflict = |err: AutumnError| {
+                    if autumn_web::error::unique_violation_field(
+                        &err,
+                        &[("users_username_key", "username", "Username already taken")],
+                    )
+                    .is_some()
+                    {
+                        AutumnError::conflict_msg("Username already taken")
+                    } else {
+                        err
+                    }
+                };
+                let user: User = match diesel::insert_into(users::table)
                     .values(&new_user)
                     .returning(User::as_returning())
                     .get_result(conn)
                     .await
-                    .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
+                {
+                    Ok(user) => user,
+                    Err(err) => return Err(insert_err_to_conflict(err.into())),
+                };
 
                 // The default profile uses the Postgres job backend, so the
                 // job row is inserted on this transaction connection.
@@ -203,13 +299,30 @@ pub async fn register(
                 )
                 .await?;
 
-                AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
+                AccountMailer.deliver_later_welcome(&mailer, email_for_tx, user.username.clone());
 
                 Ok::<_, AutumnError>(user)
             }
             .scope_boxed()
         })
-        .await?;
+        .await;
+    let user = match tx_result {
+        Ok(user) => user,
+        // Redisplay the form inline for the one classified, user-fixable
+        // failure (duplicate username, e.g. a race against the
+        // availability check above); anything else propagates as a real
+        // server error, unchanged from before.
+        Err(err) if err.status() == StatusCode::CONFLICT => {
+            return Ok(register_page(
+                &echo_username,
+                &echo_email,
+                &["Username already taken".to_owned()],
+                csrf.token(),
+            )
+            .into_response());
+        }
+        Err(err) => return Err(err),
+    };
 
     // Publish a typed domain event. Listeners (see `crate::listeners`) react
     // independently — adding a new reaction needs zero edits to this handler.
@@ -238,7 +351,7 @@ pub async fn register(
     flash
         .success(format!("Welcome to autumn/reddit, u/{}!", user.username))
         .await;
-    Ok(Redirect::to("/"))
+    Ok(Redirect::to("/").into_response())
 }
 
 // ── Login ──────────────────────────────────────────────────────
@@ -302,25 +415,104 @@ mod tests {
             "unexpected error: {error}"
         );
     }
+
+    // ── Error-path inventory (Wayfinder) ────────────────────────────
+    //
+    // Baseline before this fix: `register` and `login` returned
+    // `Err(AutumnError::...)` on every failure mode below, which the
+    // framework renders as a full-page navigation away from the form —
+    // losing the username/email the user had typed and giving no
+    // adjacent, actionable way to retry. These tests pin the fix: the
+    // pure render functions the handlers now call on failure preserve
+    // the submitted values and surface the message inline.
+
+    #[test]
+    fn register_page_preserves_username_and_email_on_failure() {
+        let html = register_page(
+            "cool_rustacean",
+            "cool@example.com",
+            &["Username already taken".to_owned()],
+            "csrf-tok-xyz",
+        )
+        .into_string();
+        assert!(html.contains(r#"value="cool_rustacean""#), "{html}");
+        assert!(html.contains(r#"value="cool@example.com""#), "{html}");
+        assert!(html.contains("Username already taken"), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[test]
+    fn register_page_lists_multiple_messages() {
+        let html = register_page(
+            "",
+            "",
+            &[
+                "Username must be 2-32 characters".to_owned(),
+                "Password must be at least 6 characters".to_owned(),
+            ],
+            "csrf-tok-xyz",
+        )
+        .into_string();
+        assert!(html.contains("Username must be 2-32 characters"), "{html}");
+        assert!(
+            html.contains("Password must be at least 6 characters"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn register_page_clean_when_no_messages() {
+        let html = register_page("", "", &[], "csrf-tok-xyz").into_string();
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[test]
+    fn login_page_preserves_username_on_failure() {
+        let html = login_page(
+            "cool_rustacean",
+            "csrf-tok-xyz",
+            Some("Invalid username or password"),
+        )
+        .into_string();
+        assert!(html.contains(r#"value="cool_rustacean""#), "{html}");
+        assert!(html.contains("Invalid username or password"), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[test]
+    fn login_page_clean_when_no_error() {
+        let html = login_page("", "csrf-tok-xyz", None).into_string();
+        assert!(!html.contains(r#"role="alert""#), "{html}");
+    }
 }
 
-#[get("/login")]
-pub async fn login_form(csrf: CsrfToken) -> Markup {
+/// Render the login form, optionally re-filling `username` and showing an
+/// authentication `error` inline.
+///
+/// Mirrors `register_page` (Wayfinder PR #2530/#2554 pattern): a failed
+/// login used to `Err(AutumnError::...)` straight to the framework's
+/// generic error page, throwing the user off the form entirely and losing
+/// the username they'd typed.
+fn login_page(username: &str, csrf_token: &str, error: Option<&str>) -> Markup {
     layout(
         "Log In",
         None,
-        Some(csrf.token()),
+        Some(csrf_token),
         html! {
             div class="max-w-md mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Log In" }
+                @if let Some(error) = error {
+                    p class="mb-4 text-sm text-red-600" role="alert" { (error) }
+                }
                 form action="/login" method="post" class="space-y-4 bg-white rounded-lg shadow p-6" {
-                    input type="hidden" name="_csrf" value=(csrf.token());
+                    input type="hidden" name="_csrf" value=(csrf_token);
                     div {
                         label for="username" class="block text-sm font-medium text-gray-700 mb-1" {
                             "Username"
                         }
                         input type="text" id="username" name="username" required
                               autocomplete="username"
+                              value=(username)
                               class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
                                      focus:outline-none focus:ring-2 focus:ring-orange-400";
                     }
@@ -348,6 +540,11 @@ pub async fn login_form(csrf: CsrfToken) -> Markup {
     )
 }
 
+#[get("/login")]
+pub async fn login_form(csrf: CsrfToken) -> Markup {
+    login_page("", csrf.token(), None)
+}
+
 #[derive(serde::Deserialize)]
 pub struct LoginForm {
     pub username: String,
@@ -359,19 +556,44 @@ pub async fn login(
     mut db: Db,
     session: Session,
     flash: Flash,
+    csrf: CsrfToken,
     form: Form<LoginForm>,
-) -> AutumnResult<Redirect> {
+) -> AutumnResult<Response> {
     let username = form.0.username.trim().to_lowercase();
 
-    let user: User = users::table
+    // Bounded copy for echoing back on a rejected submission only (same
+    // amplification guard as `register`, above): the DB lookup below must
+    // use the full `username`, or an overlong submission whose first 32
+    // characters happen to match a real, shorter account would silently
+    // authenticate against that account instead of failing to match
+    // (Codex finding on this PR) — no stored username can be longer than
+    // 32 characters (`register` enforces that on the way in), so the full
+    // `username` either matches a real row or matches nothing.
+    let echo_username: String = username.chars().take(32).collect();
+
+    let user: Option<User> = users::table
         .filter(users::username.eq(&username))
         .select(User::as_select())
         .first(&mut *db)
         .await
-        .map_err(|_| AutumnError::bad_request_msg("Invalid username or password"))?;
+        .optional()?;
+
+    let Some(user) = user else {
+        return Ok(login_page(
+            &echo_username,
+            csrf.token(),
+            Some("Invalid username or password"),
+        )
+        .into_response());
+    };
 
     if !verify_password(&form.0.password, &user.password_hash).await? {
-        return Err(AutumnError::bad_request_msg("Invalid username or password"));
+        return Ok(login_page(
+            &echo_username,
+            csrf.token(),
+            Some("Invalid username or password"),
+        )
+        .into_response());
     }
 
     // Rotate session ID to prevent session fixation
@@ -383,7 +605,7 @@ pub async fn login(
     flash
         .success(format!("Welcome back, u/{}!", user.username))
         .await;
-    Ok(Redirect::to("/"))
+    Ok(Redirect::to("/").into_response())
 }
 
 // ── Logout ─────────────────────────────────────────────────────

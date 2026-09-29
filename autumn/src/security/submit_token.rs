@@ -533,15 +533,7 @@ where
 
         let clean = crate::security::path::clean_path(req.uri().path());
         let path = clean.as_str();
-        let is_exempt = self.settings.exempt_paths.iter().any(|prefix| {
-            if path == prefix {
-                true
-            } else if let Some(stripped) = path.strip_prefix(prefix) {
-                prefix.ends_with('/') || stripped.starts_with('/')
-            } else {
-                false
-            }
-        });
+        let is_exempt = crate::security::path::is_exempt_path(path, &self.settings.exempt_paths);
         let is_guarded = !is_exempt && is_mutating_method(req.method());
 
         // Every GET (and every exempt/non-mutating request) takes this branch:
@@ -1106,6 +1098,95 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
         }
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn exempt_path_is_exact_or_subtree_only() {
+        // Mirrors csrf.rs's `exempt_path_exact_or_subtree_only`: exempting
+        // `/webhooks/stripe` must skip dedup guarding on that path and its
+        // slash-delimited subtree, but not on an adjacent route that merely
+        // starts with the same characters.
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let layer =
+            SubmitTokenLayer::new(store, &default_config()).with_exempt_path("/webhooks/stripe");
+        let app = Router::new()
+            .route(
+                "/webhooks/stripe",
+                post({
+                    let count = count_inner.clone();
+                    move || {
+                        let count = count.clone();
+                        async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/webhooks/stripe/events",
+                post({
+                    let count = count_inner.clone();
+                    move || {
+                        let count = count.clone();
+                        async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/webhooks/stripe-admin",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "ok"
+                    }
+                }),
+            )
+            .layer(layer);
+
+        let submit = |uri: &'static str, token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .body(Body::from(format!("_submit_token={token}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Exact exempt path: dedup guarding is skipped, so the same token
+        // submitted twice runs the handler both times.
+        count.store(0, Ordering::SeqCst);
+        submit("/webhooks/stripe", "tok-exact").await;
+        submit("/webhooks/stripe", "tok-exact").await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        // Slash-delimited subtree of the exempt path: same, exempt.
+        count.store(0, Ordering::SeqCst);
+        submit("/webhooks/stripe/events", "tok-subtree").await;
+        submit("/webhooks/stripe/events", "tok-subtree").await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        // Adjacent route sharing the prefix but not the boundary: NOT exempt,
+        // so dedup guarding applies and the second submit replays instead of
+        // re-running the handler.
+        count.store(0, Ordering::SeqCst);
+        submit("/webhooks/stripe-admin", "tok-adjacent").await;
+        submit("/webhooks/stripe-admin", "tok-adjacent").await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

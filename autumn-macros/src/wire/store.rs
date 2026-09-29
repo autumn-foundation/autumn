@@ -230,7 +230,7 @@ mod tests {
         let got = find_by_ident(&dir, "get_item_endpoint");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].response.serialized[0].rust_name, "id");
-        assert!(got[0].request.serialized.is_empty());
+        assert_eq!(got[0].request.serialized, [] as [WireFieldDescriptor; 0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -240,7 +240,7 @@ mod tests {
         write_endpoint(&dir, &endpoint("catalog", "get_item"));
         let got = find_by_ident(&dir, "get_item_endpoint");
         assert_eq!(got.len(), 1);
-        assert!(got[0].response.serialized.is_empty());
+        assert_eq!(got[0].response.serialized, [] as [WireFieldDescriptor; 0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -278,7 +278,10 @@ mod tests {
         let mut descriptor = endpoint("catalog", "get_item");
         descriptor.krate = "../..".to_owned();
         write_endpoint(&dir, &descriptor);
-        assert!(find_by_ident(&dir, "get_item_endpoint").is_empty());
+        assert_eq!(
+            find_by_ident(&dir, "get_item_endpoint"),
+            [] as [ResolvedEndpoint; 0]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -286,7 +289,10 @@ mod tests {
     fn a_missing_directory_reads_as_empty_rather_than_failing_the_build() {
         let dir = std::env::temp_dir().join("autumn-wire-does-not-exist");
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(find_by_ident(&dir, "get_item_endpoint").is_empty());
+        assert_eq!(
+            find_by_ident(&dir, "get_item_endpoint"),
+            [] as [ResolvedEndpoint; 0]
+        );
     }
 
     #[test]
