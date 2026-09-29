@@ -17,41 +17,41 @@
 //!
 //! | Condition | Fires when | Where to look |
 //! |-----------|------------|---------------|
-//! | [`AlertCondition::DeadLetteredJob`] | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` † |
-//! | [`AlertCondition::HealthIndicatorDown`] | a registered health indicator reports `Down` past the grace period | `/actuator/health` |
-//! | [`AlertCondition::HighErrorRate`] | the rolling 5xx rate crosses the configured threshold | `/actuator/metrics` |
-//! | [`AlertCondition::ScheduledTaskFailure`] | a framework-scheduled task (backup, cert-renewal, cron/fixed-delay) fails | `/actuator/tasks` † |
+//! | [`AlertCondition::DeadLetteredJob`](crate::alerts::AlertCondition::DeadLetteredJob) | a background job exhausts its retries and is dead-lettered | `/actuator/jobs` † |
+//! | [`AlertCondition::HealthIndicatorDown`](crate::alerts::AlertCondition::HealthIndicatorDown) | a registered health indicator reports `Down` past the grace period | `/actuator/health` |
+//! | [`AlertCondition::HighErrorRate`](crate::alerts::AlertCondition::HighErrorRate) | the rolling 5xx rate crosses the configured threshold | `/actuator/metrics` |
+//! | [`AlertCondition::ScheduledTaskFailure`](crate::alerts::AlertCondition::ScheduledTaskFailure) | a framework-scheduled task (backup, cert-renewal, cron/fixed-delay) fails | `/actuator/tasks` † |
 //!
 //! † `/actuator/jobs` and `/actuator/tasks` are mounted only when `[actuator]
 //! sensitive = true` (default `false`). When it is off, those two alerts point at
 //! the always-mounted `/actuator/health` instead and note that the richer
-//! endpoint needs `sensitive = true` (see [`sensitive_gated_where_to_look`]).
+//! endpoint needs `sensitive = true` (see `sensitive_gated_where_to_look`).
 //!
 //! # Delivery is a trait (extension point)
 //!
-//! Every destination implements [`AlertChannel`]. The [`Alerter`] holds a
+//! Every destination implements [`AlertChannel`](crate::alerts::AlertChannel). The [`Alerter`](crate::alerts::Alerter) holds a
 //! fan-out list of channels and delivers each alert to all of them on a
 //! detached task — so a slow or unreachable channel never adds latency to a
 //! request or blocks the others. Two built-in channels ship:
-//! [`MailAlertChannel`] (reuses the app's [`Mailer`](crate::mail::Mailer)) and
-//! [`WebhookAlertChannel`] (a signed, Stripe-style HMAC POST reusing the same
+//! [`MailAlertChannel`](crate::alerts::MailAlertChannel) (reuses the app's [`Mailer`](crate::mail::Mailer)) and
+//! [`WebhookAlertChannel`](crate::alerts::WebhookAlertChannel) (a signed, Stripe-style HMAC POST reusing the same
 //! signing scheme as [`webhook_outbound`](crate::webhook_outbound)).
 //!
 //! **Design intent (follow-up #1630):** PagerDuty / Slack / Discord transports
-//! are added purely by implementing [`AlertChannel`] and registering them with
+//! are added purely by implementing [`AlertChannel`](crate::alerts::AlertChannel) and registering them with
 //! [`AppBuilder::with_alert_channel`](crate::app::AppBuilder::with_alert_channel);
-//! the core never changes. That is why every [`Alert`] carries a **stable dedup
-//! key** ([`Alert::dedup_key`], which PagerDuty correlates on), a **severity
-//! class** ([`Alert::severity`]), and a **trigger vs resolve** discriminator
-//! ([`Alert::event`]).
+//! the core never changes. That is why every [`Alert`](crate::alerts::Alert) carries a **stable dedup
+//! key** ([`Alert::dedup_key`](crate::alerts::Alert::dedup_key), which PagerDuty correlates on), a **severity
+//! class** ([`Alert::severity`](crate::alerts::Alert::severity)), and a **trigger vs resolve** discriminator
+//! ([`Alert::event`](crate::alerts::Alert::event)).
 //!
 //! # Deduplication and recovery
 //!
 //! A sustained or repeating condition does **not** produce one notification per
-//! occurrence. [`AlertDeduplicator`] bounds notifications to **at most one per
+//! occurrence. [`AlertDeduplicator`](crate::alerts::AlertDeduplicator) bounds notifications to **at most one per
 //! condition per dedup window** (default 15 minutes); the condition re-notifies
 //! once per window while it persists. When a previously-alerted condition
-//! clears, a single [`AlertEventKind::Resolve`] recovery notification is sent.
+//! clears, a single [`AlertEventKind::Resolve`](crate::alerts::AlertEventKind::Resolve) recovery notification is sent.
 //!
 //! # Fail-safe
 //!
@@ -59,6 +59,14 @@
 //! unreachable the app keeps serving, the failure is logged, and no latency is
 //! added. See [`AppBuilder::with_alert_channel`](crate::app::AppBuilder::with_alert_channel)
 //! and `docs/guide/operator-alerts.md` for the full guide.
+
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -108,9 +116,9 @@ impl AlertCondition {
     ///
     /// This is the builder default. When the app configures a custom
     /// `[actuator] prefix`, the emitted alert's `where_to_look` is rebuilt from
-    /// the effective prefix (see [`actuator_where_to_look`]) so it points at the
+    /// the effective prefix (see `actuator_where_to_look`) so it points at the
     /// real endpoint rather than a `/actuator/*` 404. Keep the suffixes here in
-    /// sync with [`Self::actuator_suffix`].
+    /// sync with `Self::actuator_suffix`.
     #[must_use]
     pub const fn where_to_look(self) -> &'static str {
         match self {
@@ -191,6 +199,56 @@ pub enum AlertSeverity {
     Critical,
     /// A previously-firing condition has recovered (informational).
     Recovery,
+}
+
+/// Which alert severities a transport receives (issue #1630, per-channel
+/// severity routing).
+///
+/// Every configured native transport (`PagerDutyAlertChannel`,
+/// `SlackAlertChannel`) declares this; the [`Alerter`] consults
+/// [`AlertChannel::accepts_severity`] before fanning an alert out, so an alert
+/// whose severity a destination does not accept is **never delivered to it**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertRouting {
+    /// Receive every severity — both firing ([`AlertSeverity::Critical`])
+    /// alerts and their ([`AlertSeverity::Recovery`]) recoveries. The default
+    /// for all channels. A pager-class channel (`PagerDuty`) needs this so a
+    /// `resolve` event reaches the provider and the incident auto-resolves.
+    #[default]
+    All,
+    /// Receive only firing ([`AlertSeverity::Critical`]) alerts; recoveries are
+    /// not delivered. Use for a chat channel that should page/notify on failure
+    /// but stay quiet on recovery.
+    Critical,
+}
+
+impl AlertRouting {
+    /// Whether a channel with this routing accepts an alert of `severity`.
+    #[must_use]
+    pub const fn accepts(self, severity: AlertSeverity) -> bool {
+        match self {
+            Self::All => true,
+            Self::Critical => matches!(severity, AlertSeverity::Critical),
+        }
+    }
+}
+
+impl std::str::FromStr for AlertRouting {
+    type Err = ();
+
+    /// Parse the same `all` / `critical` spellings the `[alerts]` TOML/serde path
+    /// accepts (see the `#[serde(rename_all = "snake_case")]` above), so the
+    /// `AUTUMN_ALERTS__*_SEVERITIES` env overrides and the config file agree on
+    /// the accepted values. Any other value is rejected (the env-override layer
+    /// then logs and ignores it, leaving the existing value).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "all" => Ok(Self::All),
+            "critical" => Ok(Self::Critical),
+            _ => Err(()),
+        }
+    }
 }
 
 /// Whether this alert opens (trigger) or closes (resolve) a condition. This is
@@ -277,7 +335,7 @@ impl AlertBuilder {
                 event,
                 title: String::new(),
                 summary: String::new(),
-                timestamp: Utc::now(),
+                timestamp: crate::time::ambient_now(),
                 host: host_id(),
                 where_to_look: condition.where_to_look().to_owned(),
                 details: HashMap::new(),
@@ -405,6 +463,19 @@ pub trait AlertChannel: Send + Sync + 'static {
 
     /// Deliver `alert` to this channel.
     fn deliver<'a>(&'a self, alert: &'a Alert) -> AlertDeliveryFuture<'a>;
+
+    /// Whether this channel receives an alert of the given `severity` (issue
+    /// #1630, per-channel severity routing).
+    ///
+    /// Defaults to accepting **every** severity, so an external channel that
+    /// does not override this behaves exactly as before. The built-in native
+    /// transports override it to honor the `[alerts]` `*_severities` routing —
+    /// a channel that declares [`AlertRouting::Critical`] returns `false` for a
+    /// [`AlertSeverity::Recovery`] alert, so the [`Alerter`] skips it and the
+    /// recovery is verifiably not delivered there.
+    fn accepts_severity(&self, _severity: AlertSeverity) -> bool {
+        true
+    }
 }
 
 // ── Deduplication ───────────────────────────────────────────────────────────
@@ -519,14 +590,14 @@ pub struct AlerterSettings {
     /// The effective actuator URL prefix (`[actuator] prefix`, default
     /// `/actuator`). Every alert's `where_to_look` pointer is built from this so
     /// operators are sent to the real actuator endpoint even when the prefix is
-    /// customized. Stored raw; normalization happens in [`actuator_where_to_look`].
+    /// customized. Stored raw; normalization happens in `actuator_where_to_look`.
     pub actuator_prefix: String,
     /// The effective `[actuator] sensitive` flag (default `false`). The `/jobs`
     /// and `/tasks` actuator endpoints are mounted ONLY when this is `true`
     /// (see `actuator_router_with_prefix`), so the dead-lettered-job and
     /// scheduled-task-failure alerts point at them only when they exist and fall
     /// back to an always-mounted endpoint otherwise (see
-    /// [`sensitive_gated_where_to_look`]).
+    /// `sensitive_gated_where_to_look`).
     pub actuator_sensitive: bool,
 }
 
@@ -670,6 +741,14 @@ impl Alerter {
         };
         let alert = Arc::new(alert);
         for channel in &self.inner.channels {
+            // Per-channel severity routing (issue #1630): a destination that
+            // does not accept this alert's severity is skipped, so an alert
+            // below a channel's threshold (e.g. a recovery to a critical-only
+            // chat channel) is never delivered to it. Defaults to accept-all,
+            // so every existing channel is unaffected.
+            if !channel.accepts_severity(alert.severity) {
+                continue;
+            }
             let channel = Arc::clone(channel);
             let alert = Arc::clone(&alert);
             handle.spawn(async move {
@@ -782,7 +861,9 @@ pub fn notify_scheduled_task_recovered(state: &AppState, task_name: &str) {
     // still the closest correlation available). A real fix needs shared
     // active-alert state (Postgres/Redis) or an unconditional correlated resolve,
     // both out of scope for #1610 (fleet-level alert aggregation is listed as a
-    // non-goal); tracked for the shared-alert-state follow-up (#1630).
+    // non-goal). The native PagerDuty/Slack/Discord transports (#1630) do not
+    // change this process-local behaviour; shared active-alert state remains a
+    // separate future follow-up.
     let alert = Alert::recovery(
         AlertCondition::ScheduledTaskFailure,
         format!("scheduled_task_failure:{task_name}"),
@@ -822,6 +903,13 @@ const fn default_eval_interval_secs() -> u64 {
     30
 }
 
+/// Default `PagerDuty` Events API v2 enqueue endpoint.
+///
+/// Override via `[alerts] pagerduty_url` (or `AUTUMN_ALERTS__PAGERDUTY_URL`) to
+/// target a PagerDuty-Events-compatible endpoint offered by another paging
+/// service.
+pub const PAGERDUTY_EVENTS_URL: &str = "https://events.pagerduty.com/v2/enqueue";
+
 /// `[alerts]` configuration.
 ///
 /// Providing **only** a destination (an operator [`email`](Self::email) and/or
@@ -855,6 +943,41 @@ pub struct AlertConfig {
     /// HMAC signing secret for the webhook destination. Prefer the
     /// `AUTUMN_ALERTS__WEBHOOK_SECRET` env var over committing it.
     pub webhook_secret: Option<String>,
+    /// `PagerDuty` Events API v2 routing (integration) key. When set
+    /// (non-empty), the `PagerDuty` channel is enabled and every alert is
+    /// delivered as an Events API v2 event correlated on the alert's stable
+    /// [`Alert::dedup_key`], so a repeating condition folds into a single
+    /// incident and an [`AlertEventKind::Resolve`] event auto-resolves it.
+    /// Prefer the `AUTUMN_ALERTS__PAGERDUTY_ROUTING_KEY` env var over committing
+    /// it.
+    pub pagerduty_routing_key: Option<String>,
+    /// Override for the `PagerDuty` Events API v2 enqueue endpoint. Defaults to
+    /// [`PAGERDUTY_EVENTS_URL`]; set this to target a PagerDuty-Events-compatible
+    /// endpoint offered by another paging service.
+    pub pagerduty_url: Option<String>,
+    /// Which severities the `PagerDuty` channel receives (default
+    /// [`AlertRouting::All`], so a `resolve` event reaches `PagerDuty` and the
+    /// incident auto-resolves).
+    #[serde(default)]
+    pub pagerduty_severities: AlertRouting,
+    /// Slack incoming-webhook URL. When set (non-empty, absolute `http(s)`), the
+    /// Slack channel posts a human-readable message for each alert. Prefer the
+    /// `AUTUMN_ALERTS__SLACK_WEBHOOK_URL` env var over committing it.
+    pub slack_webhook_url: Option<String>,
+    /// Which severities the Slack channel receives (default
+    /// [`AlertRouting::All`]).
+    #[serde(default)]
+    pub slack_severities: AlertRouting,
+    /// Discord webhook URL. Delivered via Discord's Slack-compatible endpoint
+    /// (append `/slack` to a Discord webhook URL), reusing the exact same
+    /// payload dialect as Slack. When set (non-empty, absolute `http(s)`), the
+    /// Discord channel posts a human-readable message for each alert. Prefer the
+    /// `AUTUMN_ALERTS__DISCORD_WEBHOOK_URL` env var over committing it.
+    pub discord_webhook_url: Option<String>,
+    /// Which severities the Discord channel receives (default
+    /// [`AlertRouting::All`]).
+    #[serde(default)]
+    pub discord_severities: AlertRouting,
     /// Set true to tell `autumn doctor` you register an alert channel in code via
     /// `AppBuilder::with_alert_channel`; suppresses the no-destination warning.
     /// The runtime installs code-registered channels regardless of this flag.
@@ -880,6 +1003,13 @@ impl Default for AlertConfig {
             email: None,
             webhook_url: None,
             webhook_secret: None,
+            pagerduty_routing_key: None,
+            pagerduty_url: None,
+            pagerduty_severities: AlertRouting::All,
+            slack_webhook_url: None,
+            slack_severities: AlertRouting::All,
+            discord_webhook_url: None,
+            discord_severities: AlertRouting::All,
             custom_channel: false,
             dedup_window_secs: default_dedup_window_secs(),
             health_grace_secs: default_health_grace_secs(),
@@ -891,14 +1021,17 @@ impl Default for AlertConfig {
 }
 
 impl AlertConfig {
-    /// Whether a delivery destination is configured (email and/or webhook URL).
+    /// Whether a delivery destination is configured — an email, a generic
+    /// webhook URL, or any native transport (`PagerDuty` routing key, Slack or
+    /// Discord webhook URL).
     #[must_use]
     pub fn has_destination(&self) -> bool {
-        self.email.as_ref().is_some_and(|s| !s.trim().is_empty())
-            || self
-                .webhook_url
-                .as_ref()
-                .is_some_and(|s| !s.trim().is_empty())
+        let set = |v: &Option<String>| v.as_ref().is_some_and(|s| !s.trim().is_empty());
+        set(&self.email)
+            || set(&self.webhook_url)
+            || set(&self.pagerduty_routing_key)
+            || set(&self.slack_webhook_url)
+            || set(&self.discord_webhook_url)
     }
 
     /// Whether alerts should actually be active (enabled + a destination).
@@ -1036,7 +1169,7 @@ impl AlertChannel for WebhookAlertChannel {
                 .post(&self.url)
                 .header("Content-Type", "application/json");
             if let Some(secret) = self.secret.as_ref() {
-                let timestamp = Utc::now().timestamp();
+                let timestamp = crate::time::ambient_now().timestamp();
                 let signing_payload = format!("{timestamp}.{body}");
                 let signature = crate::security::config::hmac_sha256_hex(
                     secret.as_bytes(),
@@ -1059,6 +1192,412 @@ impl AlertChannel for WebhookAlertChannel {
             }
         })
     }
+}
+
+// ── Native transports (issue #1630) ─────────────────────────────────────────
+
+/// Map an [`AlertSeverity`] onto the `PagerDuty` Events API v2 `severity`
+/// taxonomy (`critical` / `error` / `warning` / `info`). Autumn's built-in
+/// conditions are all operator-critical, so a firing alert maps to `critical`;
+/// a recovery is informational (`info`) — though a `resolve` event carries no
+/// `payload`, this keeps the mapping total.
+#[cfg(feature = "http-client")]
+const fn pagerduty_severity(severity: AlertSeverity) -> &'static str {
+    match severity {
+        AlertSeverity::Critical => "critical",
+        AlertSeverity::Recovery => "info",
+    }
+}
+
+/// Build the `PagerDuty` Events API v2 request body for `alert`, correlated on
+/// the alert's stable [`Alert::dedup_key`] with `routing_key`.
+///
+/// A [`AlertEventKind::Trigger`] produces a full `trigger` event (with the
+/// `payload` block `PagerDuty` requires); a [`AlertEventKind::Resolve`] produces a
+/// minimal `resolve` event (only `routing_key`, `event_action`, and `dedup_key`,
+/// per the Events API v2 contract) that auto-resolves the correlated incident.
+#[cfg(feature = "http-client")]
+#[must_use]
+pub fn pagerduty_event_payload(alert: &Alert, routing_key: &str) -> serde_json::Value {
+    // Reserved standard-field names Autumn writes into `custom_details` below.
+    // PagerDuty routing/correlation depends on these carrying the authoritative
+    // values, so a user detail keyed with one of these must NOT clobber it — nor
+    // be clobbered by it. Colliding user keys are preserved under `custom_<key>`.
+    const RESERVED: &[&str] = &["condition", "where_to_look", "detail"];
+    if alert.event == AlertEventKind::Resolve {
+        return serde_json::json!({
+            "routing_key": routing_key,
+            "event_action": "resolve",
+            "dedup_key": alert.dedup_key,
+        });
+    }
+    let mut custom = serde_json::Map::new();
+    let mut keys: Vec<&String> = alert.details.keys().collect();
+    keys.sort();
+    for k in keys {
+        if let Some(v) = alert.details.get(k) {
+            let key = if RESERVED.contains(&k.as_str()) {
+                format!("custom_{k}")
+            } else {
+                k.clone()
+            };
+            custom.insert(key, serde_json::Value::String(v.clone()));
+        }
+    }
+    custom.insert(
+        "condition".to_owned(),
+        serde_json::Value::String(alert.condition.as_str().to_owned()),
+    );
+    custom.insert(
+        "where_to_look".to_owned(),
+        serde_json::Value::String(alert.where_to_look.clone()),
+    );
+    if !alert.summary.is_empty() {
+        custom.insert(
+            "detail".to_owned(),
+            serde_json::Value::String(alert.summary.clone()),
+        );
+    }
+    serde_json::json!({
+        "routing_key": routing_key,
+        "event_action": "trigger",
+        "dedup_key": alert.dedup_key,
+        "payload": {
+            "summary": alert.title,
+            "source": alert.host,
+            "severity": pagerduty_severity(alert.severity),
+            "timestamp": alert.timestamp.to_rfc3339(),
+            "component": alert.condition.as_str(),
+            "custom_details": serde_json::Value::Object(custom),
+        },
+    })
+}
+
+/// `PagerDuty` Events API v2 alert channel (issue #1630).
+///
+/// POSTs each alert as an Events API v2 event correlated on the alert's stable
+/// [`Alert::dedup_key`], so a repeating condition folds into a single incident
+/// and a recovery emits a `resolve` event that auto-resolves it. Works against
+/// PagerDuty-Events-compatible endpoints offered by other paging services (set
+/// `[alerts] pagerduty_url`).
+///
+/// The endpoint URL is validated only for *shape* — an absolute `http(s)` URL —
+/// at config load and by `autumn doctor`'s `alert_transports` check. The
+/// outbound POST does NOT apply the
+/// [`http_client::Client`](crate::http_client::Client)'s SSRF deny-list /
+/// address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)). Alert
+/// URLs are treated as trusted operator configuration and are intentionally
+/// exempt so operators can page internal endpoints.
+#[cfg(feature = "http-client")]
+pub struct PagerDutyAlertChannel {
+    client: crate::http_client::Client,
+    url: String,
+    routing_key: String,
+    routing: AlertRouting,
+}
+
+#[cfg(feature = "http-client")]
+impl PagerDutyAlertChannel {
+    /// Create a `PagerDuty` channel posting to `url` (typically
+    /// [`PAGERDUTY_EVENTS_URL`]) with the Events API v2 `routing_key`, receiving
+    /// the severities `routing` accepts.
+    #[must_use]
+    pub fn new(
+        client: crate::http_client::Client,
+        url: impl Into<String>,
+        routing_key: impl Into<String>,
+        routing: AlertRouting,
+    ) -> Self {
+        Self {
+            client,
+            url: url.into(),
+            routing_key: routing_key.into(),
+            routing,
+        }
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl AlertChannel for PagerDutyAlertChannel {
+    fn name(&self) -> &'static str {
+        "pagerduty"
+    }
+
+    fn accepts_severity(&self, severity: AlertSeverity) -> bool {
+        self.routing.accepts(severity)
+    }
+
+    fn deliver<'a>(&'a self, alert: &'a Alert) -> AlertDeliveryFuture<'a> {
+        Box::pin(async move {
+            let payload = pagerduty_event_payload(alert, &self.routing_key);
+            let response = self
+                .client
+                .named(&self.url)
+                .post(&self.url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| AlertDeliveryError::new("pagerduty", e.to_string()))?;
+            // The Events API v2 returns 202 Accepted on success.
+            if response.is_success() {
+                Ok(())
+            } else {
+                Err(AlertDeliveryError::new(
+                    "pagerduty",
+                    format!("endpoint returned status {}", response.status()),
+                ))
+            }
+        })
+    }
+}
+
+/// Build the Slack/Discord-compatible message text for `alert`, carrying the
+/// operator-actionable fields (#1610): what failed, when, host/replica, and
+/// where to look next, plus any structured details.
+#[cfg(feature = "http-client")]
+fn slack_message_text(alert: &Alert) -> String {
+    use std::fmt::Write as _;
+    let (icon, label) = match alert.event {
+        AlertEventKind::Trigger => ("\u{1f534}", "ALERT"),
+        AlertEventKind::Resolve => ("\u{2705}", "RECOVERED"),
+    };
+    let mut body = format!("{icon} *[{label}] {}*\n", alert.title);
+    let _ = writeln!(body, "*When:* {}", alert.timestamp.to_rfc3339());
+    let _ = writeln!(body, "*Host/replica:* {}", alert.host);
+    let _ = writeln!(body, "*Condition:* {}", alert.condition.as_str());
+    let _ = writeln!(body, "*Where to look:* {}", alert.where_to_look);
+    if !alert.summary.is_empty() {
+        let _ = write!(body, "\n{}", alert.summary);
+    }
+    if !alert.details.is_empty() {
+        body.push_str("\n\n*Details:*");
+        let mut keys: Vec<&String> = alert.details.keys().collect();
+        keys.sort();
+        for k in keys {
+            if let Some(v) = alert.details.get(k) {
+                let _ = write!(body, "\n• {k}: {v}");
+            }
+        }
+    }
+    body
+}
+
+/// Build the Slack (and Discord Slack-compatible) webhook request body for
+/// `alert`. Both accept a top-level `text` field, so one payload dialect covers
+/// both chat tools.
+#[cfg(feature = "http-client")]
+#[must_use]
+pub fn slack_message_payload(alert: &Alert) -> serde_json::Value {
+    serde_json::json!({ "text": slack_message_text(alert) })
+}
+
+/// Slack / Discord chat alert channel (issue #1630).
+///
+/// POSTs a human-readable message to a Slack incoming-webhook URL, or to a
+/// Discord webhook's Slack-compatible endpoint (append `/slack`), using one
+/// payload dialect for both.
+///
+/// The webhook URL is validated only for *shape* — an absolute `https` URL — at
+/// config load and by `autumn doctor`'s `alert_transports` check. The outbound
+/// POST does NOT apply the
+/// [`http_client::Client`](crate::http_client::Client)'s SSRF deny-list /
+/// address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)). Alert
+/// URLs are treated as trusted operator configuration and are intentionally
+/// exempt so operators can alert to internal chat endpoints.
+#[cfg(feature = "http-client")]
+pub struct SlackAlertChannel {
+    client: crate::http_client::Client,
+    url: String,
+    name: &'static str,
+    routing: AlertRouting,
+}
+
+#[cfg(feature = "http-client")]
+impl SlackAlertChannel {
+    /// Create a Slack channel posting to the incoming-webhook `url`.
+    #[must_use]
+    pub fn slack(
+        client: crate::http_client::Client,
+        url: impl Into<String>,
+        routing: AlertRouting,
+    ) -> Self {
+        Self {
+            client,
+            url: url.into(),
+            name: "slack",
+            routing,
+        }
+    }
+
+    /// Create a Discord channel posting to a Discord webhook's Slack-compatible
+    /// endpoint (`.../slack`), reusing the Slack payload dialect.
+    #[must_use]
+    pub fn discord(
+        client: crate::http_client::Client,
+        url: impl Into<String>,
+        routing: AlertRouting,
+    ) -> Self {
+        Self {
+            client,
+            url: url.into(),
+            name: "discord",
+            routing,
+        }
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl AlertChannel for SlackAlertChannel {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn accepts_severity(&self, severity: AlertSeverity) -> bool {
+        self.routing.accepts(severity)
+    }
+
+    fn deliver<'a>(&'a self, alert: &'a Alert) -> AlertDeliveryFuture<'a> {
+        Box::pin(async move {
+            let payload = slack_message_payload(alert);
+            let response = self
+                .client
+                .named(&self.url)
+                .post(&self.url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| AlertDeliveryError::new(self.name, e.to_string()))?;
+            if response.is_success() {
+                Ok(())
+            } else {
+                Err(AlertDeliveryError::new(
+                    self.name,
+                    format!("endpoint returned status {}", response.status()),
+                ))
+            }
+        })
+    }
+}
+
+/// Build the native provider channels (`PagerDuty`, Slack, Discord) configured
+/// in `[alerts]` (issue #1630).
+///
+/// Skips any transport whose required config is missing or unusable (a blank
+/// routing key, or a non-absolute webhook URL that the HTTP client could never
+/// dispatch), with a dedicated `tracing::warn!` for each skip — mirroring the
+/// built-in webhook's skip-and-warn rigor so a transport that *looks* configured
+/// actually delivers.
+///
+/// Shared by [`install_from_config`] (runtime wiring) and the CLI `autumn alert
+/// test` command so both agree on exactly which transports are usable.
+///
+/// All outbound calls go through the passed `client`, but only the transport
+/// URL *shape* is validated (absolute `https` for Slack/Discord; absolute
+/// `http(s)` for `PagerDuty`) — at config load and by `autumn doctor`'s
+/// `alert_transports` check. Dispatch does NOT apply the client's SSRF deny-list
+/// / address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)); alert
+/// URLs are trusted operator configuration and are intentionally exempt so
+/// operators can alert to internal endpoints.
+#[cfg(feature = "http-client")]
+#[must_use]
+pub fn native_transport_channels(
+    config: &AlertConfig,
+    client: &crate::http_client::Client,
+) -> Vec<Arc<dyn AlertChannel>> {
+    let mut channels: Vec<Arc<dyn AlertChannel>> = Vec::new();
+
+    if let Some(routing_key) = config
+        .pagerduty_routing_key
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let url = config
+            .pagerduty_url
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(PAGERDUTY_EVENTS_URL);
+        if is_absolute_http_url(url) {
+            channels.push(Arc::new(PagerDutyAlertChannel::new(
+                client.clone(),
+                url.to_owned(),
+                routing_key.to_owned(),
+                config.pagerduty_severities,
+            )));
+        } else {
+            tracing::warn!(
+                pagerduty_url = url,
+                "alerts: the configured [alerts] pagerduty_url ({url}) is not an absolute \
+                 http(s) URL; no PagerDuty alerts will be delivered. Fix [alerts] pagerduty_url \
+                 (or the AUTUMN_ALERTS__PAGERDUTY_URL env var)."
+            );
+        }
+    }
+
+    push_chat_channel(
+        &mut channels,
+        client,
+        config.slack_webhook_url.as_deref(),
+        "slack",
+        config.slack_severities,
+    );
+    push_chat_channel(
+        &mut channels,
+        client,
+        config.discord_webhook_url.as_deref(),
+        "discord",
+        config.discord_severities,
+    );
+
+    channels
+}
+
+/// Register a Slack-compatible chat channel (`slack` or `discord`) from a
+/// configured webhook `url`, skipping (with a warning) a URL that is not an
+/// absolute `https` URL — Slack and Discord only expose `https` webhook
+/// endpoints, so a relative, malformed, or plaintext `http://` value would never
+/// deliver (mirrors `autumn doctor`'s `is_absolute_https_url_doctor`).
+#[cfg(feature = "http-client")]
+fn push_chat_channel(
+    channels: &mut Vec<Arc<dyn AlertChannel>>,
+    client: &crate::http_client::Client,
+    url: Option<&str>,
+    provider: &'static str,
+    routing: AlertRouting,
+) {
+    let Some(url) = url.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if !is_absolute_https_url(url) {
+        tracing::warn!(
+            provider,
+            webhook_url = url,
+            "alerts: the configured [alerts] {provider}_webhook_url ({url}) is not an absolute \
+             https URL; no {provider} alerts will be delivered ({provider} only exposes https \
+             webhook endpoints). Fix the URL (or the AUTUMN_ALERTS__{PROVIDER}_WEBHOOK_URL env \
+             var).",
+            PROVIDER = provider.to_uppercase(),
+        );
+        return;
+    }
+    let channel: Arc<dyn AlertChannel> = if provider == "discord" {
+        Arc::new(SlackAlertChannel::discord(
+            client.clone(),
+            url.to_owned(),
+            routing,
+        ))
+    } else {
+        Arc::new(SlackAlertChannel::slack(
+            client.clone(),
+            url.to_owned(),
+            routing,
+        ))
+    };
+    channels.push(channel);
 }
 
 // ── Wiring ──────────────────────────────────────────────────────────────────
@@ -1086,6 +1625,20 @@ fn is_absolute_http_url(url: &str) -> bool {
         .ok()
         .and_then(|parsed| parsed.host_str().map(|h| !h.is_empty()))
         .unwrap_or(false)
+}
+
+/// Whether `url` is a non-empty ABSOLUTE **`https`** URL with a host.
+///
+/// Stricter than [`is_absolute_http_url`]: it additionally requires the `https`
+/// scheme. Slack and Discord only expose `https` webhook endpoints, so a
+/// plaintext `http://` URL will never deliver (and would transmit insecurely) —
+/// the runtime must reject it just as `autumn doctor` does. Kept in lock-step
+/// with `autumn-cli`'s `is_absolute_https_url_doctor` (same rule) so doctor and
+/// the runtime agree on which Slack/Discord webhook URLs are usable and cannot
+/// drift.
+#[cfg(feature = "http-client")]
+fn is_absolute_https_url(url: &str) -> bool {
+    url.starts_with("https://") && is_absolute_http_url(url)
 }
 
 /// Whether `email` parses as the SAME lettre [`Mailbox`](lettre::message::Mailbox)
@@ -1168,7 +1721,8 @@ fn build_mail_alert_channel(
         );
         return None;
     }
-    let mail_cfg = state.config().mail;
+    let config = state.config_arc();
+    let mail_cfg = &config.mail;
     if mail_transport_requires_from(mail_cfg.transport)
         && mail_cfg
             .from
@@ -1186,6 +1740,53 @@ fn build_mail_alert_channel(
         mailer,
         email_trimmed.to_owned(),
     )))
+}
+
+/// Append the native provider channels (issue #1630, `PagerDuty` / Slack /
+/// Discord) to `channels`, built through [`native_transport_channels`] with the
+/// shared HTTP client.
+///
+/// Alert dispatch validates only the transport URL's *shape*; it does NOT apply
+/// the client's SSRF deny-list / address pinning (see
+/// [`native_transport_channels`]). Alert URLs are trusted operator
+/// configuration and are intentionally exempt so operators can alert to
+/// internal endpoints.
+///
+/// Compiled to a warn-only no-op when the `http-client` feature is off, so a
+/// PagerDuty/Slack/Discord-only config does not silently deliver nothing.
+fn push_native_transport_channels(
+    state: &AppState,
+    config: &AlertConfig,
+    channels: &mut Vec<Arc<dyn AlertChannel>>,
+) {
+    #[cfg(feature = "http-client")]
+    {
+        let client = crate::http_client::Client::from_state(state);
+        channels.extend(native_transport_channels(config, &client));
+    }
+    #[cfg(not(feature = "http-client"))]
+    {
+        let _ = (state, channels);
+        if config
+            .pagerduty_routing_key
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || config
+                .slack_webhook_url
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty())
+            || config
+                .discord_webhook_url
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty())
+        {
+            tracing::warn!(
+                "operator-alerts: a PagerDuty/Slack/Discord transport is configured but the \
+                 `http-client` feature is not enabled; no such alerts will be delivered. Enable \
+                 the `http-client` feature or use an email destination."
+            );
+        }
+    }
 }
 
 /// Install the operator alerter from `config` plus any builder channels.
@@ -1308,6 +1909,9 @@ pub fn install_from_config(
         );
     }
 
+    // Native provider transports (issue #1630): PagerDuty / Slack / Discord.
+    push_native_transport_channels(state, config, &mut channels);
+
     channels.extend(extra_channels);
 
     if channels.is_empty() {
@@ -1320,9 +1924,13 @@ pub fn install_from_config(
     // `sensitive` keeps the dead-lettered-job/scheduled-task alerts off the
     // `/jobs` and `/tasks` endpoints, which are mounted only when `sensitive =
     // true`. The full config is installed on `state` before this runs.
-    let actuator_cfg = state.config().actuator;
+    let app_config = state.config_arc();
+    let actuator_cfg = &app_config.actuator;
     let actuator_sensitive = actuator_cfg.sensitive;
-    let actuator_prefix = actuator_cfg.prefix;
+    // Owned: `AlerterSettings` outlives this handle — it is stored on the
+    // `Alerter` installed as a state extension — so the prefix has to be a
+    // `String` it owns. One field, not the whole config.
+    let actuator_prefix = actuator_cfg.prefix.clone();
     let settings = AlerterSettings::from_config(config, actuator_prefix, actuator_sensitive);
     let alerter = Alerter::new(channels, settings);
     state.insert_extension(alerter.clone());
@@ -1493,7 +2101,7 @@ async fn evaluate_health(
     down_since: &mut HashMap<String, DateTime<Utc>>,
 ) {
     let results = state.health_indicator_registry().run_all().await;
-    let now = Utc::now();
+    let now = crate::time::ambient_now();
     let grace = chrono::Duration::from_std(settings.health_grace)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
 
@@ -2256,5 +2864,343 @@ mod tests {
         assert_eq!(v["severity"], "critical");
         assert_eq!(v["event"], "trigger");
         assert_eq!(v["where_to_look"], "/actuator/jobs");
+    }
+
+    // ── Per-channel severity routing (#1630) ─────────────────────────────────
+
+    #[test]
+    fn alert_routing_accepts_matches_severity() {
+        // `All` receives both a firing alert and its recovery.
+        assert!(AlertRouting::All.accepts(AlertSeverity::Critical));
+        assert!(AlertRouting::All.accepts(AlertSeverity::Recovery));
+        // `Critical` receives only firing alerts; a recovery is NOT delivered.
+        assert!(AlertRouting::Critical.accepts(AlertSeverity::Critical));
+        assert!(!AlertRouting::Critical.accepts(AlertSeverity::Recovery));
+    }
+
+    #[test]
+    fn alert_routing_defaults_to_all() {
+        assert_eq!(AlertRouting::default(), AlertRouting::All);
+    }
+
+    #[test]
+    fn routing_deserializes_from_toml() {
+        #[derive(Deserialize)]
+        struct Holder {
+            r: AlertRouting,
+        }
+        let all: Holder = toml::from_str(r#"r = "all""#).expect("parse all");
+        assert_eq!(all.r, AlertRouting::All);
+        let crit: Holder = toml::from_str(r#"r = "critical""#).expect("parse critical");
+        assert_eq!(crit.r, AlertRouting::Critical);
+    }
+
+    #[test]
+    fn routing_from_str_matches_toml_spellings() {
+        // The env-override path parses via FromStr; it must accept exactly the
+        // same `all` / `critical` spellings the TOML/serde path does, and reject
+        // anything else (the env layer then logs+ignores, keeping the default).
+        assert_eq!("all".parse::<AlertRouting>(), Ok(AlertRouting::All));
+        assert_eq!(
+            "critical".parse::<AlertRouting>(),
+            Ok(AlertRouting::Critical)
+        );
+        assert!("warning".parse::<AlertRouting>().is_err());
+        assert!("All".parse::<AlertRouting>().is_err());
+        assert!("".parse::<AlertRouting>().is_err());
+    }
+
+    // ── Native transport payloads (#1630) ────────────────────────────────────
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn pagerduty_trigger_payload_is_events_v2_shaped() {
+        let alert = Alert::trigger(AlertCondition::DeadLetteredJob, "dead_lettered_job:emailer")
+            .title("Job 'emailer' was dead-lettered")
+            .summary("exhausted retries")
+            .detail("job", "emailer")
+            .build();
+        let v = pagerduty_event_payload(&alert, "R0UT1NGKEY");
+        assert_eq!(v["routing_key"], "R0UT1NGKEY");
+        assert_eq!(v["event_action"], "trigger");
+        // Stable dedup key correlates repeats into one incident.
+        assert_eq!(v["dedup_key"], "dead_lettered_job:emailer");
+        assert_eq!(v["payload"]["severity"], "critical");
+        assert_eq!(v["payload"]["source"], alert.host);
+        assert_eq!(v["payload"]["summary"], "Job 'emailer' was dead-lettered");
+        assert_eq!(v["payload"]["component"], "dead_lettered_job");
+        // Custom details carry the routing/where-to-look context.
+        assert_eq!(
+            v["payload"]["custom_details"]["condition"],
+            "dead_lettered_job"
+        );
+        assert_eq!(
+            v["payload"]["custom_details"]["where_to_look"],
+            "/actuator/jobs"
+        );
+        assert_eq!(v["payload"]["custom_details"]["job"], "emailer");
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn pagerduty_custom_details_preserves_user_key_colliding_with_reserved_field() {
+        // A user detail keyed with a RESERVED standard-field name (`condition`,
+        // `where_to_look`, `detail`) must not silently clobber — nor be clobbered
+        // by — the authoritative standard field. The standard field keeps its
+        // canonical name (PagerDuty routing/correlation depends on it); the user's
+        // value is preserved under a `custom_`-prefixed key.
+        let alert = Alert::trigger(AlertCondition::DeadLetteredJob, "dead_lettered_job:emailer")
+            .title("Job 'emailer' was dead-lettered")
+            .summary("exhausted retries")
+            .detail("condition", "user-supplied-condition")
+            .detail("where_to_look", "user-supplied-pointer")
+            .detail("detail", "user-supplied-detail")
+            .build();
+        let v = pagerduty_event_payload(&alert, "R0UT1NGKEY");
+        let cd = &v["payload"]["custom_details"];
+        // Standard fields stay authoritative under their canonical names.
+        assert_eq!(cd["condition"], "dead_lettered_job");
+        assert_eq!(cd["where_to_look"], "/actuator/jobs");
+        assert_eq!(cd["detail"], "exhausted retries");
+        // The colliding user values are preserved under `custom_<key>`.
+        assert_eq!(cd["custom_condition"], "user-supplied-condition");
+        assert_eq!(cd["custom_where_to_look"], "user-supplied-pointer");
+        assert_eq!(cd["custom_detail"], "user-supplied-detail");
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn pagerduty_resolve_payload_is_minimal_and_correlates() {
+        let alert = Alert::recovery(
+            AlertCondition::ScheduledTaskFailure,
+            "scheduled_task_failure:backup",
+        )
+        .title("Scheduled task 'backup' recovered")
+        .build();
+        let v = pagerduty_event_payload(&alert, "R0UT1NGKEY");
+        assert_eq!(v["event_action"], "resolve");
+        // Same dedup key as its trigger → the correlated incident auto-resolves.
+        assert_eq!(v["dedup_key"], "scheduled_task_failure:backup");
+        // A resolve carries no payload block per the Events API v2 contract.
+        assert!(v.get("payload").is_none(), "resolve must omit payload: {v}");
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn slack_payload_carries_required_operator_fields() {
+        let alert = Alert::trigger(AlertCondition::HighErrorRate, "high_error_rate:5xx:h1")
+            .title("5xx error rate is 12.0%")
+            .summary("60 of the last 500 requests returned 5xx")
+            .where_to_look("/actuator/metrics")
+            .detail("rate", "0.1200")
+            .build();
+        let v = slack_message_payload(&alert);
+        let text = v["text"].as_str().expect("text field");
+        // #1610 required fields: what failed, when, host/replica, where to look.
+        assert!(text.contains("5xx error rate is 12.0%"), "title: {text}");
+        assert!(text.contains(&alert.host), "host: {text}");
+        assert!(text.contains("/actuator/metrics"), "where_to_look: {text}");
+        assert!(
+            text.contains(&alert.timestamp.to_rfc3339()),
+            "timestamp: {text}"
+        );
+        assert!(text.contains("rate: 0.1200"), "details: {text}");
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn pagerduty_channel_accepts_severity_reflects_routing() {
+        let crit = PagerDutyAlertChannel::new(
+            crate::http_client::Client::new(),
+            PAGERDUTY_EVENTS_URL,
+            "k",
+            AlertRouting::Critical,
+        );
+        assert_eq!(crit.name(), "pagerduty");
+        assert!(crit.accepts_severity(AlertSeverity::Critical));
+        assert!(!crit.accepts_severity(AlertSeverity::Recovery));
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn slack_and_discord_channels_name_and_route() {
+        let slack = SlackAlertChannel::slack(
+            crate::http_client::Client::new(),
+            "https://hooks.slack.com/services/x",
+            AlertRouting::Critical,
+        );
+        assert_eq!(slack.name(), "slack");
+        assert!(!slack.accepts_severity(AlertSeverity::Recovery));
+        let discord = SlackAlertChannel::discord(
+            crate::http_client::Client::new(),
+            "https://discord.com/api/webhooks/x/y/slack",
+            AlertRouting::All,
+        );
+        assert_eq!(discord.name(), "discord");
+        assert!(discord.accepts_severity(AlertSeverity::Recovery));
+    }
+
+    // ── native_transport_channels construction / skips (#1630) ───────────────
+
+    #[cfg(feature = "http-client")]
+    fn channel_names(config: &AlertConfig) -> Vec<&'static str> {
+        let client = crate::http_client::Client::new();
+        native_transport_channels(config, &client)
+            .iter()
+            .map(|c| c.name())
+            .collect()
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn native_transports_build_all_three_when_configured() {
+        let config = AlertConfig {
+            pagerduty_routing_key: Some("R0UT1NGKEY".to_owned()),
+            slack_webhook_url: Some("https://hooks.slack.com/services/x".to_owned()),
+            discord_webhook_url: Some("https://discord.com/api/webhooks/x/y/slack".to_owned()),
+            ..AlertConfig::default()
+        };
+        let names = channel_names(&config);
+        assert!(names.contains(&"pagerduty"), "{names:?}");
+        assert!(names.contains(&"slack"), "{names:?}");
+        assert!(names.contains(&"discord"), "{names:?}");
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn native_transports_skip_blank_routing_key_and_relative_urls() {
+        let config = AlertConfig {
+            pagerduty_routing_key: Some("   ".to_owned()),
+            slack_webhook_url: Some("hooks.slack/x".to_owned()),
+            discord_webhook_url: Some("/relative".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert!(
+            channel_names(&config).is_empty(),
+            "a blank routing key and relative URLs must register no channel"
+        );
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn native_transports_skip_non_absolute_pagerduty_url() {
+        let config = AlertConfig {
+            pagerduty_routing_key: Some("R0UT1NGKEY".to_owned()),
+            pagerduty_url: Some("events.pagerduty.com/v2/enqueue".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert!(
+            channel_names(&config).is_empty(),
+            "a non-absolute pagerduty_url must skip the PagerDuty channel"
+        );
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn native_transports_reject_non_https_slack_and_discord() {
+        // Slack and Discord only expose https webhook endpoints, so a plaintext
+        // http:// URL will not deliver (and would transmit insecurely). The
+        // runtime must reject it — mirroring `autumn doctor` — and register no
+        // channel. Prevents a config doctor rejects from silently "passing" at
+        // runtime.
+        let slack = AlertConfig {
+            slack_webhook_url: Some("http://hooks.slack.com/services/x".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert!(
+            channel_names(&slack).is_empty(),
+            "a non-https slack_webhook_url must not register a Slack channel"
+        );
+        let discord = AlertConfig {
+            discord_webhook_url: Some("http://discord.com/api/webhooks/x/slack".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert!(
+            channel_names(&discord).is_empty(),
+            "a non-https discord_webhook_url must not register a Discord channel"
+        );
+        // An absolute https URL is still accepted.
+        let ok = AlertConfig {
+            slack_webhook_url: Some("https://hooks.slack.com/services/x".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert_eq!(channel_names(&ok), vec!["slack"]);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn has_destination_counts_native_transports() {
+        let pd = AlertConfig {
+            pagerduty_routing_key: Some("k".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert!(pd.has_destination() && pd.is_active());
+        let slack = AlertConfig {
+            slack_webhook_url: Some("https://hooks.slack.com/x".to_owned()),
+            ..AlertConfig::default()
+        };
+        assert!(slack.has_destination());
+        assert!(!AlertConfig::default().has_destination());
+    }
+
+    // ── Delivery through the mocked SSRF-hardened client (#1630) ──────────────
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn pagerduty_channel_delivers_trigger_to_events_endpoint() {
+        use crate::http_client::{Client, MockEntry, MockRegistry};
+        use std::sync::atomic::AtomicUsize;
+
+        let registry = Arc::new(MockRegistry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        registry.register(MockEntry {
+            method: Some(reqwest::Method::POST),
+            path: "/v2/enqueue".to_owned(),
+            alias: None,
+            status: 202,
+            body: Some(serde_json::json!({"status": "success"})),
+            call_count: calls.clone(),
+        });
+        let client = Client::new().with_mock(registry);
+        let channel = PagerDutyAlertChannel::new(
+            client,
+            PAGERDUTY_EVENTS_URL,
+            "R0UT1NGKEY",
+            AlertRouting::All,
+        );
+        let alert = Alert::trigger(AlertCondition::DeadLetteredJob, "dead_lettered_job:x")
+            .title("x failed")
+            .build();
+        channel.deliver(&alert).await.expect("delivered");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn slack_channel_reports_non_2xx_as_delivery_error() {
+        use crate::http_client::{Client, MockEntry, MockRegistry};
+        use std::sync::atomic::AtomicUsize;
+
+        let registry = Arc::new(MockRegistry::new());
+        registry.register(MockEntry {
+            method: Some(reqwest::Method::POST),
+            path: "/services/x".to_owned(),
+            alias: None,
+            status: 500,
+            body: None,
+            call_count: Arc::new(AtomicUsize::new(0)),
+        });
+        let client = Client::new().with_mock(registry);
+        let channel = SlackAlertChannel::slack(
+            client,
+            "https://hooks.slack.com/services/x",
+            AlertRouting::All,
+        );
+        let alert = Alert::trigger(AlertCondition::HighErrorRate, "high_error_rate:5xx").build();
+        let err = channel
+            .deliver(&alert)
+            .await
+            .expect_err("must error on 500");
+        assert_eq!(err.channel, "slack");
     }
 }

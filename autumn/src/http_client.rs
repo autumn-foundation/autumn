@@ -45,8 +45,17 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,6 +68,10 @@ use serde::de::DeserializeOwned;
 // ── Error ────────────────────────────────────────────────────────────────────
 
 /// Errors produced by [`Client`] and [`RequestBuilder`].
+///
+/// `#[non_exhaustive]`: match it with a `_` arm, so a new variant is not a
+/// breaking change.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// An underlying `reqwest` transport error.
@@ -73,6 +86,76 @@ pub enum ClientError {
     /// The outbound circuit breaker is open.
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
+    /// The capsule recorded a transport failure for this call, and replay
+    /// reproduced it (#1634).
+    ///
+    /// A recorded transport error cannot be rebuilt as a `reqwest::Error` — it
+    /// has no public constructor — but it must not be downgraded to a status
+    /// either: a handler whose bug is "we do not handle a connection reset"
+    /// has to meet the reset again.
+    ///
+    /// Its `Display` is the recorded text *exactly*, with no replay marker of
+    /// its own. A handler that propagates this error puts the text into the
+    /// capsule's outcome, and the replay verdict compares outcome messages
+    /// verbatim — so a marker here would report an unchanged failure as a
+    /// mismatch, which is the one thing the comparison exists to get right.
+    #[error("{0}")]
+    ReplayedRequestFailure(String),
+    /// Outbound HTTP is blocked because this process is replaying a failure
+    /// capsule (see the crate-internal `block_outbound_for_replay`).
+    #[error(
+        "outbound HTTP is not recorded in a failure capsule and is blocked during replay: {0} {1}"
+    )]
+    BlockedDuringReplay(String, String),
+    /// A resolved connection target (or redirect target) is a blocked
+    /// (private / link-local / loopback / reserved) IP address per the built-in
+    /// SSRF policy. See [`is_blocked_ip`].
+    #[error("SSRF policy blocked address: {0}")]
+    SsrfBlocked(String),
+    /// A redirect chain exceeded the configured maximum number of hops.
+    #[error("too many redirects (max {0})")]
+    TooManyRedirects(usize),
+    /// A redirect's absolute `Location` target was rejected by the caller's
+    /// validator (or by the built-in scheme-downgrade guard).
+    #[error("redirect rejected: {0}")]
+    RedirectRejected(String),
+    /// A URL could not be parsed, was missing a host, or DNS resolution failed
+    /// while composing a custom (redirect / pin / SSRF-safe) request.
+    #[error("invalid or unresolvable URL: {0}")]
+    InvalidUrl(String),
+    /// [`pin_to`](RequestBuilder::pin_to) was combined with
+    /// [`follow_redirects`](RequestBuilder::follow_redirects) — an incompatible
+    /// pair. A single pinned `SocketAddr` only covers the first hop; later
+    /// redirect hops re-resolve via normal DNS, so following a cross-host `3xx`
+    /// would silently escape the pin and defeat its purpose. Use
+    /// [`Client::get_ssrf_safe`] for pinned, per-hop-revalidated redirect
+    /// following; `pin_to` alone (returns the `3xx` unfollowed); or
+    /// `follow_redirects` without `pin_to`.
+    #[error("{0}")]
+    IncompatiblePinRedirect(&'static str),
+    /// [`pin_to`](RequestBuilder::pin_to) was used on a request whose URL host is
+    /// an IP literal. reqwest/hyper treat an IP-literal host as already-resolved
+    /// and never consult the DNS resolver, so the `resolve_to_addrs` override
+    /// that installs the pin is skipped and the socket connects to the literal in
+    /// the URL — not the pinned address — silently bypassing the pin. `pin_to`
+    /// therefore requires a domain (hostname) host; put the desired IP directly
+    /// in the URL, or use a domain host. (`get_ssrf_safe` never sets a pin: it
+    /// validates the literal and connects to that same IP, so it is unaffected.)
+    #[error("{0}")]
+    PinRequiresDomainHost(&'static str),
+    /// [`pin_to`](RequestBuilder::pin_to) was combined with
+    /// [`Client::get_ssrf_safe`] — an incompatible pair. The SSRF-safe path runs
+    /// its own per-hop resolve→validate→pin and never reads the caller's
+    /// `pin_to` address, so an explicit pin would be silently ignored. Use
+    /// `pin_to` alone for a caller-chosen fixed address, or `get_ssrf_safe`
+    /// alone for guarded automatic per-hop pinning — not both.
+    #[error("{0}")]
+    PinNotAllowedWithSsrfSafe(&'static str),
+    /// The simulated network ([`crate::sim::SimNet`], issue #2967) failed the
+    /// call: a drop, a partition, a timeout, a host it does not know, or a
+    /// request or response it could not build.
+    #[error("simulated network: {0}")]
+    SimNetwork(String),
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -81,6 +164,7 @@ pub enum ClientError {
 ///
 /// Body is consumed once — call exactly one of [`json`](Self::json),
 /// [`text`](Self::text), or [`bytes`](Self::bytes).
+#[derive(Debug)]
 pub struct Response {
     status: reqwest::StatusCode,
     headers: HeaderMap,
@@ -126,6 +210,255 @@ impl Response {
     pub fn bytes(self) -> Bytes {
         self.body
     }
+}
+
+// ── SSRF address policy ──────────────────────────────────────────────────────
+
+/// Return `true` when `ip` must **not** be connected to because it belongs to a
+/// private, loopback, link-local, CGNAT, benchmarking, documentation, multicast
+/// or otherwise reserved range.
+///
+/// This is the built-in Server-Side Request Forgery (SSRF) deny-list used by
+/// [`Client::get_ssrf_safe`]. Ranges are checked explicitly (rather than via the
+/// unstable `IpAddr::is_global` family) so the code compiles on stable Rust.
+///
+/// IPv6 addresses that embed an IPv4 via a transition mechanism — IPv4-mapped
+/// (`::ffff:a.b.c.d`), the deprecated IPv4-compatible (`::a.b.c.d`), NAT64
+/// (`64:ff9b::/96`), 6to4 (`2002::/16`), and the SIIT IPv4-translated prefix
+/// (`::ffff:0:0:0/96`) — are unwrapped and re-checked as IPv4, so encodings
+/// such as `::ffff:169.254.169.254`, `64:ff9b::a9fe:a9fe`, `2002:a9fe:a9fe::`,
+/// and `::ffff:0:169.254.169.254` are all correctly blocked.
+#[must_use]
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
+}
+
+/// Return `true` when `ip` is safe to connect to — the exact negation of
+/// [`is_blocked_ip`].
+#[must_use]
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    !is_blocked_ip(ip)
+}
+
+fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _d] = ip.octets();
+    // 0.0.0.0/8 (incl. unspecified)
+    if a == 0 {
+        return true;
+    }
+    // 10.0.0.0/8
+    if a == 10 {
+        return true;
+    }
+    // 100.64.0.0/10 (CGNAT)
+    if a == 100 && (64..=127).contains(&b) {
+        return true;
+    }
+    // 127.0.0.0/8 (loopback)
+    if a == 127 {
+        return true;
+    }
+    // 169.254.0.0/16 (link-local, incl. 169.254.169.254 cloud metadata)
+    if a == 169 && b == 254 {
+        return true;
+    }
+    // 172.16.0.0/12
+    if a == 172 && (16..=31).contains(&b) {
+        return true;
+    }
+    // 192.0.0.0/24 (IETF protocol assignments)
+    if a == 192 && b == 0 && c == 0 {
+        return true;
+    }
+    // 192.0.2.0/24 (TEST-NET-1)
+    if a == 192 && b == 0 && c == 2 {
+        return true;
+    }
+    // 192.88.99.0/24 (6to4 anycast relay, RFC 3068 / RFC 7526)
+    if a == 192 && b == 88 && c == 99 {
+        return true;
+    }
+    // 192.168.0.0/16
+    if a == 192 && b == 168 {
+        return true;
+    }
+    // 198.18.0.0/15 (benchmarking)
+    if a == 198 && (18..=19).contains(&b) {
+        return true;
+    }
+    // 198.51.100.0/24 (TEST-NET-2)
+    if a == 198 && b == 51 && c == 100 {
+        return true;
+    }
+    // 203.0.113.0/24 (TEST-NET-3)
+    if a == 203 && b == 0 && c == 113 {
+        return true;
+    }
+    // 224.0.0.0/4 (multicast) and 240.0.0.0/4 (reserved, incl. 255.255.255.255)
+    if a >= 224 {
+        return true;
+    }
+    false
+}
+
+/// Extract any IPv4 address embedded in an IPv6 address via a transition
+/// mechanism, so the IPv4 SSRF policy can be re-applied to it:
+///
+/// - IPv4-mapped `::ffff:a.b.c.d`
+/// - deprecated IPv4-compatible `::a.b.c.d`
+/// - NAT64 well-known prefix `64:ff9b::/96` (RFC 6052) — e.g.
+///   `64:ff9b::a9fe:a9fe` decodes to `169.254.169.254`
+/// - 6to4 `2002::/16` (RFC 3056) — e.g. `2002:a9fe:a9fe::` embeds
+///   `169.254.169.254`
+/// - SIIT "IPv4-translated" prefix `::ffff:0:0:0/96` (RFC 6052) — e.g.
+///   `::ffff:0:169.254.169.254` decodes to `169.254.169.254`. Note this is a
+///   DIFFERENT segment layout from IPv4-mapped `::ffff:0:0/96` (here
+///   `segments()[4] == 0xffff && segments()[5] == 0`, whereas IPv4-mapped has
+///   `segments()[5] == 0xffff`), so it is NOT caught by `to_ipv4_mapped()`.
+///
+/// Returns `None` for a genuinely-native IPv6 address (no embedded v4). Using
+/// `octets()` avoids any lossy `u16 -> u8` casts.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let segs = ip.segments();
+    // SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 6052): 64 zero bits, then
+    // 0xffff, then 16 zero bits, then the IPv4 in the last 32 bits. Distinct
+    // from IPv4-mapped `::ffff:0:0/96` (segment[5] == 0xffff) — here
+    // segment[4] == 0xffff and segment[5] == 0 — so `to_ipv4_mapped()` above
+    // does NOT catch it. Decode it so the embedded IPv4 is re-checked by the
+    // IPv4 policy (e.g. `::ffff:0:169.254.169.254` must be blocked).
+    if segs[0] == 0
+        && segs[1] == 0
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0xffff
+        && segs[5] == 0
+    {
+        let o = ip.octets();
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    let o = ip.octets();
+    // NAT64 64:ff9b::/96 — embedded IPv4 in the last 32 bits (octets 12..16),
+    // with octets 4..12 all zero.
+    if o[0] == 0x00
+        && o[1] == 0x64
+        && o[2] == 0xff
+        && o[3] == 0x9b
+        && o[4..12].iter().all(|&b| b == 0)
+    {
+        return Some(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    // 6to4 2002::/16 — embedded IPv4 in bits 16..48 (octets 2..6).
+    if o[0] == 0x20 && o[1] == 0x02 {
+        return Some(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    // Deprecated IPv4-compatible ::a.b.c.d (upper 96 bits zero).
+    ip.to_ipv4()
+}
+
+fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    // Block any private / loopback / link-local / metadata IPv4 that is
+    // tunnelled inside this v6 address (IPv4-mapped, IPv4-compatible, NAT64,
+    // 6to4, or SIIT IPv4-translated `::ffff:0:0:0/96`) by re-running the IPv4
+    // policy on the embedded address. A public
+    // embedded IPv4 (e.g. 6to4 `2002:0808:0808::` == 8.8.8.8) is NOT blocked
+    // here — it falls through to the native v6 range checks below.
+    if let Some(v4) = embedded_ipv4(ip)
+        && is_blocked_ipv4(v4)
+    {
+        return true;
+    }
+
+    let segs = ip.segments();
+    // RFC 8215 local-use NAT64 prefix `64:ff9b:1::/48`: deny the whole prefix
+    // outright. Unlike the well-known `64:ff9b::/96` (where a public embedded
+    // IPv4 like 8.8.8.8 is legitimately allowed), this is a private/site-local
+    // NAT64 allocation with no legitimate public destination, and the RFC 6052
+    // embedding position varies with prefix length — a blanket deny is both
+    // simpler and strictly safer (e.g. `64:ff9b:1::a9fe:a9fe` == 169.254.169.254).
+    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+        return true;
+    }
+    // :: (unspecified)
+    if ip == Ipv6Addr::UNSPECIFIED {
+        return true;
+    }
+    // ::1 (loopback)
+    if ip == Ipv6Addr::LOCALHOST {
+        return true;
+    }
+    // fc00::/7 (unique local address)
+    if segs[0] & 0xfe00 == 0xfc00 {
+        return true;
+    }
+    // fe80::/10 (link-local)
+    if segs[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // fec0::/10 (deprecated site-local — defence-in-depth)
+    if segs[0] & 0xffc0 == 0xfec0 {
+        return true;
+    }
+    // ff00::/8 (multicast)
+    if segs[0] & 0xff00 == 0xff00 {
+        return true;
+    }
+    // 2001:db8::/32 (documentation)
+    if segs[0] == 0x2001 && segs[1] == 0x0db8 {
+        return true;
+    }
+
+    // Remaining IANA IPv6 special-purpose prefixes with Globally Reachable =
+    // False. These are reserved / benchmarking / documentation / discard ranges
+    // that must never be dialled, matching the deny-list's reserved policy.
+    // Each check uses explicit masks so it cannot catch an adjacent *public*
+    // address (e.g. benchmarking 2001:2::/48 must not swallow Teredo 2001:0::/32
+    // where s[1] == 0, and documentation 2001:db8::/32 stays its own check).
+    //
+    //   Prefix               RFC        Purpose
+    //   100::/64             RFC 6666   Discard-Only address block
+    //   2001:2::/48          RFC 5180   Benchmarking
+    //   2001:10::/28         RFC 4843   ORCHID (deprecated)
+    //   2001:20::/28         RFC 7343   ORCHIDv2
+    //   3fff::/20            RFC 9637   Documentation
+    //   5f00::/16            RFC 9602   Segment Routing (SRv6) SIDs
+    //   2620:4f:8000::/48    RFC 7534   Direct Delegation AS112 service
+    let s = segs;
+    // 100::/64 (Discard-Only, RFC 6666)
+    if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
+        return true;
+    }
+    // 2001:2::/48 (Benchmarking, RFC 5180)
+    if s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0x0000 {
+        return true;
+    }
+    // 2001:10::/28 (ORCHID, deprecated RFC 4843)
+    if s[0] == 0x2001 && (s[1] & 0xFFF0) == 0x0010 {
+        return true;
+    }
+    // 2001:20::/28 (ORCHIDv2, RFC 7343)
+    if s[0] == 0x2001 && (s[1] & 0xFFF0) == 0x0020 {
+        return true;
+    }
+    // 3fff::/20 (Documentation, RFC 9637)
+    if s[0] == 0x3fff && (s[1] & 0xF000) == 0x0000 {
+        return true;
+    }
+    // 5f00::/16 (SRv6 SIDs, RFC 9602)
+    if s[0] == 0x5f00 {
+        return true;
+    }
+    // 2620:4f:8000::/48 (Direct Delegation AS112, RFC 7534)
+    if s[0] == 0x2620 && s[1] == 0x004f && s[2] == 0x8000 {
+        return true;
+    }
+
+    false
 }
 
 // ── RetryPolicy ──────────────────────────────────────────────────────────────
@@ -264,6 +597,339 @@ impl Default for MockRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Set while this process is replaying a failure capsule, blocking every
+/// outbound request (see [`block_outbound_for_replay`]).
+static OUTBOUND_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Fail every outbound HTTP request from now on.
+///
+/// Called by the capsule replay one-shot
+/// ([`AppBuilder::run`](crate::app::AppBuilder::run) under
+/// `AUTUMN_REPLAY_CAPSULE`), which rebuilds the real application — including
+/// its real `reqwest` client — and must not let it reach anything the capsule
+/// did not record. There is deliberately no way to unset it: a process that has
+/// started replaying a capsule never goes back to serving traffic.
+pub(crate) fn block_outbound_for_replay() {
+    OUTBOUND_BLOCKED.store(true, Ordering::SeqCst);
+}
+
+/// Whether outbound HTTP is blocked for capsule replay.
+#[must_use]
+pub(crate) fn outbound_blocked_for_replay() -> bool {
+    OUTBOUND_BLOCKED.load(Ordering::SeqCst)
+}
+
+// ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
+//
+// The whole seam is behind the `reporting` feature, which is what gates the
+// `capsule` module. `OutboundRecorder` has a no-op twin below so `send` reads
+// the same on either build.
+
+/// The headers the *caller* set, in the order they were set.
+///
+/// One definition for both halves of the seam: the recorder stores this, and
+/// replay compares against it. Headers the client adds later — the injected
+/// W3C trace context, and any default the underlying `reqwest::Client` was
+/// built with — are deliberately outside it, so a client-side default can
+/// never be read as the handler changing its request.
+#[cfg(feature = "reporting")]
+fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
+    builder
+        .extra_headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Serve one outbound call from a capsule's effect tape.
+///
+/// Which [`HttpErrorKind`] a failure is, so replay can rebuild the variant and
+/// not merely quote the text.
+#[cfg(feature = "reporting")]
+const fn http_error_kind(error: &ClientError) -> crate::capsule::schema::HttpErrorKind {
+    use crate::capsule::schema::HttpErrorKind as Kind;
+    match error {
+        ClientError::Json(_) => Kind::Json,
+        ClientError::NoMock(..) => Kind::NoMock,
+        ClientError::CircuitBreakerOpen => Kind::CircuitBreakerOpen,
+        ClientError::SsrfBlocked(_) => Kind::SsrfBlocked,
+        ClientError::TooManyRedirects(_) => Kind::TooManyRedirects,
+        ClientError::RedirectRejected(_) => Kind::RedirectRejected,
+        ClientError::InvalidUrl(_) => Kind::InvalidUrl,
+        // Everything else — a `reqwest` transport error, and the replay-only
+        // variants a recorded run cannot have produced — keeps its text alone.
+        _ => Kind::Transport,
+    }
+}
+
+/// Rebuild the error a recorded call produced, as the handler observed it.
+///
+/// Variants whose payload survives in the recording are rebuilt exactly, so
+/// code that branches on them takes the branch it took in production. The rest
+/// come back as [`ClientError::ReplayedRequestFailure`], whose `Display` is the
+/// recorded text verbatim — the closest an unreconstructible foreign error can
+/// be brought.
+#[cfg(feature = "reporting")]
+fn rebuild_client_error(
+    kind: Option<crate::capsule::schema::HttpErrorKind>,
+    text: String,
+) -> ClientError {
+    use crate::capsule::schema::HttpErrorKind as Kind;
+    match kind {
+        Some(Kind::CircuitBreakerOpen) => ClientError::CircuitBreakerOpen,
+        Some(Kind::SsrfBlocked) => {
+            ClientError::SsrfBlocked(strip_prefix_payload(&text, "SSRF policy blocked address: "))
+        }
+        Some(Kind::RedirectRejected) => {
+            ClientError::RedirectRejected(strip_prefix_payload(&text, "redirect rejected: "))
+        }
+        Some(Kind::InvalidUrl) => {
+            ClientError::InvalidUrl(strip_prefix_payload(&text, "invalid or unresolvable URL: "))
+        }
+        Some(Kind::TooManyRedirects) => text
+            .trim_end_matches(')')
+            .rsplit_once("(max ")
+            .and_then(|(_, hops)| hops.parse().ok())
+            .map_or_else(
+                || ClientError::ReplayedRequestFailure(text.clone()),
+                ClientError::TooManyRedirects,
+            ),
+        // `NoMock` carries the method and URL, which the effect already holds;
+        // it is a test-harness error a recorded production run cannot produce,
+        // so it is not worth rebuilding structurally.
+        Some(Kind::Json | Kind::NoMock | Kind::Transport) | None => {
+            ClientError::ReplayedRequestFailure(text)
+        }
+    }
+}
+
+/// The payload of a single-field error, recovered from its recorded `Display`.
+///
+/// The prefixes are this module's own `#[error(...)]` strings, so they cannot
+/// drift without this file changing; a recording that does not carry one is
+/// handed back whole rather than silently truncated.
+#[cfg(feature = "reporting")]
+fn strip_prefix_payload(text: &str, prefix: &str) -> String {
+    text.strip_prefix(prefix).unwrap_or(text).to_owned()
+}
+
+/// A recorded transport failure is reproduced as one, not as a status: a
+/// handler whose bug is "we do not handle a connection reset" must meet the
+/// reset again.
+#[cfg(feature = "reporting")]
+fn replayed_response(
+    tape: &crate::capsule::effects::ReplayEffects,
+    request: &crate::capsule::effects::OutboundRequest<'_>,
+) -> Result<Response, ClientError> {
+    let Some(recorded) = tape.next_http(request) else {
+        // `next_http` already logged the divergence; the call fails closed.
+        return Err(ClientError::BlockedDuringReplay(
+            request.method.to_owned(),
+            request.url.to_owned(),
+        ));
+    };
+    if let Some(error) = recorded.error {
+        return Err(rebuild_client_error(recorded.error_kind, error));
+    }
+    let mut headers = HeaderMap::new();
+    for (name, value) in &recorded.response_headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    Ok(Response {
+        status: reqwest::StatusCode::from_u16(recorded.status)
+            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        headers,
+        body: Bytes::from(crate::capsule::effects::body_bytes(&recorded.response_body)),
+        // The recorded final location when redirects moved it, so a handler
+        // inspecting `Response::url()` sees what it saw live.
+        url: recorded
+            .final_url
+            .as_deref()
+            .or(Some(request.url))
+            .and_then(|url| url::Url::parse(url).ok()),
+    })
+}
+
+/// Tees one outbound exchange into the in-flight request's capsule.
+///
+/// Armed before the send so the request half is captured even when the call
+/// never produces a response, and disarmed to a no-op whenever no capture
+/// scope is active — which is every request in an application that has not
+/// turned `[failure_capture]` on, so the cost on the ordinary path is one
+/// task-local probe.
+#[cfg(feature = "reporting")]
+struct OutboundRecorder {
+    scope: Option<Arc<crate::capsule::CaptureScope>>,
+    /// Tape position, taken when the call *starts*. Two calls a handler
+    /// `join!`s therefore land in initiation order rather than completion
+    /// order — which is the order replay consumes them in.
+    slot: Option<usize>,
+    /// Cached from the scope's settings so `finish` need not re-read them.
+    max_body_bytes: usize,
+    method: String,
+    url: String,
+    request_headers: Vec<(String, String)>,
+    request_body: crate::capsule::CapsuleBody,
+}
+
+#[cfg(feature = "reporting")]
+impl OutboundRecorder {
+    /// Snapshot the request half, if a capsule is being recorded.
+    ///
+    /// Records the headers the *caller* set. Headers the client adds later —
+    /// the injected W3C trace context, and any default the underlying
+    /// `reqwest::Client` was built with — are not on the tape, because replay
+    /// matches on method and URL and does not need them; the recorded request
+    /// half is a debugging aid, not the match key.
+    fn arm(builder: &RequestBuilder) -> Self {
+        let scope = crate::capsule::current_scope();
+        let Some(scope) = scope else {
+            return Self {
+                scope: None,
+                slot: None,
+                max_body_bytes: 0,
+                method: String::new(),
+                url: String::new(),
+                request_headers: Vec::new(),
+                request_body: crate::capsule::CapsuleBody::Absent,
+            };
+        };
+        let max_body_bytes = scope.settings().max_body_bytes;
+        let slot = scope.reserve_http();
+        let request_headers = caller_headers(builder);
+        Self {
+            scope: Some(scope),
+            slot,
+            max_body_bytes,
+            method: builder.method.to_string(),
+            url: builder.url.clone(),
+            request_headers,
+            request_body: builder
+                .body
+                .as_ref()
+                .map_or(crate::capsule::CapsuleBody::Absent, |body| {
+                    encode_body(body, max_body_bytes)
+                }),
+        }
+    }
+
+    /// Complete the reserved slot with the finished exchange.
+    fn finish(self, result: &Result<Response, ClientError>) {
+        let (Some(scope), Some(slot)) = (self.scope, self.slot) else {
+            return;
+        };
+        let (status, response_headers, response_body, error, final_url) = match result {
+            Ok(response) => (
+                response.status.as_u16(),
+                response
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        // A header value is bytes, not text. Replacing an
+                        // opaque non-UTF-8 value with an empty string would
+                        // hand replay a header the peer never sent, and code
+                        // reading it through `as_bytes()` would branch on
+                        // nothing; the lossy form at least preserves its shape
+                        // and length rather than deleting it.
+                        (
+                            name.as_str().to_owned(),
+                            value.to_str().map_or_else(
+                                |_| String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                ToOwned::to_owned,
+                            ),
+                        )
+                    })
+                    .collect(),
+                encode_body(&response.body, self.max_body_bytes),
+                None,
+                response
+                    .url()
+                    .map(reqwest::Url::as_str)
+                    .filter(|final_url| *final_url != self.url)
+                    .map(ToOwned::to_owned),
+            ),
+            Err(error) => (
+                0,
+                Vec::new(),
+                crate::capsule::CapsuleBody::Absent,
+                Some((error.to_string(), http_error_kind(error))),
+                None,
+            ),
+        };
+        let (error, error_kind) = match error {
+            Some((text, kind)) => (Some(text), Some(kind)),
+            None => (None, None),
+        };
+        scope.fill_http(
+            slot,
+            crate::capsule::HttpEffect {
+                method: self.method,
+                url: self.url,
+                request_headers: self.request_headers,
+                request_body: self.request_body,
+                status,
+                response_headers,
+                final_url,
+                response_body,
+                error,
+                error_kind,
+            },
+        );
+    }
+}
+
+/// Record a body as capsule text when it is UTF-8, base64 otherwise.
+///
+/// Text is what makes a capsule diffable and what lets redaction parse a JSON
+/// payload by key; base64 is the honest fallback for a protobuf or an image.
+#[cfg(feature = "reporting")]
+fn encode_body(bytes: &Bytes, max_body_bytes: usize) -> crate::capsule::CapsuleBody {
+    if bytes.is_empty() {
+        return crate::capsule::CapsuleBody::Absent;
+    }
+    // Checked *before* the copy, not after: a 50 MB download must not be
+    // duplicated into a `String` (or grown by a third into base64) only to be
+    // thrown away by the capsule's body cap a moment later.
+    if bytes.len() > max_body_bytes {
+        return crate::capsule::CapsuleBody::Skipped {
+            declared_len: Some(bytes.len()),
+        };
+    }
+    std::str::from_utf8(bytes).map_or_else(
+        |_| {
+            use base64::Engine as _;
+            crate::capsule::CapsuleBody::Base64(
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            )
+        },
+        |text| crate::capsule::CapsuleBody::Text(text.to_owned()),
+    )
+}
+
+/// No capsule support compiled in: the recorder is an empty value the
+/// optimizer removes.
+#[cfg(not(feature = "reporting"))]
+struct OutboundRecorder;
+
+#[cfg(not(feature = "reporting"))]
+impl OutboundRecorder {
+    const fn arm(_builder: &RequestBuilder) -> Self {
+        Self
+    }
+
+    const fn finish(self, _result: &Result<Response, ClientError>) {}
 }
 
 /// Newtype stored in [`AppState`](crate::AppState) extensions so the
@@ -475,6 +1141,9 @@ pub struct Client {
     mock: Option<Arc<MockRegistry>>,
     /// Resilience configuration for circuit breakers.
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    /// When present (a sim with a `SimNet`), calls go through the simulated
+    /// network instead of the real one.
+    sim_net: Option<Arc<crate::sim::SimNet>>,
 }
 
 impl Client {
@@ -510,6 +1179,7 @@ impl Client {
             },
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -550,6 +1220,7 @@ impl Client {
             },
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -565,6 +1236,7 @@ impl Client {
             retry_policy: RetryPolicy::default(),
             mock: None,
             resilience_config: None,
+            sim_net: None,
         }
     }
 
@@ -631,6 +1303,7 @@ impl Client {
         if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
             client = client.with_mock(ext.0.clone());
         }
+        client.sim_net = state.extension::<crate::sim::SimNet>();
 
         client
     }
@@ -656,6 +1329,7 @@ impl Client {
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -670,6 +1344,7 @@ impl Client {
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -698,6 +1373,12 @@ impl Client {
             alias: self.alias.clone(),
             pending_error: None,
             resilience_config: self.resilience_config.clone(),
+            redirect_mode: RedirectMode::Default,
+            pin_addr: None,
+            ssrf_safe: false,
+            discard_response_body: false,
+            breaker_scoped: false,
+            sim_net: self.sim_net.clone(),
         }
     }
 
@@ -732,6 +1413,56 @@ impl Client {
     pub fn head(&self, url: impl AsRef<str>) -> RequestBuilder {
         self.build_request(Method::HEAD, url)
     }
+
+    /// Build an SSRF-safe `GET` request.
+    ///
+    /// This is the composed safe path for fetching **untrusted** URLs. Before
+    /// connecting it resolves the host **once**, validates every resolved IP
+    /// against the built-in SSRF deny-list ([`is_blocked_ip`]) and rejects the
+    /// request if *any* address is blocked. The connection is then pinned to the
+    /// full set of validated addresses so reqwest cannot re-resolve the host
+    /// (closing the DNS-rebinding / TOCTOU window) yet can still fall back across
+    /// them in order if the first is unreachable. Redirects are followed manually up to
+    /// `SSRF_SAFE_MAX_REDIRECTS` hops, re-running resolve→validate→pin on each
+    /// hop; a hop that downgrades the scheme from `https` to `http` is rejected
+    /// as defence-in-depth.
+    ///
+    /// The redirect count and per-hop validation honour a chained builder
+    /// override (the built-in resolve→validate→pin and scheme-downgrade guards
+    /// always apply):
+    ///
+    /// - by default, up to `SSRF_SAFE_MAX_REDIRECTS` hops are followed;
+    /// - a chained [`no_redirect`](RequestBuilder::no_redirect) returns the
+    ///   initial `3xx` verbatim — the initial URL is still resolved, validated
+    ///   and pinned, but no redirect is followed;
+    /// - a chained [`follow_redirects(max, validator)`](RequestBuilder::follow_redirects)
+    ///   caps following at `max` hops (so `max == 0` turns the first `3xx` into
+    ///   [`ClientError::TooManyRedirects`]) and additionally runs the caller's
+    ///   `validator(&next)` on every hop, on top of the built-in guards.
+    ///
+    /// Like the test-mock path, this custom send path bypasses the process-wide
+    /// circuit-breaker registry to avoid entangling per-URL SSRF fetches with
+    /// the shared per-host breaker state.
+    ///
+    /// **Env proxies are bypassed.** Each pinned per-hop client is built with
+    /// `.no_proxy()`, so `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` are ignored
+    /// and the socket connects directly to the validated/pinned address. This is
+    /// required for the pin to hold: reqwest checks proxy interception before the
+    /// connector where the `resolve()` override applies, so a configured proxy
+    /// would otherwise receive the request and re-resolve the host — reopening
+    /// the DNS-rebinding / SSRF window this API closes.
+    ///
+    /// **Cannot be combined with [`pin_to`](RequestBuilder::pin_to).** This path
+    /// performs its own per-hop resolve→validate→pin and never reads the
+    /// `pin_to` address, so an explicit pin would be silently ignored. Chaining
+    /// the two is therefore rejected at send time with
+    /// [`ClientError::PinNotAllowedWithSsrfSafe`]. Use `pin_to` alone for a
+    /// caller-chosen fixed address, or `get_ssrf_safe` alone for guarded
+    /// automatic per-hop pinning.
+    #[must_use]
+    pub fn get_ssrf_safe(&self, url: impl Into<String>) -> RequestBuilder {
+        self.build_request(Method::GET, url.into()).ssrf_safe()
+    }
 }
 
 impl Default for Client {
@@ -753,6 +1484,30 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
 
 // ── RequestBuilder ───────────────────────────────────────────────────────────
 
+/// Type alias for a redirect-`Location` validator.
+type RedirectValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Per-request redirect handling.
+///
+/// `Default` preserves the historical behaviour exactly (the shared-client fast
+/// path with reqwest's built-in auto-follow). `None` and `Follow` route the
+/// request through the custom one-shot-client send path.
+enum RedirectMode {
+    /// Historical behaviour: shared client, reqwest auto-follows up to 10 hops.
+    Default,
+    /// Never follow: a 3xx is returned to the caller verbatim.
+    None,
+    /// Follow up to `max` hops, calling `validator` on each absolute target
+    /// before following it.
+    Follow {
+        max: usize,
+        validator: RedirectValidator,
+    },
+}
+
+/// Default hop cap for the composed [`Client::get_ssrf_safe`] safe path.
+const SSRF_SAFE_MAX_REDIRECTS: usize = 5;
+
 /// Fluent outbound request builder produced by [`Client`] methods.
 pub struct RequestBuilder {
     client: reqwest::Client,
@@ -768,6 +1523,23 @@ pub struct RequestBuilder {
     pending_error: Option<ClientError>,
     /// Resilience configuration for circuit breakers.
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    /// Per-request redirect handling (see [`RedirectMode`]).
+    redirect_mode: RedirectMode,
+    /// When set, connect directly to this socket, skipping DNS resolution while
+    /// preserving the original `Host` header + SNI. See [`RequestBuilder::pin_to`].
+    pin_addr: Option<SocketAddr>,
+    /// When `true`, use the composed SSRF-safe send path (resolve→validate→pin
+    /// with per-hop redirect validation). Set by [`Client::get_ssrf_safe`].
+    ssrf_safe: bool,
+    /// When `true`, the response body is dropped unread. See
+    /// [`RequestBuilder::discard_response_body`].
+    discard_response_body: bool,
+    /// When `true`, `send_recorded` keeps circuit-breaker accounting even on
+    /// the custom send path (`needs_custom_path()`). See
+    /// [`RequestBuilder::breaker_scoped`].
+    breaker_scoped: bool,
+    /// The simulated network, when the client came from a sim app state.
+    sim_net: Option<Arc<crate::sim::SimNet>>,
 }
 
 impl RequestBuilder {
@@ -822,6 +1594,18 @@ impl RequestBuilder {
         self
     }
 
+    /// Set a raw byte body, without assuming any content type.
+    ///
+    /// Use this for binary payloads — [`text_body`](Self::text_body) takes a
+    /// `String` and so cannot carry bytes that are not valid UTF-8. Set the
+    /// content type yourself with [`header`](Self::header). The Web Push
+    /// transport uses this for RFC 8291-encrypted bodies.
+    #[must_use]
+    pub fn bytes_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = Some(body.into());
+        self
+    }
+
     /// Override the maximum retry count for this request.
     ///
     /// Also clears the idempotent-only flag so non-idempotent methods such as
@@ -847,6 +1631,183 @@ impl RequestBuilder {
         self
     }
 
+    /// Disable redirect following for this request.
+    ///
+    /// A `3xx` response is returned to the caller verbatim (status, headers and
+    /// body) rather than being followed. Routes the request through the custom
+    /// one-shot-client send path, which bypasses the process-wide circuit
+    /// breaker.
+    #[must_use]
+    pub fn no_redirect(mut self) -> Self {
+        self.redirect_mode = RedirectMode::None;
+        self
+    }
+
+    /// Return the status and headers without reading the response body.
+    ///
+    /// Every other path collects the whole body into memory with no ceiling,
+    /// which is the right default for an API call whose payload the caller
+    /// wants. It is the wrong default when the *remote host* is untrusted and
+    /// the caller needs only the status: a server that streams indefinitely
+    /// then costs one unbounded allocation per request until the timeout
+    /// fires.
+    ///
+    /// Web Push is exactly that shape — the endpoint URL is chosen by the
+    /// client, and the transport only ever reads the status code — so it sets
+    /// this. [`Response::bytes`] then returns empty; dropping the underlying
+    /// response closes the connection without draining it.
+    #[must_use]
+    pub const fn discard_response_body(mut self) -> Self {
+        self.discard_response_body = true;
+        self
+    }
+
+    /// Follow up to `max` redirects, validating each hop before following it.
+    ///
+    /// Before following a `3xx`, the `Location` header is resolved to an
+    /// absolute URL (relative locations are joined against the current URL) and
+    /// `validator(&absolute_location)` is called. If it returns `false` the
+    /// request fails with [`ClientError::RedirectRejected`]. If the chain would
+    /// exceed `max` hops the request fails with
+    /// [`ClientError::TooManyRedirects`] (so `max == 0` turns the first `3xx`
+    /// into an error). Routes the request through the custom one-shot-client
+    /// send path, which bypasses the process-wide circuit breaker.
+    ///
+    /// **TOCTOU / rebinding limitation.** The `validator` receives the redirect
+    /// target as a *string* (not a resolved IP), and the subsequent connection
+    /// re-resolves that host via normal DNS. So a validator that inspects IP
+    /// literals sees only literal hosts, has a connect-time TOCTOU window
+    /// against a hostname that re-resolves between check and connect, and
+    /// provides no address pinning. When you need pinned, rebind-safe following
+    /// that validates every resolved IP and pins the connection per hop, use
+    /// [`Client::get_ssrf_safe`] instead.
+    #[must_use]
+    pub fn follow_redirects<F>(mut self, max: usize, validator: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.redirect_mode = RedirectMode::Follow {
+            max,
+            validator: Arc::new(validator),
+        };
+        self
+    }
+
+    /// Pin the connection to `addr`, skipping DNS resolution.
+    ///
+    /// The original `Host` header and TLS SNI are preserved; only the
+    /// address the socket connects to is overridden. This protects against
+    /// DNS-rebinding / TOCTOU attacks where a hostname re-resolves to a
+    /// different (private) address between validation and connection.
+    ///
+    /// **Requires a domain (hostname) URL host.** The pin is enforced via a DNS
+    /// `resolve` override, but reqwest/hyper treat an IP-literal URL host as
+    /// already-resolved and never consult the resolver — so the override is
+    /// skipped and the socket would connect to the literal in the URL, not the
+    /// pinned address. A `pin_to` request whose URL host is an IP literal
+    /// (IPv4 or IPv6) is therefore **rejected at send time** with
+    /// [`ClientError::PinRequiresDomainHost`]. Put the desired IP directly in the
+    /// URL (no pin needed), or use a domain host.
+    ///
+    /// **Pinning applies to the initial connection only.** Redirects are **not**
+    /// followed under `pin_to`: a `3xx` is returned to the caller verbatim (as if
+    /// [`no_redirect`](Self::no_redirect) were set) rather than being
+    /// auto-followed to a possibly-different host that would be re-resolved via
+    /// normal DNS, silently escaping the pin. If you need pinned, rebind-safe
+    /// per-hop following, use [`Client::get_ssrf_safe`] instead.
+    ///
+    /// **Cannot be combined with [`follow_redirects`](Self::follow_redirects).**
+    /// Because the pin only covers the first hop while later hops would re-resolve
+    /// via DNS, chaining `pin_to` with `follow_redirects` (in either order) is
+    /// rejected at send time with [`ClientError::IncompatiblePinRedirect`] rather
+    /// than silently following a redirect off the pinned address. Use
+    /// [`Client::get_ssrf_safe`] for pinned, per-hop-revalidated redirect
+    /// following, `pin_to` alone (which returns the `3xx` unfollowed), or
+    /// `follow_redirects` without `pin_to`.
+    ///
+    /// Implemented via a one-shot `reqwest::ClientBuilder::resolve(host, addr)`
+    /// scoped to this request. Note that reqwest ignores the **port** in the
+    /// resolve override and connects to the port from the request URL, so
+    /// `addr.port()` is only honoured when it matches the URL's port (which it
+    /// does for addresses obtained by resolving that same URL). Routes the
+    /// request through the custom one-shot-client send path, which bypasses the
+    /// process-wide circuit breaker.
+    ///
+    /// **Env proxies are bypassed.** The pinned client is built with
+    /// `.no_proxy()`, so `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` are ignored
+    /// and the socket connects directly to `addr`. This is required for the pin
+    /// to hold: reqwest checks proxy interception before the connector where the
+    /// `resolve()` override applies, so a configured proxy would otherwise
+    /// receive the request and re-resolve the host — defeating the pin.
+    #[must_use]
+    pub const fn pin_to(mut self, addr: SocketAddr) -> Self {
+        self.pin_addr = Some(addr);
+        self
+    }
+
+    /// Route this request through the SSRF-safe resolve→validate→pin send path
+    /// documented on [`Client::get_ssrf_safe`], for any HTTP method.
+    ///
+    /// [`Client::get_ssrf_safe`] only builds `GET` requests, but the guarantee
+    /// it describes — reject a resolved address on the built-in SSRF deny-list,
+    /// pin the connection to the validated set, re-validate on every redirect
+    /// hop — is implemented by [`Self::send`] purely from this flag and is not
+    /// GET-specific. Any outbound call whose destination is not a value the
+    /// app itself chose — a webhook subscriber's `target_url`, a user-supplied
+    /// callback, an OAuth discovery endpoint — needs this on **every** verb it
+    /// uses, not only reads. Chain it after [`Client::post`], [`Client::put`],
+    /// etc.:
+    ///
+    /// ```rust,ignore
+    /// client.post(target_url).ssrf_safe().json(&payload).send().await?;
+    /// ```
+    ///
+    /// Same incompatibility with [`pin_to`](Self::pin_to) as `get_ssrf_safe`:
+    /// this path performs its own per-hop resolve→validate→pin, so chaining an
+    /// explicit pin is rejected at send time with
+    /// [`ClientError::PinNotAllowedWithSsrfSafe`].
+    #[must_use]
+    pub const fn ssrf_safe(mut self) -> Self {
+        self.ssrf_safe = true;
+        self
+    }
+
+    /// Keep circuit-breaker accounting even when this request also needs the
+    /// custom send path (`ssrf_safe()`, `pin_to()`, `no_redirect()`,
+    /// `follow_redirects()`).
+    ///
+    /// That custom path otherwise bypasses `send_recorded`'s breaker block
+    /// entirely — right for its usual case, a one-off fetch of an arbitrary
+    /// caller-chosen URL, where per-host breaker state is mostly noise. A
+    /// caller instead making *repeated* calls to a small, durable set of
+    /// hosts — outbound webhook delivery is the motivating case (#2480 code
+    /// review) — still wants the breaker: without it, a down receiver never
+    /// fails fast, and every queued delivery pays a full
+    /// DNS-resolve-and-connect timeout instead of the open-breaker
+    /// short-circuit every other outbound call gets.
+    ///
+    /// This flag is read from *inside* `send_recorded`, not layered on
+    /// externally, which is what makes it free to get right on every other
+    /// axis `send` already handles correctly: a mocked client's `self.mock.is_some()`
+    /// check runs first regardless (mock behavior is unaffected); a capsule
+    /// replay's `current_tape()` check happens even earlier, in `send` itself,
+    /// before `send_recorded` is ever reached (an open-breaker attempt is
+    /// therefore never gated on live state during replay, and — because it
+    /// stays behind `send`'s own capture tee — an open-breaker attempt made
+    /// *while capturing* is recorded into the capsule exactly like any other
+    /// outcome, so a later replay of that exact run reproduces
+    /// `CircuitBreakerOpen` instead of diverging).
+    ///
+    /// Breaker keying always uses this request's *resolved* URL (`self.url`
+    /// — already expanded past any `[http.client.base_urls]` alias by
+    /// `Client::build_request`), so an alias-targeted destination keys the
+    /// same breaker bucket a literal-URL request to the same host would.
+    #[must_use]
+    pub(crate) const fn breaker_scoped(mut self) -> Self {
+        self.breaker_scoped = true;
+        self
+    }
+
     /// Send the request, applying retries and returning a [`Response`].
     ///
     /// # Errors
@@ -866,33 +1827,86 @@ impl RequestBuilder {
             return Err(err);
         }
 
+        // Replay serves outbound calls from the capsule's effect tape (#1634) and never
+        // dials the peer. A call the tape cannot answer is a divergence, already logged by
+        // `next_http`, and fails closed here. The unconditional block below stays as the
+        // backstop for a replay process whose current task carries no tape — app boot, a
+        // state initializer, work the handler spawned — because a capsule records no
+        // response for any of those either. The check is here rather than on the client
+        // because a handler can build one any way it likes (`Client::new()`, `from_state`,
+        // a stored one) and every path must be closed.
+        #[cfg(feature = "reporting")]
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            let method = self.method.to_string();
+            // Derived exactly as `OutboundRecorder::arm` derives the recorded
+            // half, so the comparison is like with like. No cap on the body:
+            // the capsule's own cap already applied at record time, and a
+            // recording that hit it is refused before it ever reaches replay.
+            let headers = caller_headers(&self);
+            let body = self
+                .body
+                .as_ref()
+                .map_or(crate::capsule::CapsuleBody::Absent, |body| {
+                    encode_body(body, usize::MAX)
+                });
+            return replayed_response(
+                &tape,
+                &crate::capsule::effects::OutboundRequest {
+                    method: &method,
+                    url: &self.url,
+                    headers: &headers,
+                    body: &body,
+                },
+            );
+        }
+        if outbound_blocked_for_replay() {
+            return Err(ClientError::BlockedDuringReplay(
+                self.method.to_string(),
+                self.url.clone(),
+            ));
+        }
+
+        // Capture: the exchange is recorded into the in-flight request's
+        // capsule scope, when there is one. Recording wraps every send path
+        // below (mock, custom, breaker-guarded) so a capsule cannot miss an
+        // exchange because the caller happened to use `no_redirect` or a
+        // pinned address.
+        let recorder = OutboundRecorder::arm(&self);
+        let result = self.send_recorded().await;
+        recorder.finish(&result);
+        result
+    }
+
+    /// [`send`](Self::send), minus the replay gate and the capture tee.
+    async fn send_recorded(self) -> Result<Response, ClientError> {
+        // A sim network serves every send path, so nothing reaches the real
+        // network. Like mocks, it bypasses the process-global breaker.
+        if let Some(net) = self.sim_net.clone() {
+            return self.send_sim(&net).await;
+        }
+
         // Bypassing circuit breaker if a mock registry is present.
         if self.mock.is_some() {
             return self.send_inner(false).await;
         }
 
-        // ── Resilience / Circuit Breaker ──────────────────────────────────
-        let host = url::Url::parse(&self.url).ok().map_or_else(
-            || "unknown".to_owned(),
-            |u| {
-                let h = u.host_str().unwrap_or("unknown");
-                u.port()
-                    .map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
-            },
-        );
+        // Custom send path: any of no_redirect / follow_redirects / pin_to /
+        // get_ssrf_safe builds one-shot reqwest client(s) with Policy::none()
+        // (+ optional .resolve()) and does manual redirect handling. Like the
+        // mock path it deliberately BYPASSES the process-global circuit breaker
+        // to avoid entangling these one-off, per-URL requests with the shared
+        // per-host breaker registry — unless the caller opted in via
+        // `breaker_scoped()` (repeated calls to a small, durable host set; see
+        // its doc comment).
+        if self.needs_custom_path() {
+            if self.breaker_scoped {
+                return self.send_custom_breaker_guarded().await;
+            }
+            return self.send_custom(false).await;
+        }
 
-        let breaker = self.resilience_config.as_ref().map_or_else(
-            || {
-                crate::circuit_breaker::global_registry().get_or_create(
-                    &host,
-                    crate::circuit_breaker::CircuitBreakerPolicy::default(),
-                )
-            },
-            |rc| {
-                let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, &host);
-                crate::circuit_breaker::global_registry().get_or_create_with_config(&host, policy)
-            },
-        );
+        // ── Resilience / Circuit Breaker ──────────────────────────────────
+        let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
 
         // Check if circuit breaker is open
         if breaker.before_call().is_err() {
@@ -918,53 +1932,45 @@ impl RequestBuilder {
         res
     }
 
+    /// The custom send path (`send_custom`), with breaker accounting exactly
+    /// like the plain-path breaker block above: `before_call` gate,
+    /// `CircuitBreakerGuard` covering the call (its `Drop` releases a
+    /// half-open slot if this future is cancelled or panics before finishing),
+    /// `< 500` success threshold. Only reached when `breaker_scoped()` was
+    /// set — see its doc comment for why this has to live here rather than in
+    /// an external wrapper around `send()`.
+    async fn send_custom_breaker_guarded(self) -> Result<Response, ClientError> {
+        let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
+        if breaker.before_call().is_err() {
+            return Err(ClientError::CircuitBreakerOpen);
+        }
+        // Read before the breaker moves into the guard below. Mirrors the
+        // plain-path breaker block's own `is_half_open` (passed to
+        // `send_inner` to force a single attempt): a half-open probe is a
+        // budgeted, limited trial (`half_open_trial_count`), and letting
+        // `send_one`'s own retry loop turn one trial into several real
+        // network attempts spends that budget on one logical delivery
+        // instead of testing recovery with independent probes (#2480
+        // review, round 10).
+        let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
+        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
+        let res = self.send_custom(is_half_open).await;
+        match &res {
+            Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
+            _ => guard.failure(),
+        }
+        res
+    }
+
     async fn send_inner(self, suppress_retries: bool) -> Result<Response, ClientError> {
         // ── Mock short-circuit ──────────────────────────────────────────────
         if let Some(ref mock) = self.mock {
-            match mock.find_match(&self.method, &self.url, self.alias.as_deref()) {
-                Some(mock_resp) => {
-                    let status = reqwest::StatusCode::from_u16(mock_resp.status)
-                        .unwrap_or(reqwest::StatusCode::OK);
-                    let body_bytes = mock_resp
-                        .body
-                        .as_ref()
-                        .map(|v| serde_json::to_vec(v).unwrap_or_default())
-                        .unwrap_or_default();
-
-                    tracing::info!(
-                        http.method = %self.method,
-                        http.url = %self.url,
-                        http.status = mock_resp.status,
-                        "[mock] outbound request intercepted"
-                    );
-
-                    return Ok(Response {
-                        status,
-                        headers: HeaderMap::new(),
-                        body: Bytes::from(body_bytes),
-                        url: None,
-                    });
-                }
-                None => {
-                    // A mock registry is present but nothing matched — treat as
-                    // a test failure rather than falling through to the network.
-                    return Err(ClientError::NoMock(
-                        self.method.to_string(),
-                        self.url.clone(),
-                    ));
-                }
-            }
+            return self.mock_response(mock);
         }
 
         // ── Real network request with retries ───────────────────────────────
-        let start = Instant::now();
-        let max_attempts = if suppress_retries {
-            1
-        } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
-            self.retry_policy.max_retries.saturating_add(1)
-        } else {
-            1
-        };
+        let start = crate::time::ambient_instant();
+        let max_attempts = self.max_attempts(suppress_retries);
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -996,13 +2002,7 @@ impl RequestBuilder {
 
                     // 429 → honour Retry-After and retry if attempts remain.
                     if status.as_u16() == 429 && attempt + 1 < max_attempts {
-                        let mut sleep_delay =
-                            parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
-                        sleep_delay = sleep_delay.min(self.retry_policy.max_retry_after);
-                        if let Some(req_timeout) = self.retry_policy.request_timeout {
-                            sleep_delay = sleep_delay.min(req_timeout);
-                        }
-                        tokio::time::sleep(sleep_delay).await;
+                        tokio::time::sleep(self.retry_after_delay(&headers)).await;
                         continue;
                     }
 
@@ -1011,11 +2011,15 @@ impl RequestBuilder {
                         continue;
                     }
 
-                    let body = resp
-                        .bytes()
-                        .await
-                        .map_err(|e| ClientError::Request(e.without_url()))?;
-                    let elapsed = start.elapsed();
+                    let body = if self.discard_response_body {
+                        // Dropped unread — see `discard_response_body`.
+                        Bytes::new()
+                    } else {
+                        resp.bytes()
+                            .await
+                            .map_err(|e| ClientError::Request(e.without_url()))?
+                    };
+                    let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
                         &url_used,
@@ -1041,6 +2045,481 @@ impl RequestBuilder {
         // The retry loop always returns inside the last attempt; this is unreachable.
         unreachable!("retry loop exited without returning a result — this is a bug")
     }
+
+    /// How many attempts the retry policy allows for this request.
+    const fn max_attempts(&self, suppress_retries: bool) -> u32 {
+        if suppress_retries {
+            1
+        } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
+            self.retry_policy.max_retries.saturating_add(1)
+        } else {
+            1
+        }
+    }
+
+    /// The canned response for this request from `mock`, or
+    /// [`ClientError::NoMock`].
+    fn mock_response(&self, mock: &MockRegistry) -> Result<Response, ClientError> {
+        let Some(mock_resp) = mock.find_match(&self.method, &self.url, self.alias.as_deref())
+        else {
+            // A mock registry is present but nothing matched — treat as a test
+            // failure rather than falling through to the network.
+            return Err(ClientError::NoMock(
+                self.method.to_string(),
+                self.url.clone(),
+            ));
+        };
+        let status =
+            reqwest::StatusCode::from_u16(mock_resp.status).unwrap_or(reqwest::StatusCode::OK);
+        let body_bytes = mock_resp
+            .body
+            .as_ref()
+            .map(|v| serde_json::to_vec(v).unwrap_or_default())
+            .unwrap_or_default();
+
+        tracing::info!(
+            http.method = %self.method,
+            http.url = %self.url,
+            http.status = mock_resp.status,
+            "[mock] outbound request intercepted"
+        );
+
+        Ok(Response {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::from(body_bytes),
+            url: None,
+        })
+    }
+
+    /// The wait before a retry after a 429: `Retry-After`, capped by the policy.
+    fn retry_after_delay(&self, headers: &HeaderMap) -> Duration {
+        let mut delay = parse_retry_after(headers).unwrap_or(Duration::from_secs(1));
+        delay = delay.min(self.retry_policy.max_retry_after);
+        if let Some(req_timeout) = self.retry_policy.request_timeout {
+            delay = delay.min(req_timeout);
+        }
+        delay
+    }
+
+    /// Send through the simulated network (issue #2967), with the attempts,
+    /// backoff, 429 handling and per-attempt timeout of the real retry loop.
+    async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
+        let url = self.sim_url()?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| ClientError::InvalidUrl(format!("{}: no host", self.url)))?
+            .to_owned();
+        let max_attempts = self.max_attempts(false);
+        for attempt in 0..max_attempts {
+            if attempt > 0 {
+                let exp = (attempt - 1).min(10);
+                tokio::time::sleep(Duration::from_millis(100 * (1_u64 << exp))).await;
+            }
+            let last = attempt + 1 == max_attempts;
+            let exchange = self.sim_attempt(net, &host, &url);
+            let outcome = match self.retry_policy.request_timeout {
+                Some(limit) => {
+                    tokio::time::timeout(limit, exchange)
+                        .await
+                        .unwrap_or_else(|_elapsed| {
+                            Err(SimAttemptError::Transient(format!(
+                                "request to {host} timed out after {limit:?}"
+                            )))
+                        })
+                }
+                None => exchange.await,
+            };
+            let response = match outcome {
+                Ok(response) => response,
+                // A drop or a timeout is transient, like a real connect or
+                // timeout error, so it is retried.
+                Err(SimAttemptError::Transient(_)) if !last => continue,
+                Err(SimAttemptError::Transient(message)) => {
+                    return Err(ClientError::SimNetwork(message));
+                }
+                Err(SimAttemptError::Fatal(error)) => return Err(error),
+            };
+            if response.status.as_u16() == 429 && !last {
+                tokio::time::sleep(self.retry_after_delay(&response.headers)).await;
+                continue;
+            }
+            if is_retryable_status(response.status.as_u16()) && !last {
+                continue;
+            }
+            return Ok(response);
+        }
+        unreachable!("the sim retry loop returns on its last attempt")
+    }
+
+    /// The absolute URL a sim call goes to. A relative URL on a named client
+    /// (`client.named("payments").get("/charge")`) goes to the host named by
+    /// the alias, as a named http mock would match it.
+    fn sim_url(&self) -> Result<reqwest::Url, ClientError> {
+        match (reqwest::Url::parse(&self.url), self.alias.as_deref()) {
+            (Ok(url), _) => Ok(url),
+            (Err(url::ParseError::RelativeUrlWithoutBase), Some(alias)) => {
+                let path = self.url.trim_start_matches('/');
+                reqwest::Url::parse(&format!("http://{alias}/{path}"))
+                    .map_err(|error| ClientError::InvalidUrl(format!("{}: {error}", self.url)))
+            }
+            (Err(error), _) => Err(ClientError::InvalidUrl(format!("{}: {error}", self.url))),
+        }
+    }
+
+    /// One attempt through the simulated network: the network, then the host
+    /// router or the http mocks.
+    async fn sim_attempt(
+        &self,
+        net: &crate::sim::SimNet,
+        host: &str,
+        url: &reqwest::Url,
+    ) -> Result<Response, SimAttemptError> {
+        net.transmit(host, self.retry_policy.request_timeout)
+            .await
+            .map_err(|fault| SimAttemptError::Transient(format!("request to {host} {fault}")))?;
+        match (net.service(host), self.mock.as_ref()) {
+            (Some(router), _) => serve_sim_host(router, self, url.clone())
+                .await
+                .map_err(SimAttemptError::Fatal),
+            (None, Some(mock)) => self.mock_response(mock).map_err(SimAttemptError::Fatal),
+            (None, None) => Err(SimAttemptError::Fatal(ClientError::SimNetwork(format!(
+                "no sim host named {host}"
+            )))),
+        }
+    }
+
+    /// `true` when any security-hardening option requires the custom send path.
+    const fn needs_custom_path(&self) -> bool {
+        self.ssrf_safe
+            || self.pin_addr.is_some()
+            || !matches!(self.redirect_mode, RedirectMode::Default)
+    }
+
+    /// Dispatch to the appropriate custom send path. Consumes `self`.
+    ///
+    /// `is_half_open`: `true` when this call is a circuit-breaker half-open
+    /// probe (only ever passed by [`Self::send_custom_breaker_guarded`]);
+    /// forces every `send_one` this dispatch reaches down to a single
+    /// attempt, exactly like the plain-path breaker block's own
+    /// `send_inner(is_half_open)` already does — see
+    /// `send_custom_breaker_guarded`'s doc comment.
+    async fn send_custom(self, is_half_open: bool) -> Result<Response, ClientError> {
+        // Reject the incompatible `get_ssrf_safe` + `pin_to` combination up
+        // front — deterministically, before any network I/O. `get_ssrf_safe`
+        // routes through `send_ssrf_safe`, which runs its OWN per-hop
+        // resolve→validate→pin and never reads `self.pin_addr`; a caller's
+        // explicit `pin_to(addr)` would therefore be silently ignored. Fail
+        // loudly instead so the mismatch is caught rather than masked. Use
+        // `pin_to` alone for a caller-chosen fixed address, or `get_ssrf_safe`
+        // alone for guarded automatic per-hop pinning.
+        if self.ssrf_safe && self.pin_addr.is_some() {
+            return Err(ClientError::PinNotAllowedWithSsrfSafe(
+                "get_ssrf_safe cannot be combined with pin_to: the SSRF-safe path \
+                 performs its own per-hop resolve/validate/pin and never reads the \
+                 pin_to address, so an explicit pin would be silently ignored. Use \
+                 pin_to alone for a caller-chosen address, or get_ssrf_safe alone \
+                 for guarded automatic per-hop pinning.",
+            ));
+        }
+
+        // Reject the incompatible `pin_to` + `follow_redirects` combination up
+        // front — deterministically, before issuing any request. A single pinned
+        // `SocketAddr` only applies to hop 0 of `follow_loop`; later hops resolve
+        // via normal DNS, so following a cross-host `3xx` would silently escape
+        // the pin and defeat its purpose. `get_ssrf_safe` never sets `pin_addr`,
+        // so its per-hop resolve→validate→pin path is unaffected by this guard.
+        if self.pin_addr.is_some() && matches!(self.redirect_mode, RedirectMode::Follow { .. }) {
+            return Err(ClientError::IncompatiblePinRedirect(
+                "pin_to cannot be combined with follow_redirects: the pin only \
+                 covers the first hop and later redirect hops re-resolve via DNS, \
+                 escaping the pin. Use get_ssrf_safe for pinned, per-hop-revalidated \
+                 redirect following; pin_to alone (which returns the 3xx unfollowed); \
+                 or follow_redirects without pin_to.",
+            ));
+        }
+
+        // Reject `pin_to` on an IP-literal URL host up front, deterministically, before
+        // any network I/O. reqwest and hyper treat an IP-literal host as already resolved
+        // and do not consult the DNS resolver, so the `resolve_to_addrs` override
+        // `build_oneshot_client` installs — which is what enforces the pin — is skipped
+        // and the socket connects to the literal in the URL rather than the pinned
+        // address, silently violating `pin_to`'s documented guarantee. `get_ssrf_safe`
+        // never sets `pin_addr`, and validates and connects to the same literal, so it
+        // stays safe; this guard targets only the explicit `pin_to` primitive.
+        if self.pin_addr.is_some() && url_host_is_ip_literal(&self.url)? {
+            return Err(ClientError::PinRequiresDomainHost(
+                "pin_to cannot be honored for an IP-literal URL host because the \
+                 HTTP stack connects to the literal directly and skips the pinned \
+                 address; put the desired IP directly in the URL, or use a domain host.",
+            ));
+        }
+
+        let timeout = self
+            .retry_policy
+            .request_timeout
+            .unwrap_or_else(|| Duration::from_secs(30));
+
+        if self.ssrf_safe {
+            return self.send_ssrf_safe(timeout, is_half_open).await;
+        }
+
+        // Extract the follow parameters (ending the borrow) before moving `self`.
+        let follow = match &self.redirect_mode {
+            RedirectMode::Follow { max, validator } => Some((*max, validator.clone())),
+            RedirectMode::None | RedirectMode::Default => None,
+        };
+        if let Some((max, validator)) = follow {
+            return self
+                .follow_loop(max, validator, timeout, is_half_open)
+                .await;
+        }
+
+        // Only `RedirectMode::None` (explicit `no_redirect`) and the pin-only
+        // `RedirectMode::Default` reach here (`Follow` and `ssrf_safe` returned
+        // above). Both use `Policy::none()`: a 3xx is returned to the caller
+        // verbatim rather than being auto-followed. Critically, for the
+        // pin-only path this stops reqwest from silently following a cross-host
+        // redirect and re-resolving the new host via normal DNS — which would
+        // defeat the pin. Callers who want to follow redirects while staying
+        // pinned/rebind-safe use `get_ssrf_safe` (or `follow_redirects`).
+        let policy = reqwest::redirect::Policy::none();
+        let resolve = self.pin_resolve()?;
+        let client = build_oneshot_client(resolve, policy, timeout)?;
+        send_one(
+            &client,
+            &self.method,
+            &self.url,
+            &self.extra_headers,
+            self.body.as_ref(),
+            &self.retry_policy,
+            self.discard_response_body,
+            None,
+            is_half_open,
+        )
+        .await
+    }
+
+    /// Compute the `(host, addr)` resolve override for a pinned request, if any.
+    fn pin_resolve(&self) -> Result<Option<(String, Vec<SocketAddr>)>, ClientError> {
+        match self.pin_addr {
+            // Single-address pin routed through the same set-based path as the
+            // multi-address SSRF-safe pin (a one-element slice).
+            Some(addr) => Ok(Some((host_of(&self.url)?, vec![addr]))),
+            None => Ok(None),
+        }
+    }
+
+    /// Manual redirect-following loop with per-hop validation (Feature #1238).
+    async fn follow_loop(
+        self,
+        max: usize,
+        validator: RedirectValidator,
+        timeout: Duration,
+        is_half_open: bool,
+    ) -> Result<Response, ClientError> {
+        let original =
+            url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+        let mut current = self.url.clone();
+        // Threaded across hops so cross-origin header stripping (Fix A) and
+        // RFC method/body rewriting (Fix B) accumulate correctly.
+        let mut method = self.method.clone();
+        let mut headers = self.extra_headers.clone();
+        let mut body = self.body.clone();
+        for hop in 0.. {
+            // Pin only applies to the first hop's original target.
+            let resolve = if hop == 0 {
+                match self.pin_addr {
+                    Some(addr) => Some((host_of(&current)?, vec![addr])),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            // On any post-origin hop, drop credential-bearing headers if the
+            // current target is cross-origin (stays stripped once stripped).
+            if hop > 0 {
+                strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
+            }
+            let client = build_oneshot_client(resolve, reqwest::redirect::Policy::none(), timeout)?;
+            let resp = send_one(
+                &client,
+                &method,
+                &current,
+                &headers,
+                body.as_ref(),
+                &self.retry_policy,
+                self.discard_response_body,
+                None,
+                is_half_open,
+            )
+            .await?;
+
+            let Some(next) = redirect_target(&resp, &current)? else {
+                return Ok(resp);
+            };
+            if hop >= max {
+                return Err(ClientError::TooManyRedirects(max));
+            }
+            if !validator(&next) {
+                return Err(ClientError::RedirectRejected(next));
+            }
+            // RFC 7231/7538 method+body rewriting before the next hop.
+            rewrite_after_redirect(resp.status(), &mut method, &mut body, &mut headers);
+            current = next;
+        }
+        unreachable!("redirect loop is bounded by `max` and always returns")
+    }
+
+    /// Derive the SSRF-safe redirect plan `(follow, max)` from the builder's
+    /// [`RedirectMode`], so a chained `no_redirect()` / `follow_redirects(..)`
+    /// overrides the default hop cap on the SSRF-safe path:
+    ///
+    /// - [`RedirectMode::Default`] → `(true, SSRF_SAFE_MAX_REDIRECTS)`.
+    /// - [`RedirectMode::None`] (`no_redirect()`) → `(false, 0)` — the initial
+    ///   `3xx` is returned verbatim (the `max` is unused).
+    /// - [`RedirectMode::Follow { max, .. }`] (`follow_redirects(max, ..)`) →
+    ///   `(true, max)`. The caller's per-hop validator is pulled from
+    ///   `self.redirect_mode` separately inside the send loop.
+    const fn ssrf_redirect_plan(&self) -> (bool, usize) {
+        match &self.redirect_mode {
+            RedirectMode::Default => (true, SSRF_SAFE_MAX_REDIRECTS),
+            RedirectMode::None => (false, 0),
+            RedirectMode::Follow { max, .. } => (true, *max),
+        }
+    }
+
+    /// Composed SSRF-safe send path (Features #1238 + #1239). Resolves and
+    /// validates every hop, pins the connection, and rejects scheme downgrades.
+    ///
+    /// The follow/hop-cap behaviour comes from [`ssrf_redirect_plan`](Self::ssrf_redirect_plan),
+    /// so a chained `no_redirect()` / `follow_redirects(max, ..)` overrides the
+    /// default cap while every per-hop safety step (resolve→validate→pin,
+    /// https→http downgrade block, sensitive-header stripping, method/body
+    /// rewrite) still applies.
+    /// Runs the whole resolve→validate→pin→redirect operation against one
+    /// deadline `timeout` from now, rather than handing every phase of every
+    /// hop a fresh `timeout`-length budget.
+    ///
+    /// Without this, `timeout` only bounded each hop's own connect/response
+    /// wait — the DNS lookup in [`resolve_and_validate`] had no timeout of
+    /// its own, and every redirect hop got a full fresh `timeout` regardless
+    /// of how long earlier hops already took. A subscriber-controlled
+    /// destination (the motivating case: outbound webhook delivery, #2480
+    /// code review) with stalled DNS or a slow multi-hop redirect chain
+    /// could therefore occupy a job worker for `timeout × (hops + 1)` plus
+    /// unbounded DNS wait, rather than the single `timeout` every other
+    /// outbound call is bounded by.
+    ///
+    /// The budget shrinks across two seams per hop — the DNS lookup, then
+    /// the connect/response reqwest performs — rather than being enforced by
+    /// one coarse outer `tokio::time::timeout` wrapping the whole call: a
+    /// coarse wrap would race the *same* duration against both this
+    /// operation's start and each hop's own reqwest-level timeout, and since
+    /// the outer clock always starts first it would almost always fire
+    /// first, silently reclassifying an ordinary single-hop stall from
+    /// `ClientError::Request` (a `reqwest::Error` callers can query with
+    /// `.is_timeout()`) into `ClientError::InvalidUrl` (#2480 review, round
+    /// 7). Shrinking the *reqwest* timeout instead means a connect/response
+    /// stall in the common (no-redirect) case still times out inside
+    /// reqwest itself and keeps that exact, already-documented error shape;
+    /// only a stall in the DNS lookup — which had no error shape of its own
+    /// to preserve, because it had no timeout at all before this fix —
+    /// surfaces as `InvalidUrl`, consistent with the DNS-failure case
+    /// immediately below reusing the same variant.
+    async fn send_ssrf_safe(
+        self,
+        timeout: Duration,
+        is_half_open: bool,
+    ) -> Result<Response, ClientError> {
+        let deadline = crate::time::ambient_instant() + timeout;
+        let (follow, max) = self.ssrf_redirect_plan();
+        let original =
+            url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+        let mut current = self.url.clone();
+        // Threaded across hops so cross-origin header stripping (Fix A) and
+        // RFC method/body rewriting (Fix B) accumulate correctly.
+        let mut method = self.method.clone();
+        let mut headers = self.extra_headers.clone();
+        let mut body = self.body.clone();
+        for hop in 0.. {
+            let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)?;
+            // Resolve host → ALL validated addresses (rejects if ANY resolved IP
+            // is blocked), then pin the full set so reqwest cannot re-resolve but
+            // can still fall back across the validated addresses in order.
+            // Wrapped in the *remaining* budget, not the full per-request
+            // `timeout`: resolve_and_validate's DNS lookup previously had no
+            // timeout of its own at all.
+            let addrs = tokio::time::timeout(remaining_for_lookup, resolve_and_validate(&current))
+                .await
+                .map_err(|_| ssrf_safe_deadline_error(&current))??;
+            let host = host_of(&current)?;
+            // Re-measured after the lookup, so a slow DNS response shrinks
+            // what's left for the connect/response phase below rather than
+            // that phase getting a fresh full `timeout` regardless.
+            let remaining_for_connect = deadline_remaining_or_timeout(deadline, &current)?;
+            let client = build_oneshot_client(
+                Some((host, addrs)),
+                reqwest::redirect::Policy::none(),
+                remaining_for_connect,
+            )?;
+            // On any post-origin hop, drop credential-bearing headers if the
+            // current target is cross-origin (stays stripped once stripped).
+            if hop > 0 {
+                strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
+            }
+            let resp = send_one(
+                &client,
+                &method,
+                &current,
+                &headers,
+                body.as_ref(),
+                &self.retry_policy,
+                self.discard_response_body,
+                Some(deadline),
+                is_half_open,
+            )
+            .await?;
+
+            // Honour a chained `no_redirect()`: return the response verbatim
+            // BEFORE parsing the `Location` header. The initial URL was still
+            // resolved / validated / pinned above. Parsing `Location` here (via
+            // `redirect_target`) would let an untrusted server force an
+            // `InvalidUrl` error out of a `no_redirect()` fetch by returning a
+            // followable 3xx with a malformed `Location`, violating the
+            // documented "return the initial 3xx verbatim" contract.
+            if !follow {
+                return Ok(resp);
+            }
+            let Some(next) = redirect_target(&resp, &current)? else {
+                return Ok(resp);
+            };
+            if hop >= max {
+                return Err(ClientError::TooManyRedirects(max));
+            }
+            // Defence-in-depth: reject an https→http downgrade on redirect.
+            if scheme_is_https(&current)? && !scheme_is_https(&next)? {
+                return Err(ClientError::RedirectRejected(format!(
+                    "https→http scheme downgrade on redirect to {next}"
+                )));
+            }
+            // Caller-supplied per-hop validator, present only in the
+            // `follow_redirects` override. It runs in ADDITION to the built-in
+            // resolve/validate/pin already applied at the top of the loop.
+            if let RedirectMode::Follow { validator, .. } = &self.redirect_mode
+                && !validator(&next)
+            {
+                return Err(ClientError::RedirectRejected(next));
+            }
+            // RFC 7231/7538 method+body rewriting before the next hop.
+            rewrite_after_redirect(resp.status(), &mut method, &mut body, &mut headers);
+            current = next;
+            // The next loop iteration re-resolves + re-validates `current`
+            // before connecting, so a redirect to a blocked address is rejected
+            // there with `SsrfBlocked`.
+        }
+        unreachable!("redirect loop is bounded by the SSRF-safe redirect plan")
+    }
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -1056,6 +2535,558 @@ const fn is_retryable_status(status: u16) -> bool {
     matches!(status, 502..=504)
 }
 
+/// Time left until `deadline`, or the deadline error if it has already
+/// passed before this hop's next phase (DNS lookup or connect) even began.
+/// Used by [`RequestBuilder::send_ssrf_safe`] to shrink the budget handed to
+/// each successive phase rather than resetting it every hop.
+fn deadline_remaining_or_timeout(
+    deadline: std::time::Instant,
+    current: &str,
+) -> Result<Duration, ClientError> {
+    let now = crate::time::ambient_instant();
+    if now >= deadline {
+        return Err(ssrf_safe_deadline_error(current));
+    }
+    Ok(deadline - now)
+}
+
+/// The error [`RequestBuilder::send_ssrf_safe`] returns when its overall
+/// deadline is exhausted — reusing [`ClientError::InvalidUrl`] rather than a
+/// new variant (see that call site's doc comment for why), consistent with
+/// the adjacent DNS-lookup-failure case in [`resolve_and_validate`] already
+/// using the same variant for the same phase.
+fn ssrf_safe_deadline_error(current: &str) -> ClientError {
+    ClientError::InvalidUrl(format!(
+        "SSRF-safe resolve/redirect operation exceeded its deadline resolving {current}"
+    ))
+}
+
+/// Resolve (or create) the circuit breaker for `url`'s host, honouring a
+/// per-client `resilience_config` override exactly as [`RequestBuilder::send_recorded`]'s
+/// own breaker path does. Shared by both the plain-path breaker block and
+/// [`RequestBuilder::send_custom_breaker_guarded`] so the two cannot drift on
+/// how a host name is derived from the URL.
+fn breaker_for_url(
+    resilience_config: Option<&Arc<crate::config::ResilienceConfig>>,
+    url: &str,
+) -> crate::circuit_breaker::CircuitBreaker {
+    let host = url::Url::parse(url).ok().map_or_else(
+        || "unknown".to_owned(),
+        |u| {
+            let h = u.host_str().unwrap_or("unknown");
+            u.port()
+                .map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
+        },
+    );
+
+    resilience_config.map_or_else(
+        || {
+            crate::circuit_breaker::global_registry().get_or_create(
+                &host,
+                crate::circuit_breaker::CircuitBreakerPolicy::default(),
+            )
+        },
+        |rc| {
+            let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, &host);
+            crate::circuit_breaker::global_registry().get_or_create_with_config(&host, policy)
+        },
+    )
+}
+
+// ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
+
+/// Why one simulated attempt failed.
+enum SimAttemptError {
+    /// A drop, a partition or a timeout: retried while attempts remain.
+    Transient(String),
+    /// Not retried.
+    Fatal(ClientError),
+}
+
+/// Serve one request from a simulated host's router (issue #2967).
+async fn serve_sim_host(
+    router: axum::Router,
+    request: &RequestBuilder,
+    url: reqwest::Url,
+) -> Result<Response, ClientError> {
+    let target = url.query().map_or_else(
+        || url.path().to_owned(),
+        |query| format!("{}?{query}", url.path()),
+    );
+    let mut builder = axum::http::Request::builder()
+        .method(request.method.clone())
+        .uri(target);
+    if !request.extra_headers.contains_key(reqwest::header::HOST) {
+        // Host and port as the URL writes them, so an IPv6 host keeps its
+        // brackets (`[::1]:8080`).
+        let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        builder = builder.header(reqwest::header::HOST, authority);
+    }
+    // Trace context first, as on the real send path. A caller header of the
+    // same name wins.
+    for (name, value) in trace_context_headers() {
+        if !request.extra_headers.contains_key(name.as_str()) {
+            builder = builder.header(name, value);
+        }
+    }
+    // The real client sends a `Content-Length` for a known-size body. A
+    // caller header of the same name wins.
+    if let Some(body) = &request.body
+        && !request
+            .extra_headers
+            .contains_key(reqwest::header::CONTENT_LENGTH)
+    {
+        builder = builder.header(reqwest::header::CONTENT_LENGTH, body.len());
+    }
+    for (name, value) in &request.extra_headers {
+        builder = builder.header(name, value);
+    }
+    let body = request.body.clone().unwrap_or_default();
+    let http_request = builder
+        .body(axum::body::Body::from(body))
+        .map_err(|error| ClientError::SimNetwork(error.to_string()))?;
+    let response = tower::ServiceExt::oneshot(router, http_request)
+        .await
+        .unwrap_or_else(|never| match never {});
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = if request.discard_response_body {
+        Bytes::new()
+    } else {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| ClientError::SimNetwork(error.to_string()))?
+    };
+    Ok(Response {
+        status,
+        headers,
+        body,
+        url: Some(url),
+    })
+}
+
+/// Build a one-shot `reqwest::Client` for the custom send path, with the given
+/// redirect policy, per-request timeout, and optional DNS `resolve` override.
+///
+/// **Proxy bypass on pinned clients.** When a `resolve` override is present the
+/// client is built with `.no_proxy()` so the request connects DIRECTLY to the
+/// validated/pinned address. reqwest evaluates proxy interception (from
+/// `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`) BEFORE the connector where the
+/// `resolve()` override applies, so a configured env proxy would otherwise send
+/// the request to the proxy — which re-resolves the target host, reopening the
+/// exact DNS-rebinding / SSRF window that pinning closes. Non-pinned callers
+/// (`resolve == None`) keep reqwest's default proxy behaviour untouched.
+fn build_oneshot_client(
+    resolve: Option<(String, Vec<SocketAddr>)>,
+    policy: reqwest::redirect::Policy,
+    timeout: Duration,
+) -> Result<reqwest::Client, ClientError> {
+    let mut builder = reqwest::ClientBuilder::new()
+        .timeout(timeout)
+        .redirect(policy);
+    if let Some((host, addrs)) = resolve
+        && !addrs.is_empty()
+    {
+        // Pin to the FULL validated set: reqwest tries the addresses in order and
+        // falls back on connection failure, so an unreachable first address no
+        // longer dooms the request. Every pinned address was already validated,
+        // so the TOCTOU/SSRF guarantee is preserved. A pinned request must never
+        // route through a re-resolving proxy.
+        builder = builder.no_proxy().resolve_to_addrs(&host, &addrs);
+    }
+    builder.build().map_err(ClientError::Request)
+}
+
+/// Send a single request through `client` (no manual redirect following — the
+/// client's redirect policy governs that) with the same transient-error and
+/// 429/5xx retry behaviour as the shared path, and collect the [`Response`].
+///
+/// `deadline`, when set, bounds the *retry loop* — checked before each
+/// backoff sleep, so a retry that would start after the deadline is skipped
+/// in favour of failing the call immediately with a deadline error, rather
+/// than a stale response/error from an attempt that already ran. This exists
+/// for
+/// [`RequestBuilder::send_ssrf_safe`] (#2480 review, round 8): passing a
+/// shrunk per-hop `timeout` into `client`'s own reqwest-level timeout, as
+/// every other caller here already does, bounds one attempt's connect/
+/// response wait, but `client` is reused across every retry `send_one`
+/// itself performs — each gets that same per-attempt timeout again, and the
+/// backoff/`Retry-After` sleeps between attempts are outside it entirely, so
+/// a retried, timing-out SSRF-safe hop could still run well past the overall
+/// deadline the caller computed. Checked only before sleeping (never wrapped
+/// around an in-flight attempt), so it cannot race an attempt's own
+/// reqwest-level timeout the way an outer `tokio::time::timeout` would (see
+/// round 7's `ClientError::Request`/`.is_timeout()` regression) — the first
+/// attempt's error shape is always preserved unchanged. Other callers pass
+/// `None`, so their behavior is exactly as before this parameter existed.
+///
+/// Two more `deadline` seams round 9 found `send_ssrf_safe`'s own deadline
+/// fix had missed: `client`'s own reqwest-level timeout is fixed at
+/// build-hop-start, so a retry within the same hop still got the *original*
+/// per-attempt budget rather than what's actually left; and the 429
+/// `Retry-After` sleep is a second sleep, separate from the backoff sleep
+/// above, that the deadline check never covered at all. Both are fixed here:
+/// every attempt sends with an explicit per-request `.timeout()` recomputed
+/// from `deadline` (overriding `client`'s built-in one only when `deadline`
+/// is set, so non-SSRF-safe callers passing `None` are unaffected), and the
+/// `Retry-After` sleep is capped by the remaining budget and followed by the
+/// same deadline check the backoff sleep already has — falling through to
+/// return the 429 response as final, exactly like running out of
+/// `max_attempts` already does, rather than sleeping past the deadline first.
+///
+/// `suppress_retries`, when `true`, forces a single attempt regardless of
+/// `retry_policy` — the same thing [`RequestBuilder::send_inner`]'s own
+/// `suppress_retries` parameter does for the plain (non-custom) breaker path
+/// during a circuit-breaker half-open probe (#2480 review, round 10): a
+/// probe is a budgeted, limited trial, and letting this retry loop turn one
+/// trial into several real network attempts spends that budget on one
+/// logical delivery rather than testing recovery with independent probes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one seam shared by three call sites (plain custom path, follow_loop, send_ssrf_safe); \
+              splitting the request-shape fields into their own struct would still leave the \
+              retry/discard/deadline/half-open knobs alongside it, for no reduction in what a \
+              caller reasons about"
+)]
+async fn send_one(
+    client: &reqwest::Client,
+    method: &Method,
+    url: &str,
+    extra_headers: &HeaderMap,
+    body: Option<&Bytes>,
+    retry_policy: &RetryPolicy,
+    discard_response_body: bool,
+    deadline: Option<Instant>,
+    suppress_retries: bool,
+) -> Result<Response, ClientError> {
+    let start = crate::time::ambient_instant();
+    let max_attempts = if suppress_retries {
+        1
+    } else if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
+        retry_policy.max_retries.saturating_add(1)
+    } else {
+        1
+    };
+    let mut last_transient_err: Option<reqwest::Error> = None;
+
+    // A prior attempt's own connect/timeout error may be why the deadline is
+    // already gone — surface that error (preserving
+    // `ClientError::Request(e).is_timeout()` for callers) instead of masking
+    // it as an unrelated `InvalidUrl`.
+    let deadline_exceeded_err = |last_transient_err: &mut Option<reqwest::Error>| {
+        last_transient_err.take().map_or_else(
+            || ssrf_safe_deadline_error(url),
+            |e| ClientError::Request(e.without_url()),
+        )
+    };
+
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
+                return Err(deadline_exceeded_err(&mut last_transient_err));
+            }
+            let exp = (attempt - 1).min(10);
+            let mut delay = Duration::from_millis(100 * (1_u64 << exp));
+            if let Some(d) = deadline {
+                delay = delay.min(d.saturating_duration_since(crate::time::ambient_instant()));
+            }
+            tokio::time::sleep(delay).await;
+            if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
+                return Err(deadline_exceeded_err(&mut last_transient_err));
+            }
+        }
+
+        let mut req = client.request(method.clone(), url);
+        // Recomputed fresh every attempt (not just retries) rather than
+        // relying solely on `client`'s own timeout, which was fixed when the
+        // caller built it at hop-start: without this override, a retry deep
+        // into a hop's budget would still get the full original per-attempt
+        // timeout rather than what's actually left before `deadline`.
+        if let Some(d) = deadline {
+            req = req.timeout(d.saturating_duration_since(crate::time::ambient_instant()));
+        }
+        req = inject_trace_context(req);
+        for (name, value) in extra_headers {
+            req = req.header(name.clone(), value.clone());
+        }
+        if let Some(body) = body {
+            req = req.body(body.clone());
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let headers = resp.headers().clone();
+                let url_used = resp.url().clone();
+
+                if status.as_u16() == 429 && attempt + 1 < max_attempts {
+                    let mut sleep_delay =
+                        parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
+                    sleep_delay = sleep_delay.min(retry_policy.max_retry_after);
+                    if let Some(req_timeout) = retry_policy.request_timeout {
+                        sleep_delay = sleep_delay.min(req_timeout);
+                    }
+                    if let Some(d) = deadline {
+                        sleep_delay = sleep_delay
+                            .min(d.saturating_duration_since(crate::time::ambient_instant()));
+                    }
+                    tokio::time::sleep(sleep_delay).await;
+                    if deadline.is_none_or(|d| crate::time::ambient_instant() < d) {
+                        continue;
+                    }
+                    // Deadline exceeded during (or because of) the
+                    // Retry-After wait — fall through and return this 429
+                    // response as the final outcome, exactly as running out
+                    // of max_attempts already does, instead of sleeping past
+                    // the deadline and only then giving up.
+                }
+                if is_retryable_status(status.as_u16())
+                    && attempt + 1 < max_attempts
+                    && deadline.is_none_or(|d| crate::time::ambient_instant() < d)
+                {
+                    continue;
+                }
+
+                let body = if discard_response_body {
+                    // Dropped unread — see `RequestBuilder::discard_response_body`.
+                    Bytes::new()
+                } else {
+                    resp.bytes()
+                        .await
+                        .map_err(|e| ClientError::Request(e.without_url()))?
+                };
+                log_request(
+                    method.as_str(),
+                    &url_used,
+                    status.as_u16(),
+                    crate::time::ambient_instant().saturating_duration_since(start),
+                    extra_headers,
+                );
+                return Ok(Response {
+                    status,
+                    headers,
+                    body,
+                    url: Some(url_used),
+                });
+            }
+            Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {
+                last_transient_err = Some(e);
+            }
+            Err(e) => return Err(ClientError::Request(e.without_url())),
+        }
+    }
+
+    unreachable!("retry loop exited without returning a result — this is a bug")
+}
+
+/// Extract the host portion of a URL as an owned `String`.
+fn host_of(url: &str) -> Result<String, ClientError> {
+    let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    parsed
+        .host_str()
+        .map(str::to_owned)
+        .ok_or_else(|| ClientError::InvalidUrl(format!("URL has no host: {url}")))
+}
+
+/// `true` when the URL's host is an IP literal (IPv4 or IPv6) rather than a
+/// domain name. Uses the `url` crate's parsed [`url::Host`] so bracketed IPv6
+/// literals and decimal/octal/hex IPv4 encodings are classified correctly.
+fn url_host_is_ip_literal(url: &str) -> Result<bool, ClientError> {
+    let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    match parsed.host() {
+        Some(url::Host::Ipv4(_) | url::Host::Ipv6(_)) => Ok(true),
+        Some(url::Host::Domain(_)) => Ok(false),
+        None => Err(ClientError::InvalidUrl(format!("URL has no host: {url}"))),
+    }
+}
+
+/// `true` when the URL's scheme is `https` (case-insensitive).
+fn scheme_is_https(url: &str) -> Result<bool, ClientError> {
+    let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    Ok(parsed.scheme().eq_ignore_ascii_case("https"))
+}
+
+/// If `resp` is a followable redirect (status `301`, `302`, `303`, `307`, or
+/// `308`) carrying a `Location` header, resolve it to an absolute URL (joining
+/// relative locations against `base`). Returns `Ok(None)` when the response is
+/// not a followable redirect: any status outside that set (including non-3xx and
+/// the non-followable 3xx `300`/`304`/`305`/`306`), or a followable status
+/// missing its `Location` header.
+fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, ClientError> {
+    // Only the statuses reqwest itself follows are treated as redirects. A
+    // response like `304 Not Modified` (or 300/305/306) can legitimately carry
+    // a `Location` header without being a followable redirect, so matching the
+    // entire 300–399 range via `is_redirection()` would wrongly issue an extra
+    // request instead of returning the response to the caller.
+    match resp.status() {
+        reqwest::StatusCode::MOVED_PERMANENTLY
+        | reqwest::StatusCode::FOUND
+        | reqwest::StatusCode::SEE_OTHER
+        | reqwest::StatusCode::TEMPORARY_REDIRECT
+        | reqwest::StatusCode::PERMANENT_REDIRECT => {}
+        _ => return Ok(None),
+    }
+    let Some(location) = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let base_url = url::Url::parse(base).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    let joined = base_url
+        .join(location)
+        .map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    Ok(Some(joined.to_string()))
+}
+
+/// Strip credential-bearing headers when a redirect hop crosses origins.
+///
+/// If `current`'s origin (scheme + host + port, per [`url::Url::origin`])
+/// differs from the `original` request URL's origin, the `Authorization`,
+/// `Cookie`, and `Proxy-Authorization` headers are removed from `headers` so
+/// they are never forwarded to a cross-origin target (credential leak).
+/// Because the caller threads a single mutable `headers` map across hops, once
+/// these headers are stripped on any hop they stay stripped for the remainder
+/// of the chain — the safe, conservative behaviour.
+fn strip_sensitive_headers_if_cross_origin(
+    headers: &mut HeaderMap,
+    original: &url::Url,
+    current: &str,
+) -> Result<(), ClientError> {
+    let current_url =
+        url::Url::parse(current).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    if current_url.origin() != original.origin() {
+        headers.remove(reqwest::header::AUTHORIZATION);
+        headers.remove(reqwest::header::COOKIE);
+        headers.remove(reqwest::header::PROXY_AUTHORIZATION);
+    }
+    Ok(())
+}
+
+/// Apply RFC 7231 §6.4 / RFC 7538 method-and-body rewriting after receiving a
+/// redirect `status`, before issuing the next hop. Mutates `method` and `body`
+/// in place.
+///
+/// - **303 See Other**: switch to `GET` (a `HEAD` stays `HEAD`) and drop the body.
+/// - **301 Moved Permanently / 302 Found**: a `POST` becomes a bodyless `GET`;
+///   every other method (and its body) is preserved — matching prevailing
+///   browser behaviour.
+/// - **307 Temporary Redirect / 308 Permanent Redirect**: preserve the method
+///   **and** the body verbatim (the RFC-correct behaviour — the body must NOT
+///   be dropped).
+/// - Any other redirect status: leave method and body untouched.
+///
+/// Whenever the body is dropped (the POST→GET / 303→GET rewrites), the payload
+/// (entity) headers threaded across hops are also removed from `headers` so the
+/// bodyless follow-up hop does not carry a misleading `Content-Type` /
+/// `Content-Length` / `Transfer-Encoding` / `Content-Encoding` /
+/// `Content-Language` — matching reqwest's redirect layer. On 307/308 the body
+/// is preserved, so those headers are left intact.
+fn rewrite_after_redirect(
+    status: reqwest::StatusCode,
+    method: &mut Method,
+    body: &mut Option<Bytes>,
+    headers: &mut HeaderMap,
+) {
+    match status.as_u16() {
+        303 => {
+            if *method != Method::HEAD {
+                *method = Method::GET;
+            }
+            *body = None;
+            strip_payload_headers(headers);
+        }
+        301 | 302 if *method == Method::POST => {
+            *method = Method::GET;
+            *body = None;
+            strip_payload_headers(headers);
+        }
+        _ => {}
+    }
+}
+
+/// Remove payload (entity) headers from the threaded per-hop header map. Called
+/// when a redirect rewrite drops the request body so a bodyless GET does not
+/// keep carrying the original payload's `Content-Type` etc.
+fn strip_payload_headers(headers: &mut HeaderMap) {
+    use reqwest::header::{
+        CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING,
+    };
+    headers.remove(CONTENT_TYPE);
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(TRANSFER_ENCODING);
+    headers.remove(CONTENT_ENCODING);
+    headers.remove(CONTENT_LANGUAGE);
+}
+
+/// Validate a set of resolved socket addresses against the built-in SSRF
+/// deny-list, failing closed.
+///
+/// Returns `Err(SsrfBlocked)` (naming the first blocked address) if **any**
+/// address's IP is blocked ([`is_blocked_ip`]); otherwise returns the whole set
+/// unchanged, preserving order. Factored out of [`resolve_and_validate`] as a
+/// pure, synchronous helper so the validation policy is unit-testable without
+/// real multi-record DNS.
+fn validate_resolved_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, ClientError> {
+    for addr in &addrs {
+        if is_blocked_ip(addr.ip()) {
+            return Err(ClientError::SsrfBlocked(addr.ip().to_string()));
+        }
+    }
+    Ok(addrs)
+}
+
+/// Resolve `url`'s host to **all** validated [`SocketAddr`]s, rejecting with
+/// [`ClientError::SsrfBlocked`] if the host is (or resolves to) any blocked IP.
+///
+/// IP-literal hosts (including decimal/octal/hex encodings, which the `url`
+/// crate normalises to an `Ipv4Addr` at parse time) are validated directly with
+/// no DNS lookup. Domain hosts are resolved **once** via `tokio::net::lookup_host`
+/// (keeping the TOCTOU window closed) and rejected if **any** resolved address
+/// is blocked. Since the whole DNS response is rejected when any IP is blocked,
+/// it is safe to return the full validated set (order preserved) so a caller can
+/// pin all of them and let reqwest try them in order — an unreachable first
+/// address no longer dooms the request.
+async fn resolve_and_validate(url: &str) -> Result<Vec<SocketAddr>, ClientError> {
+    let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
+    // Explicit scheme allowlist (defence-in-depth): only http/https may be
+    // resolved and connected on the safe path. Reject ftp://, gopher://,
+    // file://, etc. here — before any DNS lookup or connection — rather than
+    // relying on reqwest to reject them after the fact.
+    let scheme = parsed.scheme();
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(ClientError::InvalidUrl(format!(
+            "unsupported URL scheme `{scheme}` (only http/https are allowed): {url}"
+        )));
+    }
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        ClientError::InvalidUrl(format!("URL has no port and unknown scheme: {url}"))
+    })?;
+    let host = parsed
+        .host()
+        .ok_or_else(|| ClientError::InvalidUrl(format!("URL has no host: {url}")))?;
+
+    match host {
+        url::Host::Ipv4(v4) => validate_resolved_addrs(vec![SocketAddr::new(IpAddr::V4(v4), port)]),
+        url::Host::Ipv6(v6) => validate_resolved_addrs(vec![SocketAddr::new(IpAddr::V6(v6), port)]),
+        url::Host::Domain(name) => {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((name, port))
+                .await
+                .map_err(|e| ClientError::InvalidUrl(format!("DNS lookup failed for {name}: {e}")))?
+                .collect();
+            if addrs.is_empty() {
+                return Err(ClientError::InvalidUrl(format!(
+                    "DNS lookup for {name} returned no addresses"
+                )));
+            }
+            // Reject if ANY resolved address is blocked (fail closed); otherwise
+            // return the whole validated set (order preserved from the lookup).
+            validate_resolved_addrs(addrs)
+        }
+    }
+}
+
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get("retry-after")?.to_str().ok()?;
     // Integer seconds (most common form).
@@ -1064,7 +3095,7 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     }
     // HTTP-date format per RFC 9110 (e.g. "Tue, 01 Jan 2030 00:00:00 GMT").
     let dt = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    let now = chrono::Utc::now();
+    let now = crate::time::ambient_now();
     let future = dt.with_timezone(&chrono::Utc);
     let secs = u64::try_from((future - now).num_seconds().max(0)).unwrap_or(0);
     Some(Duration::from_secs(secs))
@@ -1111,9 +3142,20 @@ fn log_request(
 /// when there is no active span with a valid context.
 #[allow(clippy::missing_const_for_fn)]
 fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let mut builder = builder;
+    for (name, value) in trace_context_headers() {
+        builder = builder.header(name, value);
+    }
+    builder
+}
+
+/// The W3C trace-context headers for the active span. Empty when the
+/// `telemetry-otlp` feature is disabled or no span has a valid context.
+#[allow(clippy::missing_const_for_fn)]
+fn trace_context_headers() -> Vec<(String, HeaderValue)> {
     #[cfg(not(feature = "telemetry-otlp"))]
     {
-        builder
+        Vec::new()
     }
     #[cfg(feature = "telemetry-otlp")]
     {
@@ -1124,13 +3166,9 @@ fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBui
         opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.inject_context(&cx, &mut TraceHeaderInjector(&mut map));
         });
-        let mut builder = builder;
-        for (k, v) in map {
-            if let Ok(value) = HeaderValue::from_str(&v) {
-                builder = builder.header(k, value);
-            }
-        }
-        builder
+        map.into_iter()
+            .filter_map(|(name, value)| Some((name, HeaderValue::from_str(&value).ok()?)))
+            .collect()
     }
 }
 
@@ -1539,6 +3577,160 @@ mod tests {
         assert!(other.base_url.is_none());
     }
 
+    // PR #2480 review, round 4 (redesign): `breaker_scoped()` moved breaker accounting for
+    // the custom send path from an external wrapper — `BreakerGuardedCall`, now removed —
+    // to a flag `send_recorded` itself reads. That is what makes the mock bypass, the
+    // capsule-replay bypass, and correct capsule recording of an open-breaker attempt all
+    // free: they were already correctly ordered around `send_recorded` before this flag
+    // existed, for every other caller.
+    //
+    // This test locks in the one thing the external wrapper got wrong (P1, round 1):
+    // keying the breaker by the alias a caller passed to `post`/`get` rather than the
+    // expanded destination. `self.url` is set once, by `Client::build_request`, before any
+    // `breaker_scoped()` or `ssrf_safe()` flag is read, so there is no separate "pass the
+    // right URL" step left to get wrong.
+    #[test]
+    fn breaker_scoped_keys_by_resolved_url_not_alias() {
+        // breaker_for_url really does get_or_create against the shared global
+        // registry, so this needs the same isolation as every other test that
+        // touches it directly — otherwise a concurrently-running test's "no
+        // breaker entry for this host" assertion can observe the entry this
+        // test creates (and never cleans up otherwise).
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut base_urls = std::collections::HashMap::new();
+        base_urls.insert(
+            "hook-service".to_owned(),
+            "http://mock-receiver/base".to_owned(),
+        );
+        let config = HttpClientConfig {
+            timeout_secs: 30,
+            max_retries: 3,
+            max_retry_after_secs: 10,
+            base_urls,
+        };
+        let client = Client::from_config(&config);
+
+        let req = client
+            .named("hook-service")
+            .post("hook-service")
+            .ssrf_safe()
+            .breaker_scoped();
+        assert_eq!(req.url, "http://mock-receiver/base/hook-service");
+        assert!(req.breaker_scoped);
+
+        // The bare alias would neither parse as a URL nor name the real
+        // destination host — exactly the bug the P1 finding caught.
+        assert!(url::Url::parse("hook-service").is_err());
+        let breaker = super::breaker_for_url(None, &req.url);
+        assert_eq!(breaker.name(), "mock-receiver");
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // PR #2480 review, round 4: `breaker_scoped()` on the custom send path
+    // must trip and fail fast exactly like the plain-path breaker already
+    // does (`test_http_client_circuit_breaker_integration`), and must key on
+    // the same host a non-custom-path request to the same URL would.
+    //
+    // No listener needed: `send_ssrf_safe` refuses a loopback destination
+    // (`SsrfBlocked`) before ever dialing, and that refusal is exactly the
+    // kind of failure the breaker must count — a subscriber pointing
+    // `target_url` at a blocked destination repeatedly must trip the breaker
+    // on those refusals just as it would on real 5xxs, not bypass accounting
+    // entirely.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn breaker_scoped_custom_path_trips_and_fails_fast() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+        rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
+        rc.circuit_breaker.defaults.open_duration_secs = Some(10);
+        let client = Client {
+            resilience_config: Some(Arc::new(rc)),
+            ..Client::new()
+        };
+
+        let url = "http://127.0.0.1:1/blocked";
+
+        for _ in 0..3 {
+            let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
+            assert!(
+                matches!(res, Err(ClientError::SsrfBlocked(_))),
+                "expected SsrfBlocked, got {res:?}"
+            );
+        }
+
+        // The breaker for 127.0.0.1 should now be OPEN — the next attempt
+        // must fail fast with CircuitBreakerOpen rather than SsrfBlocked,
+        // proving it never re-entered send_custom (no re-resolution, no
+        // reqwest client built).
+        let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
+        assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // PR #2480 review, round 4: a client with a mock registry attached must
+    // never touch the real breaker even with `breaker_scoped()` set —
+    // `send_recorded` checks `self.mock.is_some()` before it ever reads
+    // `breaker_scoped`, so a deliberately-mocked failure in one test cannot
+    // open the shared global breaker for a host name reused by an unrelated
+    // later test.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn breaker_scoped_bypassed_for_mocked_client() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let registry = Arc::new(MockRegistry::new());
+        let mock = MockSetupBuilder {
+            registry: registry.clone(),
+            alias: "http://mock-receiver/hook".to_owned(),
+            method: None,
+            path: None,
+        }
+        .post("/hook")
+        .respond_with(500, serde_json::json!({ "error": "down" }));
+        let client = Client::new().with_mock(registry);
+
+        // More attempts than minimum_sample_count would need to trip a real
+        // breaker at default thresholds — every one must still reach the
+        // mock rather than short-circuiting on CircuitBreakerOpen.
+        for _ in 0..12 {
+            let res = client
+                .named("http://mock-receiver/hook")
+                .post("http://mock-receiver/hook")
+                .ssrf_safe()
+                .breaker_scoped()
+                .send()
+                .await;
+            let res = res.expect("a mocked client must never see CircuitBreakerOpen");
+            assert_eq!(res.status().as_u16(), 500);
+        }
+        mock.expect_called(12);
+
+        // No breaker entry should exist for the mocked host at all.
+        assert!(
+            crate::circuit_breaker::global_registry()
+                .all_breakers()
+                .iter()
+                .all(|b| b.name() != "mock-receiver"),
+            "a mocked send must never create a real breaker entry"
+        );
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
     // TEST 26: from_request_parts uses AutumnConfig.http when no HttpConfig extension.
     #[tokio::test]
     async fn client_extracts_from_autumn_config_in_state() {
@@ -1710,6 +3902,128 @@ mod tests {
         log_request("POST", &url, 201, Duration::from_millis(12), &headers);
     }
 
+    /// The sim `Host` header keeps IPv6 brackets and the port (issue #2967).
+    #[test]
+    fn sim_host_header_keeps_ipv6_brackets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().route(
+            "/status",
+            axum::routing::get(|headers: HeaderMap| async move {
+                headers
+                    .get(reqwest::header::HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned()
+            }),
+        );
+        runtime.block_on(async {
+            for (url, host) in [
+                ("http://[::1]:8080/status", "[::1]:8080"),
+                ("http://[::1]/status", "[::1]"),
+                ("http://payments:8443/status", "payments:8443"),
+            ] {
+                let request = Client::new().get(url);
+                let parsed = reqwest::Url::parse(url).unwrap();
+                let seen = serve_sim_host(echo.clone(), &request, parsed)
+                    .await
+                    .unwrap()
+                    .text();
+                assert_eq!(seen, host, "{url}");
+            }
+        });
+    }
+
+    /// A sim request with a body carries its `Content-Length`, as the real
+    /// client's does, and a caller value wins (issue #2967).
+    #[test]
+    fn sim_host_receives_content_length() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            headers
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_owned()
+        });
+        let url = "http://payments/charge";
+        let parsed = reqwest::Url::parse(url).unwrap();
+        runtime.block_on(async {
+            for (request, expected) in [
+                (Client::new().post(url).text_body("hello"), "5"),
+                (
+                    Client::new().post(url).json(&serde_json::json!({"a": 1})),
+                    "7",
+                ),
+                (Client::new().post(url).bytes_body(Bytes::new()), "0"),
+                (Client::new().get(url), "none"),
+            ] {
+                let seen = serve_sim_host(echo.clone(), &request, parsed.clone())
+                    .await
+                    .unwrap()
+                    .text();
+                assert_eq!(seen, expected);
+            }
+        });
+    }
+
+    /// A sim host sees the active span's `traceparent`, as a real upstream
+    /// does, and a caller header of the same name wins (issue #2967).
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn sim_host_receives_trace_context() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing_subscriber::prelude::*;
+
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+        let provider = SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = || {
+            axum::Router::new().route(
+                "/echo",
+                axum::routing::get(|headers: HeaderMap| async move {
+                    headers
+                        .get("traceparent")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned()
+                }),
+            )
+        };
+        let url = reqwest::Url::parse("http://payments/echo").unwrap();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("sim_trace_test");
+            let _guard = span.enter();
+            runtime.block_on(async {
+                let request = Client::new().get("http://payments/echo");
+                let traceparent = serve_sim_host(echo(), &request, url.clone())
+                    .await
+                    .unwrap()
+                    .text();
+                assert!(traceparent.starts_with("00-"), "{traceparent}");
+
+                let request = Client::new()
+                    .get("http://payments/echo")
+                    .header("traceparent", "caller-value");
+                let response = serve_sim_host(echo(), &request, url.clone()).await.unwrap();
+                assert_eq!(response.text(), "caller-value");
+            });
+        });
+    }
+
     // TEST 34: inject_trace_context passthrough (without telemetry-otlp feature).
     #[test]
     fn inject_trace_context_passthrough_without_telemetry() {
@@ -1846,6 +4160,33 @@ mod tests {
         let err = ClientError::NoMock("GET".to_owned(), "/path".to_owned());
         assert!(err.to_string().contains("GET"));
         assert!(err.to_string().contains("/path"));
+    }
+
+    /// Capsule replay is offline by construction (issue #1598, AC4): a capsule
+    /// records the request, the clock and the database, and nothing about the
+    /// services the handler called. The block is process-wide and one-way, so
+    /// this checks the predicate's default and the message an operator sees —
+    /// the wiring itself is pinned by `app::tests::replay_reaches_nothing_outside_the_capsule`,
+    /// which cannot be expressed here without blocking the whole test binary.
+    #[test]
+    fn outbound_is_open_until_a_replay_blocks_it() {
+        assert!(
+            !outbound_blocked_for_replay(),
+            "a serving process must never start out blocked"
+        );
+        let error = ClientError::BlockedDuringReplay(
+            "GET".to_owned(),
+            "https://payments.example/charge".to_owned(),
+        )
+        .to_string();
+        assert!(
+            error.contains("blocked during replay") && error.contains("not recorded"),
+            "the error must say why the call did not happen, got {error}"
+        );
+        assert!(
+            error.contains("GET") && error.contains("https://payments.example/charge"),
+            "and which call it was, got {error}"
+        );
     }
 
     // TEST 40: Outbound circuit breaker integration trips and fails fast.
@@ -2018,5 +4359,1114 @@ mod tests {
         });
 
         let _client = Client::from_state(&state);
+    }
+
+    // ── Security-hardening tests (#1238 redirects, #1239 SSRF/pinning) ────────
+
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // TEST 44: SSRF address policy — blocked ranges.
+    #[test]
+    fn ssrf_policy_blocks_private_and_reserved_ipv4() {
+        let blocked = [
+            "0.0.0.0",
+            "10.1.2.3",
+            "100.64.0.1",      // CGNAT
+            "127.0.0.1",       // loopback
+            "169.254.169.254", // cloud metadata
+            "172.16.5.4",      // private
+            "192.0.0.1",       // IETF
+            "192.0.2.5",       // TEST-NET-1
+            "192.88.99.1",     // 6to4 anycast relay
+            "192.168.1.1",     // private
+            "198.18.0.1",      // benchmarking
+            "198.51.100.7",    // TEST-NET-2
+            "203.0.113.9",     // TEST-NET-3
+            "224.0.0.1",       // multicast
+            "240.0.0.1",       // reserved
+            "255.255.255.255", // broadcast
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{s} should be blocked");
+            assert!(!is_public_ip(ip), "{s} should not be public");
+        }
+    }
+
+    // TEST 45: SSRF address policy — public IPv4 is allowed.
+    #[test]
+    fn ssrf_policy_allows_public_ipv4() {
+        for s in ["1.1.1.1", "8.8.8.8", "93.184.216.34"] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_public_ip(ip), "{s} should be public");
+            assert!(!is_blocked_ip(ip), "{s} should not be blocked");
+        }
+    }
+
+    // TEST 46: SSRF address policy — IPv6 blocked ranges, mapped/compatible forms.
+    #[test]
+    fn ssrf_policy_ipv6_and_mapped_forms() {
+        let blocked = [
+            "::",                     // unspecified
+            "::1",                    // loopback
+            "fe80::1",                // link-local
+            "fc00::1",                // ULA
+            "ff02::1",                // multicast
+            "2001:db8::1",            // documentation
+            "fec0::1",                // deprecated site-local
+            "::ffff:169.254.169.254", // IPv4-mapped metadata
+            "::ffff:127.0.0.1",       // IPv4-mapped loopback
+            // Remaining IANA special-purpose prefixes (Globally Reachable = False).
+            "100::1",          // Discard-Only 100::/64 (RFC 6666)
+            "100::dead:beef",  // Discard-Only 100::/64 (RFC 6666)
+            "2001:2::1",       // Benchmarking 2001:2::/48 (RFC 5180)
+            "2001:10::1",      // ORCHID 2001:10::/28 (RFC 4843)
+            "2001:20::1",      // ORCHIDv2 2001:20::/28 (RFC 7343)
+            "2001:20:abcd::1", // ORCHIDv2 within /28 (RFC 7343)
+            "2001:2f::1",      // ORCHIDv2 top of /28 (s[1]=0x002f, RFC 7343)
+            "3fff::1",         // Documentation 3fff::/20 (RFC 9637)
+            "3fff:0fff::1",    // Documentation top of /20 (s[1]=0x0fff, RFC 9637)
+            "5f00::1",         // SRv6 SIDs 5f00::/16 (RFC 9602)
+            "5f00:1234::1",    // SRv6 SIDs within /16 (RFC 9602)
+            "2620:4f:8000::1", // Direct Delegation AS112 (RFC 7534)
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{s} should be blocked");
+        }
+        // IPv4-compatible ::7f00:1 == 127.0.0.1 (deprecated form) is blocked.
+        let compat = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001));
+        assert!(
+            is_blocked_ip(compat),
+            "::7f00:1 (127.0.0.1) should be blocked"
+        );
+
+        // A real public IPv6 (Cloudflare DNS) is allowed.
+        let public: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+        assert!(
+            is_public_ip(public),
+            "2606:4700:4700::1111 should be public"
+        );
+
+        // Negative tests: real public addresses adjacent to the newly-blocked
+        // special-purpose prefixes must stay allowed (no over-blocking).
+        let public_addrs = [
+            "2001:4860:4860::8888", // Google DNS
+            "2606:4700:4700::1111", // Cloudflare DNS
+            "2400:cb00:2048::1",    // public 2400 (Cloudflare)
+            "2620:0:2d0:200::7",    // public 2620 NOT in AS112 2620:4f:8000::/48
+            "2001:2:1::1",          // just outside benchmarking /48 (s[2]=1, not ORCHID)
+            "3fff:abcd::1",         // outside documentation /20 (s[1]=0xabcd > 0x0fff)
+            "4000::1",              // outside documentation 3fff::/20
+            "5e00::1",              // outside SRv6 5f00::/16
+            "6000::1",              // outside SRv6 5f00::/16
+        ];
+        for s in public_addrs {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_public_ip(ip), "{s} should be public");
+            assert!(!is_blocked_ip(ip), "{s} should not be blocked");
+        }
+    }
+
+    // TEST 46b: SSRF policy blocks private / metadata IPv4 tunnelled inside an
+    // IPv6 literal via NAT64 (64:ff9b::/96) and 6to4 (2002::/16), while leaving
+    // a genuinely-public embedded IPv4 (and native public v6) public.
+    #[test]
+    fn ssrf_policy_blocks_tunnelled_ipv4() {
+        let blocked = [
+            "64:ff9b::a9fe:a9fe", // NAT64 → 169.254.169.254 (cloud metadata)
+            "64:ff9b::7f00:1",    // NAT64 → 127.0.0.1 (loopback)
+            // RFC 8215 local-use NAT64 `64:ff9b:1::/48` is denied outright.
+            "64:ff9b:1::a9fe:a9fe", // local-use NAT64 → 169.254.169.254
+            "64:ff9b:1::7f00:1",    // local-use NAT64 → 127.0.0.1
+            "64:ff9b:1::808:808",   // local-use NAT64 embedding public 8.8.8.8: still blocked
+            "2002:a9fe:a9fe::",     // 6to4  → 169.254.169.254
+            "2002:7f00:1::",        // 6to4  → 127.0.0.1
+            "2002:0a00:0001::",     // 6to4  → 10.0.0.1
+            // SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 6052): segment[4] ==
+            // 0xffff, segment[5] == 0, IPv4 in the last 32 bits. Distinct from
+            // IPv4-mapped `::ffff:0:0/96`, so must be decoded and re-checked.
+            "::ffff:0:169.254.169.254", // SIIT → 169.254.169.254 (cloud metadata)
+            "::ffff:0:127.0.0.1",       // SIIT → 127.0.0.1 (loopback)
+        ];
+        for s in blocked {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{s} should be blocked");
+            assert!(!is_public_ip(ip), "{s} should not be public");
+        }
+
+        // 192.88.99.0/24 (6to4 anycast relay) is blocked as a plain IPv4 literal.
+        let anycast: IpAddr = "192.88.99.1".parse().unwrap();
+        assert!(is_blocked_ip(anycast), "192.88.99.1 should be blocked");
+
+        // A 6to4 address embedding a genuinely-public IPv4 (8.8.8.8) stays
+        // public (the embedded v4 is public, so it falls through to the native
+        // v6 checks, which do not match 2002::/16). So does a native public v6.
+        // A SIIT IPv4-translated address embedding a genuinely-public IPv4
+        // (8.8.8.8) stays public — the decoded v4 is public, so it falls
+        // through to the native v6 checks, which do not match it.
+        for s in ["2002:0808:0808::", "2606:4700::1111", "::ffff:0:8.8.8.8"] {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_public_ip(ip), "{s} should be public");
+            assert!(!is_blocked_ip(ip), "{s} should not be blocked");
+        }
+    }
+
+    // TEST 47: the `url` crate normalises decimal/hex IP-literal hosts to Ipv4,
+    // so `http://2130706433/` (== 127.0.0.1) is recognised as a blocked IP.
+    #[test]
+    fn ssrf_policy_decimal_encoded_host_is_blocked() {
+        for raw in [
+            "http://2130706433/",
+            "http://0x7f000001/",
+            "http://127.0.0.1/",
+        ] {
+            let parsed = url::Url::parse(raw).unwrap();
+            match parsed.host() {
+                Some(url::Host::Ipv4(v4)) => {
+                    assert_eq!(
+                        v4,
+                        Ipv4Addr::LOCALHOST,
+                        "{raw} should normalise to 127.0.0.1"
+                    );
+                    assert!(
+                        is_blocked_ip(IpAddr::V4(v4)),
+                        "{raw} host should be blocked"
+                    );
+                }
+                other => panic!("{raw} did not parse to an Ipv4 host: {other:?}"),
+            }
+        }
+    }
+
+    // Small axum helper: spawn `app` on an ephemeral 127.0.0.1 port, return it.
+    async fn spawn(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    fn redirect_302(location: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(302)
+            .header("location", location)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn redirect_307(location: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(307)
+            .header("location", location)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    // Build a response with an arbitrary status that carries a `Location`
+    // header — used to prove non-followable 3xx statuses (304/300/…) are NOT
+    // treated as redirects even when they advertise a `Location`.
+    fn response_with_location(status: u16, location: String) -> axum::response::Response {
+        axum::response::Response::builder()
+            .status(status)
+            .header("location", location)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    // TEST 48: no_redirect returns the 3xx verbatim without following it.
+    #[tokio::test]
+    async fn no_redirect_returns_3xx_unfollowed() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route(
+            "/start",
+            get(|| async { redirect_302("http://127.0.0.1:1/never".to_owned()) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", addr.port()))
+            .no_redirect()
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 302);
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("http://127.0.0.1:1/never")
+        );
+    }
+
+    // TEST 48b: the non-ssrf `no_redirect()` path returns the 3xx verbatim even
+    // when `Location` is a MALFORMED URL. That path uses reqwest's
+    // `Policy::none()` and never parses `Location`, so a bad target cannot turn
+    // a `no_redirect()` fetch into an error. This guards the same "don't parse
+    // Location when not following" contract that `send_ssrf_safe` now enforces
+    // by returning the 3xx BEFORE calling `redirect_target`.
+    //
+    // NOTE: the SSRF-safe equivalent — `get_ssrf_safe(url).no_redirect()`
+    // against a listener returning a malformed `Location` — cannot be exercised
+    // end-to-end in-sandbox: the SSRF guard denies loopback (127.0.0.1), so the
+    // request is rejected during resolve→validate before any response is
+    // received. This testable-layer variant documents/guards the shared
+    // contract instead.
+    #[tokio::test]
+    async fn no_redirect_returns_3xx_with_malformed_location() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route(
+            "/start",
+            // `ht!tp://\bad` is not a parseable absolute URL (invalid scheme),
+            // but it is a valid HTTP header value, so the server can emit it.
+            get(|| async { redirect_302("ht!tp://\\bad".to_owned()) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", addr.port()))
+            .no_redirect()
+            .send()
+            .await
+            .expect("no_redirect() must return the 3xx even with a malformed Location");
+
+        assert_eq!(resp.status().as_u16(), 302);
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("ht!tp://\\bad")
+        );
+    }
+
+    // TEST 49: follow_redirects follows a valid chain A→B and calls the validator.
+    #[tokio::test]
+    async fn follow_redirects_valid_chain_calls_validator() {
+        use axum::{Router, routing::get};
+
+        let b_addr = spawn(Router::new().route("/final", get(|| async { "final-body" }))).await;
+        let b_port = b_addr.port();
+        let a_addr = spawn(Router::new().route(
+            "/start",
+            get(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/final")) }),
+        ))
+        .await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", a_addr.port()))
+            .follow_redirects(5, move |_loc| {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text(), "final-body");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "validator called once per hop"
+        );
+    }
+
+    // TEST 50: follow_redirects rejects a redirect to a private/blocked target,
+    // and NEVER connects to that private address. Uses the SSRF IP policy as the
+    // validator — structurally the same guard get_ssrf_safe applies per hop.
+    #[tokio::test]
+    async fn follow_redirects_rejects_private_target() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        // A "private" server that must never be reached.
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let priv_addr = spawn(Router::new().route(
+            "/secret",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "SECRET"
+                }
+            }),
+        ))
+        .await;
+        let priv_port = priv_addr.port();
+
+        // Public-ish entrypoint that 302s to the private loopback target.
+        let a_addr = spawn(Router::new().route(
+            "/start",
+            get(
+                move || async move { redirect_302(format!("http://127.0.0.1:{priv_port}/secret")) },
+            ),
+        ))
+        .await;
+
+        let validator = |u: &str| -> bool {
+            let Ok(p) = url::Url::parse(u) else {
+                return false;
+            };
+            match p.host() {
+                Some(url::Host::Ipv4(v4)) => is_public_ip(IpAddr::V4(v4)),
+                Some(url::Host::Ipv6(v6)) => is_public_ip(IpAddr::V6(v6)),
+                _ => true,
+            }
+        };
+
+        let result = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", a_addr.port()))
+            .follow_redirects(5, validator)
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::RedirectRejected(_))),
+            "expected RedirectRejected, got {result:?}"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "the private target must never be connected to"
+        );
+    }
+
+    // TEST 51: follow_redirects with a chain longer than `max` → TooManyRedirects.
+    #[tokio::test]
+    async fn follow_redirects_cap_exceeded() {
+        use axum::{Router, routing::get};
+
+        // /loop always redirects back to itself → infinite chain.
+        let addr =
+            spawn(Router::new().route("/loop", get(|| async { redirect_302("/loop".to_owned()) })))
+                .await;
+
+        let result = Client::new()
+            .get(format!("http://127.0.0.1:{}/loop", addr.port()))
+            .follow_redirects(2, |_| true)
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::TooManyRedirects(2))),
+            "expected TooManyRedirects(2), got {result:?}"
+        );
+    }
+
+    // TEST 52: follow_redirects(0, ..) turns the first 3xx into TooManyRedirects.
+    #[tokio::test]
+    async fn follow_redirects_zero_max_errors_on_first_3xx() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route(
+            "/start",
+            get(|| async { redirect_302("http://127.0.0.1:1/x".to_owned()) }),
+        ))
+        .await;
+
+        let result = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", addr.port()))
+            .follow_redirects(0, |_| true)
+            .send()
+            .await;
+
+        assert!(matches!(result, Err(ClientError::TooManyRedirects(0))));
+    }
+
+    // TEST 53: pin_to bypasses DNS and connects to the URL's port.
+    //
+    // The host `pinned.invalid` is guaranteed non-resolvable (.invalid TLD), yet
+    // pinning to 127.0.0.1 reaches the listener — proving DNS was bypassed. The
+    // pinned SocketAddr uses port 1 (which nothing listens on) while the URL uses
+    // the real listener port; reaching the listener proves reqwest IGNORES the
+    // resolve SocketAddr's port and connects to the URL's port instead.
+    #[tokio::test]
+    async fn pin_to_bypasses_dns_and_uses_url_port() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route("/ping", get(|| async { "pong" }))).await;
+        let listener_port = addr.port();
+
+        let resp = Client::new()
+            .get(format!("http://pinned.invalid:{listener_port}/ping"))
+            // Deliberately-wrong port (1) to probe reqwest's port handling.
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1))
+            .send()
+            .await
+            .expect("pinned request should reach the loopback listener");
+
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text(), "pong");
+    }
+
+    // TEST 54: get_ssrf_safe rejects a host that resolves to a blocked IP BEFORE
+    // connecting. `localhost` resolves to 127.0.0.1 (and/or ::1), both blocked.
+    // The listener's handler must never fire.
+    #[tokio::test]
+    async fn get_ssrf_safe_rejects_loopback_host_before_connecting() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let addr = spawn(Router::new().route(
+            "/x",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "reached"
+                }
+            }),
+        ))
+        .await;
+
+        let result = Client::new()
+            .get_ssrf_safe(format!("http://localhost:{}/x", addr.port()))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::SsrfBlocked(_))),
+            "expected SsrfBlocked, got {result:?}"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "SSRF guard must reject before any connection"
+        );
+    }
+
+    // TEST 55: get_ssrf_safe rejects a decimal-encoded loopback IP literal
+    // (http://2130706433/ == 127.0.0.1) with no DNS lookup.
+    #[tokio::test]
+    async fn get_ssrf_safe_rejects_decimal_encoded_loopback() {
+        let result = Client::new()
+            .get_ssrf_safe("http://2130706433/")
+            .send()
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::SsrfBlocked(_))),
+            "expected SsrfBlocked, got {result:?}"
+        );
+    }
+
+    // TEST 56: resolve_and_validate — the resolve→validate core of get_ssrf_safe.
+    // A public IP literal validates (returning the URL's port); blocked literals
+    // and decimal-encoded loopback are rejected with SsrfBlocked. Exercising the
+    // actual network connect of the safe path against a public host is NOT
+    // reproducible in-sandbox (no reachable public server); it is covered
+    // structurally by the pin_to and follow_redirects tests. See the report.
+    #[tokio::test]
+    async fn resolve_and_validate_accepts_public_rejects_blocked() {
+        // Public literal with an explicit port → Ok, single-element validated
+        // set, port preserved.
+        let ok = resolve_and_validate("http://8.8.8.8:8080/path")
+            .await
+            .unwrap();
+        assert_eq!(
+            ok,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8080)]
+        );
+
+        // https default port is inferred.
+        let ok_https = resolve_and_validate("https://1.1.1.1/").await.unwrap();
+        assert_eq!(ok_https.len(), 1);
+        assert_eq!(ok_https[0].port(), 443);
+
+        // Blocked literals and decimal-encoded loopback → SsrfBlocked.
+        for raw in [
+            "http://127.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/",
+            "http://2130706433/",
+        ] {
+            let err = resolve_and_validate(raw).await;
+            assert!(
+                matches!(err, Err(ClientError::SsrfBlocked(_))),
+                "{raw} should be SsrfBlocked, got {err:?}"
+            );
+        }
+    }
+
+    // TEST 56b: validate_resolved_addrs — the pure validation core shared by the
+    // resolve→validate step. A set of public addrs returns ALL of them in order;
+    // a set mixing a public and a blocked addr is rejected with SsrfBlocked; an
+    // all-public IPv6+IPv4 mix returns everything in order. This exercises the
+    // multi-record path (pin to ALL validated addresses) without needing real
+    // multi-record DNS.
+    #[test]
+    fn validate_resolved_addrs_returns_all_public_rejects_any_blocked() {
+        let v4 = |a, b, c, d, p| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), p);
+
+        // Two public addrs → Ok with BOTH returned, order preserved.
+        let two = vec![v4(1, 1, 1, 1, 443), v4(8, 8, 8, 8, 443)];
+        assert_eq!(validate_resolved_addrs(two.clone()).unwrap(), two);
+
+        // Public + blocked (10.0.0.1, RFC1918) → Err(SsrfBlocked).
+        let mixed = vec![v4(1, 1, 1, 1, 443), v4(10, 0, 0, 1, 443)];
+        assert!(
+            matches!(
+                validate_resolved_addrs(mixed),
+                Err(ClientError::SsrfBlocked(_))
+            ),
+            "a set containing a blocked address must be rejected"
+        );
+
+        // All-public IPv6 (2606:4700:4700::1111, Cloudflare) + IPv4 mix → Ok,
+        // all preserved in order.
+        let v6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+            443,
+        );
+        let mix = vec![v6, v4(8, 8, 8, 8, 443)];
+        assert_eq!(validate_resolved_addrs(mix.clone()).unwrap(), mix);
+    }
+
+    // TEST 57: pin_to alone does NOT auto-follow a cross-host redirect. reqwest
+    // would otherwise re-resolve the new host via normal DNS, silently escaping
+    // the pin. The 302 must be returned verbatim and the onward target must
+    // never be connected to.
+    #[tokio::test]
+    async fn pin_to_does_not_follow_redirect_unpinned() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        // The redirect target that must never be reached.
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let onward = spawn(Router::new().route(
+            "/onward",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "REACHED"
+                }
+            }),
+        ))
+        .await;
+        let onward_port = onward.port();
+
+        let start =
+            spawn(Router::new().route(
+                "/start",
+                get(move || async move {
+                    redirect_302(format!("http://127.0.0.1:{onward_port}/onward"))
+                }),
+            ))
+            .await;
+        let start_port = start.port();
+
+        // Use a DOMAIN host (`pinned.invalid`) so the pin's resolve override is
+        // actually consulted; pinning an IP-literal host is now rejected by the
+        // PinRequiresDomainHost guard. The non-resolvable domain reaches the
+        // loopback listener only via the pin.
+        let resp = Client::new()
+            .get(format!("http://pinned.invalid:{start_port}/start"))
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), start_port))
+            .send()
+            .await
+            .expect("pinned request should return the 302 unfollowed");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "pin_to must return the redirect unfollowed"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "pin_to must not silently follow the redirect onward"
+        );
+    }
+
+    // TEST 58: get_ssrf_safe rejects a non-http(s) scheme up front with
+    // InvalidUrl, before any DNS resolution or connection.
+    #[tokio::test]
+    async fn get_ssrf_safe_rejects_non_http_scheme() {
+        for raw in ["ftp://public.example/resource", "gopher://public.example/"] {
+            let result = Client::new().get_ssrf_safe(raw).send().await;
+            assert!(
+                matches!(result, Err(ClientError::InvalidUrl(_))),
+                "{raw} should be rejected with InvalidUrl, got {result:?}"
+            );
+        }
+    }
+
+    // TEST 59: a cross-origin redirect (different port ⇒ different origin) must
+    // NOT forward credential-bearing request headers to the new origin. This is
+    // the manual-redirect-loop version of reqwest's built-in strip-on-cross-host
+    // behaviour, closing a credential-leak hole (Fix A).
+    #[tokio::test]
+    async fn follow_redirects_strips_sensitive_headers_cross_origin() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        // Listener B records the headers it received (different port = different
+        // origin from A).
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move |headers: HeaderMap| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some(headers);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        // Listener A 302-redirects onto B.
+        let a_addr = spawn(Router::new().route(
+            "/",
+            get(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .header("authorization", "secret")
+            .header("cookie", "session=abc")
+            .header("proxy-authorization", "Basic zzz")
+            .follow_redirects(3, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let headers = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("listener B must have been reached");
+        assert!(
+            headers.get("authorization").is_none(),
+            "authorization must be stripped on a cross-origin redirect"
+        );
+        assert!(
+            headers.get("cookie").is_none(),
+            "cookie must be stripped on a cross-origin redirect"
+        );
+        assert!(
+            headers.get("proxy-authorization").is_none(),
+            "proxy-authorization must be stripped on a cross-origin redirect"
+        );
+    }
+
+    // TEST 60: a SAME-origin redirect (relative `Location`, same host:port) must
+    // keep credential-bearing headers — stripping only applies across origins.
+    #[tokio::test]
+    async fn follow_redirects_keeps_sensitive_headers_same_origin() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let addr = spawn(
+            Router::new()
+                .route("/", get(|| async { redirect_302("/next".to_owned()) }))
+                .route(
+                    "/next",
+                    get(move |headers: HeaderMap| {
+                        let slot = seen2.clone();
+                        async move {
+                            *slot.lock().unwrap() = Some(headers);
+                            "ok"
+                        }
+                    }),
+                ),
+        )
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/", addr.port()))
+            .header("authorization", "secret")
+            .follow_redirects(3, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let headers = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("/next must have been reached");
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("secret"),
+            "authorization must be preserved on a same-origin redirect"
+        );
+    }
+
+    // TEST 61: RFC 7231 §6.4.3 — a 302 in response to a POST rewrites the next
+    // hop to a bodyless GET (Fix B).
+    #[tokio::test]
+    async fn follow_redirects_302_post_becomes_get() {
+        use axum::{
+            Router,
+            routing::{any, post},
+        };
+
+        let seen: Arc<Mutex<Option<(String, HeaderMap, Bytes)>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        // B records the method + headers + body it actually received, for any verb.
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            any(move |method: Method, headers: HeaderMap, body: Bytes| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some((method.to_string(), headers, body));
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        let a_addr = spawn(Router::new().route(
+            "/",
+            post(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        // `.json(..)` sets a request body AND `Content-Type: application/json`.
+        // On the 302 POST→GET rewrite the body is dropped, and the payload
+        // headers must be dropped with it (Fix B) — otherwise the followed GET
+        // would carry a misleading `Content-Type` for a body it no longer has.
+        let resp = Client::new()
+            .post(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .json(&serde_json::json!({"payload": true}))
+            .follow_redirects(3, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let (method, headers, body) = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("listener B must have been reached");
+        assert_eq!(method, "GET", "302 must rewrite POST → GET");
+        assert!(body.is_empty(), "302 POST→GET must drop the request body");
+        assert!(
+            !headers.contains_key(reqwest::header::CONTENT_TYPE),
+            "302 POST→GET must drop the Content-Type payload header"
+        );
+        assert!(
+            !headers.contains_key(reqwest::header::CONTENT_LENGTH),
+            "302 POST→GET must drop the Content-Length payload header"
+        );
+    }
+
+    // TEST 62: RFC 7231 §6.4.7 — a 307 preserves BOTH the method and the body
+    // across the redirect (the review bot's drop-body-every-hop snippet was
+    // wrong here) (Fix B).
+    #[tokio::test]
+    async fn follow_redirects_307_preserves_method_and_body() {
+        use axum::{
+            Router,
+            routing::{any, post},
+        };
+
+        let seen: Arc<Mutex<Option<(String, Bytes)>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            any(move |method: Method, body: Bytes| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some((method.to_string(), body));
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        let a_addr = spawn(Router::new().route(
+            "/",
+            post(move || async move { redirect_307(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .post(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .text_body("payload")
+            .follow_redirects(3, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200);
+        let (method, body) = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("listener B must have been reached");
+        assert_eq!(method, "POST", "307 must preserve the POST method");
+        assert_eq!(
+            &body[..],
+            b"payload",
+            "307 must preserve the request body verbatim"
+        );
+    }
+
+    // TEST 63: get_ssrf_safe derives its redirect follow/cap from the chained
+    // builder mode via ssrf_redirect_plan, so `no_redirect()` /
+    // `follow_redirects(max, ..)` override the SSRF-safe default hop cap.
+    //
+    // NOTE: the network-level follow behaviour of get_ssrf_safe cannot be
+    // exercised in-sandbox — the only reachable address here is loopback, which
+    // the SSRF guard blocks before connecting — so this deterministic unit test
+    // on the factored `ssrf_redirect_plan` helper stands in for it.
+    #[test]
+    fn ssrf_redirect_plan_honours_chained_override() {
+        let client = Client::new();
+
+        // Default get_ssrf_safe → follow up to the SSRF-safe hop cap.
+        let default = client.get_ssrf_safe("https://example.com/");
+        assert_eq!(
+            default.ssrf_redirect_plan(),
+            (true, SSRF_SAFE_MAX_REDIRECTS),
+            "default SSRF-safe path follows up to SSRF_SAFE_MAX_REDIRECTS"
+        );
+
+        // no_redirect() → do NOT follow.
+        let none = client.get_ssrf_safe("https://example.com/").no_redirect();
+        let (follow, _max) = none.ssrf_redirect_plan();
+        assert!(
+            !follow,
+            "no_redirect() must disable following on the safe path"
+        );
+
+        // follow_redirects(3, ..) → follow up to the caller's max.
+        let follow3 = client
+            .get_ssrf_safe("https://example.com/")
+            .follow_redirects(3, |_| true);
+        assert_eq!(
+            follow3.ssrf_redirect_plan(),
+            (true, 3),
+            "follow_redirects(3, ..) must cap the safe path at 3 hops"
+        );
+    }
+
+    // TEST 64: pin_to + follow_redirects is rejected at send time with
+    // IncompatiblePinRedirect — deterministically, without touching the network.
+    // A single pinned SocketAddr only covers hop 0; later redirect hops re-resolve
+    // via normal DNS, so following would silently escape the pin.
+    #[tokio::test]
+    async fn pin_then_follow_redirects_is_rejected() {
+        let result = Client::new()
+            .get("http://example.com/")
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .follow_redirects(2, |_| true)
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::IncompatiblePinRedirect(_))),
+            "expected IncompatiblePinRedirect, got {result:?}"
+        );
+    }
+
+    // TEST 65: the rejection is order-independent — chaining follow_redirects
+    // before pin_to produces the same IncompatiblePinRedirect error.
+    #[tokio::test]
+    async fn follow_redirects_then_pin_is_rejected() {
+        let result = Client::new()
+            .get("http://example.com/")
+            .follow_redirects(2, |_| true)
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::IncompatiblePinRedirect(_))),
+            "expected IncompatiblePinRedirect, got {result:?}"
+        );
+    }
+
+    // TEST 66: pin_to combined with no_redirect is NOT affected by the guard —
+    // the request proceeds and returns the 3xx verbatim (RedirectMode::None).
+    #[tokio::test]
+    async fn pin_with_no_redirect_is_allowed() {
+        use axum::{Router, routing::get};
+
+        let addr = spawn(Router::new().route(
+            "/start",
+            get(|| async { redirect_302("http://127.0.0.1:1/onward".to_owned()) }),
+        ))
+        .await;
+        let port = addr.port();
+
+        // Use a DOMAIN host so the pin's resolve override is consulted; pinning
+        // an IP-literal host is now rejected by the PinRequiresDomainHost guard.
+        let resp = Client::new()
+            .get(format!("http://pinned.invalid:{port}/start"))
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+            .no_redirect()
+            .send()
+            .await
+            .expect("pin_to + no_redirect must return the 3xx unfollowed, not error");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "pin_to + no_redirect returns the redirect verbatim"
+        );
+    }
+
+    // TEST 67: pin_to on an IPv4-literal URL host is rejected at send time with
+    // PinRequiresDomainHost — deterministically, without touching the network.
+    // reqwest/hyper treat an IP-literal host as already-resolved and skip the
+    // resolve override that installs the pin, so the socket would connect to the
+    // literal in the URL (198.51.100.1), NOT the pinned 127.0.0.1 — silently
+    // bypassing the pin. The guard rejects it instead.
+    #[tokio::test]
+    async fn pin_to_ipv4_literal_host_is_rejected() {
+        let result = Client::new()
+            .get("http://198.51.100.1:8080/")
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::PinRequiresDomainHost(_))),
+            "expected PinRequiresDomainHost, got {result:?}"
+        );
+    }
+
+    // TEST 68: the same rejection applies to an IPv6-literal URL host.
+    #[tokio::test]
+    async fn pin_to_ipv6_literal_host_is_rejected() {
+        let result = Client::new()
+            .get("http://[2606:4700::1111]/")
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::PinRequiresDomainHost(_))),
+            "expected PinRequiresDomainHost, got {result:?}"
+        );
+    }
+
+    // TEST 68b: get_ssrf_safe combined with pin_to is rejected at send time with
+    // PinNotAllowedWithSsrfSafe — deterministically, without touching the
+    // network. The SSRF-safe path runs its own per-hop resolve/validate/pin and
+    // never reads the pin_to address, so an explicit pin would be silently
+    // ignored; the guard fails loudly instead.
+    #[tokio::test]
+    async fn get_ssrf_safe_with_pin_to_is_rejected() {
+        let result = Client::new()
+            .get_ssrf_safe("http://example.com/")
+            .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080))
+            .send()
+            .await;
+
+        assert!(
+            matches!(result, Err(ClientError::PinNotAllowedWithSsrfSafe(_))),
+            "expected PinNotAllowedWithSsrfSafe, got {result:?}"
+        );
+    }
+
+    // TEST 69: a `304 Not Modified` that happens to carry a `Location` header is
+    // NOT a followable redirect. reqwest only follows 301/302/303/307/308, so
+    // `redirect_target` must return the 304 to the caller verbatim rather than
+    // issuing a second request against the `Location` target.
+    #[tokio::test]
+    async fn follow_redirects_does_not_follow_304_with_location() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        // Listener B must never be reached.
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "SHOULD-NOT-BE-HIT"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        // Listener A returns 304 + Location pointing at B.
+        let a_addr = spawn(Router::new().route(
+            "/start",
+            get(move || async move {
+                response_with_location(304, format!("http://127.0.0.1:{b_port}/dst"))
+            }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", a_addr.port()))
+            .follow_redirects(5, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            304,
+            "a 304 with a Location header must be returned verbatim, not followed"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "the 304 Location target must never be requested"
+        );
+    }
+
+    // TEST 70: a `300 Multiple Choices` that carries a `Location` header is
+    // likewise not a followable redirect (only 301/302/303/307/308 are), so the
+    // 300 is returned to the caller and the `Location` target is never hit.
+    #[tokio::test]
+    async fn follow_redirects_does_not_follow_300_with_location() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::AtomicBool;
+
+        let touched = Arc::new(AtomicBool::new(false));
+        let touched2 = touched.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move || {
+                let t = touched2.clone();
+                async move {
+                    t.store(true, Ordering::SeqCst);
+                    "SHOULD-NOT-BE-HIT"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+
+        let a_addr = spawn(Router::new().route(
+            "/start",
+            get(move || async move {
+                response_with_location(300, format!("http://127.0.0.1:{b_port}/dst"))
+            }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/start", a_addr.port()))
+            .follow_redirects(5, |_| true)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            300,
+            "a 300 with a Location header must be returned verbatim, not followed"
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "the 300 Location target must never be requested"
+        );
     }
 }

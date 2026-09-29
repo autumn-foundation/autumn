@@ -43,6 +43,31 @@
 //! logged `status` reflects the handler's response in that narrow case. The
 //! built-in filters preserve status.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -209,7 +234,7 @@ where
         AccessLogFuture {
             inner: self.inner.call(req),
             meta,
-            start: Instant::now(),
+            start: crate::time::ambient_instant(),
             fallback: self.fallback,
             sentinel,
         }
@@ -257,7 +282,10 @@ where
                 if let Some(meta) = this.meta.take()
                     && !already_emitted
                 {
-                    let duration_ms = this.start.elapsed().as_secs_f64() * 1000.0;
+                    let duration_ms = crate::time::ambient_instant()
+                        .saturating_duration_since(*this.start)
+                        .as_secs_f64()
+                        * 1000.0;
                     // The primary layer reads the id from the request
                     // extension; the fallback covers short-circuits that may
                     // never have run RequestIdLayer, so it falls back to the

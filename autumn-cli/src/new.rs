@@ -2,20 +2,30 @@
 //!
 //! Generates a complete Autumn project directory from embedded templates.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
 use autumn_web::credentials::{MasterKey, encrypt};
 
-mod templates {
+pub mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
+    /// JSON-first API flavor (`autumn new --api`): drops the HTML/CSS view
+    /// stack (`maud`) and disables `autumn-web`'s default view features.
+    pub const CARGO_API_TOML: &str = include_str!("templates/Cargo.api.toml.tmpl");
     pub const README: &str = include_str!("templates/README.md.tmpl");
     pub const MAIN_RS: &str = include_str!("templates/main.rs.tmpl");
+    /// JSON-first API flavor: `Json<...>` handlers, no `maud`/layout/HTML.
+    pub const MAIN_API_RS: &str = include_str!("templates/main.api.rs.tmpl");
     pub const AUTUMN_TOML: &str = include_str!("templates/autumn.toml.tmpl");
     pub const DOCKERFILE: &str = include_str!("templates/Dockerfile.tmpl");
+    /// JSON-first API flavor: no Tailwind download / CSS build / static copy.
+    pub const DOCKERFILE_API: &str = include_str!("templates/Dockerfile.api.tmpl");
     pub const DOCKERIGNORE: &str = include_str!("templates/.dockerignore.tmpl");
     pub const BUILD_RS: &str = include_str!("templates/build.rs.tmpl");
+    /// JSON-first API flavor: build provenance only, no Tailwind CSS step.
+    pub const BUILD_API_RS: &str = include_str!("templates/build.api.rs.tmpl");
     pub const INPUT_CSS: &str = include_str!("templates/input.css.tmpl");
     pub const TAILWIND_CONFIG: &str = include_str!("templates/tailwind.config.js.tmpl");
     pub const GITIGNORE: &str = include_str!("templates/gitignore.tmpl");
@@ -24,6 +34,12 @@ mod templates {
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
     pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
+    pub const POSTURE_GATE_WORKFLOW: &str =
+        include_str!("templates/.github/workflows/posture-gate.yml.tmpl");
+    /// Dependency advisory policy read by the generated CI's `cargo deny check
+    /// advisories` gate (issue #1600). Deliberately *not* framework-owned — see
+    /// [`super::framework_owned_files`].
+    pub const DENY_TOML: &str = include_str!("templates/deny.toml.tmpl");
     pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
     pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
     pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
@@ -115,6 +131,13 @@ pub struct GenerateOptions {
     /// Implies [`Self::with_daemon`]-style serve usage. Mutually exclusive with a
     /// DB-free daemon.
     pub with_bundled_pg: bool,
+    /// JSON-first API flavor (`autumn new --api`): emit a lean skeleton with no
+    /// HTML/CSS/Tailwind artifacts. Handlers return `Json<...>`; the `maud`
+    /// dependency and `autumn-web`'s view features (maud/htmx/tailwind) are
+    /// dropped, and the Tailwind/CSS build step, `input.css`, `tailwind.config.js`,
+    /// and vendored JS/static assets are not scaffolded. Keeps `db`/migrations so
+    /// database features still work. Mutually exclusive with the daemon flavors.
+    pub with_api: bool,
 }
 
 /// Generate a new Autumn project under `parent_dir/name` with default options.
@@ -123,7 +146,21 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
 }
 
 /// Reject unsupported flag combinations before any files are written.
-fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
+pub fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
+    // The API flavor and the daemon flavors are different app shapes with
+    // conflicting `autumn-web` feature sets: `--api` drops the view stack
+    // (maud/htmx/tailwind) for a pure-JSON app, while `--daemon`/`--bundled-pg`
+    // keep it. Composing them would produce contradictory Cargo features, so
+    // reject the combination rather than scaffolding an incoherent project.
+    // (`--api` still composes with `--with-i18n` and `--with-seed`.)
+    if opts.with_api && (opts.with_daemon || opts.with_bundled_pg) {
+        return Err(NewError::IncompatibleOptions(
+            "--api scaffolds a JSON-first app without the HTML/CSS view stack, so \
+             it cannot be combined with --daemon or --bundled-pg (which scaffold \
+             daemon apps that keep the view stack)"
+                .to_owned(),
+        ));
+    }
     // The DB-free daemon starter builds with no database, so a seed binary
     // (which needs `autumn_web::seed::SeedContext` and the `db` feature) cannot
     // compile. Reject the combination rather than scaffolding a broken project.
@@ -190,8 +227,12 @@ fn generate_inner(
     let rust_version = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
 
     fs::create_dir_all(project_dir.join("src"))?;
-    fs::create_dir_all(project_dir.join("static/css"))?;
-    fs::create_dir_all(project_dir.join("static/js"))?;
+    // The JSON-first API flavor ships no CSS/JS assets, so it has no `static/`
+    // tree; the fullstack scaffold seeds `static/css` + `static/js`.
+    if !opts.with_api {
+        fs::create_dir_all(project_dir.join("static/css"))?;
+        fs::create_dir_all(project_dir.join("static/js"))?;
+    }
     fs::create_dir_all(project_dir.join("migrations"))?;
     fs::create_dir_all(project_dir.join("tests"))?;
     fs::create_dir_all(project_dir.join("config/credentials"))?;
@@ -208,10 +249,15 @@ fn generate_inner(
     };
     let render = |template: &str| -> String { render_template(template, &vars) };
 
+    let cargo_template = if opts.with_api {
+        templates::CARGO_API_TOML
+    } else {
+        templates::CARGO_TOML
+    };
     let cargo_toml = render_cargo_toml(
         opts,
         autumn_version,
-        render(templates::CARGO_TOML),
+        render(cargo_template),
         &render(templates::SEED_CARGO_TOML),
     );
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
@@ -221,10 +267,25 @@ fn generate_inner(
         render_readme(render(templates::README), opts, &vars),
     )?;
 
-    let mut main_rs = if opts.with_i18n {
-        inject_i18n(&render(templates::MAIN_RS))
+    // The dependency advisory policy the generated CI enforces (issue #1600).
+    // Written here rather than through `framework_owned_files` because its
+    // waiver list is the app author's to grow: a file the developer is *asked*
+    // to edit would otherwise come back as a scaffold-reconciliation conflict
+    // on every `autumn upgrade`, exactly like `Cargo.toml` would.
+    fs::write(
+        project_dir.join("deny.toml"),
+        render_deny_toml(&render(templates::DENY_TOML), opts),
+    )?;
+
+    let main_template = if opts.with_api {
+        templates::MAIN_API_RS
     } else {
-        render(templates::MAIN_RS)
+        templates::MAIN_RS
+    };
+    let mut main_rs = match (opts.with_api, opts.with_i18n) {
+        (true, true) => inject_i18n_api(&render(main_template)),
+        (false, true) => inject_i18n(&render(main_template)),
+        (_, false) => render(main_template),
     };
     if opts.with_bundled_pg {
         // Managed-Postgres daemon: keep migrations, install the pool provider.
@@ -234,6 +295,79 @@ fn generate_inner(
         main_rs = strip_migrations(&main_rs);
     }
     fs::write(project_dir.join("src/main.rs"), main_rs)?;
+
+    // Every framework-owned file comes from one renderer, shared with `autumn
+    // upgrade`'s scaffold reconciliation (issue #1593). Writing them from a
+    // second, parallel code path here is how the two would silently disagree —
+    // and a byte of disagreement reads to the reconciler as a permanent
+    // conflict in every project ever generated.
+    let owned = framework_owned_files(&vars, opts);
+    for (relative, contents) in &owned {
+        fs::write(project_dir.join(relative), contents)?;
+    }
+    // Record what this release wrote, so a later `autumn upgrade` can tell a
+    // template that moved from a file the developer edited (issue #1593). Best
+    // effort by design: the manifest only ever *sharpens* a later upgrade, and
+    // failing a scaffold over bookkeeping would be a worse trade than losing
+    // conflict precision.
+    let _ = crate::upgrade::scaffold::Manifest::for_files(autumn_version, opts, &owned)
+        .save(&project_dir);
+    fs::write(project_dir.join("migrations/.gitkeep"), "")?;
+
+    // The API flavor serves no HTML, so it needs no vendored htmx/SSE JS or the
+    // static asset manifest — skip the whole `static/` vendoring step.
+    if !opts.with_api {
+        scaffold_vendor_assets(&project_dir)?;
+    }
+    scaffold_credentials(&project_dir, name)?;
+    fs::write(
+        project_dir.join("tests/integration_test.rs"),
+        render(templates::INTEGRATION_TEST),
+    )?;
+
+    write_optional_scaffold_files(&project_dir, name, opts, &render)?;
+
+    if !quiet {
+        print_scaffold_summary(name, opts);
+    }
+
+    Ok(())
+}
+
+/// Every framework-owned file `autumn new` writes outside the application's own
+/// source, rendered for `opts`.
+///
+/// This is the single definition of "what the current release's scaffold looks
+/// like". [`generate_inner`] writes these files, and `autumn upgrade`'s
+/// scaffold reconciliation (issue #1593) compares an existing project against
+/// exactly the same rendering — so the two cannot drift apart, which is the one
+/// bug that would make the reconciler report a conflict in every project on
+/// earth.
+///
+/// # What is *not* here
+///
+/// The set is an allowlist, not "everything `autumn new` writes", and two
+/// exclusions are load bearing:
+///
+/// - **`src/**`.** Application source is out of bounds for the reconciler
+///   (issue #1593); `src/main.rs` and the optional seed binary are the app's,
+///   not the framework's, the moment the project exists. Enforced by the
+///   assertion below, not just by convention.
+/// - **Files the framework generates but does not own thereafter**:
+///   `Cargo.toml` (the app's dependencies), `README.md` (the app's prose),
+///   `tests/`, `migrations/`, `i18n/`, `config/credentials/` (secrets), and the
+///   vendored `static/js/` assets, which `autumn assets` — not this — keeps
+///   current.
+///
+/// Keys are project-relative and always `/`-separated, so they are equally
+/// valid as `Path` joins and as the keys of the provenance manifest on every
+/// host.
+#[must_use]
+pub fn framework_owned_files(
+    vars: &TemplateVars<'_>,
+    opts: GenerateOptions,
+) -> BTreeMap<&'static str, String> {
+    let render = |template: &str| -> String { render_template(template, vars) };
 
     let mut autumn_toml = if opts.with_i18n {
         let mut s = render(templates::AUTUMN_TOML);
@@ -263,55 +397,96 @@ fn generate_inner(
              auto_migrate_in_production = true\n",
         );
     }
-    fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
-    fs::write(
-        project_dir.join("Dockerfile"),
-        render(templates::DOCKERFILE),
-    )?;
-    fs::write(
-        project_dir.join(".dockerignore"),
-        render(templates::DOCKERIGNORE),
-    )?;
-    fs::write(project_dir.join("build.rs"), render(templates::BUILD_RS))?;
-    fs::write(
-        project_dir.join("static/css/input.css"),
-        render(templates::INPUT_CSS),
-    )?;
-    fs::write(
-        project_dir.join("tailwind.config.js"),
-        render(templates::TAILWIND_CONFIG),
-    )?;
-    fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
-    fs::write(
-        project_dir.join(".env.example"),
-        render(templates::ENV_EXAMPLE),
-    )?;
-    fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
-    scaffold_vendor_assets(&project_dir)?;
-    scaffold_credentials(&project_dir, name)?;
-    fs::write(
-        project_dir.join("tests/integration_test.rs"),
-        render(templates::INTEGRATION_TEST),
-    )?;
-    // Bind the path so the write fits on one line: a multi-line
-    // `fs::write(...)?` leaves the `?` error-propagation region on a bare
-    // `)?;` line that passing tests never hit, which llvm-cov reports as an
-    // uncovered line (as it does for the multi-line writes above).
-    let ci_workflow = project_dir.join(".github/workflows/ci.yml");
-    fs::write(ci_workflow, render(templates::CI_WORKFLOW))?;
-    let rust_toolchain = project_dir.join("rust-toolchain.toml");
-    fs::write(rust_toolchain, render(templates::RUST_TOOLCHAIN))?;
-    fs::write(project_dir.join("rustfmt.toml"), render(templates::RUSTFMT))?;
-    fs::write(project_dir.join("clippy.toml"), render(templates::CLIPPY))?;
+    let dockerfile = if opts.with_api {
+        // The `--api` Dockerfile carries i18n `COPY` anchors resolved by flag:
+        // ship the `i18n/` sidecar into the image for `--with-i18n`, or strip
+        // the anchors so a non-i18n build context (which has no `i18n/` dir)
+        // still builds.
+        inject_i18n_dockerfile_api(&render(templates::DOCKERFILE_API), opts.with_i18n)
+    } else {
+        // The fullstack `Dockerfile.tmpl` carries the same i18n `COPY` anchors:
+        // ship the `i18n/` sidecar into the image for `--with-i18n`, or strip
+        // the anchors so a non-i18n build context (which has no `i18n/` dir)
+        // still builds.
+        inject_i18n_dockerfile(&render(templates::DOCKERFILE), opts.with_i18n)
+    };
 
-    write_optional_scaffold_files(&project_dir, name, opts, &render)?;
+    let build_rs = if opts.with_api {
+        render(templates::BUILD_API_RS)
+    } else {
+        render(templates::BUILD_RS)
+    };
 
-    if !quiet {
-        print_scaffold_summary(name, opts);
+    let ci_yml = if opts.with_api {
+        strip_ci_tailwind_note(&render(templates::CI_WORKFLOW))
+    } else {
+        render(templates::CI_WORKFLOW)
+    };
+
+    let mut files = BTreeMap::new();
+    files.insert("autumn.toml", autumn_toml);
+    files.insert("Dockerfile", dockerfile);
+    files.insert(".dockerignore", render(templates::DOCKERIGNORE));
+    files.insert("build.rs", build_rs);
+    files.insert(".gitignore", render(templates::GITIGNORE));
+    files.insert(".env.example", render(templates::ENV_EXAMPLE));
+    files.insert(".github/workflows/ci.yml", ci_yml);
+    // The security posture gate (issue #1624) is a separate workflow rather
+    // than another job in `ci.yml`: it needs `pull-requests: write` to post the
+    // diff, and that permission has no business on the job that runs the test
+    // suite.
+    files.insert(
+        ".github/workflows/posture-gate.yml",
+        render(templates::POSTURE_GATE_WORKFLOW),
+    );
+    files.insert("rust-toolchain.toml", render(templates::RUST_TOOLCHAIN));
+    files.insert("rustfmt.toml", render(templates::RUSTFMT));
+    files.insert("clippy.toml", render(templates::CLIPPY));
+    // The API flavor has no Tailwind/CSS pipeline, so it owns no CSS input and
+    // no Tailwind config (there is no `static/css` directory either).
+    if !opts.with_api {
+        files.insert("tailwind.config.js", render(templates::TAILWIND_CONFIG));
+        files.insert("static/css/input.css", render(templates::INPUT_CSS));
     }
 
-    Ok(())
+    debug_assert!(
+        files.keys().all(|path| !path.starts_with("src/")),
+        "application source is out of bounds for scaffold reconciliation"
+    );
+    files
+}
+
+/// Anchors around the waiver that only a `--bundled-pg` app's tree can reach.
+const DENY_BUNDLED_PG_OPEN: &str = "    # >>> autumn:bundled-pg-waiver\n";
+const DENY_BUNDLED_PG_CLOSE: &str = "    # <<< autumn:bundled-pg-waiver\n";
+
+/// Resolve the scaffolded `deny.toml` for `opts`.
+///
+/// `managed-pg-bundled` drags the embedded-Postgres build stack — and with it
+/// `instant` (RUSTSEC-2024-0384, unmaintained, no fix) — into the tree, so a
+/// `--bundled-pg` app needs that waiver on day one or its first CI run is red.
+/// Every other flavor would be carrying a waiver for a crate it does not have,
+/// and cargo-deny warns about unused waivers by design: that warning is how a
+/// developer learns one of *their* waivers has gone stale, so it must not be
+/// spent on one the framework shipped for a feature they never enabled.
+fn render_deny_toml(rendered: &str, opts: GenerateOptions) -> String {
+    if opts.with_bundled_pg {
+        return rendered
+            .replace(DENY_BUNDLED_PG_OPEN, "")
+            .replace(DENY_BUNDLED_PG_CLOSE, "");
+    }
+    let (open, close) = (
+        rendered.find(DENY_BUNDLED_PG_OPEN),
+        rendered.find(DENY_BUNDLED_PG_CLOSE),
+    );
+    let (Some(open), Some(close)) = (open, close) else {
+        debug_assert!(false, "deny.toml.tmpl lost its bundled-pg waiver anchors");
+        return rendered.to_owned();
+    };
+    let mut out = rendered.to_owned();
+    out.replace_range(open..close + DENY_BUNDLED_PG_CLOSE.len(), "");
+    out
 }
 
 fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
@@ -409,17 +584,28 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     if opts.with_seed {
         println!("  Created {name}/src/bin/seed.rs");
     }
-    println!("  Created {name}/static/css/input.css");
-    println!("  Created {name}/tailwind.config.js");
+    // The JSON-first API flavor ships no CSS/Tailwind pipeline.
+    if !opts.with_api {
+        println!("  Created {name}/static/css/input.css");
+        println!("  Created {name}/tailwind.config.js");
+    }
     println!("  Created {name}/.gitignore");
     println!("  Created {name}/.env.example");
     println!("  Created {name}/rust-toolchain.toml");
     println!("  Created {name}/rustfmt.toml");
     println!("  Created {name}/clippy.toml");
+    // Named with its purpose attached: when the advisory gate first fires, a
+    // developer who does not know this file exists reaches for disabling the CI
+    // step instead of recording a waiver here.
+    println!("  Created {name}/deny.toml (dependency advisory policy — CI audits against it)");
     println!("  Created {name}/migrations/");
     println!("  Created {name}/tests/integration_test.rs");
     println!("  Created {name}/config/master.key (keep secret — never commit)");
     println!("  Created {name}/config/credentials/development.toml.enc");
+    // Named with its purpose attached: it is the only generated file whose
+    // value depends entirely on being committed, and the only one a developer
+    // would otherwise be tempted to gitignore as machine bookkeeping.
+    println!("  Created {name}/.autumn/scaffold.toml (commit it — `autumn upgrade` reads it)");
     if opts.with_i18n {
         println!("  Created {name}/i18n/en.ftl");
     }
@@ -462,8 +648,8 @@ fn replace_anchor(src: &str, from: &str, to: &str) -> String {
 fn inject_i18n(main_rs: &str) -> String {
     let with_locale = replace_anchor(
         main_rs,
-        "        .routes(routes![index, hello, hello_name])",
-        "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
+        "        .routes(routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage])",
+        "        .i18n_auto()\n        .routes(routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage])",
     );
     let with_static = replace_anchor(
         &with_locale,
@@ -479,6 +665,123 @@ fn inject_i18n(main_rs: &str) -> String {
          \x20   #[cfg(feature = \"embed-assets\")]\n\
          \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n",
     )
+}
+
+/// i18n variant of [`inject_i18n`] for the JSON-first API scaffold's `main.rs`,
+/// which has no HTML/static asset layer. Enables locale auto-detection with
+/// `.i18n_auto()` and embeds the `i18n/` locale bundles into the binary (behind
+/// the `embed-assets` feature) for single-binary deploys.
+fn inject_i18n_api(main_rs: &str) -> String {
+    let with_locale_call = replace_anchor(
+        main_rs,
+        "        .routes(routes![index, hello_name])",
+        "        .i18n_auto()\n        .routes(routes![index, hello_name])",
+    );
+    let with_locales_static = replace_anchor(
+        &with_locale_call,
+        "const MIGRATIONS: EmbeddedMigrations = embed_migrations!();\n",
+        "const MIGRATIONS: EmbeddedMigrations = embed_migrations!();\n\n\
+         #[cfg(feature = \"embed-assets\")]\n\
+         static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();\n",
+    );
+    replace_anchor(
+        &with_locales_static,
+        "        .migrations(MIGRATIONS);\n\n    app\n",
+        "        .migrations(MIGRATIONS);\n\n\
+         \x20   #[cfg(feature = \"embed-assets\")]\n\
+         \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n\n    app\n",
+    )
+}
+
+/// Anchor: the builder-stage i18n `COPY` insertion point in
+/// `Dockerfile.api.tmpl` (an otherwise-inert comment line). Replaced with a
+/// `COPY i18n ./i18n` line for `--api --with-i18n`, or stripped entirely
+/// otherwise so a non-i18n project's build context has no missing `i18n/` dir.
+const DOCKERFILE_API_I18N_BUILDER_ANCHOR: &str = "# __AUTUMN_I18N_BUILDER_COPY__\n";
+/// Anchor: the runtime-stage i18n `COPY` insertion point in
+/// `Dockerfile.api.tmpl`. Replaced with a `COPY --from=builder /app/i18n
+/// /app/i18n` line for `--api --with-i18n`, or stripped otherwise.
+const DOCKERFILE_API_I18N_RUNTIME_ANCHOR: &str = "# __AUTUMN_I18N_RUNTIME_COPY__\n";
+
+/// Resolve the two i18n `COPY` anchors in the rendered `--api` Dockerfile.
+///
+/// The `--api` scaffold's `main.rs` calls `.i18n_auto()` when `--with-i18n`,
+/// which loads `i18n/en.ftl` from disk at startup and panics if it is missing.
+/// The API image must therefore ship the `i18n/` sidecar into both the builder
+/// (so `cargo build` sees it for any embed) and the runtime stage (so the
+/// running binary can read it). The `COPY` lines are gated on `with_i18n`: an
+/// unconditional `COPY i18n ./i18n` would break `docker build` for non-i18n
+/// projects, whose build context has no `i18n/` directory. When `with_i18n` is
+/// false the anchors are stripped, leaving the Dockerfile byte-for-byte as it
+/// was before this wiring (no leftover anchor markers).
+fn inject_i18n_dockerfile_api(dockerfile: &str, with_i18n: bool) -> String {
+    if with_i18n {
+        let with_builder = replace_anchor(
+            dockerfile,
+            DOCKERFILE_API_I18N_BUILDER_ANCHOR,
+            "COPY i18n ./i18n\n",
+        );
+        replace_anchor(
+            &with_builder,
+            DOCKERFILE_API_I18N_RUNTIME_ANCHOR,
+            "COPY --from=builder /app/i18n /app/i18n\n",
+        )
+    } else {
+        let no_builder = replace_anchor(dockerfile, DOCKERFILE_API_I18N_BUILDER_ANCHOR, "");
+        replace_anchor(&no_builder, DOCKERFILE_API_I18N_RUNTIME_ANCHOR, "")
+    }
+}
+
+/// Anchor: the builder-stage i18n `COPY` insertion point in the fullstack
+/// `Dockerfile.tmpl` (an otherwise-inert comment line). Replaced with a
+/// `COPY i18n ./i18n` line for `--with-i18n`, or stripped entirely otherwise so
+/// a non-i18n project's build context has no missing `i18n/` dir.
+const DOCKERFILE_I18N_BUILDER_ANCHOR: &str = "# __AUTUMN_I18N_BUILDER_COPY__\n";
+/// Anchor: the runtime-stage i18n `COPY` insertion point in the fullstack
+/// `Dockerfile.tmpl`. Replaced with a `COPY --from=builder /app/i18n /app/i18n`
+/// line for `--with-i18n`, or stripped otherwise.
+const DOCKERFILE_I18N_RUNTIME_ANCHOR: &str = "# __AUTUMN_I18N_RUNTIME_COPY__\n";
+
+/// Resolve the two i18n `COPY` anchors in the rendered fullstack Dockerfile.
+///
+/// The default (fullstack) scaffold's `main.rs` calls `.i18n_auto()` when
+/// `--with-i18n`, which loads `i18n/en.ftl` from disk at startup and panics if
+/// it is missing. The image must therefore ship the `i18n/` sidecar into both
+/// the builder (so `cargo build` sees it for any embed) and the runtime stage
+/// (so the running binary can read it). The `COPY` lines are gated on
+/// `with_i18n`: an unconditional `COPY i18n ./i18n` would break `docker build`
+/// for non-i18n projects, whose build context has no `i18n/` directory. When
+/// `with_i18n` is false the anchors are stripped, leaving the Dockerfile
+/// byte-for-byte as it was before this wiring (no leftover anchor markers).
+/// Mirrors [`inject_i18n_dockerfile_api`] for the `--api` scaffold.
+fn inject_i18n_dockerfile(dockerfile: &str, with_i18n: bool) -> String {
+    if with_i18n {
+        let with_builder = replace_anchor(
+            dockerfile,
+            DOCKERFILE_I18N_BUILDER_ANCHOR,
+            "COPY i18n ./i18n\n",
+        );
+        replace_anchor(
+            &with_builder,
+            DOCKERFILE_I18N_RUNTIME_ANCHOR,
+            "COPY --from=builder /app/i18n /app/i18n\n",
+        )
+    } else {
+        let no_builder = replace_anchor(dockerfile, DOCKERFILE_I18N_BUILDER_ANCHOR, "");
+        replace_anchor(&no_builder, DOCKERFILE_I18N_RUNTIME_ANCHOR, "")
+    }
+}
+
+/// Anchor: the Tailwind CI extension note in `ci.yml.tmpl`. The JSON-first API
+/// scaffold has no Tailwind/CSS step, so this note is stripped for `--api` (it
+/// is also the only `tailwind` mention in the generated tree).
+const CI_TAILWIND_NOTE: &str = "#   - Tailwind: add `autumn setup --tailwind` and run the downloaded binary\n\
+     #     before `cargo build` to compile CSS in CI.\n";
+
+/// Remove the Tailwind CI extension note from a rendered `ci.yml` for the API
+/// scaffold (which ships no CSS pipeline).
+fn strip_ci_tailwind_note(ci_yml: &str) -> String {
+    replace_anchor(ci_yml, CI_TAILWIND_NOTE, "")
 }
 
 /// Inject a managed-Postgres pool provider plus a shutdown hook into a
@@ -516,15 +819,22 @@ fn strip_migrations(main_rs: &str) -> String {
     replace_anchor(&no_const, "\n        .migrations(MIGRATIONS)", "")
 }
 
-/// Default `autumn-web` features minus `db` — the DB-free daemon feature set.
-const DAEMON_NO_DB_FEATURES: &[&str] = &[
-    "maud",
-    "htmx",
-    "tailwind",
-    "cache-moka",
-    "http-client",
-    "reporting",
-];
+/// The DB-free daemon feature set (issue #2309): default `autumn-web`
+/// features minus `db`, `cache-moka`, and `http-client`.
+///
+/// The daemon starter has no cache. It makes no outbound HTTP call (no auth,
+/// no webhooks). `cache-moka` and `http-client` are unused for it. Both are
+/// dropped here, not just `db`. Dropping `http-client` also drops `reqwest`
+/// and its TLS stack from the build.
+///
+/// `reporting` stays on. It adds no extra dependency, and it drives the
+/// panic-catch middleware every app should keep by default.
+const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "reporting"];
+
+/// Default `autumn-web` features minus the HTML view stack (`maud`/`htmx`/
+/// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` so
+/// migrations and database features still work.
+const API_FEATURES: &[&str] = &["db", "cache-moka", "http-client", "reporting", "flash"];
 
 /// Anchor: first line of the DB-specific prerequisites/steps block in
 /// `README.md.tmpl` (the `- **A reachable Postgres**` bullet). Everything from
@@ -548,6 +858,14 @@ const README_SCAFFOLD_ROW: &str = "| `autumn generate scaffold <Name> field:Type
 /// the DB-free daemon README (that scaffold has no migrations directory).
 const README_MIGRATIONS_LAYOUT_ROW: &str =
     "| `migrations/` | Diesel migrations — one directory per migration. |\n";
+/// Anchor: the Tailwind binary prerequisite bullet in `README.md.tmpl`. The
+/// JSON-first API scaffold has no CSS pipeline, so this bullet is removed for
+/// `--api` (it is the only `tailwind` mention in the generated README).
+const README_TAILWIND_PREREQ: &str =
+    "- **The Tailwind binary** (downloaded by `autumn setup`):\n  ```sh\n  autumn setup\n  ```\n";
+/// Anchor: the `static/` project-layout row in `README.md.tmpl`. The API
+/// scaffold ships no `static/` directory, so the row is removed for `--api`.
+const README_STATIC_LAYOUT_ROW: &str = "| `static/` | Static assets served under `/static/`. |\n";
 
 /// Render the project README, tailoring the golden path to the app shape and
 /// appending flag-specific sections.
@@ -570,6 +888,15 @@ const README_MIGRATIONS_LAYOUT_ROW: &str =
 /// `no_unsubstituted_placeholders` walks the generated tree and would flag it
 /// (crate/project names are interpolated from `vars`, not left as tokens).
 fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_>) -> String {
+    // The JSON-first API scaffold shares the DB-first golden path (it keeps
+    // `db`/migrations) but has no Tailwind/CSS pipeline and no `static/` tree,
+    // so strip the Tailwind prerequisite and the `static/` layout row.
+    if opts.with_api {
+        let mut readme = rendered.replace(README_TAILWIND_PREREQ, "");
+        readme = readme.replace(README_STATIC_LAYOUT_ROW, "");
+        append_optional_readme_sections(&mut readme, opts);
+        return readme;
+    }
     // `--bundled-pg` implies `with_daemon`, so test it first.
     let mut readme = if opts.with_bundled_pg {
         // Bundled Postgres keeps the `db` feature, so `generate scaffold` and the
@@ -581,6 +908,14 @@ fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_
     } else {
         rendered
     };
+    append_optional_readme_sections(&mut readme, opts);
+    readme
+}
+
+/// Append the `--with-i18n` and `--with-seed` README sections when those flags
+/// are set. Shared by every app shape (fullstack, daemon, and `--api`) so the
+/// flag-specific guidance is identical regardless of the golden-path body.
+fn append_optional_readme_sections(readme: &mut String, opts: GenerateOptions) {
     if opts.with_i18n {
         readme.push_str(
             "\n## Internationalization (i18n)\n\
@@ -607,7 +942,6 @@ fn render_readme(rendered: String, opts: GenerateOptions, vars: &TemplateVars<'_
              ```\n",
         );
     }
-    readme
 }
 
 /// Replace the default DB-first golden-path block (from
@@ -731,6 +1065,35 @@ fn render_cargo_toml(
     seed_bin_toml: &str,
 ) -> String {
     use std::fmt::Write;
+
+    // JSON-first API starter: drop the HTML view stack (maud/htmx/tailwind) by
+    // switching off default features and pinning the lean API feature set. The
+    // API `Cargo.toml` template ships a plain `autumn-web = "…"` dep (no `maud`
+    // line), so rewrite it to the explicit `default-features = false` table.
+    if opts.with_api {
+        let plain_dep = format!(r#"autumn-web = "{autumn_version}""#);
+        let mut features: Vec<&str> = API_FEATURES.to_vec();
+        if opts.with_i18n {
+            features.push("i18n");
+        }
+        if opts.with_seed {
+            features.push("seed");
+        }
+        let features_str = features
+            .iter()
+            .map(|f| format!(r#""{f}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dep = format!(
+            r#"autumn-web = {{ version = "{autumn_version}", default-features = false, features = [{features_str}] }}"#
+        );
+        cargo_toml = cargo_toml.replace(&plain_dep, &dep);
+        if opts.with_seed {
+            cargo_toml.push('\n');
+            cargo_toml.push_str(seed_bin_toml);
+        }
+        return cargo_toml;
+    }
 
     // DB-free daemon starter: switch off default features (drops `db`) so the
     // binary links no Postgres, and remove the diesel migrations dependency.
@@ -966,6 +1329,133 @@ mod tests {
         );
     }
 
+    // `autumn new` must scaffold a working cookie-consent banner (issue
+    // #1214): a policy-version constant the app owner can bump to re-prompt,
+    // the auto-injecting middleware wired into the app, and the accept/reject
+    // routes it posts to.
+    #[test]
+    fn generates_consent_banner_wiring_in_main_rs() {
+        let tmp = TempDir::new().unwrap();
+        generate("consent-app", tmp.path()).unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-app/src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains("CONSENT_POLICY_VERSION"),
+            "generated main.rs must declare a bump-to-reprompt policy version constant: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::inject_consent_banner"),
+            "generated main.rs must wire the consent-banner middleware: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("consent_accept") && main_rs.contains("consent_reject"),
+            "generated main.rs must define consent_accept/consent_reject routes: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("\"/consent/accept\"") && main_rs.contains("\"/consent/reject\""),
+            "generated main.rs must mount the accept/reject routes at their documented paths: {main_rs}"
+        );
+        assert!(
+            main_rs.contains(
+                "routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage]"
+            ),
+            "the new consent routes must be registered alongside the existing routes: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("\"/consent/manage\"")
+                && main_rs.contains("autumn_web::consent::consent_banner_markup"),
+            "generated main.rs must scaffold a preferences route reusing the consent-banner \
+             widget (GDPR Art. 7(3): withdrawing consent must be as easy as giving it): {main_rs}"
+        );
+        assert!(
+            main_rs.contains("href=\"/consent/manage\""),
+            "the shared layout's footer must link to the withdrawal route so it's \
+             reachable from every page: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME"),
+            "the middleware wiring must pass the CSRF cookie name explicitly: {main_rs}"
+        );
+        assert!(
+            main_rs.contains("autumn_web::consent::DEFAULT_CSRF_FORM_FIELD"),
+            "the middleware wiring must pass the CSRF form-field name explicitly: {main_rs}"
+        );
+    }
+
+    // `/consent/manage` must stay a side-effect-free `GET`: it renders the
+    // consent-banner widget so the visitor can make a new choice, but the
+    // actual state change goes through the existing CSRF-protected
+    // `POST /consent/accept` / `POST /consent/reject` handlers. If the GET
+    // handler itself mutated the consent cookie (e.g. by calling
+    // `expire_consent_cookie` directly), a same-origin prefetcher, browser
+    // extension, or cross-site top-level navigation following the footer
+    // link could silently reset a visitor's consent, since `GET` is
+    // CSRF-exempt by definition.
+    #[test]
+    fn consent_manage_route_does_not_mutate_state_on_get() {
+        let tmp = TempDir::new().unwrap();
+        generate("consent-manage-app", tmp.path()).unwrap();
+        let main_rs =
+            fs::read_to_string(tmp.path().join("consent-manage-app/src/main.rs")).unwrap();
+        let start = main_rs
+            .find("async fn consent_manage")
+            .expect("consent_manage handler must exist");
+        let body = &main_rs[start..];
+        let end = body[1..]
+            .find("\n#[")
+            .map_or(body.len(), |offset| offset + 1);
+        let handler_body = &body[..end];
+        assert!(
+            !handler_body.contains("expire_consent_cookie") && !handler_body.contains("SET_COOKIE"),
+            "the GET /consent/manage handler must not itself set or expire any cookie: {handler_body}"
+        );
+    }
+
+    // The JSON-first `--api` flavor has no HTML/layout to show a banner in —
+    // it must not scaffold the consent-banner wiring at all.
+    #[test]
+    fn api_flavor_does_not_scaffold_consent_banner() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "consent-api-app",
+            tmp.path(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-api-app/src/main.rs")).unwrap();
+        assert!(
+            !main_rs.contains("inject_consent_banner"),
+            "the --api flavor ships no HTML layout, so it must not scaffold the banner: {main_rs}"
+        );
+    }
+
+    // The generated `--with-i18n` main.rs must still compile-shape correctly:
+    // the i18n injection anchors must stay in sync with the new routes! list
+    // (see `inject_i18n`'s anchor constant).
+    #[test]
+    fn with_i18n_still_wires_consent_routes() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "consent-i18n-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let main_rs = fs::read_to_string(tmp.path().join("consent-i18n-app/src/main.rs")).unwrap();
+        assert!(
+            main_rs.contains(
+                "routes![index, hello, hello_name, consent_accept, consent_reject, consent_manage]"
+            ),
+            "i18n injection must not drop the consent routes from the routes! list: {main_rs}"
+        );
+        assert!(main_rs.contains("i18n_auto"));
+    }
+
     // The generated Cargo.toml must have [dev-dependencies] with tokio
     // so that #[tokio::test] compiles without the user adding anything.
     #[test]
@@ -1188,8 +1678,16 @@ mod tests {
 
         let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
         assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
-        assert!(content.contains("cargo:rerun-if-changed=target/autumn/tailwindcss"));
+        // The Tailwind binary's watch path is resolved at build time (issue
+        // #2457: a package-relative literal can never agree with wherever
+        // `CARGO_TARGET_DIR`/a target triple actually put it), not printed
+        // literally in the template — assert the resolution machinery is
+        // there instead of a path string that no longer appears verbatim.
+        assert!(content.contains("fn find_tailwind_cli"));
+        assert!(content.contains("fn candidate_target_dirs"));
+        assert!(content.contains("cargo:rerun-if-changed={}"));
         assert!(content.contains("cargo:rerun-if-env-changed=PATH"));
+        assert!(content.contains("cargo:rerun-if-env-changed=CARGO_TARGET_DIR"));
     }
 
     #[test]
@@ -1230,6 +1728,190 @@ mod tests {
     }
 
     #[test]
+    fn generated_build_rs_prefers_build_arg_provenance_over_git() {
+        // Issue #1676: containerized builds exclude `/.git` from the build
+        // context, so the generated build.rs must prefer `AUTUMN_BUILD_*` build
+        // args (Docker `--build-arg`/`ENV` passthrough) when set, falling back
+        // to git only for local checkout builds. Without this, production images
+        // report `git.*` as `null` on `/actuator/info`.
+        let tmp = TempDir::new().unwrap();
+        generate("build-arg-provenance-check", tmp.path()).unwrap();
+
+        let content =
+            fs::read_to_string(tmp.path().join("build-arg-provenance-check/build.rs")).unwrap();
+        // A dedicated helper reads the passthrough env vars.
+        assert!(content.contains("fn build_arg("));
+        // Each git field prefers the build arg, then falls back to git.
+        assert!(content.contains("build_arg(\"AUTUMN_BUILD_GIT_SHA\").or_else(|| git("));
+        assert!(content.contains("build_arg(\"AUTUMN_BUILD_GIT_SHA_SHORT\")"));
+        assert!(content.contains("build_arg(\"AUTUMN_BUILD_GIT_BRANCH\")"));
+        assert!(content.contains("build_arg(\"AUTUMN_BUILD_GIT_DIRTY\")"));
+        // Timestamp passthrough wins over the computed timestamp.
+        assert!(
+            content
+                .contains("build_arg(\"AUTUMN_BUILD_TIMESTAMP\").unwrap_or_else(build_timestamp)")
+        );
+        // Re-run when a passthrough build arg changes so deploys re-bake it.
+        assert!(content.contains("cargo:rerun-if-env-changed={var}"));
+    }
+
+    #[test]
+    fn generated_build_rs_reports_unknown_dirty_as_absent_not_false() {
+        // Codex P2 / issue #1676 regression: a container build supplies
+        // `AUTUMN_BUILD_GIT_SHA` but leaves `AUTUMN_BUILD_GIT_DIRTY` blank, and
+        // the Dockerfile excludes `/.git` so `git status` cannot run. The dirty
+        // state is then genuinely UNKNOWN and must be reported as absent/null on
+        // `/actuator/info`, NOT collapsed to a misleading `false`.
+        //
+        // Prove it end-to-end at the producer: compile the generated `build.rs`
+        // (which is verbatim Rust, no placeholders) and run its provenance
+        // emitter under a controlled environment. Env is passed to the child
+        // process (never mutated in-process), so this is isolated from other
+        // concurrently running tests.
+        let tmp = TempDir::new().unwrap();
+        generate("dirty-unknown-check", tmp.path()).unwrap();
+        let project = tmp.path().join("dirty-unknown-check");
+        let build_rs = project.join("build.rs");
+
+        // Compile the generated build.rs to a standalone binary. `--cap-lints
+        // allow` keeps a stray warning from failing under a strict RUSTFLAGS,
+        // and RUSTFLAGS is cleared for the same reason.
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let bin = project.join("provenance_probe");
+        let compile = std::process::Command::new(&rustc)
+            .arg(&build_rs)
+            .arg("--edition")
+            .arg("2021")
+            .arg("--cap-lints")
+            .arg("allow")
+            .arg("-o")
+            .arg(&bin)
+            .env_remove("RUSTFLAGS")
+            .output()
+            .expect("failed to spawn rustc");
+        assert!(
+            compile.status.success(),
+            "generated build.rs failed to compile:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        // Run the emitter with a cleared environment (so `PATH` is unset and no
+        // `git` binary is reachable → git is genuinely unavailable), plus only
+        // the provenance env vars under test. Returns the emitted stdout.
+        let run = |vars: &[(&str, &str)]| -> String {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.current_dir(&project).env_clear();
+            for (k, v) in vars {
+                cmd.env(k, v);
+            }
+            let out = cmd.output().expect("failed to run provenance probe");
+            assert!(
+                out.status.success(),
+                "provenance probe exited non-zero:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        let has_dirty = |stdout: &str, value: &str| {
+            stdout
+                .lines()
+                .any(|l| l == format!("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY={value}"))
+        };
+        let emits_any_dirty = |stdout: &str| {
+            stdout
+                .lines()
+                .any(|l| l.starts_with("cargo:rustc-env=AUTUMN_BUILD_GIT_DIRTY="))
+        };
+
+        // 1. SHA passthrough, dirty blank, no git → dirty is UNKNOWN → the var
+        //    is omitted entirely (consumer renders `git.dirty` as null).
+        let unknown = run(&[
+            (
+                "AUTUMN_BUILD_GIT_SHA",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+            ("AUTUMN_BUILD_GIT_DIRTY", ""),
+        ]);
+        assert!(
+            unknown.lines().any(|l| l
+                == "cargo:rustc-env=AUTUMN_BUILD_GIT_SHA=0123456789abcdef0123456789abcdef01234567"),
+            "SHA passthrough should still be emitted:\n{unknown}"
+        );
+        assert!(
+            !emits_any_dirty(&unknown),
+            "unknown dirty state must NOT emit AUTUMN_BUILD_GIT_DIRTY (would render as `false`):\n{unknown}"
+        );
+
+        // 2. Explicit dirty=true round-trips even with no git.
+        let dirty_true = run(&[
+            ("AUTUMN_BUILD_GIT_SHA", "abc123"),
+            ("AUTUMN_BUILD_GIT_DIRTY", "true"),
+        ]);
+        assert!(
+            has_dirty(&dirty_true, "true"),
+            "explicit dirty=true must round-trip:\n{dirty_true}"
+        );
+
+        // 3. Explicit dirty=false round-trips (a genuinely clean, known build).
+        let dirty_false = run(&[
+            ("AUTUMN_BUILD_GIT_SHA", "abc123"),
+            ("AUTUMN_BUILD_GIT_DIRTY", "false"),
+        ]);
+        assert!(
+            has_dirty(&dirty_false, "false"),
+            "explicit dirty=false must round-trip:\n{dirty_false}"
+        );
+    }
+
+    /// The first unsubstituted **autumn** template token in `content`, if any.
+    ///
+    /// Autumn's tokens are `{{lower_snake}}`; GitHub Actions expressions are
+    /// `${{ github.token }}`. Both contain `{{`, so a bare `contains("{{")`
+    /// would forbid every scaffolded workflow from using an Actions expression.
+    /// This looks for our shape specifically, which is what the check was ever
+    /// about.
+    fn unsubstituted_token(content: &str) -> Option<String> {
+        let bytes = content.as_bytes();
+        let mut from = 0;
+        while let Some(offset) = content[from..].find("{{") {
+            let open = from + offset;
+            // `${{ … }}` is a GitHub Actions expression, not ours.
+            let escaped = open > 0 && bytes[open - 1] == b'$';
+            if !escaped && let Some(len) = content[open + 2..].find("}}") {
+                let token = &content[open + 2..open + 2 + len];
+                if !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    return Some(token.to_owned());
+                }
+            }
+            from = open + 2;
+        }
+        None
+    }
+
+    #[test]
+    fn placeholder_scanner_tells_our_tokens_from_actions_expressions() {
+        assert_eq!(
+            unsubstituted_token("name: ${{ github.token }} and {{project_name}}").as_deref(),
+            Some("project_name"),
+            "an Actions expression is fine; ours is not"
+        );
+        assert_eq!(
+            unsubstituted_token("${{ github.event.pull_request.number }}"),
+            None
+        );
+        assert_eq!(
+            unsubstituted_token("run: exit ${{ steps.diff.outputs.status }}"),
+            None
+        );
+        assert_eq!(unsubstituted_token("nothing templated here"), None);
+    }
+
+    #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
         generate("placeholder-check", tmp.path()).unwrap();
@@ -1238,8 +1920,9 @@ mod tests {
         for entry in walkdir(&p) {
             let content = fs::read_to_string(&entry).unwrap();
             assert!(
-                !content.contains("{{"),
-                "unsubstituted placeholder in {}",
+                unsubstituted_token(&content).is_none(),
+                "unsubstituted placeholder {:?} in {}",
+                unsubstituted_token(&content),
                 entry.display()
             );
         }
@@ -1586,6 +2269,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn with_i18n_copies_i18n_into_fullstack_docker_image() {
+        // The fullstack (non-`--api`) scaffold's `main.rs` calls `.i18n_auto()`
+        // for `--with-i18n`, which loads `i18n/en.ftl` from disk at startup and
+        // panics if missing. The image must therefore ship the `i18n/` sidecar
+        // into both the builder and runtime stages (issue #1865, mirroring the
+        // `--api` fix in #1847).
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "i18n-docker-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let dockerfile = fs::read_to_string(tmp.path().join("i18n-docker-app/Dockerfile")).unwrap();
+        assert!(
+            dockerfile.contains("COPY i18n ./i18n"),
+            "--with-i18n fullstack Dockerfile must copy i18n/ into the builder stage:\n{dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("COPY --from=builder /app/i18n /app/i18n"),
+            "--with-i18n fullstack Dockerfile must copy i18n/ into the runtime stage:\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("__AUTUMN_I18N"),
+            "--with-i18n fullstack Dockerfile must not leave anchor markers:\n{dockerfile}"
+        );
+    }
+
+    #[test]
+    fn without_i18n_fullstack_docker_image_has_no_i18n_copy() {
+        // A non-i18n fullstack Dockerfile must carry NO i18n `COPY` lines (an
+        // unconditional `COPY i18n ./i18n` would break `docker build`, whose
+        // context has no `i18n/` dir) and no leftover anchor markers.
+        let tmp = TempDir::new().unwrap();
+        generate("no-i18n-docker-app", tmp.path()).unwrap();
+        let dockerfile =
+            fs::read_to_string(tmp.path().join("no-i18n-docker-app/Dockerfile")).unwrap();
+        assert!(
+            !dockerfile.contains("COPY i18n ./i18n"),
+            "non-i18n fullstack Dockerfile must not copy i18n/ (build context has no i18n/ dir):\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("/app/i18n"),
+            "non-i18n fullstack Dockerfile must not reference /app/i18n:\n{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("__AUTUMN_I18N"),
+            "non-i18n fullstack Dockerfile must not leave anchor markers:\n{dockerfile}"
+        );
+    }
+
     fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
         let mut files = Vec::new();
         if let Ok(entries) = fs::read_dir(dir) {
@@ -1709,8 +2447,9 @@ mod tests {
         for entry in walkdir(&p) {
             let content = fs::read_to_string(&entry).unwrap();
             assert!(
-                !content.contains("{{"),
-                "unsubstituted placeholder in {}",
+                unsubstituted_token(&content).is_none(),
+                "unsubstituted placeholder {:?} in {}",
+                unsubstituted_token(&content),
                 entry.display()
             );
         }
@@ -2072,5 +2811,612 @@ mod tests {
             !content.contains("/static/js/htmx.min.js"),
             "generated main.rs must not hardcode /static/js/htmx.min.js, got:\n{content}"
         );
+    }
+
+    // --- issue #1593: the framework-owned file set `autumn upgrade` reconciles ---
+
+    /// The fixed `autumn_version` `owned()` renders its fixtures with —
+    /// deliberately independent of this crate's own `CARGO_PKG_VERSION`, so
+    /// this test module does not need touching on every release. Assertions
+    /// that check a rendered workflow does *not* pin to "this app's autumn
+    /// version" must check against this constant, not `CARGO_PKG_VERSION`:
+    /// the two happen to match today, but only this one is what `owned()`
+    /// actually renders with.
+    const FIXTURE_AUTUMN_VERSION: &str = "0.7.0";
+
+    fn owned(opts: GenerateOptions) -> std::collections::BTreeMap<&'static str, String> {
+        let vars = TemplateVars {
+            project_name: "demo",
+            crate_name: "demo",
+            autumn_version: FIXTURE_AUTUMN_VERSION,
+            rust_version: "1.88.0",
+        };
+        framework_owned_files(&vars, opts)
+    }
+
+    #[test]
+    fn framework_owned_set_covers_the_fullstack_scaffold() {
+        let files = owned(GenerateOptions::default());
+        for expected in [
+            "autumn.toml",
+            "Dockerfile",
+            ".dockerignore",
+            "build.rs",
+            ".gitignore",
+            ".env.example",
+            ".github/workflows/ci.yml",
+            ".github/workflows/posture-gate.yml",
+            "rust-toolchain.toml",
+            "rustfmt.toml",
+            "clippy.toml",
+            "tailwind.config.js",
+            "static/css/input.css",
+        ] {
+            assert!(
+                files.contains_key(expected),
+                "missing {expected}: {:?}",
+                files.keys()
+            );
+        }
+    }
+
+    /// The posture gate (issue #1624) ships turned on, and the pieces that make
+    /// it a *gate* rather than a report are all present: the fresh manifest, a
+    /// staleness check that compares postures rather than bytes, the
+    /// base-branch side read out of git, an acknowledgment harvest restricted
+    /// to accounts with real write permission, and a final step that actually
+    /// fails the job.
+    #[test]
+    fn the_scaffolded_posture_gate_is_wired_end_to_end() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded by default");
+
+        assert!(workflow.contains("autumn routes audit --manifest"));
+        assert!(workflow.contains("autumn routes posture diff"));
+        assert!(
+            workflow.contains("--allow-missing-base"),
+            "first run must not break a repo"
+        );
+        assert!(workflow.contains("--ack-file \"$RUNNER_TEMP/acks.txt\""));
+        // Every scratch path lives outside the PR-controlled checkout, so a
+        // committed symlink cannot redirect one write onto another file.
+        for scratch in [
+            "base-posture.json",
+            "committed-posture.json",
+            "acks.txt",
+            "posture-diff.md",
+            "head-posture/posture-manifest.json",
+        ] {
+            assert!(
+                !workflow.contains(&format!(" {scratch}"))
+                    || workflow.contains(&format!("$RUNNER_TEMP/{scratch}")),
+                "{scratch} must be written under $RUNNER_TEMP: {workflow}"
+            );
+        }
+        assert!(
+            workflow.contains("pull-requests: write"),
+            "posting the diff needs it"
+        );
+        assert!(
+            !workflow.contains("contents: write"),
+            "the gate never writes to the repository"
+        );
+    }
+
+    /// Who may acknowledge is the only authorization control in the feature, so
+    /// it must ask GitHub for a real repository permission — `author_association`
+    /// reports organization affiliation, and would let any org member with read
+    /// access unblock a widening.
+    #[test]
+    fn the_scaffolded_gate_checks_real_write_permission_to_acknowledge() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+        assert!(
+            workflow.contains("collaborators/${login}/permission"),
+            "must resolve each commenter's actual permission: {workflow}"
+        );
+        assert!(
+            !workflow.contains("select(.author_association"),
+            "affiliation is not permission — it may be named in a comment \
+             explaining why, never used as the filter"
+        );
+        assert!(
+            workflow.contains("admin|write|maintain"),
+            "and only write-or-better may acknowledge"
+        );
+    }
+
+    /// `routes posture` did not exist in every release. The verdict job
+    /// tries the pinned CLI, falls back to the latest published release if
+    /// that lacks the command (#2495), and — even then — says which command
+    /// is missing rather than failing with an unknown-subcommand error, and
+    /// fails rather than skipping, because a gate that waves a pull request
+    /// through when its own tooling is too old is worse than a red one.
+    #[test]
+    fn the_gate_names_the_release_when_the_latest_cli_is_too_old() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let verdict: &str = workflow
+            .split("Security posture diff")
+            .last()
+            .expect("the verdict job");
+        assert!(
+            verdict.contains("routes posture --help"),
+            "the verdict job must check the CLI can run this gate: {verdict}"
+        );
+        let probe = verdict
+            .split("routes posture --help")
+            .last()
+            .expect("after the probe");
+        assert!(
+            probe.contains("::error::") && probe.contains("exit 1"),
+            "and fail loudly rather than skipping: {probe}"
+        );
+    }
+
+    /// Issue #2495: `routes posture` can postdate the release pinned to this
+    /// app's own autumn-web version — but always installing "latest" instead
+    /// would run this security gate under a CLI this project's own
+    /// compatibility check (`doctor.rs::check_version_compat`) calls
+    /// incompatible the moment a minor release ships, and the gap would only
+    /// ever grow as later, unrelated releases ship. So the verdict job tries
+    /// the pinned, compatible CLI first and, only when it lacks the command,
+    /// probes forward through a bounded run of candidate releases — landing
+    /// on the closest one that has it, not a moving "latest" — for that run
+    /// alone. The `manifest` job — which compiles the pull request's own
+    /// code — gets no such fallback at all: nothing in it may run under a
+    /// CLI this project calls incompatible.
+    #[test]
+    fn the_posture_gate_prefers_the_pinned_compatible_cli_and_falls_back_only_when_needed() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let pinned = format!("v{FIXTURE_AUTUMN_VERSION}");
+        assert!(
+            workflow.contains(&pinned),
+            "posture-gate.yml must still install the CLI pinned to this \
+             app's autumn version as the default: {workflow}"
+        );
+
+        let (build_job, verdict_job) = workflow
+            .split_once("  posture:")
+            .expect("two jobs: the build and the verdict");
+        assert!(
+            !build_job.contains("for bump in"),
+            "the manifest job compiles the pull request's own code and must \
+             never fall back to a CLI this project's own compatibility \
+             check would call incompatible: {build_job}"
+        );
+        assert!(
+            verdict_job.contains("for bump in") && verdict_job.contains("::warning::"),
+            "the verdict job must probe forward for the closest compatible \
+             release, visibly, when the pinned CLI lacks routes posture: \
+             {verdict_job}"
+        );
+        assert!(
+            !verdict_job.contains("trunk-dev"),
+            "the fallback must land on a specific, bounded candidate \
+             release, not an unbounded, ever-drifting \"latest\": \
+             {verdict_job}"
+        );
+    }
+
+    /// A missing baseline is a bootstrap exactly once — on the pull request
+    /// that adds the gate. Once the workflow is on the base branch, "no
+    /// baseline committed" is not a repository adopting the gate, it is a
+    /// repository whose gate passes everything while the required check reads
+    /// green. `autumn new` does not generate the manifest, so this is the
+    /// default state of a project that scaffolds the workflow and stops.
+    #[test]
+    fn a_missing_baseline_bootstraps_only_while_the_gate_is_new() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let step = workflow
+            .split("Check the committed manifest is up to date")
+            .last()
+            .expect("the staleness step");
+        let bootstrap = step
+            .split("no posture baseline")
+            .next()
+            .expect("before the bootstrap notice");
+        assert!(
+            bootstrap.contains("posture-gate.yml") && bootstrap.contains("exit 1"),
+            "a missing baseline must be fatal once the gate is on the base branch: {bootstrap}"
+        );
+    }
+
+    /// The boundary between harvested comment bodies must not be forgeable. A
+    /// reviewer pasting the separator inside a fenced sample would otherwise
+    /// reset the parser's state mid-body and make a following marker live —
+    /// so the harvest neutralizes any occurrence in a body before writing it,
+    /// which keeps the boundary out of reviewer-controlled text without giving
+    /// up the fence isolation the separator exists for.
+    #[test]
+    fn the_harvest_neutralizes_a_separator_inside_a_comment_body() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let harvest = workflow
+            .split("- name: Harvest acknowledgments")
+            .nth(1)
+            .expect("the harvest step");
+        let after_decode = harvest
+            .split_once("base64 -d")
+            .expect("bodies are decoded")
+            .1;
+        let neutralized = after_decode
+            .split("acks.txt")
+            .next()
+            .expect("the decode is redirected into the file");
+        assert!(
+            neutralized.contains("autumn:ack-source"),
+            "a decoded body must have the separator neutralized between the \
+             decode and the file: {neutralized}"
+        );
+    }
+
+    /// The job that compiles the pull request holds no write permission and
+    /// reaches no verdict; the job that decides never runs application code.
+    /// A malicious build script therefore cannot replace the binary that later
+    /// computes the diff, resolves acknowledgments, and sets the exit code.
+    #[test]
+    fn the_gate_decides_in_a_job_that_never_compiles_the_pull_request() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        let (build_job, verdict_job) = workflow
+            .split_once("  posture:")
+            .expect("two jobs: the build and the verdict");
+
+        assert!(
+            build_job.contains("autumn routes audit --manifest"),
+            "the build job is the one that compiles: {build_job}"
+        );
+        assert!(
+            !build_job.contains("pull-requests: write"),
+            "the job that runs the pull request's build scripts gets no write token"
+        );
+        assert!(
+            !build_job.contains("routes posture diff"),
+            "and reaches no verdict"
+        );
+
+        // Structural, not textual: the verdict job's comments and diagnostics
+        // legitimately *mention* `autumn routes audit`. What it must not do is
+        // set up a toolchain or run the build step.
+        assert!(
+            !verdict_job.contains("dtolnay/rust-toolchain")
+                && !verdict_job.contains("Swatinem/rust-cache")
+                && !verdict_job.contains("Build this commit's posture manifest"),
+            "the verdict job must never compile the pull request: {verdict_job}"
+        );
+        assert!(verdict_job.contains("routes posture diff"));
+        assert!(
+            verdict_job.contains("download-artifact"),
+            "it reads the manifest as data"
+        );
+        assert!(
+            verdict_job.contains("Install the autumn CLI"),
+            "with a CLI it installs itself, not one the build job left behind"
+        );
+    }
+
+    /// Bypasses the review found, each pinned by the thing that closes it.
+    #[test]
+    fn the_scaffolded_gate_closes_its_own_bypasses() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        // Editing the gate in the pull request the gate is judging — but NOT
+        // the pull request that adds it, which is how a repository adopts the
+        // gate at all (`autumn upgrade --apply`).
+        assert!(workflow.contains("Refuse a pull request that edits this gate"));
+        assert!(
+            workflow.contains("adding the security posture gate for the first time"),
+            "the adoption pull request must not be refused by the gate it adds: {workflow}"
+        );
+        // Deleting the baseline in this pull request, to disarm the gate — and
+        // to brick it for everyone afterwards.
+        assert!(
+            workflow.contains("this pull request deletes the committed posture baseline"),
+            "deleting the baseline must fail here: {workflow}"
+        );
+        // …but a baseline that went missing some other way must not lock the
+        // repository out, including the pull request that restores it.
+        assert!(
+            workflow.contains("::warning::${POSTURE_MANIFEST} existed on origin/"),
+            "a baseline missing for other reasons warns and bootstraps: {workflow}"
+        );
+        // A failing build must not skip the verdict: GitHub counts a skipped
+        // required check as satisfied.
+        assert!(
+            workflow.contains("if: always()") && workflow.contains("needs.manifest.result"),
+            "the verdict job runs even when the manifest job fails: {workflow}"
+        );
+        // A base ref that is not in the checkout at all.
+        assert!(workflow.contains("git rev-parse --verify"));
+        // Rewriting someone else's comment, or updating a quoted copy.
+        assert!(workflow.contains("github-actions[bot]"));
+        // A failed comment post (every fork pull request) swallowing the verdict.
+        assert!(
+            workflow.contains("if: always() && steps.diff.outcome == 'success'"),
+            "the verdict must survive a failed comment post: {workflow}"
+        );
+        // One comment per pull request, not one per concurrent push.
+        assert!(workflow.contains("cancel-in-progress: true"));
+        // One comment's unbalanced code fence swallowing another's marker.
+        assert!(workflow.contains("<!-- autumn:ack-source -->"));
+    }
+
+    /// It is a workflow of its own, not another job on `ci.yml`: `ci.yml` must
+    /// not acquire the `pull-requests: write` token the gate needs.
+    #[test]
+    fn the_posture_gate_does_not_widen_the_ci_workflows_permissions() {
+        let files = owned(GenerateOptions::default());
+        let ci = files.get(".github/workflows/ci.yml").expect("scaffolded");
+        assert!(!ci.contains("pull-requests: write"));
+    }
+
+    /// The bundled-pg waiver is resolved by flag, and its anchors are internal
+    /// bookkeeping — a leaked `>>> autumn:` marker would ship in every app.
+    #[test]
+    fn the_advisory_policy_resolves_its_flavor_anchors() {
+        let vars = TemplateVars {
+            project_name: "demo",
+            crate_name: "demo",
+            autumn_version: "0.7.0",
+            rust_version: "1.88.0",
+        };
+        let rendered = render_template(templates::DENY_TOML, &vars);
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_bundled_pg: true,
+                with_daemon: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            let policy = render_deny_toml(&rendered, opts);
+            assert!(
+                !policy.contains("autumn:bundled-pg-waiver"),
+                "template anchors must never reach a generated project:\n{policy}"
+            );
+            assert_eq!(
+                policy.contains("RUSTSEC-2024-0384"),
+                opts.with_bundled_pg,
+                "the managed-pg-bundled waiver belongs to exactly the flavor whose \
+                 tree can reach it"
+            );
+            assert!(
+                policy.contains("RUSTSEC-2023-0071"),
+                "every flavor's tree reaches rsa through jsonwebtoken"
+            );
+        }
+    }
+
+    /// The advisory policy is generated but deliberately *not* reconciled
+    /// (issue #1600): its waiver list is the app author's, and a file the
+    /// developer is asked to edit would come back as a conflict on every
+    /// `autumn upgrade` — the same reason `Cargo.toml` is not owned either.
+    #[test]
+    fn the_advisory_policy_is_generated_but_not_framework_owned() {
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            assert!(
+                !owned(opts).contains_key("deny.toml"),
+                "deny.toml carries the app's own waivers; reconciling it would \
+                 conflict with every waiver its author adds"
+            );
+        }
+        let tmp = TempDir::new().unwrap();
+        generate("policy-owner-app", tmp.path()).unwrap();
+        assert!(
+            tmp.path().join("policy-owner-app/deny.toml").is_file(),
+            "…but `autumn new` must still write it"
+        );
+    }
+
+    #[test]
+    fn framework_owned_set_never_reaches_into_src() {
+        for opts in [
+            GenerateOptions::default(),
+            GenerateOptions {
+                with_api: true,
+                ..GenerateOptions::default()
+            },
+            GenerateOptions {
+                with_i18n: true,
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        ] {
+            for path in owned(opts).keys() {
+                assert!(
+                    !path.starts_with("src/"),
+                    "application source is out of bounds, got {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn api_flavor_owns_no_css_or_tailwind() {
+        let files = owned(GenerateOptions {
+            with_api: true,
+            ..GenerateOptions::default()
+        });
+        assert!(
+            !files.contains_key("tailwind.config.js"),
+            "{:?}",
+            files.keys()
+        );
+        assert!(
+            !files.contains_key("static/css/input.css"),
+            "{:?}",
+            files.keys()
+        );
+        // ...but it still owns the common set.
+        assert!(files.contains_key("Dockerfile"));
+        assert!(files.contains_key("build.rs"));
+    }
+
+    #[test]
+    fn api_and_fullstack_render_different_dockerfiles_and_build_scripts() {
+        let full = owned(GenerateOptions::default());
+        let api = owned(GenerateOptions {
+            with_api: true,
+            ..GenerateOptions::default()
+        });
+        assert_ne!(full["Dockerfile"], api["Dockerfile"]);
+        assert_ne!(full["build.rs"], api["build.rs"]);
+    }
+
+    #[test]
+    fn i18n_option_is_reflected_in_the_owned_autumn_toml_and_dockerfile() {
+        let plain = owned(GenerateOptions::default());
+        let i18n = owned(GenerateOptions {
+            with_i18n: true,
+            ..GenerateOptions::default()
+        });
+        assert!(!plain["autumn.toml"].contains("[i18n]"));
+        assert!(i18n["autumn.toml"].contains("[i18n]"));
+        assert_ne!(plain["Dockerfile"], i18n["Dockerfile"]);
+        // The unresolved anchors never survive into a generated file.
+        assert!(!i18n["Dockerfile"].contains("__AUTUMN_I18N_BUILDER_COPY__"));
+        assert!(!plain["Dockerfile"].contains("__AUTUMN_I18N_BUILDER_COPY__"));
+    }
+
+    #[test]
+    fn daemon_and_bundled_pg_options_reach_the_owned_autumn_toml() {
+        let daemon = owned(GenerateOptions {
+            with_daemon: true,
+            ..GenerateOptions::default()
+        });
+        assert!(
+            daemon["autumn.toml"].contains("uses no database"),
+            "{}",
+            daemon["autumn.toml"]
+        );
+        let bundled = owned(GenerateOptions {
+            with_daemon: true,
+            with_bundled_pg: true,
+            ..GenerateOptions::default()
+        });
+        assert!(
+            bundled["autumn.toml"].contains("auto_migrate_in_production = true"),
+            "{}",
+            bundled["autumn.toml"]
+        );
+    }
+
+    #[test]
+    fn generated_project_files_match_the_framework_owned_rendering() {
+        // The reconciler compares a project against `framework_owned_files`, so
+        // a byte that `autumn new` writes differently is a permanent phantom
+        // conflict. One renderer, one truth.
+        let tmp = TempDir::new().unwrap();
+        generate("owned-app", tmp.path()).unwrap();
+        let vars = TemplateVars {
+            project_name: "owned-app",
+            crate_name: "owned_app",
+            autumn_version: env!("CARGO_PKG_VERSION"),
+            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        };
+        for (path, expected) in framework_owned_files(&vars, GenerateOptions::default()) {
+            let actual = fs::read_to_string(tmp.path().join("owned-app").join(path))
+                .unwrap_or_else(|e| panic!("{path} was not scaffolded: {e}"));
+            assert_eq!(actual, expected, "{path} drifted from its rendering");
+        }
+    }
+
+    #[test]
+    fn a_new_project_records_the_release_that_scaffolded_it() {
+        use crate::upgrade::scaffold::{MANIFEST_PATH, Manifest};
+
+        let tmp = TempDir::new().unwrap();
+        generate("provenance-app", tmp.path()).unwrap();
+        let root = tmp.path().join("provenance-app");
+
+        assert!(root.join(MANIFEST_PATH).is_file(), "no scaffold manifest");
+        let manifest = Manifest::load(&root).expect("manifest parses");
+        assert_eq!(manifest.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(manifest.options, GenerateOptions::default());
+        // Every framework-owned file it just wrote has a baseline digest.
+        for path in framework_owned_files(
+            &TemplateVars {
+                project_name: "provenance-app",
+                crate_name: "provenance_app",
+                autumn_version: env!("CARGO_PKG_VERSION"),
+                rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+            },
+            GenerateOptions::default(),
+        )
+        .keys()
+        {
+            assert!(
+                manifest.digests.contains_key(*path),
+                "no baseline recorded for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recorded_manifest_records_the_options_the_project_was_made_with() {
+        use crate::upgrade::scaffold::Manifest;
+
+        let tmp = TempDir::new().unwrap();
+        let opts = GenerateOptions {
+            with_api: true,
+            with_i18n: true,
+            ..GenerateOptions::default()
+        };
+        generate_with("api-provenance", tmp.path(), opts).unwrap();
+        let manifest = Manifest::load(&tmp.path().join("api-provenance")).unwrap();
+        assert_eq!(manifest.options, opts);
+    }
+
+    #[test]
+    fn a_new_project_reports_no_scaffold_drift() {
+        // The tightest guarantee available: what `autumn new` writes today is
+        // exactly what `autumn upgrade` calls current.
+        use crate::upgrade::scaffold;
+
+        let tmp = TempDir::new().unwrap();
+        generate("fresh-app", tmp.path()).unwrap();
+        let report = scaffold::plan(&tmp.path().join("fresh-app"), env!("CARGO_PKG_VERSION"));
+        assert!(!report.drifted(), "{}", scaffold::render_text(&report));
+    }
+
+    #[test]
+    fn the_scaffold_manifest_is_committed_not_ignored() {
+        // A manifest that git ignores is a manifest that never reaches the
+        // next checkout, which is the only place it has any value.
+        let tmp = TempDir::new().unwrap();
+        generate("committed-app", tmp.path()).unwrap();
+        let gitignore = fs::read_to_string(tmp.path().join("committed-app/.gitignore")).unwrap();
+        assert!(!gitignore.contains(".autumn"), "{gitignore}");
     }
 }

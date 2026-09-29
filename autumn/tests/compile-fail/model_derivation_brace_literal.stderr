@@ -1,0 +1,5 @@
+error: a `{` or `}` is not allowed in a `#[derivation(filter = ...)]` string literal: `{c}` in the emitted SQL is the child-alias placeholder the runtime substitutes, and a literal brace could forge one
+  --> tests/compile-fail/model_derivation_brace_literal.rs:32:74
+   |
+32 | #[derivation(Post, column = "featured_comment_count", filter = status == "{c}.\"id\"")]
+   |                                                                          ^^^^^^^^^^^^

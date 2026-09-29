@@ -6,6 +6,11 @@ local MCP server). It is the production, non-watch counterpart to
 [`autumn dev`](./getting-started.md): no file watching, no hot reload, plus a
 managed lifecycle and a no-fuss local database story.
 
+> **Windows:** the whole lifecycle runs natively, and can be registered as a
+> Windows service that starts at boot and restarts after a crash. The contract is
+> the same; the transport and the stop signal are not. See
+> [Windows](#windows) below.
+
 ## Quick start
 
 ```sh
@@ -28,17 +33,20 @@ two minutes with **zero externally-installed dependencies**.
 | `autumn serve --release` | Build an optimized release binary first. |
 | `autumn serve --daemon` | Build and run detached in the background. |
 | `autumn serve status` | `running (pid, address)` (exit 0) or `stopped` (exit 3). |
-| `autumn serve stop` | `SIGTERM` (graceful drain), then `SIGKILL` on timeout. |
+| `autumn serve stop` | Graceful drain, then a force-kill of the process tree on timeout. |
 | `autumn serve restart` | `stop` (if running) then `--daemon`. |
+| `autumn serve install-service` | Windows only: register the daemon as a boot-start, crash-restarting service. |
+| `autumn serve uninstall-service` | Windows only: stop it, deregister it, remove its state. |
 
 A second `--daemon` start is **rejected** with a clear message rather than
 double-binding, guarded by a PID lockfile.
 
 ## Transport and discovery
 
-The daemon binds a **Unix domain socket** (mode `0600`), never a public
-interface. A client discovers the address from a small TOML file written next
-to the socket:
+On Unix the daemon binds a **Unix domain socket** (mode `0600`), never a public
+interface; on Windows it binds its configured `server.host` / `server.port` (see
+[Windows](#windows)). Either way a client discovers where from a small TOML file
+beside the pidfile:
 
 ```toml
 # <runtime-dir>/<project>/serve.addr
@@ -61,6 +69,108 @@ Linux, `~/Library/Application Support` on macOS, `%APPDATA%`/`%LOCALAPPDATA%` on
 Windows — never the current directory, `/tmp`, or `/etc`. Set
 `AUTUMN_RUNTIME_DIR` to override the base (used in tests).
 
+Access is restricted to you. On Unix the directories are `0700` and the files
+`0600`. Windows has no mode bits, so the directories get the equivalent ACL —
+your account (by SID, so it resolves on a domain-joined or Entra-joined machine
+too), `SYSTEM` and the local `Administrators` group, with inheritance broken so
+nothing wider leaks in from a parent directory. Everything created inside (the
+log, the address file, the managed-Postgres cluster) inherits it. Autumn also
+takes ownership of the directory, because an object's owner can rewrite its ACL
+no matter what it says. If any of that cannot be applied — including on a
+directory another user already owns — the daemon **refuses to start** rather
+than run with its records reachable by other local users.
+
+On Windows this is `%LOCALAPPDATA%`, never roaming `%APPDATA%`: a pidfile is
+machine-specific, and a managed-Postgres cluster must not be synced at logoff or
+placed on a redirected network share.
+
+## Windows
+
+The lifecycle runs natively: `--daemon`, `stop`, `status` and `restart` behave
+as they do on Unix, with a single-instance guard, a readiness-gated start, the
+same `serve.addr` discovery file, and the same `status` exit codes (0 running,
+3 stopped). Three things differ, because the platforms differ.
+
+**Transport.** There is no Unix socket, so a Windows daemon binds its configured
+`server.host` / `server.port` — which is also what you want when the point is to
+self-host the app. It reports the address it actually bound back to the CLI,
+which records it:
+
+```toml
+# %LOCALAPPDATA%\autumn\<project>\data\run\serve.addr   (never Roaming)
+pid = 4242
+transport = "tcp"
+address = "127.0.0.1:3000"
+```
+
+`autumn serve status` prints `tcp:127.0.0.1:3000` where Unix prints
+`unix:/run/.../serve.sock`. A client reads the transport and address from the
+same two fields either way.
+
+**Stop.** Windows has no `SIGTERM`. `autumn serve stop` asks for the drain by
+creating `serve.stop`, which the daemon watches (the app is started with
+`AUTUMN_SHUTDOWN_SIGNAL_FILE` pointing at it). That runs the *identical*
+sequence a signal runs: readiness flips to draining, the prestop grace elapses,
+in-flight requests finish, `on_shutdown` hooks run — so a managed Postgres child
+is stopped cleanly, not orphaned. Only once the daemon's recorded budget expires
+does `stop` escalate, and then it force-kills the whole process tree rather than
+just the app.
+
+A foreground `autumn serve` also drains on a console control event —
+`CTRL_C` and `CTRL_BREAK` run the full graceful path, and `CTRL_CLOSE`,
+`CTRL_LOGOFF` and `CTRL_SHUTDOWN` start it. Be aware of what the last three
+really buy: Windows *tells* a process about them rather than asking, and the
+grace period applies to the handler, not to the work the handler starts — so a
+drain longer than a second or two will lose that race. **Stop an Autumn app
+through `autumn serve stop` or the Service Control Manager**, both of which wait
+for the app's own recorded budget. Closing a console window is a fallback, not
+the supported stop.
+
+### Running as a Windows service
+
+Two commands, from an **elevated (Administrator)** shell:
+
+```powershell
+autumn serve install-service     # build, register, start
+autumn serve uninstall-service   # stop, deregister, clean up
+```
+
+`install-service` builds the app, registers a service named
+`autumn-<project>-<dirhash>`, sets it to start automatically at boot, arms a
+restart-on-failure policy (5s, then 15s, then 60s, with the failure count
+resetting after a quiet day), and starts it. The service appears in
+`services.msc` and answers `sc.exe query`, `sc.exe stop` and `sc.exe start` like
+any other.
+
+It is not a separate lifecycle. The service hosts the same app child
+`--daemon` hosts and writes the same pidfile, address file and log, so
+`autumn serve status` and `autumn serve stop` keep working against it, and a
+`sc.exe stop` runs the same cooperative drain. `autumn serve restart` restarts
+the *service* through the Service Control Manager rather than starting a loose
+daemon beside it, so the app that comes back is still supervised. An app that exits cleanly, or one
+an operator stopped, is left stopped; an app that crashes or fails to boot is
+restarted by the Service Control Manager.
+
+`uninstall-service` stops the service (draining it), deregisters it, reaps a
+managed Postgres cluster it may have left running, and removes the daemon's
+state files. **Your database is not deleted** — the managed-Postgres data
+directory is kept, and the command prints its path.
+
+The service runs as `Local System`, the default account, which is what keeps
+registration to one command with no credentials to store. It reads and writes
+the state directory the installing user created, which is why that directory's
+ACL admits `SYSTEM`. Non-default service accounts are not configured by these
+commands; use `sc.exe config` if you need one.
+
+> **What the service trusts.** `install-service` records the built binary's path
+> and your project directory, and the Service Control Manager runs that binary as
+> `Local System` at every boot. Anyone who can write to either can therefore run
+> code as `SYSTEM`. Keep the project under a directory only you and
+> administrators can write — your user profile is fine, a folder created at the
+> root of `C:\` is not. `install-service` also **builds** your project, so run
+> it from an elevated shell only for a project you would be willing to build
+> there.
+
 ## Databases
 
 ### DB-optional by default
@@ -75,7 +185,16 @@ doesn't need persistence.
 
 For apps that use `#[model]` / `#[repository]`, `autumn new --bundled-pg`
 scaffolds a daemon that provisions and supervises a **local Postgres** in the
-app's data dir. It wires a `ManagedPostgresPoolProvider` through the existing
+app's data dir. It is behind the non-default `managed-pg` feature; the
+scaffold writes `managed-pg-bundled` (which implies it, plus a vendored
+Postgres) into the generated `Cargo.toml` for you. Wiring the provider into an
+existing app means adding it yourself:
+
+```toml
+autumn-web = { version = "0.7", features = ["managed-pg"] }
+```
+
+It wires a `ManagedPostgresPoolProvider` through the existing
 [pluggable pool provider](./custom-subsystems.md) — there are no changes to the
 query path — and ties the cluster's lifecycle to the daemon via an
 `on_shutdown` hook:
@@ -116,13 +235,21 @@ Two build modes select where the Postgres binaries come from:
 
 ## Database backups
 
-`autumn db backup` and `autumn db restore` take logical dumps of the databases
-your app actually uses. They resolve the connection URL(s) through the **same**
+`autumn db backup` and `autumn db restore` capture the databases your app
+actually uses — on Postgres as logical dumps, on SQLite as a file
+snapshot. They resolve the connection URL(s) through the **same**
 path as `autumn migrate` and the other `autumn db` commands — control plus every
 configured shard, under the active profile/`.env` overlay — so a backup captures
 exactly what the running app reads. On a managed-Postgres daemon the bundled
 `pg_dump`/`pg_restore` are used automatically, so there are no external client
 tools to install.
+
+On the [SQLite tier](./sqlite-in-production.md) neither tool is involved at all:
+a `sqlite://` target is captured with SQLite's own `VACUUM INTO` (one
+transactional statement, safe against a live app) and the artifact is a
+`control.sqlite` database file. Everything below — the run directory, `--keep`,
+`--upload`, `restore` — works the same; only `--format`, which grades Postgres
+artifacts, does not apply.
 
 ```sh
 # Back up control + every shard into ./backups/<profile>/<timestamp>/
@@ -149,6 +276,11 @@ If `pg_dump`/`pg_restore` are not on `PATH` (and you are not on a managed-Postgr
 app that bundles them), install the PostgreSQL client tools or point
 `AUTUMN_PG_BIN_DIR` at their `bin` directory. `autumn doctor` warns when they are
 missing.
+
+> **Copying a backup to staging or a laptop?** Run it through
+> [`autumn db scrub`](data-scrubbing.md) first — it anonymizes every
+> PII-classified column and refuses (rather than silently passing data through)
+> when a column has not been classified at all.
 
 ### Scheduling
 
@@ -213,8 +345,108 @@ A good drill: restore the latest backup into a scratch database, run
 `autumn doctor` / your smoke tests against it, then discard it. Confirming a
 backup restores cleanly is the only way to know it is real.
 
+### Offsite backups
+
+A backup on the same disk as the database is not disaster recovery: one failed
+drive takes the app and every backup with it. Point `autumn db backup` at an
+**S3-compatible** offsite destination (AWS S3, MinIO, Cloudflare R2, Backblaze
+B2, Garage) and it uploads each completed run **after** local integrity
+verification passes, then **verifies every remote object matches the local
+file** before reporting success. If the local backup succeeds but the upload
+fails, the command says so unambiguously and exits non-zero — the local artifact
+is left intact.
+
+Configure the destination in `autumn.toml` under `[backup.offsite]`. Credentials
+are supplied by **env-var indirection**: config names the environment variables
+the access key / secret are read from; the secret values never live in config,
+argv, logs, or error messages.
+
+```toml
+[backup.offsite]
+# Upload after every `autumn db backup`, without needing --upload:
+auto_upload = true
+# Key prefix inside the bucket (optional; objects are keyed
+# {prefix}/{profile}/{timestamp}/{file}):
+prefix = "db"
+# Independent remote retention: keep the newest N uploaded runs per profile,
+# pruning older ones only after a verified upload (never the just-uploaded run):
+keep = 30
+
+[backup.offsite.s3]
+bucket   = "myapp-db-offsite"
+region   = "auto"                       # R2 uses "auto"; MinIO ignores it
+endpoint = "https://<accountid>.r2.cloudflarestorage.com"
+force_path_style = true                 # required by MinIO / R2 / most self-hosted
+# Credentials by env-var indirection — names, not values:
+access_key_id_env     = "AUTUMN_OFFSITE_ACCESS_KEY_ID"
+secret_access_key_env = "AUTUMN_OFFSITE_SECRET_ACCESS_KEY"
+```
+
+Every setting also has an `AUTUMN_BACKUP__OFFSITE__*` environment override (e.g.
+`AUTUMN_BACKUP__OFFSITE__S3__BUCKET`) and honors profile overlays
+(`[profile.prod.backup.offsite]`), matching the rest of Autumn's config.
+
+By default the offsite destination must be **distinct** from the app's
+user-facing `[storage.s3]` bucket. Pointing both at the same bucket+endpoint
+requires the explicit opt-in `allow_shared_bucket = true`.
+
+```sh
+# Export the credentials the config names, then upload with the backup:
+export AUTUMN_OFFSITE_ACCESS_KEY_ID=...          # never committed
+export AUTUMN_OFFSITE_SECRET_ACCESS_KEY=...
+autumn db backup --upload --keep 7 --dir /var/backups/myapp
+
+# List what's offsite (timestamp, size, files) for the active profile:
+autumn db offsite list
+```
+
+`autumn doctor` includes an `offsite_backup` check that flags an unset bucket, a
+shared bucket without opt-in, or credentials that are not ready — without ever
+printing a credential value.
+
+**Scheduling.** Extend the cron / systemd recipe above with `--upload` (or set
+`auto_upload = true` and drop the flag):
+
+```cron
+0 2 * * *  cd /srv/myapp && AUTUMN_ENV=prod autumn db backup --upload --keep 7 --dir /var/backups/myapp
+```
+
+```ini
+# In the systemd unit's [Service] section, load the offsite credentials from a
+# root-only env file and add --upload to the backup command:
+EnvironmentFile=/etc/myapp/offsite.env
+ExecStart=/usr/local/bin/autumn db backup --upload --keep 7 --dir /var/backups/myapp
+```
+
+**Restore-from-offsite drill.** List the offsite runs, then restore one directly
+— it downloads the run to a temp directory and applies the **same** integrity
+verification and production `--force` guard as a local restore:
+
+```sh
+# See what's available offsite:
+autumn db offsite list
+
+# Restore the newest offsite run for a profile (into a scratch/dev DB):
+autumn db restore offsite:dev/latest
+
+# Or an explicit run, into production (this overwrites data):
+AUTUMN_ENV=prod autumn db restore offsite:prod/20260710T020000Z --force
+```
+
+**Encryption posture.** Transfers use **TLS in transit** (HTTPS to the S3
+endpoint). At rest, objects are protected by the **provider's server-side
+encryption** (enable SSE / bucket default encryption on your bucket). Uploads
+send `x-amz-checksum-sha256` so the endpoint validates payload integrity
+server-side. **Client-side backup encryption** (encrypting the artifact with a
+framework-managed key before it leaves the host) is a named follow-up — see the
+`autumn/src/encryption.rs` AES-256-GCM envelope — and is **not** applied by this
+slice.
+
 ## Out of scope
 
-SQLite as an app backend, in-process Postgres, and system-service installation
-(systemd unit / launchd plist / Windows Service) are intentionally not part of
-daemon mode — see issue #1119 for rationale.
+SQLite as an app backend, in-process Postgres, and *Unix* system-service
+installation (systemd unit / launchd plist) are intentionally not part of daemon
+mode — see issue #1119 for rationale. Windows Service registration **is** part
+of it (see [Windows](#windows)): WSL2 was the previous answer there and it is
+not an operator's answer, since it is unavailable on many Windows Server
+installs and offers no boot start or crash supervision.

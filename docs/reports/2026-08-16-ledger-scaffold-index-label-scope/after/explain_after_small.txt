@@ -1,0 +1,14 @@
+=== AFTER: page-scoped label load (this change) ===
+                                                                    QUERY PLAN                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using posts_pkey on public.posts  (cost=0.28..62.00 rows=20 width=52) (actual time=0.016..0.054 rows=20 loops=1)
+   Output: id, title
+   Index Cond: (posts.id = ANY ('{640,1772,4002,4057,4058,4078,4114,4127,4135,4151,4292,4506,4521,4582,4624,4732,4809,4845,4887,4915}'::bigint[]))
+   Buffers: shared hit=54
+ Query Identifier: 6018538679218668104
+ Planning:
+   Buffers: shared hit=55
+ Planning Time: 0.159 ms
+ Execution Time: 0.065 ms
+(9 rows)
+

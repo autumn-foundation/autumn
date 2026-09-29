@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use autumn_web::alerts::{
     Alert, AlertChannel, AlertCondition, AlertConfig, AlertDeliveryError, AlertDeliveryFuture,
-    AlertEventKind, AlertSeverity, Alerter, AlerterSettings,
+    AlertEventKind, AlertRouting, AlertSeverity, Alerter, AlerterSettings,
 };
 use autumn_web::test::TestApp;
 
@@ -967,4 +967,167 @@ async fn unreachable_channel_does_not_break_the_caller() {
     );
     // Give the detached task a chance to run and swallow its error.
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+}
+
+// ── Native transports: PagerDuty / Slack / Discord (issue #1630) ─────────────
+
+/// AC #1/#2 (#1630): a `[alerts] pagerduty_routing_key` (with a mock enqueue
+/// endpoint) installs the `PagerDuty` channel, and a dead-lettered job is
+/// delivered as an Events API v2 `trigger` to that endpoint — proving the
+/// config-only, zero-app-code path fires against a stub in-process.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn pagerduty_transport_registers_and_delivers_events_v2() {
+    let url = "https://events.pagerduty.test/v2/enqueue";
+    let mut app = TestApp::new();
+    // The channel names its client with the (full) URL, so the mock alias must
+    // equal that URL for the outbound POST to match.
+    let mock = app
+        .http_mock(url)
+        .post("/v2/enqueue")
+        .respond_with_status(202);
+    let client = app.build();
+
+    let config = AlertConfig {
+        pagerduty_routing_key: Some("R0UT1NGKEY".to_owned()),
+        pagerduty_url: Some(url.to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+    assert!(
+        client.state().extension::<Alerter>().is_some(),
+        "a PagerDuty routing key must install the PagerDuty channel"
+    );
+
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "emailer", "job-1", "boom");
+    // Give the detached delivery task a chance to hit the mock endpoint.
+    for _ in 0..50 {
+        if mock.call_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    mock.expect_called(1);
+}
+
+/// AC #3 (#1630): a Slack webhook URL installs the Slack channel and a condition
+/// is posted to the Slack-compatible endpoint. Discord uses the same channel
+/// type against its Slack-compatible endpoint.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn slack_transport_registers_and_delivers_message() {
+    let url = "https://hooks.slack.test/services/T/B/x";
+    let mut app = TestApp::new();
+    let mock = app
+        .http_mock(url)
+        .post("/services/T/B/x")
+        .respond_with_status(200);
+    let client = app.build();
+
+    let config = AlertConfig {
+        slack_webhook_url: Some(url.to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+    assert!(client.state().extension::<Alerter>().is_some());
+
+    autumn_web::alerts::notify_scheduled_task_failure(client.state(), "nightly_backup", "boom");
+    for _ in 0..50 {
+        if mock.call_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    mock.expect_called(1);
+}
+
+/// A relative/malformed native-transport URL must NOT register a channel — the
+/// SSRF-hardened HTTP client could never dispatch it. With it as the only
+/// destination, no alerter is installed (mirrors the generic-webhook rigor).
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn native_transport_with_relative_url_does_not_register_channel() {
+    let client = TestApp::new().build();
+    let config = AlertConfig {
+        slack_webhook_url: Some("hooks.slack/x".to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+    assert!(
+        client.state().extension::<Alerter>().is_none(),
+        "a relative slack_webhook_url must not install a non-delivering channel"
+    );
+}
+
+/// AC #4 (#1630, per-channel severity routing): a chat channel declaring
+/// `slack_severities = "critical"` receives the firing trigger but NOT the
+/// recovery — the recovery is verifiably not delivered to it. Proven by the
+/// endpoint being called exactly once across a trigger→recover cycle.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn critical_only_chat_channel_does_not_receive_recovery() {
+    let url = "https://hooks.slack.test/services/crit/only/x";
+    let mut app = TestApp::new();
+    let mock = app
+        .http_mock(url)
+        .post("/services/crit/only/x")
+        .respond_with_status(200);
+    let client = app.build();
+
+    let config = AlertConfig {
+        slack_webhook_url: Some(url.to_owned()),
+        slack_severities: AlertRouting::Critical,
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    // Trigger (critical) then recover (recovery) the same scheduled task.
+    autumn_web::alerts::notify_scheduled_task_failure(client.state(), "nightly_backup", "boom");
+    for _ in 0..50 {
+        if mock.call_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    autumn_web::alerts::notify_scheduled_task_recovered(client.state(), "nightly_backup");
+    // Give any (erroneous) recovery delivery a chance to land.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    mock.expect_called(1);
+}
+
+/// AC #5 (#1630, fan-out): the same alert pages `PagerDuty` AND posts to Slack
+/// simultaneously when both are configured.
+#[cfg(feature = "http-client")]
+#[tokio::test]
+async fn alert_fans_out_to_pagerduty_and_slack_simultaneously() {
+    let pd_url = "https://events.pagerduty.test/fanout/enqueue";
+    let slack_url = "https://hooks.slack.test/fanout/x";
+    let mut app = TestApp::new();
+    let pd = app
+        .http_mock(pd_url)
+        .post("/fanout/enqueue")
+        .respond_with_status(202);
+    let slack = app
+        .http_mock(slack_url)
+        .post("/fanout/x")
+        .respond_with_status(200);
+    let client = app.build();
+
+    let config = AlertConfig {
+        pagerduty_routing_key: Some("R0UT1NGKEY".to_owned()),
+        pagerduty_url: Some(pd_url.to_owned()),
+        slack_webhook_url: Some(slack_url.to_owned()),
+        ..AlertConfig::default()
+    };
+    autumn_web::alerts::install_from_config(client.state(), &config, Vec::new());
+
+    autumn_web::alerts::notify_dead_lettered_job(client.state(), "emailer", "job-1", "boom");
+    for _ in 0..50 {
+        if pd.call_count() >= 1 && slack.call_count() >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    pd.expect_called(1);
+    slack.expect_called(1);
 }

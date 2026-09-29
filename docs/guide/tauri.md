@@ -50,7 +50,7 @@ when building the sidecar binary:
 Both features are already enabled by the generated `stage-sidecar.sh` /
 `stage-sidecar.ps1` scripts; you only need to wire `ManagedPostgresPoolProvider`
 in your app's pool configuration if you haven't already (see the
-[managed Postgres guide](managed-pg.md)).
+[managed Postgres section of the daemon guide](daemon.md#managed-local-postgres-opt-in)).
 
 ## Scaffolding
 
