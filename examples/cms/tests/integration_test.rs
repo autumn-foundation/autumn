@@ -14932,6 +14932,42 @@ async fn a_refused_item_on_a_later_menu_page_still_shows_its_message() {
         .assert_body_contains(r#"value="/kept""#);
 }
 
+/// A refused item keeps its category target even when the bounded category
+/// list no longer includes it — otherwise the browser would select "No
+/// category" and the resubmitted item would silently lose its target.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_item_keeps_a_target_outside_the_bounded_lists() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Primary"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         SELECT 'category', 'cat-' || lpad(g::text, 3, '0'),
+                'cat-' || lpad(g::text, 3, '0'), '', 0
+         FROM generate_series(1, 250) AS g",
+    )
+    .await
+    .expect("seed the terms");
+
+    // cat-250 (id 250) is beyond the first 200 offered.
+    let refused = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", " "), ("term_id", "250")]))
+        .send()
+        .await;
+    refused.assert_status(422);
+    refused.assert_body_contains(r#"<option value="250" selected>cat-250"#);
+}
+
 /// Only one menu can hold a theme location, under concurrency.
 ///
 /// The replacement cleared the incumbent and inserted, with nothing

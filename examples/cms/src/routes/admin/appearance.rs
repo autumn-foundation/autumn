@@ -8,7 +8,9 @@ use serde::Deserialize;
 use crate::capabilities::Capability;
 use crate::content;
 use crate::models::{NewMenuItem, NewWidget, UpdateWidget, User};
-use crate::repositories::{MenuItemRepository as _, WidgetRepository as _};
+use crate::repositories::{
+    MenuItemRepository as _, PostRepository as _, TermRepository as _, WidgetRepository as _,
+};
 use crate::require_capability;
 use crate::theme::WidgetKind;
 
@@ -196,17 +198,41 @@ async fn appearance_page(
         })
         .await?;
 
-    let pages = repos.published_posts("page", 200).await?;
+    let mut pages = repos.published_posts("page", 200).await?;
+    // Both target lists are bounded, so a target the administrator picked can
+    // be absent from them by the time the form is redisplayed — the browser
+    // would then select "No page"/"No category" and the resubmitted item would
+    // silently lose its target. Keep the submitted one, as the settings screen
+    // does for its configured front page.
+    let kept_form = match rejected {
+        Some(Rejected::MenuItem { form, .. }) => Some(*form),
+        _ => None,
+    };
+    let kept_id = |raw: Option<&str>| raw.and_then(|v| v.trim().parse::<i64>().ok());
+    if let Some(id) = kept_id(kept_form.map(|f| f.post_id.as_str()))
+        && !pages.iter().any(|page| page.id == id)
+        && let Some(page) = repos.posts.find_by_id(id).await?
+        && page.post_type == "page"
+    {
+        pages.insert(0, page);
+    }
     // Bounded like `pages` above, and for the same reason: this is a
     // *create* control — every menu on the screen renders the whole set as
     // `<option>`s, so an unbounded finder here made the Appearance screen the
     // one that broke on a large taxonomy while the taxonomy and authoring
     // screens stayed responsive. There is no current selection to retain: the
     // control always starts at "No category".
-    let (categories, category_count) = {
+    let (mut categories, category_count) = {
         let mut conn = repos.conn().await?;
         crate::content::terms_page_with_total(&mut conn, "category", 0, MENU_TERM_LIMIT).await?
     };
+    if let Some(id) = kept_id(kept_form.map(|f| f.term_id.as_str()))
+        && !categories.iter().any(|term| term.id == id)
+        && let Some(term) = repos.terms.find_by_id(id).await?
+        && term.taxonomy == "category"
+    {
+        categories.insert(0, term);
+    }
 
     let body = html! {
         section class="mb-10" {
