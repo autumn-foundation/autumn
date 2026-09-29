@@ -10,7 +10,12 @@
 //! Clients include an `Idempotency-Key` HTTP header with a unique value (e.g., a UUID)
 //! in their request.
 //!
-//! - **First request**: The middleware caches the final response associated with the key.
+//! - **First request**: The handler runs and, when the response is cacheable, the
+//!   middleware stores it under the key. Cacheable means a `2xx`/`3xx` status, or an
+//!   error the framework marked as raised *after* a committed mutation (the
+//!   `#[repository]`-generated write paths do this), with a body of at most 10 MiB.
+//!   Any other `4xx`/`5xx`, or a larger body, streams through uncached, so a retry
+//!   runs the handler again.
 //! - **Subsequent requests**: If the middleware sees the same `Idempotency-Key` within
 //!   the retention period, it intercepts the request and returns the cached response
 //!   immediately, adding an `X-Idempotent-Replayed: true` header to indicate the
