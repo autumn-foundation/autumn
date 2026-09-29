@@ -388,7 +388,11 @@ fn build_binary(opts: &CalibrateOptions<'_>, features: &crate::routes::CargoFeat
         features,
         &crate::routes::CargoProfile::from_release(true),
     );
-    crate::routes::find_binary_in_profile(opts.package, opts.bin, &crate::routes::CargoProfile::from_release(true))
+    crate::routes::find_binary_in_profile(
+        opts.package,
+        opts.bin,
+        &crate::routes::CargoProfile::from_release(true),
+    )
 }
 
 /// Directory the calibrated package's `autumn.toml` lives in.

@@ -443,7 +443,7 @@ pub struct CargoProfile {
 impl CargoProfile {
     /// A profile selection from a plain `--release` flag.
     #[must_use]
-    pub fn from_release(release: bool) -> Self {
+    pub const fn from_release(release: bool) -> Self {
         Self {
             release,
             profile: None,
@@ -452,20 +452,23 @@ impl CargoProfile {
 
     /// Whether this selects anything other than Cargo's default dev profile.
     #[must_use]
-    pub fn is_default(&self) -> bool {
+    pub const fn is_default(&self) -> bool {
         !self.release && self.profile.is_none()
     }
 
     /// The selection as the `cargo build` flags it forwards, for reporting.
     #[must_use]
     pub fn to_args(&self) -> Vec<String> {
-        if let Some(name) = &self.profile {
-            vec!["--profile".to_string(), name.clone()]
-        } else if self.release {
-            vec!["--release".to_string()]
-        } else {
-            Vec::new()
-        }
+        self.profile.as_ref().map_or_else(
+            || {
+                if self.release {
+                    vec!["--release".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+            |name| vec!["--profile".to_string(), name.clone()],
+        )
     }
 
     /// The `target/` subdirectory Cargo places this profile's artifacts in.
@@ -825,8 +828,14 @@ mod tests {
 
         let debug = resolve_binary_in_profile(&metadata, None, cwd, None, &CargoProfile::default())
             .expect("the debug binary resolves");
-        let release = resolve_binary_in_profile(&metadata, None, cwd, None, &CargoProfile::from_release(true))
-            .expect("the release binary resolves");
+        let release = resolve_binary_in_profile(
+            &metadata,
+            None,
+            cwd,
+            None,
+            &CargoProfile::from_release(true),
+        )
+        .expect("the release binary resolves");
 
         assert!(
             debug.starts_with("/tmp/target/debug"),
@@ -888,8 +897,13 @@ mod tests {
                 }]
             }]
         });
-        let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/projects/hello"), None, &CargoProfile::default());
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/projects/hello"),
+            None,
+            &CargoProfile::default(),
+        );
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -935,7 +949,13 @@ mod tests {
                 }
             ]
         });
-        let result = resolve_binary_in_profile(&metadata, None, Path::new("/ws"), None, &CargoProfile::default());
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws"),
+            None,
+            &CargoProfile::default(),
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary packages"),
@@ -965,9 +985,14 @@ mod tests {
             ]
         });
         // Narrowing cwd to /ws/alpha means only "alpha" matches.
-        let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/ws/alpha"), None, &CargoProfile::default())
-                .unwrap();
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/alpha"),
+            None,
+            &CargoProfile::default(),
+        )
+        .unwrap();
         assert!(result.to_string_lossy().contains("alpha"));
     }
 
@@ -988,8 +1013,14 @@ mod tests {
                 }
             ]
         });
-        let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/ws"), None, &CargoProfile::default()).unwrap();
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws"),
+            None,
+            &CargoProfile::default(),
+        )
+        .unwrap();
         assert!(result.to_string_lossy().contains("myapp"));
     }
 
@@ -1003,8 +1034,13 @@ mod tests {
                 "targets": [{"name": "mylib", "kind": ["lib"]}]
             }]
         });
-        let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/ws/mylib"), None, &CargoProfile::default());
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/mylib"),
+            None,
+            &CargoProfile::default(),
+        );
         assert!(result.unwrap_err().contains("no binary target"));
     }
 
@@ -1045,8 +1081,13 @@ mod tests {
                 ]
             }]
         });
-        let result =
-            resolve_binary_in_profile(&metadata, None, Path::new("/ws/myapp"), None, &CargoProfile::default());
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/myapp"),
+            None,
+            &CargoProfile::default(),
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary targets"),
@@ -1171,14 +1212,9 @@ mod tests {
 
     fn resolve_profile_dir(profile: &CargoProfile) -> String {
         let metadata = profile_metadata();
-        let path = resolve_binary_in_profile(
-            &metadata,
-            None,
-            Path::new("/projects/hello"),
-            None,
-            profile,
-        )
-        .expect("the binary resolves");
+        let path =
+            resolve_binary_in_profile(&metadata, None, Path::new("/projects/hello"), None, profile)
+                .expect("the binary resolves");
         path.parent()
             .expect("binary has a parent dir")
             .file_name()

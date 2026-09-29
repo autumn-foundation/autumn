@@ -101,14 +101,9 @@ const COMPETING_DUMP_MODES: [&str; 7] = [
 fn dump_spec(opts: &ExportOptions<'_>) -> String {
     // Build and locate under the SAME profile: a command that builds then runs
     // must agree with itself about which binary it means.
-    compile_binary_with(
-        opts.package,
-        opts.bin,
-        &opts.features,
-        &CargoProfile::from_release(opts.release),
-    );
-    let binary =
-        find_binary_in_profile(opts.package, opts.bin, &CargoProfile::from_release(opts.release));
+    let profile = CargoProfile::from_release(opts.release);
+    compile_binary_with(opts.package, opts.bin, &opts.features, &profile);
+    let binary = find_binary_in_profile(opts.package, opts.bin, &profile);
 
     // `AppBuilder::run` checks its no-boot protocol modes in a fixed ORDER, and
     // `AUTUMN_BUILD_STATIC` / `AUTUMN_DUMP_ROUTES` are both checked BEFORE the

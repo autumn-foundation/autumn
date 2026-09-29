@@ -186,9 +186,9 @@ pub fn run(opts: &CacheAuditOptions<'_>) {
     // Say which build is being audited whenever it is not the default one, so
     // a manifest is never mistaken for a claim about a feature set or profile
     // it was not built under.
-    let mut build_flags = opts.features.to_args();
-    build_flags.extend(opts.profile.to_args());
-    if !build_flags.is_empty() {
+    if !opts.features.is_default() || !opts.profile.is_default() {
+        let mut build_flags = opts.features.to_args();
+        build_flags.extend(opts.profile.to_args());
         eprintln!("Building with {}\n", build_flags.join(" "));
     }
     routes::compile_binary_with(opts.package, opts.bin, &opts.features, &opts.profile);
