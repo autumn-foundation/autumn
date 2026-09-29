@@ -417,8 +417,8 @@ validator.workspace = true
 # `#[serde(transparent)]` over `uuid::Uuid`, so the lib does not compile under
 # `--features sqlite` without it.
 uuid = { version = "1", features = ["v4", "serde"] }
-rand = "0.9"
-rand_chacha = "0.9"
+rand = "0.10"
+rand_chacha = "0.10"
 chrono = { workspace = true }
 chrono-tz.workspace = true
 # `serde` is a default feature, named here because `SqliteDecimal` depends on it.
