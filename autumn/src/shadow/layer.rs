@@ -27,6 +27,13 @@
 //! an oversize body is not partially captured, it is abandoned and counted, so
 //! a streaming endpoint cannot grow the process.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -65,7 +72,7 @@ use crate::shadow::diff::{
     Comparison, DivergenceKind, ResponseFacts, compare, redact_path_and_query,
 };
 use crate::shadow::registry::{Recorded, RequestContext, ShadowRegistry};
-use crate::shadow::sample::{MirrorDecision, MirrorSelector, roll_from};
+use crate::shadow::sample::{MirrorDecision, MirrorSelector, SkipReason, roll_from};
 use crate::shadow::transport::{
     ShadowError, ShadowRequest, ShadowTransport, forwarded_headers, shadow_url,
 };
@@ -237,8 +244,17 @@ where
             }),
             // Not mirrored: the request is forwarded with no wrapper at all, so
             // the overwhelmingly common path costs one decision and nothing
-            // else — no body wrapper, no allocation, no metric.
+            // else — no body wrapper, no allocation. The one exception is the
+            // conditional skip, which the mirror layer counts: unlike the
+            // other skip reasons (configuration facts), conditional traffic is
+            // the coverage the mirror is silently giving up on cache-heavy
+            // routes, and the operator needs to see how much (issue #2335).
+            // The increment fires only on this rare path, never on the
+            // request path at large.
             MirrorDecision::Skip(reason) => {
+                if reason == SkipReason::Conditional {
+                    self.ctx.registry.record_skipped_conditional();
+                }
                 tracing::trace!(
                     target: "autumn::shadow",
                     reason = reason.as_str(),
@@ -942,10 +958,22 @@ mod tests {
         Response = Response<Body>,
         Error = std::convert::Infallible,
     > + Clone {
+        primary_responding(StatusCode::OK, body)
+    }
+
+    /// A primary handler that always answers with `status` and `body`.
+    fn primary_responding(
+        status: StatusCode,
+        body: &'static str,
+    ) -> impl tower::Service<
+        Request<Body>,
+        Response = Response<Body>,
+        Error = std::convert::Infallible,
+    > + Clone {
         service_fn(move |_req: Request<Body>| async move {
             Ok::<_, std::convert::Infallible>(
                 Response::builder()
-                    .status(StatusCode::OK)
+                    .status(status)
                     .header("content-type", "application/json")
                     .body(Body::from(body))
                     .expect("valid response"),
@@ -998,6 +1026,81 @@ mod tests {
 
         assert!(transport.seen().is_empty());
         assert_eq!(registry.stats().mirrored, 0);
+    }
+
+    /// Issue #2335, the false-positive end: the client revalidates with the
+    /// primary's validator, the primary answers `304`, and the candidate —
+    /// whose validator is scoped to its own build — correctly answers `200`
+    /// with the full body for byte-identical content. Before the fix the
+    /// mirror replayed the conditional request and recorded a `status_class`
+    /// divergence on ordinary cache traffic; now the request is never
+    /// mirrored, so no divergence can be recorded.
+    #[tokio::test]
+    async fn a_conditional_revalidation_is_not_mirrored_and_records_no_divergence() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: r#"{"ok":true}"#,
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings())
+            .layer(primary_responding(StatusCode::NOT_MODIFIED, ""));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .header(axum::http::header::IF_NONE_MATCH, "\"abc123\"")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        // The skip happens synchronously in `decide`: no detached mirror task
+        // is ever spawned, so asserting immediately is sound — there is
+        // nothing to settle.
+        assert!(
+            transport.seen().is_empty(),
+            "a conditional request must never reach the candidate"
+        );
+        let stats = registry.stats();
+        assert_eq!(stats.mirrored, 0);
+        assert_eq!(stats.compared, 0);
+        assert_eq!(stats.diverged, 0);
+        assert_eq!(stats.skipped_conditional, 1);
+    }
+
+    /// Issue #2335, the masking end: both builds revalidate, so the differ
+    /// would compare two empty `304` bodies and record a `match` — while
+    /// comparing nothing, hiding a genuine body regression on exactly the
+    /// traffic that revalidates. Conditional requests are excluded from the
+    /// mirror, so no vacuous comparison is recorded.
+    #[tokio::test]
+    async fn a_conditional_revalidation_is_not_compared_vacuously() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 304,
+            body: "",
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings())
+            .layer(primary_responding(StatusCode::NOT_MODIFIED, ""));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .header(
+                axum::http::header::IF_MODIFIED_SINCE,
+                "Wed, 21 Oct 2015 07:28:00 GMT",
+            )
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        assert!(transport.seen().is_empty());
+        let stats = registry.stats();
+        assert_eq!(stats.compared, 0, "no comparison may be recorded");
+        assert_eq!(
+            stats.matched, 0,
+            "an empty-vs-empty 304 pair is not a match"
+        );
+        assert_eq!(stats.skipped_conditional, 1);
     }
 
     #[tokio::test]

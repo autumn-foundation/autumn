@@ -361,6 +361,41 @@ fn a_plugin_declaring_a_route_the_app_already_serves_is_refused_not_a_boot_panic
     );
 }
 
+/// #2463: a plugin may not declare an encoded spelling of an application route.
+///
+/// The router compares `/hello/%2e/transfer` and `/hello/transfer` as two
+/// paths, so the collision preflight above cannot see the overlap. A browser
+/// removes the `%2e` segment, so a 307 to the plugin's route replays the user's
+/// POST at the application's handler. The route must not load by any entry.
+#[test]
+fn a_plugin_may_not_declare_an_encoded_spelling_of_an_app_route() {
+    let spelled = |path: &str| {
+        let mut manifest =
+            SandboxManifest::parse(&manifest_toml(&ResourceLimits::default())).expect("valid");
+        manifest.routes[0].method = "POST".to_owned();
+        manifest.routes[0].path = path.to_owned();
+        manifest
+    };
+    let module = wat::parse_str(guests::HELLO).expect("valid WAT");
+    for path in [
+        "/hello/%2e/transfer",
+        "/hello/%2E/transfer",
+        "/hello/%2e%2e/hello/transfer",
+        "/hello/%74ransfer",
+    ] {
+        assert!(
+            SandboxArtifact::seal(spelled(path), module.clone()).is_err(),
+            "{path} was packaged"
+        );
+        assert!(
+            SandboxHost::from_module(spelled(path), &module).is_err(),
+            "{path} was loaded"
+        );
+    }
+    // The control: the same manifest with a plain route loads.
+    assert!(SandboxHost::from_module(spelled("/hello/transfer"), &module).is_ok());
+}
+
 // ── AC-3, AC-4, AC-5: the adversarial corpus ─────────────────────────────
 
 /// What containment a given escape attempt is expected to produce.
