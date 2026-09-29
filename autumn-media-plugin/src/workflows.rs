@@ -33,9 +33,10 @@ use autumn_web::{AppState, AutumnError, AutumnResult, job};
 use serde::{Deserialize, Serialize};
 
 use crate::encode::{
-    FfmpegHighlightCommand, FfmpegPosterCommand, FfmpegPreviewSpriteCommand, PREVIEW_CELL_HEIGHT,
-    PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS,
-    build_preview_webvtt,
+    FfmpegHighlightCommand, FfmpegPosterCommand, FfmpegPreviewSpriteCommand,
+    FfmpegRoomCompositeCommand, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
+    PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, build_preview_webvtt,
+    validate_room_composite_input_count,
 };
 use crate::error::MediaError;
 use crate::sink::{MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSinkExt};
@@ -94,6 +95,23 @@ pub struct TranscodeJobArgs {
     /// Caller-supplied workflow id echoed back to the sink.
     pub workflow_id: String,
     /// Caller-supplied source identifier echoed back.
+    #[serde(default)]
+    pub source_id: Option<String>,
+}
+
+/// Arguments for the room-composite job, which tiles every participant's
+/// recording into one composited MP4 (see [`FfmpegRoomCompositeCommand`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomCompositeJobArgs {
+    /// One recording per room participant (`2..=6`), tiled into the grid.
+    pub source_paths: Vec<PathBuf>,
+    /// Caller-relative storage key for the composited MP4.
+    pub output_key: String,
+    /// MIME content type to persist the output with.
+    pub content_type: String,
+    /// Caller-supplied workflow id echoed back to the sink.
+    pub workflow_id: String,
+    /// Caller-supplied source identifier (e.g. a room id) echoed back.
     #[serde(default)]
     pub source_id: Option<String>,
 }
@@ -168,6 +186,19 @@ async fn transcode_window(state: AppState, args: TranscodeJobArgs) -> AutumnResu
 }
 
 #[job(
+    name = "autumn_media_compose_room_recording",
+    max_attempts = 3,
+    backoff_ms = 1000,
+    queue = "media"
+)]
+async fn compose_room_recording(state: AppState, args: RoomCompositeJobArgs) -> AutumnResult<()> {
+    let (storage, ffmpeg) = resolve_engine(&state)?;
+    let workflow_id = args.workflow_id.clone();
+    let result = run_room_composite(&ffmpeg, &storage, args).await;
+    deliver_result(&state, MediaArtifactKind::Transcode, workflow_id, result).await
+}
+
+#[job(
     name = "autumn_media_finalize_recording",
     max_attempts = 3,
     backoff_ms = 1000,
@@ -209,6 +240,7 @@ pub fn media_job_infos(queue: &str) -> Vec<JobInfo> {
         __autumn_job_info_extract_thumbnail(),
         __autumn_job_info_extract_preview(),
         __autumn_job_info_transcode_window(),
+        __autumn_job_info_compose_room_recording(),
         __autumn_job_info_finalize_recording(),
     ]
     .into_iter()
@@ -252,6 +284,8 @@ pub enum MediaWorkflowRequest {
     Preview(Box<PreviewJobArgs>),
     /// A transcode-window request.
     Transcode(Box<TranscodeJobArgs>),
+    /// A room-composite request.
+    RoomComposite(Box<RoomCompositeJobArgs>),
     /// A recording-finalize orchestration request.
     Finalize(Box<FinalizeRecordingJobArgs>),
 }
@@ -327,6 +361,21 @@ impl MediaWorkflows {
             .await
     }
 
+    /// Queue a room-composite encode (tile every participant recording into one
+    /// composited MP4).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from the runtime delegate or the fallback enqueue.
+    pub async fn queue_room_composite(
+        &self,
+        state: &AppState,
+        args: RoomCompositeJobArgs,
+    ) -> AutumnResult<()> {
+        self.dispatch(state, MediaWorkflowRequest::RoomComposite(Box::new(args)))
+            .await
+    }
+
     /// Queue a recording-finalize orchestration (poster + seek-preview).
     ///
     /// # Errors
@@ -353,6 +402,9 @@ impl MediaWorkflows {
             MediaWorkflowRequest::Thumbnail(args) => ExtractThumbnailJob::enqueue(*args).await,
             MediaWorkflowRequest::Preview(args) => ExtractPreviewJob::enqueue(*args).await,
             MediaWorkflowRequest::Transcode(args) => TranscodeWindowJob::enqueue(*args).await,
+            MediaWorkflowRequest::RoomComposite(args) => {
+                ComposeRoomRecordingJob::enqueue(*args).await
+            }
             MediaWorkflowRequest::Finalize(args) => FinalizeRecordingJob::enqueue(*args).await,
         }
     }
@@ -540,6 +592,126 @@ async fn run_transcode(
     })
 }
 
+async fn run_room_composite(
+    ffmpeg_bin: &str,
+    storage: &MediaStorage,
+    args: RoomCompositeJobArgs,
+) -> Result<MediaArtifact, MediaError> {
+    let RoomCompositeJobArgs {
+        source_paths,
+        output_key,
+        content_type,
+        workflow_id,
+        source_id,
+    } = args;
+    // Reject a malformed job (fewer than two / more than six source paths)
+    // against the same `2..=6` band `FfmpegRoomCompositeCommand::run()` enforces
+    // *before* spawning any `ffprobe`, so a bad queued job can never fan out one
+    // probe child process per supplied path only to be rejected afterwards.
+    validate_room_composite_input_count(source_paths.len())?;
+    let (output_path, ephemeral) = staged_output(storage, &output_key, "mp4")?;
+    // Detect, per input, whether it carries an audio stream so the composite
+    // mixes only the inputs that actually have audio. Probing is async I/O and
+    // lives here in the caller; `FfmpegRoomCompositeCommand::args()` stays a pure
+    // function of the resulting flags. See `probe_has_audio` for the fail-safe
+    // policy (a probe failure degrades to "no audio", never a crash).
+    let ffprobe_bin = resolve_ffprobe_bin(ffmpeg_bin);
+    // Probe every input concurrently rather than serializing one `ffprobe`
+    // spawn after another. The probes are independent async I/O; awaiting the
+    // handles in spawn order preserves input order so `audio_present[i]` still
+    // aligns with `source_paths[i]`. `probe_has_audio` is itself fail-safe (a
+    // probe error yields `false`), and a task-join failure (e.g. a panic)
+    // degrades to `false` the same way, so a probe outage never aborts the job.
+    let probes: Vec<_> = source_paths
+        .iter()
+        .map(|path| {
+            let ffprobe_bin = ffprobe_bin.clone();
+            let path = path.clone();
+            tokio::spawn(async move { probe_has_audio(&ffprobe_bin, &path).await })
+        })
+        .collect();
+    let mut audio_present = Vec::with_capacity(probes.len());
+    for probe in probes {
+        audio_present.push(probe.await.unwrap_or(false));
+    }
+    let command = FfmpegRoomCompositeCommand::new(
+        ffmpeg_bin,
+        source_paths,
+        output_path.clone(),
+        audio_present,
+    );
+    let bytes = run_blocking(move || command.run()).await?;
+    let file = persist_and_cleanup(
+        storage,
+        &output_key,
+        &output_path,
+        &content_type,
+        bytes,
+        ephemeral,
+    )
+    .await?;
+    Ok(MediaArtifact {
+        kind: MediaArtifactKind::Transcode,
+        workflow_id,
+        source_id,
+        primary: file,
+        secondary: None,
+        metadata: BTreeMap::new(),
+    })
+}
+
+/// Resolve the `ffprobe` binary from the configured `ffmpeg` binary path.
+///
+/// Prefers a sibling `ffprobe` next to the configured `ffmpeg` (they ship
+/// together), i.e. the same directory with the file name swapped. When the
+/// `ffmpeg` path carries no directory component (a bare `ffmpeg` resolved via
+/// `PATH`) or the sibling does not exist, falls back to plain `ffprobe` on
+/// `PATH`.
+fn resolve_ffprobe_bin(ffmpeg_bin: &str) -> std::ffi::OsString {
+    let candidate = Path::new(ffmpeg_bin).with_file_name("ffprobe");
+    let has_dir = candidate
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if has_dir && candidate.exists() {
+        candidate.into_os_string()
+    } else {
+        std::ffi::OsString::from("ffprobe")
+    }
+}
+
+/// Probe whether `path` carries at least one audio stream.
+///
+/// Runs `ffprobe -v error -select_streams a -show_entries stream=index -of
+/// csv=p=0 <file>` and treats non-empty stdout as "has audio".
+///
+/// **Fail-safe policy:** any probe failure (spawn error, non-zero exit, or a
+/// path with no audio) resolves to `false` ("assume no audio"). This is the
+/// only direction that **cannot crash the composite job**: a `false` merely
+/// drops that input from the `amix`, so at worst a probe outage yields a silent
+/// (but successful) grid. Returning `true` on failure would be unsafe — if the
+/// input truly had no audio, the filtergraph would reference a missing `[i:a]`
+/// stream and `FFmpeg` would fail, which is exactly the crash this replaces.
+async fn probe_has_audio(ffprobe_bin: &std::ffi::OsStr, path: &Path) -> bool {
+    let output = tokio::process::Command::new(ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => !out.stdout.iter().all(u8::is_ascii_whitespace),
+        _ => false,
+    }
+}
+
 /// Run a blocking encode closure off the async runtime.
 async fn run_blocking<F>(f: F) -> Result<u64, MediaError>
 where
@@ -678,9 +850,11 @@ async fn write_text_file(path: &Path, contents: &str) -> Result<(), MediaError> 
 mod tests {
     use super::{
         FinalizeRecordingJobArgs, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
-        MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, ThumbnailJobArgs, TranscodeJobArgs,
-        extract_thumbnail, media_job_infos, persist_and_cleanup, staged_output,
+        MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, RoomCompositeJobArgs,
+        ThumbnailJobArgs, TranscodeJobArgs, compose_room_recording, extract_thumbnail,
+        media_job_infos, persist_and_cleanup, run_room_composite, staged_output,
     };
+    use crate::error::MediaError;
     use crate::sink::MediaArtifactSinkExt;
     use crate::sink::tests::CountingSink;
     use crate::storage::MediaStorage;
@@ -709,12 +883,13 @@ mod tests {
     #[test]
     fn media_job_infos_override_declared_queue() {
         let infos = media_job_infos("custom-queue");
-        assert_eq!(infos.len(), 4);
+        assert_eq!(infos.len(), 5);
         assert!(infos.iter().all(|info| info.queue == "custom-queue"));
         let names: Vec<&str> = infos.iter().map(|info| info.name.as_str()).collect();
         assert!(names.contains(&"autumn_media_extract_thumbnail"));
         assert!(names.contains(&"autumn_media_extract_preview"));
         assert!(names.contains(&"autumn_media_transcode_window"));
+        assert!(names.contains(&"autumn_media_compose_room_recording"));
         assert!(names.contains(&"autumn_media_finalize_recording"));
     }
 
@@ -915,6 +1090,100 @@ mod tests {
         assert!(
             std::path::Path::new(&file.storage_uri).exists(),
             "local backend keeps the served file in place"
+        );
+    }
+
+    fn room_composite_args(sources: Vec<PathBuf>) -> RoomCompositeJobArgs {
+        RoomCompositeJobArgs {
+            source_paths: sources,
+            output_key: "rooms/room-7.mp4".to_owned(),
+            content_type: "video/mp4".to_owned(),
+            workflow_id: "wf-room".to_owned(),
+            source_id: Some("room-7".to_owned()),
+        }
+    }
+
+    #[test]
+    fn room_composite_args_round_trip_through_json() {
+        let args = room_composite_args(vec![
+            PathBuf::from("/rec/a.mp4"),
+            PathBuf::from("/rec/b.mp4"),
+        ]);
+        let back: RoomCompositeJobArgs =
+            serde_json::from_str(&serde_json::to_string(&args).expect("ser")).expect("de");
+        assert_eq!(args, back);
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_room_composite_to_delegate() {
+        let state = AppState::for_test();
+        let seen = Arc::new(std::sync::Mutex::new(None::<MediaWorkflowRequest>));
+        let seen_c = seen.clone();
+        let delegate: MediaWorkflowDelegate = Arc::new(move |_state, request| {
+            *seen_c.lock().expect("lock") = Some(request);
+            Box::pin(async { Ok(()) })
+        });
+        state.insert_extension(MediaWorkflowDelegateExt(delegate));
+
+        let workflows = MediaWorkflows::new("ffmpeg", "media");
+        workflows
+            .queue_room_composite(
+                &state,
+                room_composite_args(vec![
+                    PathBuf::from("/rec/a.mp4"),
+                    PathBuf::from("/rec/b.mp4"),
+                ]),
+            )
+            .await
+            .expect("delegate path returns Ok");
+        assert!(matches!(
+            seen.lock().expect("lock").as_ref(),
+            Some(MediaWorkflowRequest::RoomComposite(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn room_composite_job_reports_failure_to_sink_when_source_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = AppState::for_test();
+        state.insert_extension(local_storage(temp.path()));
+        state.insert_extension(MediaWorkflows::new("ffmpeg", "media"));
+        let sink = Arc::new(CountingSink::new());
+        state.insert_extension(MediaArtifactSinkExt(sink.clone()));
+
+        // Two source paths that do not exist → require_sources fails before
+        // FFmpeg is ever spawned, so this test needs no binary.
+        let args = room_composite_args(vec![
+            temp.path().join("missing-a.mp4"),
+            temp.path().join("missing-b.mp4"),
+        ]);
+        let result = compose_room_recording(state, args).await;
+
+        assert!(result.is_err(), "missing sources must fail the job");
+        assert_eq!(sink.failed.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.completed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn room_composite_rejects_more_than_six_paths_before_probing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage = local_storage(temp.path());
+        // Seven paths (over the 2..=6 mesh-room band). A bogus ffmpeg bin means
+        // its sibling `ffprobe` cannot resolve either, so if this reached the
+        // probe loop it would spawn seven child processes; the input-count guard
+        // must reject first and return the same `2..=6` cap error `run()` uses.
+        let sources: Vec<PathBuf> = (0..7)
+            .map(|i| temp.path().join(format!("missing-{i}.mp4")))
+            .collect();
+        let args = room_composite_args(sources);
+        let result = run_room_composite("/nonexistent/ffmpeg-bin", &storage, args).await;
+        assert!(
+            matches!(
+                result,
+                Err(MediaError::FfmpegSourceMissing { ref path })
+                    if path.contains("at most six")
+            ),
+            "a >6-path job must be rejected by the input-count cap before probing, got {result:?}"
         );
     }
 

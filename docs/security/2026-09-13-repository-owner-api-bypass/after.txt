@@ -1,0 +1,89 @@
+=== autumn-macros repository:: unit tests (323 passed, includes 5 new + 2 updated owner tests) ===
+test repository::tests::repository_owner_api_without_policy_or_scope_is_rejected ... ok
+test repository::tests::repository_owner_api_with_policy_is_accepted ... ok
+test repository::tests::repository_owner_api_with_scope_but_no_policy_is_rejected ... ok
+test repository::tests::repository_owner_api_with_policy_and_scope_is_accepted ... ok
+test repository::tests::repository_owner_without_api_is_accepted ... ok
+test repository::tests::repository_owner_scoped_list_filters_owner_in_count_and_page ... ok
+test repository::tests::repository_owner_scoped_search_filters_all_three_phases ... ok
+test repository::tests::parse_repo_args_with_owner ... ok
+...
+test result: ok. 323 passed; 0 failed; 0 ignored; 0 measured; 1106 filtered out; finished in 0.77s
+
+[exited with code 0]
+
+=== trybuild compile_fail (both fixtures now reject the vulnerable declarations) ===
+test tests/compile-fail/repository_ledgered_requires_soft_delete.rs ... ok
+test tests/compile-fail/repository_ledgered_purge_rejected.rs ... ok
+test tests/compile-fail/repository_ledgered_sensitive_columns.rs ... ok
+test tests/compile-fail/repository_owner_api_without_policy_or_scope.rs ... ok
+test tests/compile-fail/repository_owner_api_with_scope_but_no_policy.rs ... ok
+...
+
+=== full compile_fail suite result ===
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2017 filtered out; finished in 862.07s
+
+=== generated .stderr for repository_owner_api_without_policy_or_scope.rs (no policy, no scope) ===
+error: owner = <column> has no effect on the generated `api = "..."` CRUD routes: only `policy = Type` gates `GET`/`PUT`/`DELETE <api>/{id}` (via can_show/can_update/can_delete) and the list endpoint when no `scope` is set. `scope = Type` alone is not enough — it only filters `GET <api>`'s SQL query and has no effect on the single-record routes, which would stay fully open. Add `policy = Type` (referencing `owner_id`/`ctx.user_id_i64()` from it), keeping `scope = Type` alongside it if you want the list endpoint's cheaper SQL-level filter too, or drop `api = "..."` and call the generated `list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` methods from your own hand-written, owner-checked routes instead
+  --> tests/compile-fail/repository_owner_api_without_policy_or_scope.rs:37:1
+   |
+37 | / #[autumn_web::repository(
+38 | |     OwnerApiBypassNote,
+39 | |     table = "owner_api_bypass_notes",
+40 | |     api = "/api/owner-bypass-notes",
+41 | |     owner = author_id
+42 | | )]
+   | |__^
+   |
+   = note: this error originates in the attribute macro `autumn_web::repository` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+=== generated .stderr for repository_owner_api_with_scope_but_no_policy.rs (scope, but no policy — the gap Codex review caught) ===
+error: owner = <column> has no effect on the generated `api = "..."` CRUD routes: only `policy = Type` gates `GET`/`PUT`/`DELETE <api>/{id}` (via can_show/can_update/can_delete) and the list endpoint when no `scope` is set. `scope = Type` alone is not enough — it only filters `GET <api>`'s SQL query and has no effect on the single-record routes, which would stay fully open. Add `policy = Type` (referencing `owner_id`/`ctx.user_id_i64()` from it), keeping `scope = Type` alongside it if you want the list endpoint's cheaper SQL-level filter too, or drop `api = "..."` and call the generated `list_scoped(owner_id, ..)` / `search_page_scoped(owner_id, ..)` methods from your own hand-written, owner-checked routes instead
+  --> tests/compile-fail/repository_owner_api_with_scope_but_no_policy.rs:43:1
+   |
+43 | / #[autumn_web::repository(
+44 | |     OwnerApiScopeOnlyNote,
+45 | |     table = "owner_api_scope_only_notes",
+46 | |     api = "/api/owner-scope-only-notes",
+47 | |     owner = author_id,
+48 | |     scope = OwnerApiScopeOnlyNoteScope
+49 | | )]
+   | |__^
+   |
+   = note: this error originates in the attribute macro `autumn_web::repository` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+=== autumn-cli generator conformance: scaffold fix (owner_policy_wiring) ===
+cargo test -p autumn-cli --bin autumn scaffold:: -> 417 passed; 0 failed
+cargo test -p autumn-cli --test generate generated_owner_searchable_scaffold_cargo_checks -- --ignored --exact -> ok
+cargo test -p autumn-cli --test generate generated_nullable_owner_searchable_scaffold_cargo_checks -- --ignored --exact -> ok
+cargo test -p autumn-cli --test generate generated_attachment_owner_scaffold_cargo_checks -- --ignored --exact -> ok
+cargo test -p autumn-cli --test generate generated_policy_scaffold_cargo_checks -- --ignored --exact -> ok
+(all four were the CI failures autumn-foundation/autumn#2770 hit on commit e42fb6d,
+before autumn-cli/src/generate/scaffold.rs's owner_policy_wiring fix; each scaffolds
+a fresh project and runs `cargo check --tests` against it, so all four independently
+prove the generated `#[repository(..., owner = <col>, policy = <Type>)]` compiles.)
+
+Second round: the first cut of `owner_policy_wiring` (commit 1be3040) fixed the
+macro-level gate but reintroduced all four failures with a DIFFERENT error —
+`error[E0405]: cannot find trait "PostDraftExt" in this scope` at the newly-wired
+`policy = PostPolicy` attribute. Root cause: `#[repository]`'s `_api_update`
+handler expands an unqualified `{Model}DraftExt::from_patch(...)` whenever
+`has_policy` (issue #1801's merged-model validation) — and this scaffold's
+template always emits `api = "/api/{plural}"` in the attribute (the `api: bool`
+parameter only toggles the doc comment/route-mounting, never the attribute
+string), so `has_policy` is live on EVERY owner-scoped scaffold once `policy =
+Type` is wired in, `--api` or not — not only the `--live` (broadcasts) case
+`draft_ext_import`'s gate already covered. Fixed by widening that gate from
+`live` to `live || owner_column.is_some()`. Verified directly: scaffolded
+`Post title:String body:Text author_id:i64 --searchable title,body` against a
+patched (`[patch.crates-io] autumn-web = { path = ... }`) fresh project and ran
+`cargo check --tests` — `Finished` with only pre-existing unused-import/variable
+warnings, no errors (previously: E0405 on `PostDraftExt`).
+
+=== cargo fmt --all -- --check / cargo clippy -p autumn-macros --lib -- -D warnings /
+    cargo clippy -p autumn-cli --bin autumn --tests -- -D warnings ===
+All clean except one pre-existing, unrelated finding confirmed present on bare trunk
+(autumn-cli/src/generate/schema_edit.rs:1004, clippy::doc_markdown wanting `SQLite`
+backticked) — verified via `git stash` with this PR's changes removed, same finding,
+so not introduced by this change.

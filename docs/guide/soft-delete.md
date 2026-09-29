@@ -78,6 +78,24 @@ This automatically adds the `deleted_at` field, the nullable column in the migra
 the `Nullable<Timestamp>` entry in `schema.rs`, and the `soft_delete` annotation in
 the generated repository file.
 
+### Scaffolded Trash view
+
+A `--soft-delete` **scaffold** additionally generates the recover-from-trash
+UI, so nothing about the flow is hand-written:
+
+| Generated | What it does |
+| --------- | ------------ |
+| `GET /<plural>/trash` | Lists deleted rows through the repository's `page_only_deleted` — the paginated `only_deleted` scope. Linked from the index as **Trash**. |
+| `POST /<plural>/{id}/restore` | CSRF-protected **Restore** button per row; calls `restore(id)`, flashes, redirects back to Trash. |
+| `POST /<plural>/{id}/purge` | CSRF-protected **Purge** button per row behind a server-rendered confirm dialog; calls `purge(id)` — the only hard delete in the app. |
+| `tests/<name>.rs` | A lifecycle test: create → delete → in Trash / out of index → restore → purge. |
+
+Both write handlers load their row with `deleted_at IS NOT NULL` before acting,
+so a request for a row that is not in the trash 404s rather than purging a live
+record. The trash surface is emitted only on the standard HTML path — see
+[generators](./generators.md#trash-restore-and-purge---soft-delete) for the
+gated-off variants and the reasoning.
+
 ## Lifecycle example
 
 ```rust

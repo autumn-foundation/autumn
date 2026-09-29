@@ -1,0 +1,6 @@
+error: #[derive(WireShape)] refuses `#[serde(flatten)]`: the flattened keys are not visible here, so the descriptor would claim a shape it cannot see
+  --> tests/compile-fail/wire_shape_rejects_flatten.rs:13:5
+   |
+13 | /     #[serde(flatten)]
+14 | |     pub extra: Extra,
+   | |____________________^

@@ -1,0 +1,5 @@
+error: state `Refunded` is unreachable from initial state `Pending` of lifecycle `OrderState` — add a transition into it, or remove the variant
+  --> tests/compile-fail/lifecycle_unreachable_state.rs:19:5
+   |
+19 |     Refunded,
+   |     ^^^^^^^^

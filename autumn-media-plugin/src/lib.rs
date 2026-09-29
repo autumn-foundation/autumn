@@ -41,6 +41,8 @@ pub mod config;
 pub mod encode;
 pub mod error;
 pub mod retention;
+pub mod rooms;
+pub mod rooms_db;
 pub mod sink;
 pub mod storage;
 pub mod transport;
@@ -48,12 +50,13 @@ pub mod workflows;
 
 pub use config::{
     MediaConfig, MediaConfigError, MediaMtxConfig, MediaStorageBackend, MediaStorageConfig,
-    RecordingConfig,
+    RecordingConfig, RoomStoreBackend,
 };
 pub use encode::{
     FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand, FfmpegPosterCommand,
-    FfmpegPreviewSpriteCommand, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
-    PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, build_preview_webvtt,
+    FfmpegPreviewSpriteCommand, FfmpegRoomCompositeCommand, PREVIEW_CELL_HEIGHT,
+    PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS,
+    ROOM_COMPOSITE_CELL_HEIGHT, ROOM_COMPOSITE_CELL_WIDTH, build_preview_webvtt,
     newest_recording_file, newest_recording_files, newest_recording_files_since,
     recording_segments_covering_window, slugify,
 };
@@ -62,6 +65,14 @@ pub use retention::{
     RetentionDefer, RetentionReport, is_expired, recording_expires_at, spawn_retention_sweep_loop,
     sweep_recordings_root, within_root,
 };
+pub use rooms::{
+    HeartbeatRequest, HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse,
+    LeaveRequest, ParticipantView, PublishTarget, ReapFuture, ReapStats, RoomError,
+    RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore, RoomStoreFuture, SessionToken,
+    SubscribeTarget, room_participant_path, room_route_infos, room_router, spawn_room_reaper_loop,
+    validate_room_segment,
+};
+pub use rooms_db::DbRoomStore;
 pub use sink::{
     MediaArtifact, MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt,
     MediaSinkFuture,
@@ -75,23 +86,30 @@ pub use transport::{
 };
 pub use workflows::{
     FinalizeRecordingJobArgs, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
-    MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, ThumbnailJobArgs, TranscodeJobArgs,
-    media_job_infos,
+    MediaWorkflowRequest, MediaWorkflows, PreviewJobArgs, RoomCompositeJobArgs, ThumbnailJobArgs,
+    TranscodeJobArgs, media_job_infos,
 };
 
 /// Common downstream imports for configuring and mounting the media plugin.
 pub mod prelude {
     pub use crate::{
         FfmpegClipTailCommand, FfmpegHighlightCommand, FfmpegLiveThumbnailCommand,
-        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, FinalizeRecordingJobArgs, MediaArtifact,
-        MediaArtifactFile, MediaArtifactKind, MediaArtifactSink, MediaArtifactSinkExt, MediaConfig,
-        MediaConfigError, MediaError, MediaMtxConfig, MediaPlugin, MediaStorage,
-        MediaStorageBackend, MediaStorageConfig, MediaWorkflowDelegate, MediaWorkflowDelegateExt,
-        MediaWorkflowRequest, MediaWorkflows, PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH,
-        PREVIEW_FRAME_INTERVAL_SECONDS, PREVIEW_SPRITE_COLUMNS, PreviewJobArgs, RecordingConfig,
-        RetentionDefer, S3MediaStorage, StoredObject, ThumbnailJobArgs, TranscodeJobArgs,
-        build_preview_webvtt, media_job_infos, newest_recording_file, newest_recording_files,
+        FfmpegPosterCommand, FfmpegPreviewSpriteCommand, FfmpegRoomCompositeCommand,
+        FinalizeRecordingJobArgs, MediaArtifact, MediaArtifactFile, MediaArtifactKind,
+        MediaArtifactSink, MediaArtifactSinkExt, MediaConfig, MediaConfigError, MediaError,
+        MediaMtxConfig, MediaPlugin, MediaStorage, MediaStorageBackend, MediaStorageConfig,
+        MediaWorkflowDelegate, MediaWorkflowDelegateExt, MediaWorkflowRequest, MediaWorkflows,
+        PREVIEW_CELL_HEIGHT, PREVIEW_CELL_WIDTH, PREVIEW_FRAME_INTERVAL_SECONDS,
+        PREVIEW_SPRITE_COLUMNS, PreviewJobArgs, ROOM_COMPOSITE_CELL_HEIGHT,
+        ROOM_COMPOSITE_CELL_WIDTH, RecordingConfig, RetentionDefer, RoomCompositeJobArgs,
+        S3MediaStorage, StoredObject, ThumbnailJobArgs, TranscodeJobArgs, build_preview_webvtt,
+        media_job_infos, newest_recording_file, newest_recording_files,
         newest_recording_files_since, recording_segments_covering_window, slugify,
+    };
+    pub use crate::{
+        HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats,
+        RoomError, RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
+        room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
     };
     pub use crate::{
         IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
@@ -121,8 +139,10 @@ use crate::workflows::MediaWorkflowDelegate as MediaWorkflowDelegateHook;
 /// [`MediaConfig`](config::MediaConfig) with [`config`](Self::config), then
 /// install with `app.plugin(...)`.
 ///
-/// This is the slice-0 skeleton: [`build`](Plugin::build) currently declares no
-/// routes and installs no extensions.
+/// When [`with_rooms`](Self::with_rooms) is enabled, [`build`](Plugin::build)
+/// nests the [`rooms::room_router`] under the API prefix and installs a
+/// [`rooms::RoomService`] extension; the broadcast surface installs the storage
+/// / encode wiring.
 pub struct MediaPlugin {
     /// Resolved `[media]` configuration.
     config: MediaConfig,
@@ -250,6 +270,22 @@ impl MediaPlugin {
         self
     }
 
+    /// Override the mesh-room session-token lifetime, in seconds (shortcut for
+    /// `config.room_token_ttl_seconds`).
+    #[must_use]
+    pub const fn room_token_ttl_seconds(mut self, seconds: u32) -> Self {
+        self.config.room_token_ttl_seconds = seconds;
+        self
+    }
+
+    /// Override the mesh-room `MediaMTX` path namespace (shortcut for
+    /// `config.room_namespace`).
+    #[must_use]
+    pub fn room_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.config.room_namespace = Some(namespace.into());
+        self
+    }
+
     /// Override the job/Harvest queue name used for media encode work.
     #[must_use]
     pub fn queue(mut self, queue: impl Into<String>) -> Self {
@@ -326,10 +362,30 @@ impl Default for MediaPlugin {
 }
 
 impl Plugin for MediaPlugin {
+    /// This plugin ships in lockstep with `autumn-web` — see
+    /// [`lockstep_contract`](autumn_web::plugin_contract::lockstep_contract).
+    fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
+        Some(autumn_web::plugin_contract::lockstep_contract(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("autumn-media-plugin")
     }
 
+    /// Applies the plugin to the [`AppBuilder`].
+    ///
+    /// Declares the plugin-owned `[media]` top-level config section (via
+    /// [`AppBuilder::config_section`]) so a host app with
+    /// `server.strict_config = true` boots without core rejecting `[media]` as
+    /// an unknown key, then mounts the room/broadcast routers, installs the
+    /// service extensions, and spawns the retention/background loops.
+    // `build` is a long, linear plugin-assembly routine (config validation,
+    // room wiring + reaper, storage/workflow install, retention loop); it reads
+    // best as one top-to-bottom sequence rather than fragmented across helpers.
+    #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
             config,
@@ -345,12 +401,67 @@ impl Plugin for MediaPlugin {
             retention_defer,
         } = self;
 
+        // Declare the plugin-owned `[media]` top-level config table so a host app
+        // running `server.strict_config = true` boots cleanly instead of failing
+        // with `unknown key "media"`. `MediaConfig` is still read from raw TOML
+        // (see `MediaConfig::from_autumn_toml`); this only tells core's strict
+        // unknown-key check that `[media]` is a known, opaque section the plugin
+        // owns and validates itself. Applied first so every return path below
+        // (including the early room-misconfig abort) carries the declaration.
+        let app = app.config_section("media");
+
         let retention_days = retention_days.unwrap_or(config.recording.retention_days);
+
+        // The mesh is O(N²), so `DEFAULT_ROOM_MAX_PARTICIPANTS` (6) is an
+        // ABSOLUTE ceiling with no SFU: the `[media]` room config and the
+        // `room_max_participants` builder may set a per-room seat count only
+        // within `1..=6`. An out-of-range value (0 or >6) is a fatal
+        // misconfiguration — fail fast and LOUD at boot, never a silent clamp.
+        // `Plugin::build` returns an `AppBuilder` (not a `Result`), so the
+        // specific error is surfaced from an `on_startup` hook, which aborts
+        // boot with `process::exit(1)` exactly as a failed init would (see
+        // autumn-web's `run_startup_hooks`). `room_max_participants` is the
+        // effective seat count sourced from either `config(..)` (which copies
+        // `room_max_participants` into it) or the `room_max_participants(..)`
+        // builder, so this single check covers both the TOML and builder paths;
+        // `InMemoryRoomStore::create_room` re-checks the fixed 6 ceiling as a
+        // defense-in-depth backstop, and `MediaConfig::validate` stays the
+        // opt-in strict check for consumers who validate config up front.
+        //
+        // A configured `room_namespace` is prepended to every room path, so an
+        // invalid one (a slash, a dot segment, whitespace) would likewise mount
+        // the router fine yet make every `POST /rooms` fail `InvalidSegment` —
+        // another config that can never serve a request. It fails fast here too,
+        // via the same `on_startup` abort but its own specific message.
+        // The storage backend keeps its own degrade path below (unchanged), so
+        // this only fails fast on the room cap and room namespace.
+        //
+        // Gated on `enable_rooms`: a broadcast-only plugin (`with_broadcast()`
+        // without `with_rooms()`) mounts no room router / `RoomService`, so a
+        // stray/irrelevant room setting — or a room env override — must never
+        // abort boot and take the broadcast path down with it. The rooms path
+        // keeps the existing fail-fast (see `room_config_boot_error`).
+        if let Some(message) = room_config_boot_error(
+            enable_rooms,
+            room_max_participants,
+            config.room_namespace.as_deref(),
+        ) {
+            tracing::error!(
+                room_max_participants,
+                ceiling = DEFAULT_ROOM_MAX_PARTICIPANTS,
+                "🍂 Autumn Media: {message}"
+            );
+            return app.on_startup(move |_state| {
+                let message = message.clone();
+                async move { Err(autumn_web::AutumnError::internal_server_error_msg(message)) }
+            });
+        }
 
         tracing::info!(
             broadcast = %enable_broadcast,
             rooms = %enable_rooms,
             room_max_participants,
+            room_store_backend = config.room_store_backend.as_str(),
             storage_backend = config.storage.backend.as_str(),
             queue = %queue,
             api_prefix = %api_prefix,
@@ -360,9 +471,74 @@ impl Plugin for MediaPlugin {
             "🍂 Autumn Media configured"
         );
 
+        // Rooms are storage-independent, so mount the room signaling router and
+        // install the `RoomService` extension up front — they must stay
+        // available even if the storage backend below fails to resolve. The
+        // `nest` + `declare_plugin_routes` pair keeps the room routes both
+        // served and audit-visible under `api_prefix`.
+        let mut app = app;
+        if enable_rooms {
+            // Select the room-state backend (config, default `memory`).
+            //
+            // The `memory` store is per-process, so the `RoomService` and the
+            // reaper MUST share ONE instance — built once here and cloned into
+            // both hooks. The `db` store is stateless w.r.t. process memory (all
+            // room state lives in the shared database), so per-hook instances
+            // over the same pool are equivalent; it is built lazily from
+            // `state.pool()` inside each hook via `build_room_store`, which
+            // degrades to a warned in-memory store if `db` was selected without
+            // a configured database.
+            let backend = config.room_store_backend;
+            let shared_memory_store: Option<Arc<dyn rooms::RoomStore>> = match backend {
+                config::RoomStoreBackend::Memory => Some(Arc::new(rooms::InMemoryRoomStore::new(
+                    room_max_participants,
+                ))),
+                config::RoomStoreBackend::Db => None,
+            };
+
+            // URL/namespace/TTL for the `RoomService`, cloned into the
+            // initializer so the service can be built there (the `db` store
+            // needs `&AppState`).
+            let room_urls = transport::MediaUrls::from_config(&config.mediamtx);
+            let room_namespace = config.room_namespace.clone().unwrap_or_default();
+            let room_token_ttl =
+                chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds));
+
+            let init_store = shared_memory_store.clone();
+            app = app
+                .nest(&api_prefix, rooms::room_router())
+                .declare_plugin_routes(rooms::room_route_infos(&api_prefix))
+                .state_initializer(move |state| {
+                    let store = init_store
+                        .clone()
+                        .unwrap_or_else(|| build_room_store(state, room_max_participants));
+                    let room_service = rooms::RoomService::new(
+                        store,
+                        room_urls.clone(),
+                        room_namespace.clone(),
+                        room_token_ttl,
+                        room_max_participants,
+                    );
+                    state.insert_extension(room_service);
+                })
+                // Spawn from `on_startup` so the reaper shares the running app's
+                // tokio runtime (matching the retention sweep below). For the
+                // `db` backend it builds its own store instance over the same
+                // pool the service uses — sweeping the same shared rows.
+                .on_startup(move |state| {
+                    let store = shared_memory_store
+                        .clone()
+                        .unwrap_or_else(|| build_room_store(&state, room_max_participants));
+                    async move {
+                        rooms::spawn_room_reaper_loop(store);
+                        Ok(())
+                    }
+                });
+        }
+
         // Resolve the storage backend up front so a misconfiguration surfaces
-        // as one error line here rather than inside a job. On failure we still
-        // register the (empty) route surface, but install no encode wiring.
+        // as one error line here rather than inside a job. On failure the plugin
+        // still serves any mounted room routes, but installs no encode wiring.
         let storage = match storage::MediaStorage::from_config(&config.storage) {
             Ok(storage) => storage,
             Err(error) => {
@@ -370,25 +546,18 @@ impl Plugin for MediaPlugin {
                     %error,
                     "🍂 Autumn Media: storage config invalid; encode workflows disabled"
                 );
-                return app.declare_plugin_routes(media_route_infos(&api_prefix));
+                return app;
             }
         };
 
         let ffmpeg_bin = config.ffmpeg.bin;
         let workflows = workflows::MediaWorkflows::new(ffmpeg_bin, queue.clone());
 
-        // slice 3 (transport/rooms): the `transport` module (MediaMtxClient +
-        //   MediaUrls + status parsers) now exists and is re-exported; its
-        //   AppState extension wiring lands with the consumer slice — insert the
-        //   MediaMtxClient / MediaUrls extensions and
-        //   nest the broadcast + room routers under `api_prefix`.
-        //
         // Extensions are installed via `state_initializer` (not `on_startup`)
         // so they exist BEFORE job workers start — mirroring autumn-web's
         // outbound-webhook plugin, whose manager must be present before the
         // first job runs.
         let app = app
-            .declare_plugin_routes(media_route_infos(&api_prefix))
             .state_initializer(move |state| {
                 state.insert_extension(storage.clone());
                 state.insert_extension(workflows.clone());
@@ -430,6 +599,94 @@ impl Plugin for MediaPlugin {
     }
 }
 
+/// Validate an effective mesh-room seat count against the ABSOLUTE ceiling.
+///
+/// Mesh WebRTC is O(N²), so [`DEFAULT_ROOM_MAX_PARTICIPANTS`] (6) is a hard cap
+/// with no SFU, and a room must seat at least one participant. Returns the
+/// specific, fail-fast error message — naming the offending value and the cap —
+/// when `configured` is outside `1..=6`, or `None` when it is in range.
+fn room_max_participants_error(configured: usize) -> Option<String> {
+    if configured == 0 {
+        Some(format!(
+            "a room must allow at least 1 participant; got {configured}"
+        ))
+    } else if configured > DEFAULT_ROOM_MAX_PARTICIPANTS {
+        Some(format!(
+            "mesh rooms are capped at {DEFAULT_ROOM_MAX_PARTICIPANTS} participants (no SFU); got {configured}"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Validate a configured mesh-room `MediaMTX` path namespace at boot.
+///
+/// The namespace is prepended to every room / participant `MediaMTX` path, so a
+/// value [`rooms::validate_room_segment`] would reject (a slash, a `.` / `..`
+/// dot segment, whitespace, or other non-`[A-Za-z0-9_-]` label) mounts the
+/// router fine but makes every `POST /rooms` fail with `InvalidSegment` — a
+/// config that can never serve a request must instead refuse to boot. Returns
+/// the specific, fail-fast error message — naming the offending value and the
+/// allowed charset — when the namespace is present-and-invalid, or `None` when
+/// it is absent, empty, or a valid segment.
+fn room_namespace_error(namespace: Option<&str>) -> Option<String> {
+    let ns = namespace?;
+    if ns.is_empty() || rooms::validate_room_segment(ns).is_ok() {
+        return None;
+    }
+    Some(format!(
+        "media.room_namespace {ns:?} is not a valid room path segment: use only ASCII letters, digits, '_' or '-' (no '/', '.', or empty)"
+    ))
+}
+
+/// Resolve the fail-fast boot error for room configuration, gated on rooms
+/// actually being enabled.
+///
+/// Room config (the `room_max_participants` seat count and the
+/// `room_namespace` path segment) is only load-bearing when a room router /
+/// [`rooms::RoomService`] is mounted — i.e. when `enable_rooms` is true. A
+/// broadcast-only plugin (`with_broadcast()` without `with_rooms()`) serves no
+/// room requests, so an out-of-range `room_max_participants` or an invalid
+/// `room_namespace` (e.g. a stray value or a `media.room_namespace` env
+/// override) is inert and must **not** abort boot — otherwise an irrelevant
+/// room setting becomes a full broadcast outage. When `enable_rooms` is false
+/// this returns `None` unconditionally; when it is true the existing
+/// [`room_max_participants_error`] / [`room_namespace_error`] fail-fast checks
+/// apply exactly as before.
+fn room_config_boot_error(
+    enable_rooms: bool,
+    room_max_participants: usize,
+    room_namespace: Option<&str>,
+) -> Option<String> {
+    if !enable_rooms {
+        return None;
+    }
+    room_max_participants_error(room_max_participants)
+        .or_else(|| room_namespace_error(room_namespace))
+}
+
+/// Build a shared, database-backed [`rooms_db::DbRoomStore`] from the running
+/// app's connection pool for the `db` room-store backend.
+///
+/// Only called on the `db` code path (the `memory` backend shares one pre-built
+/// [`rooms::InMemoryRoomStore`] across the service and reaper). If `db` was
+/// selected but no database pool is configured, it logs an actionable error and
+/// **degrades to a per-process in-memory store** so the app still boots and
+/// rooms still work — they just will not survive across processes until a
+/// database is configured.
+fn build_room_store(state: &autumn_web::AppState, cap: usize) -> Arc<dyn rooms::RoomStore> {
+    if let Some(pool) = state.pool().cloned() {
+        Arc::new(rooms_db::DbRoomStore::new(pool, cap))
+    } else {
+        tracing::error!(
+            "🍂 Autumn Media: room_store_backend=\"db\" but no database pool is configured; \
+             falling back to the in-memory room store — rooms will NOT survive across \
+             processes. Configure a `[database]` primary_url to enable the shared store."
+        );
+        Arc::new(rooms::InMemoryRoomStore::new(cap))
+    }
+}
+
 /// Recordings root an Arroyo deployment uses when `ARROYO_RECORDINGS_ROOT` is
 /// unset — mirrors Arroyo's own `configured_recordings_root()` fallback, so the
 /// migration shim wires the retention sweep the same way with no ops change.
@@ -449,13 +706,25 @@ fn arroyo_recordings_root(env: &HashMap<String, String>) -> PathBuf {
         )
 }
 
-/// The route metadata `MediaPlugin` declares for `autumn routes` listing.
-///
-/// **Slice 0: empty.** Later slices will fill this in with the broadcast and
-/// room routers' routes under `api_prefix`, kept in sync with what `build`
-/// nests. Extracted so the empty slice-0 declaration is directly testable.
-const fn media_route_infos(_api_prefix: &str) -> Vec<autumn_web::route_listing::RouteInfo> {
-    Vec::new()
+#[cfg(test)]
+mod contract_tests {
+    use super::MediaPlugin;
+    use autumn_web::plugin::Plugin;
+
+    #[test]
+    fn contract_declares_lockstep_with_own_crate() {
+        let contract = MediaPlugin::new().contract().expect("a contract");
+        assert_eq!(contract.plugin, env!("CARGO_PKG_NAME"));
+        assert_eq!(
+            contract.plugin_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            contract.autumn_web.as_deref(),
+            Some(autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION")).as_str())
+        );
+        assert!(contract.experimental_surfaces.is_empty());
+    }
 }
 
 // ── Arroyo migration shim (slice 5) ─────────────────────────────────────────
@@ -562,16 +831,165 @@ mod arroyo_shim_tests {
     }
 }
 
+// ── Absolute room-cap enforcement (Fix 1) ───────────────────────────────────
+
+#[cfg(test)]
+mod room_cap_tests {
+    use super::{DEFAULT_ROOM_MAX_PARTICIPANTS, MediaPlugin, room_max_participants_error};
+    use crate::config::MediaConfig;
+
+    #[test]
+    fn out_of_range_room_cap_is_a_specific_fail_fast_error() {
+        // >6 fails loud, naming the offending value and the ceiling — never a
+        // clamp.
+        let over = room_max_participants_error(50).expect("50 > 6 must be rejected");
+        assert!(over.contains("50"), "names the offending value: {over}");
+        assert!(over.contains('6'), "names the ceiling: {over}");
+        assert!(over.contains("no SFU"), "explains why: {over}");
+        // 0 fails loud with its own message.
+        let zero = room_max_participants_error(0).expect("0 must be rejected");
+        assert!(zero.contains("at least 1 participant"), "0 message: {zero}");
+        assert!(zero.contains('0'), "names the value: {zero}");
+    }
+
+    #[test]
+    fn in_range_room_cap_is_accepted() {
+        assert!(room_max_participants_error(1).is_none());
+        assert!(room_max_participants_error(4).is_none());
+        assert!(room_max_participants_error(DEFAULT_ROOM_MAX_PARTICIPANTS).is_none());
+    }
+
+    #[test]
+    fn builder_and_config_paths_feed_the_same_effective_cap_that_boot_rejects() {
+        // The `room_max_participants(50)` builder stores what it was given;
+        // `build()` is what rejects it fail-fast (no clamp), so an out-of-range
+        // builder value produces the specific error at boot.
+        let over = MediaPlugin::new().with_rooms().room_max_participants(50);
+        assert_eq!(over.room_max_participants, 50);
+        assert!(room_max_participants_error(over.room_max_participants).is_some());
+
+        // `room_max_participants(4)` stays in range → a real 4-seat room.
+        let ok = MediaPlugin::new().with_rooms().room_max_participants(4);
+        assert_eq!(ok.room_max_participants, 4);
+        assert!(room_max_participants_error(ok.room_max_participants).is_none());
+
+        // The `[media] room_max_participants = 50` config path flows into the
+        // same effective field via `config(..)`, so it is rejected identically.
+        let config = MediaConfig {
+            room_max_participants: 50,
+            ..MediaConfig::default()
+        };
+        let from_config = MediaPlugin::new().config(config);
+        assert_eq!(from_config.room_max_participants, 50);
+        assert!(room_max_participants_error(from_config.room_max_participants).is_some());
+    }
+}
+
+// ── Room-namespace fail-fast (Fix P2-a) ─────────────────────────────────────
+
+#[cfg(test)]
+mod room_namespace_tests {
+    use super::{MediaPlugin, room_namespace_error};
+
+    #[test]
+    fn absent_empty_and_valid_namespaces_are_accepted() {
+        // Absent and empty mean "no namespace" → no boot error; a valid segment
+        // passes through untouched.
+        assert!(room_namespace_error(None).is_none());
+        assert!(room_namespace_error(Some("")).is_none());
+        assert!(room_namespace_error(Some("tenant-a")).is_none());
+        assert!(room_namespace_error(Some("room_1")).is_none());
+    }
+
+    #[test]
+    fn invalid_namespace_is_a_specific_fail_fast_error() {
+        // A slash, either dot segment, or embedded whitespace fails loud, naming
+        // the offending value and the allowed charset — never a silent mount
+        // that 500s every request.
+        for bad in ["tenant/a", ".", "..", "a b"] {
+            let message = room_namespace_error(Some(bad))
+                .unwrap_or_else(|| panic!("{bad:?} must be rejected"));
+            assert!(
+                message.contains(bad),
+                "names the offending value: {message}"
+            );
+            assert!(
+                message.contains("letters") && message.contains('-'),
+                "mentions the allowed charset: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn room_namespace_builder_feeds_the_effective_value_that_boot_rejects() {
+        // The `room_namespace("tenant/a")` builder stores what it was given;
+        // `build()` is what rejects it fail-fast, so an invalid builder value
+        // produces the specific error at boot.
+        let bad = MediaPlugin::new().with_rooms().room_namespace("tenant/a");
+        assert_eq!(bad.config.room_namespace.as_deref(), Some("tenant/a"));
+        assert!(room_namespace_error(bad.config.room_namespace.as_deref()).is_some());
+
+        // A valid namespace flows through untouched → a real namespaced room.
+        let ok = MediaPlugin::new().with_rooms().room_namespace("tenant-a");
+        assert_eq!(ok.config.room_namespace.as_deref(), Some("tenant-a"));
+        assert!(room_namespace_error(ok.config.room_namespace.as_deref()).is_none());
+    }
+}
+
+// ── Room-config fail-fast gated on rooms being enabled (Codex P2) ────────────
+//
+// The boot-time room-config abort must be conditional on `enable_rooms`: a
+// broadcast-only plugin mounts no room router / `RoomService`, so a stray or
+// invalid room setting (an out-of-range `room_max_participants`, a bad
+// `room_namespace` env override) is inert and must never abort boot and take
+// the broadcast path down with it. Rooms-enabled keeps the existing fail-fast.
+
+#[cfg(test)]
+mod room_config_gate_tests {
+    use super::{MediaPlugin, room_config_boot_error};
+
+    #[test]
+    fn broadcast_only_ignores_invalid_room_config() {
+        // `with_broadcast()` without `with_rooms()` → rooms disabled. An invalid
+        // room cap (0) or namespace ("bad/ns") is irrelevant and must NOT abort
+        // boot, so no failing startup hook is installed and broadcast stays up.
+        assert!(!MediaPlugin::new().with_broadcast().enable_rooms);
+        assert!(room_config_boot_error(false, 0, None).is_none());
+        assert!(room_config_boot_error(false, 50, Some("bad/ns")).is_none());
+        assert!(room_config_boot_error(false, 4, Some("tenant-a")).is_none());
+    }
+
+    #[test]
+    fn rooms_enabled_still_fails_fast_on_invalid_room_config() {
+        // `with_rooms()` → rooms enabled. The same invalid settings that a
+        // broadcast-only plugin ignores must still abort boot on the rooms path,
+        // preserving the pre-existing fail-fast (naming the offending value).
+        assert!(MediaPlugin::new().with_rooms().enable_rooms);
+
+        let bad_cap = room_config_boot_error(true, 0, None)
+            .expect("rooms-enabled must fail fast on room_max_participants = 0");
+        assert!(bad_cap.contains('0'), "names the offending cap: {bad_cap}");
+
+        let bad_ns = room_config_boot_error(true, 4, Some("bad/ns"))
+            .expect("rooms-enabled must fail fast on an invalid room_namespace");
+        assert!(
+            bad_ns.contains("bad/ns"),
+            "names the offending namespace: {bad_ns}"
+        );
+
+        // A valid room config on the rooms path boots cleanly (no abort).
+        assert!(room_config_boot_error(true, 4, Some("tenant-a")).is_none());
+    }
+}
+
 // ── Conformance reference tests ─────────────────────────────────────────────
 //
-// Slice 0's `build()` declares **zero** routes (asserted directly). The
-// conformance harness, however, treats a plugin that declares no routes as a
-// FAIL — it expects every plugin to eventually declare at least one route. So,
-// mirroring `autumn-admin-plugin`'s `conformance_tests`, the harness checks run
-// against a small **representative** future route set attributed to the plugin
-// under `/api/media`: this proves the plugin's naming/prefix conventions are
-// conformance-clean the moment routes land in a later slice, so a later slice
-// that adds routes must consciously keep them conformant.
+// The room signaling routes `MediaPlugin::build` declares under `/api/media`
+// (via `rooms::room_route_infos`) are run through autumn-web's plugin
+// conformance harness — the same checks `autumn-admin-plugin`'s
+// `conformance_tests` uses — so the plugin's naming / prefix / attribution
+// conventions stay clean and a future slice that touches the room routes must
+// consciously keep them conformant.
 
 #[cfg(test)]
 mod conformance_tests {
@@ -582,35 +1000,35 @@ mod conformance_tests {
     use autumn_web::route_listing::{RouteInfo, RouteSource};
 
     const PLUGIN_NAME: &str = "autumn-media-plugin";
+    const API_PREFIX: &str = "/api/media";
 
-    /// Slice-0 `MediaPlugin` declares **no** routes.
-    #[test]
-    fn media_plugin_declares_no_routes_in_slice_0() {
-        assert!(
-            super::media_route_infos("/api/media").is_empty(),
-            "slice 0 must declare no routes"
-        );
-    }
-
-    /// A representative route set attributed to the plugin, all under the
-    /// plugin's `/api/media` prefix. Stands in for the routes later slices will
-    /// declare, so the conformance conventions are pinned now.
-    fn representative_routes() -> Vec<RouteInfo> {
-        ["/api/media/broadcasts", "/api/media/rooms"]
+    /// The real room routes `build` declares, attributed to the plugin exactly
+    /// as `declare_plugin_routes` attributes them at runtime.
+    fn declared_room_routes() -> Vec<RouteInfo> {
+        super::rooms::room_route_infos(API_PREFIX)
             .into_iter()
-            .map(|path| RouteInfo {
-                method: "GET".to_owned(),
-                path: path.to_owned(),
-                handler: format!("media::{}", path.rsplit('/').next().unwrap_or("handler")),
-                source: RouteSource::Plugin(PLUGIN_NAME.to_owned()),
-                ..Default::default()
+            .map(|mut route| {
+                route.source = RouteSource::Plugin(PLUGIN_NAME.to_owned());
+                route
             })
             .collect()
     }
 
     #[test]
-    fn representative_routes_are_attributed_to_plugin_name() {
-        let result = check_route_attribution(PLUGIN_NAME, &representative_routes());
+    fn build_declares_the_five_room_routes_when_rooms_enabled() {
+        let routes = super::rooms::room_route_infos(API_PREFIX);
+        assert_eq!(routes.len(), 5, "rooms declare exactly five routes");
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.path.starts_with(API_PREFIX)),
+            "every declared room route lives under the API prefix"
+        );
+    }
+
+    #[test]
+    fn room_routes_are_attributed_to_plugin_name() {
+        let result = check_route_attribution(PLUGIN_NAME, &declared_room_routes());
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -620,8 +1038,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_routes_live_under_api_prefix() {
-        let result = check_route_prefix(PLUGIN_NAME, "/api/media", &[], &representative_routes());
+    fn room_routes_live_under_api_prefix() {
+        let result = check_route_prefix(PLUGIN_NAME, API_PREFIX, &[], &declared_room_routes());
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -631,8 +1049,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_routes_have_no_collisions_in_isolation() {
-        let (result, _) = check_collisions(&representative_routes());
+    fn room_routes_have_no_collisions_in_isolation() {
+        let (result, _) = check_collisions(&declared_room_routes());
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -642,8 +1060,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_routes_have_no_undeclared_sensitive_surfaces() {
-        let result = check_sensitive_surfaces(PLUGIN_NAME, &representative_routes(), &[]);
+    fn room_routes_have_no_undeclared_sensitive_surfaces() {
+        let result = check_sensitive_surfaces(PLUGIN_NAME, &declared_room_routes(), &[]);
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -653,8 +1071,8 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_single_registration_passes_duplicate_check() {
-        let result = check_duplicate_registration(PLUGIN_NAME, &representative_routes());
+    fn room_single_registration_passes_duplicate_check() {
+        let result = check_duplicate_registration(PLUGIN_NAME, &declared_room_routes());
         assert_eq!(
             result.status,
             CheckStatus::Pass,
@@ -664,9 +1082,9 @@ mod conformance_tests {
     }
 
     #[test]
-    fn representative_routes_pass_full_conformance() {
-        let config = ConformanceConfig::new(PLUGIN_NAME).prefix("/api/media");
-        let report = run_conformance(&config, &representative_routes());
+    fn room_routes_pass_full_conformance() {
+        let config = ConformanceConfig::new(PLUGIN_NAME).prefix(API_PREFIX);
+        let report = run_conformance(&config, &declared_room_routes());
         assert!(
             report.passed(),
             "MediaPlugin conformance failed:\n{}",
@@ -677,8 +1095,8 @@ mod conformance_tests {
     #[test]
     fn duplicate_registration_detected() {
         // Installing the plugin twice would double its routes → FAIL.
-        let mut routes = representative_routes();
-        routes.extend(representative_routes());
+        let mut routes = declared_room_routes();
+        routes.extend(declared_room_routes());
         let result = check_duplicate_registration(PLUGIN_NAME, &routes);
         assert_eq!(
             result.status,
@@ -691,11 +1109,11 @@ mod conformance_tests {
     fn collision_with_host_route_detected() {
         // Sanity check the harness is wired: a host route colliding with a
         // plugin route is flagged.
-        let mut routes = representative_routes();
+        let mut routes = declared_room_routes();
         routes.push(RouteInfo {
             method: "GET".to_owned(),
-            path: "/api/media/broadcasts".to_owned(),
-            handler: "host::list".to_owned(),
+            path: format!("{API_PREFIX}/rooms/{{room_id}}"),
+            handler: "host::roster".to_owned(),
             source: RouteSource::User,
             ..Default::default()
         });
@@ -704,6 +1122,25 @@ mod conformance_tests {
             result.status,
             CheckStatus::Fail,
             "expected collision to be detected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_section_tests {
+    use super::MediaPlugin;
+
+    // #1974 item 7: `MediaPlugin::build` must declare its `[media]` top-level
+    // config section on the builder so a host app with
+    // `server.strict_config = true` boots without core rejecting `[media]` as an
+    // unknown key. Registering the real plugin and asserting the section is
+    // declared proves the wiring end-to-end (not just a stand-in).
+    #[test]
+    fn build_declares_media_config_section() {
+        let builder = autumn_web::app().plugin(MediaPlugin::new());
+        assert!(
+            builder.has_config_section("media"),
+            "MediaPlugin::build must declare the [media] config section for strict_config"
         );
     }
 }

@@ -60,6 +60,14 @@
 //! added. See [`AppBuilder::with_alert_channel`](crate::app::AppBuilder::with_alert_channel)
 //! and `docs/guide/operator-alerts.md` for the full guide.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -327,7 +335,7 @@ impl AlertBuilder {
                 event,
                 title: String::new(),
                 summary: String::new(),
-                timestamp: Utc::now(),
+                timestamp: crate::time::ambient_now(),
                 host: host_id(),
                 where_to_look: condition.where_to_look().to_owned(),
                 details: HashMap::new(),
@@ -1161,7 +1169,7 @@ impl AlertChannel for WebhookAlertChannel {
                 .post(&self.url)
                 .header("Content-Type", "application/json");
             if let Some(secret) = self.secret.as_ref() {
-                let timestamp = Utc::now().timestamp();
+                let timestamp = crate::time::ambient_now().timestamp();
                 let signing_payload = format!("{timestamp}.{body}");
                 let signature = crate::security::config::hmac_sha256_hex(
                     secret.as_bytes(),
@@ -1713,7 +1721,8 @@ fn build_mail_alert_channel(
         );
         return None;
     }
-    let mail_cfg = state.config().mail;
+    let config = state.config_arc();
+    let mail_cfg = &config.mail;
     if mail_transport_requires_from(mail_cfg.transport)
         && mail_cfg
             .from
@@ -1915,9 +1924,13 @@ pub fn install_from_config(
     // `sensitive` keeps the dead-lettered-job/scheduled-task alerts off the
     // `/jobs` and `/tasks` endpoints, which are mounted only when `sensitive =
     // true`. The full config is installed on `state` before this runs.
-    let actuator_cfg = state.config().actuator;
+    let app_config = state.config_arc();
+    let actuator_cfg = &app_config.actuator;
     let actuator_sensitive = actuator_cfg.sensitive;
-    let actuator_prefix = actuator_cfg.prefix;
+    // Owned: `AlerterSettings` outlives this handle — it is stored on the
+    // `Alerter` installed as a state extension — so the prefix has to be a
+    // `String` it owns. One field, not the whole config.
+    let actuator_prefix = actuator_cfg.prefix.clone();
     let settings = AlerterSettings::from_config(config, actuator_prefix, actuator_sensitive);
     let alerter = Alerter::new(channels, settings);
     state.insert_extension(alerter.clone());
@@ -2088,7 +2101,7 @@ async fn evaluate_health(
     down_since: &mut HashMap<String, DateTime<Utc>>,
 ) {
     let results = state.health_indicator_registry().run_all().await;
-    let now = Utc::now();
+    let now = crate::time::ambient_now();
     let grace = chrono::Duration::from_std(settings.health_grace)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
 

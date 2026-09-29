@@ -23,7 +23,7 @@ The `mcp` feature builds on the OpenAPI schema machinery, so it implies the
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-web = { version = "0.5", features = ["mcp"] }
+autumn-web = { version = "0.7", features = ["mcp"] }
 ```
 
 ---
@@ -120,30 +120,55 @@ Because every piece comes from the same `SchemaEntry` data the OpenAPI
 generator uses, **there is no second schema to maintain** and no way for the
 tool catalog to drift from the handler.
 
-### Query is flat — put structured input in the body
+The per-tool `inputSchema` is generated from the request types via the `OpenApiSchema` derive, so there is no second schema to hand-maintain; serde `rename`s are honoured and tool identity is collision-proof.
 
-`Query<T>` deserializes with
-[`serde_urlencoded`](https://docs.rs/serde_urlencoded), which is **strictly
-flat**: it can decode scalars (`?q=foo&page=2`) and repeated keys for a
-sequence field (`?tags=a&tags=b`), but it **cannot** deserialize a nested
-struct by any encoding — not `key[sub]=`, not JSON-in-a-string. MCP `tools/call`
-dispatch honors this: query values are rendered as flat `key=value` pairs
-(arrays expand to repeated keys), so a query field that is itself an object or
-an array of objects could never round-trip back to the handler.
+### Structured query arguments round-trip
 
-So keep query parameters flat and **steer structured/nested input to a JSON
-body** (`Json<T>`), which round-trips losslessly through the tool's `body`
-property. When assembling `/mcp`, Autumn emits a build-time `tracing::warn` for
-a tool whose:
+A `Query<T>` field does **not** have to be a scalar. `Query<T>` decodes a
+superset of the flat `key=value` form — a bracketed dialect whose
+`items[0][sku]` shape matches the rows `NestedChangesetForm` renders,
+generalized to arbitrary objects, sequences and depths — and `tools/call`
+dispatch renders the tool's `query` object into exactly that format:
 
-- `query` or `body` resolves to a bare `{"type":"object"}` placeholder — the
-  arg type has no `OpenApiSchema`, so its fields aren't advertised. Fix it by
-  deriving (`#[derive(OpenApiSchema)]`) or implementing `OpenApiSchema` on the
-  arg type.
-- `query` advertises a nested object / array-of-object field — move that input
-  to a `Json<T>` body.
+| Tool argument | Decoded query keys | Handler field |
+| --- | --- | --- |
+| `{"page": 2}` | `page=2` | `u32` |
+| `{"tags": ["a","b"]}` | `tags=a&tags=b` | `Vec<String>` |
+| `{"filter": {"status":"open"}}` | `filter[status]=open` | a nested struct |
+| `{"items": [{"sku":"A"}]}` | `items[0][sku]=A` | `Vec<Item>` |
 
-These are warnings, not errors: the app still builds and the tool is still
+(The keys are percent-encoded on the wire — `filter%5Bstatus%5D=open` — and
+decoded before the brackets are parsed, so the two forms are equivalent.)
+
+So an agent can pass structured arguments directly, instead of the
+comma-separated strings and JSON-in-a-string fields the flat form used to
+force. What the encoding cannot carry, dispatch **refuses** rather than quietly
+altering:
+
+- A `null` **field** renders no query parameter — a query string has no null, so
+  an explicitly-null optional argument arrives as absent (`None`) rather than as
+  the literal text `null`. That is the one silent conversion, and it matches
+  what the caller meant.
+- An **empty** array or object, a `null` **array element**, and an object field
+  name that is empty or contains `[` / `]` are all invalid-params errors: each
+  would otherwise vanish a field, shorten a sequence, or invent a nesting level.
+  A field that must distinguish "empty" from "absent" belongs in a JSON body.
+- Nesting is depth-capped (`autumn_web::query_string::MAX_DEPTH`) and one call's
+  query expansion is bounded, on both the encode and decode side.
+
+For genuinely large or deeply structured input, a JSON body (`Json<T>`) is
+still the better contract: it round-trips losslessly through the tool's `body`
+property and carries real JSON types rather than coerced text.
+
+### Build-time warning
+
+When assembling `/mcp`, Autumn emits a build-time `tracing::warn` for a tool
+whose `query` or `body` resolves to a bare `{"type":"object"}` placeholder —
+the arg type has no `OpenApiSchema`, so its fields aren't advertised. Fix it by
+deriving (`#[derive(OpenApiSchema)]`) or implementing `OpenApiSchema` on the
+arg type.
+
+It is a warning, not an error: the app still builds and the tool is still
 exposed.
 
 ### Safety annotations
@@ -156,6 +181,71 @@ side effects:
 | `GET` | `true` | — |
 | `POST` / `PUT` / `PATCH` | `false` | — |
 | `DELETE` | `false` | `true` |
+
+The verb is a floor. A handler that declares an authority envelope can raise
+`destructiveHint`, never clear it — see below.
+
+### Proving what an agent can do
+
+A tool description says what an endpoint is *for*. It says nothing about what
+the call is **allowed to do**, and an MCP tool is an action an agent takes with
+no human in the loop. `#[agent_operable(grant = ...)]` closes that gap at build
+time:
+
+```rust
+use autumn_web::prelude::*;
+
+authority_grant! {
+    pub RefundDrafter {
+        writes: [Refund],
+        tenant_scope: scoped,
+        outbound: ["https://api.stripe.com/v1/refunds"],
+        jobs: [NotifyFinanceJob],
+        reversibility: compensable,
+    }
+}
+
+#[post("/api/refunds")]
+#[api_doc(mcp, summary = "Draft a refund")]
+#[agent_operable(grant = RefundDrafter)]
+pub async fn draft_refund(/* … */) -> AutumnResult<Json<Refund>> { /* … */ }
+```
+
+The macro walks the body, derives the effects it can prove — row writes,
+unbounded writes, cross-tenant access, outbound hosts, webhook topics, jobs —
+and fails `cargo build` when the grant does not cover one of them. Three things
+follow for MCP specifically:
+
+- **`destructiveHint` gets a proved input.** When a tool carries a grant, a
+  `compensable` or `irreversible` reversibility sets the hint, raising a
+  `POST`/`PATCH` the verb alone says nothing about. It only ever adds: a
+  `DELETE` stays `true` whatever the grant declares, because `reversible` means
+  the effect set is bounded writes — not that the application can put the row
+  back — and a client skips its confirmation prompt on `false`. Ungoverned
+  tools keep the table above exactly as it is.
+- **Every `tools/call` is audited**, with no per-handler wiring: an
+  `agent.tool.<name>.attempt` event before dispatch and an `agent.tool.<name>`
+  event after it, sharing one correlation id and carrying the tool, the grant,
+  the reversibility, the proved effect set and the argument *names* (never
+  their values — only the keys the tool declares, with any others counted as
+  `+N unknown`). Each carries a `phase` of `attempt`, `outcome` or `refused`.
+  An ungoverned tool is audited too, with `reversibility = "unknown"`. Every
+  write is bounded by a 2-second timeout; if the attempt record cannot be
+  written or times out and the action is not `reversible`, the call fails
+  closed, the handler never runs, and a best-effort
+  `agent.tool.<name>.refused` (status Failure, with a `refused_reason` and no
+  `http_status`) records the refusal. Note the attempt is written *before* the
+  request is dispatched, and so before route-level authorization — once a sink
+  is installed, gate the endpoint with `secure_mcp(...)` (§6) and rate-limit
+  it.
+- **`autumn agents manifest --check`** lists every MCP-exposed tool: governed
+  ones with their envelope, and every mutating tool that has *no* envelope —
+  the one gap the compiler cannot catch, because a tool with no grant has no
+  assertion to fail. Generated `#[repository(api, mcp)]` CRUD tools (§9) have
+  no annotation site in this slice, so they surface there.
+
+See [The Agent Authority Envelope](agent-authority.md) for the grant grammar,
+the effect table, the escape hatches, the manifest and the audit record.
 
 ---
 
@@ -325,6 +415,16 @@ so the call runs as that verified principal. The `Cookie` and `X-CSRF-Token`
 headers are forwarded too, so session-based `#[secured]` routes and
 CSRF-protected writes behave identically to a direct call.
 
+The example below uses `InMemoryApiTokenStore`, which keeps tokens in the
+process and seeds them in code. To manage an agent's token from the CLI
+instead — `autumn token issue <principal> --scope <scope>`, and `revoke` /
+`rotate` to take it back — the app must read the same `api_tokens` table the
+CLI writes, which means mounting
+[`DbApiTokenStore`](../../autumn/src/auth.rs) in place of the in-memory one.
+A token issued by the CLI is invisible to an in-memory store, so verification
+answers `401`. See
+[API tokens](authentication.md#issuing-listing-rotating-and-revoking-api-tokens).
+
 To put a tool behind token auth, register the route inside a `scoped` group
 carrying the `RequireApiToken` layer. The scope keeps the route in the
 registry (so MCP can derive the tool) *and* applies the layer (so every call —
@@ -346,6 +446,8 @@ autumn_web::app()
     .run()
     .await;
 ```
+
+The store is seedable for tests and local development: `InMemoryApiTokenStore::default().with_token("dev-token", "user:dev")` (or `.with_scoped_token(raw, principal, &scopes)`), and `InMemoryApiTokenStore::from_env("AUTUMN_API_TOKEN", "user:dev")` reads the raw token from an environment variable (erroring if it is unset or empty). Both are for tests/local runs — not production token storage.
 
 A `tools/call` with no token is rejected by `RequireApiToken` and surfaces as
 `isError: true`; the same call with a valid `Authorization: Bearer <token>`
@@ -395,11 +497,16 @@ CORS `allowed_origins`:
 
 - A request with **no `Origin`** header (curl, SDKs, server-side agents) is
   allowed — non-browser callers aren't subject to DNS rebinding.
-- A request whose `Origin` **isn't** in `cors.allowed_origins` (or `*`) gets
-  **403 Forbidden** before any parsing or dispatch.
+- A request whose `Origin` is **the same origin as the request's own host**, where
+  that host is a trusted host, is allowed without an allowlist entry — a browser
+  client served by the app itself is already covered.
+- Otherwise the `Origin` must be in `cors.allowed_origins` (or the list must hold
+  `*`); anything else gets **403 Forbidden** before any parsing or dispatch.
 
-So to allow a browser-based MCP client from `https://app.example.com`, add that
-origin to your CORS config; agent clients need no configuration.
+So it is specifically a **cross-origin** browser MCP client — one served from
+somewhere other than the app — that needs its origin added to your CORS config
+([CORS and Cross-Origin Requests](cors.md)); a same-origin browser client and an
+agent client both need no configuration.
 
 ---
 
@@ -622,7 +729,9 @@ that from convention to a structural guarantee.)
 > chosen `mount_mcp` path is free. If a real handler is already mounted at the
 > same path, `axum` panics at startup on the duplicate route (loud and early,
 > not a silent failure). Pick a path you don't otherwise serve — `/mcp` is the
-> convention.
+> convention. Relatedly, a user-defined route at an auto-mounted probe path
+> (`GET /health`, `/live`, `/ready`, `/startup`) now wins over the built-in
+> probe and logs an INFO override rather than panicking at startup.
 
 ---
 
@@ -633,7 +742,7 @@ This slice is **tools-only**. Tool results are buffered by default, with
 scope** and are tracked as follow-ups:
 
 - **Daemon lifetime** for long-running, session-surviving work —
-  [#1119](https://github.com/madmax983/autumn/issues/1119).
+  [#1119](https://github.com/autumn-foundation/autumn/issues/1119).
 - **Durable workflow tools** — exposing Harvest `#[workflow]`s as
   start/status/signal MCP tools on top of this layer
   ([autumn-harvest#597](https://github.com/madmax983/autumn-harvest)); the
@@ -648,6 +757,7 @@ scope** and are tracked as follow-ups:
 - **LLM-assisted tool descriptions** — descriptions come from `#[api_doc]`;
   garbage-in/garbage-out is the author's call.
 
-For the typed JSON-Schema derivation this builds on, see the OpenAPI support
-in [`openapi.rs`](../../autumn/src/openapi.rs); for the in-process dispatch
+For the typed JSON-Schema derivation this builds on, see the
+[OpenAPI guide](openapi.md) (and
+[`openapi.rs`](../../autumn/src/openapi.rs)); for the in-process dispatch
 path, see the [Testing guide](testing.md).
