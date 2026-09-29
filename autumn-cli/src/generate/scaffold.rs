@@ -6519,6 +6519,14 @@ mod attachment_read_back_tests {{
                 .map(|f| f.name.as_str()),
         );
         ignored_columns.push("created_at");
+        // The exact complement of `ignored_columns` within `csv_columns()`: every
+        // exported column the form CAN set. Derived from the same `form_carried`
+        // set, so the two lists can never disagree about a column.
+        let settable_columns: Vec<&str> = all_fields
+            .iter()
+            .filter(|f| !f.is_encrypted() && form_carried.contains(f.name.as_str()))
+            .map(|f| f.name.as_str())
+            .collect();
         let bool_columns: Vec<(&str, bool)> = all_fields
             .iter()
             .filter(|f| f.kind == FieldKind::Bool && !f.is_encrypted())
@@ -6535,6 +6543,7 @@ mod attachment_read_back_tests {{
             &authz_call,
             &text_columns,
             &ignored_columns,
+            &settable_columns,
             &bool_columns,
             labels,
         )
@@ -10604,10 +10613,11 @@ fn csv_unguard_cell<'a>(column: &str, value: &'a str) -> &'a str {
 const CSV_REQUIRED_COLUMNS_FN: &str = r"/// The columns an uploaded file must carry: every exported column
 /// `{Pascal}Form` can actually set.
 ///
-/// DERIVED from the live `CsvSchema::csv_columns()` minus the columns the
-/// import cannot set — not baked at generation time. Dropping a column from
+/// DERIVED from the live `CsvSchema::csv_columns()`, kept only where the form
+/// can set the column — not baked at generation time. Dropping a column from
 /// the export's schema therefore can never leave a stale requirement behind
-/// that rejects this app's own export (issue #2331).
+/// that rejects this app's own export, and adding a computed, export-only
+/// column never makes an upload need it (issue #2331).
 ///
 /// Checked against the header BEFORE any row is decoded, because a
 /// missing column is a property of the FILE, not of its rows. It also
@@ -10616,10 +10626,12 @@ const CSV_REQUIRED_COLUMNS_FN: &str = r"/// The columns an uploaded file must ca
 /// spreadsheet sharing no column names with this model would otherwise
 /// decode into a run of blank records and report them as insertable.
 fn csv_required_columns() -> Vec<&'static str> {
+    // The columns `{Pascal}Form` carries, as generated.
+    const SETTABLE: &[&str] = &[__SETTABLE_COLUMNS__];
     (<__PASCAL__ as autumn_web::data::csv::CsvSchema>::csv_columns())
         .iter()
         .copied()
-        .filter(|column| !CSV_IGNORED_COLUMNS.contains(column))
+        .filter(|column| SETTABLE.contains(column))
         .collect()
 }
 
@@ -11227,6 +11239,12 @@ fn render_csv_import_section(
     // way in, so the upload page names them rather than letting an operator edit
     // one and watch nothing happen.
     ignored_columns: &[&str],
+    // Every exported column `{Pascal}Form` can set, as of generation. The
+    // required header set is the LIVE `csv_columns()` intersected with this
+    // (issue #2331), so a column later dropped from the export stops being
+    // required, and an export-only computed column later added to it never
+    // becomes required.
+    settable_columns: &[&str],
     // The boolean columns, paired with whether a BLANK cell means `false` for
     // them (true for a non-nullable column, false for a nullable one). A
     // spreadsheet writes `TRUE`/`1`/`yes`/blank where serde's `bool` accepts
@@ -11299,7 +11317,13 @@ fn render_csv_import_section(
     // "1 row would insert" and commit a row of defaults. Comparing the header up front
     // makes that one file-level refusal, which is what it is: the operator picked the wrong
     // file.
-    let required_columns_const = CSV_REQUIRED_COLUMNS_FN.to_owned();
+    let settable_names = settable_columns
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let required_columns_const =
+        CSV_REQUIRED_COLUMNS_FN.replace("__SETTABLE_COLUMNS__", &settable_names);
     let header_check = [
         "    let header = autumn_web::data::csv::read_header(&uploaded[..]);",
         "    let missing: Vec<&str> = csv_required_columns()",

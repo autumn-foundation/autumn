@@ -682,8 +682,12 @@ fn a_file_missing_the_expected_columns_is_refused_whole() {
         "the required set must be derived from the LIVE schema:\n{routes}"
     );
     assert!(
-        routes.contains(".filter(|column| !CSV_IGNORED_COLUMNS.contains(column))"),
-        "the required set must subtract the columns the import cannot set:\n{routes}"
+        routes.contains(".filter(|column| SETTABLE.contains(column))"),
+        "the required set must keep only the columns the form can set:\n{routes}"
+    );
+    assert!(
+        routes.contains(r#"const SETTABLE: &[&str] = &["published", "note"];"#),
+        "the settable columns are the ones the form carries:\n{routes}"
     );
     let import = handler_slice(&routes, "import");
     // The check precedes the import, because a missing column is a property of
@@ -716,8 +720,8 @@ fn a_file_missing_the_expected_columns_is_refused_whole() {
 /// A baked `const CSV_REQUIRED_COLUMNS` goes stale the moment someone edits
 /// the export's `CsvSchema::csv_columns()` — e.g. dropping a column — and
 /// then rejects this app's own export as "missing columns". Deriving the set
-/// at request time from the live schema minus the columns the import cannot
-/// set closes that drift: the schema and the requirement can never disagree.
+/// at request time from the live schema, kept only where the form can set the
+/// column, closes that drift in both directions.
 #[test]
 fn the_required_columns_are_derived_from_the_live_schema() {
     let (_tmp, routes) = import_routes("import-live-schema", &[]);
@@ -730,9 +734,20 @@ fn the_required_columns_are_derived_from_the_live_schema() {
         helper.contains("(<Post as autumn_web::data::csv::CsvSchema>::csv_columns())"),
         "the helper must read the live schema:\n{helper}"
     );
+    // Intersected with the columns the form can set, rather than the live
+    // schema minus the ignored ones: an export-only computed column added to a
+    // hand-written `csv_columns()` is in neither generated list, and must not
+    // become a column every upload is required to carry.
     assert!(
-        helper.contains(".filter(|column| !CSV_IGNORED_COLUMNS.contains(column))"),
-        "the helper must subtract the columns the import cannot set:\n{helper}"
+        helper.contains(".filter(|column| SETTABLE.contains(column))"),
+        "the helper must keep only the columns the form can set:\n{helper}"
+    );
+    // `fn_slice` runs on to the next `fn`, past the top-level consts that
+    // follow; the body alone ends at the first closing brace in column 0.
+    let body = helper.split("\n}\n").next().unwrap_or(helper);
+    assert!(
+        !body.contains("CSV_IGNORED_COLUMNS"),
+        "subtracting the ignored columns would require an export-only column:\n{body}"
     );
     // The header check calls the helper — the trimmed comparison is unchanged.
     let import = handler_slice(&routes, "import");
