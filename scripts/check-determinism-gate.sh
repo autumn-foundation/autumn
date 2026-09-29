@@ -133,6 +133,10 @@ GATED_MODULES=(
   # window on the injected `ClockSource`, so an upgrade's timing is as
   # reproducible under a virtual clock as the drain it replaces.
   autumn/src/upgrade.rs:default
+  # Calendar-aware SLA obligations (#1826). Every deadline, status and
+  # escalation reads the injected clock, so a sim replays a quarter of
+  # business time the same way each run.
+  autumn/src/sla/mod.rs:sla
   # Direct HTTPS termination (#1603). `tls.rs::now_unix` is the module's one
   # deliberate real-wall-time read — certificate validity is a fact about the
   # real world, not about the injected clock — and the gate is what keeps a
@@ -207,7 +211,7 @@ GATED_MODULES=(
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=75
+MODULE_COUNT_FLOOR=76
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

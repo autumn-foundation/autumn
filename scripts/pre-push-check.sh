@@ -162,7 +162,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # so the lib target is where the denials actually apply, and skipping the test /
 # example / bench targets keeps this leg minutes shorter. CI still runs the
 # `--all-targets` form.
-GATED_REQUEST_PATH_FEATURES="ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence"
+GATED_REQUEST_PATH_FEATURES="ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence,sla"
 step "cargo clippy -p autumn-web --features \"$GATED_REQUEST_PATH_FEATURES\" --lib -- -D warnings"
 cargo clippy -p autumn-web \
   --features "$GATED_REQUEST_PATH_FEATURES" \
