@@ -38,6 +38,14 @@
 //! }
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use chrono::{DateTime, Utc};
 
 use crate::session::Session;
@@ -86,7 +94,7 @@ impl Default for StepUpGlobalConfig {
 /// Call this after a successful initial login **and** after a successful
 /// re-authentication (reauth form submission).
 pub async fn set_last_strong_auth_at(session: &Session) {
-    let now = Utc::now().timestamp().to_string();
+    let now = crate::time::ambient_now().timestamp().to_string();
     session.insert(STEP_UP_SESSION_KEY, now).await;
 }
 
@@ -116,10 +124,10 @@ pub async fn check_step_up(session: &Session, max_age_secs: u64) -> crate::Autum
         .parse()
         .map_err(|_| crate::AutumnError::unauthorized_msg("step-up authentication required"))?;
 
-    let last_auth = DateTime::from_timestamp(ts, 0)
+    let last_auth: DateTime<Utc> = DateTime::from_timestamp(ts, 0)
         .ok_or_else(|| crate::AutumnError::unauthorized_msg("step-up authentication required"))?;
 
-    let age_secs = (Utc::now() - last_auth).num_seconds();
+    let age_secs = (crate::time::ambient_now() - last_auth).num_seconds();
     // Negative means the timestamp is in the future (clock skew) — treat as expired.
     if u64::try_from(age_secs).map_or(true, |age| age > max_age_secs) {
         return Err(crate::AutumnError::unauthorized_msg(

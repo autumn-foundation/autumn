@@ -410,6 +410,7 @@ server.tls.acme.custom_domains.issuance_per_domain_per_day
 server.tls.acme.custom_domains.max_domains
 server.tls.acme.custom_domains.max_failure_backoff_secs
 server.tls.acme.custom_domains.poll_interval_secs
+server.tls.acme.custom_domains.resolvers
 server.tls.acme.custom_domains.store_dir
 server.tls.acme.directory
 server.tls.acme.dns

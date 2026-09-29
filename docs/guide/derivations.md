@@ -205,7 +205,11 @@ column, a `#[repository(..., position(...))]` ordering column, a model's
 count (each registers the column it claims for exactly this check). Column and
 table names are compared as the database compares quoted identifiers: exactly on
 Postgres, ASCII-case-insensitively on SQLite, where `score` and `Score` are one
-column. A database failure does not: it is logged, the sweep for that target
+column. On Postgres the comparison also truncates to the physical identifier
+length (`NAMEDATALEN - 1`, 63 bytes on a stock build), because Postgres
+truncates overlong quoted names itself — two names that agree on their first
+63 bytes are one column in the database and the boot check rejects the pair
+rather than letting two maintainers double-apply to it. A database failure does not: it is logged, the sweep for that target
 is skipped, and a derivation whose backfill has not run yet is stale rather than
 broken, which the actuator reports exactly.
 

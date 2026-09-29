@@ -1041,8 +1041,22 @@ impl CollabText {
     }
 
     /// First slot an insert anchored at `after` may occupy.
+    ///
+    /// Checks `elems`' last element before falling back to the full
+    /// `position_of` scan: sequential typing anchors every keystroke but the
+    /// first on the character just inserted, which is always the current
+    /// last element, so this turns the dominant case — appending — from an
+    /// O(n) scan into an O(1) check. A mid-document edit, or the first
+    /// character after a peer's op landed at the tail, still falls through
+    /// to the scan; the answer is identical either way.
     fn slot_after(&self, after: Option<&OpId>) -> Option<usize> {
-        after.map_or(Some(0), |id| self.position_of(id).map(|p| p + 1))
+        let Some(id) = after else {
+            return Some(0);
+        };
+        if self.elems.last().is_some_and(|e| &e.id == id) {
+            return Some(self.elems.len());
+        }
+        self.position_of(id).map(|p| p + 1)
     }
 
     /// RGA's placement rule: from `start`, step over every character that

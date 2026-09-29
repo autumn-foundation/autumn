@@ -48,6 +48,13 @@
 //!   WAL grows, lag climbs, the health indicator goes `Down`, and data is kept.
 //!   Disk is the thing that gets sacrificed, never durability.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: durability-critical module — production code path must be
 // panic-free. See CONTRIBUTING.md "Request-path panic gate". Justify exceptions
 // with #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -1238,6 +1245,10 @@ fn gzip_file(source: &Path, target: &Path) -> Result<(String, u64), ReplicationE
 
 /// Sleep `total`, waking early if `shutdown` is cancelled. Returns `true` when
 /// cancelled.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the deadline paces a real thread sleep, and a virtual clock does not move during it"
+)]
 fn sleep_or_cancelled(shutdown: &tokio_util::sync::CancellationToken, total: Duration) -> bool {
     let start = std::time::Instant::now();
     let deadline = start.checked_add(total).unwrap_or(start);
