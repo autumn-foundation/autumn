@@ -1208,4 +1208,16 @@ mod bypass_tests {
             Some("foo")
         );
     }
+
+    /// `<!--->` is a complete (abruptly closed) comment to both the scanner
+    /// and the browser, so an `hx-swap-oob` attribute after it is still seen.
+    #[test]
+    fn has_oob_attribute_sees_attribute_after_short_comment() {
+        assert!(has_oob_attribute(
+            "<!---><div id=\"x\" hx-swap-oob=\"true\"></div>"
+        ));
+        assert!(!has_oob_attribute(
+            "<!--- hx-swap-oob=\"true\" --><div></div>"
+        ));
+    }
 }
