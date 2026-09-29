@@ -957,7 +957,7 @@ const AUDITOR: &str = "cargo-deny";
 /// toolchain — least of all halfway, which is what leaves the next `cargo
 /// build` broken. With this set, rustup errors instead, and the audit reports
 /// no verdict (issue #1633).
-fn no_toolchain_installs(command: &mut Command) {
+pub fn no_toolchain_installs(command: &mut Command) {
     command.env("RUSTUP_AUTO_INSTALL", "0");
 }
 

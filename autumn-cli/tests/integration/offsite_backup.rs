@@ -201,17 +201,22 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
     out
 }
 
-/// `testcontainers-modules`' `MinIO` image pins `minio/minio` on Docker Hub.
-/// Docker Hub no longer serves that repository at all (`MinIO` Inc. dropped
-/// it), so every pull now fails with "pull access denied ... repository does
-/// not exist". Point at `MinIO`'s other public registry, `quay.io/minio/minio`,
-/// instead. This tag choice is independent of `testcontainers-modules`, so it
-/// stays pullable even if a future crate bump changes the crate's own default.
+/// `testcontainers-modules`' `MinIO` image pins `minio/minio` on Docker Hub,
+/// which `MinIO` Inc. deleted. `quay.io/minio/minio` then stopped anonymous
+/// pulls too (2026-09-24). Chainguard's `MinIO` build is free to pull without
+/// an account and runs the same `minio` binary with the same entrypoint, so the
+/// module's command, credentials and wait strategy work unchanged.
+///
+/// Chainguard's free tier serves only `latest`, so the image is pinned by
+/// digest. Chainguard keeps old digests pullable.
 fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::minio::MinIO> {
     use testcontainers::ImageExt as _;
+    use testcontainers::core::IntoContainerPort as _;
     testcontainers_modules::minio::MinIO::default()
-        .with_name("quay.io/minio/minio")
-        .with_tag("RELEASE.2025-09-07T16-13-09Z")
+        .with_name("cgr.dev/chainguard/minio")
+        .with_tag("latest@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1")
+        // The image has no `EXPOSE`, so publish the API port by hand.
+        .with_mapped_port(0, 9000.tcp())
 }
 
 /// Guards the registry override without needing Docker.
@@ -222,12 +227,15 @@ fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::min
 #[test]
 fn minio_image_pulls_from_the_public_registry() {
     let descriptor = minio_image().descriptor();
-    let (name, tag) = descriptor.rsplit_once(':').expect("name:tag");
+    let (name, tag) = descriptor.split_once(':').expect("name:tag");
     assert_eq!(
-        name, "quay.io/minio/minio",
-        "Docker Hub no longer serves minio/minio",
+        name, "cgr.dev/chainguard/minio",
+        "Docker Hub and quay.io no longer serve minio/minio anonymously",
     );
-    assert!(!tag.is_empty(), "the tag must be pinned explicitly");
+    assert!(
+        tag.contains("@sha256:"),
+        "the image must be pinned by digest"
+    );
 }
 
 #[tokio::test]
