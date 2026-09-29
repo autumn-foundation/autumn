@@ -42,6 +42,16 @@ pub const STORIES_PATH: &str = "/_stories";
 /// Route template for a single story's detail page.
 const STORY_DETAIL_PATH: &str = "/_stories/{slug}";
 
+/// Demo backend for the "Active search" story. See [`demo_search`].
+const STORIES_DEMO_SEARCH_PATH: &str = "/_stories/demo/search";
+
+/// Demo backend for the "Autocomplete" story. See [`demo_tag_search`].
+const STORIES_DEMO_TAG_SEARCH_PATH: &str = "/_stories/demo/tags/search";
+
+/// Demo backend for the "Infinite feed" story's sentinel. See
+/// [`demo_infinite_feed`].
+const STORIES_DEMO_FEED_PATH: &str = "/_stories/demo/posts/feed";
+
 /// Derive a URL slug from a story name: lowercase, alphanumeric runs joined
 /// by single `-`, everything else (punctuation, whitespace, non-ASCII)
 /// treated as a separator.
@@ -355,6 +365,118 @@ where
                 },
             ),
         )
+        // Demo backends for the two typeahead stories (Active search,
+        // Autocomplete) — see `demo_search`/`demo_tag_search` below for why
+        // these two specifically get real handlers where every other
+        // story's action URL stays a synthetic 404-on-submit (already the
+        // documented pattern for e.g. Confirm action / Avatar). Namespaced
+        // under `/_stories/demo/*`, the same convention `confirm_action`'s
+        // story already uses (`/_stories/demo/delete-post`), so a real app's
+        // own routes can never collide with these.
+        .route(STORIES_DEMO_SEARCH_PATH, axum::routing::get(demo_search))
+        .route(
+            STORIES_DEMO_TAG_SEARCH_PATH,
+            axum::routing::get(demo_tag_search),
+        )
+        .route(
+            STORIES_DEMO_FEED_PATH,
+            axum::routing::get(demo_infinite_feed),
+        )
+}
+
+/// Query params `demo_search` and `demo_tag_search` both accept — the `q`
+/// param [`ActiveSearchConfig`](crate::widgets::ActiveSearchConfig) and
+/// [`AutocompleteConfig`](crate::widgets::AutocompleteConfig) both default
+/// `param_name`/`query_param` to.
+#[derive(serde::Deserialize)]
+struct DemoQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// Demo backend for the "Active search" story's action — mounted at
+/// [`STORIES_DEMO_SEARCH_PATH`]. Filters a small fixed post list
+/// case-insensitively by `q`, returning the same
+/// [`active_search_empty_state`](crate::widgets::active_search_empty_state)
+/// the story documents for the no-matches case.
+async fn demo_search(
+    crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
+) -> Html<String> {
+    const POSTS: &[&str] = &[
+        "The Long Autumn",
+        "Falling Leaves",
+        "Autumn in Practice",
+        "Shipping Widgets",
+    ];
+    let query = q.to_lowercase();
+    let matches: Vec<&str> = POSTS
+        .iter()
+        .copied()
+        .filter(|title| query.is_empty() || title.to_lowercase().contains(&query))
+        .collect();
+    let markup = if matches.is_empty() {
+        crate::widgets::active_search_empty_state("No posts matched your search.")
+    } else {
+        maud::html! {
+            ul class="story-demo-results" {
+                @for title in matches {
+                    li { (title) }
+                }
+            }
+        }
+    };
+    Html(markup.into_string())
+}
+
+/// Demo backend for the "Autocomplete" story's `/tags/search`-shaped action
+/// — mounted at [`STORIES_DEMO_TAG_SEARCH_PATH`]. Filters a small fixed tag
+/// list case-insensitively by the `q` query param, rendering matches with
+/// the same [`autocomplete_option`](crate::widgets::autocomplete_option) /
+/// [`autocomplete_empty_state`](crate::widgets::autocomplete_empty_state)
+/// the story's source already documents.
+async fn demo_tag_search(
+    crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
+) -> Html<String> {
+    const TAGS: &[(&str, &str)] = &[("42", "rust"), ("7", "web"), ("13", "axum"), ("21", "htmx")];
+    let query = q.to_lowercase();
+    let matches: Vec<(&str, &str)> = TAGS
+        .iter()
+        .copied()
+        .filter(|(_, label)| query.is_empty() || label.to_lowercase().contains(&query))
+        .collect();
+    let markup = if matches.is_empty() {
+        crate::widgets::autocomplete_empty_state("No matching tags.")
+    } else {
+        maud::html! {
+            @for (value, label) in matches {
+                (crate::widgets::autocomplete_option(value, label))
+            }
+        }
+    };
+    Html(markup.into_string())
+}
+
+/// Demo backend for the "Infinite feed" story's sentinel — mounted at
+/// [`STORIES_DEMO_FEED_PATH`].
+///
+/// Exists only so loading `htmx.min.js` (needed for the two typeahead
+/// demos above) doesn't turn this *specific* story into a visible
+/// regression: unlike every other action URL in the gallery, this one's
+/// [`FeedMode::Reveal`](crate::widgets::FeedMode::Reveal) sentinel fires
+/// `hx-trigger="revealed, click"` — htmx auto-requests it the moment the
+/// element scrolls into view, no click required, so visiting the story page
+/// alone would have 404-swapped it without the visitor doing anything. This
+/// always returns a terminal page (no further cursor), matching what the
+/// story's own `feed_page` snippet already documents as "the last page".
+async fn demo_infinite_feed() -> Html<String> {
+    let markup = crate::widgets::feed_page(
+        maud::html! {
+            article class="post" { h3 { "Loaded live via a real request." } }
+        },
+        None,
+        &crate::widgets::FeedConfig::new(STORIES_DEMO_FEED_PATH),
+    );
+    Html(markup.into_string())
 }
 
 fn registry_from_state(state: &AppState) -> StoryRegistry {
@@ -416,30 +538,351 @@ fn story_detail_response(
     }
 }
 
-/// Minimal gallery chrome layered on top of the framework widget stylesheet.
+/// Gallery chrome layered on top of the framework widget stylesheet
+/// (`WIDGETS_CSS_PATH`, linked before this `<style>` in `<head>`, so this
+/// block's declarations win the cascade at equal specificity).
+///
+/// Themed with the shared [`crate::ui::tokens`] custom properties
+/// (`var(--bg)`, `var(--primary)`, …) rather than hardcoded grays, so the
+/// gallery reads as a real Autumn surface instead of bare unstyled HTML —
+/// and so every `autumn-*` widget previewed inside a story re-themes too,
+/// since custom properties inherit down from `body`.
+///
+/// The `body { --bg: …; }` block below sets the gallery's own default
+/// ("Autumn": warm, not the framework's violet default) by overriding the
+/// tokens locally; it doesn't touch `tokens.css` itself, so apps embedding
+/// these widgets elsewhere are unaffected. [`theme_switch`] adds three more
+/// presets, swapped live by the same tokens — see its doc comment.
 const STORY_GALLERY_CSS: &str = r"
-body { margin: 0; font-family: system-ui, sans-serif; color: #1f2933; }
+body {
+    margin: 0;
+    font-family: var(--font-family);
+    color: var(--text);
+    background: var(--bg);
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+
+    /* The pale first-draft --border and --primary here both failed contrast
+       (review follow-up, verified independently across all three light
+       themes, none of it yet flagged when this comment was written):
+       --border read at ~1.3:1 against --surface in every one of them
+       (pastel-on-near-white, picked to look subtle, not checked against
+       what it sits on) — WCAG 1.4.11 wants 3:1. And unlike Midnight,
+       darkening --primary here has no downside to weigh: --primary-light
+       is the *light* end of the pair already, so a darker --primary only
+       ever increases contrast, for both the white-text button case and
+       the primary-on-primary-light case (e.g. #c2540a on #fbe4cd was
+       3.74:1, short of text's 4.5:1). No role conflict like Midnight's —
+       just needed darkening. Ocean and Forest below get the same two
+       fixes, values picked the same way. */
+    --bg: #fdf8f2;
+    --surface: #fffaf4;
+    --text: #2b1c10;
+    --text-muted: #7a6a58;
+    --border: #8a6f52;
+    --primary: #a8470c;
+    --primary-hover: #83380a;
+    --primary-light: #fbe4cd;
+    --radius: 0.6rem;
+    --shadow: 0 1px 3px rgba(43, 28, 16, 0.12), 0 4px 14px rgba(43, 28, 16, 0.08);
+}
+
+body:has(#story-theme-ocean:checked) {
+    --bg: #f0f7fb; --surface: #ffffff; --text: #0f2a3d; --text-muted: #52717f;
+    --border: #6b93a6; --primary: #0a5f78; --primary-hover: #084c60; --primary-light: #d7f0f5;
+    --shadow: 0 1px 3px rgba(15, 42, 61, 0.12), 0 4px 14px rgba(15, 42, 61, 0.08);
+}
+body:has(#story-theme-forest:checked) {
+    --bg: #f3f8f1; --surface: #ffffff; --text: #1b2e18; --text-muted: #5c7256;
+    --border: #5c8a52; --primary: #256829; --primary-hover: #1d5320; --primary-light: #dcefdb;
+    --shadow: 0 1px 3px rgba(27, 46, 24, 0.12), 0 4px 14px rgba(27, 46, 24, 0.08);
+}
+body:has(#story-theme-midnight:checked) {
+    /* Reuses tokens.css's own default violet (not a lighter #8b7cf6-family
+       shade) because white text sits directly on --primary throughout the
+       widget set (checked pills, buttons, …): #7c3aed keeps that pairing at
+       ~5.7:1 contrast, comfortably above WCAG AA's 4.5:1 for normal text —
+       a lighter violet dropped as low as 3.33:1 (review follow-up).
+
+       --primary-light also needed its own override here, NOT a darker tint
+       to match this theme's dark surfaces: text=var(--primary) on
+       bg=var(--primary-light) (hovered sidebar links, the selected
+       autocomplete option) needs the *opposite* of the button pairing above
+       — with primary that dark, only a light background clears 4.5:1
+       (review follow-up: the dark tint this carried before was 2.46:1). So
+       this reuses tokens.css's own default --primary-light (#ede9fe)
+       unchanged — the identical pairing already proven in the light theme
+       — rendering as a deliberately bright chip against the dark chrome,
+       ~4.8:1.
+
+       --danger stays at tokens.css's own default (#dc2626,
+       --danger-hover #b91c1c, --danger-light #fee2e2, all unset here) for
+       the identical reason: `.autumn-modal__confirm--danger` fills with
+       --danger under white text, the same button-fill role --primary
+       plays above, so it needs to stay dark (review follow-up: lightening
+       it to fix the Comment thread error text below dropped the confirm
+       button to 2.77:1). --danger-light is the same primary-light-chip
+       role as above too — dark text (--danger) on a light chip is already
+       proven in the light theme, so it also stays at the default.
+
+       --surface-muted isn't a tokens.css variable at all — widgets.css's
+       badge component reads it as `var(--surface-muted, #f1f5f9)`, a
+       standalone fallback nothing else declares. Every other theme here
+       leaves it unset and gets that light fallback, which is fine paired
+       with their (dark-ish, light-surface-appropriate) --text-muted. Dark
+       mode needs its own dark fallback for the same reason --primary-light
+       needed its own value above: --text-muted is light here, so it
+       reads at only 2.64:1 on the undeclared light default (review
+       follow-up).
+
+       --border needed lightening too: form controls (e.g.
+       .autumn-autocomplete__input) sit on --surface with only this border
+       as their visible boundary, and the original tint (matched to the
+       other dark surfaces, not against them) was 1.26:1 — WCAG 1.4.11
+       wants 3:1 for a UI component boundary, not the 4.5:1 text threshold
+       above (review follow-up). */
+    --bg: #14151c; --surface: #1d1f2b; --text: #e7e7ee; --text-muted: #9497ab;
+    --border: #666b8c; --primary: #7c3aed; --primary-hover: #6d28d9; --primary-light: #ede9fe;
+    --surface-muted: #23253a;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+/* --primary (#7c3aed) and --danger (#dc2626, from tokens.css's default,
+   unset above) are each also the *only* colors widgets.css ships for text
+   and graphical marks that aren't inside a button or a chip — e.g.
+   `.autumn-feed__more`, `.autumn-comment-reply-toggle`, this file's own
+   `.story-breadcrumb a` (all `color: var(--primary)`), the chart line/
+   point/bar SVG marks (`stroke`/`fill: var(--primary)` — deliberately, per
+   widgets.css's own comment: 'charts re-theme by overriding --primary'),
+   and `.autumn-comments-error` (`color: var(--danger)`) — a role with no
+   token of its own, alongside the button-fill role above and the
+   *-light-chip role before it. All three roles read the same variable but
+   need different lightness in dark mode: button-fill wants it dark (for
+   white text), plain text/marks want it light (for surface contrast) —
+   mutually exclusive for one shared value (review follow-up, three
+   rounds: --primary at the button-fill shade was 2.87:1 on --surface for
+   text and, separately, 2.87:1 again for the chart marks, which only need
+   WCAG 1.4.11's 3:1 graphical-object threshold rather than 4.5:1 but still
+   fell short; --danger lightened to fix its own text case promptly broke
+   its confirm button the same way, 2.77:1). Giving plain text/marks their
+   own token is a widgets.css-wide change well past this PR's scope of
+   theming the gallery, so this overrides plain-text-color usage instead —
+   every `color: var(--primary)` rule in widgets.css that isn't paired
+   with `background: var(--primary-light)` (that pairing is the
+   already-fixed chip role, e.g. the selected autocomplete option) — a
+   real fix for the actual gap, not a one-off patch for whichever
+   selector a story happened to render and review happened to catch
+   first (four of these eight were found that way, across four rounds).
+   See PR #2887 for the proposed follow-up (dedicated text/mark-color
+   tokens in tokens.css, so this whole list stops needing upkeep by
+   hand). */
+body:has(#story-theme-midnight:checked) .autumn-feed__more,
+body:has(#story-theme-midnight:checked) .autumn-comment-reply-toggle,
+body:has(#story-theme-midnight:checked) .autumn-nav__item a:hover,
+body:has(#story-theme-midnight:checked) .autumn-locale-switcher a:hover,
+body:has(#story-theme-midnight:checked) .autumn-breadcrumb__link:hover,
+body:has(#story-theme-midnight:checked) .autumn-reaction-active,
+body:has(#story-theme-midnight:checked) .wizard-step--completed .wizard-step__label,
+body:has(#story-theme-midnight:checked) .story-breadcrumb a {
+    color: #a78bfa;
+}
+body:has(#story-theme-midnight:checked) .autumn-reaction-active {
+    border-color: #a78bfa;
+}
+body:has(#story-theme-midnight:checked) .autumn-comments-error,
+body:has(#story-theme-midnight:checked) .autumn-field__error,
+body:has(#story-theme-midnight:checked) .autumn-job-status__error {
+    color: #f87171;
+}
+body:has(#story-theme-midnight:checked) .autumn-comments-error {
+    border-color: #f87171;
+}
+/* Same text-on-surface conflict as --danger above, mirrored for --success:
+   `.autumn-job-status__success` is the only widgets.css rule that renders
+   var(--success) as direct text rather than in a self-contained chip
+   (badge--success/alert-success pair it with --success-light, which stays
+   unaffected by this theme), and the default shade is 4.34:1 on Midnight's
+   --surface, just short of 4.5:1. */
+body:has(#story-theme-midnight:checked) .autumn-job-status__success {
+    color: #34d399;
+}
+/* Charts and the upload progress fill both read `var(--primary)` directly
+   for a non-text mark (stroke/fill, and `::before`'s background-color —
+   by design, see the comment above), so redeclaring the custom property
+   itself, scoped to the mark's container, re-themes it in one declaration
+   instead of overriding each individual rule. */
+body:has(#story-theme-midnight:checked) .autumn-chart,
+body:has(#story-theme-midnight:checked) .autumn-upload-bar {
+    --primary: #a78bfa;
+}
+/* The wizard's own completed-step connector (`.wizard-step--completed +
+   .wizard-step::before`) is the same non-text `var(--primary)` mark as
+   the two above (2.87:1 on --surface, short of the 3:1 floor), but can't
+   use the same custom-property redeclare trick: it's a sibling
+   combinator, not a descendant, so a property set on the completed step
+   wouldn't inherit to it. Overriding the resolved background-color
+   directly instead. */
+body:has(#story-theme-midnight:checked) .wizard-step--completed + .wizard-step::before {
+    background-color: #a78bfa;
+}
+/* Every `:focus-visible` keyboard outline in widgets.css is `2px solid
+   var(--primary)` too — a fourth role hitting the same conflict (review
+   follow-up: 2.87:1 on --surface, short of WCAG 1.4.11's 3:1 non-text
+   floor), unfixed by any of the overrides above since none of them touch
+   `outline-color`. Swept every such selector in widgets.css, plus this
+   gallery's own theme-switch pill below. */
+body:has(#story-theme-midnight:checked) .alert__dismiss:has(.alert__dismiss-toggle:focus-visible),
+body:has(#story-theme-midnight:checked) .autumn-feed__more:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-reaction-button:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-consent-banner__button:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-bulk-actions button:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-bulk-select:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-comment-reply-toggle:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-comment-input:focus-visible,
+body:has(#story-theme-midnight:checked) .autumn-comment-submit:focus-visible,
+body:has(#story-theme-midnight:checked) .story-theme-switch input[type='radio']:focus-visible + label {
+    outline-color: #a78bfa;
+}
+/* Same conflict again, fifth and sixth roles: :focus/:hover border-color
+   (input focus rings, hover borders) and the tabs active-indicator
+   border-bottom-color — both non-text UI, same 3:1 floor, same 2.87:1
+   shortfall (review follow-up). Doing every remaining `var(--primary)`
+   usage in widgets.css in one pass this time, rather than per-round:
+   between this block, the outline block above, and the color block
+   below, every such usage widgets.css has is now covered. */
+body:has(#story-theme-midnight:checked) .autumn-field__input:focus,
+body:has(#story-theme-midnight:checked) .autumn-search__input:focus,
+body:has(#story-theme-midnight:checked) .autumn-autocomplete__input:focus,
+body:has(#story-theme-midnight:checked) .autumn-feed__more:hover,
+body:has(#story-theme-midnight:checked) .autumn-consent-banner__button:hover,
+body:has(#story-theme-midnight:checked) .autumn-bulk-actions button:hover,
+body:has(#story-theme-midnight:checked) .autumn-comment-submit:hover {
+    border-color: #a78bfa;
+}
+body:has(#story-theme-midnight:checked) .autumn-tabs__tab--active,
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
+body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
+    border-bottom-color: #a78bfa;
+}
+/* Unlike the --primary/--danger conflicts above, this one isn't Midnight-
+   specific: `.wizard-step__number`'s idle state pairs `var(--border)`
+   (background) with `var(--text-muted)` (text), and in every one of the
+   four gallery palettes those two tokens land within a few points of the
+   same luminance (1.11:1 up to 1.8:1, all far short of the 4.5:1 text
+   floor) — even pure black text on the Autumn border color only reaches
+   4.48:1, so no foreground swap alone can fix it; the background itself
+   has to change. `var(--surface-muted)` is already far enough from
+   `var(--text-muted)` in every theme (it's the near-white widgets.css
+   fallback in the three light themes, and Midnight's own dark override),
+   so using it here instead of `var(--border)` clears 4.5:1 everywhere
+   without per-theme fixed colors (review follow-up). Both the bare
+   `.wizard-step__number` and widgets.css's own two-class
+   `.wizard-step--upcoming .wizard-step__number` need the override: the
+   upcoming-state rule redeclares the identical `var(--border)` background
+   explicitly (the widget always renders one of --completed/--current/
+   --upcoming, never the bare class alone) and its two-class selector
+   otherwise outranks this one on specificity regardless of source order,
+   so leaving it out left the actual rendered state unfixed (review
+   follow-up). */
+.wizard-step__number,
+.wizard-step--upcoming .wizard-step__number {
+    background-color: var(--surface-muted, #f1f5f9);
+}
+
+.story-theme-switch { display: flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
+.story-theme-switch legend { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-right: 0.25rem; padding: 0; }
+.story-theme-switch input[type='radio'] { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.story-theme-switch label { padding: 0.3rem 0.75rem; border-radius: 999px; border: 1px solid var(--border); font-size: 0.8rem; line-height: 1; cursor: pointer; color: var(--text-muted); }
+.story-theme-switch input[type='radio']:checked + label { background: var(--primary); border-color: var(--primary); color: #fff; }
+.story-theme-switch input[type='radio']:focus-visible + label { outline: 2px solid var(--primary); outline-offset: 2px; }
+
 .story-layout { display: flex; gap: 2rem; align-items: flex-start; }
-.story-sidebar { flex: 0 0 14rem; padding: 1rem 1.25rem; border-right: 1px solid #e0e0e0; min-height: 100vh; }
-.story-sidebar h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: #616e7c; margin: 1.25rem 0 0.25rem; }
+.story-sidebar { flex: 0 0 14rem; padding: 1.25rem; border-right: 1px solid var(--border); min-height: 100vh; background: var(--surface); }
+.story-sidebar h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin: 1.5rem 0 0.35rem; }
+.story-sidebar h2:first-child { margin-top: 0; }
 .story-sidebar ul { list-style: none; margin: 0; padding: 0; }
 .story-sidebar li { margin: 0.15rem 0; }
-.story-content { flex: 1 1 auto; padding: 1.5rem; max-width: 60rem; }
-.story-preview { padding: 1.5rem; border: 1px solid #e0e0e0; border-radius: 6px; margin-bottom: 1.5rem; }
-.story-content pre { background: #f5f7fa; border-radius: 6px; padding: 1rem; overflow-x: auto; }
-.story-empty { padding: 2rem; border: 1px dashed #cbd2d9; border-radius: 6px; }
+.story-sidebar a { color: var(--text); text-decoration: none; border-radius: 0.35rem; padding: 0.15rem 0.4rem; display: block; }
+.story-sidebar a:hover { background: var(--primary-light); color: var(--primary); }
+.story-content { flex: 1 1 auto; padding: 1.75rem 2rem 3rem; max-width: 60rem; }
+.story-content h1 { margin-top: 0; }
+.story-breadcrumb { color: var(--text-muted); font-size: 0.85rem; }
+.story-breadcrumb a { color: var(--primary); }
+.story-preview { padding: 1.75rem; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1.5rem; background: var(--surface); box-shadow: var(--shadow); }
+.story-content pre { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; overflow-x: auto; }
+.story-empty { padding: 2rem; border: 1px dashed var(--border); border-radius: var(--radius); color: var(--text-muted); }
 ";
 
-/// Full HTML document shell: framework widget stylesheet + widget runtime
-/// script + gallery chrome.
+/// The gallery's theme presets: `(radio value / id suffix, visible label)`.
+/// `"autumn"` is the default (checked server-side so the page never renders
+/// themeless before CSS applies).
+const STORY_THEMES: [(&str, &str); 4] = [
+    ("autumn", "Autumn"),
+    ("ocean", "Ocean"),
+    ("forest", "Forest"),
+    ("midnight", "Midnight"),
+];
+
+/// Live theme switcher: a `fieldset` of radio buttons that re-theme the
+/// whole page — including every `autumn-*` widget previewed in a story —
+/// with **no JavaScript**.
 ///
-/// Interactive widgets (`modal_trigger`, `confirm_action`, `nav_bar`, …) emit
-/// `data-*` hooks wired by the framework's `autumn-widgets.js` runtime, so the
-/// shell loads that same-origin script (always mounted under the `htmx`
-/// feature) alongside the stylesheet — otherwise the live previews of those
-/// stories would be inert in browsers that need the JS fallback. The script
-/// needs no CSP nonce: the framework's default policy keeps `'self'` in
-/// `script-src` in both plain and nonce modes.
+/// Each radio's `:checked` state is matched by a `body:has(#story-theme-…
+/// :checked)` rule in [`STORY_GALLERY_CSS`] that overrides the shared
+/// design tokens (`--bg`, `--primary`, …); because custom properties
+/// inherit, every rule referencing `var(--primary)` — in this stylesheet
+/// *and* in the linked `WIDGETS_CSS_PATH` bundle — re-resolves live the
+/// moment a different radio is checked. Same `:has()`-driven, script-free
+/// pattern as the alert widget's dismiss toggle and the tabs widget's
+/// `:target` deep-linking; safe under a strict `script-src 'self'` CSP with
+/// no `'unsafe-inline'` and no nonce, since nothing here executes.
+fn theme_switch() -> maud::Markup {
+    maud::html! {
+        fieldset class="story-theme-switch" {
+            legend { "Theme" }
+            @for (value, label) in STORY_THEMES {
+                input type="radio" name="story-theme" id=(format!("story-theme-{value}"))
+                    checked[value == "autumn"];
+                label for=(format!("story-theme-{value}")) { (label) }
+            }
+        }
+    }
+}
+
+/// Full HTML document shell: framework widget stylesheet + htmx + widget
+/// runtime script + gallery chrome.
+///
+/// Loads two same-origin scripts (both always mounted under the `htmx`
+/// feature), in this order so `defer` preserves it regardless of download
+/// timing:
+///
+/// 1. `htmx.min.js` — every `hx-get`/`hx-post`-driven widget (active search,
+///    autocomplete, reaction controls, comment threads, the infinite feed
+///    sentinel, …) renders correct `hx-*` attributes either way (see each
+///    story's "Rendered HTML" tab), but they stay inert without htmx itself
+///    on the page to process them.
+/// 2. `autumn-widgets.js` — the framework's own `data-*`-hook runtime for
+///    `modal_trigger`, `confirm_action`, `nav_bar`, and the autocomplete
+///    widget's selection wiring.
+///
+/// Neither script needs a CSP nonce itself: the framework's default policy
+/// keeps `'self'` in `script-src` in both plain and nonce modes. htmx does,
+/// though, indirectly — it injects its own default loading-indicator
+/// `<style>` at startup, and needs the nonce told to it via an
+/// `htmx-config` meta tag (its documented mechanism) or that injected tag
+/// has none and nonce-mode `style-src` (no `'unsafe-inline'`) blocks it
+/// (review follow-up).
+///
+/// Most widgets' action URLs stay synthetic 404s-on-submit by design (e.g.
+/// Confirm action, Bulk actions) — see each story's own comment. Two
+/// typeahead stories (Active search, Autocomplete) get real demo backends
+/// instead (`demo_search`, `demo_tag_search`), since a search box that
+/// visibly does nothing while typing reads as broken rather than as a
+/// deliberately-inert mockup; the Infinite feed story gets one too
+/// (`demo_infinite_feed`) purely to stop its auto-firing `revealed` trigger
+/// from 404-swapping on page load — see that function's doc comment.
 ///
 /// When the security layer's per-request CSP nonce is active
 /// (`security.headers.csp_nonce.enabled = true`, which drops
@@ -452,9 +895,12 @@ fn story_page(
     nonce: Option<&crate::security::CspNonce>,
 ) -> maud::Markup {
     #[cfg(feature = "htmx")]
-    let widgets_js: Option<&str> = Some(crate::htmx::AUTUMN_WIDGETS_JS_PATH);
+    let scripts: &[&str] = &[
+        crate::htmx::HTMX_JS_PATH,
+        crate::htmx::AUTUMN_WIDGETS_JS_PATH,
+    ];
     #[cfg(not(feature = "htmx"))]
-    let widgets_js: Option<&str> = None;
+    let scripts: &[&str] = &[];
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -463,14 +909,20 @@ fn story_page(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn stories" }
                 link rel="stylesheet" href=(crate::ui::WIDGETS_CSS_PATH);
-                @if let Some(src) = widgets_js {
+                @if let Some(n) = nonce {
+                    meta name="htmx-config" content=(format!(r#"{{"inlineStyleNonce":"{}"}}"#, n.value()));
+                }
+                @for src in scripts {
                     script src=(src) defer {}
                 }
                 style nonce=[nonce.map(crate::security::CspNonce::value)] {
                     (maud::PreEscaped(STORY_GALLERY_CSS))
                 }
             }
-            body { (body) }
+            body {
+                (theme_switch())
+                (body)
+            }
         }
     }
 }
@@ -993,6 +1445,220 @@ mod tests {
         assert!(
             plain.contains("<style>") && !plain.contains("nonce="),
             "without the security layer no nonce attribute is emitted: {plain}"
+        );
+    }
+
+    // U16 (interactivity follow-up): htmx injects its own default loading-
+    // indicator <style> at startup; under nonce-mode CSP it needs that
+    // nonce told to it via an htmx-config meta tag (its documented
+    // mechanism), or the tag it injects has none and gets blocked the same
+    // way the reported CSP violation did.
+    #[cfg(feature = "htmx")]
+    #[test]
+    fn story_pages_tell_htmx_the_csp_nonce_via_meta_tag() {
+        let nonce = crate::security::CspNonce::new_for_tests("test-nonce-value");
+        let registry = StoryRegistry::new(vec![demo_story("Display", "Card")]);
+
+        let with_nonce = render_story_index(&registry, Some(&nonce)).into_string();
+        assert!(
+            with_nonce.contains(
+                r#"<meta name="htmx-config" content="{&quot;inlineStyleNonce&quot;:&quot;test-nonce-value&quot;}">"#
+            ),
+            "story page must tell htmx the CSP nonce via htmx-config: {with_nonce}"
+        );
+
+        let plain = render_story_index(&registry, None).into_string();
+        assert!(
+            !plain.contains("htmx-config"),
+            "without the security layer no htmx-config meta tag is needed: {plain}"
+        );
+    }
+
+    // U11 (theming/interactivity follow-up): every story page renders a live
+    // theme switcher — one radio per `STORY_THEMES` entry, "autumn" checked
+    // by default — and each radio's `id` matches a `body:has(#story-theme-…
+    // :checked)` override in `STORY_GALLERY_CSS`, so picking a theme needs no
+    // JavaScript. This also guards the CSP: the switcher must never grow an
+    // inline `<script>`/`on*=` handler, only the pure-CSS `:has()` pattern.
+    #[test]
+    fn theme_switch_renders_radios_wired_to_css_overrides() {
+        let registry = StoryRegistry::new(vec![demo_story("Display", "Card")]);
+        let index = render_story_index(&registry, None).into_string();
+        let dom = crate::test_html::parse(&index);
+
+        let fieldset = crate::test_html::SelectorList::parse("fieldset.story-theme-switch")
+            .expect("selector parses");
+        assert!(
+            !fieldset.matches(&dom).is_empty(),
+            "index must render the theme switcher: {index}"
+        );
+
+        for (value, label) in STORY_THEMES {
+            let radio_id = format!("story-theme-{value}");
+            let radio_selector = crate::test_html::SelectorList::parse(&format!(
+                "input[type=\"radio\"][name=\"story-theme\"]#{radio_id}"
+            ))
+            .expect("selector parses");
+            assert!(
+                !radio_selector.matches(&dom).is_empty(),
+                "missing theme radio for {value:?}: {index}"
+            );
+
+            let label_selector =
+                crate::test_html::SelectorList::parse(&format!("label[for=\"{radio_id}\"]"))
+                    .expect("selector parses");
+            let label_matches = label_selector.matches(&dom);
+            assert!(
+                !label_matches.is_empty(),
+                "missing theme label for {value:?}: {index}"
+            );
+            assert!(
+                label_matches[0].text().contains(label),
+                "theme label for {value:?} should read {label:?}: {index}"
+            );
+
+            // "autumn" is the base `body {}` rule's own default — it needs no
+            // `:has()` override, only the other three presets do.
+            if value != "autumn" {
+                assert!(
+                    STORY_GALLERY_CSS.contains(&format!("#story-theme-{value}:checked")),
+                    "STORY_GALLERY_CSS must override tokens when #{radio_id} is checked"
+                );
+            }
+        }
+
+        assert!(
+            index.contains(r#"id="story-theme-autumn" checked"#),
+            "the default theme (autumn) must be checked server-side so the \
+             page never renders themeless before CSS applies: {index}"
+        );
+
+        assert!(
+            !index.contains("<script>")
+                && !index.contains(" onclick=")
+                && !index.contains(" onchange="),
+            "the theme switcher must stay pure-CSS (:has()), no inline script \
+             or event handler, to hold under a strict script-src CSP: {index}"
+        );
+    }
+
+    // U12 (interactivity follow-up): every hx-*-driven widget stayed inert
+    // because htmx.min.js was never loaded, only the framework's own
+    // data-*-hook runtime was. Both must load, htmx first (both `defer`, so
+    // document order fixes execution order — autumn-widgets.js's
+    // autocomplete wiring can assume htmx is already present).
+    #[cfg(feature = "htmx")]
+    #[test]
+    fn story_page_loads_htmx_before_the_widgets_runtime() {
+        let page = render_story_index(&StoryRegistry::default(), None).into_string();
+        let htmx_at = page
+            .find(crate::htmx::HTMX_JS_PATH)
+            .expect("story page must load htmx.min.js");
+        let widgets_at = page
+            .find(crate::htmx::AUTUMN_WIDGETS_JS_PATH)
+            .expect("story page must load autumn-widgets.js");
+        assert!(
+            htmx_at < widgets_at,
+            "htmx.min.js must appear before autumn-widgets.js so `defer` \
+             preserves that execution order: {page}"
+        );
+    }
+
+    // U13 (interactivity follow-up): the two typeahead stories point at real
+    // demo backends now (not the synthetic 404-on-submit URLs most other
+    // stories use), and since the URL is a plain string literal in the
+    // story's own source — not a reference to the route const, which would
+    // show up literally in the public "Source" tab — nothing else catches
+    // the two drifting apart. Guard it here instead.
+    #[test]
+    fn typeahead_stories_point_at_their_registered_demo_routes() {
+        let registry = builtin();
+        let active_search = registry
+            .find("active-search")
+            .expect("active-search story exists");
+        assert!(
+            active_search.source().contains(STORIES_DEMO_SEARCH_PATH),
+            "Active search story must point at STORIES_DEMO_SEARCH_PATH \
+             ({STORIES_DEMO_SEARCH_PATH}): {}",
+            active_search.source()
+        );
+
+        let autocomplete = registry
+            .find("autocomplete")
+            .expect("autocomplete story exists");
+        assert!(
+            autocomplete.source().contains(STORIES_DEMO_TAG_SEARCH_PATH),
+            "Autocomplete story must point at STORIES_DEMO_TAG_SEARCH_PATH \
+             ({STORIES_DEMO_TAG_SEARCH_PATH}): {}",
+            autocomplete.source()
+        );
+
+        let feed = registry
+            .find("infinite-feed")
+            .expect("infinite-feed story exists");
+        assert!(
+            feed.source().contains(STORIES_DEMO_FEED_PATH),
+            "Infinite feed story must point at STORIES_DEMO_FEED_PATH \
+             ({STORIES_DEMO_FEED_PATH}), or its Reveal-mode sentinel \
+             404-swaps on page load with no visitor action: {}",
+            feed.source()
+        );
+    }
+
+    // U14 (interactivity follow-up): the demo handlers backing those routes
+    // actually filter, case-insensitively, and fall back to the same empty
+    // states the stories document.
+    #[tokio::test]
+    async fn demo_search_filters_case_insensitively_with_empty_state_fallback() {
+        let hit = demo_search(crate::extract::Query(DemoQuery {
+            q: "AUTUMN".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(hit.contains("The Long Autumn"), "{hit}");
+        assert!(hit.contains("Autumn in Practice"), "{hit}");
+        assert!(!hit.contains("Falling Leaves"), "{hit}");
+
+        let miss = demo_search(crate::extract::Query(DemoQuery {
+            q: "nonexistent".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(
+            miss.contains("No posts matched your search."),
+            "no-match query must fall back to active_search_empty_state: {miss}"
+        );
+    }
+
+    #[tokio::test]
+    async fn demo_tag_search_filters_case_insensitively_with_empty_state_fallback() {
+        let hit = demo_tag_search(crate::extract::Query(DemoQuery { q: "RU".to_owned() }))
+            .await
+            .0;
+        assert!(hit.contains("rust"), "{hit}");
+        assert!(!hit.contains("axum"), "{hit}");
+
+        let miss = demo_tag_search(crate::extract::Query(DemoQuery {
+            q: "nonexistent".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(
+            miss.contains("No matching tags."),
+            "no-match query must fall back to autocomplete_empty_state: {miss}"
+        );
+    }
+
+    // U15 (interactivity follow-up): the feed demo must terminate (no
+    // further sentinel) — otherwise it would just keep auto-firing.
+    #[tokio::test]
+    async fn demo_infinite_feed_returns_a_terminal_page_with_no_further_sentinel() {
+        let body = demo_infinite_feed().await.0;
+        assert!(body.contains("Loaded live via a real request."), "{body}");
+        assert!(
+            !body.contains("autumn-feed__sentinel"),
+            "a next_cursor of None must emit no further sentinel, or the \
+             `revealed` trigger keeps auto-firing forever: {body}"
         );
     }
 }

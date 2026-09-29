@@ -330,7 +330,7 @@ impl VariantHandle {
         let max_width = budget.max_source_width;
         let max_height = budget.max_source_height;
 
-        let (output_bytes, output_content_type) = tokio::task::spawn_blocking(
+        let (output_bytes, output_content_type) = crate::time::spawn_blocking(
             move || -> Result<(Vec<u8>, &'static str), VariantError> {
                 // Use decoder limits to guard against image bombs: a compressed
                 // file under `max_source_bytes` can still expand to gigabytes of

@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use tokio::sync::{Semaphore, watch};
 
@@ -280,7 +280,7 @@ pub fn jittered_ttl(base: Duration, fraction: f64) -> Duration {
     let mut buf = [0_u8; 4];
     if getrandom::getrandom(&mut buf).is_err() {
         // Fallback entropy source if the OS RNG is unavailable.
-        let nanos = SystemTime::now()
+        let nanos = crate::time::ambient_system_time()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
         buf = nanos.to_le_bytes();
@@ -412,7 +412,10 @@ fn now_unix_ms(clock: &dyn ClockSource) -> u64 {
 /// replica mistake the old stale envelope for a completed refresh.
 fn fast_path_value<V>(cache: &Arc<dyn Cache>, key: &str, options: &GetOrComputeOptions) -> Option<V>
 where
-    V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
+    // `Serialize` because `get_cached` records the value it served into a
+    // failure capsule (#1634); every caller of this helper already carries the
+    // bound, since the same `V` is written back through `insert_cached`.
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     if options.stale_while_revalidate.is_some() {
         get_cached::<SwrEnvelope<V>>(cache.as_ref(), key)
@@ -508,7 +511,10 @@ where
             read_through_metrics()
                 .fill_lock_contended
                 .fetch_add(1, Ordering::Relaxed);
-            let start = Instant::now();
+            // Use the ambient clock, not `options.clock`. A test can set a
+            // fixed clock there, and a fixed clock does not advance, so the
+            // wait below would not end.
+            let start = crate::time::ambient_instant();
             // Exponential backoff, capped at MAX_LOCK_POLL_INTERVAL: a flat
             // poll cadence means every waiting replica hammers Redis (a cache
             // read plus a lock-acquire attempt, each a block_in_place round
@@ -521,7 +527,9 @@ where
                 // could otherwise overshoot lock_wait_timeout by a full
                 // interval before this loop gets a chance to check it,
                 // making the "bounded wait" option not actually bounded.
-                let remaining = options.lock_wait_timeout.saturating_sub(start.elapsed());
+                let remaining = options.lock_wait_timeout.saturating_sub(
+                    crate::time::ambient_instant().saturating_duration_since(start),
+                );
                 if remaining.is_zero() {
                     let result = fill().await;
                     return finish_fill(cache, key, options, result, &tx);
@@ -534,7 +542,9 @@ where
                     return Ok(value);
                 }
 
-                if start.elapsed() >= options.lock_wait_timeout {
+                if crate::time::ambient_instant().saturating_duration_since(start)
+                    >= options.lock_wait_timeout
+                {
                     // Bounded damage: give up waiting and fill locally rather
                     // than block the caller indefinitely.
                     let result = fill().await;

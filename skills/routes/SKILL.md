@@ -80,17 +80,74 @@ omitted. They do not need to be shown unless the user asks:
 If `autumn routes` fails because the project has not been compiled, tell the
 user to run `cargo build` first, then retry.
 
-## Auth-coverage audit (unreleased — trunk-dev, issues #1604, #1850)
+## Auth-coverage audit (unreleased — trunk-dev, issues #1604, #1850, #1627)
 
 On trunk-dev, `autumn routes audit` audits every route's authentication
 exposure. It prints each route's classification — `gated`, `public`,
 `framework`, or `unclassified` — and emits a stable-ordered (by path, then
 method) JSON security manifest. It exits non-zero on any `unclassified` (or
-omitted) route, so it can gate CI.
+omitted) route, so it can gate CI. `autumn new` now wires this into every
+scaffolded app's `.github/workflows/ci.yml` by default (right after the
+a11y-verify step, reusing its installed CLI), so a fresh app fails CI on day
+one if a route is left unclassified.
 
 Mark a deliberately-unauthenticated handler with the new `#[public]` attribute
 (mirrors `#[secured]`) to classify it as `public` and clear it from the
 `unclassified` set.
+
+An unclassified-route diagnostic now names the offending handler's `file:line`
+(from `file!()`/`line!()`) alongside its module, e.g. `POST /widgets (handler
+`create_widget` [myapp::widgets] at src/routes/widgets.rs:12)`, so it can be
+jumped to directly. See `docs/guide/route-auth-coverage.md` for the full
+default-deny posture model and how to classify `gated`/`public`/`framework`
+routes.
+
+The manifest (schema v3) carries four dimensions, each tagged with a provenance
+class:
+
+- `routes` (`provable`) — the per-route classification above.
+- `csrf` (`declared`) — CSRF enforcement per mutating route, from config.
+- `security_headers` (`declared`) — effective response headers, from config.
+- `authorization_policies` (`provable`) — one `(action, resource)` entry per
+  `#[authorize]` binding, plus a `runtime_caveat` recording that which
+  `impl Policy<R>` serves the check is a boot fact the build cannot see.
+
+Dimensions that are not yet emitted are named in the manifest's `excluded`
+list with the class they will eventually carry. See
+`docs/guide/security-posture-manifest.md` for the provenance rubric that
+decides a dimension's class.
+
+## Posture diffs and the merge gate (unreleased — trunk-dev, issue #1624)
+
+`autumn routes audit` says what the surface *is*. `autumn routes posture` says
+what a change *did to it*:
+
+```bash
+# The pull-request gate. Exit 0 = clean or acknowledged, 1 = blocked,
+# 2 = the tool could not run.
+autumn routes posture diff --base base-posture.json --head security-posture.json
+
+# The digest a release records, and the deploy-time proof.
+autumn routes posture digest --manifest security-posture.json
+autumn routes posture verify --manifest security-posture.json \
+  --expect-digest <digest> --repo owner/repo
+```
+
+Only *widening* blocks: a new public or unclassified route, a classification
+downgraded, a role requirement dropped, a role added (roles are OR-ed, so one
+more admits more callers), a scope removed (scopes are AND-ed), an
+`#[authorize]` binding or policy check removed, CSRF enforcement lost, or a
+security header no longer emitted. Narrowing and neutral changes annotate and
+never block, a security header's *value* changing is reported but never
+blocked, and a handler rename or a moved file produces no finding at all.
+
+A widening is acknowledged with one pull-request comment carrying the digest
+the report prints — `/ack-posture <digest> <reason>` — which stays valid across
+unrelated pushes and stops matching the moment something new widens. That is
+also the only escape hatch for a false positive: nothing disables the gate.
+
+`autumn new` scaffolds `.github/workflows/posture-gate.yml`; existing apps
+adopt it with `autumn upgrade --apply`. See `docs/guide/posture-gate.md`.
 
 ## Comparing expected vs actual routes
 
