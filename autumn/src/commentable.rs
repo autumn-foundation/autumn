@@ -50,6 +50,14 @@
 //! Values (bodies, ids, the discriminator) are always **bound**, never
 //! formatted.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamp};
 use diesel_async::RunQueryDsl as _;
 use scoped_futures::ScopedFutureExt as _;
@@ -380,6 +388,13 @@ struct SubtreeRow {
     id: i64,
     #[diesel(sql_type = BigInt)]
     depth: i64,
+}
+
+/// A reply the hard-delete cascade would reach outside the subtree.
+#[derive(diesel::QueryableByName)]
+struct CommentIdRow {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -826,6 +841,9 @@ pub async fn add_comment(
 ///   when that record is not visible to this caller. The record is part of the
 ///   check on purpose: without it, any comment id would be deletable from any
 ///   record of the same model.
+/// - `422` on the hard-delete path (`soft_delete = false`) when the subtree is
+///   too deep for the walk, or has a reply on another record. The cascade
+///   would remove rows the counter does not see. The call removes nothing.
 /// - Any database error.
 pub async fn delete_comment(
     conn: &mut RuntimeConnection,
@@ -1450,6 +1468,9 @@ async fn insert_comment(
 /// it), but no foreign key or `CHECK` enforces that, and an app that inserts
 /// comments with raw Diesel can. Without the predicate one parent's counter
 /// would absorb the whole span.
+///
+/// The hard-delete cascade can go past the record. Thus the hard-delete path
+/// refuses a subtree with a reply that the walk did not reach (#2275).
 async fn delete_subtree(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -1540,13 +1561,36 @@ async fn delete_subtree(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Issue #2275. The walk stops at the record, but the `parent_id` cascade
+    // does not. The cascade would remove a reply that is not in `ids`. Then the
+    // returned count is too low, and the counter on that reply's record stays
+    // too high. The framework cannot write such an edge, so refuse the delete.
+    if !spec.soft_delete {
+        let escaped: Option<CommentIdRow> = diesel::sql_query(format!(
+            "SELECT {pk} AS id FROM {comments} \
+             WHERE {parent_column} IN ({id_list}) AND {pk} NOT IN ({id_list}) \
+             ORDER BY {pk} LIMIT 1"
+        ))
+        .get_result::<CommentIdRow>(conn)
+        .await
+        .optional_row()?;
+        if let Some(escaped) = escaped {
+            let escaped = escaped.id;
+            return Err(AutumnError::unprocessable_msg(format!(
+                "comment {comment_id} cannot be hard-deleted. Its reply {escaped} is not on this \
+                 record, and the cascade would delete it. Set the parent_id of comment \
+                 {escaped} to NULL or to a comment on its own record. Then delete again."
+            )));
+        }
+    }
+
     if spec.soft_delete {
         diesel::sql_query(format!(
             "UPDATE {comments} SET {deleted_at} = {} \
              WHERE {pk} IN ({id_list}) AND {deleted_at} IS NULL",
             ph(1),
         ))
-        .bind::<Timestamp, _>(chrono::Utc::now().naive_utc())
+        .bind::<Timestamp, _>(crate::time::ambient_now().naive_utc())
         .execute(conn)
         .await
         .map_err(AutumnError::from)?;
