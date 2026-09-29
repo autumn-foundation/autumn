@@ -287,14 +287,10 @@ pub fn jittered_ttl(base: Duration, fraction: f64) -> Duration {
     }
     let unit = f64::from(u32::from_le_bytes(buf)) / f64::from(u32::MAX);
     // factor is uniform in [1 - fraction, 1 + fraction].
+    // `try_from_secs_f64` saturates instead of panicking (as `mul_f64` did)
+    // when a huge base times a factor above 1 overflows `Duration`.
     let factor = fraction.mul_add(2.0f64.mul_add(unit, -1.0), 1.0).max(0.0);
-    #[allow(clippy::cast_precision_loss)]
-    let max_secs = u64::MAX as f64;
-    if base.as_secs_f64() * factor >= max_secs {
-        Duration::MAX
-    } else {
-        base.mul_f64(factor)
-    }
+    Duration::try_from_secs_f64(base.as_secs_f64() * factor).unwrap_or(Duration::MAX)
 }
 
 // ── In-flight registry (single-flight) ──────────────────────────────
