@@ -2944,7 +2944,7 @@ previous_secrets = []
             .expect("workflow must cut over via az containerapp update");
         let enable_at = workflow
             .find("az containerapp ingress enable")
-            .expect("workflow must enable external ingress at cutover: {workflow}");
+            .expect("workflow must enable external ingress at cutover");
         assert!(
             enable_at > update_at,
             "ingress must open AFTER the real image is deployed, not before: {workflow}"
