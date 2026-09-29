@@ -267,21 +267,26 @@ pub fn print_json(routes: &[RouteInfo]) {
 }
 
 /// Print routes as a Mermaid flowchart.
+///
+/// An empty route table still prints a (node-less) `flowchart`, so piping the
+/// output into a renderer never receives prose instead of Mermaid.
 pub fn print_mermaid(routes: &[RouteInfo]) {
-    if routes.is_empty() {
-        println!("No routes found.");
-        return;
-    }
+    print!("{}", format_mermaid(routes));
+}
 
-    let mermaid = format_mermaid(routes);
-    println!("{mermaid}");
+/// Escape text for a quoted Mermaid label. Mermaid has no backslash escape in
+/// labels; `"` is written as the `#quot;` entity instead.
+fn mermaid_label(text: &str) -> String {
+    text.replace('"', "#quot;")
 }
 
 /// Build the Mermaid string (extracted for testability).
 ///
-/// Routes are grouped into one `subgraph` per source; `:` and `-` in a source
-/// (`plugin:autumn-admin`) become `_` so the subgraph id stays a valid
-/// Mermaid identifier.
+/// Routes are grouped into one `subgraph` per source. A source is free text
+/// (a plugin name may hold `@`, `/` or whitespace), so it is never used as an
+/// identifier: each subgraph gets a generated id (`src1`, `src2`, …) and the
+/// source is rendered as its quoted title. Distinct sources therefore never
+/// collide, however similar their names.
 pub fn format_mermaid(routes: &[RouteInfo]) -> String {
     use std::fmt::Write as _;
 
@@ -293,16 +298,21 @@ pub fn format_mermaid(routes: &[RouteInfo]) -> String {
 
     let mut out = String::from("flowchart LR\n");
     let mut node_id = 0_usize;
-    for (source, source_routes) in by_source {
-        let subgraph = source.replace([':', '-'], "_");
+    for (source_id, (source, source_routes)) in by_source.into_iter().enumerate() {
         // Writing into a `String` cannot fail.
-        let _ = writeln!(out, "    subgraph {subgraph}");
+        let _ = writeln!(
+            out,
+            "    subgraph src{}[\"{}\"]",
+            source_id + 1,
+            mermaid_label(source)
+        );
         for route in source_routes {
             node_id += 1;
             let _ = writeln!(
                 out,
                 "        route{node_id}(\"<b>{}</b> {}\")",
-                route.method, route.path
+                mermaid_label(&route.method),
+                mermaid_label(&route.path)
             );
         }
         out.push_str("    end\n");
@@ -794,9 +804,9 @@ mod tests {
         let routes = sample_routes();
         let mermaid = format_mermaid(&routes);
         assert!(mermaid.starts_with("flowchart LR"));
-        assert!(mermaid.contains("subgraph framework"));
-        assert!(mermaid.contains("subgraph plugin_harvest"));
-        assert!(mermaid.contains("subgraph user"));
+        assert!(mermaid.contains("subgraph src1[\"framework\"]"));
+        assert!(mermaid.contains("subgraph src2[\"plugin:harvest\"]"));
+        assert!(mermaid.contains("subgraph src3[\"user\"]"));
 
         // Check for specific routes
         assert!(mermaid.contains("\"<b>GET</b> /about\""));
@@ -804,6 +814,40 @@ mod tests {
         assert!(mermaid.contains("\"<b>GET</b> /actuator/health\""));
         assert!(mermaid.contains("\"<b>POST</b> /posts\""));
         assert!(mermaid.contains("\"<b>GET</b> /posts/{id}\""));
+    }
+
+    #[test]
+    fn format_mermaid_empty_is_valid_flowchart() {
+        assert_eq!(format_mermaid(&[]), "flowchart LR\n");
+    }
+
+    #[test]
+    fn format_mermaid_quotes_unsafe_sources_and_keeps_them_distinct() {
+        let mut routes = sample_routes();
+        let base = routes[0].clone();
+        routes.push(RouteInfo {
+            source: "plugin:foo-bar".to_owned(),
+            ..base.clone()
+        });
+        routes.push(RouteInfo {
+            source: "plugin:foo_bar".to_owned(),
+            ..base.clone()
+        });
+        routes.push(RouteInfo {
+            source: "plugin:react_graphql::GraphqlPlugin@/graphql \"x\"".to_owned(),
+            ..base
+        });
+        let mermaid = format_mermaid(&routes);
+        assert!(mermaid.contains("[\"plugin:foo-bar\"]"));
+        assert!(mermaid.contains("[\"plugin:foo_bar\"]"));
+        assert!(
+            mermaid.contains("[\"plugin:react_graphql::GraphqlPlugin@/graphql #quot;x#quot;\"]")
+        );
+        let subgraphs = mermaid
+            .lines()
+            .filter(|l| l.trim_start().starts_with("subgraph "))
+            .count();
+        assert_eq!(subgraphs, 6);
     }
 
     // ── resolve_binary_from_metadata ──────────────────────────────────────

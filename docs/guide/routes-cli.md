@@ -125,7 +125,8 @@ autumn routes --format mermaid
 ```
 
 Routes are grouped into one `subgraph` per `source` (`user`, `framework`,
-`plugin_<name>`), each route a node labelled with its method and path.
+`plugin:<name>`), titled with the source, each route a node labelled with its
+method and path. An empty route table still prints a valid, empty `flowchart`.
 
 ## WebSocket routes
 
