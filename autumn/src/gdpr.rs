@@ -21,6 +21,14 @@
 //!     ));
 //! ```
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -194,7 +202,7 @@ impl ExportArchive {
         Self {
             manifest: ExportManifest {
                 user_id: user_id.into(),
-                generated_at: chrono::Utc::now().to_rfc3339(),
+                generated_at: crate::time::ambient_now().to_rfc3339(),
                 framework_version: env!("CARGO_PKG_VERSION").to_owned(),
                 ..Default::default()
             },

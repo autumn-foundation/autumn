@@ -29,6 +29,14 @@
 //!
 //! [`Channels`]: crate::channels::Channels
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,7 +87,7 @@ impl PresenceInner {
             .push(ConnectionPresence {
                 connection_id,
                 meta,
-                last_heartbeat: Instant::now(),
+                last_heartbeat: crate::time::ambient_instant(),
             });
     }
 
@@ -122,7 +130,7 @@ impl PresenceInner {
         {
             for c in conns.iter_mut() {
                 if c.connection_id == connection_id {
-                    c.last_heartbeat = Instant::now();
+                    c.last_heartbeat = crate::time::ambient_instant();
                 }
             }
         }
@@ -130,7 +138,7 @@ impl PresenceInner {
 
     fn sweep_expired(&mut self) -> Vec<(String, String)> {
         let ttl = self.ttl;
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         let mut removed = Vec::new();
 
         self.entries.retain(|topic, by_key| {
