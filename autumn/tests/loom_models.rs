@@ -346,14 +346,15 @@ fn metrics_active_gauge_balance() {
 /// Models the process-global job tracking store's first-initialisation race
 /// (`GLOBAL_TRACKING_STORE` in `autumn/src/job_tracking.rs`).
 ///
-/// The old `clear_global_tracking_store` did `get()` then, on `None`,
-/// `set(RwLock::new(None))`: when it raced a concurrent install, one side's
-/// value landed in a slot that lost the `set` race and was dropped — a lost
-/// update. The fix routes both through `get_or_init`, so every write lands in
-/// the one published slot. `OnceCell` below mirrors `OnceLock` with loom
+/// `install_tracking_store` always went through `get_or_init`, but the old
+/// `clear_global_tracking_store` did `get()` then, on `None`,
+/// `set(RwLock::new(None))`. Racing a first install, the clear could see no
+/// slot, lose the `set` to the installer, and have its reset silently
+/// discarded — the store stayed installed. The fix routes the clear through
+/// `get_or_init` too, so every write lands in the one published slot. `OnceCell` below mirrors `OnceLock` with loom
 /// primitives and records which slot each value-write hit; the model asserts
 /// every write hit the canonical (published) slot. Set
-/// `TRACKING_STORE_LOOM_SHOW_BUG=1` to run the pre-fix algorithm and watch
+/// `TRACKING_STORE_LOOM_SHOW_BUG=1` to run the pre-fix clear and watch
 /// loom find the interleaving.
 mod tracking_store_first_init {
     use loom::sync::atomic::{AtomicUsize, Ordering};
@@ -420,16 +421,6 @@ mod tracking_store_first_init {
         }
     }
 
-    fn buggy_install(cell: &OnceCell, client: StoreId) {
-        if let Some(slot) = cell.get() {
-            cell.write_through(&slot, Some(client));
-        } else {
-            let slot = cell.new_slot(Some(client));
-            cell.record_write(slot.id);
-            let _ = cell.set(slot);
-        }
-    }
-
     fn buggy_clear(cell: &OnceCell) {
         if let Some(slot) = cell.get() {
             cell.write_through(&slot, None);
@@ -440,7 +431,7 @@ mod tracking_store_first_init {
         }
     }
 
-    fn fixed_install(cell: &OnceCell, client: StoreId) {
+    fn install(cell: &OnceCell, client: StoreId) {
         let slot = cell.get_or_init(|| cell.new_slot(None));
         cell.write_through(&slot, Some(client));
     }
@@ -458,11 +449,8 @@ mod tracking_store_first_init {
 
             let c1 = cell.clone();
             let t1 = thread::spawn(move || {
-                if show_bug {
-                    buggy_install(&c1, 1);
-                } else {
-                    fixed_install(&c1, 1);
-                }
+                // The installer always used `get_or_init`; only the clear changed.
+                install(&c1, 1);
             });
 
             let c2 = cell.clone();
