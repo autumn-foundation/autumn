@@ -1426,6 +1426,16 @@ pub struct ManageTagsForm {
     pub tags: String,
 }
 
+/// The bound `Tag::name` declares (`#[validate(length(min = 1, max = 40))]`).
+///
+/// `resolve_or_create_tag_ids` writes new tags via a raw
+/// `diesel::insert_into` (not the generated repository's `save()`/`update()`
+/// pipeline), so nothing else ever runs `Tag`'s validation — an overlong name
+/// was previously persisted uncapped, silently, with no error at all. Checked
+/// here so the bound is enforced somewhere, and the author is told, the same
+/// way a content-free name already is (see `dropped_too_long` below).
+const MAX_TAG_NAME_LEN: usize = 40;
+
 /// What `parse_tag_names` made of the author's free-text tag field.
 struct ParsedTags {
     /// Tag slugs in first-seen order.
@@ -1436,7 +1446,12 @@ struct ParsedTags {
     /// letter or number. Counted so the handler can say so instead of
     /// silently returning fewer tags than were asked for. Stray empty pieces
     /// (a trailing comma) are not counted: nobody meant to type those.
-    dropped: usize,
+    dropped_no_letter_or_number: usize,
+    /// How many names the author actually typed were dropped for exceeding
+    /// `MAX_TAG_NAME_LEN`. Same reasoning as `dropped_no_letter_or_number`:
+    /// counted and reported rather than silently persisted uncapped or
+    /// silently truncated.
+    dropped_too_long: usize,
 }
 
 /// Split raw tag input into slugs (first-seen order) and their display names.
@@ -1445,7 +1460,8 @@ struct ParsedTags {
 fn parse_tag_names(raw: &str) -> ParsedTags {
     let mut slug_order: Vec<String> = Vec::new();
     let mut name_by_slug: HashMap<String, String> = HashMap::new();
-    let mut dropped = 0_usize;
+    let mut dropped_no_letter_or_number = 0_usize;
+    let mut dropped_too_long = 0_usize;
     for piece in raw.split([',', '\n']) {
         let name = piece.trim();
         if name.is_empty() {
@@ -1455,7 +1471,11 @@ fn parse_tag_names(raw: &str) -> ParsedTags {
         // this used to keep every `***`/`🎉` the author typed as a tag whose
         // only visible form was its hash slug.
         if !contains_letter_or_number(name) {
-            dropped += 1;
+            dropped_no_letter_or_number += 1;
+            continue;
+        }
+        if name.chars().count() > MAX_TAG_NAME_LEN {
+            dropped_too_long += 1;
             continue;
         }
         let slug = slugify(name);
@@ -1467,7 +1487,8 @@ fn parse_tag_names(raw: &str) -> ParsedTags {
     ParsedTags {
         slug_order,
         name_by_slug,
-        dropped,
+        dropped_no_letter_or_number,
+        dropped_too_long,
     }
 }
 
@@ -1479,17 +1500,22 @@ fn parse_tag_names(raw: &str) -> ParsedTags {
 /// shape the DB layer as a whole already handles via other unique
 /// constraints in this app) — 1-3 round trips total, not per tag name.
 ///
-/// Returns the resolved ids alongside the number of names dropped for holding
-/// no letter or number, so the caller can tell the author rather than quietly
-/// saving fewer tags than they asked for.
-async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<(Vec<i64>, usize)> {
+/// Returns the resolved ids alongside the number of names dropped for each
+/// reason (no letter or number; longer than `MAX_TAG_NAME_LEN`), so the
+/// caller can tell the author rather than quietly saving fewer tags than they
+/// asked for.
+async fn resolve_or_create_tag_ids(
+    raw: &str,
+    db: &mut Db,
+) -> AutumnResult<(Vec<i64>, usize, usize)> {
     let ParsedTags {
         slug_order,
         name_by_slug,
-        dropped,
+        dropped_no_letter_or_number,
+        dropped_too_long,
     } = parse_tag_names(raw);
     if slug_order.is_empty() {
-        return Ok((Vec::new(), dropped));
+        return Ok((Vec::new(), dropped_no_letter_or_number, dropped_too_long));
     }
 
     let mut id_by_slug: HashMap<String, i64> = tags::table
@@ -1545,25 +1571,33 @@ async fn resolve_or_create_tag_ids(raw: &str, db: &mut Db) -> AutumnResult<(Vec<
         })?;
         ids.push(id);
     }
-    Ok((ids, dropped))
+    Ok((ids, dropped_no_letter_or_number, dropped_too_long))
 }
 
 /// What to tell the author after saving tags.
 ///
 /// A dropped name is the author's own input disappearing, so it does not get
-/// to hide behind an unqualified "Tags updated." (#2424). Pure, so the
-/// sentence is testable without a database.
-fn tags_updated_notice(dropped: usize) -> String {
-    match dropped {
-        0 => "Tags updated.".to_owned(),
-        1 => "Tags updated. 1 tag name was ignored — a tag needs at least one \
-              letter or number."
-            .to_owned(),
-        n => format!(
-            "Tags updated. {n} tag names were ignored — a tag needs at least \
-             one letter or number."
-        ),
+/// to hide behind an unqualified "Tags updated." (#2424) — for either reason
+/// a name can be dropped. Pure, so the sentence is testable without a
+/// database.
+fn tags_updated_notice(dropped_no_letter_or_number: usize, dropped_too_long: usize) -> String {
+    let mut reasons = Vec::new();
+    if dropped_no_letter_or_number > 0 {
+        reasons.push(match dropped_no_letter_or_number {
+            1 => "1 tag name needs at least one letter or number".to_owned(),
+            n => format!("{n} tag names need at least one letter or number"),
+        });
     }
+    if dropped_too_long > 0 {
+        reasons.push(match dropped_too_long {
+            1 => format!("1 tag name was longer than {MAX_TAG_NAME_LEN} characters"),
+            n => format!("{n} tag names were longer than {MAX_TAG_NAME_LEN} characters"),
+        });
+    }
+    if reasons.is_empty() {
+        return "Tags updated.".to_owned();
+    }
+    format!("Tags updated. Ignored: {}.", reasons.join("; "))
 }
 
 /// Replace a post's tags with the free-text `tags` field, creating any new
@@ -1583,11 +1617,17 @@ pub async fn manage_tags(
     let post =
         load_post_and_authorize(&state, &session, &mut db, &sub_slug, &post_slug, "update").await?;
 
-    let (tag_ids, dropped) = resolve_or_create_tag_ids(&form.0.tags, &mut db).await?;
+    let (tag_ids, dropped_no_letter_or_number, dropped_too_long) =
+        resolve_or_create_tag_ids(&form.0.tags, &mut db).await?;
     drop(db);
     repo.set_tags(post.id, &tag_ids).await?;
 
-    flash.success(tags_updated_notice(dropped)).await;
+    flash
+        .success(tags_updated_notice(
+            dropped_no_letter_or_number,
+            dropped_too_long,
+        ))
+        .await;
     Ok(Redirect::to(&paths::show(&sub_slug, &post_slug)))
 }
 
@@ -2146,7 +2186,31 @@ mod tests {
         );
         // The two the author typed are reported; the stray empty piece from
         // the double comma is not — nobody meant to type that.
-        assert_eq!(parsed.dropped, 2);
+        assert_eq!(parsed.dropped_no_letter_or_number, 2);
+        assert_eq!(parsed.dropped_too_long, 0);
+    }
+
+    #[test]
+    fn a_tag_name_longer_than_the_model_bound_is_skipped_and_counted() {
+        // `Tag::name` declares `#[validate(length(max = 40))]`, but
+        // `resolve_or_create_tag_ids` writes new tags via a raw
+        // `diesel::insert_into`, bypassing that validation entirely — so this
+        // is the only place the bound is ever checked.
+        let too_long = "x".repeat(41);
+        let parsed = parse_tag_names(&format!("rust, {too_long}"));
+
+        assert_eq!(parsed.slug_order, vec!["rust".to_owned()]);
+        assert_eq!(parsed.dropped_no_letter_or_number, 0);
+        assert_eq!(parsed.dropped_too_long, 1);
+    }
+
+    #[test]
+    fn a_tag_name_at_exactly_the_model_bound_is_kept() {
+        let exactly_forty = "x".repeat(40);
+        let parsed = parse_tag_names(&exactly_forty);
+
+        assert_eq!(parsed.slug_order.len(), 1);
+        assert_eq!(parsed.dropped_too_long, 0);
     }
 
     #[test]
@@ -2162,19 +2226,37 @@ mod tests {
             parsed.name_by_slug.get("rust").map(String::as_str),
             Some("rust")
         );
-        assert_eq!(parsed.dropped, 0);
+        assert_eq!(parsed.dropped_no_letter_or_number, 0);
     }
 
     #[test]
-    fn the_tag_notice_says_how_many_names_were_ignored() {
-        assert_eq!(tags_updated_notice(0), "Tags updated.");
+    fn the_tag_notice_says_how_many_names_were_ignored_and_why() {
+        assert_eq!(tags_updated_notice(0, 0), "Tags updated.");
 
-        let one = tags_updated_notice(1);
-        assert!(one.contains("1 tag name was ignored"), "got: {one}");
-        assert!(one.contains("at least one letter or number"), "got: {one}");
+        let one = tags_updated_notice(1, 0);
+        assert!(
+            one.contains("1 tag name needs at least one letter or number"),
+            "got: {one}"
+        );
 
-        let many = tags_updated_notice(3);
-        assert!(many.contains("3 tag names were ignored"), "got: {many}");
+        let many = tags_updated_notice(3, 0);
+        assert!(
+            many.contains("3 tag names need at least one letter or number"),
+            "got: {many}"
+        );
+
+        let too_long = tags_updated_notice(0, 2);
+        assert!(
+            too_long.contains("2 tag names were longer than 40 characters"),
+            "got: {too_long}"
+        );
+
+        let both = tags_updated_notice(1, 1);
+        assert!(
+            both.contains("1 tag name needs at least one letter or number")
+                && both.contains("1 tag name was longer than 40 characters"),
+            "got: {both}"
+        );
     }
 
     #[test]
@@ -2192,7 +2274,7 @@ mod tests {
                 .map(String::as_str),
             Some("日本語")
         );
-        assert_eq!(parsed.dropped, 0);
+        assert_eq!(parsed.dropped_no_letter_or_number, 0);
     }
 
     // ── Rich text (#1255) ──────────────────────────────────────────
