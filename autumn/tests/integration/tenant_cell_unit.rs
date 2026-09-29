@@ -803,3 +803,17 @@ fn structural_overhead_counts_resident_lifecycle_records() {
     assert_eq!(structural.resident_cells, ids.len());
     assert_eq!(structural.tenant_id_capacity_bytes, 3 * id_bytes);
 }
+
+/// Regression: an evicted-but-live domain's lifecycle entry is still allocated
+/// structure, so its key keeps counting after the cell leaves the resident map.
+#[test]
+fn structural_overhead_counts_non_resident_lifecycle_records() {
+    let registry = TenantCellRegistry::new();
+    let held = registry.get_or_create("tenant-held", 0);
+    let evicted = registry.evict("tenant-held").expect("was resident");
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, 0);
+    assert_eq!(structural.tenant_id_capacity_bytes, "tenant-held".len());
+    assert!(structural.registry_entry_bytes > 0);
+    drop((held, evicted));
+}

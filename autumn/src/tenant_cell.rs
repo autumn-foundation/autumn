@@ -80,10 +80,11 @@ pub struct TenantCellStructuralOverhead {
     /// atomics, scratch-map header, mutex, and global-gauge `Arc` pointer.
     pub tenant_cell_inner_bytes: usize,
     /// Inline values in occupied map buckets: each resident `(String,
-    /// Arc<TenantCell>)` entry plus its `(String, Weak<_>)` lifecycle record.
+    /// Arc<TenantCell>)` entry plus every `(String, Weak<_>)` lifecycle record
+    /// (resident, evicted-but-live, or awaiting the tombstone sweep).
     pub registry_entry_bytes: usize,
-    /// Heap capacity of every copy of each resident tenant id (resident key,
-    /// lifecycle key, and the cell's own id).
+    /// Heap capacity of the tenant-id copies: each resident cell's registry
+    /// key and own id, plus every lifecycle record's key.
     pub tenant_id_capacity_bytes: usize,
     /// Two strong/weak counter pairs: one for each per-cell `Arc` allocation.
     pub arc_header_bytes: usize,
@@ -1003,10 +1004,10 @@ impl TenantCellRegistry {
         type RegistryEntry = (String, Arc<TenantCell>);
         type LifecycleEntry = (String, Weak<TenantCellInner>);
 
-        // Every resident cell also owns a lifecycle record (its own tenant-id
-        // key plus a `Weak`), so those are counted with it. Lifecycle records
-        // for evicted-but-in-flight cells and the cleanup queue are excluded:
-        // they are not resident, and omitting them keeps this a lower bound.
+        // Count every occupied lifecycle record and its owned key: resident
+        // cells', evicted-but-in-flight domains', and tombstones awaiting the
+        // bounded sweep — all are allocated structure. The cleanup queue's
+        // own copies are still excluded, keeping this a lower bound.
         let state = self
             .inner
             .state
@@ -1019,18 +1020,15 @@ impl TenantCellRegistry {
             + 2 * ARC_HEADER;
         let tenant_cell_bytes = resident_cells * std::mem::size_of::<TenantCell>();
         let tenant_cell_inner_bytes = resident_cells * std::mem::size_of::<TenantCellInner>();
-        let resident_lifecycle_key_capacities: Vec<usize> = cells
-            .keys()
-            .filter_map(|id| state.lifecycle.get_key_value(id.as_str()))
-            .map(|(key, _)| key.capacity())
-            .collect();
+        let index_entries = state.lifecycle.len();
+        let index_key_capacity: usize = state.lifecycle.keys().map(String::capacity).sum();
         let registry_entry_bytes = resident_cells * std::mem::size_of::<RegistryEntry>()
-            + resident_lifecycle_key_capacities.len() * std::mem::size_of::<LifecycleEntry>();
+            + index_entries * std::mem::size_of::<LifecycleEntry>();
         let tenant_id_capacity_bytes = cells
             .iter()
             .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
             .sum::<usize>()
-            + resident_lifecycle_key_capacities.iter().sum::<usize>();
+            + index_key_capacity;
         // Like the resident map, sweeping tombstones can lower the lifecycle
         // map's `capacity()` without shrinking its allocation, so read the
         // high-water mark that inserts maintain under the write guard.

@@ -212,10 +212,11 @@ every entry.
 
 The lower-bound estimate sums the current platform's `size_of` layouts for `TenantCell` and
 `TenantCellInner` (including atomics, the scratch-map header, and mutex), both
-per-cell `Arc` counter headers, occupied registry entries plus each resident
-cell's lifecycle record, all three tenant-id allocation capacities (registry
-key, lifecycle key, and the cell's own id), and amortized spare buckets plus
-control bytes for both the registry and the lifecycle map.
+per-cell `Arc` counter headers, occupied registry entries plus every lifecycle
+record (resident, evicted-but-live, or awaiting the tombstone sweep), the
+tenant-id allocation capacities (each resident cell's registry key and own id,
+and every lifecycle key), and amortized spare buckets plus control bytes for
+both the registry and the lifecycle map.
 Because `HashMap::capacity()` is an **element capacity**, not a bucket count,
 the model rounds it up to the current SwissTable implementation's power-of-two
 backing bucket count. For this workload that means 1,792 elements map to 2,048
