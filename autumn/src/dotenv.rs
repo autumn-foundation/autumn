@@ -275,13 +275,13 @@ pub(crate) fn resolve_dotenv_vars(
 /// Resolve the merged `.env` variable set for an EXPLICIT directory and profile,
 /// layered under `base` (real env wins).
 ///
-/// A public seam over [`resolve_dotenv_vars`] for CLI callers that resolve
+/// A public seam over `resolve_dotenv_vars` for CLI callers that resolve
 /// config for a specific project directory rather than the process manifest dir
 /// — e.g. `autumn generate`'s backend detection, which reads the profile-merged
 /// `autumn.toml` from a passed `project_root` and must consult the same `.env`
-/// the app / `autumn migrate` would. Same gating ([`should_load`] — only the
+/// the app / `autumn migrate` would. Same gating (`should_load` — only the
 /// `dev`/`test` profiles auto-load unless `AUTUMN_DOTENV=1`), same
-/// profile-selector exclusion ([`PROFILE_SELECTOR_KEYS`]), and same precedence
+/// profile-selector exclusion (`PROFILE_SELECTOR_KEYS`), and same precedence
 /// (`base` wins; the first candidate file to set a key wins over later ones) as
 /// the process-level [`resolve_process_dotenv`].
 ///
@@ -419,6 +419,30 @@ pub fn os_env_with_dotenv_for_profile(profile: &str) -> Result<DotenvOsEnv, Dote
     let dir = dotenv_base_dir(&base);
     Ok(DotenvOsEnv {
         overlay: resolve_dotenv_vars(&dir, profile, &base)?
+            .into_iter()
+            .collect(),
+    })
+}
+
+/// Like [`os_env_with_dotenv_for_profile`] but resolves dotenv gating against
+/// a caller-supplied `base`.
+///
+/// The gating (`should_load`) and `.env` precedence are evaluated against
+/// `base` instead of a bare `OsEnv`. This lets a caller opt a non-dev profile
+/// into `.env.<profile>` loading by supplying a base that reports
+/// `AUTUMN_DOTENV=1`, WITHOUT mutating the global process environment. Values
+/// still layer under the real OS environment via the returned [`DotenvOsEnv`].
+///
+/// # Errors
+/// Returns a [`DotenvError`] if a project-root `.env` file exists but cannot be
+/// read or parsed.
+pub fn os_env_with_dotenv_for_profile_using(
+    base: &dyn Env,
+    profile: &str,
+) -> Result<DotenvOsEnv, DotenvError> {
+    let dir = dotenv_base_dir(base);
+    Ok(DotenvOsEnv {
+        overlay: resolve_dotenv_vars(&dir, profile, base)?
             .into_iter()
             .collect(),
     })

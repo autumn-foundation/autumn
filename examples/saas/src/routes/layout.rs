@@ -18,6 +18,12 @@ pub fn layout(title: &str, signed_in: bool, content: Markup) -> Markup {
                 script src="/static/js/htmx.min.js" {}
             }
             body class="bg-gray-50 text-gray-900" {
+                a href="#main-content"
+                  class="skip-link sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 \
+                         focus:z-50 focus:px-4 focus:py-2 focus:bg-white focus:text-gray-900 \
+                         focus:border focus:border-gray-300 focus:rounded focus:shadow" {
+                    "Skip to main content"
+                }
                 header class="border-b bg-white" {
                     nav class="max-w-3xl mx-auto flex items-center justify-between px-4 py-3" {
                         a href="/" class="font-bold text-lg" { "saas" }
@@ -37,7 +43,7 @@ pub fn layout(title: &str, signed_in: bool, content: Markup) -> Markup {
                         }
                     }
                 }
-                main class="max-w-3xl mx-auto px-4 py-8" {
+                main id="main-content" class="max-w-3xl mx-auto px-4 py-8" {
                     (content)
                 }
             }

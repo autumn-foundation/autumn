@@ -1,0 +1,52 @@
+running 1 test
+test integration::repository_dependent_destroy_leaf_batch_profile::repository_dependent_destroy_leaf_batch_profile ... 
+-- fixture: 23378 total comments across 500 posts; post 500 has 5000 comments (expected 5000) --
+
+=== pg_stat_statements: delete_by_id(viral post) ===
+calls=1      buffers=5066     SELECT count(*) FROM (SELECT id FROM "ledger_dd_comments" WHERE "post_id" = $1 ORDER BY id FOR UPDATE) AS __autumn_locked
+calls=1      buffers=63       SELECT $2 FROM ONLY "public"."ledger_dd_comments" x WHERE $1 OPERATOR(pg_catalog.=) "post_id" FOR KEY SHARE OF x
+calls=1      buffers=5063     DELETE FROM "ledger_dd_comments" WHERE "post_id" = $1
+-- ledger_dd_comments total: calls=3 buffers=10192 --
+
+-- statement-count claim: 5000 comments cascaded, ledger_dd_comments statements: calls=3 buffers=10192 --
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched DELETE by post_id = $1 (the actual post-fix statement shape), against post 499's 3,500 comments, rolled back — diagnostic only ===
+DELETE FROM ledger_dd_comments WHERE post_id = 499 RETURNING id
+Delete on public.ledger_dd_comments  (cost=43.41..338.16 rows=3500 width=6) (actual time=0.140..2.539 rows=3500 loops=1)
+  Output: id
+  Buffers: shared hit=7045
+  ->  Bitmap Heap Scan on public.ledger_dd_comments  (cost=43.41..338.16 rows=3500 width=6) (actual time=0.130..0.501 rows=3500 loops=1)
+        Output: ctid
+        Recheck Cond: (ledger_dd_comments.post_id = 499)
+        Heap Blocks: exact=41
+        Buffers: shared hit=45
+        ->  Bitmap Index Scan on ledger_dd_comments_post_id_idx  (cost=0.00..42.54 rows=3500 width=0) (actual time=0.120..0.121 rows=3818 loops=1)
+              Index Cond: (ledger_dd_comments.post_id = 499)
+              Buffers: shared hit=4
+Query Identifier: 2700938011233519563
+Planning Time: 0.033 ms
+Execution Time: 2.706 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): point SELECT+DELETE by id (the pre-fix loop's per-row statement shape), rolled back — diagnostic only ===
+SELECT * FROM ledger_dd_comments WHERE id = (SELECT id FROM ledger_dd_comments WHERE post_id = 499 LIMIT 1)
+Index Scan using ledger_dd_comments_pkey on public.ledger_dd_comments  (cost=0.44..8.46 rows=1 width=55) (actual time=0.949..0.950 rows=1 loops=1)
+  Output: ledger_dd_comments.id, ledger_dd_comments.post_id, ledger_dd_comments.body, ledger_dd_comments.author, ledger_dd_comments.edited_at
+  Index Cond: (ledger_dd_comments.id = $0)
+  Buffers: shared hit=145
+  InitPlan 1 (returns $0)
+    ->  Limit  (cost=0.00..0.16 rows=1 width=8) (actual time=0.921..0.921 rows=1 loops=1)
+          Output: ledger_dd_comments_1.id
+          Buffers: shared hit=142
+          ->  Seq Scan on public.ledger_dd_comments ledger_dd_comments_1  (cost=0.00..543.23 rows=3500 width=8) (actual time=0.920..0.920 rows=1 loops=1)
+                Output: ledger_dd_comments_1.id
+                Filter: (ledger_dd_comments_1.post_id = 499)
+                Rows Removed by Filter: 13527
+                Buffers: shared hit=142
+Query Identifier: -2750644040687736675
+Planning:
+  Buffers: shared hit=9
+Planning Time: 0.141 ms
+Execution Time: 0.989 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1940 filtered out; finished in 3.50s
