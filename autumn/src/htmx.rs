@@ -1190,15 +1190,22 @@ mod tests {
         );
     }
 }
+
 #[cfg(test)]
 mod bypass_tests {
     use super::*;
 
+    /// A duplicated `id` attribute resolves to the first one, the same one a
+    /// browser uses, so a second `id` cannot redirect an OOB swap target.
     #[test]
-    fn test_extract_id() {
-        let html = "<div id=\"foo\" id=\"bar\"></div>";
-        println!("{:?}", extract_html_id(html));
-        let html = "<div id=\"foo\"></div>";
-        println!("{:?}", extract_html_id(html));
+    fn extract_html_id_takes_first_of_duplicate_ids() {
+        assert_eq!(
+            extract_html_id("<div id=\"foo\" id=\"bar\"></div>").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            extract_html_id("<div id=\"foo\"></div>").as_deref(),
+            Some("foo")
+        );
     }
 }
