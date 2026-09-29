@@ -6,5 +6,5 @@
   the busy handler at all, so the pooled `busy_timeout` does not bound those
   waits (issue #2881). The `docs/guide/money.md` retry advice now documents
   the instant all-contenders-lose failure mode under real contention and its
-  mitigations (backoff retry loop, an up-front `IMMEDIATE` write lock, or a
-  WAL-mode file database).
+  mitigations (a backoff retry loop or a WAL-mode file database; an up-front
+  `BEGIN IMMEDIATE` does not help under shared cache).

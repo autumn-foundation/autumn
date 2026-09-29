@@ -201,9 +201,10 @@ handler at all** (this pool does not wire `sqlite3_unlock_notify`), so the
 pooled `PRAGMA busy_timeout = 5000` does not bound those waits: under real
 contention *all* contenders can fail instantly in the same round, with no wait
 between them (issue #2881). A bare "retry once" is not enough there — use an
-exponential-backoff retry loop, take the write lock up front with a
-transaction that begins `IMMEDIATE`, or prefer a WAL-mode file database for
-hot write tables. See `docs/guide/sqlite-in-production.md` for the production
+exponential-backoff retry loop, or prefer a WAL-mode file database for hot
+write tables. Taking the write lock up front with `BEGIN IMMEDIATE` does not
+help on a shared-cache target: a contending `BEGIN IMMEDIATE` also returns
+`SQLITE_LOCKED` without consulting the busy handler. See `docs/guide/sqlite-in-production.md` for the production
 SQLite story.
 
 The locks are sorted within one call, not across a transaction. If one
