@@ -1173,6 +1173,7 @@ pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
 /// Split out of [`check_client_auth_impl`] so each function stays readable; the
 /// caller has already handled every not-loadable state, so the fallthrough arm
 /// here is unreachable in practice.
+#[allow(clippy::too_many_lines)]
 fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
     match data {
         ClientAuthDoctorData::Healthy {
