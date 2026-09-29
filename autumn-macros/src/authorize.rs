@@ -84,7 +84,7 @@ fn parse_authorize_args(attr: TokenStream) -> syn::Result<AuthorizeArgs> {
             }
             Meta::List(l) => {
                 if l.path.is_ident("action") {
-                    let lit: LitStr = syn::parse2(l.tokens.clone())?;
+                    let lit: LitStr = syn::parse2(l.tokens)?;
                     args.action = Some(lit.value());
                 } else {
                     return Err(syn::Error::new_spanned(

@@ -1894,12 +1894,36 @@ fn stop_child_cooperatively(
     outcome
 }
 
-fn resolve_target_directory() -> Result<PathBuf, String> {
+pub fn resolve_target_directory() -> Result<PathBuf, String> {
     let metadata = cargo_metadata();
     metadata["target_directory"]
         .as_str()
         .map(PathBuf::from)
         .ok_or_else(|| "missing target_directory in cargo metadata".to_owned())
+}
+
+/// Tolerant counterpart of [`resolve_target_directory`]: `None` instead of
+/// exiting when `cargo metadata` is unavailable or unreadable. Callers that
+/// must keep reporting (e.g. `autumn doctor`, which runs many independent
+/// checks) use this and fall back to a `target`-relative default rather than
+/// aborting the whole run over one unreadable manifest.
+///
+/// It also never makes rustup install the project's pinned toolchain: doctor
+/// runs its checks at the same time, and concurrent installs leave a toolchain
+/// half-installed.
+pub fn try_resolve_target_directory() -> Option<PathBuf> {
+    let mut cargo = Command::new("cargo");
+    cargo.args(["metadata", "--format-version=1", "--no-deps"]);
+    crate::deps::no_toolchain_installs(&mut cargo);
+    let output = cargo.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()?
+        .get("target_directory")?
+        .as_str()
+        .map(PathBuf::from)
 }
 
 fn cargo_metadata() -> serde_json::Value {
@@ -1910,6 +1934,7 @@ fn cargo_metadata() -> serde_json::Value {
 
     if !output.status.success() {
         eprintln!("\u{2717} Failed to read cargo metadata");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
         std::process::exit(1);
     }
 

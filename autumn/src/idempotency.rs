@@ -1,3 +1,10 @@
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -520,7 +527,7 @@ struct MemoryInFlightLock {
 /// non-expiring). See [`crate::time_math::saturating_deadline`], which the
 /// job and job-tracking modules share.
 fn saturating_deadline(ttl: Duration) -> Instant {
-    crate::time_math::saturating_deadline(Instant::now(), ttl)
+    crate::time_math::saturating_deadline(crate::time::ambient_instant(), ttl)
 }
 
 impl MemoryIdempotencyStore {
@@ -544,7 +551,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
             .cloned();
-        entry.filter(|e| e.expires_at > Instant::now())
+        entry.filter(|e| e.expires_at > crate::time::ambient_instant())
     }
 
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
@@ -559,7 +566,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         // long-running processes. O(N) scan is amortised over every 128 writes.
         let n = self.write_count.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(128) {
-            let now = Instant::now();
+            let now = crate::time::ambient_instant();
             entries.retain(|_, v| v.expires_at > now);
         }
     }
@@ -569,7 +576,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         let mut in_flight = self
             .in_flight
             .write()

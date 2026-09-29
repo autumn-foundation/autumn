@@ -224,18 +224,7 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // replay-ownership, nor both claim it).
     let owns_replay = should_own_replay(&input_fn);
     let replay_check = if owns_replay {
-        quote! {
-            let __autumn_idempotency_replay = parts
-                .extensions
-                .get::<::autumn_web::idempotency::IdempotencyReplayResponse>()
-                .cloned()
-                .map(::autumn_web::reexports::axum::extract::Extension);
-            if let ::core::option::Option::Some(__autumn_response) =
-                ::autumn_web::idempotency::__replay_response(&__autumn_idempotency_replay)
-            {
-                return ::core::result::Result::Err(__autumn_response);
-            }
-        }
+        crate::idempotency_guard::owned_replay_check_tokens()
     } else {
         quote! {}
     };
@@ -442,21 +431,21 @@ mod tests {
     #[test]
     fn parses_empty() {
         let a = parse_secured_args(quote! {}).unwrap();
-        assert!(a.roles.is_empty());
-        assert!(a.scopes.is_empty());
+        assert_eq!(a.roles, [] as [String; 0]);
+        assert_eq!(a.scopes, [] as [String; 0]);
     }
 
     #[test]
     fn parses_roles_only() {
         let a = parse_secured_args(quote! { "admin", "editor" }).unwrap();
         assert_eq!(a.roles, vec!["admin", "editor"]);
-        assert!(a.scopes.is_empty());
+        assert_eq!(a.scopes, [] as [String; 0]);
     }
 
     #[test]
     fn parses_scopes_only() {
         let a = parse_secured_args(quote! { scopes = ["posts:read", "posts:write"] }).unwrap();
-        assert!(a.roles.is_empty());
+        assert_eq!(a.roles, [] as [String; 0]);
         assert_eq!(a.scopes, vec!["posts:read", "posts:write"]);
     }
 

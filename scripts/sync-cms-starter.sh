@@ -45,6 +45,14 @@ while IFS= read -r path; do
   case "$rel" in
     Cargo.toml|tests/system/smoke.rs|static/css/app.css) continue ;;
     target/*|.git/*) continue ;;
+    # Same exclusion `assert_starter_matches_example` applies to the example's
+    # stray-file check (autumn-cli/src/starters/mod.rs): a `tests/*_profile.rs`
+    # is a benchmark harness, not part of the starter, and none of the
+    # substitution cases below handle the `cms::` references inside one — the
+    # drift test never catches that gap since it excludes these files too, so
+    # copying one here only surfaces as this script's own `cms::` guard
+    # failing at the bottom.
+    tests/*_profile.rs) continue ;;
   esac
 
   mkdir -p "$(dirname "${dst}/${rel}")"

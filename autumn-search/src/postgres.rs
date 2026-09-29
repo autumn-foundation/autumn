@@ -777,6 +777,21 @@ fn pgvector_order_by(filtered: bool) -> String {
     }
 }
 
+/// The pgvector similarity scan's `WHERE` predicate on the embedding column.
+///
+/// Beyond the NULL check, it excludes zero-norm stored vectors: pgvector's
+/// `<=>` returns NaN for them, and NaN sorts FIRST under `DESC`, so a
+/// filtered query's NaN rows would consume `LIMIT` slots ahead of valid
+/// neighbours — the Rust-side `is_finite` filter runs after `LIMIT` and
+/// cannot give those slots back (#2313). NaN is not equal to itself, so a
+/// self-equality test on the distance drops exactly the NaN rows. (The
+/// portable `autumn_search_cosine` yields 0 for zero-norm vectors rather
+/// than NaN, so the array predicate needs no such guard.)
+fn pgvector_embedding_predicate() -> String {
+    "embedding_vec IS NOT NULL AND (embedding_vec <=> $2::vector) = (embedding_vec <=> $2::vector)"
+        .to_owned()
+}
+
 /// References into `documents` keeping only ONE occurrence of each
 /// `record_id` — the FIRST if `keep_first`, else the LAST — in ascending
 /// original-index order.
@@ -1324,7 +1339,7 @@ impl SearchBackend for PostgresSearchStore {
                     // so it forces an exact scan: slower, and right. An unfiltered
                     // query keeps the index-friendly form, where the fast path pays.
                     pgvector_order_by(filtered),
-                    "embedding_vec IS NOT NULL".to_owned(),
+                    pgvector_embedding_predicate(),
                 )
             } else {
                 let expr = "autumn_search_cosine(embedding, $2::double precision[])".to_owned();
@@ -1387,8 +1402,9 @@ impl SearchBackend for PostgresSearchStore {
             Ok(rows
                 .into_iter()
                 // A zero-norm vector makes pgvector's `<=>` return NaN, which
-                // sorts FIRST under `DESC` — a garbage row would rank #1 with
-                // a displayed score of 0. Drop those rather than surface them.
+                // sorts FIRST under `DESC`. The `WHERE` predicate excludes
+                // those rows before `LIMIT` (#2313); this filter stays as
+                // defense-in-depth so a NaN score can never surface.
                 .filter(|row| row.score.is_finite())
                 .map(|row| SearchHit::new(definition.name, row.record_id, narrow_score(row.score)))
                 .collect())
@@ -2092,6 +2108,26 @@ mod tests {
             "a filtered query must not be served by the approximate index: {scoped}"
         );
         assert_ne!(open, scoped);
+    }
+
+    #[test]
+    fn the_pgvector_predicate_excludes_nan_scores_before_limit() {
+        // Zero-norm stored vectors make pgvector's `<=>` return NaN, which
+        // sorts FIRST under `DESC` — on a filtered query they would consume
+        // `LIMIT` slots ahead of valid neighbours, and the Rust-side
+        // `is_finite` filter runs too late to give those slots back (#2313).
+        // NaN is not equal to itself, so the predicate's self-equality test
+        // on the distance drops exactly the NaN rows, before ordering and
+        // limiting.
+        let predicate = pgvector_embedding_predicate();
+        assert!(
+            predicate.contains("embedding_vec IS NOT NULL"),
+            "{predicate}"
+        );
+        assert!(
+            predicate.contains("(embedding_vec <=> $2::vector) = (embedding_vec <=> $2::vector)"),
+            "NaN must be excluded by self-inequality: {predicate}"
+        );
     }
 
     #[test]

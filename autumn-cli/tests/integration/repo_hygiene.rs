@@ -958,6 +958,44 @@ fn generator_conformance_ci_gate_is_configured() {
         "generator-conformance.yml must include a cron schedule so generator rot \
          is caught even when no template or prelude file was touched directly",
     );
+
+    // Issue #2538, gap 1: the `mod.rs` registry decides which test files
+    // compile into the `cli_tests` binary at all, so it must be in the
+    // trigger lists — matched in both `push.paths` and `pull_request.paths`.
+    let trigger_lists = workflow
+        .matches("\"autumn-cli/tests/integration/mod.rs\"")
+        .count();
+    assert!(
+        trigger_lists >= 2,
+        "generator-conformance.yml must list `autumn-cli/tests/integration/mod.rs` \
+         in both trigger path lists — a change that removes or renames a `mod` \
+         declaration would otherwise never fire this workflow (issue #2538)",
+    );
+
+    // Issue #2538, gap 2: every routed per-test invocation must be guarded by
+    // an assert-ran check. `cargo test` exits 0 when an `--exact` filter
+    // matches zero tests, so without the guard a renamed or removed test goes
+    // silently green. Matched per step block (not file-wide) so a guard added
+    // to the wrong step cannot satisfy it; comments are stripped first so a
+    // guard mentioned only in prose does not count.
+    let stripped = strip_yaml_comments(&workflow);
+    let mut guarded_steps = 0;
+    for block in stripped.split("\n      - name: ").skip(1) {
+        if block.contains("--ignored --exact") {
+            let step_name = block.lines().next().unwrap_or("?");
+            assert!(
+                block.contains("test result: ok"),
+                "generator-conformance.yml step `{step_name}` routes a per-test \
+                 `--ignored --exact` invocation with no assert-ran guard — a \
+                 filter matching zero tests would pass silently (issue #2538)",
+            );
+            guarded_steps += 1;
+        }
+    }
+    assert!(
+        guarded_steps > 0,
+        "expected to find guarded per-test steps in generator-conformance.yml",
+    );
 }
 
 // ── cli_tests per-test triage (issue #1945) ───────────────────────────────
@@ -1038,6 +1076,7 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
         "integration::serve::serve_daemon_start_status_stop_over_unix_socket",
         "integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks",
         "integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks",
+        "integration::scaffold_validation::documented_scaffold_example_builds_without_warnings",
     ] {
         assert!(
             invocations.contains(&format!("{test_name} -- --ignored --exact")),
@@ -1094,6 +1133,164 @@ fn flag_values<'a>(tokens: &[&'a str], flag: &str) -> Vec<&'a str> {
     values
 }
 
+/// Feed one shell line through `\`-continuation joining: a line ending in `\`
+/// extends `pending`, anything else flushes the joined command.
+fn feed_command_line(line: &str, pending: &mut String, commands: &mut Vec<String>) {
+    let trimmed = line.trim_end();
+    if let Some(head) = trimmed.strip_suffix('\\') {
+        pending.push_str(head);
+        pending.push(' ');
+    } else {
+        pending.push_str(trimmed);
+        commands.push(std::mem::take(pending));
+    }
+}
+
+/// Every shell command a workflow actually runs, in order.
+///
+/// Only lines inside a `run:` scalar are commands. A line-at-a-time scan
+/// credits *any* YAML line, so step metadata like
+/// `- name: cargo test … --test <target>` satisfied the coverage guard while
+/// no job ran the target (issue #2574).
+///
+/// `run:`-block membership is tracked by indentation: a `run:` key — inline
+/// `run: <cmd>`, block `run: |` / `run: >` (chomping indicators included), a
+/// bare `run:` whose scalar follows on later lines, or the sequence-item
+/// form `- run: <cmd>` — opens a region covering the more-indented lines
+/// after it. The first non-blank line at or left of the key's indent closes
+/// it; blank lines never close a block. A dangling `\`-continuation is
+/// flushed when its block closes, mirroring the end-of-file behavior.
+fn workflow_commands(body: &str) -> Vec<String> {
+    /// If `line` (already trimmed) is a `run:` key, return the scalar tail:
+    /// `""` for a bare `run:`, `"|"`/`">"`/`"|-"`/… for a block header, or the
+    /// inline command. `None` for anything else (`name:`, `running:`, …).
+    fn run_key_tail(line: &str) -> Option<&str> {
+        // A step can also spell the key as a sequence item (`- run: …`).
+        let key = line.strip_prefix("- ").unwrap_or(line);
+        let tail = key.strip_prefix("run:")?;
+        // `run:` must be the whole key, followed by end-of-line or
+        // whitespace — not `running:` or `run-foo:`.
+        if tail.is_empty() || tail.starts_with([' ', '\t']) {
+            Some(tail.trim_start())
+        } else {
+            None
+        }
+    }
+
+    let mut commands = Vec::new();
+    let mut pending = String::new();
+    let mut run_indent: Option<usize> = None;
+    for line in strip_yaml_comments(body).lines() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        if let Some(ri) = run_indent
+            && !trimmed.is_empty()
+            && indent <= ri
+        {
+            if !pending.is_empty() {
+                commands.push(std::mem::take(&mut pending));
+            }
+            run_indent = None;
+        }
+        if let Some(tail) = run_key_tail(trimmed) {
+            run_indent = Some(indent);
+            // An inline `run: <cmd>` tail is itself a command; a block
+            // indicator or a bare `run:` leaves the command to the lines
+            // that follow.
+            if !tail.is_empty() && !tail.starts_with('|') && !tail.starts_with('>') {
+                feed_command_line(tail, &mut pending, &mut commands);
+            }
+            continue;
+        }
+        if run_indent.is_none() {
+            continue;
+        }
+        feed_command_line(line, &mut pending, &mut commands);
+    }
+    if !pending.is_empty() {
+        commands.push(pending);
+    }
+    commands
+}
+
+#[test]
+fn workflow_commands_ignores_non_run_lines() {
+    // Issue #2574: a step whose `name:` (or any non-`run:` field) contains a
+    // full `cargo test --features sqlite --test <target>` string must NOT
+    // count as coverage for `<target>`.
+    let yaml = r"
+jobs:
+  sqlite:
+    steps:
+      - name: cargo test -p autumn-web --features sqlite --test sqlite_decoy
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features sqlite \
+            --test sqlite_real
+      - name: next step
+        env:
+          CMD: cargo test --features sqlite --test sqlite_env_decoy
+      - run: cargo test -p autumn-web --features sqlite --test sqlite_inline
+";
+    let commands = workflow_commands(yaml);
+    let is_credited = |target: &str| {
+        commands.iter().any(|command| {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            tokens.contains(&"cargo")
+                && tokens.contains(&"test")
+                && flag_values(&tokens, "--features")
+                    .iter()
+                    .any(|v| v.split(',').any(|f| f.trim() == "sqlite"))
+                && flag_values(&tokens, "--test").contains(&target)
+        })
+    };
+
+    assert!(
+        !is_credited("sqlite_decoy"),
+        "a `name:` line naming a target must not credit it; got {commands:?}",
+    );
+    assert!(
+        !is_credited("sqlite_env_decoy"),
+        "an `env:` value naming a target must not credit it; got {commands:?}",
+    );
+    assert!(
+        is_credited("sqlite_real"),
+        "a `run: |` block invocation (with `\\`-continuation) must credit its target; got {commands:?}",
+    );
+    assert!(
+        is_credited("sqlite_inline"),
+        "an inline `run:` / `- run:` invocation must credit its target; got {commands:?}",
+    );
+    // The `\`-continued invocation is one joined command, not two fragments.
+    assert!(
+        commands
+            .iter()
+            .any(|c| c.contains("--features sqlite") && c.contains("--test sqlite_real")),
+        "expected one joined command for the continued invocation; got {commands:?}",
+    );
+}
+
+#[test]
+fn workflow_commands_ignores_commented_invocations() {
+    let yaml = r"
+    steps:
+      - name: sqlite suite
+        # run: cargo test -p autumn-web --features sqlite --test sqlite_commented
+        run: |
+          cargo test -p autumn-web --features sqlite --test sqlite_live
+";
+    let commands = workflow_commands(yaml);
+    let text = commands.join("\n");
+    assert!(
+        !text.contains("sqlite_commented"),
+        "a commented-out invocation must not become a command; got {commands:?}",
+    );
+    assert!(
+        text.contains("--test sqlite_live"),
+        "the live invocation must survive; got {commands:?}",
+    );
+}
+
 /// Every `sqlite`-gated `[[test]]` target in `autumn/Cargo.toml` must be named
 /// in a CI workflow (issue #1908).
 ///
@@ -1118,10 +1315,11 @@ fn sqlite_test_targets_are_ci_named() {
     let manifest = std::fs::read_to_string(&manifest_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
 
-    // Collect the cargo commands every workflow actually runs. `strip_yaml_comments`
-    // drops commented-out invocations and prose mentions; joining `\`-continued
-    // lines keeps one wrapped command as one command, so a target is credited only
-    // to the invocation that names it.
+    // Collect the cargo commands every workflow actually runs. `workflow_commands`
+    // keeps only lines inside a `run:` scalar (issue #2574) — `strip_yaml_comments`
+    // drops commented-out invocations and prose mentions, and joining
+    // `\`-continued lines keeps one wrapped command as one command, so a target
+    // is credited only to the invocation that names it.
     let workflows_dir = root.join(".github/workflows");
     let mut commands: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(&workflows_dir)
@@ -1131,20 +1329,7 @@ fn sqlite_test_targets_are_ci_named() {
         let Ok(body) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        let mut pending = String::new();
-        for line in strip_yaml_comments(&body).lines() {
-            let trimmed = line.trim_end();
-            if let Some(head) = trimmed.strip_suffix('\\') {
-                pending.push_str(head);
-                pending.push(' ');
-            } else {
-                pending.push_str(trimmed);
-                commands.push(std::mem::take(&mut pending));
-            }
-        }
-        if !pending.is_empty() {
-            commands.push(pending);
-        }
+        commands.extend(workflow_commands(&body));
     }
 
     // A command covers a target only when it BOTH enables the `sqlite` feature and
@@ -8956,7 +9141,7 @@ fn codemod_gate_accepts_a_walkthrough_codemod_bullet_wrapped_onto_a_continuation
 }
 
 /// The registry every `MinIO` testcontainer must be pulled from.
-const MINIO_REGISTRY: &str = "quay.io/minio/minio";
+const MINIO_REGISTRY: &str = "cgr.dev/chainguard/minio";
 
 /// Collect `.rs` files under `dir`, skipping build output.
 fn rust_sources(dir: &Path, found: &mut Vec<PathBuf>) {
@@ -8980,16 +9165,16 @@ fn builder_window(source: &str, index: usize) -> String {
     source
         .lines()
         .skip(index)
-        .take(4)
+        .take(8)
         .collect::<Vec<_>>()
         .join("\n")
 }
 
 #[test]
 fn every_minio_container_is_pulled_from_the_public_registry() {
-    // Docker Hub refuses anonymous pulls of `minio/minio` — its registry answers
-    // 401, which Docker reports as "repository does not exist". Every call site
-    // must therefore override the name that `testcontainers-modules` pins.
+    // Docker Hub no longer serves `minio/minio`, and `quay.io/minio/minio`
+    // refuses anonymous pulls. Every call site must therefore override the name
+    // that `testcontainers-modules` pins.
     //
     // This is a whole-tree scan rather than a list, because the tests it guards
     // run only in the Docker sweep: a fourth call site added without the
@@ -9037,8 +9222,8 @@ fn every_minio_container_is_pulled_from_the_public_registry() {
     assert!(
         offenders.is_empty(),
         "every MinIO container must be started with \
-         `.with_name(\"{MINIO_REGISTRY}\")` — Docker Hub denies anonymous pulls \
-         of minio/minio. Unqualified call sites:\n{offenders}",
+         `.with_name(\"{MINIO_REGISTRY}\")` — Docker Hub and quay.io deny \
+         anonymous pulls of minio/minio. Unqualified call sites:\n{offenders}",
     );
 }
 

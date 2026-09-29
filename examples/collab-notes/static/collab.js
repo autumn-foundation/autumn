@@ -8,6 +8,9 @@
 //      index may be stale by the time the server sees it; the id is not.
 //   2. Apply the operations the server broadcasts, including its own echoed
 //      back, by id. Applying one twice is a no-op, so a reconnect is safe.
+//   3. Show a character the moment it is typed, as a placeholder, and queue
+//      the message that tells the server about it. The editor stays open
+//      while an edit is in flight, so no keystroke is lost.
 
 (function () {
   const editor = document.getElementById("editor");
@@ -21,45 +24,22 @@
   /** This editor's own actor id, from the snapshot. */
   let myActor = null;
   /**
-   * Characters this editor typed and spliced in locally, waiting for the
-   * server to mint their real ids. One entry per sent insert, oldest first;
-   * the server answers our messages in order, so the oldest entry matches the
-   * next echo. Holding them in `elems` is what lets a remote character land
-   * beside them instead of appearing to replace them.
+   * Placeholders for characters this editor sent, waiting for the server to
+   * mint their real ids. One entry per sent character, oldest first; the
+   * server answers our messages in order, so the oldest entry matches the next
+   * echo. A placeholder the queue still holds is in `elems` but not here.
+   * Holding them in `elems` is what lets a remote character land beside them
+   * instead of appearing to replace them.
    */
   let provisional = [];
   let provisionalSeq = 0;
   /** Delete ids sent but not yet echoed back. */
-  const unsentDeletes = new Set();
+  const sentDeletes = new Set();
+  /** Delete ids the queue holds, for characters the server already knows. */
+  const queuedDeletes = [];
   // Operations whose left neighbour has not arrived. The server buffers the
   // same way; dropping one would leave this replica short a character.
   let waiting = [];
-  // Remote operations received while the user has typed ahead of the echo
-  // (`pendingInput`). They are integrated only once the queue settles, in
-  // arrival order. Integrating one earlier would put characters into the
-  // replica that the textarea was never synced to, and the next `flush()`
-  // diff would misread them as text the user deleted — silently deleting
-  // another person's characters. Holding them for one round trip costs
-  // nothing: RGA inserts commute, so every replica converges identically.
-  let heldRemote = [];
-  /**
-   * Keystrokes typed while an edit is outstanding. They sit in the textarea,
-   * unseen by the replica, until the echo settles the queue and `flush()`
-   * sends them. While set:
-   *
-   * - `render()` must not redraw: the replica's view does not contain them
-   *   yet, and converging the textarea to it would delete them.
-   * - remote operations are held in `heldRemote` instead of integrated, for
-   *   the same reason: the diff in `flush()` compares the textarea against
-   *   the replica, and a character the textarea was never synced to would
-   *   read as a user deletion.
-   *
-   * (This used to be enforced with `editor.readOnly`, which was worse — a
-   * read-only textarea still fires `keydown`, but the browser suppresses the
-   * value mutation and the `input` event, so the keystroke vanished entirely,
-   * silently. Issue #2843.)
-   */
-  let pendingInput = false;
 
   // Ids are "<counter>@<actor>". Order by counter, then actor — the same
   // order the server uses, which is what keeps the two lists identical.
@@ -147,13 +127,11 @@
 
   // True when the server has echoed everything this editor sent.
   function settled() {
-    return provisional.length === 0 && unsentDeletes.size === 0;
+    return provisional.length === 0 && sentDeletes.size === 0;
   }
 
   // Our own operation coming back. Drop the placeholder it replaces so the
-  // real, server-ordered character can take its place. Returns `true` when
-  // the operation is one of ours (so the caller can tell our echoes apart
-  // from remote operations).
+  // real, server-ordered character can take its place.
   function acknowledge(op) {
     if (op.op === "insert") {
       if (myActor !== null && op.id.slice(op.id.indexOf("@") + 1) === myActor) {
@@ -161,33 +139,39 @@
         if (placeholder !== undefined) {
           const at = indexOfId(placeholder);
           if (at >= 0) {
+            // Erased while it was in flight. The server names the character
+            // here, which is the id the delete was waiting for.
+            if (elems[at].doomed) queuedDeletes.push(op.id);
             elems.splice(at, 1);
             known.delete(placeholder);
           }
         }
-        return true;
       }
-      return false;
+    } else {
+      sentDeletes.delete(op.target);
     }
-    return unsentDeletes.delete(op.target);
   }
 
-  // Drop every placeholder and un-delete anything the server refused. Used
-  // when the server rejects an edit, and when a snapshot resets the world.
+  // Drop every placeholder, queued or in flight, and un-delete anything the
+  // server refused. Used when the server rejects an edit, and when a snapshot
+  // resets the world.
   function discardProvisional() {
-    for (const id of provisional) {
-      const at = indexOfId(id);
-      if (at >= 0) {
-        elems.splice(at, 1);
-        known.delete(id);
-      }
-    }
+    const restore = [...sentDeletes, ...queuedDeletes];
+    elems = elems.filter((element) => {
+      if (!element.provisional) return true;
+      // A queued `replace` carries the ids it removes. They stay if the
+      // message that would have removed them never goes out.
+      for (const id of element.replaces ?? []) restore.push(id);
+      known.delete(element.id);
+      return false;
+    });
     provisional = [];
-    for (const id of unsentDeletes) {
+    for (const id of restore) {
       const at = indexOfId(id);
       if (at >= 0) elems[at].deleted = false;
     }
-    unsentDeletes.clear();
+    sentDeletes.clear();
+    queuedDeletes.length = 0;
   }
 
   function text() {
@@ -231,10 +215,6 @@
   // Redraw from the local view, which includes this editor's own pending
   // characters as placeholders. Safe at any time: a remote character merges
   // in beside them rather than appearing to replace them.
-  //
-  // Not safe while `pendingInput` is set: the textarea holds keystrokes the
-  // replica has not seen yet, and converging it to the replica's view would
-  // delete them. Callers check the flag before redrawing.
   function render() {
     const anchor = caretAnchor();
     const next = text();
@@ -281,9 +261,8 @@
       // The snapshot is authoritative and already holds anything the server
       // accepted from us, so nothing is outstanding after it.
       provisional = [];
-      unsentDeletes.clear();
-      pendingInput = false;
-      heldRemote = [];
+      sentDeletes.clear();
+      queuedDeletes.length = 0;
       if (message.actor) myActor = message.actor;
       for (const element of message.elems) {
         elems.push({ id: element.id, ch: element.ch, deleted: !!element.deleted });
@@ -301,41 +280,26 @@
       renderRoster(message.participants);
     } else if (message.type === "ops") {
       for (const op of message.ops) {
-        // Our own echoes settle the queue and are always integrated at once.
-        // Remote operations that arrive while the user has typed ahead wait
-        // in `heldRemote`: see its declaration for why they cannot be
-        // integrated or rendered yet.
-        if (!acknowledge(op) && pendingInput) {
-          heldRemote.push(op);
-        } else {
-          integrate(op);
-        }
+        acknowledge(op);
+        integrate(op);
       }
-      // Send anything typed while the round trip was outstanding BEFORE
-      // redrawing: `render()` converges the textarea to the replica's view,
-      // which does not contain those keystrokes yet, and redrawing first
-      // would wipe them before `flush()` ever saw them.
-      if (flush()) {
-        pendingInput = false;
-        // The queue settled, so the textarea and the replica agree again:
-        // fold in whatever arrived while the user was typing ahead, then
-        // redraw once, with everything in place.
-        for (const op of heldRemote) integrate(op);
-        heldRemote = [];
+      // A character erased while in flight is real now. Hide it until its
+      // delete lands.
+      for (const id of queuedDeletes) {
+        const at = indexOfId(id);
+        if (at >= 0) elems[at].deleted = true;
       }
-      if (!pendingInput) render();
+      render();
+      pump();
     } else if (message.type === "presence") {
       renderRoster(message.participants);
     } else if (message.type === "error") {
       // The server refused an edit — a document at its limit, or a message it
       // could not read. Clear the bookkeeping for it: left counted, `settled`
-      // would never come back true and the editor would freeze, sending
-      // nothing and showing nobody else's changes again. The refused text is
-      // dropped, so redraw from the authority to show what really happened.
+      // would never come back true, the queue would never drain, and this
+      // editor would send nothing again. The refused text is dropped, so
+      // redraw from the authority to show what really happened.
       discardProvisional();
-      pendingInput = false;
-      for (const op of heldRemote) integrate(op);
-      heldRemote = [];
       render();
       if (status) status.textContent = message.message;
     }
@@ -348,20 +312,11 @@
   // Turn "the textarea says this now" into character operations: keep the
   // common prefix and suffix, delete the middle, insert the replacement.
   //
-  // The edit is not applied locally — the server mints the ids, echoes the
-  // operations back, and `render()` puts them in. So a second keystroke inside
-  // one round trip cannot be diffed yet: the document still lacks the first
-  // one, and diffing against it would send that character twice. `flush`
-  // therefore reports `false` while an edit is outstanding; the `ops` handler
-  // calls it again as soon as the echo lands, and the characters typed in
-  // between go out together. The keystrokes themselves are never blocked —
-  // the textarea stays editable, so nothing the user typed is lost.
-  //
-  // Returns `true` when the diff ran (the queue was settled), `false` when
-  // the flush was deferred.
-  function flush() {
-    if (!settled()) return false;
-
+  // The characters go into `elems` at once, as placeholders. The model and the
+  // textarea therefore always hold the same text, and a redraw can never drop
+  // a keystroke. What waits for the round trip is the message, not the
+  // character: `pump` sends it when the edit before it is echoed.
+  function capture() {
     const before = [...text()];
     const after = [...editor.value];
 
@@ -379,81 +334,108 @@
     }
 
     const shown = visible();
-    // Held until we know whether an insert rides along with it.
-    let pendingDeletes = [];
-    const removed = shown.slice(prefix, before.length - suffix);
-    if (removed.length > 0) {
-      // Only real, server-known characters can be deleted. A placeholder has
-      // no server id yet, so it is simply dropped locally.
-      const ids = [];
-      for (const element of removed) {
-        if (element.provisional) {
-          const at = indexOfId(element.id);
-          if (at >= 0) {
-            elems.splice(at, 1);
-            known.delete(element.id);
-          }
-          provisional = provisional.filter((id) => id !== element.id);
-        } else {
-          element.deleted = true; // optimistic
-          unsentDeletes.add(element.id);
-          ids.push(element.id);
+    // Held until we know whether an insert rides along with them.
+    let replaced = [];
+    for (const element of shown.slice(prefix, before.length - suffix)) {
+      if (!element.provisional) {
+        element.deleted = true; // optimistic
+        replaced.push(element.id);
+      } else if (provisional.includes(element.id)) {
+        // In flight, so the server will name it whatever we do now. Hide it
+        // and mark it; `acknowledge` turns the mark into a delete.
+        element.deleted = true;
+        element.doomed = true;
+      } else {
+        // Still in the queue. It was never sent, so it is simply dropped.
+        const at = indexOfId(element.id);
+        if (at >= 0) {
+          elems.splice(at, 1);
+          known.delete(element.id);
         }
       }
-      pendingDeletes = ids;
     }
 
     const added = after.slice(prefix, after.length - suffix);
     if (added.length === 0) {
-      // A pure delete: nothing is waiting on it, so send it as it is.
-      if (pendingDeletes.length > 0) send({ type: "delete", ids: pendingDeletes });
-    } else {
-      // Anchor to the element left of the insertion point in the full list,
-      // tombstones included — that is the neighbour the server knows. A
-      // placeholder cannot be an anchor: the server has never heard of it.
-      let slot = prefix === 0 ? 0 : elems.indexOf(shown[prefix - 1]) + 1;
-      let anchor = null;
-      for (let i = slot - 1; i >= 0; i--) {
-        if (!elems[i].provisional) {
-          anchor = elems[i].id;
-          break;
-        }
-      }
-      // One message when this edit both removes and adds — typing over a
-      // selection. Two messages let the delete land while the insert is
-      // refused for a document at its limit, which is the editor destroying
-      // the text it was asked to replace. `replace` is refused whole or not
-      // at all.
-      if (pendingDeletes.length > 0) {
-        send({
-          type: "replace",
-          ids: pendingDeletes,
-          after: anchor,
-          text: added.join(""),
-        });
-      } else {
-        send({ type: "insert", after: anchor, text: added.join("") });
-      }
-
-      // Splice the characters in locally so the textarea and `elems` agree.
-      // A remote character arriving before the echo then merges in beside
-      // them, rather than looking like the user deleted it.
-      for (const ch of added) {
-        const id = `local-${(provisionalSeq += 1)}`;
-        elems.splice(slot, 0, { id, ch, deleted: false, provisional: true });
-        known.add(id);
-        provisional.push(id);
-        slot += 1;
-      }
+      // A pure delete: nothing is waiting on it, so queue it as it is.
+      queuedDeletes.push(...replaced);
+      return;
     }
-    return true;
+
+    let slot = prefix === 0 ? 0 : elems.indexOf(shown[prefix - 1]) + 1;
+    for (const ch of added) {
+      const id = `local-${(provisionalSeq += 1)}`;
+      const cell = { id, ch, deleted: false, provisional: true };
+      // The ids this edit removes ride with the first character it adds, so
+      // the two go out as one `replace` — typing over a selection. Two
+      // messages let the delete land while the insert is refused for a
+      // document at its limit, which is the editor destroying the text it was
+      // asked to replace. `replace` is refused whole or not at all.
+      if (replaced.length > 0) {
+        cell.replaces = replaced;
+        replaced = [];
+      }
+      elems.splice(slot, 0, cell);
+      known.add(id);
+      slot += 1;
+    }
+  }
+
+  // Send what the queue holds: one message per run of queued characters, then
+  // one for the queued deletes.
+  //
+  // The server mints the character ids, so this client cannot name a keystroke
+  // itself. It does not refuse the keystroke — it holds the message until the
+  // edit before it is echoed. Nothing is in flight at that moment, so the
+  // character to the left of a run is one the server knows, which is the
+  // anchor an insert needs. A run goes out whole, so the server chains its ids
+  // and keeps the characters in the order they were typed.
+  //
+  // A production client does not queue. It runs the same RGA, mints its own
+  // ids, and applies its edits locally the moment they are typed; the server
+  // then merges rather than numbers. That is a client-side CRDT, which is
+  // more than this example is for.
+  function pump() {
+    if (!settled()) return;
+
+    let i = 0;
+    while (i < elems.length) {
+      if (!elems[i].provisional) {
+        i += 1;
+        continue;
+      }
+      const ids = [];
+      let typed = "";
+      let end = i;
+      while (end < elems.length && elems[end].provisional) {
+        for (const id of elems[end].replaces ?? []) ids.push(id);
+        delete elems[end].replaces;
+        typed += elems[end].ch;
+        provisional.push(elems[end].id);
+        end += 1;
+      }
+      // Anchor to the element left of the run in the full list, tombstones
+      // included — that is the neighbour the server knows.
+      const anchor = i === 0 ? null : elems[i - 1].id;
+      if (ids.length > 0) {
+        send({ type: "replace", ids, after: anchor, text: typed });
+        for (const id of ids) sentDeletes.add(id);
+      } else {
+        send({ type: "insert", after: anchor, text: typed });
+      }
+      i = end;
+    }
+
+    if (queuedDeletes.length > 0) {
+      send({ type: "delete", ids: queuedDeletes });
+      for (const id of queuedDeletes) sentDeletes.add(id);
+      queuedDeletes.length = 0;
+    }
   }
 
   editor.addEventListener("input", () => {
-    // A deferred flush leaves the keystroke in the textarea; the echo
-    // handler picks it up. Mark it so `render()` does not redraw over it
-    // in the meantime (see the `ops` handler).
-    if (!flush()) pendingInput = true;
+    capture();
+    pump();
   });
 
   const reportCaret = () =>
