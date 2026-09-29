@@ -25,6 +25,14 @@
 //!   minting a fresh owned `BIGSERIAL`. A single-column UUID PK keeps its
 //!   `gen_random_uuid()` default (the model parser records the same), so the two
 //!   agree. See [`normalize_default`] / [`normalize_serial_pk_default`].
+//! - **Redundant-cast canonicalization**: `pg_get_expr` renders a stored
+//!   literal default with its cast (`'{}'::text` on a `TEXT` column) while the
+//!   model parser records the bare literal (`'{}'`), so exact IR equality
+//!   would report drift forever. A cast to the column's *own* Postgres type on
+//!   a *literal* is never load-bearing and is stripped during
+//!   [`normalize_default`], establishing one canonical form; a cast to a
+//!   different type, a cast carrying a typmod, or a cast over a non-literal
+//!   expression stays verbatim. See [`strip_redundant_default_cast`].
 //! - **Uniqueness**: a single-column unique index sets the owning column's
 //!   `unique` flag *and* is recorded as an [`Index`] (`unique = true`), mirroring
 //!   how the model parser represents a `#[unique]` field, so a round-trip diff is
@@ -1101,6 +1109,131 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
     (indexes, unique_columns)
 }
 
+/// Strip a redundant `::type` cast from a literal column default when the cast
+/// names the column's own Postgres type (issue #2292).
+///
+/// `pg_get_expr` renders a stored literal default with its cast, so a
+/// `DEFAULT '{}'` on a `TEXT` column introspects as `'{}'::text` while the
+/// model parser records the bare literal `'{}'` — and exact equality in
+/// `diff_column` then reports drift forever, emitting a no-op `ALTER COLUMN`
+/// on every plan. A cast to the column's *own* type on a *literal* is never
+/// load-bearing (the literal's value is unchanged), so it is stripped here —
+/// establishing one canonical form inside [`normalize_default`] instead of
+/// spreading cast-awareness across every `Column.default` consumer (the DDL
+/// emitter, `is_convention_uuid_default`, `is_nextval_default`).
+///
+/// Only `<literal>::<type>` is touched, where the literal is a single-quoted
+/// string (with `''` escapes) or a bare numeric literal and the cast names one
+/// of the column's own Postgres type spellings. Everything else stays
+/// verbatim: a cast to a *different* type (`'{}'::integer` on a `TEXT` column),
+/// a cast carrying a typmod (`'abc'::character(3)` — the cast truncates, so it
+/// is load-bearing), and any cast over a non-literal expression
+/// (`nextval('s'::regclass)`, `now()`, …).
+fn strip_redundant_default_cast<'a>(raw: &'a str, ty: &ColumnType) -> &'a str {
+    let trimmed = raw.trim();
+    let Some((literal, cast_target)) = split_literal_cast(trimmed) else {
+        return raw;
+    };
+    if is_own_pg_type(cast_target, ty) {
+        literal
+    } else {
+        raw
+    }
+}
+
+/// Split `<literal>::<type>` into the literal and the cast target, or `None`
+/// when `raw` is not exactly one literal followed by one cast.
+fn split_literal_cast(raw: &str) -> Option<(&str, &str)> {
+    let (literal, rest) = if raw.starts_with('\'') {
+        // Quoted literal: find the closing quote, honoring `''` escapes.
+        let mut i = 1; // byte index into `raw`, past the opening quote
+        let end = loop {
+            let rel = raw[i..].find('\'')?;
+            let q = i + rel;
+            if raw[q + 1..].starts_with('\'') {
+                i = q + 2; // escaped quote — keep scanning
+            } else {
+                break q + 1; // just past the closing quote
+            }
+        };
+        raw.split_at(end)
+    } else {
+        // Bare numeric literal: optional sign, digits, optional fraction.
+        let bytes = raw.as_bytes();
+        let mut i = 0;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let int_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == int_start {
+            return None;
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            let dot = i;
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == dot + 1 {
+                return None; // `123.` — not a literal we canonicalize
+            }
+        }
+        raw.split_at(i)
+    };
+    let target = rest.trim_start().strip_prefix("::")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some((literal, target))
+}
+
+/// Whether a `::type` cast target (as `pg_get_expr` renders it) names the
+/// column's own Postgres type. Compared case-insensitively; an optional
+/// `pg_catalog.` qualification is tolerated. A target carrying a typmod
+/// (`character(3)`) never matches — the cast can change the value.
+fn is_own_pg_type(target: &str, ty: &ColumnType) -> bool {
+    // Tolerate an optional `pg_catalog.` qualification, case-insensitively —
+    // compare everything lowercased from here on.
+    let lowered = target.to_ascii_lowercase();
+    let target = lowered
+        .strip_prefix("pg_catalog.")
+        .unwrap_or(lowered.as_str());
+    if target.contains('(') {
+        return false;
+    }
+    // The IR does not distinguish `TEXT` from the `VARCHAR` family (see
+    // `is_implicit_pg_type_cast` in `diff.rs`), so the family's spellings all
+    // count as the column's own type here.
+    let names: &[&str] = match ty {
+        ColumnType::Text | ColumnType::Enum { .. } => {
+            &["text", "character varying", "varchar", "character", "char"]
+        }
+        ColumnType::Int32 => &["integer", "int", "int4"],
+        ColumnType::Int64 => &["bigint", "int8"],
+        ColumnType::Bool => &["boolean", "bool"],
+        ColumnType::Float32 => &["real", "float4"],
+        ColumnType::Float64 => &["double precision", "float8"],
+        ColumnType::Uuid => &["uuid"],
+        ColumnType::Timestamp => &["timestamp", "timestamp without time zone"],
+        ColumnType::TimestampTz => &["timestamp with time zone", "timestamptz"],
+        ColumnType::Bytes => &["bytea"],
+        ColumnType::Attachment | ColumnType::Json => &["jsonb"],
+        ColumnType::Decimal { .. } => &["numeric", "decimal"],
+        ColumnType::Opaque { .. } => &[],
+    };
+    if names.contains(&target) {
+        return true;
+    }
+    // An opaque column's own type is whatever Postgres reported for it.
+    if let ColumnType::Opaque { pg_type } = ty {
+        return target == pg_type.to_ascii_lowercase();
+    }
+    false
+}
+
 /// Normalize a raw Postgres `column_default` string into a [`ColumnDefault`],
 /// matching what the model IR records so a round-trip diff is empty.
 ///
@@ -1115,6 +1248,13 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
 ///   column (`owns_sequence == false`) → preserved verbatim as
 ///   [`ColumnDefault::Sql`], so recreation continues to allocate from that
 ///   sequence instead of minting a fresh owned `BIGSERIAL`.
+/// - a redundant `::type` cast on a literal default (`'{}'::text` on a `TEXT`
+///   column, `123::integer` on an `INTEGER` column) → the cast is stripped when
+///   it names the column's own Postgres type, so the introspected IR agrees
+///   with the model parser's bare literal instead of drifting forever (issue
+///   #2292; see [`strip_redundant_default_cast`]). A cast to a *different*
+///   type, a cast carrying a typmod, or a cast over a non-literal expression
+///   stays verbatim.
 /// - anything else → [`ColumnDefault::Sql`] verbatim (e.g. a UUID PK's
 ///   `gen_random_uuid()`, which the model parser records identically).
 fn normalize_default(
@@ -1139,7 +1279,14 @@ fn normalize_default(
     if normalize_serial_pk_default(&lowered, ty, is_primary_key, primary_key, owns_sequence) {
         return None;
     }
-    Some(ColumnDefault::Sql(raw.to_owned()))
+    // A redundant `::type` cast on a literal default (`'{}'::text` on a TEXT
+    // column) is stripped when the cast names the column's own type, so the
+    // introspected IR agrees with the model parser's bare literal (issue
+    // #2292). Anything load-bearing stays verbatim — see
+    // [`strip_redundant_default_cast`].
+    Some(ColumnDefault::Sql(
+        strip_redundant_default_cast(raw, ty).to_owned(),
+    ))
 }
 
 /// Whether a raw (lower-cased) default is the auto-increment sequence default of
@@ -2639,6 +2786,138 @@ mod tests {
             false,
         );
         assert_eq!(ct, Some(ColumnDefault::Now));
+    }
+
+    /// #2292: `pg_get_expr` renders a stored `'{}'` default on a `TEXT` column
+    /// as `'{}'::text` while the model parser records the bare literal — the
+    /// redundant own-type cast must be stripped so the round-trip diff is
+    /// empty instead of emitting a no-op `ALTER COLUMN` forever.
+    #[test]
+    fn normalize_default_strips_redundant_own_type_cast_on_literals() {
+        let norm = |raw: &str, ty: &ColumnType| normalize_default(Some(raw), ty, false, &[], false);
+        assert_eq!(
+            norm("'{}'::text", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'{}'".to_owned()))
+        );
+        // A hand-written non-translatable text default round-trips the same
+        // way — the fix is the general one, not translatable-specific.
+        assert_eq!(
+            norm("'draft'::text", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'draft'".to_owned()))
+        );
+        // The `VARCHAR`-family spellings count as a TEXT column's own type
+        // (the IR does not distinguish TEXT from VARCHAR).
+        assert_eq!(
+            norm("'draft'::character varying", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'draft'".to_owned()))
+        );
+        // A bare numeric literal on its own integer type.
+        assert_eq!(
+            norm("42::integer", &ColumnType::Int32),
+            Some(ColumnDefault::Sql("42".to_owned()))
+        );
+        assert_eq!(
+            norm("-1.5::double precision", &ColumnType::Float64),
+            Some(ColumnDefault::Sql("-1.5".to_owned()))
+        );
+        // Case-insensitive, with a `pg_catalog.` qualification tolerated.
+        assert_eq!(
+            norm("'{}'::PG_CATALOG.TEXT", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'{}'".to_owned()))
+        );
+        // Escaped quotes inside the literal are honored, not mistaken for the
+        // closing quote.
+        assert_eq!(
+            norm("'it''s'::text", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'it''s'".to_owned()))
+        );
+    }
+
+    /// #2292: anything load-bearing stays verbatim — a cast to a *different*
+    /// type than the column's, a cast carrying a typmod (which can change the
+    /// value), or a cast over a non-literal expression.
+    #[test]
+    fn normalize_default_preserves_load_bearing_casts_verbatim() {
+        let norm = |raw: &str, ty: &ColumnType| normalize_default(Some(raw), ty, false, &[], false);
+        // A cast to a different type than the column's.
+        assert_eq!(
+            norm("'{}'::integer", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'{}'::integer".to_owned()))
+        );
+        assert_eq!(
+            norm("'{}'::text", &ColumnType::Int32),
+            Some(ColumnDefault::Sql("'{}'::text".to_owned()))
+        );
+        // A cast carrying a typmod can change the value (`character(3)`
+        // truncates) — never stripped.
+        assert_eq!(
+            norm("'abcdef'::character(3)", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'abcdef'::character(3)".to_owned()))
+        );
+        // A cast over a non-literal expression is not a literal cast at all.
+        assert_eq!(
+            norm("nextval('posts_id_seq'::regclass)", &ColumnType::Int64),
+            Some(ColumnDefault::Sql(
+                "nextval('posts_id_seq'::regclass)".to_owned()
+            ))
+        );
+        // Not a literal at all — the `Now` recovery is unaffected.
+        assert_eq!(
+            norm("now()", &ColumnType::Timestamp),
+            Some(ColumnDefault::Now)
+        );
+        // A bare literal with no cast passes through untouched.
+        assert_eq!(
+            norm("'{}'", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'{}'".to_owned()))
+        );
+    }
+
+    /// #2292: the full round-trip — a `#[translatable]` column parsed from a
+    /// model, introspected back from Postgres (`pg_get_expr` renders the stored
+    /// `'{}'` default as `'{}'::text`), and diffed — must produce an empty
+    /// plan: no perpetual `SetDefault`.
+    #[test]
+    fn translatable_column_round_trips_without_set_default() {
+        use crate::schema::diff::{DiffOptions, diff_schema};
+        use crate::schema::parse::parse_model_source;
+
+        let src = r"
+            #[autumn_web::model]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[translatable]
+                pub title: autumn_web::i18n::Translated,
+            }
+        ";
+        let desired = parse_model_source(src, Backend::Postgres).expect("parse");
+
+        // Simulate the introspected baseline: the DB stores `DEFAULT '{}'`,
+        // which `pg_get_expr` renders with the cast.
+        let mut baseline = desired.tables.clone();
+        for table in &mut baseline {
+            for column in &mut table.columns {
+                if column.name == "title" {
+                    column.default =
+                        normalize_default(Some("'{}'::text"), &column.ty, false, &[], false);
+                }
+            }
+        }
+
+        let plan = diff_schema(
+            &baseline,
+            &desired,
+            DiffOptions {
+                allow_destructive: false,
+                definitions_authoritative: false,
+            },
+        );
+        assert!(
+            plan.is_empty(),
+            "translatable round-trip must be drift-free, got: {:?}",
+            plan.changes
+        );
     }
 
     #[test]
