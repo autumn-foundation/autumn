@@ -195,7 +195,7 @@ fn comments_table_state(project_root: &Path) -> (bool, bool) {
 /// Quoting is load-bearing. The pipeline lowercases unquoted text but preserves
 /// quoted identifiers, so `comments` (unquoted, folded) and `"comments"`
 /// (quoted, exact) both land on `comments`, while `"Comments"` stays distinct —
-/// exactly PostgreSQL's case-folding rule. A `public` schema (quoted or not,
+/// exactly `PostgreSQL`'s case-folding rule. A `public` schema (quoted or not,
 /// both spell the same schema) is normalised away: `public.comments` IS
 /// `comments` under the default search path, and the old fixed-spelling scan
 /// already treated the two as one table. Any other schema stays distinct —
@@ -345,7 +345,7 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
 }
 
 /// Whether `c` can continue a bare SQL identifier.
-fn is_ident_char(c: char) -> bool {
+const fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '$'
 }
 
@@ -445,7 +445,7 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
 const CREATE_VERBS: &[&str] = &["table", "unlogged table"];
 
 /// Every persistent `CREATE TABLE` in `sql`: (offset, table, column-list body).
-fn create_tables<'a>(sql: &'a str) -> Vec<(usize, TableRef, &'a str)> {
+fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
     let mut found = Vec::new();
     let mut base = 0usize;
     while let Some(at) = sql[base..].find("create ") {
@@ -543,7 +543,7 @@ fn drop_tables(sql: &str) -> Vec<(usize, Vec<TableRef>)> {
 }
 
 /// Every `ALTER TABLE` in `sql`: (offset, table, statement text after the name).
-fn alter_tables<'a>(sql: &'a str) -> Vec<(usize, TableRef, &'a str)> {
+fn alter_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
     let mut found = Vec::new();
     let mut base = 0usize;
     while let Some(at) = sql[base..].find("alter table") {
