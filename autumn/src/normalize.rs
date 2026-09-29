@@ -76,18 +76,16 @@ pub fn upcase(s: &str) -> String {
 /// Trim and collapse every internal run of whitespace to a single ASCII space.
 #[must_use]
 pub fn squish(s: &str) -> String {
-    let mut parts = s.split_whitespace();
-    if let Some(first) = parts.next() {
-        let mut result = String::with_capacity(s.len());
-        result.push_str(first);
-        for part in parts {
+    // One allocation sized to the input, instead of collecting a `Vec` of
+    // slices and joining it into a second `String`.
+    let mut result = String::with_capacity(s.len());
+    for part in s.split_whitespace() {
+        if !result.is_empty() {
             result.push(' ');
-            result.push_str(part);
         }
-        result
-    } else {
-        String::new()
+        result.push_str(part);
     }
+    result
 }
 
 /// Remove every NUL (`U+0000`) character (issue #2423).
@@ -293,6 +291,13 @@ mod tests {
     #[test]
     fn squish_collapses_internal_whitespace() {
         assert_eq!(squish("  a   b\tc\n d "), "a b c d");
+    }
+
+    #[test]
+    fn squish_empty_and_blank_inputs_are_empty() {
+        assert_eq!(squish(""), "");
+        assert_eq!(squish(" \t\n "), "");
+        assert_eq!(squish("word"), "word");
     }
 
     #[test]
