@@ -43,11 +43,11 @@ impl OnceCell {
     fn set(&self, slot: Arc<Slot>) -> Result<(), ()> {
         let mut published = self.published.lock().unwrap();
         if published.is_some() {
-            Err(())
-        } else {
-            *published = Some(slot);
-            Ok(())
+            return Err(());
         }
+        *published = Some(slot);
+        drop(published);
+        Ok(())
     }
 
     fn get_or_init(&self, make: impl FnOnce() -> Arc<Slot>) -> Arc<Slot> {
