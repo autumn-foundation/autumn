@@ -692,7 +692,7 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
 
 ## SLA obligations (`autumn_web::sla`, unreleased, #1826)
 
-Deadlines in business time. The clock runs only in working hours and reads
+Needs the `sla` feature. Deadlines in business time. The clock runs only in working hours and reads
 only the injected `Clock`.
 
 - `BusinessCalendar::new()` / `::weekdays(hours)` + `.hours(Weekday, hours)` /

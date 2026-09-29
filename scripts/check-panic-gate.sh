@@ -135,7 +135,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/money/ledger.rs:db
   # Calendar-aware SLA obligations (#1826). The Sla extractor calculates
   # deadlines on the request path.
-  autumn/src/sla/mod.rs:default
+  autumn/src/sla/mod.rs:sla
   autumn/src/cluster/mod.rs:default
   autumn/src/cluster/counter.rs:default
   autumn/src/cluster/membership.rs:default

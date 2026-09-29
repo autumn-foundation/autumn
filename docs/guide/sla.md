@@ -9,7 +9,11 @@ The engine reads time only from the injected `Clock`. Thus a test can move a
 full quarter of business time forward in less than one second, with no
 `sleep`.
 
-> **Status:** always on. No Cargo feature is necessary. Issue #1826.
+> **Status:** opt-in. Enable the `sla` Cargo feature. Issue #1826.
+>
+> ```toml
+> autumn-web = { version = "0.7", features = ["sla"] }
+> ```
 
 ---
 
