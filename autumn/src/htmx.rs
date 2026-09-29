@@ -563,12 +563,14 @@ impl IntoResponse for HtmxFragments {
     }
 }
 
-/// Elements whose content a browser tokenizes as raw text or RCDATA: no tags
-/// and no comments inside, only the matching end tag ends them. `noscript` is
-/// included because htmx implies scripting is on, and the parser then treats
-/// it as raw text too.
+/// Elements whose content the HTML tokenizer reads as raw text or RCDATA: no
+/// tags and no comments inside, only the matching end tag ends them.
+///
+/// `noscript` is deliberately absent. It is raw text only when scripting is
+/// enabled, and htmx parses swap responses with `DOMParser`, whose document has
+/// scripting disabled, so markup inside `<noscript>` is live there.
 #[cfg(feature = "maud")]
-const RAW_TEXT_ELEMENTS: [&str; 10] = [
+const RAW_TEXT_ELEMENTS: [&str; 9] = [
     "script",
     "style",
     "textarea",
@@ -577,12 +579,15 @@ const RAW_TEXT_ELEMENTS: [&str; 10] = [
     "iframe",
     "noembed",
     "noframes",
-    "noscript",
     "plaintext",
 ];
 
 /// If `after_lt` (the text after a `<`) opens a raw-text/RCDATA element,
 /// return its name.
+///
+/// The name must be followed by an HTML space character (tab, LF, FF, CR,
+/// space), `/` or `>`. `char::is_ascii_whitespace` is exactly that set; it
+/// excludes U+000B VERTICAL TAB, as the tokenizer does.
 #[cfg(feature = "maud")]
 fn raw_text_element(after_lt: &str) -> Option<&'static str> {
     RAW_TEXT_ELEMENTS.into_iter().find(|name| {
@@ -1363,6 +1368,15 @@ mod bypass_tests {
         ));
         assert!(has_oob_attribute(
             "<titles><i hx-swap-oob=\"x\"></i></titles>"
+        ));
+        // A vertical tab is not an HTML space: `<textarea\u{b}>` is a
+        // different element to the tokenizer, so what follows is live markup.
+        assert!(has_oob_attribute(
+            "<textarea\u{b}><div hx-swap-oob=\"delete:#victim\"></div>"
+        ));
+        // `noscript` is live markup in htmx's scripting-disabled DOMParser.
+        assert!(has_oob_attribute(
+            "<noscript><div hx-swap-oob=\"delete:#victim\"></div></noscript>"
         ));
     }
 
