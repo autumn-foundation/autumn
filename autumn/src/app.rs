@@ -420,7 +420,7 @@ pub struct AppBuilder {
     /// Non-None while a plugin's `build()` is executing; routes and scoped
     /// groups added during that window are attributed to this plugin.
     current_plugin: Option<String>,
-    tasks: Vec<crate::task::TaskInfo>,
+    pub(crate) tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
     pub(crate) jobs: Vec<crate::job::JobInfo>,
     /// Registered event listeners; durable ones are synthesized into jobs at
@@ -4028,7 +4028,7 @@ impl AppBuilder {
             let interval = std::time::Duration::from_millis(500);
             loop {
                 let poll_path = path.clone();
-                let load_res = tokio::task::spawn_blocking(move || {
+                let load_res = crate::time::spawn_blocking(move || {
                     crate::maintenance::MaintenanceState::load_from_file(&poll_path)
                 })
                 .await;
@@ -4181,7 +4181,7 @@ impl AppBuilder {
             // read from it, so a test that freezes time moves them all (#1797).
             let clock = state.clock_arc();
 
-            let built = tokio::task::spawn_blocking(move || {
+            let built = crate::time::spawn_blocking(move || {
                 crate::replication::build(
                     &replication_config,
                     &database_url,
@@ -6992,7 +6992,7 @@ impl AppBuilder {
 
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
-        let applied_total = tokio::task::spawn_blocking(move || {
+        let applied_total = crate::time::spawn_blocking(move || {
             let mut total = 0_usize;
             if let Some(url) = &control_url {
                 // SQLite single-writer control target (issue #1614, PR3): apply with
@@ -8679,7 +8679,7 @@ fn start_task_scheduler(
 
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
-fn start_task_scheduler_with_config(
+pub(crate) fn start_task_scheduler_with_config(
     tasks: Vec<crate::task::TaskInfo>,
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -8807,6 +8807,8 @@ async fn execute_task_result(
     name: &str,
     schedule: &'static str,
 ) -> Result<u64, (u64, String)> {
+    // A tick is work a sim drain must see (issue #2967).
+    crate::sim::note_drain_progress();
     // A fresh span per run so OTLP-enabled deployments see each invocation
     // as its own trace rather than inheriting whatever was current on the
     // scheduler thread.
@@ -10037,7 +10039,10 @@ fn spawn_custom_domain_task(
         cache,
         certs: std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
         provider,
-        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier),
+        // `validate` already refused an unparseable entry at boot.
+        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier::new(
+            config.resolver_addrs().unwrap_or_default(),
+        )),
         issuer,
         limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
             config.issuance_per_domain_per_day,
@@ -11969,7 +11974,7 @@ async fn run_startup_migrations(
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
     #[cfg(feature = "sqlite")]
     let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
-    let migration_result = tokio::task::spawn_blocking(move || {
+    let migration_result = crate::time::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (#1614, PR3): apply the
         // registered migrations to a `sqlite://` control target with no advisory
         // lock. Sharding — directory, shard-map, per-shard fan-out — is

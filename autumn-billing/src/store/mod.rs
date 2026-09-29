@@ -385,6 +385,43 @@ pub trait BillingStore: Send + Sync + 'static {
         provider_customer_id: &'a ProviderId,
     ) -> StoreFuture<'a, Option<Customer>>;
 
+    /// Overwrite the `user_id` link on the customer keyed by `id`, even when
+    /// one is already set — [`upsert_customer`](BillingStore::upsert_customer)
+    /// deliberately refuses that (see its "never replaces an existing link"
+    /// doc). For operator-driven identity migrations only (e.g. relinking a
+    /// row created before `[tenancy]` was enabled to its new tenant-scoped
+    /// id, via [`crate::gate::scope_identity`]) — never call this from
+    /// request-handling or webhook code, where an unconditional overwrite
+    /// would let a confused deputy or a replayed request silently reassign a
+    /// paying customer to a different user.
+    ///
+    /// `Ok(None)` when no customer with this `id` exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BillingError::Conflict`] when `user_id` already links a
+    /// different customer (the same partial-unique constraint
+    /// [`upsert_customer`](BillingStore::upsert_customer) observes).
+    ///
+    /// Defaulted to [`BillingError::Unsupported`] so a `BillingStore`
+    /// implemented outside this crate before this method existed keeps
+    /// compiling unchanged — adding a method to a `pub trait` without a
+    /// default is a breaking change for every external implementor,
+    /// tenancy or not. [`MemoryBillingStore`] and [`DbBillingStore`]
+    /// (`crate::store::db`, `feature = "db"`) both override it; a custom
+    /// store wanting operator-driven relinking should too.
+    fn relink_customer<'a>(
+        &'a self,
+        id: &'a str,
+        user_id: String,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, Option<Customer>> {
+        let _ = (id, user_id, now);
+        Box::pin(std::future::ready(Err(BillingError::Unsupported(
+            "relink_customer (this BillingStore has not implemented it)",
+        ))))
+    }
+
     // ── Subscriptions ───────────────────────────────────────────────────
 
     /// Guarded insert or update.

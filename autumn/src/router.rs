@@ -5,6 +5,14 @@
 //! user routes, static files, middleware, error pages, and framework endpoints
 //! like actuators and probes.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -4564,7 +4572,7 @@ where
         // requirement, and every driver in this crate reaches it through
         // `ServiceExt::oneshot`, which calls `call` only from inside a poll.
         let inner = self.inner.call(req);
-        let start = std::time::Instant::now();
+        let start = crate::time::ambient_instant();
 
         RequestTimeoutFuture::Bounded {
             inner: tokio::time::timeout(duration, inner),
@@ -4683,7 +4691,12 @@ fn deadline_exceeded_response(
     cors_origin: Option<&http::HeaderValue>,
     start: std::time::Instant,
 ) -> axum::response::Response {
-    let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let elapsed_ms = u64::try_from(
+        crate::time::ambient_instant()
+            .saturating_duration_since(start)
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
     let route = matched_path.unwrap_or("<unmatched>");
     // Structured telemetry: route template + elapsed time so operators
     // can alert on the (already-counted) timeout event.

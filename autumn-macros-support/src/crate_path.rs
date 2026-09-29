@@ -626,19 +626,67 @@ mod tests {
         result
     }
 
+    /// A process-wide counter, not a timestamp: these tests run concurrently
+    /// by default under `cargo test`, all sharing one `pid`, and a wall-clock
+    /// reading is not guaranteed unique at whatever resolution the platform's
+    /// clock actually offers under thread contention (measured on this
+    /// repo's own Linux hardware: ~1 in 4,700 `SystemTime::now()` pairs
+    /// collided under 64-way concurrency; the organic failure this guards
+    /// against hit `Test (macos-latest)` — see
+    /// `docs/ci-health/quarantine-ledger.md`). Two tests racing to the same directory name
+    /// would then race their `fs::write` in `with_fixture_manifest` (which
+    /// happens before its `temp_env::with_var` lock is held), so one test's
+    /// fixture `Cargo.toml` could silently become another's. A monotonic
+    /// counter can never repeat within a process, regardless of clock
+    /// resolution.
+    fn unique_fixture_dir_name() -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            "autumn-macros-crate-path-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
     fn tempfile_dir() -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "autumn-macros-crate-path-test-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        dir.push(unique);
+        dir.push(unique_fixture_dir_name());
         std::fs::create_dir_all(&dir).expect("create fixture dir");
         dir
+    }
+
+    #[test]
+    fn unique_fixture_dir_name_never_collides_under_concurrency() {
+        // Regression test: stress the naming scheme directly
+        // (no filesystem I/O) at the same concurrency/iteration count that
+        // measured a real, repeatable collision rate (~0.02%) in the old
+        // pid+nanosecond-timestamp scheme on ordinary Linux hardware -- the
+        // organic failure this guards against hit macOS, where clock
+        // resolution under contention is plausibly coarser still. This test
+        // passes deterministically post-fix (a monotonic counter cannot
+        // repeat) and is expected to fail intermittently if the old
+        // timestamp-based scheme is ever reintroduced.
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let handles: Vec<_> = (0..64)
+            .map(|_| {
+                let seen = Arc::clone(&seen);
+                std::thread::spawn(move || {
+                    let names: Vec<String> = (0..2000).map(|_| unique_fixture_dir_name()).collect();
+                    for name in names {
+                        assert!(
+                            seen.lock().unwrap().insert(name),
+                            "duplicate fixture dir name generated"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]
