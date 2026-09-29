@@ -76,9 +76,16 @@
 //! (`Err(ExperimentError::ExcludedByGroup)`). This prevents interaction effects
 //! between experiments targeting the same funnel.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -864,10 +871,7 @@ impl ExperimentStore for InMemoryExperimentStore {
 // ── Hash and bucketing helpers ────────────────────────────────────────────────
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    crate::time::clock_unix_secs(&crate::time::AmbientClock)
 }
 
 /// FNV-1a 64-bit hash of a byte slice.
@@ -1678,7 +1682,7 @@ pub mod pg {
         }
 
         fn cached(&self, name: &str) -> CacheLookup {
-            let now = Instant::now();
+            let now = crate::time::ambient_instant();
             let Ok(cache) = self.cache.read() else {
                 return CacheLookup::Miss;
             };
@@ -1692,7 +1696,8 @@ pub mod pg {
             if self.cache_ttl.is_zero() {
                 return;
             }
-            let Some(expires_at) = Instant::now().checked_add(self.cache_ttl) else {
+            let Some(expires_at) = crate::time::ambient_instant().checked_add(self.cache_ttl)
+            else {
                 return;
             };
             if let Ok(mut cache) = self.cache.write() {
@@ -1716,6 +1721,12 @@ pub mod pg {
         ) -> std::thread::JoinHandle<()> {
             std::thread::spawn(move || {
                 const OVERLAP_SECS: i64 = 5;
+                // Postgres stamps `changed_at` with its own real clock, so the
+                // cursor reads the real clock too.
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "cursor is compared with Postgres changed_at, a real clock"
+                )]
                 let now_secs = || {
                     i64::try_from(
                         std::time::SystemTime::now()

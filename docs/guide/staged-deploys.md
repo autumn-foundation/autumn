@@ -531,6 +531,18 @@ container, another port, another machine) and point `target` at it.
   normally and every request through a planned maintenance window would look
   like a status-class divergence. The trade is that a genuine handler-produced
   `429`/`503` divergence is not reported either.
+- **Conditional requests are not mirrored.** A `GET`/`HEAD` carrying
+  `If-None-Match`, `If-Modified-Since`, or `If-Range` (or `If-Match` /
+  `If-Unmodified-Since`) is a cache revalidation, and a validator is scoped to
+  the build that issued it: the primary answers `304` while the candidate —
+  whose validator legitimately differs — answers `200`, so replaying the
+  primary's validator to the candidate records a `status_class` divergence on
+  ordinary cache traffic. Worse, when both builds *do* revalidate, the differ
+  compares two empty `304` bodies and records a `match` while comparing
+  nothing, hiding a genuine body regression on exactly the traffic that
+  revalidates. These requests are skipped and counted as `skipped_conditional`.
+  The trade is that on a cache-heavy route the revalidating share of traffic
+  gets no coverage — the counter shows how much.
 - **A mirror's waiting is bounded.** One deadline, stamped at dispatch, covers
   both the shadow request and the wait for the mirrored primary response, so a
   client that stops reading — or a long-lived `text/event-stream` — cannot pin
@@ -661,8 +673,8 @@ $ curl -s localhost:3000/actuator/shadow | jq
 }
 ```
 
-`stats` also carries `skipped_refused` and `primary_incomplete` (see the
-outcomes below).
+`stats` also carries `skipped_refused`, `skipped_conditional`, and
+`primary_incomplete` (see the outcomes below).
 
 `/actuator/shadow` is a **sensitive** endpoint (`[actuator] sensitive = true`),
 like `/actuator/tasks` — the samples are excerpts of real production responses.

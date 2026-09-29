@@ -23,6 +23,14 @@
 //!
 //! See `docs/guide/data-retention.md`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -547,7 +555,7 @@ async fn run_one_dataset(
     dataset: RetentionDataset,
     dry_run: bool,
 ) -> RetentionDatasetReport {
-    let started = std::time::Instant::now();
+    let started = crate::time::ambient_monotonic();
     let effective = effective_retention(config, dataset);
     // A provisional cutoff, so a dataset with no database still reports one.
     // The sweep path replaces it with the instant Postgres itself resolved —
@@ -555,7 +563,7 @@ async fn run_one_dataset(
     let cutoff = effective
         .window
         .and_then(|window| chrono::Duration::from_std(window).ok())
-        .map(|window| Utc::now() - window);
+        .map(|window| crate::time::ambient_now() - window);
 
     let mut report = RetentionDatasetReport {
         dataset: dataset.key().to_owned(),
@@ -660,8 +668,13 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
     note
 }
 
-fn elapsed_ms(started: std::time::Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+fn elapsed_ms(started: crate::time::MonotonicInstant) -> u64 {
+    u64::try_from(
+        crate::time::ambient_monotonic()
+            .saturating_duration_since(started)
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Prune abandoned custom-domain registrations and orphaned certificates
