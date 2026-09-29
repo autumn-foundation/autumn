@@ -771,6 +771,10 @@ pub struct TestApp {
     /// handler intercepts matching requests.
     #[cfg(feature = "http-client")]
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
+    /// The sim network, installed with the mock registry and before any state
+    /// initializer, so every client built from state sends through it.
+    #[cfg(feature = "http-client")]
+    sim_net: Option<crate::sim::SimNet>,
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
     tasks: Vec<crate::task::TaskInfo>,
@@ -854,6 +858,8 @@ impl TestApp {
             http_interceptor: None,
             #[cfg(feature = "http-client")]
             http_mock_registry: None,
+            #[cfg(feature = "http-client")]
+            sim_net: None,
             state_initializers: Vec::new(),
             jobs: Vec::new(),
             tasks: Vec::new(),
@@ -1792,6 +1798,13 @@ impl TestApp {
         }
     }
 
+    /// Route outbound HTTP through `net`. Set by [`Sim::net`](crate::sim::Sim::net).
+    #[cfg(feature = "http-client")]
+    pub(crate) fn with_sim_net(mut self, net: crate::sim::SimNet) -> Self {
+        self.sim_net = Some(net);
+        self
+    }
+
     /// Build the application and return a [`TestClient`] ready for requests.
     ///
     /// This constructs the full Axum router with all middleware applied,
@@ -2265,6 +2278,10 @@ impl TestApp {
         #[cfg(feature = "http-client")]
         if let Some(registry) = self.http_mock_registry {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
+        }
+        #[cfg(feature = "http-client")]
+        if let Some(net) = self.sim_net.take() {
+            state.insert_extension(net);
         }
 
         // Register metrics sources before state initializers — mirrors production
@@ -3498,7 +3515,7 @@ pub struct RequestBuilder {
     /// without a client (not reachable through the public API today).
     cookie_jar: Option<CookieJar>,
     /// The originating client's clock, used to evaluate `Expires` when folding
-    /// `Set-Cookie` back into the jar. `None` falls back to [`chrono::Utc::now`].
+    /// `Set-Cookie` back into the jar. `None` falls back to [`crate::time::ambient_now`].
     clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
     /// Default N+1 detection threshold (`dev.inspector_n_plus_one_threshold`),
     /// propagated to the resulting [`TestResponse`] so
@@ -3608,7 +3625,7 @@ impl RequestBuilder {
             let now = self
                 .clock
                 .as_ref()
-                .map_or_else(chrono::Utc::now, |c| c.now());
+                .map_or_else(crate::time::ambient_now, |c| c.now());
             let cookie_header = {
                 let mut jar = jar.lock().expect("cookie jar mutex poisoned");
                 jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now));
@@ -3701,7 +3718,7 @@ impl RequestBuilder {
             let now = self
                 .clock
                 .as_ref()
-                .map_or_else(chrono::Utc::now, |c| c.now());
+                .map_or_else(crate::time::ambient_now, |c| c.now());
             let mut jar = jar.lock().expect("cookie jar mutex poisoned");
             for (name, value) in &headers {
                 if name.eq_ignore_ascii_case("set-cookie") {

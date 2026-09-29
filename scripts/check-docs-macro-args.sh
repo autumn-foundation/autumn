@@ -327,6 +327,8 @@ OWNERS = {
     "mailer_preview": "mailer_preview.rs",
     "main": "main_macro.rs",
     "model": "model.rs",
+    # Business-time obligations (#1826).
+    "obligation": "obligation.rs",
     # A forwarder, not a marker: `oauth2_callback_macro` hands its arguments
     # straight to `route::route_macro`, so it accepts the whole route grammar.
     # Reading only its own file left it with `crate` alone and reported the

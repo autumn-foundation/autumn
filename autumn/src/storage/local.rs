@@ -9,7 +9,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::SystemTime;
+use std::time::{Duration, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::StreamExt as _;
@@ -494,7 +496,7 @@ impl BlobStore for LocalBlobStore {
             } else {
                 expires_in
             };
-            let exp_at = SystemTime::now()
+            let exp_at = crate::time::ambient_system_time()
                 .checked_add(expires_in)
                 .unwrap_or(UNIX_EPOCH)
                 .duration_since(UNIX_EPOCH)
@@ -529,7 +531,7 @@ impl BlobStore for LocalBlobStore {
             } else {
                 expires_in
             };
-            let exp_at = SystemTime::now()
+            let exp_at = crate::time::ambient_system_time()
                 .checked_add(expires_in)
                 .unwrap_or(UNIX_EPOCH)
                 .duration_since(UNIX_EPOCH)
@@ -599,7 +601,7 @@ pub fn verify_upload(
     expires_at: u64,
     signature: &str,
 ) -> Result<(), BlobStoreError> {
-    let now = SystemTime::now()
+    let now = crate::time::ambient_system_time()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     verify_upload_with_now(
@@ -793,7 +795,7 @@ pub fn verify(
     expires_at: u64,
     signature: &str,
 ) -> Result<(), BlobStoreError> {
-    let now = SystemTime::now()
+    let now = crate::time::ambient_system_time()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     verify_with_now(signing_key, blob_key, expires_at, signature, now)
