@@ -2436,6 +2436,19 @@ fn emit_counter_caches_impl(
         // differently-keyed parent — without it the maintenance SQL would
         // address a column that does not exist.
         let parent_pk = decl.parent_pk.as_deref().unwrap_or("id");
+        // The same guard `#[derivation]` applies: a counter on the parent's
+        // primary key would run `SET <pk> = <pk> + 1 WHERE <pk> = …`,
+        // rewriting the parent's identity on every child mutation.
+        if column == parent_pk {
+            return Err(syn::Error::new(
+                decl.span,
+                format!(
+                    "`counter_cache` cannot maintain `{parent_table}.{parent_pk}`: that is \
+                     the parent's primary key, and a maintained value would rewrite the \
+                     parent's identity. Name a dedicated counter column"
+                ),
+            ));
+        }
         let fk_ident = format_ident!("{fk}");
 
         // The foreign key has to be a real field: without this check the
@@ -5817,6 +5830,12 @@ fn diesel_column_name(field: &syn::Field) -> Option<String> {
 /// — they must honor a renamed `#[id]` here rather than splicing the Rust
 /// field name into SQL. With no rename the result equals the old spelling, so
 /// existing expansions are byte-for-byte unchanged.
+///
+/// Limitation: `column_name` names Diesel's *schema identifier*, which is the
+/// SQL column unless `schema.rs` maps it with `#[sql_name = "…"]` (Diesel
+/// emits one only for a column that is not a valid Rust identifier). The
+/// macro cannot see `schema.rs`, so such a primary key is unsupported by
+/// `#[votable]` / `#[commentable]`; the guides document it.
 fn physical_pk_column(pk_field: Option<&syn::Field>) -> String {
     pk_field
         .and_then(|field| {
@@ -12687,6 +12706,26 @@ mod tests {
         assert!(
             !generated.contains("cannot maintain"),
             "`id` is not the parent's key here: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_counter_cache_cannot_maintain_the_parent_primary_key() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache = "post_uuid", parent_pk = "post_uuid")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.post_uuid`"),
+            "the parent primary key is not a counter column: {generated}"
         );
     }
 

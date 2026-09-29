@@ -818,7 +818,10 @@ The column defaults to `{snake(child)}_count` — **singular**, matching
 `#[votable(aggregate = count)]` — and is overridable with `counter_cache =
 "<column>"`. `counter_cache_tenant = "<column>"` confines every delta to the
 caller's tenant (both tables must carry that column); without it no tenant
-predicate is emitted. It is a **`belongs_to`** option only — on a `has_many`, on
+predicate is emitted. `parent_pk = "<column>"` names the parent's primary-key
+column when it is not `id` (a renamed `#[id]` or `#[diesel(column_name)]`) —
+the child cannot see the parent's fields, so it is never inferred (#2662). It
+is a **`belongs_to`** option only — on a `has_many`, on
 a `through =` join table, with a non-identifier column, with two legs resolving
 onto one parent column, or on a composite `#[id]`, it is a directed compile
 error.
@@ -848,8 +851,8 @@ string literal>`, `field.is_some()`/`is_none()`, `a && b` and parentheses over
 `bool`/integer/`String` fields and their `Option` forms; each filter is lowered
 to both Rust and SQL, and string ordering comparisons and float literals are
 compile errors. Other keys, each at most once: `fk`, `parent_table` (for a
-parent that overrides its table; the parent pk is always `id`), `tenant`,
-`name`. The parent column is the
+parent that overrides its table), `parent_pk` (for a parent whose primary key
+is not `id`, #2662), `tenant`, `name`. The parent column is the
 app's migration (`BIGINT NOT NULL DEFAULT 0`); the `_autumn_derivations` state
 table ships as a framework migration and is applied automatically. Each
 derivation is content-addressed, so a changed filter enqueues a resumable,

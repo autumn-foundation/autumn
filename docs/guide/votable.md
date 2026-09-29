@@ -17,6 +17,12 @@ and derivations — cannot see the parent's fields, so those take an explicit
 `parent_pk = "…"` override instead; see the counter-cache and derivations
 guides.)
 
+Diesel's `column_name` is the *schema identifier*, which is the SQL column
+unless `schema.rs` maps it with `#[sql_name = "…"]` (Diesel emits that only for
+a column whose name is not a valid Rust identifier, e.g. `post-id`). The macro
+cannot see `schema.rs`, so a primary key mapped through `sql_name` is not
+supported here: rename the column to a valid identifier.
+
 `#[votable]` makes that a declaration. You name the reactor model and the
 aggregate mode; the `#[model]` macro generates the edge table's typed
 `diesel::table!`, a `react()` that toggles/flips/inserts, and an aggregate
