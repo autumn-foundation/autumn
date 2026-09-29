@@ -2520,16 +2520,18 @@ fn emit_counter_caches_impl(
     for (index, decl) in derivations.iter().enumerate() {
         let column = &decl.column;
         let parent_table = derivation_parent_table(decl);
-        // The parent primary key is `id` (see `parent_pk` below), and a
-        // derivation maintaining it would rewrite the parent's identity on the
-        // first qualifying mutation.
-        if column == "id" {
+        // The parent primary key is `parent_pk` (default `id`, see below), and
+        // a derivation maintaining it would rewrite the parent's identity on
+        // the first qualifying mutation. Compared against the EFFECTIVE key: an
+        // override moves the forbidden column with it (#2662).
+        let effective_parent_pk = decl.parent_pk.as_deref().unwrap_or("id");
+        if column == effective_parent_pk {
             return Err(syn::Error::new(
                 decl.span,
                 format!(
-                    "`#[derivation]` cannot maintain `{parent_table}.id`: that is the \
-                     parent's primary key, and a maintained value would rewrite the \
-                     parent's identity. Name a dedicated aggregate column"
+                    "`#[derivation]` cannot maintain `{parent_table}.{effective_parent_pk}`: \
+                     that is the parent's primary key, and a maintained value would \
+                     rewrite the parent's identity. Name a dedicated aggregate column"
                 ),
             ));
         }
@@ -12643,6 +12645,48 @@ mod tests {
         assert!(
             generated.contains("cannot maintain `posts.id`"),
             "the parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_derivation_cannot_maintain_an_overridden_parent_primary_key() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "post_uuid", parent_pk = "post_uuid", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot maintain `posts.post_uuid`"),
+            "the overridden parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    /// With the key overridden, a plain `id` column on the parent is just a
+    /// column, so maintaining it is not rejected as the primary key.
+    #[test]
+    fn model_derivation_may_maintain_id_when_the_parent_key_is_overridden() {
+        let generated = model_macro(
+            TokenStream::new(),
+            quote! {
+                #[derivation(Post, column = "id", parent_pk = "post_uuid", fk = post_id)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("cannot maintain"),
+            "`id` is not the parent's key here: {generated}"
         );
     }
 
