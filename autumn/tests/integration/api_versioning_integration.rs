@@ -392,3 +392,25 @@ async fn test_api_versioning_auth_preservation() {
         .await;
     resp.assert_status(410); // Authorized sunset request is 410 Gone!
 }
+
+/// `#[authorize]` written *above* `#[get]` (#1627): the authorize macro expands
+/// first and removes its own attribute, so by the time the route macro runs
+/// there is nothing left but the rewritten body. The binding is recovered from
+/// the marker const `#[authorize]` leaves behind, which is why this pure
+/// ordering-B handler records the same `(action, resource)` pair the
+/// route-macro-outermost handlers do.
+#[test]
+fn authorize_above_route_macro_records_binding() {
+    let route = __autumn_route_info_api_authorize_policy_denial_reverse_sunset();
+    let bindings: Vec<(&str, &str)> = route
+        .api_doc
+        .authorize_bindings
+        .iter()
+        .map(|b| (b.action, b.resource))
+        .collect();
+    assert_eq!(
+        bindings,
+        vec![("show", "SunsetPolicyDenialNote")],
+        "an #[authorize] that expanded before the route macro must still record its binding"
+    );
+}

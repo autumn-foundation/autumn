@@ -1,0 +1,107 @@
+[package]
+name = "autumn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach the fuzz crate into its own workspace so cargo-fuzz's nightly/sanitizer
+# build never participates in `cargo build --workspace` for the main tree. The
+# root `Cargo.toml` also lists this directory under `[workspace] exclude`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The framework crate is published as `autumn-web`; pull it in under the `autumn`
+# name via a path dependency so the fuzz targets `use autumn::__fuzz`. Only the
+# features needed to reach the fuzzed request-path surfaces are enabled.
+[dependencies.autumn]
+path = "../autumn"
+package = "autumn-web"
+# Keep the crate's default features (maud/htmx/db/… — the normal build posture
+# the parsing seams live in) and add the extra surfaces the fuzz targets reach:
+# inbound-mail MIME parsing, multipart form decoding, and `openapi` (which gates
+# `router::extract_path_params`, the path-parameter extraction seam).
+# `plugin-sandbox` is here for the `sandbox` target: the container reader, the
+# manifest validator and the guest frame parser all decode bytes an unaudited
+# artifact produced. `acme` is here for the `dns` target.
+features = ["inbound-mail", "multipart", "openapi", "acme", "plugin-sandbox"]
+
+# cargo-fuzz builds in release mode with ASAN instrumentation, which is the
+# repo's heaviest build; debug info is a large share of that footprint and is
+# what pushes the runner over its ceiling (see the "Free disk space" step in
+# .github/workflows/fuzz.yml). `line-tables-only` keeps stack traces
+# symbolicated — all a crash reproducer needs, since the input is replayed
+# locally with full debug info — while dropping the type/variable DWARF nobody
+# reads from a CI log. Build scripts and proc macros never appear in a fuzz
+# backtrace, so they need none at all. Mirrors the root workspace's
+# `[profile.test]` / `[profile.test.build-override]` pairing.
+[profile.release]
+debug = "line-tables-only"
+
+[profile.release.build-override]
+debug = 0
+
+# Keep fuzz-target builds from tripping the "unused `main`" style lints and to
+# match cargo-fuzz conventions.
+[[bin]]
+name = "idempotency"
+path = "fuzz_targets/idempotency.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "routing"
+path = "fuzz_targets/routing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "body"
+path = "fuzz_targets/body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sandbox"
+path = "fuzz_targets/sandbox.rs"
+test = false
+doc = false
+bench = false
+
+# The sim demo scenario (issue #2967): the same `Op` vocabulary the
+# `sim-sweep` proptest sweep draws from.
+[[bin]]
+name = "sim_ops"
+path = "fuzz_targets/sim_ops.rs"
+test = false
+doc = false
+bench = false

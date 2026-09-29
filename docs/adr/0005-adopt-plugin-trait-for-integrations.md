@@ -172,6 +172,21 @@ costs nothing for the default `type_name` case and removes the leak trap.
 
 ## Follow-On Work
 
+> **Done (issue #1601):** *"Declare which parts of the plugin-facing surface
+> are stable."* The `Plugin` trait this ADR adopted gave plugin authors an
+> entry point but no compatibility contract, which capped how far anyone could
+> reasonably build on it. `autumn_web::plugin_contract::PLUGIN_SURFACES` now
+> declares every plugin-facing API `stable` or `experimental`, `Plugin::contract`
+> lets a plugin declare the `autumn-web` range it supports (an excluded pairing
+> fails at registration naming both versions), and a pinned reference plugin
+> compiled in CI turns a stable-surface break into a red check. See
+> [`docs/plugins.md`](../plugins.md#the-plugin-api-contract) and
+> [`STABILITY.md`](../../STABILITY.md#the-plugin-api-surface-issue-1601).
+>
+> This does not revisit any decision recorded above: `contract` is a defaulted
+> method, so the warn-and-skip duplicate behaviour, the `self`-consuming
+> `build`, and the `Cow<'static, str>` name all stand unchanged.
+
 - Re-export `Plugin` from `autumn_web::prelude` once the authoring contract
   has been exercised by more than one first-party integration.
 - Consider a `#[plugin]` proc-macro that stamps out `Default`, `::new()`,
