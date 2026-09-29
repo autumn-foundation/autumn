@@ -1,0 +1,14 @@
+error[E0599]: no method named `render` found for struct `TextField<State>` in the current scope
+  --> tests/compile-fail/a11y_textfield_attrs_unlabeled.rs:22:10
+   |
+13 |       let _markup = TextField::new("title")
+   |  ___________________-
+14 | |         .input_type("text")
+15 | |         .class("autumn-field__input autumn-field__input--invalid")
+16 | |         .aria_invalid(true)
+...  |
+21 | |         .maxlength(120)
+22 | |         .render();
+   | |         -^^^^^^ method not found in `TextField<NoLabel>`
+   | |_________|
+   |

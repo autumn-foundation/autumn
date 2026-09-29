@@ -96,7 +96,7 @@ fn decode_encoded_slashes(path: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `Some(dot_count)` when `segment` consists solely of one or two
 /// dots, where each dot may be literal (`.`) or percent-encoded (`%2e` /
 /// `%2E`). Returns `None` for every other segment.
-fn dot_segment_len(segment: &str) -> Option<usize> {
+pub const fn dot_segment_len(segment: &str) -> Option<usize> {
     let bytes = segment.as_bytes();
     let mut i = 0;
     let mut dots = 0usize;
@@ -122,9 +122,63 @@ fn dot_segment_len(segment: &str) -> Option<usize> {
     if dots == 0 { None } else { Some(dots) }
 }
 
+/// Yields each well-formed percent-escape in `text` as its decoded byte, and
+/// whether its hex digits are upper case.
+///
+/// One level only, as in [`dot_segment_len`]: `%252e` yields `%` once. A `%`
+/// without two hex digits after it is not an escape and yields nothing.
+#[cfg(any(feature = "plugin-sandbox", test))]
+pub fn percent_escapes(text: &str) -> impl Iterator<Item = (u8, bool)> + '_ {
+    text.as_bytes().windows(3).filter_map(|window| {
+        let [b'%', high, low] = *window else {
+            return None;
+        };
+        let digit = |byte: u8| char::from(byte).to_digit(16);
+        let byte = u8::try_from(digit(high)? * 16 + digit(low)?).ok()?;
+        let upper = !high.is_ascii_lowercase() && !low.is_ascii_lowercase();
+        Some((byte, upper))
+    })
+}
+
+/// Whether `path` matches one of `exempt_paths` on an exact-or-subtree basis.
+///
+/// A prefix matches when `path` equals it exactly, or when `path` continues
+/// past it at a `/` boundary (either the prefix itself ends with `/`, or the
+/// next byte of `path` is `/`). A bare prefix match with no boundary does
+/// *not* count — exempting `/webhooks/stripe` must not also exempt
+/// `/webhooks/stripe-admin` (see #1643's `docs/plans/2026-06-06-…` writeup).
+///
+/// `path` must already be normalized (see [`clean_path`]); this function does
+/// not resolve dot-segments itself.
+///
+/// This predicate is duplicated once more, deliberately, in
+/// `autumn-cli/src/routes_audit.rs::path_is_exempt` — that copy runs at build
+/// time over a static route manifest with no live request to normalize, in a
+/// crate this module isn't exported to (`security::path` is `pub(crate)`).
+/// Keep both in sync by hand; `routes_audit.rs`'s doc comment names this
+/// function as the one it mirrors.
+pub fn is_exempt_path(path: &str, exempt_paths: &[String]) -> bool {
+    exempt_paths.iter().any(|prefix| {
+        if path == prefix {
+            true
+        } else if let Some(stripped) = path.strip_prefix(prefix.as_str()) {
+            prefix.ends_with('/') || stripped.starts_with('/')
+        } else {
+            false
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_escapes_decodes_one_level() {
+        let found: Vec<(u8, bool)> = percent_escapes("/a%2Fb%2e%252e%zz%4").collect();
+        assert_eq!(found, [(b'/', true), (b'.', false), (b'%', true)]);
+        assert_eq!(percent_escapes("%%41").collect::<Vec<_>>(), [(b'A', true)]);
+    }
 
     #[test]
     fn passes_through_plain_paths() {
@@ -193,5 +247,58 @@ mod tests {
         assert_eq!(clean_path("/api/a%2e%2e"), "/api/a%2e%2e");
         assert_eq!(clean_path("/api/..."), "/api/...");
         assert_eq!(clean_path("/file.txt"), "/file.txt");
+    }
+
+    #[test]
+    fn is_exempt_path_matches_exact() {
+        let exempt = vec!["/webhooks/stripe".to_string()];
+        assert!(is_exempt_path("/webhooks/stripe", &exempt));
+    }
+
+    #[test]
+    fn is_exempt_path_matches_slash_delimited_subtree() {
+        let exempt = vec!["/webhooks/stripe".to_string()];
+        assert!(is_exempt_path("/webhooks/stripe/events", &exempt));
+    }
+
+    #[test]
+    fn is_exempt_path_rejects_bare_prefix_without_boundary() {
+        // Exempting `/webhooks/stripe` must not also exempt an adjacent route
+        // that merely starts with the same characters.
+        let exempt = vec!["/webhooks/stripe".to_string()];
+        assert!(!is_exempt_path("/webhooks/stripe-admin", &exempt));
+    }
+
+    #[test]
+    fn is_exempt_path_prefix_with_trailing_slash_matches_bare_subtree_root() {
+        let exempt = vec!["/webhooks/".to_string()];
+        assert!(is_exempt_path("/webhooks/stripe", &exempt));
+        assert!(is_exempt_path("/webhooks/", &exempt));
+    }
+
+    #[test]
+    fn is_exempt_path_rejects_non_matching_path() {
+        let exempt = vec!["/webhooks/stripe".to_string()];
+        assert!(!is_exempt_path("/form/submit", &exempt));
+    }
+
+    #[test]
+    fn is_exempt_path_empty_list_matches_nothing() {
+        assert!(!is_exempt_path("/anything", &[]));
+    }
+
+    #[test]
+    fn is_exempt_path_checks_every_configured_prefix() {
+        let exempt = vec!["/api/".to_string(), "/webhooks/stripe".to_string()];
+        assert!(is_exempt_path("/webhooks/stripe/events", &exempt));
+        assert!(is_exempt_path("/api/items", &exempt));
+        assert!(!is_exempt_path("/other", &exempt));
+    }
+
+    #[test]
+    fn is_exempt_path_boundary_check_is_byte_safe_on_multibyte_paths() {
+        let exempt = vec!["/café".to_string()];
+        assert!(is_exempt_path("/café/menu", &exempt));
+        assert!(!is_exempt_path("/café-list", &exempt));
     }
 }

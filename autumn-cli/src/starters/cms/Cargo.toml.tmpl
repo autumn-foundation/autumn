@@ -1,0 +1,38 @@
+[package]
+name = "{{crate_name}}"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# `markdown` gives the safe user-content path (`render_user_content`, which
+# sanitizes through ammonia) that the editor and comment bodies both need;
+# `storage` + `multipart` + `variants` back the media library and its
+# on-demand image thumbnails.
+autumn-web = { version = "{{autumn_version}}", features = [
+    "maud",
+    "htmx",
+    "db",
+    "flash",
+    "markdown",
+    "storage",
+    "multipart",
+    "variants",
+] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
+diesel-async = { version = "0.9", features = ["postgres"] }
+pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
+diesel_migrations = "2"
+maud = { version = "0.27", features = ["axum"] }
+scoped-futures = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+validator = { version = "0.20", features = ["derive"] }
+
+[dev-dependencies]
+autumn-web = { version = "{{autumn_version}}", features = ["test-support"] }
+serde_json = "1"
+
+[workspace]

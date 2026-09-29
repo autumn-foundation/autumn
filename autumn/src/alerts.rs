@@ -60,6 +60,14 @@
 //! added. See [`AppBuilder::with_alert_channel`](crate::app::AppBuilder::with_alert_channel)
 //! and `docs/guide/operator-alerts.md` for the full guide.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -327,7 +335,7 @@ impl AlertBuilder {
                 event,
                 title: String::new(),
                 summary: String::new(),
-                timestamp: Utc::now(),
+                timestamp: crate::time::ambient_now(),
                 host: host_id(),
                 where_to_look: condition.where_to_look().to_owned(),
                 details: HashMap::new(),
@@ -1161,7 +1169,7 @@ impl AlertChannel for WebhookAlertChannel {
                 .post(&self.url)
                 .header("Content-Type", "application/json");
             if let Some(secret) = self.secret.as_ref() {
-                let timestamp = Utc::now().timestamp();
+                let timestamp = crate::time::ambient_now().timestamp();
                 let signing_payload = format!("{timestamp}.{body}");
                 let signature = crate::security::config::hmac_sha256_hex(
                     secret.as_bytes(),
@@ -1271,8 +1279,16 @@ pub fn pagerduty_event_payload(alert: &Alert, routing_key: &str) -> serde_json::
 /// [`Alert::dedup_key`], so a repeating condition folds into a single incident
 /// and a recovery emits a `resolve` event that auto-resolves it. Works against
 /// PagerDuty-Events-compatible endpoints offered by other paging services (set
-/// `[alerts] pagerduty_url`). Uses the SSRF-hardened
-/// [`http_client::Client`](crate::http_client::Client) for the outbound call.
+/// `[alerts] pagerduty_url`).
+///
+/// The endpoint URL is validated only for *shape* — an absolute `http(s)` URL —
+/// at config load and by `autumn doctor`'s `alert_transports` check. The
+/// outbound POST does NOT apply the
+/// [`http_client::Client`](crate::http_client::Client)'s SSRF deny-list /
+/// address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)). Alert
+/// URLs are treated as trusted operator configuration and are intentionally
+/// exempt so operators can page internal endpoints.
 #[cfg(feature = "http-client")]
 pub struct PagerDutyAlertChannel {
     client: crate::http_client::Client,
@@ -1380,8 +1396,16 @@ pub fn slack_message_payload(alert: &Alert) -> serde_json::Value {
 ///
 /// POSTs a human-readable message to a Slack incoming-webhook URL, or to a
 /// Discord webhook's Slack-compatible endpoint (append `/slack`), using one
-/// payload dialect for both. Uses the SSRF-hardened
-/// [`http_client::Client`](crate::http_client::Client) for the outbound call.
+/// payload dialect for both.
+///
+/// The webhook URL is validated only for *shape* — an absolute `https` URL — at
+/// config load and by `autumn doctor`'s `alert_transports` check. The outbound
+/// POST does NOT apply the
+/// [`http_client::Client`](crate::http_client::Client)'s SSRF deny-list /
+/// address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)). Alert
+/// URLs are treated as trusted operator configuration and are intentionally
+/// exempt so operators can alert to internal chat endpoints.
 #[cfg(feature = "http-client")]
 pub struct SlackAlertChannel {
     client: crate::http_client::Client,
@@ -1467,8 +1491,16 @@ impl AlertChannel for SlackAlertChannel {
 /// actually delivers.
 ///
 /// Shared by [`install_from_config`] (runtime wiring) and the CLI `autumn alert
-/// test` command so both agree on exactly which transports are usable. All
-/// outbound calls go through the passed SSRF-hardened `client`.
+/// test` command so both agree on exactly which transports are usable.
+///
+/// All outbound calls go through the passed `client`, but only the transport
+/// URL *shape* is validated (absolute `https` for Slack/Discord; absolute
+/// `http(s)` for `PagerDuty`) — at config load and by `autumn doctor`'s
+/// `alert_transports` check. Dispatch does NOT apply the client's SSRF deny-list
+/// / address pinning (that guard is only enabled via
+/// [`Client::get_ssrf_safe`](crate::http_client::Client::get_ssrf_safe)); alert
+/// URLs are trusted operator configuration and are intentionally exempt so
+/// operators can alert to internal endpoints.
 #[cfg(feature = "http-client")]
 #[must_use]
 pub fn native_transport_channels(
@@ -1689,7 +1721,8 @@ fn build_mail_alert_channel(
         );
         return None;
     }
-    let mail_cfg = state.config().mail;
+    let config = state.config_arc();
+    let mail_cfg = &config.mail;
     if mail_transport_requires_from(mail_cfg.transport)
         && mail_cfg
             .from
@@ -1711,7 +1744,13 @@ fn build_mail_alert_channel(
 
 /// Append the native provider channels (issue #1630, `PagerDuty` / Slack /
 /// Discord) to `channels`, built through [`native_transport_channels`] with the
-/// SSRF-hardened shared HTTP client.
+/// shared HTTP client.
+///
+/// Alert dispatch validates only the transport URL's *shape*; it does NOT apply
+/// the client's SSRF deny-list / address pinning (see
+/// [`native_transport_channels`]). Alert URLs are trusted operator
+/// configuration and are intentionally exempt so operators can alert to
+/// internal endpoints.
 ///
 /// Compiled to a warn-only no-op when the `http-client` feature is off, so a
 /// PagerDuty/Slack/Discord-only config does not silently deliver nothing.
@@ -1885,9 +1924,13 @@ pub fn install_from_config(
     // `sensitive` keeps the dead-lettered-job/scheduled-task alerts off the
     // `/jobs` and `/tasks` endpoints, which are mounted only when `sensitive =
     // true`. The full config is installed on `state` before this runs.
-    let actuator_cfg = state.config().actuator;
+    let app_config = state.config_arc();
+    let actuator_cfg = &app_config.actuator;
     let actuator_sensitive = actuator_cfg.sensitive;
-    let actuator_prefix = actuator_cfg.prefix;
+    // Owned: `AlerterSettings` outlives this handle — it is stored on the
+    // `Alerter` installed as a state extension — so the prefix has to be a
+    // `String` it owns. One field, not the whole config.
+    let actuator_prefix = actuator_cfg.prefix.clone();
     let settings = AlerterSettings::from_config(config, actuator_prefix, actuator_sensitive);
     let alerter = Alerter::new(channels, settings);
     state.insert_extension(alerter.clone());
@@ -2058,7 +2101,7 @@ async fn evaluate_health(
     down_since: &mut HashMap<String, DateTime<Utc>>,
 ) {
     let results = state.health_indicator_registry().run_all().await;
-    let now = Utc::now();
+    let now = crate::time::ambient_now();
     let grace = chrono::Duration::from_std(settings.health_grace)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
 
