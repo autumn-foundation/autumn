@@ -1,2 +1,3 @@
+DROP TABLE IF EXISTS remember_tokens;
 DROP TABLE IF EXISTS projects;
 DROP TABLE IF EXISTS users;

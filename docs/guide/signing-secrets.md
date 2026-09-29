@@ -12,34 +12,47 @@ provisioning, multi-replica setup, and rotation.
 The signing secret is one shared key that protects every HMAC-signed surface
 the framework manages:
 
-| Surface | Why it needs the secret |
-|---|---|
-| **Session cookies** | The session backend signs the session ID embedded in the cookie so it cannot be forged or replayed |
-| **CSRF tokens** | Per-request CSRF tokens are bound to the session and verified with the same key |
-| **Flash / signed-cookie state** | Short-lived cross-request state rides the same signed cookie mechanism |
-| **Local-storage signed URLs** | Blob presigned URLs (served by the local storage backend) are HMAC-SHA256 signed with this key and include an expiry |
-| **Any future framework-owned signed token** | New framework surfaces will share this secret rather than introduce new config knobs |
+| Surface | Why it needs the secret | Signed with no `secret` set? |
+|---|---|---|
+| **Session cookies** | Signs the session ID in the cookie. Stops forgery and replay. | No. Outside `prod`, the cookie is unsigned until you set `secret`. |
+| **CSRF tokens** | Binds each CSRF token to the session. Uses the same key. | No. Same rule as session cookies. |
+| **Flash / signed-cookie state** | Rides inside the session cookie. | No. It follows the session cookie's state. |
+| **Local-storage signed URLs** | Signs presigned blob URLs from the local storage backend. Each URL carries an expiry. | Yes. Uses a random per-process key when `secret` is unset. |
+| **`database.read_your_writes = "session"`** | Signs the `autumn.ryw` cross-request pinning cookie. | No. The cookie is not issued at all when `secret` is unset. |
+
+Outside `prod`, only local-storage signed URLs get a real key with no `secret`
+set. Every other row needs `secret` set — or the `prod`/`production` profile,
+which fails startup without one (see below) — before the framework signs
+anything for it.
 
 ---
 
 ## Development and test (zero-config)
 
-In `dev` and `test` profiles Autumn generates an **ephemeral, per-process random
-key** at startup. You do not need to set anything.
+In `dev` and `test` profiles, an unset `secret` does **not** turn on signing
+for sessions, CSRF tokens, or the RYW cookie. Those stay unsigned. The RYW
+cookie is not even issued. Set `security.signing_secret.secret` to turn
+signing on for them.
 
-**What breaks with an ephemeral key:**
+Only local-storage signed URLs always get a key: Autumn generates a random,
+per-process key for them at startup. You do not need to set anything for
+local development to work.
+
+**What that means day to day:**
 
 | Scenario | Consequence |
 |---|---|
-| Process restart | All existing sessions are invalidated immediately |
-| Signed URLs from a previous process | Return `403 Forbidden` — the signature cannot be verified |
-| Multiple dev replicas | Sessions started on one replica are not readable by another |
-| `database.read_your_writes = "session"` | The ephemeral key is deliberately **not** threaded into the RYW middleware (see `router.rs`), so the `autumn.ryw` cookie is never issued — cross-request pinning silently does nothing until a secret is configured. A warning is logged at startup. `request` mode is unaffected (it needs no cookie). |
+| Process restart, default in-memory session store | Sessions are gone. The store is process-local memory. No key rotated — there was no key. |
+| Process restart, session store backed by Redis or another persistent store | Old session cookies keep working. No key exists to rotate. |
+| Local-storage signed URLs from a previous process | Return `403 Forbidden`. The per-process key rotated. |
+| Multiple dev replicas, local-storage signed URLs | A URL signed by one replica fails on another. Each replica has its own key. |
+| Multiple dev replicas, sessions on a shared store (e.g. Redis) | Sessions work across replicas. With no key, any replica holding the store can read the same unsigned ID. (The default in-memory store still keeps replicas apart — because it is process-local, not because of signing.) |
+| `database.read_your_writes = "session"` | No `autumn.ryw` cookie is issued. Cross-request pinning silently does nothing until you set a secret. A warning is logged at startup. `request` mode is unaffected — it needs no cookie. |
 
-This is intentional: ephemeral keys keep local development zero-config and
-ensure you never accidentally use a development secret in production. The
-`autumn doctor` command reports this state as a **warning** so you know what
-to expect.
+This is intentional. An unset secret keeps local development zero-config and
+stops a development secret from reaching production by accident. The `autumn
+doctor` command reports this state as a **warning** so you know what to
+expect.
 
 ---
 
@@ -243,7 +256,7 @@ The `signing_secret` check reports:
 | Outcome | Status | Meaning |
 |---|---|---|
 | Production, valid secret | ✅ Pass | Ready to deploy |
-| Dev, no secret configured | ⚠️ Warn | Ephemeral key in use; fine for local dev |
+| Dev, no secret configured | ⚠️ Warn | Sessions and CSRF tokens are unsigned; fine for local dev |
 | Production, missing | ❌ Fail | Set `AUTUMN_SECURITY__SIGNING_SECRET` |
 | Production, too short | ❌ Fail | Generate a new secret with `openssl rand -hex 32` |
 | Production, demo value | ❌ Fail | Generate a new secret with `openssl rand -hex 32` |
