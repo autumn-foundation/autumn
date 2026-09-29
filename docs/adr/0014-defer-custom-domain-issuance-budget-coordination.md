@@ -84,21 +84,39 @@ Reproduce with the commands in **Reproduce** below.
    domain's still-counting attempts on the next restart, letting the
    deployment-wide budget run over exactly the case it exists to catch.
 4. **This is not a new architecture question — ADR 0004 already answered
-   it in the abstract**, and this repository's evidence bar (Step 7:
-   "check for prior decisions") requires citing that rather than re-deciding
-   it. ADR 0004 ("Externalize Distributed Runtime State", 2026-04-09)
-   classifies "rate-limit counters" as Category 3 ("Shared Mutable Runtime
-   State") that "must use pluggable external backends in production-safe
-   deployments" — but the same ADR's own risk list names "over-externalizing"
-   and "adding too many backends too early" as live failure modes to avoid,
-   and its Coordination Strategy section prefers Postgres-backed leases
-   "where that keeps the system simple" over building new distributed
-   machinery on spec. `autumn/src/security/rate_limit.rs` shows what the
-   ADR 0004-compliant shape looks like when the fleet-wide case is real: an
-   explicit `"memory"` vs `"redis"` backend choice, config-selected, tested
-   under `redis_job_admin`-style CI coverage per CLAUDE.md's CI notes. No
-   comparable multi-backend need has been demonstrated for the issuance
-   limiter.
+   it in the abstract — and this ADR reconciles with, rather than silently
+   contradicts, ADR 0004's Category 3 "must."** ADR 0004 ("Externalize
+   Distributed Runtime State", 2026-04-09, Status: Proposed) classifies
+   "rate-limit counters" — which `IssuanceLimiter` structurally is — as
+   Category 3 ("Shared Mutable Runtime State"), and its Decision section
+   states plainly: "This must use pluggable external backends in
+   production-safe deployments." Read on its own, that "must" is in direct
+   tension with this ADR's default path, which leaves the limiter
+   per-process — that tension is real and is not resolved by citing ADR
+   0004's risks in isolation, as an earlier draft of this ADR did. Read in
+   the context ADR 0004 itself gives that sentence, the tension resolves
+   instead of just being cited past: the same document names "Supporting
+   every possible cache or session backend in Phase 1" a Non-Goal, names
+   "adding too many backends too early" and "over-externalizing" as Risks
+   to actively avoid, and stages its own rollout one target at a time —
+   "the first mandatory externalization target is session state," with the
+   rest of Category 3 following as evidence of real need arrives, not as a
+   single simultaneous mandate the ADR's date already forces.
+   `autumn/src/security/rate_limit.rs` is the proof that rollout happens:
+   its `"redis"` backend, documented as "share the budget across all pods,"
+   *is* ADR 0004's Category-3 answer, built once a real fleet-wide need
+   existed for that specific counter — durable-state option 3 for
+   `IssuanceLimiter` would be the same answer, not a cheaper substitute for
+   it (see Default path below, which does not claim otherwise). No
+   comparable evidenced need has reached `IssuanceLimiter` yet (Evidence
+   items 6-7): the default value is miscalibrated, not the architecture
+   proven wrong. **This ADR is therefore a scoped, evidence-gated exception
+   to ADR 0004's Category 3, not a supersession of it**: it defers *when*
+   `IssuanceLimiter` gets a pluggable external backend, using exactly the
+   criterion — a real, evidenced fleet-wide need — that ADR 0004's own
+   Risks and Non-Goals sections say should gate that decision. It does not
+   dispute that the limiter eventually belongs on that backend. The Trigger
+   section below is what turns "eventually" into "now."
 5. **The seam for fleet-wide coordination, if it is ever needed, already
    exists and needs nothing new built to stay open.** ADR 0010 ("Expose an
    App-Facing Distributed Lock", accepted 2026-07-09) already generalized
@@ -190,19 +208,21 @@ floor asks for, and it would be dishonest to wave it off as unmet. It does
 not, however, clear the floor *for option 3*: the requirement that fails is
 that the **default value** of `global_per_hour` assumes one process, not
 that the architecture must become distributed to hold the guarantee.
-Lowering the default (or documenting that an operator running N replicas
-must divide their configured `global_per_hour` by N — the same shape
-`rate_limit.rs` already documents for its own multi-replica story) closes
-the identical arithmetic gap at config/doc cost: no new call site, no new
-store, no coordination primitive, smaller even than durable-state option
-1's own fix. Per this framework's instruction to take the smallest decision
-that closes the question, that config/documentation fix — not option 3 —
-is what condition 4 actually calls for; it is added to Default path below
-as a fifth action item rather than left to the trigger. With condition 4's
-gap closed by that cheaper fix instead of by option 3, and none of the
-other five conditions met, this still does not clear the floor for
-*option 3* — it is not RFC-worthy today, but the default-value gap it
-surfaced is real and is not being deferred alongside it.
+Lowering the default so it keeps a small number of replicas, not only
+N=1, inside the vendor limit closes the identical arithmetic gap at
+config/doc cost: no new call site, no new store, no coordination primitive,
+smaller even than durable-state option 1's own fix — see Default path
+below, which is explicit that this is not a "divide by N" feature (no such
+feature exists; see Evidence item 4). Per this framework's instruction to
+take the smallest decision that closes the question, that config/
+documentation fix — not option 3 — is what condition 4 actually calls for
+today; it is added to Default path below as a fifth action item rather
+than left to the trigger. With condition 4's immediate gap closed by that
+cheaper fix instead of by option 3, and none of the other five conditions
+met, this still does not clear the floor for *building option 3 now* — it
+is not RFC-worthy today, but per Evidence item 4 it is an explicit,
+evidence-gated exception to ADR 0004's Category 3 "must," not a claim that
+`IssuanceLimiter` never needs a pluggable backend.
 
 ## Default path
 
@@ -223,15 +243,19 @@ it in this pass — durability and cross-replica coordination are separate
 questions, and only the latter is what this ADR defers.
 
 A fifth action item, surfaced by this review rather than by #2644 itself:
-recalibrate `default_custom_domains_global_per_hour` (`config.rs:10233`,
-currently `50`) or document a "divide your configured `global_per_hour` by
-your replica count" rule — matching the shape `rate_limit.rs` already
-documents for its own multi-replica story — so that the account stays
-inside Let's Encrypt's 300-orders-per-3-hours limit at whatever replica
-count a deployment actually runs (see Evidence item 7 and Impact floor
-condition 4). This is a config-default or documentation change, not code
-architecture; it needs no ADR of its own and rides the same PR as items
-1/3/4.
+lower `default_custom_domains_global_per_hour` (`config.rs:10233`,
+currently `50`) so the shipped default keeps a small number of replicas —
+not only N=1 — inside Let's Encrypt's 300-orders-per-3-hours account limit
+(see Evidence item 7 and Impact floor condition 4), and document that an
+operator whose real replica count exceeds what the new default assumes has
+two honest options: lower `global_per_hour` further in their own config
+proportional to their replica count, or treat that as their trigger (below)
+to request the Redis-backed Category-3 backend `rate_limit.rs` already
+demonstrates the shape of. This is not a "divide by N" feature the limiter
+gains — no such feature exists, and inventing one here would be exactly the
+kind of new machinery Default path already declines to build. It is a
+config-default and documentation change; it needs no ADR of its own and
+rides the same PR as items 1/3/4.
 
 ## Seam kept open
 
