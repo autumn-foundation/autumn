@@ -1388,13 +1388,14 @@ An `#[edge]` capsule never sees cookies, session ids, signing keys or store
 credentials. The **host** resolves identity before the capsule runs and passes
 only normalized claims: `EdgeIdentity { user_id: EdgeUserId, roles: Vec<EdgeRole> }`
 (re-exported from `autumn_web::edge_support`), taken as a handler extractor.
-`EdgeIdentity` is also in `autumn_edge::prelude`. A request without one
-rejects with `EdgeIdentityRequired` and falls through to origin instead of
-running the capsule.
+`EdgeIdentity` is also in `autumn_edge::prelude`. A handler taking it must
+declare `#[edge(needs(identity))]` (a build error otherwise); a request without
+host-verified claims then falls through to origin before dispatch, so no
+extractor or handler code runs.
 
 ```rust
 #[get("/me")]
-#[edge]
+#[edge(needs(identity))]
 pub async fn whoami(identity: EdgeIdentity) -> String {
     identity.user_id().as_str().to_owned()
 }

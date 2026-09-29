@@ -7,6 +7,7 @@
 //! no wasm target and no host in the loop.
 
 use std::io::{Cursor, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_edge::prelude::*;
@@ -37,6 +38,15 @@ async fn note(Path(key): Path<String>, cache: EdgeCache) -> String {
 
 async fn whoami(identity: EdgeIdentity) -> String {
     identity.user_id().as_str().to_owned()
+}
+
+/// Counts every call. Declares `needs(identity)` but takes no `EdgeIdentity`,
+/// so only the pre-dispatch gate — not an extractor — can keep it from running.
+static GATED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+async fn identity_gated() -> &'static str {
+    GATED_CALLS.fetch_add(1, Ordering::SeqCst);
+    "ran"
 }
 
 /// A handler that declines explicitly by setting the sentinel itself.
@@ -124,7 +134,14 @@ fn routes() -> Vec<EdgeRoute> {
             path: "/whoami",
             handler: edge_get(whoami),
             name: "whoami",
-            needs: &[],
+            needs: &[EdgeCapability::Identity],
+        },
+        EdgeRoute {
+            method: http::Method::GET,
+            path: "/gated",
+            handler: edge_get(identity_gated),
+            name: "identity_gated",
+            needs: &[EdgeCapability::Identity],
         },
         EdgeRoute {
             method: http::Method::GET,
@@ -212,6 +229,42 @@ fn identity_required_miss_falls_through_without_calling_handler() {
             ..
         }
     ));
+}
+
+/// The identity gate runs before dispatch: no extractor and no handler code
+/// executes for an unauthenticated request, even when the host (wrongly)
+/// lists `identity` as provided without sending claims.
+#[test]
+fn identity_gate_declines_before_dispatch() {
+    let before = GATED_CALLS.load(Ordering::SeqCst);
+    let frames = drive(&[
+        request_line(EdgeRequest::get("/gated"), &[]),
+        request_line(EdgeRequest::get("/gated"), &[EdgeCapability::Identity]),
+    ]);
+    for frame in &frames {
+        assert!(
+            matches!(
+                frame,
+                GuestFrame::Fallthrough {
+                    reason: FallthroughReason::MissingCapability,
+                    ..
+                }
+            ),
+            "{frame:?}"
+        );
+    }
+    assert_eq!(GATED_CALLS.load(Ordering::SeqCst), before);
+
+    let identity = EdgeIdentity::new(EdgeUserId::new("alice"), Vec::new());
+    let frames = drive(&[request_line(
+        EdgeRequest::get("/gated").with_identity(identity),
+        &[],
+    )]);
+    let GuestFrame::Response(response) = &frames[0] else {
+        panic!("expected response, got {:?}", frames[0]);
+    };
+    assert_eq!(response.body, b"ran");
+    assert_eq!(GATED_CALLS.load(Ordering::SeqCst), before + 1);
 }
 
 // ── in-memory transport ──────────────────────────────────────────────

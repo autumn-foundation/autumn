@@ -221,6 +221,8 @@ where
         );
     };
 
+    let provided_capabilities =
+        effective_capabilities(provided_capabilities, request.identity.is_some());
     if let Some(missing) = missing_capability(probe, &request.uri, &provided_capabilities) {
         return EdgeOutcome::fallthrough(
             FallthroughReason::MissingCapability,
@@ -241,6 +243,21 @@ where
 fn edge_eligible_method(raw: &str) -> Option<http::Method> {
     let method = http::Method::from_bytes(raw.as_bytes()).ok()?;
     (method == http::Method::GET || method == http::Method::HEAD).then_some(method)
+}
+
+/// The capabilities this request actually has. `identity` is per request: it
+/// is provided exactly when the frame carries host-verified claims, so a host
+/// listing it without sending an identity cannot let an identity-requiring
+/// route reach dispatch.
+fn effective_capabilities(
+    mut provided: Vec<EdgeCapability>,
+    has_identity: bool,
+) -> Vec<EdgeCapability> {
+    provided.retain(|capability| *capability != EdgeCapability::Identity);
+    if has_identity {
+        provided.push(EdgeCapability::Identity);
+    }
+    provided
 }
 
 /// The first declared capability the host did not provide, if any. `None` for
