@@ -115,6 +115,19 @@ Each entry in the JSON array follows this schema:
 | `"plugin:<name>"` | Registered by a named Autumn plugin (e.g. `"plugin:autumn-admin"`) |
 | `"framework"` | Registered by the Autumn framework itself |
 
+## Postman output
+
+Emit a [Postman](https://www.postman.com/) v2.1 collection you can import
+directly:
+
+```bash
+autumn routes --format postman > autumn.postman_collection.json
+```
+
+Each route becomes one request named `METHOD /path`. Path parameters such as
+`{id}` are rewritten to Postman's `:id` form, and every URL starts with the
+`{{base_url}}` collection variable, which defaults to `http://localhost:3000`.
+
 ## WebSocket routes
 
 Routes registered with `#[ws]` appear with method `WS`:
