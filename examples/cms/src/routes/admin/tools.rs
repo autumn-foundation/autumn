@@ -1715,6 +1715,7 @@ pub async fn import(
             let wanted_status = import_status(&post.status, post.published_at).to_owned();
             let ours_id = ours.id;
             let current_status = ours.status.clone();
+            let ours_type = ours.post_type.clone();
             // The discussion is restored in the same transaction as the terms
             // and the status, and *before* the transition: publishing the post
             // first left it publicly commentable with no discussion in between,
@@ -1735,6 +1736,19 @@ pub async fn import(
                     )
                     .await?;
                     conn.transaction(async move |conn| {
+                        // The hierarchy lock before any post row lock — the
+                        // order every hierarchy mutation follows. The
+                        // transition below takes it itself, but only after
+                        // `import_comments` has locked the post row, which
+                        // deadlocks against a concurrent re-parent of this
+                        // post. Held from here whenever the transition will
+                        // need it (see `transition_status`).
+                        if wanted_status != current_status
+                            && (wanted_status == "trash"
+                                || content::is_hierarchical_type(&ours_type))
+                        {
+                            content::lock_page_hierarchy(conn).await?;
+                        }
                         content::set_post_terms(conn, ours_id, term_ids).await?;
                         let discussion_restored =
                             content::import_comments(conn, ours_id, &incoming).await?;

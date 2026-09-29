@@ -966,10 +966,13 @@ pub async fn moderate_comment(
 
         // Which approved replies the thread page already cannot show, so the
         // check after the update can tell what *this* approval evicted.
-        let unreadable_before: Vec<i64> = if target == "approved" {
-            unrendered_approved_replies(conn, comment.post_id).await?
+        let unreadable_before: std::collections::HashSet<i64> = if target == "approved" {
+            unrendered_approved_replies(conn, comment.post_id)
+                .await?
+                .into_iter()
+                .collect()
         } else {
-            Vec::new()
+            std::collections::HashSet::new()
         };
 
         let saved: Comment = diesel::update(comments::table.find(comment_id))
@@ -1128,10 +1131,13 @@ pub async fn create_comment(
         let post_id = new.post_id;
         // What the thread page already cannot show, so the check after the
         // insert can tell what *this* comment evicted.
-        let unreadable_before: Vec<i64> = if approved {
-            unrendered_approved_replies(conn, post_id).await?
+        let unreadable_before: std::collections::HashSet<i64> = if approved {
+            unrendered_approved_replies(conn, post_id)
+                .await?
+                .into_iter()
+                .collect()
         } else {
-            Vec::new()
+            std::collections::HashSet::new()
         };
         let saved: Comment = diesel::insert_into(comments::table)
             .values(&new)
@@ -4871,7 +4877,11 @@ pub async fn import_comments(
         // What the thread page already cannot show, so the check after the
         // restore rejects only what *this* import made unreadable: a retry on a
         // post that was over the window before must not fail forever on it.
-        let unreadable_before = unrendered_approved_replies(conn, post_id).await?;
+        let unreadable_before: std::collections::HashSet<i64> =
+            unrendered_approved_replies(conn, post_id)
+                .await?
+                .into_iter()
+                .collect();
 
         let mut created = 0usize;
         let mut level: Vec<(Option<i64>, &ImportedComment)> =
