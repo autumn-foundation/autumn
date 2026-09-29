@@ -964,6 +964,14 @@ pub async fn moderate_comment(
             }
         }
 
+        // Which approved replies the thread page already cannot show, so the
+        // check after the update can tell what *this* approval evicted.
+        let unreadable_before: Vec<i64> = if target == "approved" && comment.parent_id.is_some() {
+            unrendered_approved_replies(conn, comment.post_id).await?
+        } else {
+            Vec::new()
+        };
+
         let saved: Comment = diesel::update(comments::table.find(comment_id))
             .set(comments::status.eq(&target))
             .returning(Comment::as_returning())
@@ -974,9 +982,16 @@ pub async fn moderate_comment(
         // count a comment no reader can reach — the same state the write path
         // refuses to create. Refuse the approval instead; the moderator can
         // spam or delete the reply.
+        //
+        // The whole thread is re-checked, not just this row: an older reply
+        // approved onto a full page sorts into the window and can evict a newer
+        // one that was already showing.
         if target == "approved"
             && saved.parent_id.is_some()
-            && !approved_reply_is_renderable(conn, saved.id).await?
+            && unrendered_approved_replies(conn, saved.post_id)
+                .await?
+                .iter()
+                .any(|id| !unreadable_before.contains(id))
         {
             return Err(AutumnError::unprocessable_msg(
                 "This conversation has reached its display limit, so this reply cannot be shown",
@@ -4811,8 +4826,11 @@ pub async fn import_comments(
         type LegacyKey = (Option<i64>, Option<i64>, String, String, String, i64);
         let mut existing: std::collections::HashMap<LegacyKey, Vec<i64>> =
             std::collections::HashMap::new();
+        // Newest id first so `pop` hands out the oldest: identical siblings
+        // were inserted in file order, and take their rows back in that order.
         let present: Vec<Comment> = comments::table
             .filter(comments::post_id.eq(post_id))
+            .order(comments::id.desc())
             .select(Comment::as_select())
             .load(conn)
             .await?;
@@ -4927,7 +4945,11 @@ pub async fn import_comments(
         // Every approved reply on the post, not just the rows this call
         // inserted: older backup rows can fill a page's window and push out a
         // visitor reply that was visible before the merge.
-        if let Some(id) = first_unrendered_approved_reply(conn, post_id).await? {
+        if let Some(id) = unrendered_approved_replies(conn, post_id)
+            .await?
+            .into_iter()
+            .next()
+        {
             return Err(AutumnError::unprocessable_msg(format!(
                 "comment {id} is beyond the display budget and cannot be shown"
             )));
@@ -5491,7 +5513,7 @@ pub async fn approved_reply_is_renderable(
     approved_comment_is_rendered(conn, comment_id, page).await
 }
 
-/// The first approved reply on a post that no thread page renders, if any.
+/// Every approved reply on a post that no thread page renders.
 ///
 /// The batch form of [`approved_reply_is_renderable`], for callers that must
 /// vet a whole discussion at once. It replays the renderer's own
@@ -5499,12 +5521,12 @@ pub async fn approved_reply_is_renderable(
 /// the post's approved replies, so a thread of thousands of comments costs a
 /// few queries per page instead of several per reply. A post whose approved
 /// comments all fit one page's budget skips even that: nothing can truncate.
-pub async fn first_unrendered_approved_reply(
+pub async fn unrendered_approved_replies(
     conn: &mut AsyncPgConnection,
     post_id: i64,
-) -> AutumnResult<Option<i64>> {
+) -> AutumnResult<Vec<i64>> {
     if approved_comment_count(conn, post_id).await? <= MAX_THREAD_COMMENTS {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut rendered: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut offset = 0_i64;
@@ -5524,7 +5546,10 @@ pub async fn first_unrendered_approved_reply(
         .select(comments::id)
         .load(conn)
         .await?;
-    Ok(replies.into_iter().find(|id| !rendered.contains(id)))
+    Ok(replies
+        .into_iter()
+        .filter(|id| !rendered.contains(id))
+        .collect())
 }
 
 /// Which page of a post's approved thread a comment appears on, if any.
