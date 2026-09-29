@@ -221,9 +221,11 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64, i64, i64) {
 fn explain(conn: &mut PgConnection, label: &str, sql: &str) {
     use diesel::RunQueryDsl;
     println!("\n=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): {label} ===");
-    let lines = diesel::sql_query(format!("EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) {sql}"))
-        .load::<ExplainLine>(conn)
-        .expect("explain");
+    let lines = diesel::sql_query(format!(
+        "EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) {sql}"
+    ))
+    .load::<ExplainLine>(conn)
+    .expect("explain");
     for line in lines {
         println!("{}", line.line);
     }
@@ -282,13 +284,21 @@ async fn post_terms_batch_profile() {
     // The two statement shapes at issue, planned against the real fixture:
     // the per-term lookup `find_by_id` issues, and the single `ANY` lookup
     // that resolves every term at once.
-    explain(&mut conn, "post_terms links for the 12-term post", &format!(
-        "SELECT * FROM post_terms WHERE post_id = {}", measured[2].0
-    ));
-    explain(&mut conn, "one terms.id = $1 lookup (per-term find_by_id shape)",
-        "SELECT * FROM terms WHERE terms.id = 5");
-    explain(&mut conn, "one terms.id = ANY($1) lookup (12 ids)",
-        "SELECT * FROM terms WHERE terms.id = ANY(ARRAY[5,42,79,116,153,190,227,264,301,338,375,412])");
+    explain(
+        &mut conn,
+        "post_terms links for the 12-term post",
+        &format!("SELECT * FROM post_terms WHERE post_id = {}", measured[2].0),
+    );
+    explain(
+        &mut conn,
+        "one terms.id = $1 lookup (per-term find_by_id shape)",
+        "SELECT * FROM terms WHERE terms.id = 5",
+    );
+    explain(
+        &mut conn,
+        "one terms.id = ANY($1) lookup (12 ids)",
+        "SELECT * FROM terms WHERE terms.id = ANY(ARRAY[5,42,79,116,153,190,227,264,301,338,375,412])",
+    );
 
     println!("\n#################### MEASURED: GET /archives/{{id}} ####################");
     let mut summary = Vec::new();
@@ -315,7 +325,11 @@ async fn post_terms_batch_profile() {
         }
         let (calls, buffers, t_calls, t_buffers) =
             print_profile(&mut conn, &format!("k={k} terms (post id {id})"));
-        println!("-- body: {} bytes, hash {:016x} --", body.len(), body_hash(&body));
+        println!(
+            "-- body: {} bytes, hash {:016x} --",
+            body.len(),
+            body_hash(&body)
+        );
         summary.push((*k, calls, buffers, t_calls, t_buffers));
     }
 

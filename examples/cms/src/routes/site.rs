@@ -484,18 +484,23 @@ impl Repos {
 
     /// The terms a post is filed under, across every taxonomy.
     ///
-    /// Two queries: the filings, then the terms. A post carries a handful of
-    /// terms, so loading them individually is bounded by the editor's patience
-    /// rather than by the size of the site.
+    /// Two queries however many terms the post carries: the filings, then every
+    /// term they name in one `id = ANY(...)` lookup (this used to be
+    /// one `find_by_id` per filing, `1 + k` statements on every public
+    /// single-post view). Order follows the filings; a filing whose term has
+    /// gone is skipped, as before.
     pub async fn post_terms(&self, post_id: i64) -> AutumnResult<Vec<Term>> {
         let links = self.post_term_links.find_by_post_id(post_id).await?;
-        let mut terms = Vec::with_capacity(links.len());
-        for link in links {
-            if let Some(term) = self.terms.find_by_id(link.term_id).await? {
-                terms.push(term);
-            }
+        if links.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(terms)
+        let ids: Vec<i64> = links.iter().map(|link| link.term_id).collect();
+        let mut conn = self.conn().await?;
+        let by_id = crate::content::terms_by_ids(&mut conn, &ids).await?;
+        Ok(links
+            .iter()
+            .filter_map(|link| by_id.get(&link.term_id).cloned())
+            .collect())
     }
 
     /// The published posts filed under a term, newest first, for one page of an
