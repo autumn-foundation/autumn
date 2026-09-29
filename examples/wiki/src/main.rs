@@ -14,6 +14,12 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 #[autumn_web::main]
 async fn main() {
     autumn_web::app()
+        // Required by `commit_hooks = true` (src/repositories.rs) and by
+        // `[jobs] backend = "postgres"` (autumn.toml): the durable
+        // repository-commit-hook queue and the Postgres job-queue tables
+        // both live in the framework's own migration set, not wiki's.
+        // Matches examples/reddit-clone's main.rs.
+        .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
         .plugin(wiki::search_plugin())
         .routes(wiki::all_routes())
