@@ -192,8 +192,10 @@ fn print_profile(conn: &mut PgConnection, label: &str) -> (i64, i64, i64, i64) {
     let (mut calls, mut buffers, mut t_calls, mut t_buffers) = (0, 0, 0, 0);
     for row in &rows {
         let normalized = row.query.split_whitespace().collect::<Vec<_>>().join(" ");
-        let is_terms = normalized.contains("FROM terms")
-            && (normalized.contains("terms.id = $1") || normalized.contains("terms.id = ANY"));
+        let is_terms = normalized.contains("FROM \"terms\"")
+            && (normalized.contains("\"terms\".\"id\" = $1")
+                || normalized.contains("\"terms\".\"id\" = ANY")
+                || normalized.contains("\"terms\".\"id\" IN"));
         println!(
             "calls={:<4} buffers={:<5}{} {normalized}",
             row.calls,
