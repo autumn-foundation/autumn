@@ -1,0 +1,5 @@
+error: #[endpoint] must sit directly above the route attribute (`#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]`): it reads the method and path from it, and the handler's signature before the route macro rewrites it
+  --> tests/compile-fail/wire_endpoint_below_route_attribute.rs:13:5
+   |
+13 | pub async fn get_item(id: Path<String>) -> AutumnResult<Json<Item>> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

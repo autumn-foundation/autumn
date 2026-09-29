@@ -1,5 +1,14 @@
 # Echo DX Audit Complaint
 
+> **Resolved.** Both findings below are fixed.
+> - "Leaky Macro Error Messages": `route_macro` now re-emits the handler and a
+>   stub `__autumn_route_info_*` companion when the route attribute fails to
+>   parse, so `#[get()]` reports one error instead of three (Onramp,
+>   autumn-macros/src/route.rs's `emit_with_attr_parse_error`, regression
+>   fixture `autumn/tests/compile-fail/route_attr_error_cascades_through_routes.rs`).
+> - "Verbose Extractor Import": `Path` is already re-exported from
+>   `autumn_web::prelude` (`autumn/src/prelude.rs`).
+
 ## 1. Experience - The Walkthrough
 I followed the README Quickstart:
 - Ran `autumn new my-app2`

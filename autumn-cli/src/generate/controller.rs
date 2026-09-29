@@ -20,7 +20,7 @@
 //!
 //! # Modes
 //!
-//! - HTML (default): each action returns a Maud [`Markup`](maud::Markup) stub
+//! - HTML (default): each action returns a Maud `Markup` stub
 //!   rendered through a local `layout(...)` helper → HTTP 200 with placeholder
 //!   content.
 //! - `--api`: each action returns `AutumnResult<Json<serde_json::Value>>` with a

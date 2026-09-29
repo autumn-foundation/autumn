@@ -40,21 +40,21 @@ changelog_entry_for_version() {
 }
 
 changelog_has_breaking_section() {
-  local version="$1"
-  # Keep this in one awk process. `awk | grep -q` is flaky under `pipefail`:
-  # grep exits after the first match, awk can receive SIGPIPE while writing the
-  # rest of a long changelog entry, and the pipeline reports a false negative.
-  awk -v ver="$version" '
-    $0 ~ "^## \\[" ver "\\]" { in_version = 1; next }
-    /^## \[/                 { in_version = 0 }
-    in_version {
-      line = tolower($0)
-      if (line ~ /^[[:space:]]*###[[:space:]]+breaking([[:space:]]|$)/) {
-        found = 1
-      }
-    }
-    END { exit found ? 0 : 1 }
-  ' CHANGELOG.md
+  local version="$1" inventory count
+
+  # Delegate to the migration-guide gate rather than keeping a second regex
+  # here. Two detectors drift: this one used to look for a `### Breaking`
+  # heading that no release section in this changelog has ever carried, so it
+  # never fired, and a copy that missed the gate's code-span and suppression
+  # rules would fail a release the gate passes with no way to satisfy both.
+  # `--list` prints one row per changelog section:
+  #   SECTION  GUIDE  IN-SCOPE  BREAKING-ENTRIES
+  inventory="$(scripts/check-migration-guides.sh --list)"
+  count="$(
+    awk -v ver="$version" '$1 == ver { print $4 + 0; found = 1 }
+                           END { if (!found) print 0 }' <<<"$inventory"
+  )"
+  [[ "${count:-0}" -gt 0 ]]
 }
 
 # Workspace version (canonical version for all published crates).
@@ -117,7 +117,12 @@ else
 fi
 
 if $is_breaking; then
-  migration_file="docs/migrations/${workspace_version}.md"
+  # A release candidate is gated against its release's guide: `0.7.0-rc.1`
+  # wants `docs/migrations/0.7.0.md`. Keep this in step with the same mapping
+  # in scripts/check-migration-guides.sh — a prerelease that satisfies one gate
+  # and blocks the other is worse than either gate alone.
+  release_version="${workspace_version%%-*}"
+  migration_file="docs/migrations/${release_version}.md"
   if [[ ! -f "$migration_file" ]]; then
     die "breaking release detected but no migration guide found at $migration_file. Create the stub before tagging."
   fi

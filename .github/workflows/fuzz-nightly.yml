@@ -39,13 +39,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [idempotency, routing, headers, session, body]
+        target: [idempotency, routing, headers, session, body, dns, sandbox, sim_ops]
     steps:
       - uses: actions/checkout@v7
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        # Pin @v2 and pass the tool explicitly. The bare @cargo-fuzz tag form can
+        # resolve with an empty tool input and install nothing (broke the Fuzz
+        # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
+        uses: taiki-e/install-action@v2.87.11
+        with:
+          tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2.7.8
         with:
           workspaces: fuzz
@@ -56,7 +61,7 @@ jobs:
       # to the newest prior cache for this target+ref if the exact key misses, so
       # the corpus is never silently reset to the committed seeds alone.
       - name: Restore persisted corpus
-        uses: actions/cache@v7
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.ref }}-${{ github.run_id }}
@@ -64,7 +69,10 @@ jobs:
             fuzz-corpus-${{ matrix.target }}-${{ github.ref }}-
             fuzz-corpus-${{ matrix.target }}-
       - name: Fuzz ${{ matrix.target }} (5 min, corpus persisted across runs)
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -timeout=10
+        # Force the gnu host target: cargo-fuzz is installed as a musl-static binary
+        # (via install-action's cargo-binstall fallback) and would otherwise default to
+        # x86_64-unknown-linux-musl, where the ASAN build fails (sanitizer vs static libc).
+        run: cargo +nightly fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=300 -timeout=10
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@v7
