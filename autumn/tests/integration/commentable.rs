@@ -1092,61 +1092,125 @@ async fn a_hard_delete_comments_table_removes_the_subtree_outright() {
     assert_eq!(remaining, 0, "hard delete leaves nothing behind");
 }
 
-/// Issues #2285/#2275: a cross-record `parent_id` edge (writable only outside
-/// the framework — `add_comment` refuses it, so this test grafts it with raw
-/// SQL the way an import, backfill, or hand edit would) must not let the
-/// hard-delete path's `ON DELETE CASCADE` silently remove another record's
-/// rows while its counter is never adjusted. The delete is refused, loudly,
-/// before anything is removed: both counters and every row stay exactly as
-/// they were.
+/// Issue #2275: a hard delete must not cascade into another record.
+///
+/// The walk skips a reply on another record, but the `parent_id` cascade does
+/// not. The delete would remove that reply, report a smaller count, and leave
+/// the other record's counter too high. The delete must fail and remove
+/// nothing.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn a_hard_delete_refuses_a_cross_record_parent_id_edge() {
+async fn a_hard_delete_refuses_a_subtree_with_a_reply_on_another_record() {
     let (pool, _container) = setup_pool().await;
     let repo = PgCmtHardRepository::with_pool_untracked(pool.clone());
     let mut conn = pool.get().await.expect("conn");
     let author = seed_user(&mut conn, "ada").await;
-    let record_a = seed_one_col(&mut conn, "cmt_hards", "title", "a").await;
-    let record_b = seed_one_col(&mut conn, "cmt_hards", "title", "b").await;
+    let mine = seed_one_col(&mut conn, "cmt_hards", "title", "a").await;
+    let other = seed_one_col(&mut conn, "cmt_hards", "title", "b").await;
 
-    let root_a = repo
-        .add_comment(record_a, author, "a-root", None)
+    let root = repo
+        .add_comment(mine, author, "a", None)
         .await
-        .expect("a root");
-    let stray_b = repo
-        .add_comment(record_b, author, "b-stray", None)
+        .expect("root");
+    let reply = repo
+        .add_comment(mine, author, "a1", Some(root.id))
         .await
-        .expect("b stray");
-    assert_eq!(counter(&mut conn, "cmt_hards", record_a).await, 1);
-    assert_eq!(counter(&mut conn, "cmt_hards", record_b).await, 1);
+        .expect("reply");
+    let foreign = repo
+        .add_comment(other, author, "b", None)
+        .await
+        .expect("foreign");
+    repo.add_comment(other, author, "b1", Some(foreign.id))
+        .await
+        .expect("foreign reply");
 
-    // The framework's own write path refuses this graft; only raw SQL can
-    // create it.
+    // The framework cannot write this edge. Imported data or raw SQL can.
     diesel::sql_query("UPDATE cmt_hard_comments SET parent_id = $1 WHERE id = $2")
-        .bind::<BigInt, _>(root_a.id)
-        .bind::<BigInt, _>(stray_b.id)
+        .bind::<BigInt, _>(reply.id)
+        .bind::<BigInt, _>(foreign.id)
         .execute(&mut conn)
         .await
-        .expect("graft the stray");
+        .expect("graft across records");
 
     let err = repo
-        .delete_comment(record_a, root_a.id)
+        .delete_comment(mine, root.id)
         .await
-        .expect_err("a cross-record edge must refuse the hard delete");
-    assert_eq!(err.status().as_u16(), 422);
-    let msg = err.to_string();
-    assert!(msg.contains("another record"), "directed error, got: {msg}");
+        .expect_err("the cascade would cross into another record");
+    assert_eq!(err.status().as_u16(), 422, "{err}");
+    let message = err.to_string();
+    assert!(message.contains("not on this record"), "{message}");
+    assert!(
+        message.contains(&format!("reply {} ", foreign.id)),
+        "{message}"
+    );
 
-    // Nothing moved: the refusal fires before the `DELETE`, so both counters
-    // and every row are exactly as they were.
-    assert_eq!(counter(&mut conn, "cmt_hards", record_a).await, 1);
-    assert_eq!(counter(&mut conn, "cmt_hards", record_b).await, 1);
+    assert_eq!(counter(&mut conn, "cmt_hards", mine).await, 2);
+    assert_eq!(counter(&mut conn, "cmt_hards", other).await, 2);
     let remaining = diesel::sql_query("SELECT COUNT(*) AS count FROM cmt_hard_comments")
         .get_result::<CountRow>(&mut conn)
         .await
         .expect("count")
         .count;
-    assert_eq!(remaining, 2, "the refused delete removes nothing");
+    assert_eq!(remaining, 4, "a refused delete removes nothing");
+
+    // Repair the edge as the message says. The delete then succeeds.
+    diesel::sql_query("UPDATE cmt_hard_comments SET parent_id = NULL WHERE id = $1")
+        .bind::<BigInt, _>(foreign.id)
+        .execute(&mut conn)
+        .await
+        .expect("repair the edge");
+    assert_eq!(
+        repo.delete_comment(mine, root.id)
+            .await
+            .expect("delete after repair"),
+        2
+    );
+    assert_eq!(counter(&mut conn, "cmt_hards", mine).await, 0);
+    assert_eq!(counter(&mut conn, "cmt_hards", other).await, 2);
+}
+
+/// Issue #2275, soft path: a soft delete fires no cascade.
+///
+/// A reply on another record stays live and counted. The soft path must keep
+/// that behavior and must not refuse the delete.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_soft_delete_leaves_a_reply_on_another_record_live() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let mine = seed_one_col(&mut conn, "cmt_posts", "title", "a").await;
+    let other = seed_one_col(&mut conn, "cmt_posts", "title", "b").await;
+
+    let root = repo
+        .add_comment(mine, author, "a", None)
+        .await
+        .expect("root");
+    let foreign = repo
+        .add_comment(other, author, "b", None)
+        .await
+        .expect("foreign");
+
+    diesel::sql_query("UPDATE cmt_comments SET parent_id = $1 WHERE id = $2")
+        .bind::<BigInt, _>(root.id)
+        .bind::<BigInt, _>(foreign.id)
+        .execute(&mut conn)
+        .await
+        .expect("graft across records");
+
+    assert_eq!(repo.delete_comment(mine, root.id).await.expect("delete"), 1);
+    assert_eq!(counter(&mut conn, "cmt_posts", mine).await, 0);
+    assert_eq!(counter(&mut conn, "cmt_posts", other).await, 1);
+    assert_eq!(
+        row_count(
+            &mut conn,
+            &format!("id = {} AND deleted_at IS NULL", foreign.id)
+        )
+        .await,
+        1,
+        "the other record's reply stays live"
+    );
 }
 
 /// The body cap is enforced in **bytes**, as documented — a multi-byte body
