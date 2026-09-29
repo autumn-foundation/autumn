@@ -146,13 +146,19 @@ pub async fn list_posts(
         }
     };
 
-    let mut out = Vec::with_capacity(posts.len());
-    for post in &posts {
-        out.push(PostView::from(
-            post,
-            repos.permalink(post, &settings).await?,
-        ));
-    }
+    // Batched the same way `front::listing()`/`search()` resolve a page of
+    // results: `Repos::permalink` walks a `page`-typed post's ancestor chain
+    // one row at a time, so calling it per post here cost up to
+    // `MAX_PAGE_DEPTH` (8) sequential single-row round trips per hierarchical
+    // hit on this unauthenticated route (Ledger,
+    // docs/reports/2026-09-27-ledger-cms-api-permalink-ancestry-batch).
+    // `permalinks_for` loads every ancestor across the whole page in one pass
+    // and preserves `posts`' order.
+    let out = super::front::permalinks_for(&repos, &posts, &settings)
+        .await?
+        .into_iter()
+        .map(|(post, url)| PostView::from(&post, url))
+        .collect();
     Ok(Json(out))
 }
 
