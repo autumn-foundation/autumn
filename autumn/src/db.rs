@@ -1507,7 +1507,11 @@ fn sqlite_target_is_memory(target: &str) -> bool {
 /// are never forced single-slot.
 #[cfg(feature = "sqlite")]
 pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
-    target.contains("cache=shared")
+    // Only an exact `cache=shared` query pair enables shared cache; a path or
+    // another parameter merely containing that text does not.
+    target
+        .split_once('?')
+        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "cache=shared"))
 }
 
 /// Whether a `SQLite` database URL (any accepted spelling) resolves to **any**
@@ -4979,6 +4983,13 @@ mod tests {
         // Plain file targets are NOT shared-cache.
         assert!(!sqlite_target_is_shared_cache("file:/srv/ref.db"));
         assert!(!sqlite_target_is_shared_cache("/var/lib/app.db"));
+        // Text that merely contains `cache=shared` outside an exact query
+        // pair is NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache("/srv/cache=shared.db"));
+        assert!(!sqlite_target_is_shared_cache(
+            "file:/srv/app.db?note=cache=shared"
+        ));
+        assert!(!sqlite_target_is_shared_cache("file:app?cache=sharedly"));
     }
 
     // The `statement_timeout` rejection must not claim `busy_timeout` bounds

@@ -11263,12 +11263,16 @@ async fn setup_database(
     // that opt-out. The check is idempotent with the built-in factories' own, and
     // `resolve_shard_set` applies the same Some-gated guard for shards.
     #[cfg(feature = "sqlite")]
-    if topology.is_some() {
-        crate::db::reject_sqlite_statement_timeout(
-            config.database.statement_timeout,
-            config.database.effective_primary_url().unwrap_or_default(),
-        )
-        .map_err(|e| format!("Failed to create database pool: {e}"))?;
+    if let Some(topology) = topology.as_ref() {
+        // Prefer the provider-resolved target (a custom provider may have no
+        // static URL, or a different one) so the message describes the pool
+        // that was actually built, as the migration path below does.
+        let target = topology
+            .migration_url()
+            .or_else(|| config.database.effective_primary_url())
+            .unwrap_or_default();
+        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout, target)
+            .map_err(|e| format!("Failed to create database pool: {e}"))?;
     }
 
     // Spawn the directory invalidation listener only at real runtime — a static
