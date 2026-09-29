@@ -1440,10 +1440,8 @@ fn builder_anchor(main_rs: &str) -> Option<usize> {
     for (index, (line, _)) in lines.iter().enumerate() {
         // The depth at the declaration itself, not at the start of its line:
         // `impl Server { async fn main() {` opens the impl on the same line.
-        if crate::rust_source::declares_async_main(line)
-            && line
-                .find("async fn main")
-                .is_some_and(|at| step(depth, &line[..at]) == 0)
+        if crate::rust_source::async_main_offset(line)
+            .is_some_and(|at| step(depth, &line[..at]) == 0)
         {
             main_at = Some(index);
             break;
@@ -1966,7 +1964,11 @@ fn refuse_virtual_workspace(root: &Path) -> Result<(), PluginError> {
                 detail: error.message().to_owned(),
             }
         })?;
-    if table.get("package").is_some_and(toml::Value::is_table) {
+    // `[project]` is Cargo's legacy alias for `[package]`.
+    if ["package", "project"]
+        .iter()
+        .any(|key| table.get(*key).is_some_and(toml::Value::is_table))
+    {
         Ok(())
     } else {
         Err(PluginError::NoPackageTable)
@@ -3785,6 +3787,30 @@ autumn-web = "0.7.0"
             matches!(err, PluginError::NoPackageTable),
             "plan_add_community: {err}"
         );
+    }
+
+    /// `[project]` is Cargo's legacy alias for `[package]`: such a manifest
+    /// owns its dependencies and must not be refused as a virtual workspace.
+    #[test]
+    fn a_legacy_project_table_counts_as_a_package() {
+        let tmp = fake_project(
+            SCAFFOLD_MAIN,
+            "[project]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n",
+        );
+        assert!(refuse_virtual_workspace(tmp.path()).is_ok());
+    }
+
+    /// The depth is measured at the occurrence that passed the identifier
+    /// check, not at an earlier `async fn main_loop` on the same line.
+    #[test]
+    fn insert_mount_measures_depth_at_the_validated_main() {
+        let source = "use autumn_web::prelude::*;\n\nasync fn main_loop() {} impl Server { async fn main() {\n        let app = autumn_web::app()\n            .routes(routes![]);\n    }\n}\n\n#[autumn_web::main]\nasync fn main() {\n    let app = autumn_web::app()\n        .routes(routes![index]);\n\n    app.run().await;\n}\n";
+        let updated = insert_mount(source, admin().mount).expect("anchor on the real main");
+        let real_main_at = updated.find("#[autumn_web::main]").expect("real main kept");
+        let mount_at = updated
+            .find(admin().mount.trim_end_matches('\n'))
+            .expect("mount spliced");
+        assert!(mount_at > real_main_at, "mounted into the impl helper");
     }
 
     /// A malformed package manifest is a parse error, not a virtual

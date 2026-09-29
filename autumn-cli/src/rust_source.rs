@@ -302,20 +302,30 @@ pub fn for_each_code_line<T>(
 /// `plugin::install`, which tracks the depth).
 #[must_use]
 pub fn declares_async_main(line: &str) -> bool {
+    async_main_offset(line).is_some()
+}
+
+/// Byte offset of the `async fn main` occurrence that
+/// [`declares_async_main`] accepts — the first one not followed by an
+/// identifier character — so callers measure context at the declaration that
+/// actually matched, not at an earlier `async fn main_loop`.
+#[must_use]
+pub fn async_main_offset(line: &str) -> Option<usize> {
     const NEEDLE: &str = "async fn main";
-    let mut rest = line;
-    while let Some(at) = rest.find(NEEDLE) {
-        let after = &rest[at + NEEDLE.len()..];
-        if after
+    let mut base = 0;
+    while let Some(at) = line[base..].find(NEEDLE) {
+        let start = base + at;
+        let end = start + NEEDLE.len();
+        if line[end..]
             .chars()
             .next()
             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
         {
-            return true;
+            return Some(start);
         }
-        rest = after;
+        base = end;
     }
-    false
+    None
 }
 
 #[cfg(test)]
