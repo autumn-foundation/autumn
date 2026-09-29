@@ -62,6 +62,10 @@ const CREATE_SCHEMA: &str = include_str!("../migrations/20260419000000_create_re
 // schema-setup helper below applies it for parity, even though these tests
 // don't preload `author`.
 const ADD_AVATAR: &str = include_str!("../migrations/20260427000000_add_user_avatar/up.sql");
+// Comments became polymorphic in #1367; `Subreddit::as_select()` and any
+// insert into `comments` need the reshaped table.
+const POLYMORPHIC_COMMENTS: &str =
+    include_str!("../migrations/20260820000000_polymorphic_comments/up.sql");
 const CREATE_TAGS: &str = include_str!("../migrations/20260702000001_create_tags/up.sql");
 
 #[derive(diesel::QueryableByName)]
@@ -127,6 +131,9 @@ async fn setup_schema(conn: &mut AsyncPgConnection) {
     conn.batch_execute(ADD_AVATAR)
         .await
         .expect("add users.avatar column");
+    conn.batch_execute(POLYMORPHIC_COMMENTS)
+        .await
+        .expect("make comments polymorphic");
     conn.batch_execute(CREATE_TAGS)
         .await
         .expect("create tags/post_tags");

@@ -421,7 +421,20 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// and carriage return) are dropped, since they cannot appear in a well-formed
 /// XML document even when escaped. Escaping `>` also neutralises any `]]>`
 /// sequence so untrusted titles/bodies cannot break out of the document.
+///
+/// Real titles/bodies are overwhelmingly plain ASCII text containing none of
+/// the five special characters, but the byte-by-byte `chars()` loop below
+/// pays a full UTF-8 decode + 5-way match per character even for that common
+/// case. `needs_escaping` does one cheap byte scan to detect it and returns
+/// the input unchanged (one allocation, one memcpy) instead of rebuilding it
+/// one `char` at a time. Any non-ASCII byte falls straight through to the
+/// per-`char` path unconditionally, so `is_xml_char`'s
+/// `U+FFFE`/`U+FFFF`-filtering — which only matters for non-ASCII code
+/// points — is never bypassed.
 fn escape(s: &str) -> String {
+    if !needs_escaping(s) {
+        return s.to_owned();
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if !is_xml_char(c) {
@@ -437,6 +450,20 @@ fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `s` contains anything `escape` would change: a byte outside the
+/// ASCII range (conservatively routed to the full per-`char` path, since only
+/// non-ASCII code points can be `U+FFFE`/`U+FFFF` or otherwise need
+/// `is_xml_char`'s multi-byte-aware filtering), one of the five characters
+/// `escape` turns into an entity, or an ASCII control byte `is_xml_char`
+/// drops (below `0x20`, excluding tab/newline/carriage return).
+fn needs_escaping(s: &str) -> bool {
+    s.bytes().any(|b| {
+        !b.is_ascii()
+            || matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')
+            || (b < 0x20 && !matches!(b, 0x9 | 0xA | 0xD))
+    })
 }
 
 /// Whether `c` is a valid XML 1.0 character (XML 1.0 §2.2 `Char` production).
@@ -467,6 +494,35 @@ mod proptests {
             .replace("&quot;", "\"")
             .replace("&apos;", "'")
             .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn escape_takes_the_fast_path_on_clean_ascii() {
+        let clean = "Named futures and readable stack traces";
+        assert_eq!(escape(clean), clean);
+        assert!(!needs_escaping(clean));
+    }
+
+    #[test]
+    fn escape_takes_the_slow_path_on_special_ascii_bytes() {
+        assert_eq!(escape("Rust & WebAssembly"), "Rust &amp; WebAssembly");
+        assert_eq!(escape("it's <ok>"), "it&apos;s &lt;ok&gt;");
+        assert!(needs_escaping("Rust & WebAssembly"));
+    }
+
+    #[test]
+    fn escape_drops_control_bytes_on_an_otherwise_clean_ascii_string() {
+        // A bare control byte (below 0x20, not tab/newline/CR) has no special
+        // ASCII characters, so the fast path's own scan — not just the
+        // non-ASCII check — must still catch it.
+        assert_eq!(escape("a\u{1}b"), "ab");
+    }
+
+    #[test]
+    fn escape_still_filters_noncharacters_in_non_ascii_input() {
+        // U+FFFE is dropped by `is_xml_char`; the fast path must route any
+        // non-ASCII input to the full per-char path so this still happens.
+        assert_eq!(escape("café\u{FFFE}!"), "café!");
     }
 
     proptest! {

@@ -60,6 +60,10 @@ async fn main() {
             routes::bookmarks::by_tag,
             routes::bookmarks::new_form,
             routes::bookmarks::create,
+            // Self-clustering substrate (#1762): the local member view plus a
+            // cluster-wide counter, shared between the two compose replicas
+            // with no coordination service. See `src/routes/cluster.rs`.
+            routes::cluster::status,
             repositories::bookmark_api_count,
             repositories::bookmark_api_list,
             repositories::bookmark_api_get,
@@ -75,6 +79,82 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    use autumn_web::config::{AutumnConfig, MockEnv};
+
+    /// Load the `docker` profile the compose stack runs under, with the
+    /// per-instance values compose supplies as environment overrides.
+    fn docker_config() -> AutumnConfig {
+        let env = MockEnv::new()
+            .with("AUTUMN_PROFILE", "docker")
+            .with("AUTUMN_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR"))
+            .with("AUTUMN_CLUSTER__SECRET", "a-shared-cluster-secret-value-32")
+            .with("AUTUMN_CLUSTER__NODE_ID", "web-2")
+            .with("AUTUMN_CLUSTER__ADVERTISE_ADDR", "172.28.0.12:7946")
+            .with("AUTUMN_CLUSTER__SEED_PEERS", "172.28.0.11:7946");
+        AutumnConfig::load_with_env(&env).expect("docker profile config should load")
+    }
+
+    /// The compose stack's two web replicas are meant to form a cluster, so
+    /// the profile they boot under has to actually turn it on.
+    #[test]
+    fn docker_profile_enables_the_cluster_substrate() {
+        let config = docker_config();
+
+        assert!(
+            config.cluster.enabled,
+            "the docker profile must enable [cluster] — that is what makes \
+             bookmarks-1 and bookmarks-2 a two-node cluster"
+        );
+        assert_eq!(config.cluster.cluster_name, "bookmarks-distributed");
+        assert_eq!(config.cluster.bind_addr, "0.0.0.0:7946");
+        assert_eq!(
+            config.cluster.seed_peers,
+            vec!["172.28.0.11:7946".to_owned()],
+            "seed_peers arrives as a comma-separated environment override"
+        );
+    }
+
+    /// `[cluster]` is validated at boot, and a bad section is a startup error
+    /// rather than a warning — so a committed profile that would fail
+    /// validation takes the whole compose stack down on first run.
+    #[test]
+    fn docker_profile_cluster_section_passes_boot_validation() {
+        docker_config()
+            .cluster
+            .validate()
+            .expect("the committed [cluster] section must satisfy boot validation");
+    }
+
+    /// A wildcard bind is not an address a peer can dial, so every replica
+    /// must advertise a concrete one. `docker-compose.yml` gives each replica a
+    /// fixed IP on the `bookmarks` network for exactly this reason: the config
+    /// parses socket addresses and does not resolve hostnames, so the service
+    /// names the rest of the stack uses would not work here.
+    #[test]
+    fn compose_gives_each_replica_a_distinct_dialable_identity() {
+        let compose = include_str!("../docker-compose.yml");
+
+        for (node_id, ip) in [("web-1", "172.28.0.11"), ("web-2", "172.28.0.12")] {
+            assert!(
+                compose.contains(&format!("AUTUMN_CLUSTER__NODE_ID: {node_id}")),
+                "compose must give each replica a stable node id; {node_id} is missing"
+            );
+            assert!(
+                compose.contains(&format!("AUTUMN_CLUSTER__ADVERTISE_ADDR: {ip}:7946")),
+                "compose must advertise a dialable address for {node_id}"
+            );
+            assert!(
+                compose.contains(&format!("ipv4_address: {ip}")),
+                "{node_id} needs a fixed address — [cluster] does not resolve hostnames"
+            );
+        }
+
+        assert!(
+            compose.contains("AUTUMN_CLUSTER__SEED_PEERS: \"172.28.0.11:7946\""),
+            "seeding one direction is enough, and it has to point at the other node"
+        );
+    }
 
     const MIGRATION_SQL: &str =
         include_str!("../migrations/00000000000000_create_bookmarks/up.sql");

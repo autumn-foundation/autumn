@@ -6,6 +6,11 @@
 //! 2. Include `Authorization: Bearer <token>` on every subsequent request.
 //!
 //! The HTML routes at `/todos` are unaffected — they use session auth as usual.
+//!
+//! This module also carries a **content-negotiated** route ([`summary`]) that
+//! serves the same resource as HTML or JSON from one handler based on the
+//! request's `Accept` header. Unlike the token API above it is mounted outside
+//! the `/api` bearer-token scope in `main.rs`, so a browser reaches it directly.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -16,7 +21,7 @@ use autumn_web::sse::{Event, Sse};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use futures::stream::{self, Stream, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::models::{NewTodo, Todo};
 use crate::schema::todos;
@@ -132,4 +137,76 @@ pub async fn scan_json(
     });
 
     Ok(Sse::new(stream))
+}
+
+// ── Content-negotiated resource (issue #2099) ───────────────────────────────────
+//
+// One handler, two representations. The `Negotiate` extractor reads the
+// request's `Accept` header, and `.respond(html_closure, json_value)` serves the
+// Maud markup to a browser (`Accept: text/html`) and the JSON value to an API
+// client (`Accept: application/json`) from a single source of truth — the same
+// `Summary` is rendered once and serialized once, never both. `Negotiated` also
+// sets `Vary: Accept` so shared caches key the two representations separately.
+//
+// Unlike the endpoints above, this route is mounted OUTSIDE the `/api`
+// bearer-token scope in `main.rs`, so a browser can reach it without a token and
+// see the HTML branch. Try both representations against a running server:
+//
+//   curl localhost:3000/todos/summary                                # HTML
+//   curl -H 'Accept: application/json' localhost:3000/todos/summary   # JSON
+
+/// A small aggregate over the todo list.
+///
+/// `Copy` so the HTML closure and the JSON value below can each own a copy — the
+/// closure captures one by copy while the original is handed to `.respond` as
+/// the serialized body, avoiding a move/borrow conflict over a single value.
+#[derive(Clone, Copy, Serialize)]
+pub struct Summary {
+    pub total: i64,
+    pub completed: i64,
+    pub pending: i64,
+}
+
+/// Serve the todo summary as HTML to browsers and JSON to API clients.
+///
+/// `Negotiate` captures the `Accept` preference; `.respond` picks the
+/// representation and renders exactly one branch — the `html!` closure never
+/// runs for a JSON response, and the JSON value is never serialized for an HTML
+/// response. A client that forbids both (`Accept: text/html;q=0,
+/// application/json;q=0`) gets `406 Not Acceptable`.
+#[get("/todos/summary")]
+pub async fn summary(negotiate: Negotiate, mut db: Db) -> AutumnResult<impl IntoResponse> {
+    let all = Todo::all(&mut db).await?;
+    let total = all.len() as i64;
+    let completed = all.iter().filter(|t| t.completed).count() as i64;
+    let summary = Summary {
+        total,
+        completed,
+        pending: total - completed,
+    };
+
+    Ok(negotiate.respond(
+        // `move` copies the `Copy` summary into the closure; the binding below
+        // stays valid to hand to the JSON arm.
+        move || {
+            html! {
+                (autumn_web::PreEscaped("<!DOCTYPE html>"))
+                html lang="en" {
+                    head {
+                        meta charset="utf-8";
+                        title { "Todo summary" }
+                    }
+                    body {
+                        h1 { "Todo summary" }
+                        ul {
+                            li { "Total: " (summary.total) }
+                            li { "Completed: " (summary.completed) }
+                            li { "Pending: " (summary.pending) }
+                        }
+                    }
+                }
+            }
+        },
+        summary,
+    ))
 }
