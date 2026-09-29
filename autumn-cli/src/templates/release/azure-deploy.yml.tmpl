@@ -247,6 +247,24 @@ jobs:
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
 
+      - name: Enable external ingress
+        run: |
+          # Terraform boots the app with external ingress DISABLED so no
+          # inbound request can wake the bootstrap placeholder revision with
+          # production secret refs and the Key Vault-capable identity
+          # attached (#2312). Open it now that the real image is serving;
+          # the command is idempotent, so later deploys leave the setting
+          # untouched.
+          az containerapp ingress enable \
+            --name "$AZURE_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --type external \
+            --target-port 3000 \
+            --transport http
+        env:
+          AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
+          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+
       # ── Supply chain (issue #1615) ──────────────────────────────────────
       # Deliberately the LAST steps in the job. The image is already in the
       # registry by the time they run, so attesting first would buy nothing
