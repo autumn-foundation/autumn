@@ -782,7 +782,7 @@ impl Analyzer {
                 // matching arm, so every guard on the path can run. They sum.
                 let mut worst_body = Cost::ZERO;
                 for arm in &m.arms {
-                    if let Some((_, guard)) = &arm.guard {
+                    if let (_, Some(guard)) = crate::parse::arm_pat_and_guard(arm) {
                         cost = cost.then(self.expr(guard));
                     }
                     let body = match self.annotation(&arm.attrs) {
@@ -1775,6 +1775,7 @@ fn collect_pat_idents(pat: &Pat, out: &mut HashSet<String>) {
         Pat::Type(p) => collect_pat_idents(&p.pat, out),
         Pat::Reference(p) => collect_pat_idents(&p.pat, out),
         Pat::Paren(p) => collect_pat_idents(&p.pat, out),
+        Pat::Guard(p) => collect_pat_idents(&p.pat, out),
         Pat::Tuple(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),
         Pat::TupleStruct(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),
         Pat::Slice(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),

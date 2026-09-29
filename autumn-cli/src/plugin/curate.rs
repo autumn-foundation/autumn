@@ -215,6 +215,16 @@ fn check_report_shape(
             )
         ));
     }
+    // A `route-prefix` pass that leaned on `--intentional-root` exemptions is
+    // not evidence the index can keep: a listing has no field for them, so
+    // reverification would re-run without them and fail (issue #2828).
+    if !report.intentional_root.is_empty() {
+        return Err(format!(
+            "the report for `{name}` exempted intentional root routes from `route-prefix`, \
+             which a plugin index listing cannot record; re-run `autumn plugin-check` \
+             without `--intentional-root`"
+        ));
+    }
     // `no_routes` exempts a listing from a prefix, so its report must show
     // the assertion held: `route-attribution` skips only under `plugin-check
     // --no-routes` with no routes found. A run without it passes a plugin
@@ -1075,6 +1085,7 @@ mod tests {
             autumn_web: None,
             // The prefix its `route-prefix` check tested: the fixtures'.
             prefix: Some("/admin".to_owned()),
+            intentional_root: Vec::new(),
         }
     }
 
@@ -1129,6 +1140,26 @@ mod tests {
         let mut r = report("autumn-admin-plugin", true, contract);
         r.prefix = Some("/admin/".to_owned());
         apply_report(&mut l, &r, "0.7.0", "2026-10-01").expect("the listing's prefix");
+    }
+
+    /// A pass that leaned on `--intentional-root` cannot be replayed by
+    /// reverification, which has no way to pass the exemption, so the index
+    /// refuses it rather than listing a plugin that would then fail (#2828).
+    /// A failing report still flags.
+    #[test]
+    fn a_pass_that_leans_on_intentional_root_routes_is_refused() {
+        let mut l = listing("autumn-admin-plugin");
+        let before = l.clone();
+        let contract = Some(lockstep("autumn-admin-plugin", "0.7.0"));
+        let mut r = report("autumn-admin-plugin", true, contract.clone());
+        r.intentional_root = vec!["/webhook".to_owned()];
+        let err = apply_report(&mut l, &r, "0.7.0", "2026-10-01").unwrap_err();
+        assert!(err.contains("--intentional-root"), "{err}");
+        assert_eq!(l, before);
+
+        let mut failing = report("autumn-admin-plugin", false, contract);
+        failing.intentional_root = vec!["/webhook".to_owned()];
+        apply_report(&mut l, &failing, "0.7.0", "2026-10-01").expect("a fail still flags");
     }
 
     /// AC 4: a pass on a new release refreshes the listing for it.
@@ -1463,6 +1494,7 @@ mod tests {
                 contract: None,
                 autumn_web: None,
                 prefix: None,
+                intentional_root: Vec::new(),
             },
             // A baseline with nothing new: the new artifact asks for no more.
             upgrade: Some(delta(&[])),
