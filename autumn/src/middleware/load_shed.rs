@@ -15,10 +15,37 @@
 //! returns `None` in that case so this layer is never applied and there is
 //! no overhead.
 //!
+//! The ceiling itself no longer has to be a hand-tuned guess: with
+//! `[server] capacity_contract` pointing at a committed `capacity.lock`, it is
+//! sourced from the envelope `autumn calibrate` proved for this build on this
+//! host class, so the layer sheds at a measured edge rather than an assumed
+//! one (issue #1733, `docs/guide/capacity-contracts.md`). An explicit
+//! `max_concurrent_requests` still wins, and every contract problem degrades
+//! to *unlimited* rather than to a ceiling — see
+//! [`crate::capacity::resolve_admission_limit`].
+//!
 //! The admission gauge is a dedicated counter, independent of
 //! [`crate::middleware::MetricsCollector`]'s `requests_active` and the
 //! graceful-shutdown drain accounting, so shedding cannot double-count,
 //! deadlock, or extend the drain budget.
+
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
 
 use std::future::Future;
 use std::pin::Pin;
@@ -66,10 +93,20 @@ pub struct LoadShedLayer {
     limit: usize,
     in_flight: Arc<AtomicUsize>,
     metrics: MetricsCollector,
+    paths: Arc<ExemptPaths>,
+    cors: Option<Arc<crate::config::CorsConfig>>,
+}
+
+/// The exempt-path sets, resolved once at router-assembly time.
+///
+/// Behind an `Arc` because [`LoadShedService`] clones this layer wholesale and
+/// is itself cloned on the request path; by-value `String`/`Vec<String>` fields
+/// made every such clone deep-copy them (issue #2193).
+#[derive(Clone)]
+struct ExemptPaths {
     health_prefix: String,
     health_prefix_slash: String,
     probe_paths: Vec<String>,
-    cors: Option<Arc<crate::config::CorsConfig>>,
 }
 
 impl LoadShedLayer {
@@ -86,9 +123,11 @@ impl LoadShedLayer {
             limit,
             in_flight: Arc::new(AtomicUsize::new(0)),
             metrics,
-            health_prefix: String::new(),
-            health_prefix_slash: String::new(),
-            probe_paths: Vec::new(),
+            paths: Arc::new(ExemptPaths {
+                health_prefix: String::new(),
+                health_prefix_slash: String::new(),
+                probe_paths: Vec::new(),
+            }),
             cors: None,
         }
     }
@@ -97,8 +136,9 @@ impl LoadShedLayer {
     /// uncounted (e.g. the actuator prefix).
     #[must_use]
     pub fn with_health_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.health_prefix = prefix.into();
-        self.health_prefix_slash = prefix_with_trailing_slash(&self.health_prefix);
+        let paths = Arc::make_mut(&mut self.paths);
+        paths.health_prefix = prefix.into();
+        paths.health_prefix_slash = prefix_with_trailing_slash(&paths.health_prefix);
         self
     }
 
@@ -106,7 +146,7 @@ impl LoadShedLayer {
     /// `/live`, `/ready`, `/startup`, `/health`).
     #[must_use]
     pub fn with_probe_paths(mut self, paths: Vec<String>) -> Self {
-        self.probe_paths = paths;
+        Arc::make_mut(&mut self.paths).probe_paths = paths;
         self
     }
 
@@ -150,11 +190,16 @@ impl<S> LoadShedService<S> {
         let path = req.uri().path();
         let prefix_matched = health_prefix_matches(
             path,
-            &self.layer.health_prefix,
-            &self.layer.health_prefix_slash,
+            &self.layer.paths.health_prefix,
+            &self.layer.paths.health_prefix_slash,
         );
         prefix_matched
-            || self.layer.probe_paths.iter().any(|probe| probe == path)
+            || self
+                .layer
+                .paths
+                .probe_paths
+                .iter()
+                .any(|probe| probe == path)
             || req.extensions().get::<LoadShedExempt>().is_some()
     }
 }
@@ -198,9 +243,12 @@ where
                     )),
                 };
             }
+            // `current < limit` is checked immediately above, so the bump is
+            // exact; `saturating_add` only guards the theoretical `usize::MAX`
+            // limit, where sticking at MAX beats aborting the request.
             match in_flight.compare_exchange_weak(
                 current,
-                current + 1,
+                current.saturating_add(1),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -289,6 +337,10 @@ where
 {
     type Output = Result<Response<Body>, E>;
 
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: future not polled after Ready"
+    )]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             LoadShedFutureProj::ShortCircuit { response } => Poll::Ready(Ok(response

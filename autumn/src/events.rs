@@ -457,6 +457,75 @@ fn current_event_app() -> Option<AppState> {
     CURRENT_EVENT_APP.try_with(AppState::clone).ok()
 }
 
+/// Tower [`Layer`](tower::Layer) installing the request's app as the ambient
+/// event-bus context for the whole downstream stack.
+///
+/// This was an `axum::middleware::from_fn_with_state` until #2214. `from_fn`
+/// has to `Box::pin` the async block it generates, because that block's type
+/// cannot be named — one heap allocation on every request, and this layer sits
+/// near the outside of the ingress stack, so the block captured the entire
+/// downstream continuation. [`scope_event_app`] already returns a *named*
+/// future ([`tokio::task::futures::TaskLocalFuture`]), so a hand-rolled service
+/// can hand it straight back and allocate nothing.
+///
+/// The inner future is built inside a `sync_scope` and then polled inside a
+/// `scope`, rather than simply being passed to `scope` as an argument.
+/// Arguments are evaluated first, so the plain form would run the whole
+/// synchronous `Service::call` chain beneath this layer — which includes
+/// `TrustedProxiesService` and every operator- or plugin-registered Tower layer
+/// — with the task-local unset, where the `from_fn` form it replaces ran it
+/// inside the scope. `crate::capsule::capture` documents the same hazard and
+/// guards it with a dedicated test.
+#[derive(Clone)]
+pub(crate) struct EventAppContextLayer {
+    state: AppState,
+}
+
+impl EventAppContextLayer {
+    pub(crate) const fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+impl<S> tower::Layer<S> for EventAppContextLayer {
+    type Service = EventAppContextService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        EventAppContextService {
+            inner,
+            state: self.state.clone(),
+        }
+    }
+}
+
+/// Tower [`Service`](tower::Service) produced by [`EventAppContextLayer`].
+#[derive(Clone)]
+pub(crate) struct EventAppContextService<S> {
+    inner: S,
+    state: AppState,
+}
+
+impl<S, ReqBody> tower::Service<axum::http::Request<ReqBody>> for EventAppContextService<S>
+where
+    S: tower::Service<axum::http::Request<ReqBody>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tokio::task::futures::TaskLocalFuture<AppState, S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
+        let inner = CURRENT_EVENT_APP.sync_scope(self.state.clone(), || self.inner.call(req));
+        scope_event_app(self.state.clone(), inner)
+    }
+}
+
 /// Publish an event without a request context (services, jobs, scheduled tasks).
 ///
 /// Resolves the **current app** from the ambient request/job context when one is

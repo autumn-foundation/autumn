@@ -51,6 +51,15 @@
 //! }
 //! ```
 //!
+//! # The stability contract
+//!
+//! A plugin can declare the `autumn-web` range it supports and the
+//! experimental surface it leans on by implementing [`Plugin::contract`]. An
+//! incompatible pairing fails loudly when the plugin is registered, naming both
+//! versions; `autumn plugin-check` reports experimental dependence. See
+//! [`plugin_contract`](crate::plugin_contract) for the declared tiers and the
+//! `SemVer` policy behind each one.
+//!
 //! # Duplicate registration
 //!
 //! Registering two plugins that share the same [`Plugin::name`] is a no-op
@@ -63,6 +72,7 @@
 use std::borrow::Cow;
 
 use crate::app::AppBuilder;
+use crate::plugin_contract::PluginContract;
 
 /// A reusable Autumn integration that wires itself into an [`AppBuilder`].
 ///
@@ -95,6 +105,44 @@ pub trait Plugin: Sized + Send + 'static {
     /// `docs/guide/extensibility.md` for the full extensibility model.
     #[must_use]
     fn build(self, app: AppBuilder) -> AppBuilder;
+
+    /// Declare which `autumn-web` versions this plugin supports, and any
+    /// experimental surface it knowingly depends on.
+    ///
+    /// Returning `None` (the default) declares nothing and changes no
+    /// behaviour — every plugin written before the contract existed keeps
+    /// working. Returning a contract whose
+    /// [`autumn_web`](PluginContract::autumn_web) range excludes the framework
+    /// this plugin is compiled into makes
+    /// [`AppBuilder::plugin`](crate::app::AppBuilder::plugin) **panic at
+    /// registration** with a diagnostic naming both versions and both
+    /// remedies. That is deliberate: a silent mismatch is the failure mode
+    /// this contract exists to remove.
+    ///
+    /// See [`plugin_contract`](crate::plugin_contract) for the stability tiers
+    /// and the `SemVer` policy each one carries.
+    ///
+    /// ```rust
+    /// # use autumn_web::app::AppBuilder;
+    /// # use autumn_web::plugin::Plugin;
+    /// use autumn_web::plugin_contract::PluginContract;
+    ///
+    /// # struct MyPlugin;
+    /// impl Plugin for MyPlugin {
+    ///     fn contract(&self) -> Option<PluginContract> {
+    ///         Some(
+    ///             PluginContract::new(env!("CARGO_PKG_NAME"))
+    ///                 .plugin_version(env!("CARGO_PKG_VERSION"))
+    ///                 .autumn_web("0.7"),
+    ///         )
+    ///     }
+    ///
+    ///     fn build(self, app: AppBuilder) -> AppBuilder { app }
+    /// }
+    /// ```
+    fn contract(&self) -> Option<PluginContract> {
+        None
+    }
 }
 
 /// A bundle of plugins that can be applied to an [`AppBuilder`] in one call.

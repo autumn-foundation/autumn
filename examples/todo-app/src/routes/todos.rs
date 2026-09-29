@@ -92,7 +92,7 @@ fn layout(title: &str, content: Markup) -> Markup {
                 script src="/static/js/htmx.min.js" {}
             }
             body class="bg-stone-50 min-h-screen font-sans text-stone-800 antialiased" {
-                div class="max-w-xl mx-auto py-12 px-6" {
+                main id="main-content" class="max-w-xl mx-auto py-12 px-6" {
                     (content)
                 }
                 footer class="text-center text-xs text-stone-400 py-8" {
@@ -176,6 +176,7 @@ fn title_field_partial(form: &ChangesetForm<TodoForm>) -> Markup {
     html! {
         div id="title-field" data-autumn-field-wrapper="title" class="flex-1 flex flex-col gap-1" {
             input type="text" name="title"
+                  aria-label="Todo title"
                   value=(value)
                   placeholder="What needs to be done?"
                   autocomplete="off"

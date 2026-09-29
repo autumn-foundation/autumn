@@ -13,6 +13,14 @@ This is the view-layer companion to Autumn's other caching primitives:
 | `CacheResponseLayer` | whole HTTP responses | per-URL |
 | **`cache_fragment`** | **rendered `Markup`** | **per-fragment** |
 
+For the first two rows, [`autumn cache audit`](cache-coherence.md) proves at
+build time that no `#[repository]` write can leave the value stale — declare a
+`#[cached]` function's dependency set with `reads(...)`, and a fragment's with
+`declare_cached_read!`. Whole-response caching is **not** covered: a
+`CacheResponseLayer` entry is keyed by URI with no annotated item naming what it
+was derived from, and the coherence manifest lists it under `excluded` rather
+than pretending otherwise.
+
 Whole-response caching is too coarse — any per-user chrome (a CSRF token, a
 "signed in as…" banner) busts the entire page. Data caching skips the query but
 still re-runs the `html!{}` work. `cache_fragment` sits in between: it caches the
@@ -75,10 +83,12 @@ pub async fn index(mut db: Db) -> AutumnResult<Markup> {
 }
 ```
 
-## The two helpers
+## The helpers
 
 ```rust
 use autumn_web::cache::{cache_fragment, cache_fragment_global};
+// Namespaced variants, for fragments a repository write should invalidate:
+use autumn_web::cache::{cache_fragment_in, cache_fragment_global_in};
 ```
 
 ### `cache_fragment_global`
@@ -111,6 +121,29 @@ pub async fn index(state: AppState, mut db: Db) -> AutumnResult<Markup> {
     })
 }
 ```
+
+### `cache_fragment_in` / `cache_fragment_global_in`
+
+The same two helpers with a leading `namespace`, which is prefixed onto the
+cache key. Reach for these when the fragment is declared with
+`declare_cached_read!` and a `#[repository]` write is expected to invalidate it:
+the plain helpers key entries under a bare `fragment:` prefix that carries no
+per-read identity, so a namespace sweep for one fragment read matches none of
+them and silently clears nothing.
+
+```rust
+cache_fragment_global_in(
+    "blog::routes::sidebar_fragment",   // the same string the declaration uses as `id`
+    format_args!("post_card:{}", post.id),
+    post.updated_at.and_utc().timestamp_micros(),
+    None,
+    || render_post_card(post),
+)
+```
+
+Version-token invalidation is unchanged — the namespace is an *additional*
+handle, not a replacement. See
+[the cache-coherence guide](cache-coherence.md) for the gate that uses it.
 
 ## Choosing the identity and version
 

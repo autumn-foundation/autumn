@@ -59,9 +59,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  meta:
+    uses: ./.github/workflows/runner-routing.yml
+
   feature-combinations:
     name: Feature combination compile gate
-    runs-on: ubuntu-latest
+    needs: meta
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
 
     steps:
       - uses: actions/checkout@v7
@@ -86,7 +90,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-hack tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.87.11
         with:
           tool: cargo-hack
 
