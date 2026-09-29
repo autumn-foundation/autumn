@@ -1561,16 +1561,26 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// "discouraged", recommending WAL mode instead — and WAL does **not** fix this
 /// deadlock class (the table-lock protocol is orthogonal to the journal mode).
 ///
+/// [`Db::tx_immediate`] does **not** rescue this: under shared cache a second
+/// connection's `BEGIN IMMEDIATE` also fails with `SQLITE_LOCKED_SHAREDCACHE`
+/// immediately, since `SQLite` never invokes the busy handler for
+/// `SQLITE_LOCKED` (this pool does not wire `sqlite3_unlock_notify`).
+/// Concurrent shared-cache writers must be serialized or retried with backoff
+/// by the application; the real fix is a WAL-mode file database, where
+/// `tx_immediate` does queue on the busy timeout.
+///
 /// Autumn keeps supporting shared cache (the test suite uses it deliberately —
-/// see [`crate::test_urls`]), so this is a warning, not a refusal. But
-/// write-heavy workloads on a shared-cache target should run their write
-/// transactions through [`Db::tx_immediate`] (`BEGIN IMMEDIATE`, which moves
-/// contention onto the busy timeout) or, better, move to a WAL-mode file
-/// database. [`build_sqlite_pool`] logs a loud boot warning when it sees this
-/// so the deadlock mode is never a surprise.
+/// see [`crate::test_urls`]), so this is a warning, not a refusal.
+/// [`build_sqlite_pool`] logs a loud boot warning when it sees this so the
+/// deadlock mode is never a surprise.
+///
+/// Only an exact `cache=shared` query pair counts; a path or another
+/// parameter merely containing that text does not.
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_shared_cache(target: &str) -> bool {
-    target.contains("cache=shared")
+    target
+        .split_once('?')
+        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "cache=shared"))
 }
 
 /// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
@@ -1664,11 +1674,13 @@ fn build_sqlite_pool(
              Concurrent deferred read→write transactions can deadlock permanently \
              under shared cache: the lock upgrade fails with SQLITE_LOCKED / \
              SQLITE_BUSY_SNAPSHOT, which bypasses the busy-timeout handler, and \
-             WAL mode does not fix this deadlock class (issue #2885). Prefer a \
-             WAL-mode file database; if shared cache is required, run write-heavy \
-             transactions through `Db::tx_immediate` (BEGIN IMMEDIATE), which \
-             moves contention onto the busy timeout. SQLite itself discourages \
-             shared-cache mode: https://www.sqlite.org/sharedcache.html"
+             WAL mode does not fix this deadlock class (issue #2885). An up-front \
+             BEGIN IMMEDIATE does not help either: shared-cache lock contention \
+             returns SQLITE_LOCKED without consulting the busy timeout, so \
+             concurrent writers fail fast. Prefer a WAL-mode file database; if \
+             shared cache is required, serialize writers or retry them with \
+             backoff. SQLite itself discourages shared-cache mode: \
+             https://www.sqlite.org/sharedcache.html"
         );
     }
     let max_size = if sqlite_target_is_memory(&target) {
@@ -2812,11 +2824,15 @@ impl Db {
     /// before the closure runs. A concurrent writer then queues on the
     /// connection's `busy_timeout` instead of failing its deferred read→write
     /// snapshot upgrade with `SQLITE_BUSY_SNAPSHOT` (which bypasses the busy
-    /// handler and can deadlock permanently — see issue #2885). Reach for this
-    /// when the closure is write-heavy: read-modify-write cycles, queue
-    /// claims, session writes, outbox/idempotency inserts, or anything that
-    /// runs concurrently against a `SQLite` target using shared-cache mode
-    /// (`cache=shared`).
+    /// handler — see issue #2885). Reach for this when the closure is
+    /// write-heavy: read-modify-write cycles, queue claims, session writes,
+    /// outbox/idempotency inserts.
+    ///
+    /// This does **not** help on a shared-cache target (`cache=shared`): there
+    /// a second connection's `BEGIN IMMEDIATE` fails at once with
+    /// `SQLITE_LOCKED_SHAREDCACHE`, because `SQLite` never consults the busy
+    /// handler for `SQLITE_LOCKED`. Serialize or retry shared-cache writers in
+    /// the application, or move to a WAL-mode file database.
     ///
     /// The tradeoff is deliberate: an immediate transaction holds the write
     /// lock for its whole lifetime, so a long-running `tx_immediate` serializes
@@ -5082,6 +5098,23 @@ mod tests {
         ));
         // Plain file targets are not in-memory.
         assert!(!sqlite_target_is_memory("/var/lib/app.db"));
+    }
+
+    // The shared-cache boot warning (issue #2885) fires only for an exact
+    // `cache=shared` query pair, not for text merely containing it.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_target_is_shared_cache_requires_an_exact_query_pair() {
+        assert!(sqlite_target_is_shared_cache("file::memory:?cache=shared"));
+        assert!(sqlite_target_is_shared_cache(
+            "file:app?mode=memory&cache=shared"
+        ));
+        assert!(!sqlite_target_is_shared_cache("file:app?mode=memory"));
+        assert!(!sqlite_target_is_shared_cache("/var/lib/cache=shared.db"));
+        assert!(!sqlite_target_is_shared_cache(
+            "file:/srv/app.db?note=cache=shared"
+        ));
+        assert!(!sqlite_target_is_shared_cache("file:app?cache=sharedly"));
     }
 
     // `sqlite_target_is_any_in_memory` is the broader predicate the

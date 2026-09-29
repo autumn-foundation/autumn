@@ -285,18 +285,22 @@ Two things Autumn does about it (issue #2885):
 - **`Db::tx_immediate`.** The explicit user-facing transaction for write-heavy
   closures: on SQLite it begins with `BEGIN IMMEDIATE`, taking the write lock
   up front through diesel's transaction manager (so nested savepoints keep
-  working). A concurrent writer then queues on `busy_timeout` instead of
-  failing its snapshot upgrade — the permanent deadlock becomes a bounded
-  wait. `Db::tx` itself deliberately **stays deferred** so read-only
-  transactions keep their read concurrency; the generated write-RMW paths
-  (`with_lock`, `update`, `delete_by_id`, `find_or_create_by`) already issue
-  `BEGIN IMMEDIATE` since #1996.
+  working). On a WAL-mode (or rollback-journal) file database a concurrent
+  writer then queues on `busy_timeout` instead of failing its snapshot
+  upgrade with `SQLITE_BUSY_SNAPSHOT`. `Db::tx` itself deliberately **stays
+  deferred** so read-only transactions keep their read concurrency; the
+  generated write-RMW paths (`with_lock`, `update`, `delete_by_id`,
+  `find_or_create_by`) already issue `BEGIN IMMEDIATE` since #1996.
 
-Rule of thumb: on a shared-cache target, pure reads go through `Db::tx`,
-anything that reads-then-writes goes through `Db::tx_immediate`. On a WAL-mode
-file database the same split is still the right habit — it just matters less,
-because the shared-cache table-lock protocol is what turns the upgrade failure
-into a deadlock.
+`Db::tx_immediate` is **not** a shared-cache remedy. Under `cache=shared` a
+second connection's `BEGIN IMMEDIATE` fails at once with
+`SQLITE_LOCKED_SHAREDCACHE`: SQLite never consults the busy handler for
+`SQLITE_LOCKED`, so there is no queueing to move contention onto. On a
+shared-cache target, concurrent writers must be serialized or retried with
+backoff by the application — or, better, move to a WAL-mode file database.
+
+Rule of thumb on a file database: pure reads go through `Db::tx`, anything that
+reads-then-writes goes through `Db::tx_immediate`.
 
 ### `#[scheduled]` tasks
 
