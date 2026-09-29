@@ -13,6 +13,14 @@
 //! existing [`SchedulerCoordinator`](crate::scheduler::SchedulerCoordinator) so
 //! that, across a fleet, only one replica orders per certificate.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -304,6 +312,10 @@ impl crate::actuator::HealthIndicator for AcmeHealthIndicator {
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "compares real X.509 expiry dates from a real ACME server"
+)]
 fn default_now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

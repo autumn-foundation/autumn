@@ -10,6 +10,13 @@
 //! Byte-valued fields (wire frames, bind parameters) are base64-encoded so a
 //! capsule stays a plain, diffable JSON file.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -939,7 +946,7 @@ pub mod test_support {
         Capsule {
             format_version: CAPSULE_FORMAT_VERSION,
             id: "fixture".to_owned(),
-            captured_at: chrono::Utc::now(),
+            captured_at: crate::time::ambient_now(),
             autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
             app: AppInfo::default(),
             request,

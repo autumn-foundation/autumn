@@ -16,6 +16,14 @@
 //! Exceeding one denies that call and records it. It does not fail the request:
 //! see the module header on why a denial is an answer.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -175,7 +183,7 @@ impl CapabilityRateLimiter {
                 .map(|_| {
                     Mutex::new(Bucket {
                         tokens: full,
-                        last: Instant::now(),
+                        last: crate::time::ambient_instant(),
                     })
                 })
                 .collect(),
@@ -221,7 +229,7 @@ impl CapabilityRateLimiter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let full = u64::from(self.per_second).saturating_mul(SCALE);
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         let micros = u64::try_from(now.saturating_duration_since(bucket.last).as_micros())
             .unwrap_or(u64::MAX);
         // `as_micros` rather than `as_secs_f64`: the refill has to be monotone
@@ -251,5 +259,39 @@ impl CapabilityRateLimiter {
         }
         bucket.tokens = bucket.tokens.saturating_sub(SCALE);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use chrono::{TimeZone, Utc};
+
+    use super::{CapabilityRateLimiter, SandboxCapability};
+    use crate::time::{TickingClock, install_ambient};
+
+    #[test]
+    fn a_bucket_from_a_nested_timeline_refills_on_the_outer_one() {
+        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let capability = SandboxCapability::ALL[0];
+        let outer = TickingClock::starting_at(epoch);
+        let _outer = install_ambient(Arc::new(outer.clone()));
+        let limiter = CapabilityRateLimiter::new(1);
+
+        // A nested timeline drains the bucket an hour in.
+        let inner = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(inner.clone()));
+        inner.advance(Duration::from_secs(3600));
+        assert!(limiter.try_take(capability));
+        assert!(!limiter.try_take(capability), "drained");
+        drop(guard);
+
+        // The outer timeline goes on from the nested one's, so no time has
+        // passed. One second here refills one token.
+        assert!(!limiter.try_take(capability), "no time has passed yet");
+        outer.advance(Duration::from_secs(1));
+        assert!(limiter.try_take(capability), "one second refills one token");
     }
 }
