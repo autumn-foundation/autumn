@@ -494,10 +494,19 @@ fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
 /// table" for a migration that does create one. `None` only when there is no
 /// opening paren in this statement (e.g. `CREATE TABLE x AS SELECT 1;`): the
 /// search stops at the statement's `;`, so a later statement's column list is
-/// never borrowed as this table's.
+/// never borrowed as this table's. Likewise `None` when an `AS` precedes the
+/// paren: in `CREATE TABLE x AS SELECT jsonb_build_object('id', id) …` the
+/// parens belong to the query, and the table's columns are whatever it
+/// projects — unknowable here, so never read as a column list.
 fn create_table_body(sql: &str, from: usize) -> Option<&str> {
     let open = sql[from..].find(['(', ';'])? + from;
     if sql[open..].starts_with(';') {
+        return None;
+    }
+    if sql[from..open]
+        .split(|c: char| !is_ident_char(c))
+        .any(|word| word == "as")
+    {
         return None;
     }
     let mut depth = 0usize;
@@ -2014,6 +2023,27 @@ mod tests {
         assert!(
             !already_migrated(tmp.path()),
             "legacy_comments never had the discriminator columns"
+        );
+    }
+
+    /// The parens of a `CREATE TABLE … AS SELECT` query are not a column list,
+    /// even when the query names every discriminator column.
+    #[test]
+    fn a_create_table_as_query_is_not_read_as_a_column_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments AS SELECT jsonb_build_object(\
+             commentable_type, commentable_id, id, parent_id, author_id, body, \
+             created_at, deleted_at) AS payload FROM source;\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the table only has `payload`, whatever its query mentions"
         );
     }
 
