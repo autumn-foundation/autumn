@@ -5501,7 +5501,7 @@ const SECRET_KEYWORDS: [&str; 3] = ["password", "sslpassword", "oauth_client_sec
 /// Compared without case, because a URI query key is not normalised for us.
 /// `passfile`, `sslcert` and friends name files, not secrets — printing the
 /// path does not print the credential — so they stay printable.
-const PRINTABLE_KEYWORDS: [&str; 40] = [
+const PRINTABLE_KEYWORDS: [&str; 47] = [
     "application_name",
     "channel_binding",
     "client_encoding",
@@ -5519,6 +5519,9 @@ const PRINTABLE_KEYWORDS: [&str; 40] = [
     "keepalives_interval",
     "krbsrvname",
     "load_balance_hosts",
+    "max_protocol_version",
+    "min_protocol_version",
+    "oauth_client_id",
     "oauth_discovery_url",
     "oauth_issuer",
     "oauth_scope",
@@ -5528,17 +5531,21 @@ const PRINTABLE_KEYWORDS: [&str; 40] = [
     "replication",
     "require_auth",
     "requirepeer",
+    "requiressl",
     "service",
     "ssl_max_protocol_version",
     "ssl_min_protocol_version",
     "sslcert",
+    "sslcertmode",
     "sslcompression",
     "sslcrl",
     "sslcrldir",
     "sslkey",
+    "sslkeylogfile",
     "sslmode",
     "sslnegotiation",
     "sslrootcert",
+    "sslsni",
     "target_session_attrs",
     "tcp_user_timeout",
     "user",
@@ -6817,6 +6824,31 @@ mod tests {
         assert!(
             refused.contains("\\quit"),
             "a boundary that cannot be printed must halt psql: {refused}"
+        );
+    }
+
+    /// Supported non-secret libpq options (`sslcertmode`, `sslsni`, 18's
+    /// protocol-version bounds and `oauth_client_id`) print, so a target that
+    /// uses them still dry-runs; the SCRAM key parameters are credentials
+    /// and stay unlisted, so they still refuse the target.
+    #[test]
+    fn supported_non_secret_libpq_options_print() {
+        let url = "postgres://u@db/app?sslcertmode=allow&sslsni=1&min_protocol_version=3.0\
+                   &max_protocol_version=latest&oauth_client_id=cli";
+        let conninfo =
+            super::password_free_conninfo(url).expect("supported non-secret options must print");
+        for key in [
+            "sslcertmode",
+            "sslsni",
+            "min_protocol_version",
+            "max_protocol_version",
+            "oauth_client_id",
+        ] {
+            assert!(conninfo.contains(key), "{key} must be kept: {conninfo}");
+        }
+        assert!(
+            super::password_free_conninfo("postgres://u@db/app?scram_client_key=AAAA").is_none(),
+            "a SCRAM key is a credential, not a printable option"
         );
     }
 
