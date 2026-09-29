@@ -4799,21 +4799,30 @@ pub async fn import_comments(
         // trimmed body and timestamp (microseconds, Postgres' precision). An
         // import interrupted before the completion marker existed committed
         // its rows without the record, and a hand-restored comment looks the
-        // same. Each such row is matched one-for-one and reused as the parent
-        // of its replies instead of being inserted again, so a retry neither
+        // same. Each such row is matched one-for-one within its tree position (same
+        // resolved parent) and reused as the parent of its replies instead of being inserted again, so a retry neither
         // appends the thread a second time nor drops the rest of it because a
         // single row happened to be there already. A visitor's comment never
         // matches a backup row.
-        let mut existing: std::collections::HashMap<(String, i64), Vec<i64>> =
+        let mut existing: std::collections::HashMap<(Option<i64>, String, i64), Vec<i64>> =
             std::collections::HashMap::new();
-        let present: Vec<(i64, String, chrono::NaiveDateTime)> = comments::table
+        let present: Vec<(i64, Option<i64>, String, chrono::NaiveDateTime)> = comments::table
             .filter(comments::post_id.eq(post_id))
-            .select((comments::id, comments::body, comments::created_at))
+            .select((
+                comments::id,
+                comments::parent_id,
+                comments::body,
+                comments::created_at,
+            ))
             .load(conn)
             .await?;
-        for (id, body, at) in present {
+        for (id, parent, body, at) in present {
             existing
-                .entry((body.trim().to_owned(), at.and_utc().timestamp_micros()))
+                .entry((
+                    parent,
+                    body.trim().to_owned(),
+                    at.and_utc().timestamp_micros(),
+                ))
                 .or_default()
                 .push(id);
         }
@@ -4857,6 +4866,7 @@ pub async fn import_comments(
                 }
                 if let Some(id) = existing
                     .get_mut(&(
+                        new.parent_id,
                         new.body.clone(),
                         comment.created_at.and_utc().timestamp_micros(),
                     ))
@@ -4911,19 +4921,10 @@ pub async fn import_comments(
         // Every approved reply on the post, not just the rows this call
         // inserted: older backup rows can fill a page's window and push out a
         // visitor reply that was visible before the merge.
-        let approved_replies: Vec<i64> = comments::table
-            .filter(comments::post_id.eq(post_id))
-            .filter(comments::status.eq("approved"))
-            .filter(comments::parent_id.is_not_null())
-            .select(comments::id)
-            .load(conn)
-            .await?;
-        for id in approved_replies {
-            if !approved_reply_is_renderable(conn, id).await? {
-                return Err(AutumnError::unprocessable_msg(format!(
-                    "comment {id} is beyond the display budget and cannot be shown"
-                )));
-            }
+        if let Some(id) = first_unrendered_approved_reply(conn, post_id).await? {
+            return Err(AutumnError::unprocessable_msg(format!(
+                "comment {id} is beyond the display budget and cannot be shown"
+            )));
         }
 
         recount_post_comments(conn, post_id).await?;
@@ -5482,6 +5483,42 @@ pub async fn approved_reply_is_renderable(
         return Ok(true);
     };
     approved_comment_is_rendered(conn, comment_id, page).await
+}
+
+/// The first approved reply on a post that no thread page renders, if any.
+///
+/// The batch form of [`approved_reply_is_renderable`], for callers that must
+/// vet a whole discussion at once. It replays the renderer's own
+/// [`approved_thread_page`] once per root page and compares the rendered ids to
+/// the post's approved replies, so a thread of thousands of comments costs a
+/// few queries per page instead of several per reply. A post whose approved
+/// comments all fit one page's budget skips even that: nothing can truncate.
+pub async fn first_unrendered_approved_reply(
+    conn: &mut AsyncPgConnection,
+    post_id: i64,
+) -> AutumnResult<Option<i64>> {
+    if approved_comment_count(conn, post_id).await? <= MAX_THREAD_COMMENTS {
+        return Ok(None);
+    }
+    let mut rendered: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut offset = 0_i64;
+    loop {
+        let page = approved_thread_page(conn, post_id, offset, THREAD_ROOTS_PER_PAGE).await?;
+        rendered.extend(page.comments.iter().map(|c| c.id));
+        offset += THREAD_ROOTS_PER_PAGE;
+        if offset >= page.total_roots {
+            break;
+        }
+    }
+    let replies: Vec<i64> = comments::table
+        .filter(comments::post_id.eq(post_id))
+        .filter(comments::status.eq("approved"))
+        .filter(comments::parent_id.is_not_null())
+        .order(comments::id.asc())
+        .select(comments::id)
+        .load(conn)
+        .await?;
+    Ok(replies.into_iter().find(|id| !rendered.contains(id)))
 }
 
 /// Which page of a post's approved thread a comment appears on, if any.
