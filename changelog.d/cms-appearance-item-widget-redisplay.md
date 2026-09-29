@@ -10,5 +10,5 @@
   and everything typed into the card. Each now redisplays the Appearance
   screen at 422 with the card's values kept, the reason shown in the card
   (`role="alert"`, tied to the first field with `aria-describedby`) and that
-  field focused. The Appearance screen reopens on the page that holds the menu that
-  refused the item, so the message is always beside it.
+  field focused. The menu that refused an item is always shown with the message, even
+  when it is not on the current page of menus.

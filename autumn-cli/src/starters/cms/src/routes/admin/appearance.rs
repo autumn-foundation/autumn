@@ -163,13 +163,26 @@ async fn appearance_page(
         let total = content::menu_count(&mut conn).await?;
         let ids: Vec<i64> = menus.iter().map(|menu| menu.id).collect();
         let mut items = content::menu_items_for(&mut conn, &ids, MENU_ITEMS_SHOWN).await?;
-        let blocks: Vec<(crate::models::Menu, Vec<crate::models::MenuItem>)> = menus
+        let mut blocks: Vec<(crate::models::Menu, Vec<crate::models::MenuItem>)> = menus
             .into_iter()
             .map(|menu| {
                 let own = items.remove(&menu.id).unwrap_or_default();
                 (menu, own)
             })
             .collect();
+        // A refused item must be redisplayed beside its own menu, and menus
+        // are paged by name — so the menu may not be on this page (another
+        // administrator renamed or added one since the form was rendered).
+        // Show it first, whichever page it belongs to, rather than a 422
+        // that carries neither the message nor the input.
+        if let Some(Rejected::MenuItem { menu_id, .. }) = rejected
+            && !blocks.iter().any(|(menu, _)| menu.id == *menu_id)
+            && let Some(menu) = content::menu_by_id(&mut conn, *menu_id).await?
+        {
+            let mut own = content::menu_items_for(&mut conn, &[menu.id], MENU_ITEMS_SHOWN).await?;
+            let items = own.remove(&menu.id).unwrap_or_default();
+            blocks.insert(0, (menu, items));
+        }
         (blocks, total)
     };
     let last_menu_page = ((menu_total + MENUS_PER_PAGE - 1) / MENUS_PER_PAGE).max(1);
@@ -565,21 +578,10 @@ async fn redisplay_rejected(
     csrf: &Csrf,
     rejected: &Rejected<'_>,
 ) -> AutumnResult<Response> {
-    // Open on the page that holds the menu, as it is now: menus are ordered by
-    // name, so another administrator's new menu can push this one onto a
-    // different page than the form was rendered on, and the message would then
-    // land on a page that does not list it.
-    let page = match rejected {
-        Rejected::MenuItem { menu_id, .. } => repos
-            .with_conn(async |conn| content::menu_position(conn, *menu_id).await)
-            .await?
-            .and_then(|position| usize::try_from(position / MENUS_PER_PAGE + 1).ok()),
-        Rejected::Widget { .. } => None,
-    };
     let body = appearance_page(
         repos,
         csrf,
-        &AppearanceFilter { page },
+        &AppearanceFilter::default(),
         ("", ""),
         None,
         Some(rejected),

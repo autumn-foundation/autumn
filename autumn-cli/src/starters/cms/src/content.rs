@@ -4515,32 +4515,17 @@ pub async fn menus_page(
         .await?)
 }
 
-/// Where a menu sits in `menus_page`'s ordering (0-based), or `None` if it is
-/// gone — so a screen that must show one menu can open on the page holding it.
-pub async fn menu_position(
+/// One menu by id, for a screen that must show it whichever page it is on.
+pub async fn menu_by_id(
     conn: &mut AsyncPgConnection,
     menu_id: i64,
-) -> AutumnResult<Option<i64>> {
-    let Some(name) = menus::table
+) -> AutumnResult<Option<crate::models::Menu>> {
+    Ok(menus::table
         .find(menu_id)
-        .select(menus::name)
-        .first::<String>(conn)
+        .select(crate::models::Menu::as_select())
+        .first(conn)
         .await
-        .optional()?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(
-        menus::table
-            .filter(
-                menus::name
-                    .lt(&name)
-                    .or(menus::name.eq(&name).and(menus::id.lt(menu_id))),
-            )
-            .count()
-            .get_result(conn)
-            .await?,
-    ))
+        .optional()?)
 }
 
 /// How many menus the site holds, for the pager.
