@@ -266,9 +266,18 @@ pub fn print_json(routes: &[RouteInfo]) {
     println!("{json}");
 }
 
+/// Method label `autumn routes` gives `#[ws]` routes. They are HTTP `GET`
+/// upgrades, not requests Postman's v2.1 collection format can express.
+const WS_METHOD: &str = "WS";
+
+/// Build a Postman v2.1 collection from the route table.
+///
+/// `#[ws]` routes are left out: a v2.1 collection item is an HTTP request, and
+/// importing one with the synthetic `WS` verb would never reach the upgrade
+/// handler. [`print_postman`] reports how many were skipped.
 pub fn generate_postman(routes: &[RouteInfo]) -> serde_json::Value {
     let mut items = Vec::new();
-    for route in routes {
+    for route in routes.iter().filter(|r| r.method != WS_METHOD) {
         let name = format!("{} {}", route.method, route.path);
         // Replace `{param}` with `:param` for Postman path variables
         let url = format!(
@@ -307,10 +316,18 @@ pub fn generate_postman(routes: &[RouteInfo]) -> serde_json::Value {
     })
 }
 
+/// Print routes as a Postman v2.1 collection, noting skipped `#[ws]` routes
+/// on stderr so stdout stays importable.
 pub fn print_postman(routes: &[RouteInfo]) {
     let json = serde_json::to_string_pretty(&generate_postman(routes))
         .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     println!("{json}");
+    let skipped = routes.iter().filter(|r| r.method == WS_METHOD).count();
+    if skipped > 0 {
+        eprintln!(
+            "note: skipped {skipped} WebSocket route(s); Postman v2.1 collections cannot express them"
+        );
+    }
 }
 
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
@@ -814,6 +831,21 @@ mod tests {
             items[2]["request"]["url"]["path"],
             serde_json::json!(["posts", ":id"])
         );
+    }
+
+    #[test]
+    fn generate_postman_skips_websocket_routes() {
+        let mut routes = sample_routes();
+        let http_count = routes.len();
+        routes.push(RouteInfo {
+            method: "WS".to_owned(),
+            path: "/ws/chat".to_owned(),
+            ..routes[0].clone()
+        });
+        let collection = generate_postman(&routes);
+        let items = collection["item"].as_array().unwrap();
+        assert_eq!(items.len(), http_count);
+        assert!(items.iter().all(|i| i["request"]["method"] != "WS"));
     }
 
     // ── resolve_binary_from_metadata ──────────────────────────────────────

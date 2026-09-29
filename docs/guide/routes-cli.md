@@ -127,6 +127,8 @@ autumn routes --format postman > autumn.postman_collection.json
 Each route becomes one request named `METHOD /path`. Path parameters such as
 `{id}` are rewritten to Postman's `:id` form, and every URL starts with the
 `{{base_url}}` collection variable, which defaults to `http://localhost:3000`.
+`#[ws]` routes are skipped (a v2.1 collection item is an HTTP request), with
+a note on stderr so stdout stays importable.
 
 ## WebSocket routes
 

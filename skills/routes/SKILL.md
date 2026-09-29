@@ -48,6 +48,17 @@ autumn routes --format json --user-only --method POST --filter /posts
 
 Capture stdout, stderr, and exit code.
 
+When the user asks for a Postman collection to import, use
+`--format postman` instead of `json` and write stdout to a file:
+
+```bash
+autumn routes --format postman --user-only > autumn.postman_collection.json
+```
+
+It emits a Postman v2.1 collection (`{param}` path segments become `:param`,
+URLs start with a `{{base_url}}` variable defaulting to
+`http://localhost:3000`). `#[ws]` routes are skipped, with a note on stderr.
+
 ## Output handling
 
 Parse the JSON array and present a clean table grouped by handler file or
