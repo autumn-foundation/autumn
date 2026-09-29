@@ -509,9 +509,9 @@ fn build_isr_state(manifest: &StaticManifest) -> HashMap<String, IsrRouteState> 
 /// request still advertised the old boundary — exactly the undecodable-response
 /// desync this check exists to prevent. The exceptions are the parameters
 /// whose *values* their own specifications define as case-insensitive: `charset`
-/// (RFC 2046 §4.1.2) and `type` where its value is itself a media type —
-/// `multipart/related` (RFC 2387 §3.1), `multipart/signed` and
-/// `multipart/encrypted` (RFC 1847 §§2.1, 2.2). See
+/// (RFC 2046 §4.1.2) and the parameters whose value is itself a media type —
+/// `type` on `multipart/related` (RFC 2387 §3.1), `protocol` on
+/// `multipart/signed` and `multipart/encrypted` (RFC 1847 §§2.1, 2.2). See
 /// [`parameter_value_case_insensitive`].
 ///
 /// Quoted values are unquoted (decoding quoted-pairs, so `boundary="a\b"` and
@@ -587,26 +587,26 @@ fn decode_quoted_pairs(raw_value: &str) -> Cow<'_, str> {
 /// `normalize_content_type` applies when canonicalizing:
 ///
 /// - `charset` — case-insensitive on every media type (RFC 2046 §4.1.2);
-/// - `type` — but only where its value is itself a media type: on
-///   `multipart/related` (RFC 2387 §3.1), `multipart/signed` and
-///   `multipart/encrypted` (RFC 1847 §§2.1, 2.2). Media types are
+/// - `type` on `multipart/related` (RFC 2387 §3.1) and `protocol` on
+///   `multipart/signed` / `multipart/encrypted` (RFC 1847 §§2.1, 2.2) — the
+///   parameters whose value is itself a media type. Media types are
 ///   case-insensitive (RFC 9110 §8.3), so `type="TEXT/HTML"` and
 ///   `type="text/html"` denote the same thing there.
 ///
 /// Everything else keeps its value byte-verbatim. `boundary` in particular
 /// stays case-sensitive: a build-time `boundary=Aa` matching a regenerated
 /// `boundary=aa` would let ISR overwrite a body whose advertised boundary no
-/// longer decodes it. `type` on any other media type is likewise verbatim —
-/// no specification gives it media-type semantics there.
+/// longer decodes it. `type` and `protocol` on any other media type are
+/// likewise verbatim — no specification gives them media-type semantics there.
 fn parameter_value_case_insensitive(media_type: &str, name: &str) -> bool {
     if name == "charset" {
         return true;
     }
-    name == "type"
-        && matches!(
-            media_type,
-            "multipart/related" | "multipart/signed" | "multipart/encrypted"
-        )
+    match name {
+        "type" => media_type == "multipart/related",
+        "protocol" => matches!(media_type, "multipart/signed" | "multipart/encrypted"),
+        _ => false,
+    }
 }
 
 /// Canonical form of a `Content-Type` for comparison: the lowercased media type
@@ -1283,9 +1283,9 @@ mod tests {
         ));
     }
 
-    /// A `type` parameter whose value is itself a media type is
-    /// case-insensitive: `multipart/related` (RFC 2387 §3.1), `multipart/signed`
-    /// and `multipart/encrypted` (RFC 1847 §§2.1, 2.2). A harmless
+    /// A parameter whose value is itself a media type is case-insensitive:
+    /// `type` on `multipart/related` (RFC 2387 §3.1), `protocol` on
+    /// `multipart/signed` and `multipart/encrypted` (RFC 1847 §§2.1, 2.2). A harmless
     /// reserialization between `autumn build` and regeneration — a layer that
     /// rewrites the header, a library that normalizes media-type case — must
     /// not freeze the route the way a raw byte comparison would.
@@ -1300,15 +1300,25 @@ mod tests {
             "multipart/related; TYPE=Text/Html",
             "multipart/related; type=text/html"
         ));
-        // Same rule for the other two multipart types whose `type` carries a
-        // media type value (RFC 1847 §§2.1, 2.2).
+        // Same rule for the RFC 1847 types, whose media-type-valued parameter
+        // is `protocol` (§§2.1, 2.2).
         assert!(content_type_equivalent(
-            r#"multipart/signed; type="APPLICATION/PKCS7-SIGNATURE""#,
-            r#"multipart/signed; type="application/pkcs7-signature""#
+            r#"multipart/signed; protocol="APPLICATION/PKCS7-SIGNATURE""#,
+            r#"multipart/signed; protocol="application/pkcs7-signature""#
         ));
         assert!(content_type_equivalent(
-            r#"multipart/encrypted; type="APPLICATION/PGP-ENCRYPTED""#,
-            r#"multipart/encrypted; type="application/pgp-encrypted""#
+            r#"multipart/encrypted; protocol="APPLICATION/PGP-ENCRYPTED""#,
+            r#"multipart/encrypted; protocol="application/pgp-encrypted""#
+        ));
+        // …and there `type` has no media-type semantics, so it stays verbatim,
+        // as does `protocol` on `multipart/related`.
+        assert!(!content_type_equivalent(
+            "multipart/signed; type=BAR",
+            "multipart/signed; type=bar"
+        ));
+        assert!(!content_type_equivalent(
+            "multipart/related; protocol=BAR",
+            "multipart/related; protocol=bar"
         ));
 
         // Must not regress: a genuinely different media type value still
@@ -1331,8 +1341,8 @@ mod tests {
     }
 
     /// Parameter values are case-sensitive except where their own specification
-    /// says otherwise (`charset` everywhere; `type` where its value is a media
-    /// type — see [`parameter_value_case_insensitive`]), and their interior
+    /// says otherwise (`charset` everywhere; `type`/`protocol` where the value is
+    /// a media type — see [`parameter_value_case_insensitive`]), and their interior
     /// spacing is their own. Flattening them would be a bug in the
     /// dangerous direction: a recorded `boundary=Aa` matching a regenerated
     /// `boundary=aa` lets ISR overwrite the body while every request still
