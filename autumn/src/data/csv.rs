@@ -53,6 +53,8 @@
 use std::collections::HashMap;
 use std::io;
 
+use axum::response::{IntoResponse, Response};
+
 // ── Row-level error ───────────────────────────────────────────────────────────
 
 /// A parse or validation error for a single CSV row.
@@ -249,6 +251,58 @@ where
 
     wtr.flush()?;
     Ok(())
+}
+
+/// Axum response wrapper that serializes an iterator of [`CsvSchema`] records
+/// into a downloaded CSV file (`Content-Disposition: attachment`).
+///
+/// The records are buffered into memory before the response is sent.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::data::csv::{CsvSchema, CsvExport};
+///
+/// struct Post { id: i64, title: String }
+/// impl CsvSchema for Post {
+///     fn csv_columns() -> &'static [&'static str] { &["id", "title"] }
+///     fn to_csv_record(&self) -> Vec<String> {
+///         vec![self.id.to_string(), self.title.clone()]
+///     }
+/// }
+///
+/// #[get("/posts.csv")]
+/// async fn export() -> impl axum::response::IntoResponse {
+///     let posts = vec![Post { id: 1, title: "Hello".into() }];
+///     CsvExport("posts.csv".to_owned(), posts)
+/// }
+/// ```
+pub struct CsvExport<I>(pub String, pub I);
+
+impl<I, T> IntoResponse for CsvExport<I>
+where
+    I: IntoIterator<Item = T>,
+    T: CsvSchema,
+{
+    fn into_response(self) -> Response {
+        let mut out = Vec::new();
+        if export_csv(self.1, &mut out).is_err() {
+            return (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to generate CSV export",
+            )
+                .into_response();
+        }
+
+        // `Download` owns the `Content-Disposition` encoding: it strips control
+        // characters, reduces the name to its basename, and quotes/escapes it,
+        // so a caller-supplied filename cannot inject header directives.
+        crate::download::Download::from_bytes(out)
+            .filename(self.0)
+            .content_type("text/csv; charset=utf-8")
+            .into_response()
+    }
 }
 
 // ── import_csv ────────────────────────────────────────────────────────────────
@@ -609,6 +663,46 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         let header = s.lines().next().unwrap();
         assert_eq!(header, "id,title,published");
+    }
+
+    // ── CsvExport tests ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn csv_export_sets_csv_headers_and_body() {
+        let resp = CsvExport("posts.csv".to_owned(), sample_posts()).into_response();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()[http::header::CONTENT_TYPE],
+            "text/csv; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers()[http::header::CONTENT_DISPOSITION],
+            "attachment; filename=\"posts.csv\""
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.starts_with("id,title,published\n"), "{body}");
+        assert!(body.contains("\"Hello, World\""), "{body}");
+    }
+
+    #[test]
+    fn csv_export_filename_cannot_inject_header_directives() {
+        let resp = CsvExport(
+            "../x\"; filename=evil.exe\r\nSet-Cookie: a=b".to_owned(),
+            sample_posts(),
+        )
+        .into_response();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert!(resp.headers().get(http::header::SET_COOKIE).is_none());
+        let disposition = resp.headers()[http::header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            disposition,
+            "attachment; filename=\"x\\\"; filename=evil.exeSet-Cookie: a=b\""
+        );
     }
 
     // ── import_csv tests ──────────────────────────────────────────────────────

@@ -355,6 +355,32 @@ collapsing a mixed-tenant batch behind one arbitrary witness would either sweep
 cross-tenant children into the increment or drop legitimate ones. Tenant-scoped
 associations therefore trade the folding optimization for exactness.
 
+## Parent primary key
+
+Every counter-cache `UPDATE` addresses the parent row through `parent_pk` —
+`WHERE posts.<parent_pk> = ...` — and the default is `id`. When the parent's
+`#[id]` field is not named `id` (or is renamed with
+`#[diesel(column_name)]`), the default addresses a column that does not exist
+and the maintenance fails at runtime, on every insert and delete.
+
+Name the key explicitly:
+
+```rust,ignore
+#[belongs_to(Post, counter_cache, parent_pk = "post_uuid")]
+```
+
+It is explicit rather than inferred because `#[model]` on the child cannot
+see the parent's fields — the same visibility limit that makes
+`counter_cache_tenant` explicit. Without the key the SQL is byte-identical to
+before. `#[derivation]` takes the same `parent_pk = "<column>"` key with the
+same default.
+
+The key also drives the `belongs_to` preload: the loader filters on and
+selects `parent_pk` instead of `<parent>::id`. Note that a `#[model]` parent
+still needs an `id` column today (#3033), so for a counter cache the override
+currently serves counting through an alternate unique key; derivations onto a
+parent that is not a `#[model]` are unaffected by that limit.
+
 ## Filtered and weighted counts
 
 `counter_cache` counts every live child. For a count restricted by a predicate,

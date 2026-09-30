@@ -79,7 +79,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use uuid::Uuid;
 
@@ -1677,7 +1677,7 @@ mod tests {
         plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
-    use rand::RngCore;
+    use rand::Rng;
 
     #[tokio::test(start_paused = true)]
     async fn blocking_work_reads_auto_advanced_sim_time() {
