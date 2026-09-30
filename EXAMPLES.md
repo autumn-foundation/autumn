@@ -153,7 +153,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 |-------|-------|
 | **Persona** | Developer adding audit trails and lifecycle hooks to a content model, or serving Markdown-backed docs pages |
 | **Journey** | Hooks/revisions: slug lifecycle, before/after-save hooks, full revision history, REST API. Docs: embedded `content/*.md` rendered live at `/docs/{slug}` and pre-rendered to `dist/` by the same handler |
-| **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API, `markdown` feature (`MarkdownRegistry` + frontmatter + TOC) composed with `#[static_get]` SSG |
+| **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API, `markdown` feature (`MarkdownRegistry` + frontmatter + TOC) composed with `#[static_get]` SSG, `autumn-search` plugin (ranked keyword search, `GET /api/v1/search`) alongside the in-core `#[searchable]` FTS route |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL |
 | **Run command** | `cargo run -p wiki` |
 | **Success proof** | `curl http://localhost:3000/api/v1/pages` returns `[]` |
@@ -403,6 +403,7 @@ can pick the closest starting point without overlap.
 | Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Markdown docs + SSG | `wiki` | `markdown` feature: embedded `.md` with frontmatter, TOC, heading anchors, rendered live at `/docs/{slug}` and pre-rendered via `#[static_get]` |
+| `autumn-search` plugin (keyword) | `wiki` | `SearchPlugin` mounted on the same `#[searchable]` `Page` model as the in-core FTS route, kept in sync by composed commit hooks |
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting, route-level SEO, accessible forms, rich text, cookie consent, pagination, failure capsules and a seeded `#[sim_test]` — the complete feature showcase |
 | Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 | Live mesh rooms | `media-room` | Installs `autumn-media-plugin` with rooms and creates/lists mesh-call rooms through the mounted `RoomService` |
