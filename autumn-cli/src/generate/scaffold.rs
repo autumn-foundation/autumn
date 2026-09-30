@@ -2303,8 +2303,8 @@ fn plan_scaffold_with_options_impl(
                 "tests/{snake_name}.rs uses `autumn_web::test::TestDb`, a Postgres-only \
                  testcontainer, so `cargo test` will not compile on this SQLite app. The app \
                  itself is unaffected — `cargo run`, `cargo build` and `autumn migrate` all \
-                 work. A SQLite `TestDb` lands with the runtime slice, \
-                 https://github.com/autumn-foundation/autumn/issues/1905 — until then, delete \
+                 work. A SQLite `TestDb` is tracked in \
+                 https://github.com/autumn-foundation/autumn/issues/2555 — until then, delete \
                  that file or gate it behind a Postgres-only cargo feature."
             ));
         }
