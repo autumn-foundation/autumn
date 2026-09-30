@@ -1998,39 +1998,82 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             if strip_line_comment(&trimmed).contains(FEATURE) {
                 break; // already present
             }
-            if let Some(feat_bracket) =
-                find_unquoted_str(strip_line_comment(&trimmed), "features = [")
-            {
+
+            // The whole inline table may span multiple lines, and its
+            // `features` key — if it has one at all — may be on any of
+            // them, not necessarily this opener line. Scan forward for
+            // whichever comes first: an existing `features = [` key, or
+            // the table's closing `}` (meaning no `features` key exists).
+            let mut feat_line: Option<usize> = None;
+            let mut close_line_no_features: Option<usize> = None;
+            let mut k = i;
+            loop {
+                let owned;
+                let code: &str = if k == i {
+                    strip_line_comment(&trimmed)
+                } else {
+                    let tk = lines[k].trim();
+                    if tk.starts_with('[') {
+                        break;
+                    }
+                    owned = strip_line_comment(tk).to_owned();
+                    &owned
+                };
+                if find_unquoted_str(code, "features = [").is_some() {
+                    feat_line = Some(k);
+                    break;
+                }
+                if find_unquoted(code, '}').is_some() {
+                    close_line_no_features = Some(k);
+                    break;
+                }
+                if k + 1 >= lines.len() {
+                    break;
+                }
+                k += 1;
+            }
+
+            if let Some(feat_line_idx) = feat_line {
+                let feat_trimmed = if feat_line_idx == i {
+                    trimmed
+                } else {
+                    lines[feat_line_idx].trim().to_owned()
+                };
+                let feat_indent: String = lines[feat_line_idx]
+                    .chars()
+                    .take_while(char::is_ascii_whitespace)
+                    .collect();
+                let feat_bracket =
+                    find_unquoted_str(strip_line_comment(&feat_trimmed), "features = [").unwrap();
                 let list_start = feat_bracket + "features = [".len();
-                if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
+                if let Some(close_bracket) = find_unquoted(&feat_trimmed[list_start..], ']') {
                     // Add to existing, single-line features list.
                     let list_end = close_bracket + list_start;
-                    let existing = trimmed[list_start..list_end].trim();
+                    let existing = feat_trimmed[list_start..list_end].trim();
                     let new_list = if existing.is_empty() {
                         FEATURE.to_owned()
                     } else {
                         format!("{existing}, {FEATURE}")
                     };
-                    lines[i] = format!(
-                        "{indent}{}{}{}",
-                        &trimmed[..list_start],
+                    lines[feat_line_idx] = format!(
+                        "{feat_indent}{}{}{}",
+                        &feat_trimmed[..list_start],
                         new_list,
-                        &trimmed[list_end..]
+                        &feat_trimmed[list_end..]
                     );
                 } else {
-                    // The inline table's `features = [` array spans multiple
-                    // lines (e.g. `autumn-web = { version = "0.3", features = [\n
-                    // "ws",\n] }`): scan every line up to the closing bracket,
-                    // the same way the subtable branch below does. The feature
-                    // may already be present on a continuation line (not just
+                    // The `features = [` array spans multiple lines: scan
+                    // every line up to the closing bracket, the same way
+                    // the subtable branch below does. The feature may
+                    // already be present on a continuation line (not just
                     // the opener), and the separator before the closing
-                    // bracket depends on the last non-empty entry, which may
-                    // be several lines back rather than on the closing line
-                    // itself.
-                    let opener_tail = &trimmed[list_start..];
-                    let mut already_present = strip_line_comment(opener_tail).contains(FEATURE);
+                    // bracket depends on the last non-empty entry, which
+                    // may be several lines back rather than on the closing
+                    // line itself.
+                    let opener_tail = feat_trimmed[list_start..].to_owned();
+                    let mut already_present = strip_line_comment(&opener_tail).contains(FEATURE);
                     let mut close_line = None;
-                    let mut j = i + 1;
+                    let mut j = feat_line_idx + 1;
                     while j < lines.len() {
                         let tj = lines[j].trim();
                         if tj.starts_with('[') {
@@ -2058,11 +2101,11 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                         let tk = lines[k].trim().to_owned();
                         let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
                         let before_close = tk[..close_idx].trim();
-                        let last_entry = (i..=k).rev().find_map(|idx| {
+                        let last_entry = (feat_line_idx..=k).rev().find_map(|idx| {
                             let raw: String = if idx == k {
                                 before_close.to_owned()
-                            } else if idx == i {
-                                opener_tail.to_owned()
+                            } else if idx == feat_line_idx {
+                                opener_tail.clone()
                             } else {
                                 lines[idx].trim().to_owned()
                             };
@@ -2082,78 +2125,71 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                             format!("{indent_k}{before_close}{sep}{FEATURE}{}", &tk[close_idx..]);
                     }
                 }
-            } else if let Some(close) = trimmed.rfind('}') {
-                // No features key — insert before closing `}` on this line.
-                let before_close = trimmed[..close].trim_end();
-                let sep = if before_close.ends_with('{') {
-                    ""
+            } else if let Some(close_line_idx) = close_line_no_features {
+                if close_line_idx == i {
+                    // No features key, and the table closes on this same
+                    // opener line — insert before that `}`.
+                    let close = trimmed.rfind('}').unwrap();
+                    let before_close = trimmed[..close].trim_end();
+                    let sep = if before_close.ends_with('{') {
+                        ""
+                    } else {
+                        ", "
+                    };
+                    lines[i] = format!(
+                        "{indent}{}{sep}features = [{FEATURE}]{}",
+                        &trimmed[..close],
+                        &trimmed[close..]
+                    );
                 } else {
-                    ", "
-                };
-                lines[i] = format!(
-                    "{indent}{}{sep}features = [{FEATURE}]{}",
-                    &trimmed[..close],
-                    &trimmed[close..]
-                );
-            } else {
-                // The whole inline table spans multiple lines (not just a
-                // `features` array within it) and has no `features` key at
-                // all: this opener line has no closing `}` to insert
-                // before. Scan forward to the table's real close and add a
-                // new `features = [...]` line just before it.
-                let mut j = i + 1;
-                while j < lines.len() {
+                    // No features key anywhere in the table, which spans
+                    // multiple lines: insert a new `features = [...]` line
+                    // just before its real closing `}`.
+                    let j = close_line_idx;
                     let tj = lines[j].trim().to_owned();
-                    if tj.starts_with('[') {
-                        break;
-                    }
-                    if strip_line_comment(&tj).contains('}') {
-                        // If the closing line also carries the table's final
-                        // entry (e.g. `optional = true }`), the inserted line
-                        // will need its own trailing comma to separate it
-                        // from that entry.
-                        let close_code = strip_line_comment(&tj);
-                        let brace_idx = find_unquoted(close_code, '}').unwrap_or(close_code.len());
-                        let sep = if close_code[..brace_idx].trim().is_empty() {
-                            ""
-                        } else {
-                            ","
-                        };
-                        // Inline-table entries are comma-separated even when
-                        // wrapped across lines: the previous real entry needs
-                        // a trailing comma before the new line is inserted.
-                        // The comma must land in the code portion, before any
-                        // trailing `# comment` on that line — appended after
-                        // the comment marker, it would itself be commented
-                        // out and do nothing.
-                        let mut prev = j;
-                        while prev > i {
-                            prev -= 1;
-                            let code = strip_line_comment(lines[prev].trim()).trim().to_owned();
-                            if code.is_empty() {
-                                continue;
-                            }
-                            if !code.ends_with(',') && !code.ends_with('{') {
-                                let raw = lines[prev].trim_end();
-                                lines[prev] = find_unquoted(raw, '#').map_or_else(
-                                    || format!("{raw},"),
-                                    |hash_idx| {
-                                        let code_part = raw[..hash_idx].trim_end();
-                                        let comment_part = &raw[hash_idx..];
-                                        format!("{code_part}, {comment_part}")
-                                    },
-                                );
-                            }
-                            break;
+                    let close_code = strip_line_comment(&tj);
+                    let brace_idx = find_unquoted(close_code, '}').unwrap_or(close_code.len());
+                    // If the closing line also carries the table's final
+                    // entry (e.g. `optional = true }`), the inserted line
+                    // will need its own trailing comma to separate it
+                    // from that entry.
+                    let sep = if close_code[..brace_idx].trim().is_empty() {
+                        ""
+                    } else {
+                        ","
+                    };
+                    // Inline-table entries are comma-separated even when
+                    // wrapped across lines: the previous real entry needs
+                    // a trailing comma before the new line is inserted.
+                    // The comma must land in the code portion, before any
+                    // trailing `# comment` on that line — appended after
+                    // the comment marker, it would itself be commented
+                    // out and do nothing.
+                    let mut prev = j;
+                    while prev > i {
+                        prev -= 1;
+                        let code = strip_line_comment(lines[prev].trim()).trim().to_owned();
+                        if code.is_empty() {
+                            continue;
                         }
-                        let indent_j: String = lines[j]
-                            .chars()
-                            .take_while(char::is_ascii_whitespace)
-                            .collect();
-                        lines.insert(j, format!("{indent_j}features = [{FEATURE}]{sep}"));
+                        if !code.ends_with(',') && !code.ends_with('{') {
+                            let raw = lines[prev].trim_end();
+                            lines[prev] = find_unquoted(raw, '#').map_or_else(
+                                || format!("{raw},"),
+                                |hash_idx| {
+                                    let code_part = raw[..hash_idx].trim_end();
+                                    let comment_part = &raw[hash_idx..];
+                                    format!("{code_part}, {comment_part}")
+                                },
+                            );
+                        }
                         break;
                     }
-                    j += 1;
+                    let indent_j: String = lines[j]
+                        .chars()
+                        .take_while(char::is_ascii_whitespace)
+                        .collect();
+                    lines.insert(j, format!("{indent_j}features = [{FEATURE}]{sep}"));
                 }
             }
             break;
@@ -16853,6 +16889,29 @@ mod tests {
     fn ensure_autumn_web_mail_feature_inline_table_multiline_entry_on_closing_line() {
         let toml = "autumn-web = {\n    version = \"0.3\",\n    optional = true }\n";
         let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    // Codex review (5th round) on #3044: when the whole inline table spans
+    // multiple lines and its `features` key is on a continuation line
+    // (not the opener), the "does this table have a features key" scan
+    // must check every line up to the table's close, not just the opener
+    // — otherwise it wrongly concludes there is no key and inserts a
+    // duplicate `features = [...]`, which does not parse as TOML.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_multiline_features_key_on_continuation_line() {
+        let toml = "autumn-web = {\n    version = \"0.3\",\n    features = [\"ws\"]\n}\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(
+            out.matches("features =").count(),
+            1,
+            "features duplicated: {out}"
+        );
         assert!(
             out.contains("\"mail\""),
             "mail feature must be merged: {out}"
