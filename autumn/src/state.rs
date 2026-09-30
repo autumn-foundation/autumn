@@ -349,6 +349,14 @@ impl AppState {
             .and_then(|value| Arc::downcast::<T>(value).ok())
     }
 
+    /// Return the process-wide cooperative tenant-memory registry, if tenancy
+    /// middleware has installed it. Request arenas resolved from this registry
+    /// never use a second, implicit registry or accounting domain.
+    #[must_use]
+    pub fn tenant_cell_registry(&self) -> Option<Arc<crate::tenant_cell::TenantCellRegistry>> {
+        self.extension::<crate::tenant_cell::TenantCellRegistry>()
+    }
+
     /// A handle that reads this state's extensions later, from a place that
     /// cannot hold an [`AppState`].
     ///
