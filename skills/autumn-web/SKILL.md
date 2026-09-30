@@ -1150,6 +1150,12 @@ let opts = TxOptions::serializable()      // or ::repeatable_read(), ::read_comm
 db.tx_with(opts, |conn| async move { /* &mut AsyncPgConnection */ }.scope_boxed()).await?;
 ```
 
+On SQLite, a write-heavy closure (read-modify-write, queue claims, outbox
+inserts) should use `Db::tx_immediate(f)` (unreleased, #2885): it begins
+`BEGIN IMMEDIATE`, so a concurrent writer on a file database waits on
+`busy_timeout` instead of failing with `SQLITE_BUSY_SNAPSHOT`. It is not a
+`cache=shared` fix — use a WAL-mode file database there.
+
 `TxOptions::default()` is identical to `Db::tx`. See
 `docs/guide/transactions.md` and `docs/guide/hooks-and-transactions.md`.
 
