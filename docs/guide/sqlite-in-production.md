@@ -711,8 +711,8 @@ unhyphenated, uppercase), and such a row loads correctly but will not match a
 `autumn_web::test::TestDb`, a Postgres-only testcontainer, so `cargo test` on a
 generated SQLite app does not compile yet — `autumn generate scaffold` warns
 about this on a SQLite app. The app itself is unaffected: `cargo run`, `cargo
-build` and `autumn migrate` all work. A SQLite `TestDb` lands with the runtime
-slice, #1905.
+build` and `autumn migrate` all work. A SQLite `TestDb` is tracked in #2555
+(the SQLite-native scaffold smoke harness).
 
 Additional generator shapes are refused on SQLite:
 
