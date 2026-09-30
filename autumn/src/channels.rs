@@ -531,6 +531,9 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
     use crate::htmx::{OobMethod, OobSwap};
     match strategy {
         OobSwap::Delete => {
+            // The id may be derived from user data: escape it so a `"` cannot
+            // break out of the attribute (same XSS class as `inject_oob_attr`).
+            let id = crate::htmx::escape_attribute_string(id);
             format!("<div id=\"{id}\" hx-swap-oob=\"delete\"></div>")
         }
         OobSwap::True => inject_oob_attr(fragment_html, "true"),
@@ -577,6 +580,9 @@ pub(crate) fn inject_oob_attr(html: &str, value: &str) -> String {
         && let Some(name_end) = after_lt.find([' ', '>'])
         && let Some((tag_name, rest)) = after_lt.split_at_checked(name_end)
     {
+        // Escape the attribute value: a caller-supplied `"><script>` must not
+        // break out of the quoted attribute (XSS, see the security tests).
+        let value = crate::htmx::escape_attribute_string(value);
         return format!("{before_tag}<{tag_name} hx-swap-oob=\"{value}\"{rest}");
     }
     html.to_string()
@@ -2341,5 +2347,41 @@ mod tests {
     fn inject_oob_attr_fallback_no_boundary() {
         let result = inject_oob_attr("<", "true");
         assert_eq!(result, "<", "fallback must return html unchanged");
+    }
+}
+
+#[cfg(all(test, feature = "maud"))]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn test_inject_oob_attr_escapes_input() {
+        let result = inject_oob_attr("<div></div>", "\"><script>alert(1)</script>");
+        assert!(
+            !result.contains("<script>alert(1)</script>"),
+            "channels::inject_oob_attr is vulnerable!"
+        );
+        assert!(result.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
+
+    #[test]
+    fn delete_tombstone_escapes_id() {
+        let result = sse_oob_envelope(
+            "\"><script>alert(1)</script>",
+            &crate::htmx::OobSwap::Delete,
+            "",
+        );
+        assert!(
+            !result.contains("<script>"),
+            "delete tombstone id must be attribute-escaped: {result}"
+        );
+        assert!(
+            result.starts_with("<div id=\"&quot;&gt;&lt;script&gt;"),
+            "{result}"
+        );
+        assert!(
+            result.ends_with("\" hx-swap-oob=\"delete\"></div>"),
+            "{result}"
+        );
     }
 }

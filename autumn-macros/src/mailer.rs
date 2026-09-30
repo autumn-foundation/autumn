@@ -58,7 +58,7 @@ fn parse_mail_method(method: &ImplItemFn) -> syn::Result<Option<MailMethod>> {
     let Some(receiver) = method.sig.receiver() else {
         return Ok(None);
     };
-    if receiver.reference.is_none() || receiver.mutability.is_some() {
+    if !matches!(receiver.kind, syn::ReceiverKind::Reference(_, _, None)) {
         return Err(syn::Error::new_spanned(
             receiver,
             "#[mailer] template methods must use an `&self` receiver",
@@ -194,7 +194,7 @@ pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 && method
                     .sig
                     .receiver()
-                    .is_some_and(|r| r.reference.is_some() && r.mutability.is_none())
+                    .is_some_and(|r| matches!(r.kind, syn::ReceiverKind::Reference(_, _, None)))
             {
                 let orig_block = method.block.clone();
                 method.block = syn::parse_quote!({

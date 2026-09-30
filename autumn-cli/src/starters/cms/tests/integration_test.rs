@@ -14779,6 +14779,195 @@ async fn an_invalid_menu_name_is_refused_and_redisplayed() {
     assert_eq!(count, 0, "neither invalid name may be persisted");
 }
 
+/// A refused menu item or widget is redisplayed in its own card, not replaced
+/// by the generic error page.
+///
+/// `create_menu_item` and `create_widget` reported every refusal — a blank
+/// label (which `required` does not reject when it is whitespace), a parent
+/// that vanished since the form was rendered, a full sidebar — by returning
+/// the error, so the administrator lost the whole Appearance screen and
+/// everything typed into the card. Each is now a 422 that keeps the values and
+/// puts the reason (`role="alert"`) inside the card it belongs to.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_menu_item_or_widget_is_redisplayed_with_its_input() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Main"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Blank label: the URL the administrator typed survives.
+    let blank = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", "   "), ("url", "/keep-me")]))
+        .send()
+        .await;
+    blank.assert_status(422);
+    assert!(blank.header("location").is_none());
+    blank
+        .assert_body_contains("A menu item needs a label")
+        .assert_body_contains(r#"role="alert""#)
+        .assert_body_contains(r#"value="/keep-me""#)
+        .assert_body_contains("autofocus");
+
+    // A parent that does not exist (deleted in another tab) is refused with the
+    // label and URL intact.
+    let stale = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("label", "Products"),
+            ("url", "/products"),
+            ("parent_id", "999"),
+        ]))
+        .send()
+        .await;
+    stale.assert_status(422);
+    stale
+        .assert_body_contains("can only nest under a top-level item")
+        .assert_body_contains(r#"value="Products""#)
+        .assert_body_contains(r#"value="/products""#);
+
+    // An oversized widget title: kind, text and position survive.
+    let long_title = client
+        .post("/admin/appearance/widgets")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("kind", "text"),
+            ("title", &"t".repeat(201)),
+            ("text", "Keep this blurb."),
+            ("position", "7"),
+        ]))
+        .send()
+        .await;
+    long_title.assert_status(422);
+    long_title
+        .assert_body_contains("A widget title must be at most 200 characters")
+        .assert_body_contains(r#"role="alert""#)
+        .assert_body_contains("Keep this blurb.")
+        .assert_body_contains(r#"value="7""#)
+        .assert_body_contains(r#"value="text" selected"#);
+
+    // A full sidebar: the refusal is the store's own message, shown in the card.
+    for _ in 0..30 {
+        client
+            .post("/admin/appearance/widgets")
+            .header("cookie", &cookie)
+            .form(&form(&[("kind", "text"), ("text", "x"), ("position", "0")]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+    let full = client
+        .post("/admin/appearance/widgets")
+        .header("cookie", &cookie)
+        .form(&form(&[("kind", "text"), ("text", "One too many.")]))
+        .send()
+        .await;
+    full.assert_status(422);
+    full.assert_body_contains("Remove one before adding another")
+        .assert_body_contains("One too many.");
+
+    let (items, widgets): (i64, i64) = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        (
+            {{crate_name}}::schema::menu_items::table
+                .count()
+                .get_result(&mut conn)
+                .await
+                .expect("item count"),
+            {{crate_name}}::schema::widgets::table
+                .count()
+                .get_result(&mut conn)
+                .await
+                .expect("widget count"),
+        )
+    };
+    assert_eq!(items, 0, "no refused item may be stored");
+    assert_eq!(widgets, 30, "only the widgets that fit were stored");
+}
+
+/// A refused item is redisplayed beside its own menu even when that menu is
+/// not on the first page of the Appearance screen — the page is resolved from
+/// the menu, not from the (possibly stale) page the form was rendered on.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_item_on_a_later_menu_page_still_shows_its_message() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for n in 1..=21 {
+        client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("name", &format!("Menu {n:02}")),
+                ("location", ""),
+            ]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    // Menu 21 is id 21 and sorts last: page 2 at 20 menus per page.
+    let refused = client
+        .post("/admin/appearance/menus/21/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", " "), ("url", "/kept")]))
+        .send()
+        .await;
+    refused.assert_status(422);
+    refused
+        .assert_body_contains("A menu item needs a label")
+        .assert_body_contains("Menu 21")
+        .assert_body_contains(r#"value="/kept""#);
+}
+
+/// A refused item keeps its category target even when the bounded category
+/// list no longer includes it — otherwise the browser would select "No
+/// category" and the resubmitted item would silently lose its target.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_item_keeps_a_target_outside_the_bounded_lists() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Primary"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         SELECT 'category', 'cat-' || lpad(g::text, 3, '0'),
+                'cat-' || lpad(g::text, 3, '0'), '', 0
+         FROM generate_series(1, 250) AS g",
+    )
+    .await
+    .expect("seed the terms");
+
+    // cat-250 (id 250) is beyond the first 200 offered.
+    let refused = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", " "), ("term_id", "250")]))
+        .send()
+        .await;
+    refused.assert_status(422);
+    refused.assert_body_contains(r#"<option value="250" selected>cat-250"#);
+}
+
 /// Only one menu can hold a theme location, under concurrency.
 ///
 /// The replacement cleared the incumbent and inserted, with nothing

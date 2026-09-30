@@ -957,13 +957,15 @@ pub(crate) fn global_tracking_store() -> Option<Arc<dyn JobTrackingStore>> {
 
 /// Reset the process-global tracking store, mirroring
 /// [`crate::job::clear_global_job_client`].
+///
+/// Uses `get_or_init` rather than a `get()`-then-`set()` pair: with the
+/// latter, a concurrent [`install_tracking_store`] could publish its slot
+/// between the two calls, the `set` would fail silently, and the clear
+/// would be lost (modelled in `chaos_job_tracking_store_loom`).
 pub(crate) fn clear_global_tracking_store() {
-    if let Some(lock) = GLOBAL_TRACKING_STORE.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = None;
-        }
-    } else {
-        let _ = GLOBAL_TRACKING_STORE.set(RwLock::new(None));
+    let lock = GLOBAL_TRACKING_STORE.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = None;
     }
 }
 

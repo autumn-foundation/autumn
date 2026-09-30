@@ -41,7 +41,7 @@ Diesel/`diesel-async` (Postgres), and Maud for HTML.
   serde_json = "1"
   chrono = { version = "0.4", features = ["serde"] }
   tokio = { version = "1", features = ["full"] }
-  validator = { version = "0.20", features = ["derive"] }
+  validator = { version = "0.21", features = ["derive"] }
 
   [dev-dependencies]
   autumn-web = { path = "../../../../../autumn", features = ["test-support"] }

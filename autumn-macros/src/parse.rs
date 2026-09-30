@@ -409,3 +409,38 @@ pub fn extract_interceptors(attrs: &mut Vec<Attribute>) -> Vec<syn::Path> {
     });
     interceptors
 }
+
+/// Splits a `match` arm's pattern from its `if` guard.
+///
+/// Since syn 3 a guard is no longer a field of [`syn::Arm`]; it is carried
+/// as a top-level [`syn::Pat::Guard`] wrapping the arm's real pattern. Every
+/// walker that binds names from the pattern and then evaluates the guard
+/// needs the two apart, so this is the one place that knows the shape.
+pub fn arm_pat_and_guard(arm: &syn::Arm) -> (&syn::Pat, Option<&syn::Expr>) {
+    match &arm.pat {
+        syn::Pat::Guard(g) => (&g.pat, Some(&g.guard)),
+        pat => (pat, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arm_pat_and_guard;
+
+    #[test]
+    fn arm_guard_is_split_from_its_pattern() {
+        let arm: syn::Arm = syn::parse_quote!(Some(x) if x > 0 => x);
+        let (pat, guard) = arm_pat_and_guard(&arm);
+        assert!(matches!(pat, syn::Pat::TupleStruct(_)));
+        let guard = guard.expect("guard present");
+        assert_eq!(quote::quote!(#guard).to_string(), "x > 0");
+    }
+
+    #[test]
+    fn unguarded_arm_has_no_guard() {
+        let arm: syn::Arm = syn::parse_quote!(None => 0);
+        let (pat, guard) = arm_pat_and_guard(&arm);
+        assert!(matches!(pat, syn::Pat::Ident(_)));
+        assert!(guard.is_none());
+    }
+}

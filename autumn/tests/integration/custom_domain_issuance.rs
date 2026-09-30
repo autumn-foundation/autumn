@@ -731,6 +731,235 @@ async fn retention_prunes_abandoned_registrations_and_orphaned_certificates() {
     );
 }
 
+// ── AC7 on the extracted prune-only type (#2652) ─────────────────────────
+
+#[tokio::test]
+async fn the_prune_only_pruner_the_cli_installs_prunes_like_the_task() {
+    use autumn_web::acme::tenant_domains::PruneOnlyCustomDomainPruner;
+    use autumn_web::custom_domain::CustomDomainPruner as _;
+
+    // The harness task needs a verifier and an issuer, but the prune-only
+    // type the one-shot `autumn db retention` path installs is built from the
+    // same parts WITHOUT them: no order is placed and no CA is contacted on
+    // the CLI path.
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    let pruner = PruneOnlyCustomDomainPruner {
+        registry: Arc::clone(&h.registry),
+        cache: Arc::clone(&h.cache),
+        certs: Arc::clone(&h.store) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        cert_store_paths: Some(Arc::clone(&h.store)),
+        retained_cert_ids: HashSet::from([CertId::from_domains(&["app.example.com".to_owned()])
+            .as_str()
+            .to_owned()]),
+        reporter: Arc::new({
+            let sink = Arc::clone(&h.alerts);
+            move |message: String| sink.lock().unwrap().push(message)
+        }),
+        recovery: None,
+    };
+
+    // Never published DNS.
+    h.registry
+        .register("abandoned.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+    // A certificate whose registry record is already gone.
+    h.store
+        .save_cert(
+            &CertId::from_domains(&["orphan.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    // The deployment's own certificate: same store, no registry record, but
+    // named in `retained_cert_ids` — the prune must not delete it.
+    h.store
+        .save_cert(
+            &CertId::from_domains(&["app.example.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let cutoff = NOW + 86_400;
+    // A dry run reports without deleting.
+    assert_eq!(pruner.prune(cutoff, true).await.unwrap(), 2);
+    assert!(h.registry.get("abandoned.clientco.com").is_some());
+
+    assert_eq!(pruner.prune(cutoff, false).await.unwrap(), 2);
+    assert!(h.registry.get("abandoned.clientco.com").is_none());
+    assert!(
+        h.store
+            .load_cert(&CertId::from_domains(&["orphan.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // The retained deployment certificate survives the prune.
+    assert!(
+        h.store
+            .load_cert(&CertId::from_domains(&["app.example.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some(),
+        "the prune must not delete the deployment's own certificate"
+    );
+    // And nothing ever asked the issuer for anything.
+    assert_eq!(issuer.count(), 0, "the prune path must not contact a CA");
+}
+
+/// A one-shot `autumn db retention` loads its registry once, at startup, while
+/// the serving process keeps writing to the same store. Its prune must judge
+/// against what the store holds NOW (Codex review on the #2652 sweep PR): a
+/// hostname registered and issued since, or an abandoned one verified since,
+/// must survive.
+#[tokio::test]
+async fn a_one_shot_prune_spares_what_the_serving_process_wrote_after_it_loaded() {
+    use autumn_web::acme::tenant_domains::PruneOnlyCustomDomainPruner;
+    use autumn_web::custom_domain::CustomDomainPruner as _;
+    use autumn_web::custom_domain::CustomDomainStore as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let shared = Arc::new(MemoryCustomDomainStore::new());
+    let server = CustomDomainRegistry::new(
+        Arc::clone(&shared) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    );
+    server.load().await.unwrap();
+    server
+        .register("stalled.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    // The one-shot process loads its own view of the same store...
+    let one_shot = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&shared) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    one_shot.load_without_migration().await.unwrap();
+
+    // ...and only then does the server finish the stalled domain's DNS and
+    // connect, verify and issue a brand-new one.
+    server
+        .record_verified("stalled.clientco.com", NOW + 10)
+        .await
+        .unwrap();
+    server
+        .register("fresh.clientco.com", "tenant-b", NOW + 10)
+        .await
+        .unwrap();
+    server
+        .record_verified("fresh.clientco.com", NOW + 10)
+        .await
+        .unwrap();
+    certs
+        .save_cert(
+            &CertId::from_domains(&["fresh.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let pruner = PruneOnlyCustomDomainPruner {
+        registry: Arc::clone(&one_shot),
+        cache: Arc::new(CustomDomainCertCache::new(4)),
+        certs: Arc::clone(&certs) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        cert_store_paths: Some(Arc::clone(&certs)),
+        retained_cert_ids: HashSet::new(),
+        reporter: Arc::new(|_: String| {}),
+        recovery: None,
+    };
+    let cutoff = NOW + 86_400;
+    assert_eq!(
+        pruner.prune(cutoff, true).await.unwrap(),
+        0,
+        "the report must not count what the server wrote since the load"
+    );
+    assert_eq!(pruner.prune(cutoff, false).await.unwrap(), 0);
+    assert!(
+        certs
+            .load_cert(&CertId::from_domains(&["fresh.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some(),
+        "a certificate issued after the one-shot loaded must not be deleted"
+    );
+    assert!(
+        shared
+            .load_all()
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.hostname == "stalled.clientco.com"),
+        "a domain verified after the one-shot loaded must not be offboarded"
+    );
+}
+
+/// A retention report must write nothing (Codex review on the #2652 sweep
+/// PR): the boot migration that gives a pre-token record its ownership token
+/// also resets its status and registration time.
+#[tokio::test]
+async fn loading_without_migration_leaves_a_pre_token_record_untouched() {
+    use autumn_web::custom_domain::CustomDomainStore as _;
+
+    let shared = Arc::new(MemoryCustomDomainStore::new());
+    let seed = CustomDomainRegistry::new(
+        Arc::clone(&shared) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    );
+    seed.load().await.unwrap();
+    let mut legacy = seed
+        .register("legacy.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    legacy.verification_token = None;
+    legacy.status = DomainStatus::Verified;
+    shared.save(&legacy).await.unwrap();
+
+    let report = CustomDomainRegistry::new(
+        Arc::clone(&shared) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    );
+    assert_eq!(report.load_without_migration().await.unwrap(), 1);
+    assert!(report.is_hydrated());
+    let stored = shared.load_all().await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].status, DomainStatus::Verified);
+    assert_eq!(stored[0].registered_at_unix, NOW);
+    assert!(
+        stored[0].verification_token.is_none(),
+        "a report-time load must not migrate the record"
+    );
+
+    // The serving boot path still migrates it.
+    let boot = CustomDomainRegistry::new(
+        Arc::clone(&shared) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    );
+    boot.load().await.unwrap();
+    assert!(
+        shared.load_all().await.unwrap()[0]
+            .verification_token
+            .is_some()
+    );
+}
+
 // ── AC5: health names the domain and the tenant ──────────────────────────
 
 #[tokio::test]
@@ -2426,8 +2655,144 @@ async fn a_failed_order_for_a_hostname_that_changed_hands_spares_the_new_tenant(
     );
 }
 
+/// An issuer that offboards and re-registers the hostname for the SAME tenant
+/// and then fails, so the error belongs to a registration that no longer
+/// exists (#2655, item 1).
+#[derive(Debug)]
+struct FailingReregisterIssuer {
+    registry: Arc<CustomDomainRegistry>,
+    /// Also prove the successor's DNS before failing, so it is `Verified` —
+    /// an orderable state — when the dead order's failure lands.
+    verify_successor: bool,
+}
+
+impl DomainIssuer for FailingReregisterIssuer {
+    fn issue<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
+        Box::pin(async move {
+            self.registry.remove(hostname).await.unwrap();
+            // Same tenant, new generation: `registered_at` moves on.
+            self.registry
+                .register(hostname, "tenant-a", NOW + 1)
+                .await
+                .unwrap();
+            if self.verify_successor {
+                self.registry
+                    .record_verified(hostname, NOW + 1)
+                    .await
+                    .unwrap();
+            }
+            Err("the CA rejected the order".to_owned())
+        })
+    }
+}
+
 #[tokio::test]
-async fn a_failure_is_recorded_only_for_the_tenant_that_still_owns_the_hostname() {
+async fn a_failed_order_for_a_hostname_that_was_re_registered_spares_the_new_generation() {
+    // The same-tenant twin of the takeover test: the stale failure must not
+    // charge the re-registered successor either — it is a fresh `PendingDns`
+    // an order never flew against, so it gets no reason, no backoff, no
+    // failure count, and no alert.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        10,
+    ));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(4));
+    let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&alerts);
+    let mut task = task_over(
+        Arc::clone(&registry),
+        cache,
+        certs,
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::new(FailingReregisterIssuer {
+            registry: Arc::clone(&registry),
+            verify_successor: false,
+        }) as Arc<dyn DomainIssuer>,
+    );
+    task.reporter = Arc::new(move |message: String| sink.lock().unwrap().push(message));
+
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    task.tick(NOW).await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.tenant, "tenant-a");
+    assert_eq!(record.status, DomainStatus::PendingDns);
+    assert_eq!(
+        record.registered_at_unix,
+        NOW + 1,
+        "the assertions below are about the re-registered generation"
+    );
+    assert!(
+        record.failure_reason.is_none(),
+        "the re-registered generation must not show the old order's error: {record:?}"
+    );
+    assert_eq!(record.consecutive_failures, 0);
+    assert!(
+        record.next_attempt_unix.is_none(),
+        "the re-registered generation must not wait out a backoff it did not earn"
+    );
+    assert!(
+        alerts.lock().unwrap().is_empty(),
+        "a failure belonging to a dead registration must not page an operator"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_order_spares_a_re_registered_successor_that_is_already_verified() {
+    // Status alone cannot tell registrations apart: the successor here is
+    // `Verified` — orderable — when the dead order's failure lands, so only
+    // the per-registration token keeps the stale failure off it.
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(MemoryCustomDomainStore::new()),
+        10,
+    ));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(4));
+    let alerts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&alerts);
+    let mut task = task_over(
+        Arc::clone(&registry),
+        cache,
+        certs,
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::new(FailingReregisterIssuer {
+            registry: Arc::clone(&registry),
+            verify_successor: true,
+        }) as Arc<dyn DomainIssuer>,
+    );
+    task.reporter = Arc::new(move |message: String| sink.lock().unwrap().push(message));
+
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    task.tick(NOW).await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_eq!(record.registered_at_unix, NOW + 1);
+    assert_eq!(record.status, DomainStatus::Verified);
+    assert!(
+        record.failure_reason.is_none(),
+        "a verified successor must not show the dead order's error: {record:?}"
+    );
+    assert_eq!(record.consecutive_failures, 0);
+    assert!(record.next_attempt_unix.is_none());
+    assert!(
+        alerts.lock().unwrap().is_empty(),
+        "a failure belonging to a dead registration must not page an operator"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_is_recorded_only_for_the_tenant_and_generation_that_still_own_the_hostname() {
     let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
     registry.load().await.unwrap();
     registry
@@ -2440,6 +2805,7 @@ async fn a_failure_is_recorded_only_for_the_tenant_that_still_owns_the_hostname(
         .await
         .unwrap();
 
+    // A failure must never charge a tenant that does not own the hostname.
     assert!(
         !registry
             .record_failure_for("app.clientco.com", "tenant-a", NOW, "stale", 300)
@@ -2454,6 +2820,30 @@ async fn a_failure_is_recorded_only_for_the_tenant_that_still_owns_the_hostname(
             .is_none()
     );
 
+    // ...and never a `PendingDns` record either, even for its own tenant: an
+    // order never flies against one, so a failure arriving for it is stale
+    // (#2655, item 1).
+    assert!(
+        !registry
+            .record_failure_for("app.clientco.com", "tenant-b", NOW, "stale", 300)
+            .await
+            .unwrap(),
+        "a failure must not charge a re-registered generation"
+    );
+    assert!(
+        registry
+            .get("app.clientco.com")
+            .unwrap()
+            .failure_reason
+            .is_none()
+    );
+
+    // Once the record is the orderable generation, its own tenant's failure
+    // applies.
+    registry
+        .record_verified("app.clientco.com", NOW)
+        .await
+        .unwrap();
     assert!(
         registry
             .record_failure_for("app.clientco.com", "tenant-b", NOW, "mine", 300)

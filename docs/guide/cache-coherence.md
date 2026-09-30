@@ -566,6 +566,8 @@ the coherence registration is placed inside the function body precisely so an
 | `--features F` | Cargo features to build the audited binary with (repeatable) |
 | `--all-features` | build the audited binary with every feature |
 | `--no-default-features` | build the audited binary without default features |
+| `--release` | build and audit the release binary (`target/release`) |
+| `--profile NAME` | build and audit under a Cargo profile (`target/NAME`; `dev`/`test` use `target/debug`, `bench` `target/release`) |
 
 **Audit the feature set you deploy.** The manifest describes the binary that
 produced it. A `#[cached]` read or a `#[repository]` write behind a feature the
@@ -573,6 +575,8 @@ build does not enable is not compiled in at all, so it cannot appear in the
 manifest and cannot be found incoherent — a default-feature audit exits green
 on a configuration it never looked at. Pass the same feature flags your release
 build uses; the audit echoes them when they are not Cargo's defaults, so the
-report says which build it is talking about.
+report says which build it is talking about. The same holds for the profile: a
+read behind `#[cfg(not(debug_assertions))]` exists only in a release build, so
+pass `--release` (or `--profile NAME`) to audit the profile you ship.
 
 Exit code is `0` when nothing can be left stale, `1` otherwise.

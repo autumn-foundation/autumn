@@ -147,6 +147,112 @@ fn eviction_reclaims_to_zero() {
     );
 }
 
+/// Eviction ends cache residency, not the tenant's accounting lifetime. An
+/// in-flight owner forces a subsequent lookup to rejoin the same quota counter
+/// and scratch domain until every owner has gone away.
+#[test]
+fn eviction_does_not_split_a_live_tenant_accounting_domain() {
+    let registry = TenantCellRegistry::new();
+    let old = registry.get_or_create("t", 1_000);
+    old.scratch_insert("shared", vec![7; 100])
+        .expect("initial scratch allocation fits");
+    let initial = old.tracked_bytes();
+    let old_charge = old.try_charge(600).expect("initial charge fits");
+    let in_flight = Arc::clone(&old);
+
+    let evicted = registry.evict("t").expect("tenant was resident");
+    assert_eq!(registry.len(), 0, "eviction removes cache residency");
+
+    let replacement = registry.get_or_create("t", 1_000);
+    assert_eq!(
+        replacement.scratch_get("shared"),
+        Some(vec![7; 100]),
+        "the replacement must use the still-live scratch domain"
+    );
+    let remaining = 1_000 - initial - old_charge.bytes();
+    replacement
+        .try_charge(remaining + 1)
+        .expect_err("old and new requests share one aggregate tenant quota");
+    assert_eq!(replacement.tracked_bytes(), initial + 600);
+
+    drop(old_charge);
+    drop(old);
+    drop(in_flight);
+    drop(evicted);
+    let final_resident = registry
+        .evict("t")
+        .expect("resurrected cell remains resident until explicitly evicted");
+    drop(replacement);
+    drop(final_resident);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
+/// Dead weak lifecycle tombstones must not turn a bounded resident cache into
+/// an unbounded tenant-id string cache under one-off, request-controlled IDs.
+#[test]
+fn eviction_sweeps_expired_lifecycle_tombstones_under_churn() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+
+    for i in 0..1_000 {
+        let cell = registry.get_or_create(&format!("one-off-{i}"), 1_000);
+        drop(cell);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.accounting_domain_count(),
+            1,
+            "capacity enforcement must discard dead tenant lifecycle keys"
+        );
+    }
+
+    // A live evicted domain is preserved, then swept only after its last handle
+    // drops and the next mutation gives the registry an opportunity to prune.
+    let live = registry.get_or_create("live", 1_000);
+    let evicted = registry.evict("live").expect("live tenant was resident");
+    assert!(registry.accounting_domain_count() >= 1);
+    drop(live);
+    drop(evicted);
+    let next = registry.get_or_create("next", 1_000);
+    drop(next);
+    assert_eq!(registry.accounting_domain_count(), 1);
+}
+
+/// Lifecycle cleanup is amortized: many simultaneously-live evicted domains
+/// are retained, then reclaimed in bounded batches after their owners drop.
+#[test]
+fn lifecycle_tombstones_are_swept_incrementally() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+    let mut in_flight = Vec::new();
+    for i in 0..100 {
+        in_flight.push(registry.get_or_create(&format!("stream-{i}"), 1_000));
+    }
+    assert_eq!(registry.accounting_domain_count(), 100);
+
+    drop(in_flight);
+    // Each mutation examines a fixed-size batch. Seven batches are enough for
+    // the 99 non-resident candidates; the final resident domain remains.
+    for _ in 0..7 {
+        assert!(registry.evict("not-present").is_none());
+    }
+    assert_eq!(registry.accounting_domain_count(), 1);
+}
+
+/// A resurrected cell must use one timestamp for touching and TTL enforcement,
+/// otherwise a millisecond rollover can immediately evict it at a zero TTL.
+#[test]
+fn resurrection_with_zero_idle_ttl_remains_resident() {
+    let registry = TenantCellRegistry::with_limits(0, Some(Duration::ZERO));
+    let original = registry.get_or_create("t", 1_000);
+    let evicted = registry.evict("t").expect("tenant was resident");
+
+    let resurrected = registry.get_or_create("t", 1_000);
+    assert_eq!(registry.len(), 1);
+    assert!(registry.get("t").is_some());
+
+    drop(original);
+    drop(evicted);
+    drop(resurrected);
+}
+
 /// Density smoke test: empty resident cells keep API-accounted payload separate
 /// from their process-resident structural cost, meet the configured target,
 /// and can all be torn down.
@@ -680,4 +786,34 @@ fn touch_does_not_regress_timestamp() {
         5,
         "an out-of-order sequence must not regress the recorded access sequence"
     );
+}
+
+/// Regression: each resident cell also owns a lifecycle record with its own
+/// copy of the tenant id, so the structural lower bound must count three id
+/// copies per cell (resident key, lifecycle key, the cell's own id), not two.
+#[test]
+fn structural_overhead_counts_resident_lifecycle_records() {
+    let registry = TenantCellRegistry::new();
+    let ids: Vec<String> = (0..10).map(|i| format!("tenant-{i:04}")).collect();
+    for id in &ids {
+        drop(registry.get_or_create(id, 0));
+    }
+    let id_bytes: usize = ids.iter().map(String::len).sum();
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, ids.len());
+    assert_eq!(structural.tenant_id_capacity_bytes, 3 * id_bytes);
+}
+
+/// Regression: an evicted-but-live domain's lifecycle entry is still allocated
+/// structure, so its key keeps counting after the cell leaves the resident map.
+#[test]
+fn structural_overhead_counts_non_resident_lifecycle_records() {
+    let registry = TenantCellRegistry::new();
+    let held = registry.get_or_create("tenant-held", 0);
+    let evicted = registry.evict("tenant-held").expect("was resident");
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, 0);
+    assert_eq!(structural.tenant_id_capacity_bytes, "tenant-held".len());
+    assert!(structural.registry_entry_bytes > 0);
+    drop((held, evicted));
 }

@@ -510,6 +510,21 @@ impl ColumnType {
         }
     }
 
+    /// The leaf segment of a Rust type path as written in a model struct field —
+    /// the same leaf [`from_rust_type`](Self::from_rust_type) matches on:
+    /// `autumn_web::i18n::Translated` → `Translated`, `String` → `String`.
+    /// Surrounding whitespace is trimmed (so the spacing `quote!` introduces —
+    /// `autumn_web :: i18n :: Translated` — resolves like the compact
+    /// spelling); interior whitespace is left alone, matching a token as
+    /// written.
+    #[must_use]
+    pub fn rust_type_leaf(rust: &str) -> &str {
+        let trimmed = rust.trim();
+        trimmed
+            .rfind("::")
+            .map_or(trimmed, |idx| trimmed[idx + 2..].trim())
+    }
+
     /// Inverse of [`ColumnType::rust_type`]: resolve a Rust type token (as it
     /// would appear in a `#[model]` struct) back to a [`ColumnType`]. Intended
     /// for the slice-2 `syn`-backed parser, so it is **tolerant of leading path
@@ -572,15 +587,20 @@ impl ColumnType {
             .next()
             .unwrap_or(normalized.as_str());
         match leaf {
-            // `Translated` is a `#[translatable]` per-locale container (issue
-            // #1384): its storage is a plain `TEXT` column holding a JSON
-            // object, so the declarative lane manages it exactly like any other
-            // text column. Without it here the parser skips the column and the
-            // diff refuses to emit `CREATE TABLE` for the whole model.
+            // `Translated` is deliberately NOT matched here (issue #2292):
+            // the leaf alone cannot tell the framework's `#[translatable]`
+            // per-locale container (issue #1384) apart from an application
+            // type that happens to share the name (e.g. `domain::Translated`).
+            // The declarative parser maps a `Translated`-leafed field to
+            // `Text` only when the field carries the `#[translatable]` marker
+            // (keying on [`rust_type_leaf`](Self::rust_type_leaf) at the call
+            // site); an unmarked look-alike falls through to `None` below and
+            // is skipped with a diagnostic, exactly like any other unknown
+            // type.
             // `CollabText` is a `#[collaborative]` CRDT document (issue #1806);
-            // like `Translated` its storage is a plain `TEXT` column holding
-            // JSON, so the declarative lane manages it as a text column.
-            "String" | "Translated" | "CollabText" => Some(Self::Text),
+            // like the marked `Translated` its storage is a plain `TEXT` column
+            // holding JSON, so the declarative lane manages it as a text column.
+            "String" | "CollabText" => Some(Self::Text),
             "i32" => Some(Self::Int32),
             "i64" => Some(Self::Int64),
             "bool" => Some(Self::Bool),
@@ -1399,18 +1419,39 @@ mod tests {
     }
 
     #[test]
+    fn rust_type_leaf_takes_the_final_path_segment() {
+        assert_eq!(ColumnType::rust_type_leaf("String"), "String");
+        assert_eq!(
+            ColumnType::rust_type_leaf("autumn_web::i18n::Translated"),
+            "Translated"
+        );
+        // The spacing `quote!` introduces in the parser.
+        assert_eq!(
+            ColumnType::rust_type_leaf("autumn_web :: i18n :: Translated"),
+            "Translated"
+        );
+        assert_eq!(ColumnType::rust_type_leaf("::Translated"), "Translated");
+        assert_eq!(ColumnType::rust_type_leaf("  Translated  "), "Translated");
+        assert_eq!(
+            ColumnType::rust_type_leaf("Option<Translated>"),
+            "Option<Translated>"
+        );
+    }
+
+    #[test]
     fn from_rust_type_happy_and_path_tolerant() {
         // Bare tokens.
         assert_eq!(ColumnType::from_rust_type("String"), Some(ColumnType::Text));
-        // #1384: a translatable container is TEXT storage, path-tolerant.
-        assert_eq!(
-            ColumnType::from_rust_type("Translated"),
-            Some(ColumnType::Text)
-        );
+        // #2292: `Translated` is keyed on the `#[translatable]` marker at the
+        // parser call site, NOT on the type name — the generic mapper stays
+        // unaware of it, so an application's look-alike `Translated` type is
+        // never claimed as framework storage.
+        assert_eq!(ColumnType::from_rust_type("Translated"), None);
         assert_eq!(
             ColumnType::from_rust_type("autumn_web::i18n::Translated"),
-            Some(ColumnType::Text)
+            None
         );
+        assert_eq!(ColumnType::from_rust_type("domain::Translated"), None);
         assert_eq!(ColumnType::from_rust_type("i32"), Some(ColumnType::Int32));
         assert_eq!(ColumnType::from_rust_type("i64"), Some(ColumnType::Int64));
         assert_eq!(ColumnType::from_rust_type("bool"), Some(ColumnType::Bool));

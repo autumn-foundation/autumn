@@ -600,8 +600,9 @@ pub fn run(opts: &AgentsManifestOptions<'_>) {
     if opts.release {
         eprintln!("Building the release profile\n");
     }
-    routes::compile_binary_with_profile(opts.package, opts.bin, &opts.features, opts.release);
-    let binary = routes::find_binary_in_profile(opts.package, opts.bin, opts.release);
+    let profile = routes::CargoProfile::from_release(opts.release);
+    routes::compile_binary_with(opts.package, opts.bin, &opts.features, &profile);
+    let binary = routes::find_binary_in_profile(opts.package, opts.bin, &profile);
 
     let output = Command::new(&binary)
         .env(DUMP_ENV, "1")
