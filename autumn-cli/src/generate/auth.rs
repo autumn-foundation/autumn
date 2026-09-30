@@ -2103,14 +2103,29 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                 // new `features = [...]` line just before it.
                 let mut j = i + 1;
                 while j < lines.len() {
-                    let tj = lines[j].trim();
+                    let tj = lines[j].trim().to_owned();
                     if tj.starts_with('[') {
                         break;
                     }
-                    if strip_line_comment(tj).contains('}') {
+                    if strip_line_comment(&tj).contains('}') {
+                        // If the closing line also carries the table's final
+                        // entry (e.g. `optional = true }`), the inserted line
+                        // will need its own trailing comma to separate it
+                        // from that entry.
+                        let close_code = strip_line_comment(&tj);
+                        let brace_idx = find_unquoted(close_code, '}').unwrap_or(close_code.len());
+                        let sep = if close_code[..brace_idx].trim().is_empty() {
+                            ""
+                        } else {
+                            ","
+                        };
                         // Inline-table entries are comma-separated even when
                         // wrapped across lines: the previous real entry needs
                         // a trailing comma before the new line is inserted.
+                        // The comma must land in the code portion, before any
+                        // trailing `# comment` on that line — appended after
+                        // the comment marker, it would itself be commented
+                        // out and do nothing.
                         let mut prev = j;
                         while prev > i {
                             prev -= 1;
@@ -2119,7 +2134,15 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                                 continue;
                             }
                             if !code.ends_with(',') && !code.ends_with('{') {
-                                lines[prev] = format!("{},", lines[prev].trim_end());
+                                let raw = lines[prev].trim_end();
+                                lines[prev] = find_unquoted(raw, '#').map_or_else(
+                                    || format!("{raw},"),
+                                    |hash_idx| {
+                                        let code_part = raw[..hash_idx].trim_end();
+                                        let comment_part = &raw[hash_idx..];
+                                        format!("{code_part}, {comment_part}")
+                                    },
+                                );
                             }
                             break;
                         }
@@ -2127,7 +2150,7 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                             .chars()
                             .take_while(char::is_ascii_whitespace)
                             .collect();
-                        lines.insert(j, format!("{indent_j}features = [{FEATURE}]"));
+                        lines.insert(j, format!("{indent_j}features = [{FEATURE}]{sep}"));
                         break;
                     }
                     j += 1;
@@ -16798,6 +16821,37 @@ mod tests {
     #[test]
     fn ensure_autumn_web_mail_feature_inline_table_multiline_without_features_key() {
         let toml = "autumn-web = {\n    version = \"0.3\"\n}\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    // Codex review (4th round) on #3044: the previous entry's trailing
+    // comma must land in the code portion, before a `# comment`, or the
+    // comma is itself commented out and does nothing.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_multiline_comma_before_trailing_comment() {
+        let toml = "autumn-web = {\n    version = \"0.3\" # pinned\n}\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    // Codex review (4th round) on #3044: when the closing-brace line also
+    // carries the table's final entry (e.g. `optional = true }`), the
+    // inserted `features = [...]` line needs its own trailing comma to
+    // separate it from that entry.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_multiline_entry_on_closing_line() {
+        let toml = "autumn-web = {\n    version = \"0.3\",\n    optional = true }\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(
             out.contains("\"mail\""),
