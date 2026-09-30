@@ -86,6 +86,39 @@ impl MutationHooks for PageHooks {
 
         Ok(())
     }
+
+    // `PageHooks` already carries the slug/state-machine logic above, so the
+    // search index is kept in sync by composing into these hooks rather than
+    // replacing `hooks =` with `SearchSyncHooks` (docs/guide/search.md,
+    // "Keep the index in sync": "If the repository already has hooks, compose
+    // instead of replacing"). `commit_hooks = true` on `PageRepository`
+    // (src/repositories.rs) writes the enqueue durably in the same
+    // transaction as the mutation, so a rolled-back save never reindexes and
+    // a crash between commit and enqueue is recovered by the queue.
+
+    async fn after_create_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &Page,
+    ) -> AutumnResult<()> {
+        autumn_search::enqueue_reindex_for(record).await
+    }
+
+    async fn after_update_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &Page,
+    ) -> AutumnResult<()> {
+        autumn_search::enqueue_reindex_for(record).await
+    }
+
+    async fn after_delete_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &Page,
+    ) -> AutumnResult<()> {
+        autumn_search::enqueue_unindex_for(record).await
+    }
 }
 
 #[cfg(test)]

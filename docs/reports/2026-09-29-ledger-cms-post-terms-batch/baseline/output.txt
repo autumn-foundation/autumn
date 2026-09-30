@@ -1,0 +1,92 @@
+
+running 1 test
+test post_terms_batch_profile ... 
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): post_terms links for the 12-term post ===
+Bitmap Heap Scan on public.post_terms  (cost=4.32..15.68 rows=3 width=24) (actual time=0.041..0.043 rows=12 loops=1)
+  Output: id, post_id, term_id
+  Recheck Cond: (post_terms.post_id = 50003)
+  Heap Blocks: exact=1
+  Buffers: shared hit=6
+  ->  Bitmap Index Scan on idx_post_terms_pair  (cost=0.00..4.32 rows=3 width=0) (actual time=0.034..0.034 rows=12 loops=1)
+        Index Cond: (post_terms.post_id = 50003)
+        Buffers: shared hit=5
+Query Identifier: -3613545784320677430
+Planning:
+  Buffers: shared hit=34
+Planning Time: 0.325 ms
+Execution Time: 0.081 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): one terms.id = $1 lookup (per-term find_by_id shape) ===
+Index Scan using terms_pkey on public.terms  (cost=0.27..8.29 rows=1 width=58) (actual time=0.018..0.020 rows=1 loops=1)
+  Output: id, taxonomy, name, slug, description, parent_id, post_count, created_at
+  Index Cond: (terms.id = 5)
+  Buffers: shared hit=3
+Query Identifier: 1138777872108583864
+Planning:
+  Buffers: shared hit=49
+Planning Time: 0.486 ms
+Execution Time: 0.046 ms
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): one terms.id = ANY($1) lookup (12 ids) ===
+Seq Scan on public.terms  (cost=0.00..18.50 rows=12 width=58) (actual time=0.010..0.085 rows=12 loops=1)
+  Output: id, taxonomy, name, slug, description, parent_id, post_count, created_at
+  Filter: (terms.id = ANY ('{5,42,79,116,153,190,227,264,301,338,375,412}'::integer[]))
+  Rows Removed by Filter: 488
+  Buffers: shared hit=6
+Query Identifier: 6613375009233127658
+Planning Time: 0.072 ms
+Execution Time: 0.096 ms
+
+#################### MEASURED: GET /archives/{id} ####################
+
+=== pg_stat_statements: k=1 terms (post id 50001) (ranked by calls) ===
+calls=9    buffers=0     SELECT $1
+calls=6    buffers=0     SET statement_timeout = 0
+calls=2    buffers=0     SELECT "menus"."id", "menus"."name", "menus"."slug", "menus"."location", "menus"."created_at" FROM "menus" WHERE ("menus"."location" = $1)
+calls=1    buffers=3     SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1    buffers=3     SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=1    buffers=3     [TERM-RESOLVE] SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=1    buffers=1     SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1    buffers=0     SELECT "comments"."id", "comments"."post_id", "comments"."parent_id", "comments"."author_id", "comments"."author_name", "comments"."author_email", "comments"."author_url", "comments"."author_ip", "comments"."body", "comments"."status", "comments"."created_at" FROM "comments" WHERE ((("comments"."post_id" = $1) AND ("comments"."status" = $2)) AND ("comments"."parent_id" IS NULL)) ORDER BY "comments"."created_at" ASC, "comments"."id" ASC LIMIT $3 OFFSET $4
+calls=1    buffers=0     SELECT "widgets"."id", "widgets"."sidebar", "widgets"."kind", "widgets"."title", "widgets"."settings", "widgets"."position" FROM "widgets" WHERE ("widgets"."sidebar" = $1) ORDER BY "widgets"."position" ASC, "widgets"."id" ASC LIMIT $2
+calls=1    buffers=0     SELECT COUNT(*) FROM "comments" WHERE ((("comments"."post_id" = $1) AND ("comments"."status" = $2)) AND ("comments"."parent_id" IS NULL))
+-- request total: statements=24 buffers=10; term-resolve slice: statements=1 (4.2% of calls) buffers=3 (30.0% of buffers) --
+-- body: 3633 bytes, hash 2f9836db2b3704e1 --
+
+=== pg_stat_statements: k=4 terms (post id 50002) (ranked by calls) ===
+calls=12   buffers=0     SELECT $1
+calls=9    buffers=0     SET statement_timeout = 0
+calls=4    buffers=12    [TERM-RESOLVE] SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=2    buffers=0     SELECT "menus"."id", "menus"."name", "menus"."slug", "menus"."location", "menus"."created_at" FROM "menus" WHERE ("menus"."location" = $1)
+calls=1    buffers=3     SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1    buffers=3     SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=1    buffers=1     SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1    buffers=0     SELECT "comments"."id", "comments"."post_id", "comments"."parent_id", "comments"."author_id", "comments"."author_name", "comments"."author_email", "comments"."author_url", "comments"."author_ip", "comments"."body", "comments"."status", "comments"."created_at" FROM "comments" WHERE ((("comments"."post_id" = $1) AND ("comments"."status" = $2)) AND ("comments"."parent_id" IS NULL)) ORDER BY "comments"."created_at" ASC, "comments"."id" ASC LIMIT $3 OFFSET $4
+calls=1    buffers=0     SELECT "widgets"."id", "widgets"."sidebar", "widgets"."kind", "widgets"."title", "widgets"."settings", "widgets"."position" FROM "widgets" WHERE ("widgets"."sidebar" = $1) ORDER BY "widgets"."position" ASC, "widgets"."id" ASC LIMIT $2
+calls=1    buffers=0     SELECT COUNT(*) FROM "comments" WHERE ((("comments"."post_id" = $1) AND ("comments"."status" = $2)) AND ("comments"."parent_id" IS NULL))
+-- request total: statements=33 buffers=19; term-resolve slice: statements=4 (12.1% of calls) buffers=12 (63.2% of buffers) --
+-- body: 3982 bytes, hash ec0b8ba178fdc241 --
+
+=== pg_stat_statements: k=12 terms (post id 50003) (ranked by calls) ===
+calls=20   buffers=0     SELECT $1
+calls=17   buffers=0     SET statement_timeout = 0
+calls=12   buffers=36    [TERM-RESOLVE] SELECT "terms"."id", "terms"."taxonomy", "terms"."name", "terms"."slug", "terms"."description", "terms"."parent_id", "terms"."post_count", "terms"."created_at" FROM "terms" WHERE ("terms"."id" = $1) LIMIT $2
+calls=2    buffers=0     SELECT "menus"."id", "menus"."name", "menus"."slug", "menus"."location", "menus"."created_at" FROM "menus" WHERE ("menus"."location" = $1)
+calls=1    buffers=3     SELECT "post_terms"."id", "post_terms"."post_id", "post_terms"."term_id" FROM "post_terms" WHERE ("post_terms"."post_id" = $1)
+calls=1    buffers=3     SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2
+calls=1    buffers=1     SELECT "users"."id", "users"."username", "users"."email", "users"."password_hash", "users"."display_name", "users"."role", "users"."bio", "users"."website", "users"."created_at", "users"."updated_at" FROM "users" WHERE ("users"."id" = $1) LIMIT $2
+calls=1    buffers=0     SELECT "comments"."id", "comments"."post_id", "comments"."parent_id", "comments"."author_id", "comments"."author_name", "comments"."author_email", "comments"."author_url", "comments"."author_ip", "comments"."body", "comments"."status", "comments"."created_at" FROM "comments" WHERE ((("comments"."post_id" = $1) AND ("comments"."status" = $2)) AND ("comments"."parent_id" IS NULL)) ORDER BY "comments"."created_at" ASC, "comments"."id" ASC LIMIT $3 OFFSET $4
+calls=1    buffers=0     SELECT "widgets"."id", "widgets"."sidebar", "widgets"."kind", "widgets"."title", "widgets"."settings", "widgets"."position" FROM "widgets" WHERE ("widgets"."sidebar" = $1) ORDER BY "widgets"."position" ASC, "widgets"."id" ASC LIMIT $2
+calls=1    buffers=0     SELECT COUNT(*) FROM "comments" WHERE ((("comments"."post_id" = $1) AND ("comments"."status" = $2)) AND ("comments"."parent_id" IS NULL))
+-- request total: statements=57 buffers=43; term-resolve slice: statements=12 (21.1% of calls) buffers=36 (83.7% of buffers) --
+-- body: 4922 bytes, hash 22cb2fa9af11c2e6 --
+
+=== summary (per request) ===
+k         stmts total  buffers total stmts term-resolve buffers term-resolve
+1                  24             10                  1                  3
+4                  33             19                  4                 12
+12                 57             43                 12                 36
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.10s
+

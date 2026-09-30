@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 autumn-web = { path = "../../autumn", features = ["markdown"] }
+autumn-search = { path = "../../autumn-search" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.9", features = ["postgres"] }
@@ -42,6 +43,15 @@ system-tests = ["autumn-web/system-tests"]
 [[test]]
 name = "smoke"
 path = "tests/system/smoke.rs"
+
+# Isolated integration test (CLAUDE.md/AGENTS.md "Integration Test Layout
+# Guidelines"): targeted individually in CI via `--test
+# search_plugin_integration` (ci.yml's Docker-dependent-tests step), so it
+# gets an explicit [[test]] entry rather than relying on Cargo's automatic
+# `tests/*.rs` discovery.
+[[test]]
+name = "search_plugin_integration"
+path = "tests/search_plugin_integration.rs"
 
 [lints.rust]
 unsafe_code = "forbid"

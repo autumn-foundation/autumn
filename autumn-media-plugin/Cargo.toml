@@ -102,6 +102,7 @@ aws-sdk-s3 = { version = ">=1.122, <1.123", default-features = false, features =
 tempfile = "3"
 # Job-arg / artifact (de)serialization round-trip tests.
 serde_json = { workspace = true }
+tower = { workspace = true }
 # DB-backed `RoomStore` (rooms_db) testcontainer integration tests — spin a real
 # Postgres via testcontainers, exactly mirroring autumn-admin-plugin's
 # `tests/token_admin_db.rs`. `#[ignore]`d so a default `cargo test` never needs

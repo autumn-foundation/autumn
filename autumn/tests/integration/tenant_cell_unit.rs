@@ -7,6 +7,117 @@ use autumn_web::tenant_cell::{QuotaExceeded, TenantCell, TenantCellRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[test]
+fn allocator_failure_is_returned_without_leaking_reserved_usage() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 0);
+    let error = cell
+        .arena()
+        .try_bytes(usize::MAX)
+        .expect_err("impossible capacity must fail fallibly");
+
+    match error {
+        autumn_web::tenant_cell::TenantAllocationError::Allocator { requested, source } => {
+            assert_eq!(requested, usize::MAX);
+            assert!(!source.to_string().is_empty());
+        }
+        autumn_web::tenant_cell::TenantAllocationError::Quota(_) => {
+            panic!("unlimited quota must reach the allocator")
+        }
+    }
+    assert_eq!(cell.tracked_bytes(), 0);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
+#[test]
+fn arena_happy_path_and_exact_boundary() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 64);
+    let arena = cell.arena();
+    let mut bytes = arena.try_bytes(32).expect("bytes fit");
+    bytes.as_mut_slice()[0] = 7;
+    let text = arena
+        .try_string(&"x".repeat(32))
+        .expect("exact boundary fits");
+    assert_eq!(bytes.as_slice()[0], 7);
+    assert_eq!(text.as_str().len(), 32);
+    assert_eq!(cell.tracked_bytes(), 64);
+}
+
+#[test]
+fn arena_over_quota_is_non_mutating_and_tenants_are_concurrent() {
+    let registry = TenantCellRegistry::new();
+    let a = registry.get_or_create("a", 32);
+    let b = registry.get_or_create("b", 32);
+    let held = a.arena().try_bytes(32).expect("a fills exact quota");
+    let before = a.tracked_bytes();
+    a.arena().try_bytes(1).expect_err("a is over quota");
+    assert_eq!(a.tracked_bytes(), before, "failed reservation is inert");
+    let thread = std::thread::spawn(move || b.arena().try_bytes(32));
+    let other = thread
+        .join()
+        .expect("tenant thread does not panic")
+        .expect("b has an independent domain");
+    assert_eq!(other.tracked_bytes(), 32);
+    drop(held);
+    assert_eq!(a.tracked_bytes(), 0);
+}
+
+#[test]
+fn final_eviction_makes_all_supported_arena_allocations_unreachable() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 128);
+    let bytes = cell.arena().try_bytes(64).expect("bytes fit");
+    let text = cell
+        .arena()
+        .try_string("region-owned")
+        .expect("string fits");
+    drop(registry.evict("tenant"));
+    drop(cell);
+    assert!(
+        registry.total_tracked_bytes() > 0,
+        "owned allocations remain modeled reachable after eviction"
+    );
+    drop(bytes);
+    assert!(
+        registry.total_tracked_bytes() > 0,
+        "string is still modeled reachable"
+    );
+    drop(text);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
+/// Eviction removes residency, not the tenant's live accounting domain. A new
+/// request while an old arena allocation survives must observe the old usage
+/// and cannot acquire a second full quota.
+#[test]
+fn evicted_generation_reuses_live_accounting_domain() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+    let old_cell = registry.get_or_create("tenant", 64);
+    let old_allocation = old_cell.arena().try_bytes(64).expect("fills quota");
+
+    // Materializing another tenant exceeds max_cells and LRU-evicts `tenant`
+    // while its arena allocation remains alive.
+    let _other = registry.get_or_create("other", 64);
+    drop(old_cell);
+    assert!(registry.get("tenant").is_none());
+
+    let rebound = registry.get_or_create("tenant", 64);
+    assert_eq!(rebound.tracked_bytes(), 64, "rebind observes live usage");
+    rebound
+        .arena()
+        .try_bytes(1)
+        .expect_err("eviction must not reset the tenant quota");
+
+    drop(old_allocation);
+    assert_eq!(rebound.tracked_bytes(), 0);
+    let replacement = rebound
+        .arena()
+        .try_bytes(64)
+        .expect("quota becomes available after final old allocation drop");
+    assert_eq!(replacement.tracked_bytes(), 64);
+}
+
 /// A charge raises both the per-tenant and process-wide gauges by exactly its
 /// size, and dropping it returns them to zero.
 #[test]
