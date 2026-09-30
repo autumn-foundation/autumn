@@ -1464,6 +1464,13 @@ fn jwk_allowed_algorithms(
         AlgorithmParameters::OctetKey(_) => Err(crate::AutumnError::unauthorized_msg(
             "symmetric jwk not allowed for id_token verification",
         )),
+        // `Other` (a `kty` this crate does not recognise) and any variant a
+        // future `jsonwebtoken` adds — the enum is `#[non_exhaustive]` since
+        // 11.0 — cannot verify a signature here, so fail closed rather than
+        // guess an algorithm family.
+        _ => Err(crate::AutumnError::unauthorized_msg(
+            "unsupported jwk key type for id_token verification",
+        )),
     }
 }
 
@@ -3193,6 +3200,25 @@ mod tests {
             jwk["alg"] = serde_json::json!(alg);
         }
         jwk
+    }
+
+    /// A JWKS entry with a `kty` this crate does not know (jsonwebtoken 11's
+    /// `AlgorithmParameters::Other`) must be rejected, not mapped to a
+    /// signature algorithm.
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn unknown_jwk_key_type_is_rejected() {
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "AKP",
+            "kid": "post-quantum-1",
+            "pub": "AAAA"
+        }))
+        .expect("unknown kty deserializes into AlgorithmParameters::Other");
+        let err = jwk_allowed_algorithms(&jwk).expect_err("unknown key type must be refused");
+        assert_eq!(
+            err.status(),
+            crate::reexports::http::StatusCode::UNAUTHORIZED
+        );
     }
 
     #[cfg(feature = "oauth2")]
