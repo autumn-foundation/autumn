@@ -674,13 +674,37 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsL
     for TlsConnectInfo
 {
     fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
-        let peer = *stream.remote_addr();
+        Self::from_stream(stream.io(), *stream.remote_addr())
+    }
+}
+
+/// The HTTPS serve path wraps its listener in `StopAcceptingOnShutdown` (see
+/// `accept_drain`), so the connect info must be available for the wrapper too.
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, crate::accept_drain::StopAcceptingOnShutdown<TlsListener>>,
+    > for TlsConnectInfo
+{
+    fn connect_info(
+        stream: axum::serve::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<TlsListener>,
+        >,
+    ) -> Self {
+        Self::from_stream(stream.io(), *stream.remote_addr())
+    }
+}
+
+impl TlsConnectInfo {
+    fn from_stream(
+        io: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        peer: std::net::SocketAddr,
+    ) -> Self {
         // rustls exposes the peer chain only after a successful handshake, so
         // anything here has already passed the configured verifier — the parse
         // turns a verified certificate into a usable identity, it does not
         // decide trust.
-        let client = stream
-            .io()
+        let client = io
             .get_ref()
             .1
             .peer_certificates()
