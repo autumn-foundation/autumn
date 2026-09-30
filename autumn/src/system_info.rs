@@ -50,6 +50,8 @@ mod tests {
             .await
             .unwrap();
         let info: SystemInfo = serde_json::from_slice(&body_bytes).unwrap();
-        assert!(!info.os.is_empty());
+        assert_eq!(info.os, std::env::consts::OS);
+        assert_eq!(info.arch, std::env::consts::ARCH);
+        assert!(info.available_parallelism > 0);
     }
 }

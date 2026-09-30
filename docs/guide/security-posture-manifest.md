@@ -243,8 +243,12 @@ speaking, not a proof that every mutating request is checked.
 
 **Example — the `mtls` dimension** (schema v4). It mirrors the runtime
 `RequireClientCert` predicate against `[server.tls.client_auth]`: one entry per
-route, `mtls_required: true` when the listener requests client certificates
-*and* the route matches a configured `required_paths` prefix.
+route, `mtls_required: true` when the route demands a verified client
+certificate — under `mode = "required"` that is every route (the handshake
+rejects every uncertified client), otherwise exactly the routes matching a
+configured `required_paths` prefix. The posture diff reads `required` the same
+way, so removing a `required_paths` entry while locking the listener to
+`required` is not a widening: no URL lost its protection.
 
 ```json
 { "path": "/internal/keys", "method": "GET", "mtls_required": true }

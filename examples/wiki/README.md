@@ -24,6 +24,10 @@ twice.
 - **Nested `has_many` forms** — the Collections feature edits a parent record
   and its child links in one master–detail form via `NestedChangesetForm`, saved
   atomically (see `src/routes/collections.rs` and `docs/guide/nested-forms.md`)
+- **`autumn-search` plugin** — `SearchPlugin` mounted on `Page` (already
+  `#[searchable]` for the in-core FTS `/search` route above), kept in sync by
+  `PageHooks`'s composed commit hooks (see `src/lib.rs::search_plugin` and
+  `docs/guide/search.md`)
 
 ## Prerequisites
 
@@ -87,6 +91,15 @@ behavior automatically.
 | POST | `/api/v1/pages` | Create a page |
 | PUT | `/api/v1/pages/{id}` | Update a page |
 | DELETE | `/api/v1/pages/{id}` | Delete a page |
+| GET | `/api/v1/search?q=...` | Ranked keyword search via `autumn-search`, hydrated into `Page` rows |
+
+`PageHooks` only enqueues a reindex on create/update/delete, so **existing
+pages are not indexed until each is next saved.** A fresh `cargo run -p wiki`
+starts with an empty table, so this only matters when adding the plugin to an
+already-populated wiki: run `autumn search reindex --package wiki` once from
+the workspace root to backfill (`docs/guide/search.md`'s "Backfill" section) —
+`--package` is required there since the workspace has more than one binary
+target and a bare `autumn search reindex` cannot choose between them.
 
 ### Docs (Markdown + SSG)
 

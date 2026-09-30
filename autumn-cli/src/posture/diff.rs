@@ -1822,16 +1822,28 @@ fn diff_mtls_required_paths(
     let before: BTreeSet<&String> = base.dimensions.mtls.required_paths.iter().collect();
     let after: BTreeSet<&String> = head.dimensions.mtls.required_paths.iter().collect();
 
+    // `required` mode protects every route, so the diff reads it as covering
+    // everything: dropping a prefix under a `required` head loses no coverage,
+    // and a prefix the head adds loses none when the base was already
+    // `required` (issue #2706, item 4). The mode change itself is still
+    // reported by `diff_mtls_mode` — this only silences the prefix rows that
+    // would call a narrowing a widening.
+    let head_covers_all = head.dimensions.mtls.mode == "required";
+    let base_covers_all = base.dimensions.mtls.mode == "required";
+
     // Dropped when the head no longer requests certificates at all (every
-    // prefix is then uncovered), or when no remaining prefix covers it.
+    // prefix is then uncovered), or when no remaining prefix covers it — and
+    // only while the head leaves some URL uncovered at all.
     let dropped: Vec<String> = before
         .iter()
-        .filter(|p| !head_requests || !after.iter().any(|new| covers_prefix(new, p)))
+        .filter(|p| {
+            !head_covers_all && (!head_requests || !after.iter().any(|new| covers_prefix(new, p)))
+        })
         .map(|p| (*p).clone())
         .collect();
     let added: Vec<String> = after
         .iter()
-        .filter(|p| !before.iter().any(|old| covers_prefix(old, p)))
+        .filter(|p| !base_covers_all && !before.iter().any(|old| covers_prefix(old, p)))
         .map(|p| (*p).clone())
         .collect();
 
@@ -2316,6 +2328,63 @@ mod tests {
             &manifest_mtls(&routes, "optional", &["/internal/keys"], &entry),
         );
         assert!(kinds(&narrowed).contains(&"mtls_required_path_removed"));
+    }
+
+    /// Issue #2706, item 4: `required` mode protects every route, so removing
+    /// a `required_paths` entry while locking the listener loses no coverage
+    /// — the removal finding must stay silent. `mtls_mode_strengthened` still
+    /// says the posture narrowed, which is the only finding this change earns.
+    #[test]
+    fn dropping_a_required_prefix_while_locking_the_listener_is_not_a_widening() {
+        let routes = route("/internal/keys", "GET", "gated", &[], &[], false);
+        let base = manifest_mtls(
+            &routes,
+            "optional",
+            &["/internal/"],
+            &mtls_entry("/internal/keys", "GET", true),
+        );
+        let head = manifest_mtls(
+            &routes,
+            "required",
+            &[],
+            &mtls_entry("/internal/keys", "GET", true),
+        );
+
+        let findings = diff(&base, &head);
+        let kinds = kinds(&findings);
+        assert!(
+            !kinds.contains(&"mtls_required_path_removed"),
+            "removing the prefix under `required` loses no coverage: {findings:#?}"
+        );
+        assert_eq!(kinds, vec!["mtls_mode_strengthened"], "{findings:#?}");
+    }
+
+    /// The mirror: a base already at `required` covers everything, so a prefix
+    /// the head adds protects no new URL — the added-prefix finding must stay
+    /// silent. The mode weakening is the finding that matters.
+    #[test]
+    fn a_head_prefix_adds_no_coverage_when_the_base_locks_the_listener() {
+        let routes = route("/internal/keys", "GET", "gated", &[], &[], false);
+        let base = manifest_mtls(
+            &routes,
+            "required",
+            &[],
+            &mtls_entry("/internal/keys", "GET", true),
+        );
+        let head = manifest_mtls(
+            &routes,
+            "optional",
+            &["/internal/"],
+            &mtls_entry("/internal/keys", "GET", true),
+        );
+
+        let findings = diff(&base, &head);
+        let kinds = kinds(&findings);
+        assert!(
+            !kinds.contains(&"mtls_required_path_added"),
+            "the head prefix adds no coverage past `required`: {findings:#?}"
+        );
+        assert_eq!(kinds, vec!["mtls_mode_weakened"], "{findings:#?}");
     }
 
     /// Replacing a broad prefix with a narrower one leaves `added` empty (the

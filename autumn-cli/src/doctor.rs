@@ -1094,6 +1094,13 @@ pub enum ClientAuthDoctorData {
         ca_count: usize,
         /// Whether a CRL is configured, and whether its `nextUpdate` has passed.
         crl_stale: Option<bool>,
+        /// Subject DNs of the CAs in the bundle that no CRL in the configured
+        /// CRL file is issued by (issue #2706). Empty when no CRL is
+        /// configured. Once any CRL is configured, the runtime refuses
+        /// handshakes whose revocation status is unknown, so these CAs'
+        /// clients would be rejected — and the server refuses to boot on this,
+        /// so `--strict` fails the run.
+        crl_coverage_gaps: Vec<String>,
         /// How many route prefixes demand a certificate.
         required_path_count: usize,
     },
@@ -1110,8 +1117,10 @@ pub enum ClientAuthDoctorData {
 ///   boot on exactly these).
 /// - Any CA in the bundle already expired → **Fail**: it verifies nothing, so a
 ///   bundle of only-expired CAs rejects every client.
-/// - A CA expiring within 30 days, a stale CRL, or `optional` with no route
-///   requiring a certificate → **Warn**.
+/// - A CRL set that does not cover every CA in the bundle, a CA expiring
+///   within 30 days, a stale CRL, or `optional` with no route requiring a
+///   certificate → **Warn**. The coverage gap is the severest Warn: the
+///   runtime refuses to boot on it, so `--strict` fails the run.
 /// - Otherwise → **Pass**.
 #[must_use]
 pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
@@ -1164,6 +1173,27 @@ pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
 /// Split out of [`check_client_auth_impl`] so each function stays readable; the
 /// caller has already handled every not-loadable state, so the fallthrough arm
 /// here is unreachable in practice.
+/// The `tls_client_auth` result when the CRL set leaves some bundle CAs
+/// uncovered (issue #2706): the runtime refuses to boot on this, so doctor
+/// warns (and fails under `--strict`).
+fn grade_crl_coverage_gaps(crl_coverage_gaps: &[String]) -> CheckResult {
+    CheckResult {
+        name: "tls_client_auth",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "the [server.tls.client_auth] revocation list has no CRL issued by {} — once any \
+             CRL is configured, the server refuses handshakes whose revocation status is \
+             unknown, so the clients of these CAs would be rejected, and the server refuses \
+             to boot on this",
+            crl_coverage_gaps.join(", ")
+        )),
+        hint: Some(
+            "Publish a CRL for each CA in the bundle, or remove the uncovered CA. Under \
+             `--strict` this warning fails the run, matching the runtime",
+        ),
+    }
+}
+
 fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
     match data {
         ClientAuthDoctorData::Healthy {
@@ -1184,6 +1214,9 @@ fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
                  nothing",
             ),
         },
+        ClientAuthDoctorData::Healthy {
+            crl_coverage_gaps, ..
+        } if !crl_coverage_gaps.is_empty() => grade_crl_coverage_gaps(crl_coverage_gaps),
         ClientAuthDoctorData::Healthy {
             crl_stale: Some(true),
             ..
@@ -7185,10 +7218,40 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
             }
         },
     };
-    let required_path_count = section
-        .get("required_paths")
-        .and_then(toml::Value::as_array)
-        .map_or(0, Vec::len);
+    let required_path_count = match section.get("required_paths") {
+        // A PRESENT `required_paths` that is not an array of strings is a
+        // config the runtime refuses to deserialize
+        // (`ClientAuthConfig.required_paths` is a `Vec<String>`), so the app
+        // cannot start. Reading it as zero paths through
+        // `as_array().map_or(0, ...)` would bless that app as Pass — the same
+        // class of lie as the non-table section and the non-string `mode`
+        // handled above, so Fail with the offending value (issue #2706,
+        // item 2).
+        None => 0,
+        Some(toml::Value::Array(paths)) => {
+            let mut count = 0;
+            for path in paths {
+                if path.as_str().is_none() {
+                    return ClientAuthDoctorData::Invalid {
+                        detail: format!(
+                            "[server.tls.client_auth] required_paths must be an array of strings; \
+                             found {path}"
+                        ),
+                    };
+                }
+                count += 1;
+            }
+            count
+        }
+        Some(other) => {
+            return ClientAuthDoctorData::Invalid {
+                detail: format!(
+                    "[server.tls.client_auth] required_paths must be an array of strings; \
+                     found {other}"
+                ),
+            };
+        }
+    };
 
     if mode == "off" {
         // `ClientAuthConfig::validate` refuses this combination — no
@@ -7254,18 +7317,35 @@ fn grade_client_auth_trust_store(
                 };
             }
         };
-        let crl_stale = match crl {
+        let (crl_stale, crl_coverage_gaps) = match crl {
             Some(path) => {
-                match autumn_web::tls::client_auth::inspect_crl(std::path::Path::new(path)) {
-                    Ok(inspection) => Some(inspection.is_stale(now)),
+                let path = std::path::Path::new(path);
+                let inspection = match autumn_web::tls::client_auth::inspect_crl(path) {
+                    Ok(inspection) => inspection,
                     Err(e) => {
                         return ClientAuthDoctorData::Invalid {
                             detail: e.to_string(),
                         };
                     }
-                }
+                };
+                // The #2706 coverage gap: a CRL set that covers only some of
+                // the bundle's CAs makes the runtime refuse the clients of the
+                // rest (and refuse to boot). Both files already loaded through
+                // the runtime paths above, so this only compares names.
+                let gaps = match autumn_web::tls::client_auth::crl_coverage_gaps(
+                    std::path::Path::new(bundle),
+                    path,
+                ) {
+                    Ok(gaps) => gaps,
+                    Err(e) => {
+                        return ClientAuthDoctorData::Invalid {
+                            detail: e.to_string(),
+                        };
+                    }
+                };
+                (Some(inspection.is_stale(now)), gaps)
             }
-            None => None,
+            None => (None, Vec::new()),
         };
 
         let expired_cas: Vec<String> = cas
@@ -7286,6 +7366,7 @@ fn grade_client_auth_trust_store(
             near_expiry_cas,
             ca_count: cas.len(),
             crl_stale,
+            crl_coverage_gaps,
             required_path_count,
         }
     }
@@ -9216,7 +9297,6 @@ const DEPLOY_HOST_SPELLING_REACHABILITY_HINT: &str = "Fix the [deploy] host spel
 ///    Results are joined back in display order.
 #[allow(clippy::too_many_lines)]
 pub fn run(opts: DoctorOptions) {
-    use std::thread;
     type Task = Box<dyn FnOnce() -> CheckResult + Send>;
 
     let cli_version = env!("CARGO_PKG_VERSION");
@@ -10492,9 +10572,13 @@ pub fn run(opts: DoctorOptions) {
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
+    run_doctor_tasks(tasks, opts);
+}
+
+fn run_doctor_tasks(tasks: Vec<Box<dyn FnOnce() -> CheckResult + Send>>, opts: DoctorOptions) {
     #[allow(clippy::needless_collect)]
-    let handles: Vec<thread::JoinHandle<CheckResult>> =
-        tasks.into_iter().map(thread::spawn).collect();
+    let handles: Vec<std::thread::JoinHandle<CheckResult>> =
+        tasks.into_iter().map(std::thread::spawn).collect();
 
     // ── Phase 4: join in order (preserves display ordering) ──────────────────
     let results: Vec<CheckResult> = handles
@@ -13002,6 +13086,7 @@ pub struct Vault {
             near_expiry_cas: Vec::new(),
             ca_count: 1,
             crl_stale: None,
+            crl_coverage_gaps: Vec::new(),
             required_path_count,
         }
     }
@@ -13110,8 +13195,47 @@ pub struct Vault {
             near_expiry_cas: vec![("CN=Aging CA".to_owned(), 3)],
             ca_count: 2,
             crl_stale: Some(true),
+            crl_coverage_gaps: vec!["CN=Uncovered CA".to_owned()],
             required_path_count: 0,
         };
+        let r = check_client_auth_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn client_auth_warns_on_a_crl_coverage_gap() {
+        // Issue #2706: the CRL set names only some of the bundle's CAs, so
+        // the runtime would refuse the uncovered CAs' clients — and refuse
+        // to boot at all.
+        let mut data = healthy_client_auth("required", 1);
+        if let ClientAuthDoctorData::Healthy {
+            crl_coverage_gaps, ..
+        } = &mut data
+        {
+            crl_coverage_gaps.push("CN=New CA".to_owned());
+        }
+        let r = check_client_auth_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("CN=New CA"), "{detail}");
+        assert!(detail.contains("refuses to boot"), "{detail}");
+    }
+
+    #[test]
+    fn client_auth_grades_an_expired_ca_above_a_crl_coverage_gap() {
+        // Worst problem first: the expired CA is a Fail, the coverage gap a
+        // Warn, so the Fail must win.
+        let mut data = healthy_client_auth("required", 1);
+        if let ClientAuthDoctorData::Healthy {
+            expired_cas,
+            crl_coverage_gaps,
+            ..
+        } = &mut data
+        {
+            expired_cas.push("CN=Retired CA".to_owned());
+            crl_coverage_gaps.push("CN=New CA".to_owned());
+        }
         let r = check_client_auth_impl(&data);
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.unwrap().contains("expired"));
@@ -13168,6 +13292,48 @@ pub struct Vault {
         let result = check_client_auth_impl(&data);
         assert!(matches!(result.status, CheckStatus::Fail));
         assert!(result.detail.unwrap().contains("required_paths"));
+    }
+
+    #[test]
+    fn client_auth_fails_when_required_paths_is_not_an_array_of_strings() {
+        // Issue #2706, item 2: a string here used to read as zero paths through
+        // `as_array().map_or(0, ...)`, grading an app that cannot start as
+        // Pass. The runtime deserializes `required_paths` as `Vec<String>`,
+        // so any other shape fails the boot — doctor must Fail with the
+        // offending value in the detail, in every mode.
+        for (mode, bad) in [
+            ("required", toml::Value::String("/internal/".to_owned())),
+            ("required", toml::Value::Integer(7)),
+            (
+                "required",
+                toml::Value::Array(vec![
+                    toml::Value::String("/internal/".to_owned()),
+                    toml::Value::Integer(7),
+                ]),
+            ),
+            ("off", toml::Value::String("/internal/".to_owned())),
+        ] {
+            let mut section = toml::Table::new();
+            section.insert("mode".to_owned(), toml::Value::String(mode.to_owned()));
+            section.insert("required_paths".to_owned(), bad.clone());
+            section.insert(
+                "ca_bundle_path".to_owned(),
+                toml::Value::String("ca.pem".to_owned()),
+            );
+            let mut tls = toml::Table::new();
+            tls.insert("client_auth".to_owned(), toml::Value::Table(section));
+
+            let data = resolve_client_auth_doctor_data(Some(&tls));
+            assert!(
+                matches!(data, ClientAuthDoctorData::Invalid { .. }),
+                "mode = {mode}, required_paths = {bad} should be graded invalid, got {data:?}"
+            );
+            let result = check_client_auth_impl(&data);
+            assert!(matches!(result.status, CheckStatus::Fail));
+            let detail = result.detail.expect("invalid state carries a detail");
+            assert!(detail.contains("required_paths"), "{detail}");
+            assert!(detail.contains("array of strings"), "{detail}");
+        }
     }
 
     #[test]

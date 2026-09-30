@@ -2954,6 +2954,29 @@ enum ServeCommands {
     },
 }
 
+impl ServeCommands {
+    /// The Windows-service journey this subcommand selects, if any. These
+    /// build and register rather than start, so they never reach `serve::run`.
+    const fn service_action(&self) -> Option<service::ServiceAction> {
+        match self {
+            Self::InstallService => Some(service::ServiceAction::Install),
+            Self::UninstallService => Some(service::ServiceAction::Uninstall),
+            Self::RunService { .. } => Some(service::ServiceAction::Run),
+            Self::Stop | Self::Status | Self::Restart => None,
+        }
+    }
+
+    /// The daemon lifecycle action this subcommand selects, if any.
+    const fn lifecycle_action(&self) -> Option<serve::ServeAction> {
+        match self {
+            Self::Stop => Some(serve::ServeAction::Stop),
+            Self::Status => Some(serve::ServeAction::Status),
+            Self::Restart => Some(serve::ServeAction::Restart),
+            Self::InstallService | Self::UninstallService | Self::RunService { .. } => None,
+        }
+    }
+}
+
 /// Normalize a repeated/comma-separated `--pin` into what the app parses.
 ///
 /// No `--pin` at all leaves `AUTUMN_JOBS__PIN` untouched so the child reads
@@ -3129,6 +3152,33 @@ enum MigrateCommands {
     ///   autumn migrate check-collisions
     #[command(verbatim_doc_comment, name = "check-collisions")]
     CheckCollisions,
+}
+
+impl MigrateCommands {
+    /// Translate a database-targeting subcommand into the `migrate` module's
+    /// action. `new` and `check-collisions` have no database target and are
+    /// dispatched before this is called.
+    fn into_action(self) -> migrate::MigrateAction {
+        match self {
+            Self::Status => migrate::MigrateAction::Status,
+            Self::Check => migrate::MigrateAction::Check,
+            Self::Down {
+                steps,
+                to,
+                yes_i_mean_prod,
+            } => migrate::MigrateAction::Down(migrate::DownArgs {
+                steps,
+                to,
+                yes_i_mean_prod,
+            }),
+            Self::Baseline { force } => migrate::MigrateAction::Baseline(migrate::BaselineArgs {
+                force_version: force,
+            }),
+            Self::New { .. } | Self::CheckCollisions => {
+                unreachable!("migrate new/check-collisions are dispatched before into_action")
+            }
+        }
+    }
 }
 
 /// Subcommands for `autumn shard`.
@@ -4684,18 +4734,8 @@ fn run_command(command: Commands) {
         } => {
             // The service journeys are their own command family: they build
             // and register rather than start, so they never reach `serve::run`.
-            let service_action = match action {
-                Some(ServeCommands::InstallService) => Some(service::ServiceAction::Install),
-                Some(ServeCommands::UninstallService) => Some(service::ServiceAction::Uninstall),
-                Some(ServeCommands::RunService { .. }) => Some(service::ServiceAction::Run),
-                _ => None,
-            };
-            let lifecycle = match action {
-                Some(ServeCommands::Stop) => Some(serve::ServeAction::Stop),
-                Some(ServeCommands::Status) => Some(serve::ServeAction::Status),
-                Some(ServeCommands::Restart) => Some(serve::ServeAction::Restart),
-                _ => None,
-            };
+            let service_action = action.as_ref().and_then(ServeCommands::service_action);
+            let lifecycle = action.as_ref().and_then(ServeCommands::lifecycle_action);
             let opts = serve::ServeOptions {
                 package,
                 // --bundled-pg implies --daemon, and a service always hosts one.
@@ -4740,28 +4780,7 @@ fn run_command(command: Commands) {
                 }
                 _ => {}
             }
-            let action = match action {
-                Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
-                Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
-                Some(MigrateCommands::Down {
-                    steps,
-                    to,
-                    yes_i_mean_prod,
-                }) => migrate::MigrateAction::Down(migrate::DownArgs {
-                    steps,
-                    to,
-                    yes_i_mean_prod,
-                }),
-                Some(MigrateCommands::Baseline { force }) => {
-                    migrate::MigrateAction::Baseline(migrate::BaselineArgs {
-                        force_version: force,
-                    })
-                }
-                Some(MigrateCommands::New { .. } | MigrateCommands::CheckCollisions) => {
-                    unreachable!("handled above and returned")
-                }
-                None => migrate::MigrateAction::Run,
-            };
+            let action = action.map_or(migrate::MigrateAction::Run, MigrateCommands::into_action);
             let target = match (shard, control_only) {
                 (Some(name), _) => migrate::MigrateTarget::Shard(name),
                 (None, true) => migrate::MigrateTarget::ControlOnly,

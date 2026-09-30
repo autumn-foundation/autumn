@@ -728,6 +728,7 @@ dependencies = [
  "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -870,7 +871,7 @@ dependencies = [
  "serde_path_to_error",
  "serde_urlencoded",
  "serde_yaml",
- "sha1 0.10.7",
+ "sha1 0.11.0",
  "sha2 0.10.9",
  "socket2",
  "subtle",
@@ -903,7 +904,7 @@ dependencies = [
  "wat",
  "webauthn-rs",
  "webpki-roots 1.0.9",
- "x509-parser 0.16.0",
+ "x509-parser 0.18.1",
  "zeroize",
 ]
 
@@ -1637,6 +1638,8 @@ dependencies = [
  "pq-sys",
  "serde",
  "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
 ]
 
@@ -9863,7 +9866,7 @@ dependencies = [
  "log",
  "rand 0.10.2",
  "sha1 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -10647,6 +10650,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 name = "wiki"
 version = "0.7.0"
 dependencies = [
+ "autumn-search",
  "autumn-web",
  "chrono",
  "diesel",

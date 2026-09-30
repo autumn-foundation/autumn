@@ -1150,6 +1150,12 @@ let opts = TxOptions::serializable()      // or ::repeatable_read(), ::read_comm
 db.tx_with(opts, |conn| async move { /* &mut AsyncPgConnection */ }.scope_boxed()).await?;
 ```
 
+On SQLite, a write-heavy closure (read-modify-write, queue claims, outbox
+inserts) should use `Db::tx_immediate(f)` (unreleased, #2885): it begins
+`BEGIN IMMEDIATE`, so a concurrent writer on a file database waits on
+`busy_timeout` instead of failing with `SQLITE_BUSY_SNAPSHOT`. It is not a
+`cache=shared` fix — use a WAL-mode file database there.
+
 `TxOptions::default()` is identical to `Db::tx`. See
 `docs/guide/transactions.md` and `docs/guide/hooks-and-transactions.md`.
 
@@ -2750,6 +2756,17 @@ async fn build_report() -> AutumnResult<String> {
   it to give the next request a clean slate or purge scratch immediately. This is a tracked-bytes
   accounting boundary via `tracked_bytes()` / `total_tracked_bytes()`, **not**
   RSS — allocations made outside the cell API are invisible by design.
+
+For the allocations Autumn can *own*, not just charge for, use the typed
+arena: `current_tenant_arena()` returns `Option<TenantArena>`, and
+`arena.try_bytes(len)` / `arena.try_string(&str)` hand back `TenantBytes` /
+`TenantString` values that carry their own RAII quota charge and release it on
+drop — including through eviction, until the value itself is gone. A
+`TenantAllocationError` (quota or allocator failure) converts to HTTP **503**
+via `?`, and the failed reservation mutates nothing. This is a cooperative,
+tracked boundary, not hard isolation: ordinary `Vec`/`String`/`Box`,
+framework, third-party and allocator-internal allocations stay outside it
+(ADR 0012).
 
 `TenantCell`/`TenantCellRegistry`/`current_tenant_cell` live in
 `autumn_web::tenant_cell` (not in the prelude). Orthogonal to sharding: sharding

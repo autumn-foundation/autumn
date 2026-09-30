@@ -32,6 +32,7 @@ pub fn is_enabled_with_env(env: &dyn crate::config::Env) -> bool {
 
 pub async fn live_reload_state_handler() -> impl IntoResponse {
     let body = read_reload_state_body_with_env(&crate::config::OsEnv)
+        .await
         .unwrap_or_else(|| r#"{"version":0,"kind":"full"}"#.to_owned());
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::OK;
@@ -99,9 +100,11 @@ async fn inject_live_reload_into_response(response: Response<Body>) -> Response<
     Response::from_parts(parts, Body::from(updated))
 }
 
-fn read_reload_state_body_with_env(env: &dyn crate::config::Env) -> Option<String> {
+async fn read_reload_state_body_with_env<E: crate::config::Env + Sync + ?Sized>(
+    env: &E,
+) -> Option<String> {
     let path = env.var(DEV_RELOAD_STATE_ENV).ok()?;
-    std::fs::read_to_string(path).ok()
+    tokio::fs::read_to_string(path).await.ok()
 }
 
 fn is_html_response(response: &Response<Body>) -> bool {
@@ -447,6 +450,7 @@ mod tests {
         let env = MockEnv::new().with(DEV_RELOAD_ENV, "1");
 
         let body = read_reload_state_body_with_env(&env)
+            .await
             .unwrap_or_else(|| r#"{"version":0,"kind":"full"}"#.to_owned());
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = StatusCode::OK;
@@ -477,7 +481,7 @@ mod tests {
             .with(DEV_RELOAD_ENV, "1")
             .with(DEV_RELOAD_STATE_ENV, tmp_file.path().to_str().unwrap());
 
-        let body = read_reload_state_body_with_env(&env).unwrap();
+        let body = read_reload_state_body_with_env(&env).await.unwrap();
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = StatusCode::OK;
         let headers = response.headers_mut();

@@ -178,12 +178,15 @@ prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 | `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness and renew the advisory token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | The **member-gated** roster (`Authorization: Bearer <session token>`). |
 
-> **Security:** these routes ship **no built-in authentication or rate
-> limiting** on create/join — they **must** be mounted behind your
-> application's own auth / rate-limit middleware. The plugin does not gate who
-> may create or join a room. An `InMemoryRoomStore` caps the registry at 10,000
+> **Security:** create and join are `#[secured]`: they require an
+> authenticated session (the app's `auth.session_key` in the session), and an
+> anonymous request gets `401 Unauthorized`. Call them from a signed-in browser
+> session, or send the session cookie with API clients. Leave, heartbeat and the
+> roster are authorized by the per-room session token `join` returns. The
+> plugin ships **no rate limiting** — mount the routes behind your own
+> rate-limit middleware. An `InMemoryRoomStore` caps the registry at 10,000
 > rooms as a defense-in-depth backstop, and a background reaper reclaims idle
-> rooms, but neither substitutes for your auth layer.
+> rooms.
 
 A `join` response gives the joiner its own `publish` target (the WHIP URL for
 its `MediaMTX` path) plus one `subscribe` target (a WHEP URL) per existing peer.
