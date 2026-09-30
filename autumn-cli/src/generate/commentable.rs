@@ -282,17 +282,22 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                 continue;
             }
             // An ALTER naming the column may be adding it, dropping it, or
-            // renaming it away. Treating every mention as an add would let
+            // renaming it away. Additions declare exactly the column they
+            // name: `ADD COLUMN author_id BIGINT REFERENCES users(id)` adds
+            // `author_id` — the `(id)` in the REFERENCES clause merely
+            // mentions `id`, and the old mention-based loop read it as `id`
+            // being added, so a table lacking the key read as complete (#3035).
+            for column in alter_added_columns(statement) {
+                events.push((at, TableEvent::Add(table.clone(), column)));
+            }
+            // Removals classify as before: `DROP COLUMN <column>` removes it
+            // outright, `RENAME COLUMN <column> TO …` removes it under that
+            // name. Treating every mention as an add would let
             // `DROP COLUMN commentable_type` read as proof the column is
             // present.
             for column in REQUIRED_COLUMNS.iter().copied() {
-                if !mentions_column(statement, column) {
-                    continue;
-                }
-                if alter_removes_column(statement, column) {
+                if mentions_column(statement, column) && alter_removes_column(statement, column) {
                     events.push((at, TableEvent::Remove(table.clone(), column)));
-                } else {
-                    events.push((at, TableEvent::Add(table.clone(), column)));
                 }
             }
         }
@@ -406,6 +411,15 @@ fn parse_ident_segment(text: &str) -> Option<(String, usize)> {
 ///
 /// Returns the canonical ref and the bytes consumed (through the name), so
 /// callers can slice what follows. `None` when no table reference starts here.
+///
+/// Whitespace may sit on either side of the schema dot — `archive .
+/// legacy_comments` names the schema-qualified table, exactly as the tight
+/// spelling does — so the whitespace is trimmed BEFORE the dot check, not
+/// after. Checking first parsed the schema as the table name, and a later
+/// `ALTER TABLE archive. legacy_comments RENAME TO comments` then carried the
+/// schema's columns into the default-schema record: the generator concluded
+/// the shared table existed and skipped creating it, while the real table was
+/// `archive.comments` (#3035).
 fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
     let mut rest = text.trim_start();
     // `IF EXISTS` / `IF NOT EXISTS`: valid on CREATE, DROP and ALTER alike.
@@ -422,7 +436,7 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
     rest = strip_keyword(rest, "only");
     let (first, used) = parse_ident_segment(rest)?;
     rest = &rest[used..];
-    let (schema, name) = if let Some(dot) = rest.strip_prefix('.') {
+    let (schema, name) = if let Some(dot) = rest.trim_start().strip_prefix('.') {
         let (second, used) = parse_ident_segment(dot)?;
         rest = &dot[used..];
         (Some(first), second)
@@ -754,6 +768,73 @@ fn alter_removes_column(statement: &str, column: &str) -> bool {
         }
     }
     false
+}
+
+/// Which of the discriminator columns an `ALTER TABLE …` statement makes
+/// present, other than by removal: the `<name>` in each
+/// `ADD [COLUMN] [IF NOT EXISTS] <name> …` action, plus the `to` side of a
+/// `RENAME [COLUMN] <from> TO <name>` — renaming a column INTO the
+/// discriminator name adds it. `DROP`/`RENAME`-away removals classify
+/// separately in [`alter_removes_column`].
+///
+/// Declaration, not mention — the ALTER half of the CREATE-side rule in
+/// [`declares_column`]: `ADD COLUMN author_id BIGINT REFERENCES users(id)`
+/// adds `author_id` and nothing else. The `(id)` in the REFERENCES clause
+/// merely mentions `id`; reading every required name the statement carries as
+/// added made a table lacking the key read as the complete shared table, so
+/// the generator skipped the migration for it (#3035).
+fn alter_added_columns(statement: &str) -> Vec<&'static str> {
+    let mut added = Vec::new();
+    // The action keyword is a whole word (`readd` is not `add`) followed by
+    // whitespace — newlines included: migrations format `ALTER TABLE t\nADD
+    // COLUMN …` all the time, and the old mention-based loop saw those. A
+    // plain `" add "` substring search would miss them and silently drop the
+    // addition. String literals are skipped: a `' add id'` inside a CHECK is
+    // not an action.
+    let mut in_literal = false;
+    let mut prev_is_ident = false;
+    for (at, ch) in statement.char_indices() {
+        if ch == '\'' {
+            in_literal = !in_literal;
+        }
+        let is_action = !in_literal
+            && !prev_is_ident
+            && ch == 'a'
+            && statement[at..].starts_with("add")
+            && statement[at + "add".len()..].starts_with(|c: char| c.is_whitespace());
+        prev_is_ident = is_ident_char(ch);
+        if !is_action {
+            continue;
+        }
+        let rest = statement[at + "add".len()..].trim_start();
+        let rest = strip_keyword(rest, "column");
+        let rest = strip_keyword(rest, "if not exists");
+        // `ADD CONSTRAINT …`, `ADD PRIMARY KEY (…)`: the head names no column.
+        if let Some((name, _)) = parse_ident_segment(rest)
+            && let Some(column) = REQUIRED_COLUMNS.iter().copied().find(|c| *c == name)
+        {
+            added.push(column);
+        }
+    }
+    if let Some(column) = rename_into_column(statement) {
+        added.push(column);
+    }
+    added
+}
+
+/// The discriminator column a `RENAME [COLUMN] <from> TO <to>` renames INTO,
+/// if any: `RENAME COLUMN kind TO commentable_type` makes `commentable_type`
+/// present. `RENAME TO <table>` is a table rename (classified before this runs)
+/// and `RENAME CONSTRAINT …` touches no column, so neither one counts.
+fn rename_into_column(statement: &str) -> Option<&'static str> {
+    let at = statement.find(" rename ")?;
+    let rest = statement[at + " rename ".len()..].trim_start();
+    if rest.starts_with("to ") || rest.starts_with("constraint ") {
+        return None;
+    }
+    let (_, to) = rest.split_once(" to ")?;
+    let (name, _) = parse_ident_segment(to)?;
+    REQUIRED_COLUMNS.iter().copied().find(|c| *c == name)
 }
 
 /// The plpgsql function behind every parent's cleanup trigger.
@@ -1806,6 +1887,70 @@ mod tests {
         assert!(
             !already_migrated(other.path()),
             "archive.comments is not public.comments"
+        );
+    }
+
+    /// Whitespace may sit on either side of the schema dot: `archive .
+    /// legacy_comments` is `archive.legacy_comments`, not an unqualified
+    /// `archive`. The old `parse_table_ref` checked for the dot before
+    /// trimming, so it parsed the schema as the table name — and a later
+    /// `RENAME TO comments` carried the schema's columns into the
+    /// default-schema record, making the generator believe the shared table
+    /// existed while the real table was `archive.comments` (#3035).
+    #[test]
+    fn a_spaced_schema_dot_keeps_the_table_in_its_schema() {
+        for dot in ["archive. ", "archive .", "archive . "] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = tmp.path().join("migrations").join("0001_spaced");
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(
+                dir.join("up.sql"),
+                format!(
+                    "CREATE TABLE {dot}legacy_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+                     ALTER TABLE {dot}legacy_comments RENAME TO comments;\n"
+                ),
+            )
+            .expect("write");
+            assert!(
+                !already_migrated(tmp.path()),
+                "{dot}legacy_comments: the renamed table is archive.comments, not the shared comments table"
+            );
+        }
+    }
+
+    /// An `ALTER TABLE … ADD` action adds exactly the column it declares, not
+    /// every discriminator name the statement mentions:
+    /// `ADD COLUMN author_id BIGINT REFERENCES users(id)` adds `author_id`;
+    /// the `(id)` in the REFERENCES clause is a mention, not a declaration.
+    /// The old mention-based loop read it as `id` being added, so a table
+    /// lacking the key read as the complete shared table (#3035).
+    #[test]
+    fn an_alter_add_references_clause_does_not_add_the_referenced_column() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_add_ref");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, parent_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             ALTER TABLE comments ADD COLUMN author_id BIGINT REFERENCES users(id);\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the REFERENCES clause mentions id but the table has no id column"
+        );
+
+        // …while the declared column itself still lands.
+        let with_id = tmp.path().join("migrations").join("0002_add_id");
+        std::fs::create_dir_all(&with_id).expect("mkdir");
+        std::fs::write(
+            with_id.join("up.sql"),
+            "ALTER TABLE comments ADD COLUMN id BIGSERIAL PRIMARY KEY;\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "adding the declared column still counts"
         );
     }
 
