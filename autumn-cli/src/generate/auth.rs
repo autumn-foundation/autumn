@@ -2082,9 +2082,8 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                             format!("{indent_k}{before_close}{sep}{FEATURE}{}", &tk[close_idx..]);
                     }
                 }
-            } else {
-                // No features key — insert before closing `}`.
-                let close = trimmed.rfind('}').unwrap();
+            } else if let Some(close) = trimmed.rfind('}') {
+                // No features key — insert before closing `}` on this line.
                 let before_close = trimmed[..close].trim_end();
                 let sep = if before_close.ends_with('{') {
                     ""
@@ -2096,6 +2095,43 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                     &trimmed[..close],
                     &trimmed[close..]
                 );
+            } else {
+                // The whole inline table spans multiple lines (not just a
+                // `features` array within it) and has no `features` key at
+                // all: this opener line has no closing `}` to insert
+                // before. Scan forward to the table's real close and add a
+                // new `features = [...]` line just before it.
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let tj = lines[j].trim();
+                    if tj.starts_with('[') {
+                        break;
+                    }
+                    if strip_line_comment(tj).contains('}') {
+                        // Inline-table entries are comma-separated even when
+                        // wrapped across lines: the previous real entry needs
+                        // a trailing comma before the new line is inserted.
+                        let mut prev = j;
+                        while prev > i {
+                            prev -= 1;
+                            let code = strip_line_comment(lines[prev].trim()).trim().to_owned();
+                            if code.is_empty() {
+                                continue;
+                            }
+                            if !code.ends_with(',') && !code.ends_with('{') {
+                                lines[prev] = format!("{},", lines[prev].trim_end());
+                            }
+                            break;
+                        }
+                        let indent_j: String = lines[j]
+                            .chars()
+                            .take_while(char::is_ascii_whitespace)
+                            .collect();
+                        lines.insert(j, format!("{indent_j}features = [{FEATURE}]"));
+                        break;
+                    }
+                    j += 1;
+                }
             }
             break;
         }
@@ -16751,6 +16787,24 @@ mod tests {
         let toml = "autumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(out.contains("\"mail\""), "mail must be merged: {out}");
+    }
+
+    // Codex review (3rd round) on #3044: when the whole `autumn-web = {
+    // ... }` inline table spans multiple lines (not just its `features`
+    // array) and has no `features` key at all, the "no features key —
+    // insert before closing `}`" branch only looked at the opener line for
+    // that `}`, which isn't there — panicking instead of inserting a new
+    // `features = [...]` line before the table's real close.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_multiline_without_features_key() {
+        let toml = "autumn-web = {\n    version = \"0.3\"\n}\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
     }
 
     // Codex review on #3044: a multiline inline-table `features = [...]`
