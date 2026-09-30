@@ -250,6 +250,18 @@ pub struct CacheAuditArgs {
     /// Build the audited binary without default Cargo features.
     #[arg(long)]
     no_default_features: bool,
+    /// Audit the release binary rather than the debug one (issue #2363).
+    ///
+    /// The manifest describes the binary that produced it: a `#[cached]` read
+    /// behind `#[cfg(not(debug_assertions))]` exists only in a release build.
+    /// Audit the profile you deploy.
+    #[arg(long, conflicts_with = "profile")]
+    release: bool,
+    /// Audit the binary built under this Cargo profile (a custom
+    /// `[profile.<NAME>]` builds into `target/<NAME>`; `dev` into
+    /// `target/debug`).
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
 }
 
 /// Arguments for `autumn data-flow`.
@@ -1982,6 +1994,8 @@ enum Commands {
     ///
     ///   autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin \
     ///       --sensitive-route /admin:"Role: admin required"
+    ///   autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin \
+    ///       --intentional-root /webhook
     ///   autumn plugin-check --plugin-name autumn-admin-plugin --deny-experimental
     #[command(verbatim_doc_comment)]
     PluginCheck {
@@ -1997,6 +2011,13 @@ enum Commands {
         /// Expected route prefix for all plugin routes (e.g. `/admin`).
         #[arg(long, value_name = "PREFIX")]
         prefix: Option<String>,
+        /// Declare a path as an intentional root-level route, exempting it
+        /// from the route-prefix check (exact path match, e.g. `/webhook`).
+        /// Mirrors the library API's
+        /// `ConformanceConfig::intentional_root_route` (issue #2828).
+        /// Repeatable.
+        #[arg(long, value_name = "PATH")]
+        intentional_root: Vec<String>,
         /// Declare a sensitive route with its auth/profile gating mechanism.
         /// Format: `PATH_PREFIX:DESCRIPTION` (e.g. `/admin:Role admin required`).
         /// Repeatable.
@@ -2263,7 +2284,7 @@ enum Commands {
         /// Binary target to inspect (for packages with multiple bin targets).
         #[arg(long, value_name = "BIN")]
         bin: Option<String>,
-        /// Output format.
+        /// Output format: `table`, `json`, or `mermaid`.
         #[arg(long, default_value = "table", value_name = "FORMAT")]
         format: String,
         /// Show only routes whose path starts with PREFIX (positional shorthand for --filter).
@@ -2933,6 +2954,29 @@ enum ServeCommands {
     },
 }
 
+impl ServeCommands {
+    /// The Windows-service journey this subcommand selects, if any. These
+    /// build and register rather than start, so they never reach `serve::run`.
+    const fn service_action(&self) -> Option<service::ServiceAction> {
+        match self {
+            Self::InstallService => Some(service::ServiceAction::Install),
+            Self::UninstallService => Some(service::ServiceAction::Uninstall),
+            Self::RunService { .. } => Some(service::ServiceAction::Run),
+            Self::Stop | Self::Status | Self::Restart => None,
+        }
+    }
+
+    /// The daemon lifecycle action this subcommand selects, if any.
+    const fn lifecycle_action(&self) -> Option<serve::ServeAction> {
+        match self {
+            Self::Stop => Some(serve::ServeAction::Stop),
+            Self::Status => Some(serve::ServeAction::Status),
+            Self::Restart => Some(serve::ServeAction::Restart),
+            Self::InstallService | Self::UninstallService | Self::RunService { .. } => None,
+        }
+    }
+}
+
 /// Normalize a repeated/comma-separated `--pin` into what the app parses.
 ///
 /// No `--pin` at all leaves `AUTUMN_JOBS__PIN` untouched so the child reads
@@ -3108,6 +3152,33 @@ enum MigrateCommands {
     ///   autumn migrate check-collisions
     #[command(verbatim_doc_comment, name = "check-collisions")]
     CheckCollisions,
+}
+
+impl MigrateCommands {
+    /// Translate a database-targeting subcommand into the `migrate` module's
+    /// action. `new` and `check-collisions` have no database target and are
+    /// dispatched before this is called.
+    fn into_action(self) -> migrate::MigrateAction {
+        match self {
+            Self::Status => migrate::MigrateAction::Status,
+            Self::Check => migrate::MigrateAction::Check,
+            Self::Down {
+                steps,
+                to,
+                yes_i_mean_prod,
+            } => migrate::MigrateAction::Down(migrate::DownArgs {
+                steps,
+                to,
+                yes_i_mean_prod,
+            }),
+            Self::Baseline { force } => migrate::MigrateAction::Baseline(migrate::BaselineArgs {
+                force_version: force,
+            }),
+            Self::New { .. } | Self::CheckCollisions => {
+                unreachable!("migrate new/check-collisions are dispatched before into_action")
+            }
+        }
+    }
 }
 
 /// Subcommands for `autumn shard`.
@@ -4663,18 +4734,8 @@ fn run_command(command: Commands) {
         } => {
             // The service journeys are their own command family: they build
             // and register rather than start, so they never reach `serve::run`.
-            let service_action = match action {
-                Some(ServeCommands::InstallService) => Some(service::ServiceAction::Install),
-                Some(ServeCommands::UninstallService) => Some(service::ServiceAction::Uninstall),
-                Some(ServeCommands::RunService { .. }) => Some(service::ServiceAction::Run),
-                _ => None,
-            };
-            let lifecycle = match action {
-                Some(ServeCommands::Stop) => Some(serve::ServeAction::Stop),
-                Some(ServeCommands::Status) => Some(serve::ServeAction::Status),
-                Some(ServeCommands::Restart) => Some(serve::ServeAction::Restart),
-                _ => None,
-            };
+            let service_action = action.as_ref().and_then(ServeCommands::service_action);
+            let lifecycle = action.as_ref().and_then(ServeCommands::lifecycle_action);
             let opts = serve::ServeOptions {
                 package,
                 // --bundled-pg implies --daemon, and a service always hosts one.
@@ -4719,28 +4780,7 @@ fn run_command(command: Commands) {
                 }
                 _ => {}
             }
-            let action = match action {
-                Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
-                Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
-                Some(MigrateCommands::Down {
-                    steps,
-                    to,
-                    yes_i_mean_prod,
-                }) => migrate::MigrateAction::Down(migrate::DownArgs {
-                    steps,
-                    to,
-                    yes_i_mean_prod,
-                }),
-                Some(MigrateCommands::Baseline { force }) => {
-                    migrate::MigrateAction::Baseline(migrate::BaselineArgs {
-                        force_version: force,
-                    })
-                }
-                Some(MigrateCommands::New { .. } | MigrateCommands::CheckCollisions) => {
-                    unreachable!("handled above and returned")
-                }
-                None => migrate::MigrateAction::Run,
-            };
+            let action = action.map_or(migrate::MigrateAction::Run, MigrateCommands::into_action);
             let target = match (shard, control_only) {
                 (Some(name), _) => migrate::MigrateTarget::Shard(name),
                 (None, true) => migrate::MigrateTarget::ControlOnly,
@@ -5168,6 +5208,10 @@ fn run_command(command: Commands) {
                 json: args.json,
                 strict: args.strict,
                 features,
+                profile: routes::CargoProfile {
+                    release: args.release,
+                    profile: args.profile,
+                },
             });
         }
         Commands::Openapi(OpenApiSubcommands::Export(args)) => {
@@ -5619,6 +5663,7 @@ fn run_command(command: Commands) {
             bin,
             plugin_name,
             prefix,
+            intentional_root,
             sensitive_route,
             format,
             deny_experimental,
@@ -5628,7 +5673,7 @@ fn run_command(command: Commands) {
                 package.as_deref(),
                 bin.as_deref(),
                 &plugin_name,
-                prefix.as_deref(),
+                (prefix.as_deref(), &intentional_root),
                 &sensitive_route,
                 &format,
                 (deny_experimental, no_routes),
@@ -5933,7 +5978,7 @@ fn run_plugin_check_command(
     package: Option<&str>,
     bin: Option<&str>,
     plugin_name: &str,
-    prefix: Option<&str>,
+    (prefix, intentional_root): (Option<&str>, &[String]),
     sensitive_route_args: &[String],
     format: &str,
     (deny_experimental, no_routes): (bool, bool),
@@ -5963,6 +6008,7 @@ fn run_plugin_check_command(
         bin,
         plugin_name,
         expected_prefix: prefix,
+        intentional_root_routes: intentional_root,
         sensitive_routes: &sensitive_routes,
         format: fmt,
         // Populated by `run` from the built binary's contract dump.
@@ -6633,6 +6679,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 password,
                 select: select_specs,
                 exclude,
+                for_destroy: mode == ApplyMode::Destroy,
                 // Encrypted-column flags are auto-detected from the model source.
                 ..Default::default()
             };
@@ -9139,9 +9186,41 @@ mod tests {
                 assert!(args.features.is_empty());
                 assert!(!args.all_features);
                 assert!(!args.no_default_features);
+                // No flag keeps the debug build existing callers audit.
+                assert!(!args.release);
+                assert!(args.profile.is_none());
             }
             _ => panic!("expected Cache audit subcommand"),
         }
+    }
+
+    /// The audited build has to be the profile that ships (issue #2363): a
+    /// read behind `#[cfg(not(debug_assertions))]` exists only in release.
+    #[test]
+    fn parse_cache_audit_forwards_the_cargo_profile_selection() {
+        let cli = Cli::try_parse_from(["autumn", "cache", "audit", "--release"]).unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert!(args.release);
+                assert!(args.profile.is_none());
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+
+        let cli = Cli::try_parse_from(["autumn", "cache", "audit", "--profile", "ci"]).unwrap();
+        match cli.command {
+            Commands::Cache(CacheSubcommands::Audit(args)) => {
+                assert!(!args.release);
+                assert_eq!(args.profile.as_deref(), Some("ci"));
+            }
+            _ => panic!("expected Cache audit subcommand"),
+        }
+
+        // Cargo rejects `--release --profile`; refuse it before building.
+        assert!(
+            Cli::try_parse_from(["autumn", "cache", "audit", "--release", "--profile", "ci"])
+                .is_err()
+        );
     }
 
     /// The manifest describes the binary that produced it, so the audited
@@ -10003,6 +10082,46 @@ mod tests {
         }
     }
 
+    /// `--intentional-root` is repeatable and defaults to empty
+    /// (issue #2828: CLI parity with the library's
+    /// `ConformanceConfig::intentional_root_route`).
+    #[test]
+    fn parse_plugin_check_with_intentional_root() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "autumn-admin-plugin",
+            "--prefix",
+            "/admin",
+            "--intentional-root",
+            "/webhook",
+            "--intentional-root",
+            "/healthz",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck {
+                intentional_root, ..
+            } => {
+                assert_eq!(intentional_root, vec!["/webhook", "/healthz"]);
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+
+        let default =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        match default.command {
+            Commands::PluginCheck {
+                intentional_root, ..
+            } => assert!(
+                intentional_root.is_empty(),
+                "no --intentional-root means nothing is exempt"
+            ),
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
     #[test]
     fn parse_plugin_check_with_package() {
         let cli = Cli::try_parse_from([
@@ -10173,11 +10292,13 @@ mod tests {
                 bin,
                 plugin_name,
                 prefix,
+                intentional_root,
                 sensitive_route,
                 format,
                 deny_experimental,
                 no_routes,
             } => {
+                assert!(intentional_root.is_empty(), "no root routes by default");
                 assert!(!deny_experimental, "the flag defaults off");
                 assert!(!no_routes, "the flag defaults off");
                 assert_eq!(package.as_deref(), Some("my-app"));

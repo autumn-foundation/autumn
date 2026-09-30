@@ -247,6 +247,11 @@ impl Presence {
     /// # Panics
     ///
     /// Panics if the internal presence store mutex is poisoned.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held across the publish on purpose: the event must be \
+                  broadcast in the same order the state changed (issue #1936)"
+    )]
     pub fn track(
         &self,
         topic: impl Into<String>,
@@ -258,16 +263,22 @@ impl Presence {
         let meta = meta.into();
         let connection_id = next_connection_id();
 
-        {
-            let mut inner = self.inner.lock().expect("presence lock poisoned");
-            inner.add(&topic, &key, connection_id, meta.clone());
-        }
-
         let event = PresenceEvent::Join {
             key: key.clone(),
-            meta,
+            meta: meta.clone(),
         };
-        self.publish_event(&topic, &event);
+
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        let publish_channel = format!("presence:{topic}");
+
+        {
+            let mut inner = self.inner.lock().expect("presence lock poisoned");
+            inner.add(&topic, &key, connection_id, meta);
+
+            if let Err(e) = self.channels.publish(&publish_channel, json) {
+                tracing::warn!(topic = %topic, error = ?e, "presence: failed to publish event");
+            }
+        }
 
         PresenceHandle {
             topic,
@@ -310,20 +321,23 @@ impl Presence {
     /// # Panics
     ///
     /// Panics if the internal presence store mutex is poisoned.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held across the publish on purpose: the event must be \
+                  broadcast in the same order the state changed (issue #1936)"
+    )]
     pub fn sweep_expired(&self) {
-        let removed = {
-            let mut inner = self.inner.lock().expect("presence lock poisoned");
-            inner.sweep_expired()
-        };
-        for (topic, key) in removed {
-            self.publish_event(&topic, &PresenceEvent::Leave { key });
-        }
-    }
+        let mut inner = self.inner.lock().expect("presence lock poisoned");
+        let removed = inner.sweep_expired();
 
-    fn publish_event(&self, topic: &str, event: &PresenceEvent) {
-        let json = serde_json::to_string(event).unwrap_or_default();
-        if let Err(e) = self.channels.publish(&format!("presence:{topic}"), json) {
-            tracing::warn!(topic, error = ?e, "presence: failed to publish event");
+        // Publish events while still holding the lock to preserve exact ordering
+        // relative to other track/drop events.
+        for (topic, key) in removed {
+            let event = PresenceEvent::Leave { key };
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            if let Err(e) = self.channels.publish(&format!("presence:{topic}"), json) {
+                tracing::warn!(topic = %topic, error = ?e, "presence: failed to publish sweep event");
+            }
         }
     }
 }
@@ -367,11 +381,14 @@ impl PresenceHandle {
 }
 
 impl Drop for PresenceHandle {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held across the publish on purpose: the event must be \
+                  broadcast in the same order the state changed (issue #1936)"
+    )]
     fn drop(&mut self) {
-        let key_fully_removed = {
-            let mut inner = self.inner.lock().expect("presence lock poisoned");
-            inner.remove(&self.topic, &self.key, self.connection_id)
-        };
+        let mut inner = self.inner.lock().expect("presence lock poisoned");
+        let key_fully_removed = inner.remove(&self.topic, &self.key, self.connection_id);
 
         // Only broadcast Leave when this was the last connection for the key.
         // If the same user still has other tabs open their key remains present,

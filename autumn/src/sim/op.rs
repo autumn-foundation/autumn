@@ -110,7 +110,7 @@ use std::fmt;
 use proptest::arbitrary::{Arbitrary, any};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::{Config, RngAlgorithm, TestError, TestRng, TestRunner};
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use super::Sim;

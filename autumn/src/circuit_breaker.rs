@@ -301,7 +301,8 @@ impl CircuitBreaker {
                 if inner.history.len() as u64 >= min_sample {
                     let ratio = inner.failure_ratio();
                     if ratio >= failure_ratio_threshold {
-                        inner.open_until = Some(now + open_duration);
+                        inner.open_until =
+                            Some(crate::time_math::saturating_deadline(now, open_duration));
                         inner.transition_to(&self.name, CircuitState::Open, ratio);
                     }
                 }
@@ -320,7 +321,8 @@ impl CircuitBreaker {
                     }
                 } else {
                     inner.half_open_failures += 1;
-                    inner.open_until = Some(now + open_duration);
+                    inner.open_until =
+                        Some(crate::time_math::saturating_deadline(now, open_duration));
                     inner.transition_to(&self.name, CircuitState::Open, 1.0);
                 }
             }
@@ -779,6 +781,51 @@ mod tests {
             assert!(res.is_ok());
         }
         assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_run_with_fallback() {
+        let policy = CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: Duration::from_secs(10),
+            minimum_sample_count: 2,
+            open_duration: Duration::from_secs(60),
+            half_open_trial_count: 1,
+        };
+        let breaker = CircuitBreaker::new("fallback_test", policy);
+
+        // Test fallback on execution error
+        let fallback_result = breaker
+            .run_with_fallback(
+                async { Err::<&'static str, &'static str>("failed") },
+                |err| match err {
+                    CircuitBreakerError::Execution(_) => Ok("fallback_success"),
+                    CircuitBreakerError::Open => Err("wrong_error"),
+                },
+            )
+            .await;
+        assert_eq!(fallback_result, Ok("fallback_success"));
+
+        // Force open by exceeding threshold
+        let _ = breaker
+            .run(async { Err::<(), &'static str>("fail1") })
+            .await;
+        let _ = breaker
+            .run(async { Err::<(), &'static str>("fail2") })
+            .await;
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        // Test fallback on Open state
+        let fallback_result_open = breaker
+            .run_with_fallback(
+                async { Ok::<&'static str, &'static str>("won't run") },
+                |err| match err {
+                    CircuitBreakerError::Open => Ok("fallback_from_open"),
+                    CircuitBreakerError::Execution(_) => Err("wrong_error"),
+                },
+            )
+            .await;
+        assert_eq!(fallback_result_open, Ok("fallback_from_open"));
     }
 
     #[test]

@@ -7,6 +7,117 @@ use autumn_web::tenant_cell::{QuotaExceeded, TenantCell, TenantCellRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[test]
+fn allocator_failure_is_returned_without_leaking_reserved_usage() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 0);
+    let error = cell
+        .arena()
+        .try_bytes(usize::MAX)
+        .expect_err("impossible capacity must fail fallibly");
+
+    match error {
+        autumn_web::tenant_cell::TenantAllocationError::Allocator { requested, source } => {
+            assert_eq!(requested, usize::MAX);
+            assert!(!source.to_string().is_empty());
+        }
+        autumn_web::tenant_cell::TenantAllocationError::Quota(_) => {
+            panic!("unlimited quota must reach the allocator")
+        }
+    }
+    assert_eq!(cell.tracked_bytes(), 0);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
+#[test]
+fn arena_happy_path_and_exact_boundary() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 64);
+    let arena = cell.arena();
+    let mut bytes = arena.try_bytes(32).expect("bytes fit");
+    bytes.as_mut_slice()[0] = 7;
+    let text = arena
+        .try_string(&"x".repeat(32))
+        .expect("exact boundary fits");
+    assert_eq!(bytes.as_slice()[0], 7);
+    assert_eq!(text.as_str().len(), 32);
+    assert_eq!(cell.tracked_bytes(), 64);
+}
+
+#[test]
+fn arena_over_quota_is_non_mutating_and_tenants_are_concurrent() {
+    let registry = TenantCellRegistry::new();
+    let a = registry.get_or_create("a", 32);
+    let b = registry.get_or_create("b", 32);
+    let held = a.arena().try_bytes(32).expect("a fills exact quota");
+    let before = a.tracked_bytes();
+    a.arena().try_bytes(1).expect_err("a is over quota");
+    assert_eq!(a.tracked_bytes(), before, "failed reservation is inert");
+    let thread = std::thread::spawn(move || b.arena().try_bytes(32));
+    let other = thread
+        .join()
+        .expect("tenant thread does not panic")
+        .expect("b has an independent domain");
+    assert_eq!(other.tracked_bytes(), 32);
+    drop(held);
+    assert_eq!(a.tracked_bytes(), 0);
+}
+
+#[test]
+fn final_eviction_makes_all_supported_arena_allocations_unreachable() {
+    let registry = TenantCellRegistry::new();
+    let cell = registry.get_or_create("tenant", 128);
+    let bytes = cell.arena().try_bytes(64).expect("bytes fit");
+    let text = cell
+        .arena()
+        .try_string("region-owned")
+        .expect("string fits");
+    drop(registry.evict("tenant"));
+    drop(cell);
+    assert!(
+        registry.total_tracked_bytes() > 0,
+        "owned allocations remain modeled reachable after eviction"
+    );
+    drop(bytes);
+    assert!(
+        registry.total_tracked_bytes() > 0,
+        "string is still modeled reachable"
+    );
+    drop(text);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
+/// Eviction removes residency, not the tenant's live accounting domain. A new
+/// request while an old arena allocation survives must observe the old usage
+/// and cannot acquire a second full quota.
+#[test]
+fn evicted_generation_reuses_live_accounting_domain() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+    let old_cell = registry.get_or_create("tenant", 64);
+    let old_allocation = old_cell.arena().try_bytes(64).expect("fills quota");
+
+    // Materializing another tenant exceeds max_cells and LRU-evicts `tenant`
+    // while its arena allocation remains alive.
+    let _other = registry.get_or_create("other", 64);
+    drop(old_cell);
+    assert!(registry.get("tenant").is_none());
+
+    let rebound = registry.get_or_create("tenant", 64);
+    assert_eq!(rebound.tracked_bytes(), 64, "rebind observes live usage");
+    rebound
+        .arena()
+        .try_bytes(1)
+        .expect_err("eviction must not reset the tenant quota");
+
+    drop(old_allocation);
+    assert_eq!(rebound.tracked_bytes(), 0);
+    let replacement = rebound
+        .arena()
+        .try_bytes(64)
+        .expect("quota becomes available after final old allocation drop");
+    assert_eq!(replacement.tracked_bytes(), 64);
+}
+
 /// A charge raises both the per-tenant and process-wide gauges by exactly its
 /// size, and dropping it returns them to zero.
 #[test]
@@ -145,6 +256,112 @@ fn eviction_reclaims_to_zero() {
         0,
         "residual bytes must be reclaimed once the cell is dropped"
     );
+}
+
+/// Eviction ends cache residency, not the tenant's accounting lifetime. An
+/// in-flight owner forces a subsequent lookup to rejoin the same quota counter
+/// and scratch domain until every owner has gone away.
+#[test]
+fn eviction_does_not_split_a_live_tenant_accounting_domain() {
+    let registry = TenantCellRegistry::new();
+    let old = registry.get_or_create("t", 1_000);
+    old.scratch_insert("shared", vec![7; 100])
+        .expect("initial scratch allocation fits");
+    let initial = old.tracked_bytes();
+    let old_charge = old.try_charge(600).expect("initial charge fits");
+    let in_flight = Arc::clone(&old);
+
+    let evicted = registry.evict("t").expect("tenant was resident");
+    assert_eq!(registry.len(), 0, "eviction removes cache residency");
+
+    let replacement = registry.get_or_create("t", 1_000);
+    assert_eq!(
+        replacement.scratch_get("shared"),
+        Some(vec![7; 100]),
+        "the replacement must use the still-live scratch domain"
+    );
+    let remaining = 1_000 - initial - old_charge.bytes();
+    replacement
+        .try_charge(remaining + 1)
+        .expect_err("old and new requests share one aggregate tenant quota");
+    assert_eq!(replacement.tracked_bytes(), initial + 600);
+
+    drop(old_charge);
+    drop(old);
+    drop(in_flight);
+    drop(evicted);
+    let final_resident = registry
+        .evict("t")
+        .expect("resurrected cell remains resident until explicitly evicted");
+    drop(replacement);
+    drop(final_resident);
+    assert_eq!(registry.total_tracked_bytes(), 0);
+}
+
+/// Dead weak lifecycle tombstones must not turn a bounded resident cache into
+/// an unbounded tenant-id string cache under one-off, request-controlled IDs.
+#[test]
+fn eviction_sweeps_expired_lifecycle_tombstones_under_churn() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+
+    for i in 0..1_000 {
+        let cell = registry.get_or_create(&format!("one-off-{i}"), 1_000);
+        drop(cell);
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.accounting_domain_count(),
+            1,
+            "capacity enforcement must discard dead tenant lifecycle keys"
+        );
+    }
+
+    // A live evicted domain is preserved, then swept only after its last handle
+    // drops and the next mutation gives the registry an opportunity to prune.
+    let live = registry.get_or_create("live", 1_000);
+    let evicted = registry.evict("live").expect("live tenant was resident");
+    assert!(registry.accounting_domain_count() >= 1);
+    drop(live);
+    drop(evicted);
+    let next = registry.get_or_create("next", 1_000);
+    drop(next);
+    assert_eq!(registry.accounting_domain_count(), 1);
+}
+
+/// Lifecycle cleanup is amortized: many simultaneously-live evicted domains
+/// are retained, then reclaimed in bounded batches after their owners drop.
+#[test]
+fn lifecycle_tombstones_are_swept_incrementally() {
+    let registry = TenantCellRegistry::with_limits(1, None);
+    let mut in_flight = Vec::new();
+    for i in 0..100 {
+        in_flight.push(registry.get_or_create(&format!("stream-{i}"), 1_000));
+    }
+    assert_eq!(registry.accounting_domain_count(), 100);
+
+    drop(in_flight);
+    // Each mutation examines a fixed-size batch. Seven batches are enough for
+    // the 99 non-resident candidates; the final resident domain remains.
+    for _ in 0..7 {
+        assert!(registry.evict("not-present").is_none());
+    }
+    assert_eq!(registry.accounting_domain_count(), 1);
+}
+
+/// A resurrected cell must use one timestamp for touching and TTL enforcement,
+/// otherwise a millisecond rollover can immediately evict it at a zero TTL.
+#[test]
+fn resurrection_with_zero_idle_ttl_remains_resident() {
+    let registry = TenantCellRegistry::with_limits(0, Some(Duration::ZERO));
+    let original = registry.get_or_create("t", 1_000);
+    let evicted = registry.evict("t").expect("tenant was resident");
+
+    let resurrected = registry.get_or_create("t", 1_000);
+    assert_eq!(registry.len(), 1);
+    assert!(registry.get("t").is_some());
+
+    drop(original);
+    drop(evicted);
+    drop(resurrected);
 }
 
 /// Density smoke test: empty resident cells keep API-accounted payload separate
@@ -680,4 +897,34 @@ fn touch_does_not_regress_timestamp() {
         5,
         "an out-of-order sequence must not regress the recorded access sequence"
     );
+}
+
+/// Regression: each resident cell also owns a lifecycle record with its own
+/// copy of the tenant id, so the structural lower bound must count three id
+/// copies per cell (resident key, lifecycle key, the cell's own id), not two.
+#[test]
+fn structural_overhead_counts_resident_lifecycle_records() {
+    let registry = TenantCellRegistry::new();
+    let ids: Vec<String> = (0..10).map(|i| format!("tenant-{i:04}")).collect();
+    for id in &ids {
+        drop(registry.get_or_create(id, 0));
+    }
+    let id_bytes: usize = ids.iter().map(String::len).sum();
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, ids.len());
+    assert_eq!(structural.tenant_id_capacity_bytes, 3 * id_bytes);
+}
+
+/// Regression: an evicted-but-live domain's lifecycle entry is still allocated
+/// structure, so its key keeps counting after the cell leaves the resident map.
+#[test]
+fn structural_overhead_counts_non_resident_lifecycle_records() {
+    let registry = TenantCellRegistry::new();
+    let held = registry.get_or_create("tenant-held", 0);
+    let evicted = registry.evict("tenant-held").expect("was resident");
+    let structural = registry.structural_overhead();
+    assert_eq!(structural.resident_cells, 0);
+    assert_eq!(structural.tenant_id_capacity_bytes, "tenant-held".len());
+    assert!(structural.registry_entry_bytes > 0);
+    drop((held, evicted));
 }

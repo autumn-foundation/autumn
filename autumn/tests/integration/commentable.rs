@@ -104,6 +104,50 @@ pub struct CmtPhoto {
 pub trait CmtPhotoRepository {}
 
 diesel::table! {
+    cmt_renamed_authors (id) {
+        id -> Int8,
+        screen_name -> Text,
+    }
+}
+
+/// An author model whose display-name field is renamed from its column with
+/// `#[diesel(column_name = …)]` — the Rust field is `username`, the column is
+/// `screen_name`. Hand-written (no `#[model]`), as author structs often are.
+#[derive(diesel::Queryable, diesel::Selectable)]
+#[diesel(table_name = cmt_renamed_authors)]
+pub struct CmtRenamedAuthor {
+    pub id: i64,
+    #[diesel(column_name = screen_name)]
+    pub username: String,
+}
+
+diesel::table! {
+    cmt_renamed_parents (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+    }
+}
+
+/// `author_name` is the column the SQL selects; `author_name_field` is the
+/// author struct's field the compile-time guard reads. Without it, this model
+/// would not compile: the guard would look for a `screen_name` field.
+#[autumn_web::model(table = "cmt_renamed_parents")]
+#[commentable(
+    by = CmtRenamedAuthor,
+    table = cmt_comments,
+    author_name = screen_name,
+    author_name_field = username
+)]
+pub struct CmtRenamedParent {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+}
+
+diesel::table! {
     cmt_shallows (id) {
         id -> Int8,
         title -> Text,
@@ -553,6 +597,11 @@ fn commentable_spec_uses_the_documented_conventions() {
     assert_eq!(CmtShallow::commentable_spec().max_depth, 1);
     assert_eq!(CmtShallow::commentable_spec().author_name_column, None);
     assert_eq!(CmtUncounted::commentable_spec().counter_column, None);
+
+    // A diesel-renamed author field: the SQL reads the physical column.
+    let renamed = CmtRenamedParent::commentable_spec();
+    assert_eq!(renamed.author_name_column, Some("screen_name"));
+    assert_eq!(renamed.author_table, Some("cmt_renamed_authors"));
 }
 
 /// AC5: every `#[commentable]` model registers itself, so a generic router can

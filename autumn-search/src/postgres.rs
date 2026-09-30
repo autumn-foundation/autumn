@@ -285,7 +285,7 @@ impl PostgresSearchStore {
     /// `documents` is a caller-supplied slice on a PUBLIC trait method, not
     /// something this type controls the shape of — [`SearchDocument::fields`]
     /// is itself a public, uncapped `Vec` a hand-built document can push
-    /// arbitrarily many (even repeated) entries onto — so four defenses
+    /// arbitrarily many (even repeated) entries onto — so five defenses
     /// apply before any SQL is built:
     ///
     /// - **duplicate `record_id`s are deduplicated** — a single statement's
@@ -305,6 +305,15 @@ impl PostgresSearchStore {
     ///       (`WHERE updated_at <= watermark`) fails against that
     ///       just-written row and silently no-ops. Deduplicate keeping the
     ///       FIRST, to match.
+    /// - **every document's embedding width is validated BEFORE
+    ///   deduplication** — a malformed duplicate that loses the
+    ///   keep-first/keep-last coin flip would otherwise be silently
+    ///   discarded, masking malformed embedder output the old per-document
+    ///   loop always rejected with `DimensionMismatch` (#2311). Only the
+    ///   pgvector-mode + physical-`embedding_vec`-column combination
+    ///   rejects; other modes keep the row loop's existing behavior
+    ///   (a stale column copy is repaired by `NULL`ing it, not by failing
+    ///   the batch).
     /// - **the batch is split into chunks sized so no single statement can
     ///   approach Postgres's 65,535 bind-parameter limit**, using each
     ///   document's ACTUAL bind count (not `definition.fields.len()`, which
@@ -378,6 +387,14 @@ impl PostgresSearchStore {
         } else {
             ("", "")
         };
+
+        // Every supplied document is validated BEFORE `dedupe_by_id`
+        // selects the duplicate winner: a malformed duplicate that loses the
+        // keep-first/keep-last coin flip would otherwise be silently
+        // discarded, masking malformed embedder output that the old
+        // per-document loop always rejected (#2311). This runs over the full
+        // supplied slice, not the survivors.
+        validate_embedding_widths(documents, vector_width, self.vector_mode())?;
 
         // See the doc comment above for why the direction depends on
         // `watermark`.
@@ -824,6 +841,66 @@ fn dedupe_by_id(documents: &[IndexedDocument], keep_first: bool) -> Vec<&Indexed
         .collect()
 }
 
+/// Reject a batch carrying a wrong-width embedding BEFORE [`dedupe_by_id`]
+/// selects the duplicate winner.
+///
+/// The old per-document loop validated every document as it wrote it, so a
+/// malformed embedder output always surfaced as
+/// [`SearchError::DimensionMismatch`]. Deduplication runs first now, and a
+/// malformed duplicate that loses the keep-first/keep-last coin flip is
+/// silently discarded — an unconditional batch `[bad-width id=1, valid id=1]`
+/// succeeds, and a watermark-guarded batch `[valid id=1, bad-width id=1]`
+/// succeeds too. Malformed output from the app's embedder is then masked
+/// rather than reported (#2311).
+///
+/// This mirrors the per-document check the row loop in `write_documents`
+/// still applies: only the pgvector-mode + physical-`embedding_vec`-column
+/// combination rejects a width mismatch. Every other combination keeps the
+/// loop's existing behavior — notably the portable/`Array` mode, where a
+/// stale `embedding_vec` copy left by a previous width is repaired by `NULL`ing
+/// it rather than failing the batch.
+fn validate_embedding_widths(
+    documents: &[IndexedDocument],
+    vector_width: Option<usize>,
+    vector_mode: Option<VectorMode>,
+) -> SearchResult<()> {
+    let Some(width) = vector_width else {
+        // No physical column: nothing to validate against.
+        return Ok(());
+    };
+    if !vector_mode.is_some_and(VectorMode::is_pgvector) {
+        // Only pgvector-mode writers run k-NN off `embedding_vec`; other
+        // modes write the portable `embedding` array at full width and let
+        // the row loop repair a stale column copy by NULLing it.
+        return Ok(());
+    }
+    for document in documents {
+        if let Some(embedding) = document.embedding.as_deref()
+            && embedding.len() != width
+        {
+            return Err(SearchError::DimensionMismatch {
+                expected: width,
+                actual: embedding.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The `record_id` order `delete()` binds for its ledger `INSERT ...
+/// unnest($2)`.
+///
+/// The insert acquires its tombstone rows in array order, so the array must
+/// be ascending to match the unconditional batch's `ORDER BY record_id FOR
+/// UPDATE` tombstone clear — opposite orders on the two paths deadlock over
+/// the same tombstones (#2310). Kept as a pure helper so the ordering
+/// contract is unit-testable without a database.
+fn ascending_ids(ids: &[i64]) -> Vec<i64> {
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted
+}
+
 /// One row's already-rendered column-value expression list, in the exact
 /// order `upsert_sql`'s INSERT column list declares (`index_name,
 /// record_id, tenant_id, language, fields, content, search_vector,
@@ -941,11 +1018,26 @@ fn upsert_sql(
     // then delete" (document absent, tombstone present) and "delete, then upsert+clear"
     // (document present, no tombstone). Both are consistent; the inconsistent interleaving
     // cannot happen.
+    //
+    // `cleared` locks the ledger rows in ascending `record_id` order — via `ORDER BY`
+    // plus `FOR UPDATE` in a `SELECT`, the only thing that actually controls Postgres's
+    // row-lock acquisition order — matching `delete()`'s `INSERT ... unnest($2)` order.
+    // A bare `DELETE ... WHERE record_id = ANY($n)` locks whatever rows its scan visits,
+    // independent of the array's order, so racing an oppositely-ordered `delete()` over
+    // the same tombstones could deadlock: each statement holds one ledger row and waits
+    // for the other (#2310).
     format!(
         "WITH upserted AS ( \
            {upsert} \
+         ), \
+         cleared AS ( \
+           SELECT record_id FROM {DELETES_TABLE} \
+           WHERE index_name = $1 AND record_id = ANY(${ids_param}) \
+           ORDER BY record_id \
+           FOR UPDATE \
          ) \
-         DELETE FROM {DELETES_TABLE} WHERE index_name = $1 AND record_id = ANY(${ids_param})"
+         DELETE FROM {DELETES_TABLE} \
+         WHERE index_name = $1 AND record_id IN (SELECT record_id FROM cleared)"
     )
 }
 
@@ -1136,6 +1228,13 @@ impl SearchBackend for PostgresSearchStore {
             // scan visits them, independent of the array's order, so a bare `DELETE
             // ... WHERE record_id = ANY($2)` could lock out of order and deadlock
             // against a concurrent `write_documents` batch.
+            //
+            // The ledger half needs the same treatment in reverse: the `INSERT ...
+            // unnest($2)` below acquires its tombstone rows in array order, so the
+            // array is pre-sorted ascending to match the unconditional batch's
+            // `ORDER BY record_id FOR UPDATE` tombstone clear. Opposite orders on
+            // the two paths deadlock over the same tombstones (#2310).
+            let sorted_ids = ascending_ids(ids);
             bind_all(
                 diesel::sql_query(format!(
                     "WITH doomed AS ( \
@@ -1155,7 +1254,7 @@ impl SearchBackend for PostgresSearchStore {
                 .into_boxed::<autumn_web::RuntimeBackend>(),
                 [
                     Bound::Text(definition.name.to_owned()),
-                    Bound::Ids(ids.to_vec()),
+                    Bound::Ids(sorted_ids),
                 ],
             )
             .execute(&mut conn)
@@ -1986,6 +2085,85 @@ mod tests {
         }
     }
 
+    fn doc_with_embedding(id: i64, width: usize) -> IndexedDocument {
+        doc(id).with_embedding(vec![0.0; width])
+    }
+
+    const PGVECTOR_MODE: Option<VectorMode> = Some(VectorMode::PgVector { dimensions: 4 });
+
+    fn assert_dimension_mismatch(error: &SearchError, expected: usize, actual: usize) {
+        assert!(
+            matches!(
+                error,
+                SearchError::DimensionMismatch {
+                    expected: exp,
+                    actual: act
+                } if *exp == expected && *act == actual
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn embedding_widths_are_validated_before_unconditional_dedup_can_hide_a_bad_duplicate() {
+        // #2311: the issue's exact scenario. Unconditional (`index`) dedup
+        // keeps the LAST occurrence, so the malformed first entry never
+        // reaches the row loop's width check — without pre-dedup validation
+        // this batch succeeds and the malformed embedder output is masked.
+        let documents = vec![
+            doc_with_embedding(1, 3), // bad width, loses the coin flip
+            doc_with_embedding(1, 4), // valid, survives dedup
+        ];
+        let error = validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
+            .expect_err("a wrong-width embedding must be rejected");
+        assert_dimension_mismatch(&error, 4, 3);
+    }
+
+    #[test]
+    fn embedding_widths_are_validated_before_guarded_dedup_can_hide_a_bad_duplicate() {
+        // Watermark-guarded (`index_unless_newer`) dedup keeps the FIRST
+        // occurrence, so a malformed LATER duplicate is the one that would
+        // be silently discarded.
+        let documents = vec![
+            doc_with_embedding(1, 4), // valid, survives dedup
+            doc_with_embedding(1, 3), // bad width, loses the coin flip
+        ];
+        let error = validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
+            .expect_err("a wrong-width embedding must be rejected");
+        assert_dimension_mismatch(&error, 4, 3);
+    }
+
+    #[test]
+    fn embedding_width_validation_accepts_a_clean_batch() {
+        let documents = vec![
+            doc_with_embedding(1, 4),
+            doc_with_embedding(2, 4),
+            doc(3), // no embedding at all is fine
+        ];
+        validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
+            .expect("a clean batch must validate");
+    }
+
+    #[test]
+    fn embedding_width_validation_only_rejects_in_pgvector_mode() {
+        // The portable/`Array` mode does not reject a width mismatch: the
+        // row loop repairs a stale `embedding_vec` copy from a previous
+        // width by NULLing it, so pre-dedup validation must not change that
+        // behavior.
+        let documents = vec![doc_with_embedding(1, 3)];
+        validate_embedding_widths(&documents, Some(4), Some(VectorMode::Array))
+            .expect("non-pgvector mode must not reject a width mismatch");
+    }
+
+    #[test]
+    fn embedding_width_validation_skips_when_there_is_no_physical_column() {
+        // `None` width means the `embedding_vec` column is absent and must
+        // stay out of the write entirely — nothing to validate against.
+        let documents = vec![doc_with_embedding(1, 3)];
+        validate_embedding_widths(&documents, None, PGVECTOR_MODE)
+            .expect("no physical column means no validation");
+    }
+
     #[test]
     fn greedy_chunking_never_lets_a_statement_approach_the_bind_limit_even_with_repeated_fields() {
         // Mirrors write_documents' own greedy accounting: `SearchDocument::fields`
@@ -2155,6 +2333,19 @@ mod tests {
         );
         assert!(sql.contains("record_id = ANY($9)"), "{sql}");
 
+        // The tombstone clear must lock the ledger rows in ascending
+        // `record_id` order — ORDER BY + FOR UPDATE is the only thing that
+        // controls Postgres's lock acquisition order — matching `delete()`'s
+        // `INSERT ... unnest($2)` order. A bare DELETE ... ANY($n) locks in
+        // scan order and deadlocks against an oppositely-ordered delete
+        // racing over the same tombstones (#2310).
+        let lock_block = sql
+            .find(&format!("DELETE FROM {DELETES_TABLE}"))
+            .map(|at| &sql[..at])
+            .expect("the tombstone-clear DELETE exists");
+        assert!(lock_block.contains("ORDER BY record_id"), "{sql}");
+        assert!(lock_block.contains("FOR UPDATE"), "{sql}");
+
         // A watermarked (backfill) write leaves the ledger alone — its batch is
         // older than any tombstone by construction. Clearing it there would
         // undo the very delete the guard is protecting.
@@ -2182,6 +2373,18 @@ mod tests {
         assert_eq!(multi.matches("$3::timestamptz").count(), 3, "{multi}");
         assert!(multi.contains("record_id = $4"), "{multi}");
         assert!(multi.contains("record_id = $9"), "{multi}");
+    }
+
+    #[test]
+    fn delete_binds_its_ledger_ids_in_ascending_order() {
+        // `delete()`'s `INSERT ... unnest($2)` acquires tombstone rows in
+        // array order, so the bound array must be ascending to match the
+        // unconditional batch's `ORDER BY record_id FOR UPDATE` tombstone
+        // clear — opposite orders on the two paths deadlock (#2310).
+        assert_eq!(ascending_ids(&[3, 1, 2]), vec![1, 2, 3]);
+        assert_eq!(ascending_ids(&[1, 2, 3]), vec![1, 2, 3]);
+        assert_eq!(ascending_ids(&[5, 5, 1]), vec![1, 5, 5]);
+        assert_eq!(ascending_ids(&[]), Vec::<i64>::new());
     }
 
     #[test]

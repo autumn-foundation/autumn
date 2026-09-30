@@ -52,7 +52,7 @@
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Utc};
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -85,7 +85,7 @@ fn global() -> &'static Mutex<FakeState> {
             .and_then(|s| s.trim().parse::<u64>().ok());
         Mutex::new(seed.map_or_else(
             || FakeState {
-                rng: ChaCha8Rng::from_os_rng(),
+                rng: ChaCha8Rng::from_rng(&mut rand::rng()),
                 deterministic: false,
             },
             |seed| FakeState {
@@ -780,6 +780,12 @@ static DOMAINS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn int_range_boundary() {
+        assert_eq!(int_range(5, 5), 5);
+        assert_eq!(int_range(10, 5), 10);
+    }
 
     /// Integer digits of a [`Decimal`] — digits left of the decimal point.
     fn int_digits(value: Decimal) -> u32 {

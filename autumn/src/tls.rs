@@ -275,6 +275,32 @@ pub enum TlsError {
         /// Human-readable parse detail.
         detail: String,
     },
+    /// The mTLS revocation list does not cover every CA in the client-CA
+    /// bundle: no CRL in the file is issued by one or more of the bundle's
+    /// CAs (issue #2706).
+    ///
+    /// Once any CRL is configured, rustls denies handshakes whose revocation
+    /// status is *unknown*, so clients presenting certificates issued by an
+    /// uncovered CA are refused even though their CA is trusted — the
+    /// availability trap in the CA rotation `docs/guide/tls.md` documents
+    /// (old + new CA in one bundle, CRL published for the old one first).
+    /// Publish a CRL for each CA in the bundle (or remove the uncovered CA)
+    /// before starting with a CRL configured.
+    #[error(
+        "the mTLS revocation list `{crl_path}` has no CRL issued by {uncovered:?} \
+         from the client CA bundle `{ca_bundle_path}`; once any CRL is configured, \
+         rustls refuses handshakes whose revocation status is unknown, so these \
+         CAs' clients would be rejected — publish a CRL for each CA in the \
+         bundle or remove the uncovered CA"
+    )]
+    CrlCoverageGap {
+        /// CA bundle path.
+        ca_bundle_path: PathBuf,
+        /// CRL path.
+        crl_path: PathBuf,
+        /// Subject DNs of the CAs no CRL in the file is issued by.
+        uncovered: Vec<String>,
+    },
     /// Building the rustls client-certificate verifier failed.
     #[error("failed to build the mTLS client certificate verifier: {source}")]
     BuildClientVerifier {
@@ -648,13 +674,37 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TlsL
     for TlsConnectInfo
 {
     fn connect_info(stream: axum::serve::IncomingStream<'_, TlsListener>) -> Self {
-        let peer = *stream.remote_addr();
+        Self::from_stream(stream.io(), *stream.remote_addr())
+    }
+}
+
+/// The HTTPS serve path wraps its listener in `StopAcceptingOnShutdown` (see
+/// `accept_drain`), so the connect info must be available for the wrapper too.
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, crate::accept_drain::StopAcceptingOnShutdown<TlsListener>>,
+    > for TlsConnectInfo
+{
+    fn connect_info(
+        stream: axum::serve::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<TlsListener>,
+        >,
+    ) -> Self {
+        Self::from_stream(stream.io(), *stream.remote_addr())
+    }
+}
+
+impl TlsConnectInfo {
+    fn from_stream(
+        io: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        peer: std::net::SocketAddr,
+    ) -> Self {
         // rustls exposes the peer chain only after a successful handshake, so
         // anything here has already passed the configured verifier — the parse
         // turns a verified certificate into a usable identity, it does not
         // decide trust.
-        let client = stream
-            .io()
+        let client = io
             .get_ref()
             .1
             .peer_certificates()

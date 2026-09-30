@@ -69,6 +69,11 @@ pub struct CommentableSpec {
     /// The author display-name column. `None` (the default) resolves no name —
     /// the framework refuses to guess a column.
     pub author_name_column: Option<String>,
+    /// The author model's Rust field that holds the display name, when it is
+    /// not spelled like the column — a `#[diesel(column_name = …)]` rename.
+    /// `None` (the default) reads the field named by `author_name`. Only the
+    /// compile-time guard reads it; the generated SQL always uses the column.
+    pub author_name_field: Option<String>,
     /// Maximum nesting depth; a top-level comment is depth `0`.
     pub max_depth: u32,
     /// Cap on one comment body, in bytes.
@@ -131,6 +136,7 @@ const KNOWN_KEYS: &[&str] = &[
     "author_table",
     "author_pk",
     "author_name",
+    "author_name_field",
     "max_depth",
     "max_body",
 ];
@@ -158,10 +164,11 @@ struct KeyValue {
 ///               created_at_column = created_at, soft_delete = true,
 ///               counter_cache = comment_count | false,
 ///               author_table = users, author_pk = id, author_name = username,
+///               author_name_field = username,
 ///               max_depth = 5, max_body = 10000)]
 /// ```
-// Seventeen independent keys, each with its own parse + validation arm, plus
-// the convention-derived defaults for the sixteen optional ones.
+// Eighteen independent keys, each with its own parse + validation arm, plus
+// the convention-derived defaults for the seventeen optional ones.
 #[allow(clippy::too_many_lines)]
 pub fn parse_commentable_attr(
     attr: &syn::Attribute,
@@ -316,6 +323,38 @@ pub fn parse_commentable_attr(
             Some(parsed.value.clone())
         }
     };
+    // `author_name` is the physical column the SQL selects; the compile-time
+    // guard reads the author model's *field*. The two differ when the model
+    // renames the column with `#[diesel(column_name = …)]`, so the field can
+    // be named separately. It means nothing without a column to guard, and
+    // without `by` there is no author struct to read it on.
+    let author_name_field = match pairs.get("author_name_field") {
+        None => None,
+        Some(parsed) => {
+            // A Rust field name, never spliced into SQL: a keyword-named field
+            // is spelled `r#type`, so the raw prefix is allowed here (and only
+            // here) and the rest must still be a plain identifier.
+            let key_ident = syn::Ident::new("author_name_field", parsed.span);
+            let bare = parsed.value.strip_prefix("r#").unwrap_or(&parsed.value);
+            check_ident_value(&key_ident, bare, parsed.span)?;
+            if author_name_column.is_none() {
+                return Err(syn::Error::new(
+                    parsed.span,
+                    "`author_name_field` in `#[commentable]` names the author \
+                     model's field for the `author_name` column: add \
+                     `author_name = <column>`",
+                ));
+            }
+            if author_model.is_none() {
+                return Err(syn::Error::new(
+                    parsed.span,
+                    "`author_name_field` in `#[commentable]` names a field on \
+                     the author model: add `by = <AuthorModel>`",
+                ));
+            }
+            Some(parsed.value.clone())
+        }
+    };
     let soft_delete = match pairs.get("soft_delete") {
         None => true,
         Some(parsed) => parsed.boolean.ok_or_else(|| {
@@ -452,6 +491,7 @@ pub fn parse_commentable_attr(
         author_table: ident_value("author_table", &author_table_default)?,
         author_pk: ident_value("author_pk", "id")?,
         author_name_column,
+        author_name_field,
         max_depth,
         max_body_bytes,
         span,
@@ -506,13 +546,21 @@ pub struct ParentShape<'a> {
     pub is_sharded: bool,
     /// The model's primary key field, for the `i64` guard.
     pub pk_ident: Option<&'a syn::Ident>,
+    /// The model's physical primary-key column, for the spec's `parent_pk`.
+    /// The caller resolves any `#[diesel(column_name)]` rename on the `#[id]`
+    /// field (#2662); the spec's SQL must name the column the database has,
+    /// not the Rust field.
+    pub pk_column: &'a str,
 }
 
 /// Emit everything a `#[commentable]` declaration generates.
 ///
 /// `pk_ident` is the model's primary-key field, resolved by the caller exactly
-/// as the CRUD codegen resolves it — it becomes `parent_pk` in the spec, so a
-/// model whose `#[id]` is not named `id` still gets a correct parent probe.
+/// as the CRUD codegen resolves it — it drives the `i64` guard. `pk_column`
+/// is the physical primary-key column (any `#[diesel(column_name)]` rename
+/// resolved); it becomes `parent_pk` in the spec, so a model whose `#[id]`
+/// is not named `id` — or is renamed in the database — still gets a correct
+/// parent probe (#2662).
 ///
 /// `has_deleted_at` / `has_tenant_id` mirror `#[votable]`: the parent's
 /// soft-delete and tenant columns are *projected into the spec* rather than
@@ -534,6 +582,7 @@ pub fn emit_commentable_items(
         has_tenant_id,
         is_sharded,
         pk_ident,
+        pk_column,
     } = *parent;
     let model_snake = pascal_to_snake(&model_ident.to_string());
     let spec_static = format_ident!("__AUTUMN_COMMENTABLE_SPEC_{}", model_snake.to_uppercase());
@@ -549,7 +598,9 @@ pub fn emit_commentable_items(
     let body_column = &spec.body_column;
     let created_at_column = &spec.created_at_column;
     let soft_delete = spec.soft_delete;
-    let parent_pk = pk_ident.map_or_else(|| "id".to_owned(), std::string::ToString::to_string);
+    // The spec's `parent_pk` addresses the parent row in SQL, so it names the
+    // physical column the caller resolved — not the Rust field (#2662).
+    let parent_pk = pk_column;
     let max_depth = spec.max_depth;
     let max_body_bytes = spec.max_body_bytes;
 
@@ -647,6 +698,51 @@ pub fn emit_commentable_items(
             };
         }
     });
+    // A typo'd `author_name = usernme` passed macro expansion (the macro only
+    // checked identifier syntax) and failed at run time with an
+    // undefined-column or decoding error on the first request — the generated
+    // SQL references the column in both `insert_comment` and `comment_thread`.
+    // Read through the FIELD here, exactly as `author_guard` reads the key
+    // field, so a misspelled column is a name-resolution error at compile
+    // time. The bound is on the field's type, on autumn's own
+    // `CommentAuthorName` (`String`, `Box<str>`, `Option<T>` of either, or a
+    // text-backed newtype that opts in with one impl): a non-text field is a
+    // schema mismatch the same way a non-i64 key is, and a trait bound would
+    // have demanded `#[model]`, which hand-written author structs deliberately
+    // do not derive. Only emitted when the author MODEL is available — an
+    // explicit `author_table` with no `by` names a table the macro cannot see
+    // into, so there is nothing to resolve.
+    //
+    // `author_name` is the physical column. When the author model renames it
+    // (`#[diesel(column_name = screen_name)] pub username: String`), the
+    // field is spelled differently and `author_name_field` names it.
+    let author_name_guard = match (spec.author_model.as_ref(), spec.author_name_column.as_ref()) {
+        (Some(author_model), Some(column)) => {
+            let author_name_ident = spec.author_name_field.as_deref().map_or_else(
+                || format_ident!("{column}"),
+                |field| {
+                    field.strip_prefix("r#").map_or_else(
+                        || format_ident!("{field}"),
+                        |raw| syn::Ident::new_raw(raw, proc_macro2::Span::call_site()),
+                    )
+                },
+            );
+            Some(quote! {
+                const _: fn(&#author_model) = |__autumn_commentable_author| {
+                    fn __autumn_commentable_author_name<
+                        T: ::autumn_web::commentable::CommentAuthorName,
+                    >(
+                        _: &T,
+                    ) {
+                    }
+                    __autumn_commentable_author_name(
+                        &__autumn_commentable_author.#author_name_ident
+                    );
+                };
+            })
+        }
+        _ => None,
+    };
     let author_model_name = spec
         .author_model
         .as_ref()
@@ -795,6 +891,7 @@ pub fn emit_commentable_items(
         #pk_guard
         #counter_guard
         #author_guard
+        #author_name_guard
 
         // Keep this a `static`, never a `const`. The runtime finds a model's
         // repository facts by comparing THIS item's address
@@ -1294,6 +1391,7 @@ mod tests {
                 has_tenant_id: false,
                 is_sharded: false,
                 pk_ident: Some(&pk),
+                pk_column: "id",
             },
         )
         .to_token_stream()
@@ -1313,6 +1411,194 @@ mod tests {
         assert!(
             emitted.contains("author_pk") || emitted.contains("id"),
             "read through the author's key field"
+        );
+    }
+
+    /// Emit the `#[commentable]` surface for a spec, as token text.
+    fn emit(attr: &proc_macro2::TokenStream) -> String {
+        let spec = parse(attr).expect("valid");
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let vis: syn::Visibility = syn::parse_quote!(pub);
+        let pk: syn::Ident = syn::parse_quote!(id);
+        emit_commentable_items(
+            &model,
+            &vis,
+            &spec,
+            "posts",
+            &ParentShape {
+                has_deleted_at: false,
+                has_tenant_id: false,
+                is_sharded: false,
+                pk_ident: Some(&pk),
+                pk_column: "id",
+            },
+        )
+        .to_token_stream()
+        .to_string()
+    }
+
+    /// A typo'd `author_name` used to pass macro expansion and fail at run
+    /// time; the guard reads the field on the author model, so a misspelled
+    /// column is a compile error, and the `CommentAuthorName` bound
+    /// rejects a non-text field the same way `CommentAuthorKey` rejects a
+    /// non-i64 key.
+    #[test]
+    fn an_author_name_column_is_guard_bound_when_an_author_model_is_available() {
+        let emitted = emit(&quote! { (by = User, author_name = username) });
+        assert!(
+            emitted.contains("CommentAuthorName"),
+            "the author-name bound, {emitted}"
+        );
+        assert!(
+            emitted.contains("username"),
+            "read through the author's name field, {emitted}"
+        );
+    }
+
+    /// No `author_name` configured means no name is ever read, so there is
+    /// nothing to guard — the key guard stands alone.
+    #[test]
+    fn no_author_name_guard_without_an_author_name() {
+        let emitted = emit(&quote! { (by = User) });
+        assert!(
+            emitted.contains("CommentAuthorKey"),
+            "the key guard is still there, {emitted}"
+        );
+        assert!(
+            !emitted.contains("CommentAuthorName"),
+            "no name guard without author_name, {emitted}"
+        );
+    }
+
+    /// A `#[diesel(column_name = …)]`-renamed author field is spelled
+    /// differently from its column: the SQL keeps selecting the column, and
+    /// the guard reads the field `author_name_field` names (Codex review on
+    /// #3038). Without the key, the guard reads the column's own name.
+    #[test]
+    fn author_name_field_names_the_field_the_guard_reads() {
+        let spec = parse(&quote! {
+            (by = User, author_name = screen_name, author_name_field = username)
+        })
+        .expect("valid");
+        assert_eq!(spec.author_name_column.as_deref(), Some("screen_name"));
+        assert_eq!(spec.author_name_field.as_deref(), Some("username"));
+
+        let emitted = emit(&quote! {
+            (by = User, author_name = screen_name, author_name_field = username)
+        });
+        assert!(
+            emitted.contains("__autumn_commentable_author . username"),
+            "the guard reads the renamed field, {emitted}"
+        );
+        assert!(
+            !emitted.contains("__autumn_commentable_author . screen_name"),
+            "the guard must not read the column as a field, {emitted}"
+        );
+        assert!(
+            emitted.contains("\"screen_name\""),
+            "the SQL still selects the column, {emitted}"
+        );
+
+        let spec = parse(&quote! { (by = User, author_name = username) }).expect("valid");
+        assert_eq!(spec.author_name_field, None);
+        let emitted = emit(&quote! { (by = User, author_name = username) });
+        assert!(
+            emitted.contains("__autumn_commentable_author . username"),
+            "no override reads the column's own name, {emitted}"
+        );
+    }
+
+    /// A keyword-named author field is spelled `r#type`: the raw prefix is
+    /// accepted for `author_name_field` (a Rust field, never SQL) and the
+    /// guard reads it as a raw identifier (Codex review on #3038).
+    #[test]
+    fn author_name_field_accepts_a_raw_identifier() {
+        let spec = parse(&quote! {
+            (by = User, author_name = kind, author_name_field = r#type)
+        })
+        .expect("a raw field name is valid");
+        assert_eq!(spec.author_name_field.as_deref(), Some("r#type"));
+        let emitted = emit(&quote! {
+            (by = User, author_name = kind, author_name_field = r#type)
+        });
+        assert!(
+            emitted.contains("__autumn_commentable_author . r#type"),
+            "the guard reads the raw field, {emitted}"
+        );
+        // The prefix is not a licence for anything else after it.
+        let message = error(&quote! {
+            (by = User, author_name = kind, author_name_field = "r#ty pe")
+        });
+        assert!(message.contains("not a valid identifier"), "{message}");
+    }
+
+    /// `author_name_field` is meaningless without a column to guard, and has
+    /// no struct to read without `by`.
+    #[test]
+    fn author_name_field_needs_author_name_and_by() {
+        let message = error(&quote! { (by = User, author_name_field = username) });
+        assert!(
+            message.contains("add `author_name = <column>`"),
+            "{message}"
+        );
+
+        let message = error(&quote! {
+            (author_table = users, author_name = screen_name, author_name_field = username)
+        });
+        assert!(message.contains("add `by = <AuthorModel>`"), "{message}");
+
+        let message = error(&quote! {
+            (by = User, author_name = screen_name, author_name_field = "user name")
+        });
+        assert!(message.contains("not a valid identifier"), "{message}");
+    }
+
+    /// An explicit `author_table` with no `by` names a table the macro cannot
+    /// see into — there is no author type to read a field on, so no guard is
+    /// emitted (and none is possible).
+    #[test]
+    fn no_author_name_guard_without_an_author_model() {
+        let emitted = emit(&quote! { (author_table = users, author_name = username) });
+        assert!(
+            !emitted.contains("CommentAuthorName"),
+            "no name guard without an author model, {emitted}"
+        );
+    }
+
+    /// #2662: the spec's `parent_pk` must name the physical primary-key
+    /// column. The caller resolves any `#[diesel(column_name)]` rename on the
+    /// `#[id]` field into `ParentShape::pk_column`; the parent probe SQL must
+    /// address the column the database has, not the Rust field.
+    #[test]
+    fn the_spec_parent_pk_names_the_physical_primary_key_column() {
+        let spec = parse(&quote! { (by = User, author_name = username) }).expect("valid");
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let vis: syn::Visibility = syn::parse_quote!(pub);
+        let pk: syn::Ident = syn::parse_quote!(uuid);
+        let emitted = emit_commentable_items(
+            &model,
+            &vis,
+            &spec,
+            "posts",
+            &ParentShape {
+                has_deleted_at: false,
+                has_tenant_id: false,
+                is_sharded: false,
+                pk_ident: Some(&pk),
+                pk_column: "post_uuid",
+            },
+        )
+        .to_token_stream()
+        .to_string();
+
+        assert!(
+            emitted.contains("parent_pk : \"post_uuid\""),
+            "the renamed physical column must reach the spec, got: {emitted}"
+        );
+        assert!(
+            !emitted.contains("parent_pk : \"uuid\""),
+            "the Rust field name must not survive as the parent probe key, \
+             got: {emitted}"
         );
     }
 
@@ -1336,6 +1622,7 @@ mod tests {
                 has_tenant_id: false,
                 is_sharded: false,
                 pk_ident: Some(&pk),
+                pk_column: "id",
             },
         )
         .to_token_stream()
@@ -1356,6 +1643,7 @@ mod tests {
                 has_tenant_id: true,
                 is_sharded: false,
                 pk_ident: Some(&pk),
+                pk_column: "id",
             },
         )
         .to_token_stream()
