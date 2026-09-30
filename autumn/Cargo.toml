@@ -444,7 +444,7 @@ lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
 infer = { version = "0.22", optional = true }
-sha1 = { version = "0.10", optional = true }
+sha1 = { version = "0.11", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
 # `zeroize` wipes the AES round-key schedule and the GHASH subkey when a cipher
 # drops. It matters on the client side of `#[confidential]` (#1771), where a
