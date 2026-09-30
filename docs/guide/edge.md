@@ -469,3 +469,29 @@ a middleware, a macro or a dependency is exactly what could break it.
   category-2 framing `EdgeKv` inherits
 - [Conditional GET](conditional-get.md) — and `#[static_get]`, for pages that
   can be pre-rendered outright, which is cheaper than any capsule
+
+## Authenticated edge routes
+
+Identity is resolved on the host before capsule execution. Install a custom
+`EdgeIdentityProvider` with `AppBuilder::with_edge_identity_provider`; return
+`Ok(Some(EdgeIdentity))` only after authoritative verification, `Ok(None)` for
+missing/invalid authentication, and a typed error for store or network failure.
+Only normalized user and role claims cross the wire. Cookies, session ids and
+maps, signing secrets, and backend credentials remain host-only.
+
+A handler that takes `EdgeIdentity` must declare it — `#[edge(needs(identity))]`
+— or the build fails. The declaration travels in the route's `needs` like
+`kv`, and the capsule checks it *before dispatch*: a request whose frame carries
+no identity falls through to origin with `missing_capability`, and not one
+extractor or line of handler code runs. Unlike `kv`, `identity` is per request —
+it counts as provided exactly when the host attached verified claims, whatever
+the host lists in `provided_capabilities`. Identity infrastructure errors also
+fall through to origin. See [ADR-0005](../adr/0005-edge-session-identity.md).
+
+```rust
+#[get("/me")]
+#[edge(needs(identity))]
+pub async fn whoami(identity: EdgeIdentity) -> String {
+    identity.user_id().as_str().to_owned()
+}
+```

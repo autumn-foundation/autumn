@@ -885,6 +885,14 @@ its certificate back from the store and caches it. Nothing requires every
 certificate to be resident, so `cert_cache_size` is a memory knob, not a
 correctness one.
 
+A stored pair that rots *while its certificate is still cached* is not
+re-read until the cache stops holding it: the repair pass re-reads and
+re-parses the pair on the first tick after an eviction (or a restart), and a
+pair that will not load is treated as missing and re-ordered. So a
+corrupted-on-disk certificate is detected within one tick of the eviction
+that exposes it — never earlier, never silently permanent — but also never
+proactively while the cached copy is still serving.
+
 Custom domains live **inside** the ACME TLS listener, so they exist only where
 autumn terminates TLS itself. Behind
 [reverse-proxy termination](#terminating-tls-at-a-reverse-proxy) there is no
@@ -1150,6 +1158,27 @@ Two deliberate choices:
   honoring the list rather than failing every handshake — the revocations it
   names stay enforced. `autumn doctor` warns so the staleness is not silent.
 
+And one hard rule:
+
+- **Every CA in the bundle needs a CRL.** Once `crl_path` is set, rustls
+  denies handshakes whose revocation status is *unknown*, so a CRL that names
+  only some of the bundle's CAs would silently refuse the clients of the rest
+  — exactly the availability trap the rotation above walks into if the new
+  CA's CRL is published late. The server **fails fast at startup**, naming the
+  uncovered CAs, rather than serving half the clients. During a rotation,
+  publish the new CA's CRL (an empty one counts — a CRL with zero revoked
+  certificates) before, or together with, the bundle edit that adds the new
+  CA. A CRL-file change that breaks coverage hot-reloads the same way any bad
+  bundle does: it logs an error and keeps the previous trust store.
+
+  A CRL counts for a CA only if it is signed by that CA's key: a renewed CA
+  that keeps its name under a new key needs a CRL from the new key. If your
+  client certificates chain through an intermediate whose CRL you configure
+  (the bundle holds only the root), the check stands down — revocation is
+  checked against the issuing intermediate, which the bundle cannot show. A
+  root shipped in the bundle alongside its intermediate needs no CRL of its
+  own; the intermediate does.
+
 **OCSP and OCSP stapling are not supported.** CRL plus short-lived certificates
 first.
 
@@ -1205,7 +1234,8 @@ Both surface through the usual metrics/actuator endpoints.
 
 Startup **fails fast** with the offending path in the message on a missing,
 unparseable, or empty CA bundle or CRL — the listener never binds trusting
-nobody.
+nobody. It also fails fast when the CRL does not cover every CA in the bundle
+(see above), naming the uncovered CAs.
 
 ### `autumn doctor`
 
@@ -1213,9 +1243,11 @@ nobody.
 
 - **Fail** — the bundle or CRL is missing, unparseable, or empty (the same
   conditions the runtime refuses to boot on), or a CA in the bundle has expired.
-- **Warn** — a CA expires within 30 days, the CRL's `nextUpdate` has passed, or
-  `mode = "optional"` with no route requiring a certificate (client auth
-  configured and enforcing nothing).
+- **Warn** — the CRL has no entry for every CA in the bundle (the runtime
+  refuses to boot on this too, so `--strict` fails the run), a CA expires
+  within 30 days, the CRL's `nextUpdate` has passed, or `mode = "optional"`
+  with no route requiring a certificate (client auth configured and enforcing
+  nothing).
 - **Pass** — otherwise, reporting the mode, the CA count, and how many route
   prefixes demand a certificate.
 

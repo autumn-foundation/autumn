@@ -29,25 +29,29 @@ use syn::{Ident, ItemFn, Stmt, Token, parse_quote};
 pub const EDGE_MARKER: &str = "__AUTUMN_EDGE";
 /// Marker const injected for `#[edge(needs(kv))]`.
 pub const EDGE_NEEDS_KV_MARKER: &str = "__AUTUMN_EDGE_NEEDS_KV";
+/// Marker const injected for `#[edge(needs(identity))]`.
+pub const EDGE_NEEDS_IDENTITY_MARKER: &str = "__AUTUMN_EDGE_NEEDS_IDENTITY";
 
 /// The grammar `#[edge]` accepts, quoted verbatim in every rejection so a typo
 /// is answered with the whole (small) surface rather than a hint.
-const SUPPORTED_GRAMMAR: &str = "`#[edge]` or `#[edge(needs(kv))]`";
+const SUPPORTED_GRAMMAR: &str = "`#[edge]` or `#[edge(needs(kv, identity))]`";
 
 /// Capabilities that may appear inside `needs(...)`. The edge host mediates
 /// each one; anything else is a platform seam that does not exist yet.
-const SUPPORTED_CAPABILITIES: &[&str] = &["kv"];
+const SUPPORTED_CAPABILITIES: &[&str] = &["kv", "identity"];
 
 /// Parsed `#[edge(...)]` arguments.
 #[derive(Default, Clone, Copy)]
 pub struct EdgeAttrArgs {
     /// Whether `needs(kv)` was declared.
     pub needs_kv: bool,
+    /// Whether `needs(identity)` was declared.
+    pub needs_identity: bool,
 }
 
 impl Parse for EdgeAttrArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut needs_kv = false;
+        let mut declared: Vec<String> = Vec::new();
         let mut seen_needs = false;
 
         while !input.is_empty() {
@@ -80,7 +84,7 @@ impl Parse for EdgeAttrArgs {
                 ));
             }
             seen_needs = true;
-            needs_kv = parse_needs_group(input)?;
+            declared = parse_needs_group(input)?;
 
             if input.peek(Token![,]) {
                 let _comma: Token![,] = input.parse()?;
@@ -95,17 +99,20 @@ impl Parse for EdgeAttrArgs {
             )));
         }
 
-        Ok(Self { needs_kv })
+        Ok(Self {
+            needs_kv: declared.iter().any(|name| name == "kv"),
+            needs_identity: declared.iter().any(|name| name == "identity"),
+        })
     }
 }
 
-/// Parse the body of a `needs(...)` argument, returning whether `kv` was named.
+/// Parse the body of a `needs(...)` argument, returning the capabilities named.
 ///
 /// An empty `needs()` is rejected for the same reason an empty `seo()` is: it
 /// is almost certainly an unfinished edit, and silently treating it as "no
 /// capabilities" would ship a route that faults at the edge instead of failing
 /// the build.
-fn parse_needs_group(input: ParseStream) -> syn::Result<bool> {
+fn parse_needs_group(input: ParseStream) -> syn::Result<Vec<String>> {
     let span = input.span();
     let content;
     syn::parenthesized!(content in input);
@@ -153,7 +160,7 @@ fn parse_needs_group(input: ParseStream) -> syn::Result<bool> {
         ));
     }
 
-    Ok(declared.iter().any(|name| name == "kv"))
+    Ok(declared)
 }
 
 /// Expand `#[edge]` / `#[edge(needs(kv))]` on a route handler.
@@ -190,6 +197,12 @@ pub fn edge_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         input_fn.block.stmts.insert(1, needs_kv);
     }
+    if args.needs_identity {
+        let needs_identity: Stmt = parse_quote! {
+            const __AUTUMN_EDGE_NEEDS_IDENTITY: () = ();
+        };
+        input_fn.block.stmts.insert(1, needs_identity);
+    }
 
     quote! { #input_fn }
 }
@@ -199,6 +212,8 @@ pub fn edge_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub struct EdgeMarking {
     /// Whether the handler declared `needs(kv)`.
     pub needs_kv: bool,
+    /// Whether the handler declared `needs(identity)`.
+    pub needs_identity: bool,
     /// Where to point a rejection: the `#[edge]` attribute when it is still
     /// live, otherwise the handler's name.
     pub span: Span,
@@ -235,6 +250,7 @@ pub fn detect(input_fn: &ItemFn) -> Option<EdgeMarking> {
             };
             return Some(EdgeMarking {
                 needs_kv: args.needs_kv,
+                needs_identity: args.needs_identity,
                 span: attr.path().span(),
             });
         }
@@ -243,6 +259,7 @@ pub fn detect(input_fn: &ItemFn) -> Option<EdgeMarking> {
     if stmts_have_marker(&input_fn.block.stmts, EDGE_MARKER) {
         return Some(EdgeMarking {
             needs_kv: stmts_have_marker(&input_fn.block.stmts, EDGE_NEEDS_KV_MARKER),
+            needs_identity: stmts_have_marker(&input_fn.block.stmts, EDGE_NEEDS_IDENTITY_MARKER),
             span: input_fn.sig.ident.span(),
         });
     }
@@ -380,7 +397,7 @@ mod tests {
             "the error must name the offending option: {generated}"
         );
         assert!(
-            generated.contains("`#[edge]` or `#[edge(needs(kv))]`"),
+            generated.contains("`#[edge]` or `#[edge(needs(kv, identity))]`"),
             "the error must spell out the supported grammar: {generated}"
         );
     }
@@ -398,7 +415,7 @@ mod tests {
             "the error must name the offending capability: {generated}"
         );
         assert!(
-            generated.contains("Supported capabilities: `kv`"),
+            generated.contains("Supported capabilities: `kv`, `identity`"),
             "the error must list what the edge host can mediate: {generated}"
         );
     }

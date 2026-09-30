@@ -97,10 +97,10 @@ fn step_code(bytes: &[u8], i: usize, out: &mut [u8]) -> (Scan, usize) {
     } else if bytes[i] == b'"' {
         blank(out, i);
         (Scan::Str, 1)
-    } else if let Some(after) = raw_string_start(bytes, i) {
+    } else if let Some((after, prefix)) = raw_string_start(bytes, i) {
         // `after` is just past the opening quote; the hashes sit between the
-        // `r` and it.
-        let hashes = after - i - 2;
+        // prefix (`r`, `br`, `cr`) and it.
+        let hashes = after - i - prefix - 1;
         blank_run(out, i, after - i);
         (Scan::RawStr(hashes), after - i)
     } else if bytes[i] == b'\'' && is_char_literal(bytes, i) {
@@ -174,21 +174,29 @@ fn step_raw_string(bytes: &[u8], i: usize, hashes: usize, out: &mut [u8]) -> (Sc
     }
 }
 
-/// If a raw-string literal opens at `i` (`r"`, `r#"`, `r##"`, …), the offset
-/// just past its opening quote.
-fn raw_string_start(bytes: &[u8], i: usize) -> Option<usize> {
-    if bytes[i] != b'r' {
+/// If a raw-string literal opens at `i` (`r"`, `br#"`, `cr##"`, …), the
+/// offset just past its opening quote and the prefix length (`r` is 1,
+/// `br`/`cr` are 2).
+fn raw_string_start(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
+    // A `b`/`c` immediately before the `r` makes a raw byte string (`br"…"`)
+    // or a raw C string (`cr"…"`).
+    let prefix = if bytes[i] == b'r' {
+        1
+    } else if (bytes[i] == b'b' || bytes[i] == b'c') && bytes.get(i + 1) == Some(&b'r') {
+        2
+    } else {
         return None;
-    }
-    // A `r` that continues an identifier (`for`, `var`) is not a literal.
+    };
+    // A prefix that continues an identifier (`for`, `var`, `xbr`) is not a
+    // literal — the guard sits on the character before the *prefix*.
     if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
         return None;
     }
-    let mut at = i + 1;
+    let mut at = i + prefix;
     while bytes.get(at) == Some(&b'#') {
         at += 1;
     }
-    (bytes.get(at) == Some(&b'"')).then_some(at + 1)
+    (bytes.get(at) == Some(&b'"')).then_some((at + 1, prefix))
 }
 
 /// Whether the `"` at `i` closes a raw string opened with `hashes` hashes.
@@ -286,30 +294,39 @@ pub fn for_each_code_line<T>(
         .find_map(|(line, offset)| f(&line, offset))
 }
 
-/// Whether `line` declares `async fn main` — the entry point, not a helper
+/// Where `line` declares `async fn main` — the entry point, not a helper
 /// whose name merely starts with it (`async fn main_loop`).
+///
+/// Only meaningful at brace depth 0: an indented `async fn main` inside an
+/// `impl` block is a method, not the entry point (see `builder_anchor` in
+/// `plugin::install`, which tracks the depth).
+///
+/// Returns the byte offset of the first `async fn main` not followed by an
+/// identifier character, so callers measure context at the declaration that
+/// actually matched, not at an earlier `async fn main_loop`.
 #[must_use]
-pub fn declares_async_main(line: &str) -> bool {
+pub fn async_main_offset(line: &str) -> Option<usize> {
     const NEEDLE: &str = "async fn main";
-    let mut rest = line;
-    while let Some(at) = rest.find(NEEDLE) {
-        let after = &rest[at + NEEDLE.len()..];
-        if after
+    let mut base = 0;
+    while let Some(at) = line[base..].find(NEEDLE) {
+        let start = base + at;
+        let end = start + NEEDLE.len();
+        if line[end..]
             .chars()
             .next()
             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
         {
-            return true;
+            return Some(start);
         }
-        rest = after;
+        base = end;
     }
-    false
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        balanced_close_paren, code_lines, declares_async_main, for_each_code_line, mask_non_code,
+        async_main_offset, balanced_close_paren, code_lines, for_each_code_line, mask_non_code,
     };
 
     /// The mask must be a byte-for-byte overlay: offsets computed on it index
@@ -354,6 +371,58 @@ mod tests {
                 .contains("autumn_web::app()")
                 .then_some(()))
             .is_none()
+        );
+    }
+
+    /// Raw byte strings (`br"…"`) and raw C strings (`cr"…"` ) mask their
+    /// contents like any other raw string (issue #2381 item 5).
+    #[test]
+    fn raw_byte_and_c_string_contents_are_not_code() {
+        for source in [
+            "fn main() {\n    let doc = br#\"\n    autumn_web::app()\n\"#;\n}\n",
+            "fn main() {\n    let doc = cr##\"\n    autumn_web::app()\n\"##;\n}\n",
+        ] {
+            assert!(
+                for_each_code_line(source, |line, _| line
+                    .contains("autumn_web::app()")
+                    .then_some(()))
+                .is_none(),
+                "{source:?}"
+            );
+        }
+    }
+
+    /// A quote *inside* a raw byte string is content, not a terminator: the
+    /// hash-count-aware raw-string state carries past it. The old
+    /// ordinary-string fallback desynced on the interior quote and leaked the
+    /// probe as code (issue #2381 item 5).
+    #[test]
+    fn a_quote_inside_a_raw_byte_string_does_not_desync_the_mask() {
+        // Valid Rust: the raw string ends at `"#`; the interior `"` is content.
+        let source = "fn main() {\n    let doc = br#\"a \" b autumn_web::app()\"#;\n    let real = autumn_web::app();\n}\n";
+        let found = for_each_code_line(source, |line, offset| {
+            line.contains("autumn_web::app()").then_some(offset)
+        })
+        .expect("the real call");
+        assert!(
+            source[found..].trim_start().starts_with("let real"),
+            "the probe leaked as code: {source:?}"
+        );
+    }
+
+    /// The identifier-continuation guard sits before the *prefix*: `xbr` is an
+    /// identifier, not a raw byte string, and the `"` that follows still opens
+    /// an ordinary string (issue #2381 item 5).
+    #[test]
+    fn a_prefix_continuing_an_identifier_is_not_a_raw_string() {
+        let source = "let xbr = 1;\nlet s = xbr\"not raw\";\nlet real = autumn_web::app();\n";
+        let found = for_each_code_line(source, |line, offset| {
+            line.contains("autumn_web::app()").then_some(offset)
+        })
+        .expect("the real call");
+        assert!(
+            source[found..].starts_with("let real"),
+            "the scan desynced: {source:?}"
         );
     }
 
@@ -458,11 +527,11 @@ mod tests {
 
     #[test]
     fn a_helper_whose_name_starts_with_main_is_not_the_entry_point() {
-        assert!(declares_async_main("async fn main() {"));
-        assert!(declares_async_main("pub async fn main() {"));
-        assert!(!declares_async_main("async fn main_loop() {"));
-        assert!(!declares_async_main("async fn mainly() {"));
-        assert!(!declares_async_main("fn main() {"));
+        assert!(async_main_offset("async fn main() {").is_some());
+        assert!(async_main_offset("pub async fn main() {").is_some());
+        assert!(async_main_offset("async fn main_loop() {").is_none());
+        assert!(async_main_offset("async fn mainly() {").is_none());
+        assert!(async_main_offset("fn main() {").is_none());
     }
 
     #[test]

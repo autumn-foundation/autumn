@@ -28,6 +28,23 @@ pub enum PluginError {
     )]
     NoAutumnWeb,
 
+    /// The project's `Cargo.toml` has no `[package]` table: it is a virtual
+    /// workspace root, which cannot own a `[dependencies]` section.
+    #[error(
+        "this Cargo.toml has no `[package]` table — it looks like a virtual workspace root, which cannot own dependencies, so there is nothing to install into. Run `autumn plugin add` inside one of the workspace's member crates instead — no files were changed."
+    )]
+    NoPackageTable,
+
+    /// The project's `Cargo.toml` is not valid TOML, so whether it is a
+    /// package or a virtual workspace cannot be told.
+    #[error(
+        "Cargo.toml could not be parsed ({detail}) — fix the manifest and re-run `autumn plugin add`; no files were changed."
+    )]
+    ManifestParse {
+        /// The TOML parser's message.
+        detail: String,
+    },
+
     /// The plugin's supported `autumn-web` range excludes the app's version.
     #[error(
         "`{crate_name} {plugin_version}` supports autumn-web {supported}, but this app uses autumn-web {app_version} — no files were modified.\nUpgrade the app with `autumn upgrade`, or install a `{crate_name}` release built for autumn-web {app_version}."
@@ -1393,8 +1410,12 @@ pub fn mount_call_span(
 ///    `#[cfg(test)] mod tests` harness would otherwise be spliced *there* —
 ///    mounting the plugin into a function the binary never calls, or (for the
 ///    `autumn-storage-s3` mount, which awaits) into a synchronous fn, which
-///    does not compile. The body runs from the `async fn main` line to the
-///    first line that closes a brace at column 0.
+///    does not compile. The entry point is a free function, so the `async fn
+///    main` line must sit at brace depth 0: a helper method with the same name
+///    inside an `impl` block (indented, depth > 0) is not the entry the binary
+///    runs, and anchoring there would splice the mount into the wrong function.
+///    The body runs from the `async fn main` line to the first line that closes
+///    a brace at column 0.
 /// 2. **Exactly one candidate.** [`crate::rust_source::code_lines`] skips
 ///    comments but not string literals, so a quick-start snippet inside a raw
 ///    string can look like an anchor. Refusing when there is more than one
@@ -1405,9 +1426,29 @@ pub fn mount_call_span(
 ///    call into.
 fn builder_anchor(main_rs: &str) -> Option<usize> {
     let lines = crate::rust_source::code_lines(main_rs);
-    let main_at = lines
-        .iter()
-        .position(|(line, _)| crate::rust_source::declares_async_main(line))?;
+    // The mask blanks strings and comments, so only real code braces move the
+    // depth; a brace inside a string or comment cannot shift it.
+    let step = |depth: usize, text: &str| {
+        text.bytes().fold(depth, |depth, byte| match byte {
+            b'{' => depth + 1,
+            b'}' => depth.saturating_sub(1),
+            _ => depth,
+        })
+    };
+    let mut depth = 0usize;
+    let mut main_at = None;
+    for (index, (line, _)) in lines.iter().enumerate() {
+        // The depth at the declaration itself, not at the start of its line:
+        // `impl Server { async fn main() {` opens the impl on the same line.
+        if crate::rust_source::async_main_offset(line)
+            .is_some_and(|at| step(depth, &line[..at]) == 0)
+        {
+            main_at = Some(index);
+            break;
+        }
+        depth = step(depth, line);
+    }
+    let main_at = main_at?;
     // The body ends at the first code line that closes a brace at column 0 —
     // the closing brace of a top-level `async fn main`.
     let body_end = lines
@@ -1591,19 +1632,22 @@ fn spans_series(app: &str, release: &str) -> bool {
 /// a single [`crate::generate::emit::Action`] exists, so every refusal leaves
 /// the app byte-identical. The builder-chain edit is computed (not applied)
 /// before the manifest edit is queued, so no outcome can add a dependency whose
-/// mount was never even computed — and the two writes are queued mount-first,
-/// so a mid-execute I/O failure fails loudly at `rustc` instead of looking like
-/// a completed install.
+/// mount was never even computed — and the two writes are queued manifest-first,
+/// so a mid-execute I/O failure leaves an inert dependency (it compiles; it
+/// shows in `cargo tree`) instead of a mount with no dependency, which leaves
+/// the app uncompilable.
 ///
 /// # Errors
 ///
 /// [`PluginError::NotInProject`], [`PluginError::NoAutumnWeb`],
-/// [`PluginError::Incompatible`], or an I/O error reading the manifest.
+/// [`PluginError::NoPackageTable`], [`PluginError::Incompatible`], or an I/O
+/// error reading the manifest.
 pub fn plan_add(
     root: &Path,
     entry: &CatalogEntry,
     version: &str,
 ) -> Result<AddOutcome, PluginError> {
+    refuse_virtual_workspace(root)?;
     app_autumn_web(root)?;
     let app = resolved_app_version(root, entry.crate_name)?;
     // A range (`>=0.8, <0.9`) has no single series to compare, but one that
@@ -1703,15 +1747,12 @@ pub fn plan_add(
         }
     };
 
-    // `src/main.rs` is queued BEFORE `Cargo.toml`. `Plan::execute` writes
+    // `Cargo.toml` is queued BEFORE `src/main.rs`. `Plan::execute` writes
     // actions in order with no rollback, so if the second write fails (a
-    // read-only file, ENOSPC) this ordering leaves a mount with no dependency
-    // — which rustc rejects immediately — rather than a dependency with no
-    // mount, which looks exactly like a completed install.
+    // read-only file, ENOSPC) this ordering leaves a dependency with no mount
+    // — inert, compiling, visible in `cargo tree` — rather than a mount with
+    // no dependency, which leaves the app uncompilable.
     let mut plan = Plan::new(root);
-    if let Some(updated_main) = mounted_src {
-        plan.modify(main_path, updated_main);
-    }
     // Exact: the trust review and the conformance record describe this
     // release, and a caret would let Cargo take a later, unreviewed patch.
     let spec = format!("\"{}\"", exact_pin(version));
@@ -1721,6 +1762,9 @@ pub fn plan_add(
     );
     if updated_manifest != manifest_src {
         plan.modify(manifest, updated_manifest);
+    }
+    if let Some(updated_main) = mounted_src {
+        plan.modify(main_path, updated_main);
     }
     Ok(AddOutcome::Installed {
         plan: Box::new(plan),
@@ -1738,12 +1782,14 @@ pub fn plan_add(
 /// # Errors
 ///
 /// [`PluginError::NotInProject`], [`PluginError::NoAutumnWeb`],
-/// [`PluginError::ImplausibleVersion`], or an I/O error reading the manifest.
+/// [`PluginError::NoPackageTable`], [`PluginError::ImplausibleVersion`], or an
+/// I/O error reading the manifest.
 pub fn plan_add_community(
     root: &Path,
     crate_name: &str,
     version: &str,
 ) -> Result<AddOutcome, PluginError> {
+    refuse_virtual_workspace(root)?;
     app_autumn_web(root)?;
     // `=` pins a listed crate to its verified version (issue #1625).
     if !is_plausible_version(version.strip_prefix('=').unwrap_or(version)) {
@@ -1893,6 +1939,40 @@ pub fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
 #[must_use]
 pub fn manifest_path(root: &Path) -> PathBuf {
     root.join("Cargo.toml")
+}
+
+/// Whether the manifest text declares a `[package]` table — i.e. it is a
+/// package manifest that can own a `[dependencies]` section, not a virtual
+/// workspace root (issue #2381).
+/// A virtual workspace root has no `[package]` table: `ensure_cargo_dependencies`
+/// would append a `[dependencies]` section to a manifest that cannot own
+/// dependencies (issue #2381). Checked before any dependency resolution, so a
+/// real virtual manifest — `[workspace]` plus `[workspace.dependencies]`, no
+/// top-level `[dependencies]` — gets this diagnostic rather than
+/// [`PluginError::NoAutumnWeb`].
+fn refuse_virtual_workspace(root: &Path) -> Result<(), PluginError> {
+    let manifest = manifest_path(root);
+    if !manifest.is_file() {
+        return Err(PluginError::NotInProject);
+    }
+    // A parse failure is reported as one, not as a virtual workspace: a
+    // package manifest mid-edit is the likelier cause, and "move into a
+    // member crate" would send the author the wrong way.
+    let table =
+        toml::from_str::<toml::Table>(&std::fs::read_to_string(&manifest)?).map_err(|error| {
+            PluginError::ManifestParse {
+                detail: error.message().to_owned(),
+            }
+        })?;
+    // `[project]` is Cargo's legacy alias for `[package]`.
+    if ["package", "project"]
+        .iter()
+        .any(|key| table.get(*key).is_some_and(toml::Value::is_table))
+    {
+        Ok(())
+    } else {
+        Err(PluginError::NoPackageTable)
+    }
 }
 
 #[cfg(test)]
@@ -3153,6 +3233,53 @@ maud = { version = "0.27", features = ["axum"] }
         }
     }
 
+    /// A helper method named `main` inside an `impl` block is not the entry
+    /// point: the mount must anchor to the real top-level `async fn main`,
+    /// not to the helper (issue #2381 item 4).
+    #[test]
+    fn insert_mount_ignores_a_helper_named_main_inside_an_impl_block() {
+        let source = "use autumn_web::prelude::*;\n\nimpl Server {\n    async fn main() {\n        let _probe = autumn_web::app();\n    }\n}\n\n#[autumn_web::main]\nasync fn main() {\n    let app = autumn_web::app()\n        .routes(routes![index]);\n\n    app.run().await;\n}\n";
+        let updated = insert_mount(source, admin().mount).expect("anchor on the real main");
+        assert!(mount_present(&updated, admin()));
+        let real_main_at = updated.find("#[autumn_web::main]").expect("real main kept");
+        let mount_at = updated
+            .find(admin().mount.trim_end_matches('\n'))
+            .expect("mount spliced");
+        assert!(
+            mount_at > real_main_at,
+            "the mount landed before the real entry point — it was spliced into the impl helper"
+        );
+    }
+
+    /// The same guard when the `impl` opens on the helper's own line: the
+    /// depth that matters is the one at the declaration, not at the start of
+    /// its line.
+    #[test]
+    fn insert_mount_ignores_a_same_line_impl_helper_named_main() {
+        let source = "use autumn_web::prelude::*;\n\nimpl Server { async fn main() {\n        let app = autumn_web::app()\n            .routes(routes![]);\n    }\n}\n\n#[autumn_web::main]\nasync fn main() {\n    let app = autumn_web::app()\n        .routes(routes![index]);\n\n    app.run().await;\n}\n";
+        let updated = insert_mount(source, admin().mount).expect("anchor on the real main");
+        let real_main_at = updated.find("#[autumn_web::main]").expect("real main kept");
+        let mount_at = updated
+            .find(admin().mount.trim_end_matches('\n'))
+            .expect("mount spliced");
+        assert!(
+            mount_at > real_main_at,
+            "the mount landed in the same-line impl helper, not the real entry point"
+        );
+    }
+
+    /// With only an `impl`-block helper named `main` and no free-standing
+    /// entry point, there is no anchor: the command must take the manual
+    /// fallback, not splice into the helper (issue #2381 item 4).
+    #[test]
+    fn insert_mount_refuses_when_only_an_impl_helper_is_named_main() {
+        let source = "use autumn_web::prelude::*;\n\nimpl Server {\n    async fn main() {\n        autumn_web::app()\n    }\n}\n";
+        assert!(
+            insert_mount(source, admin().mount).is_none(),
+            "anchored to a helper that is not the entry point"
+        );
+    }
+
     // ── AC #4: idempotency ───────────────────────────────────────────────────
 
     #[test]
@@ -3579,10 +3706,11 @@ maud = { version = "0.27", features = ["axum"] }
         );
     }
 
-    /// The mount is queued before the manifest edit, so a mid-execute I/O
-    /// failure cannot leave a dependency whose mount never landed.
+    /// The manifest edit is queued before the mount, so a mid-execute I/O
+    /// failure leaves an inert dependency rather than an uncompilable mount
+    /// (issue #2381 item 2).
     #[test]
-    fn the_mount_is_queued_before_the_manifest() {
+    fn the_manifest_is_queued_before_the_mount() {
         let tmp = fake_project(SCAFFOLD_MAIN, SCAFFOLD_CARGO);
         let AddOutcome::Installed { plan, .. } = plan_add(tmp.path(), admin(), "0.7.0").unwrap()
         else {
@@ -3594,8 +3722,115 @@ maud = { version = "0.27", features = ["axum"] }
             .map(|action| action.path().to_path_buf())
             .collect();
         assert_eq!(paths.len(), 2, "{paths:?}");
-        assert!(paths[0].ends_with("main.rs"), "{paths:?}");
-        assert!(paths[1].ends_with("Cargo.toml"), "{paths:?}");
+        assert!(paths[0].ends_with("Cargo.toml"), "{paths:?}");
+        assert!(paths[1].ends_with("main.rs"), "{paths:?}");
+    }
+
+    /// A Cargo.toml with `[workspace]` and no `[package]` — the shape that
+    /// passes `app_autumn_web` when it hand-declares `autumn-web`.
+    const VIRTUAL_WORKSPACE_CARGO: &str = r#"[workspace]
+
+[dependencies]
+autumn-web = "0.7.0"
+"#;
+
+    /// `plugin add` must not plan a manifest edit at a virtual workspace root:
+    /// there is no `[package]` for the `[dependencies]` section to belong to
+    /// (issue #2381 item 3).
+    #[test]
+    fn plan_add_rejects_a_virtual_workspace_root() {
+        let tmp = fake_project(SCAFFOLD_MAIN, VIRTUAL_WORKSPACE_CARGO);
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::NoPackageTable),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+            VIRTUAL_WORKSPACE_CARGO,
+            "a refused install must leave the manifest byte-identical"
+        );
+    }
+
+    /// The community path plans a manifest edit without ever reading
+    /// `src/main.rs`, so it needs the same guard (issue #2381 item 3).
+    #[test]
+    fn plan_add_community_rejects_a_virtual_workspace_root() {
+        let tmp = fake_project(SCAFFOLD_MAIN, VIRTUAL_WORKSPACE_CARGO);
+        let err = plan_add_community(tmp.path(), "autumn-plugin-x", "=0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::NoPackageTable),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+            VIRTUAL_WORKSPACE_CARGO,
+            "a refused install must leave the manifest byte-identical"
+        );
+    }
+
+    /// A real virtual manifest declares `autumn-web` only under
+    /// `[workspace.dependencies]`, so `app_autumn_web` alone would report
+    /// `NoAutumnWeb`: the package-table guard must run first.
+    #[test]
+    fn both_add_paths_name_a_real_virtual_workspace_root() {
+        const REAL_VIRTUAL_CARGO: &str = "[workspace]\nmembers = [\"app\"]\n\n\
+                                          [workspace.dependencies]\nautumn-web = \"0.7.0\"\n";
+        let tmp = fake_project(SCAFFOLD_MAIN, REAL_VIRTUAL_CARGO);
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::NoPackageTable),
+            "plan_add: {err}"
+        );
+        let err = plan_add_community(tmp.path(), "autumn-plugin-x", "=0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::NoPackageTable),
+            "plan_add_community: {err}"
+        );
+    }
+
+    /// `[project]` is Cargo's legacy alias for `[package]`: such a manifest
+    /// owns its dependencies and must not be refused as a virtual workspace.
+    #[test]
+    fn a_legacy_project_table_counts_as_a_package() {
+        let tmp = fake_project(
+            SCAFFOLD_MAIN,
+            "[project]\nname = \"demo\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n",
+        );
+        assert!(refuse_virtual_workspace(tmp.path()).is_ok());
+    }
+
+    /// The depth is measured at the occurrence that passed the identifier
+    /// check, not at an earlier `async fn main_loop` on the same line.
+    #[test]
+    fn insert_mount_measures_depth_at_the_validated_main() {
+        let source = "use autumn_web::prelude::*;\n\nasync fn main_loop() {} impl Server { async fn main() {\n        let app = autumn_web::app()\n            .routes(routes![]);\n    }\n}\n\n#[autumn_web::main]\nasync fn main() {\n    let app = autumn_web::app()\n        .routes(routes![index]);\n\n    app.run().await;\n}\n";
+        let updated = insert_mount(source, admin().mount).expect("anchor on the real main");
+        let real_main_at = updated.find("#[autumn_web::main]").expect("real main kept");
+        let mount_at = updated
+            .find(admin().mount.trim_end_matches('\n'))
+            .expect("mount spliced");
+        assert!(mount_at > real_main_at, "mounted into the impl helper");
+    }
+
+    /// A malformed package manifest is a parse error, not a virtual
+    /// workspace: the diagnostic must not send the author to a member crate.
+    #[test]
+    fn a_malformed_manifest_is_reported_as_a_parse_error() {
+        let tmp = fake_project(
+            SCAFFOLD_MAIN,
+            "[package]\nname = \"demo\"\n\n[dependencies]\nautumn-web = { version = \"0.7.0\"\n",
+        );
+        let err = plan_add(tmp.path(), admin(), "0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::ManifestParse { .. }),
+            "plan_add: {err}"
+        );
+        let err = plan_add_community(tmp.path(), "autumn-plugin-x", "=0.7.0").unwrap_err();
+        assert!(
+            matches!(err, PluginError::ManifestParse { .. }),
+            "plan_add_community: {err}"
+        );
     }
 
     #[test]

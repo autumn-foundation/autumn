@@ -258,6 +258,7 @@ impl<'a> Analyzer<'a> {
                     self.bind_pattern(case, Bound::Other);
                 }
             }
+            syn::Pat::Guard(p) => self.bind_pattern(&p.pat, Bound::Other),
             _ => {}
         }
     }
@@ -314,10 +315,9 @@ impl<'a> Analyzer<'a> {
         // Drop the associated function to leave the type's own path.
         let mut owner = path.path.clone();
         owner.segments.pop();
-        if let Some(pair) = owner.segments.pop() {
-            owner.segments.push(pair.into_value());
-        }
+        owner.segments.pop_punct();
         self.client_index(&syn::Type::Path(syn::TypePath {
+            attrs: Vec::new(),
             qself: None,
             path: owner,
         }))
@@ -494,8 +494,9 @@ impl Visit<'_> for Analyzer<'_> {
 
     fn visit_arm(&mut self, arm: &syn::Arm) {
         self.scopes.push(BTreeMap::new());
-        self.bind_pattern(&arm.pat, Bound::Other);
-        if let Some((_, guard)) = &arm.guard {
+        let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
+        self.bind_pattern(pat, Bound::Other);
+        if let Some(guard) = guard {
             self.visit_expr(guard);
         }
         self.visit_expr(&arm.body);
