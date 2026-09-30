@@ -1463,6 +1463,56 @@ use autumn_web::sim::Sim;
 **Automation:** `manual` — delete the import; nothing else can have used the
 types.
 
+### Commentable: `author_name` is checked against the author model (#2288)
+
+**Why:** `author_name` names the column a comment's display name is read
+from. The macro only checked that it was an identifier, so a typo
+(`author_name = usernme`) or a non-text column compiled and then failed on
+the first request with an undefined-column or decoding error. With
+`by = <AuthorModel>`, the macro now reads the same-named field on the author
+struct and requires it to be a `String` or `Option<String>`.
+
+A correct declaration can now fail to compile in one case: the author struct
+renames the display-name column, so the field is not spelled like the column.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = users)]
+pub struct User {
+    pub id: i64,
+    #[diesel(column_name = screen_name)]
+    pub username: String,
+}
+
+#[model]
+#[commentable(by = User, author_name = screen_name)]
+pub struct Post { /* … */ }
+```
+
+This compiled and worked.
+
+**After (`{X.Z}`):**
+
+```text
+error[E0609]: no field `screen_name` on type `&User`
+```
+
+Keep `author_name` on the column, and name the field with
+`author_name_field`:
+
+```rust
+#[commentable(by = User, author_name = screen_name, author_name_field = username)]
+```
+
+Nothing else changes: the generated SQL still selects `screen_name`. A
+declaration whose field and column share a name, or that has no `by`, needs
+no edit. See [Commentable](../guide/commentable.md#options).
+
+**Automation:** `manual` — the field name lives on a struct the macro cannot
+see from the commented model.
+
 ## Plugin authors
 
 This release **adds** plugin-facing surface and removes none, so no plugin that

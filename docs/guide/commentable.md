@@ -323,6 +323,7 @@ name from.
 #[commentable(
     by = User,                    // the author model; also supplies `author_table`
     author_name = username,       // display-name column; omitted → `user #id`
+    author_name_field = username, // the author struct's field, if renamed from the column
     author_table = users,         // override the table derived from `by`
     author_pk = id,
     type_name = "Post",           // discriminator; defaults to the Rust type name
@@ -346,6 +347,17 @@ Two of these are worth a second look:
 - **`author_name`** is deliberately unset by default. The framework will not
   guess a column, and a scaffolded `User` carries an `email` — defaulting a
   *public* display name to it would leak addresses into every rendered thread.
+- **`author_name`** names the *column* the SQL selects, and with `by` the
+  macro checks it at compile time by reading the same-named *field* on the
+  author struct, which must be a `String` or `Option<String>`. A typo is a
+  compile error, not a failed first request. When the author struct renames
+  the column (`#[diesel(column_name = screen_name)] pub username: String`),
+  the field and column are spelled differently: keep `author_name` on the
+  column and name the field with `author_name_field`:
+
+  ```rust,ignore
+  #[commentable(by = User, author_name = screen_name, author_name_field = username)]
+  ```
 
 ## Multi-tenancy
 

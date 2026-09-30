@@ -69,6 +69,11 @@ pub struct CommentableSpec {
     /// The author display-name column. `None` (the default) resolves no name —
     /// the framework refuses to guess a column.
     pub author_name_column: Option<String>,
+    /// The author model's Rust field that holds the display name, when it is
+    /// not spelled like the column — a `#[diesel(column_name = …)]` rename.
+    /// `None` (the default) reads the field named by `author_name`. Only the
+    /// compile-time guard reads it; the generated SQL always uses the column.
+    pub author_name_field: Option<String>,
     /// Maximum nesting depth; a top-level comment is depth `0`.
     pub max_depth: u32,
     /// Cap on one comment body, in bytes.
@@ -131,6 +136,7 @@ const KNOWN_KEYS: &[&str] = &[
     "author_table",
     "author_pk",
     "author_name",
+    "author_name_field",
     "max_depth",
     "max_body",
 ];
@@ -158,10 +164,11 @@ struct KeyValue {
 ///               created_at_column = created_at, soft_delete = true,
 ///               counter_cache = comment_count | false,
 ///               author_table = users, author_pk = id, author_name = username,
+///               author_name_field = username,
 ///               max_depth = 5, max_body = 10000)]
 /// ```
-// Seventeen independent keys, each with its own parse + validation arm, plus
-// the convention-derived defaults for the sixteen optional ones.
+// Eighteen independent keys, each with its own parse + validation arm, plus
+// the convention-derived defaults for the seventeen optional ones.
 #[allow(clippy::too_many_lines)]
 pub fn parse_commentable_attr(
     attr: &syn::Attribute,
@@ -316,6 +323,34 @@ pub fn parse_commentable_attr(
             Some(parsed.value.clone())
         }
     };
+    // `author_name` is the physical column the SQL selects; the compile-time
+    // guard reads the author model's *field*. The two differ when the model
+    // renames the column with `#[diesel(column_name = …)]`, so the field can
+    // be named separately. It means nothing without a column to guard, and
+    // without `by` there is no author struct to read it on.
+    let author_name_field = match pairs.get("author_name_field") {
+        None => None,
+        Some(parsed) => {
+            let key_ident = syn::Ident::new("author_name_field", parsed.span);
+            check_ident_value(&key_ident, &parsed.value, parsed.span)?;
+            if author_name_column.is_none() {
+                return Err(syn::Error::new(
+                    parsed.span,
+                    "`author_name_field` in `#[commentable]` names the author \
+                     model's field for the `author_name` column: add \
+                     `author_name = <column>`",
+                ));
+            }
+            if author_model.is_none() {
+                return Err(syn::Error::new(
+                    parsed.span,
+                    "`author_name_field` in `#[commentable]` names a field on \
+                     the author model: add `by = <AuthorModel>`",
+                ));
+            }
+            Some(parsed.value.clone())
+        }
+    };
     let soft_delete = match pairs.get("soft_delete") {
         None => true,
         Some(parsed) => parsed.boolean.ok_or_else(|| {
@@ -452,6 +487,7 @@ pub fn parse_commentable_attr(
         author_table: ident_value("author_table", &author_table_default)?,
         author_pk: ident_value("author_pk", "id")?,
         author_name_column,
+        author_name_field,
         max_depth,
         max_body_bytes,
         span,
@@ -660,9 +696,14 @@ pub fn emit_commentable_items(
     // do not derive. Only emitted when the author MODEL is available — an
     // explicit `author_table` with no `by` names a table the macro cannot see
     // into, so there is nothing to resolve.
+    //
+    // `author_name` is the physical column. When the author model renames it
+    // (`#[diesel(column_name = screen_name)] pub username: String`), the
+    // field is spelled differently and `author_name_field` names it.
     let author_name_guard = match (spec.author_model.as_ref(), spec.author_name_column.as_ref()) {
         (Some(author_model), Some(column)) => {
-            let author_name_ident = format_ident!("{column}");
+            let field = spec.author_name_field.as_deref().unwrap_or(column);
+            let author_name_ident = format_ident!("{field}");
             Some(quote! {
                 const _: fn(&#author_model) = |__autumn_commentable_author| {
                     fn __autumn_commentable_author_name<
@@ -1402,6 +1443,65 @@ mod tests {
             !emitted.contains("CommentAuthorName"),
             "no name guard without author_name, {emitted}"
         );
+    }
+
+    /// A `#[diesel(column_name = …)]`-renamed author field is spelled
+    /// differently from its column: the SQL keeps selecting the column, and
+    /// the guard reads the field `author_name_field` names (Codex review on
+    /// #3038). Without the key, the guard reads the column's own name.
+    #[test]
+    fn author_name_field_names_the_field_the_guard_reads() {
+        let spec = parse(&quote! {
+            (by = User, author_name = screen_name, author_name_field = username)
+        })
+        .expect("valid");
+        assert_eq!(spec.author_name_column.as_deref(), Some("screen_name"));
+        assert_eq!(spec.author_name_field.as_deref(), Some("username"));
+
+        let emitted = emit(&quote! {
+            (by = User, author_name = screen_name, author_name_field = username)
+        });
+        assert!(
+            emitted.contains("__autumn_commentable_author . username"),
+            "the guard reads the renamed field, {emitted}"
+        );
+        assert!(
+            !emitted.contains("__autumn_commentable_author . screen_name"),
+            "the guard must not read the column as a field, {emitted}"
+        );
+        assert!(
+            emitted.contains("\"screen_name\""),
+            "the SQL still selects the column, {emitted}"
+        );
+
+        let spec = parse(&quote! { (by = User, author_name = username) }).expect("valid");
+        assert_eq!(spec.author_name_field, None);
+        let emitted = emit(&quote! { (by = User, author_name = username) });
+        assert!(
+            emitted.contains("__autumn_commentable_author . username"),
+            "no override reads the column's own name, {emitted}"
+        );
+    }
+
+    /// `author_name_field` is meaningless without a column to guard, and has
+    /// no struct to read without `by`.
+    #[test]
+    fn author_name_field_needs_author_name_and_by() {
+        let message = error(&quote! { (by = User, author_name_field = username) });
+        assert!(
+            message.contains("add `author_name = <column>`"),
+            "{message}"
+        );
+
+        let message = error(&quote! {
+            (author_table = users, author_name = screen_name, author_name_field = username)
+        });
+        assert!(message.contains("add `by = <AuthorModel>`"), "{message}");
+
+        let message = error(&quote! {
+            (by = User, author_name = screen_name, author_name_field = "user name")
+        });
+        assert!(message.contains("not a valid identifier"), "{message}");
     }
 
     /// An explicit `author_table` with no `by` names a table the macro cannot

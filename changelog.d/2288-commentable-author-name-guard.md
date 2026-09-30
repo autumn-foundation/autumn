@@ -1,3 +1,14 @@
+### Breaking Changes
+
+- **`#[commentable]`:** **Breaking:** with `by = <AuthorModel>`,
+  `author_name` is now checked at compile time against the author struct's
+  field of the same name. An author struct that renames the display-name
+  column (`#[diesel(column_name = screen_name)] pub username: String`) no
+  longer compiles with `author_name = screen_name` alone: add
+  `author_name_field = username` to name the field. The SQL still selects the
+  column ([migration
+  guide](docs/migrations/next.md#commentable-author_name-is-checked-against-the-author-model-2288)).
+
 ### Fixed
 
 - **`#[commentable]`:** a typo'd `author_name` column (e.g.
@@ -10,4 +21,5 @@
   compile time and a non-text field is rejected the same way a non-`i64`
   author key already was. The guard is emitted only when `by = <Model>`
   names an author model — an explicit `author_table` with no `by` names a
-  table the macro cannot see into.
+  table the macro cannot see into. The new `author_name_field` key names the
+  author struct's field when it is renamed from its column.
