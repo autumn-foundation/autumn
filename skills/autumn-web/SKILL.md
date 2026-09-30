@@ -1385,6 +1385,34 @@ recorded as `"system"` — the `_autumn_version_history.actor` column is `NOT NU
 DEFAULT 'system'` and the generated code falls back to `VersionEntry::SYSTEM_ACTOR`
 (#1383). See `docs/guide/version-history.md`.
 
+### Authenticated `#[edge]` routes — host-resolved identity (unreleased, feature `edge`)
+
+An `#[edge]` capsule never sees cookies, session ids, signing keys or store
+credentials. The **host** resolves identity before the capsule runs and passes
+only normalized claims: `EdgeIdentity { user_id: EdgeUserId, roles: Vec<EdgeRole> }`
+(re-exported from `autumn_web::edge_support`), taken as a handler extractor.
+`EdgeIdentity` is also in `autumn_edge::prelude`. A handler taking it must
+declare `#[edge(needs(identity))]` (a build error otherwise); a request without
+host-verified claims then falls through to origin before dispatch, so no
+extractor or handler code runs.
+
+```rust
+#[get("/me")]
+#[edge(needs(identity))]
+pub async fn whoami(identity: EdgeIdentity) -> String {
+    identity.user_id().as_str().to_owned()
+}
+```
+
+Install the source with `AppBuilder::with_edge_identity_provider(provider)`.
+The first-party one is `SessionIdentityProvider::new(store, AuthSessionProjector::new("user_id"), cookie_name, signing_keys)`:
+it reuses `SessionLayer`'s cookie and signing-key verification, so it accepts
+exactly what the session middleware accepts. A custom `EdgeIdentityProvider`
+returns `Ok(Some(_))` only after authoritative verification, `Ok(None)` for a
+missing/invalid credential, and a typed error for store/network failure (also a
+fall-through). Revocation needs an authoritative store — never back it with an
+opportunistic cache. See `docs/guide/edge.md` and ADR-0005.
+
 ## OAuth2/OIDC scaffolding
 
 OAuth2/OIDC social login has shipped since the 0.5.0 line. Do not repeat the stale
