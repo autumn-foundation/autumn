@@ -228,6 +228,7 @@ pub mod seo;
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
+pub(crate) mod accept_drain;
 #[cfg(feature = "inbound-mail")]
 pub mod inbound_mail;
 pub mod inspector;
