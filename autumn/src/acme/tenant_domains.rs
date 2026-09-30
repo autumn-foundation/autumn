@@ -590,8 +590,13 @@ impl CustomDomainTask {
         )
         .await;
         for domain in self.registry.due_for_issuance(now_unix) {
-            self.issue_one(&domain.hostname, &domain.tenant, now_unix)
-                .await;
+            self.issue_one(
+                &domain.hostname,
+                &domain.tenant,
+                domain.verification_token.as_deref(),
+                now_unix,
+            )
+            .await;
         }
         // Renewal re-verifies first. A tenant who repointed or gave up their
         // domain would otherwise be renewed forever: every cycle spends an
@@ -604,8 +609,13 @@ impl CustomDomainTask {
             if !self.still_points_here(&domain, now_unix).await {
                 continue;
             }
-            self.issue_one(&domain.hostname, &domain.tenant, now_unix)
-                .await;
+            self.issue_one(
+                &domain.hostname,
+                &domain.tenant,
+                domain.verification_token.as_deref(),
+                now_unix,
+            )
+            .await;
         }
         // An active domain whose stored certificate has gone (a torn write, a
         // partial restore, a manual delete) is refused at the handshake but is
@@ -620,8 +630,13 @@ impl CustomDomainTask {
                     hostname = %domain.hostname,
                     "custom domain is active but its certificate is missing; re-ordering"
                 );
-                self.issue_one(&domain.hostname, &domain.tenant, now_unix)
-                    .await;
+                self.issue_one(
+                    &domain.hostname,
+                    &domain.tenant,
+                    domain.verification_token.as_deref(),
+                    now_unix,
+                )
+                .await;
             }
         }
     }
@@ -704,6 +719,7 @@ impl CustomDomainTask {
         self.record_failure(
             hostname,
             &domain.tenant,
+            domain.verification_token.as_deref(),
             now_unix,
             format!(
                 "renewal skipped: {reason}. The certificate will expire unless the record is \
@@ -809,7 +825,7 @@ impl CustomDomainTask {
     }
 
     /// Order (or renew) one hostname's certificate, budget permitting.
-    async fn issue_one(&self, hostname: &str, tenant: &str, now_unix: i64) {
+    async fn issue_one(&self, hostname: &str, tenant: &str, token: Option<&str>, now_unix: i64) {
         // A distributed scheduler backend was configured but this process fell
         // back to a per-process coordinator. Ordering now would give every
         // replica its own lease, so all of them would order the SAME
@@ -818,6 +834,7 @@ impl CustomDomainTask {
             self.record_failure(
                 hostname,
                 tenant,
+                token,
                 now_unix,
                 "refusing to order: a distributed scheduler backend is configured but its \
                  coordinator is unavailable in this process, so a lease would not exclude the \
@@ -834,7 +851,7 @@ impl CustomDomainTask {
         let decision = self.limiter.check(hostname, now_unix);
         if !decision.is_allowed() {
             if let Some(reason) = decision.reason() {
-                self.record_failure(hostname, tenant, now_unix, reason, false)
+                self.record_failure(hostname, tenant, token, now_unix, reason, false)
                     .await;
             }
             return;
@@ -860,6 +877,7 @@ impl CustomDomainTask {
                 self.record_failure(
                     hostname,
                     tenant,
+                    token,
                     now_unix,
                     format!("leader election failed: {e}"),
                     true,
@@ -898,6 +916,7 @@ impl CustomDomainTask {
                 self.record_failure(
                     hostname,
                     tenant,
+                    token,
                     now_unix,
                     format!("refusing to order: the issuing state could not be persisted ({e})"),
                     true,
@@ -920,14 +939,14 @@ impl CustomDomainTask {
         let issued = match outcome {
             Ok(issued) => issued,
             Err(e) => {
-                self.record_failure(hostname, tenant, now_unix, e, true)
+                self.record_failure(hostname, tenant, token, now_unix, e, true)
                     .await;
                 return;
             }
         };
 
         if let Err(e) = self.install(hostname, tenant, &issued, now_unix).await {
-            self.record_failure(hostname, tenant, now_unix, e, true)
+            self.record_failure(hostname, tenant, token, now_unix, e, true)
                 .await;
         }
     }
@@ -1049,10 +1068,15 @@ impl CustomDomainTask {
 
     /// Record a failure on one domain, alerting the operator when it is an
     /// issuance failure rather than a deferral the budget already explains.
+    ///
+    /// `token` is the registration's ownership token as read when the work
+    /// started: the failure is recorded only while the stored record is still
+    /// that registration.
     async fn record_failure(
         &self,
         hostname: &str,
         tenant: &str,
+        token: Option<&str>,
         now_unix: i64,
         reason: impl Into<String>,
         alert: bool,
@@ -1061,17 +1085,24 @@ impl CustomDomainTask {
         let failures = self
             .registry
             .get(hostname)
-            .filter(|d| d.tenant == tenant)
+            .filter(|d| d.tenant == tenant && d.verification_token.as_deref() == token)
             .map_or(0, |d| d.consecutive_failures)
             .saturating_add(1);
         let backoff = i64::try_from(self.limiter.backoff_for(failures)).unwrap_or(i64::MAX);
-        // Only while this tenant still owns the hostname. An order runs across
-        // several awaits: if the domain was offboarded and re-registered
-        // meanwhile, charging the failure here would put one tenant's reason
-        // and backoff on the next tenant's record.
+        // Only while this registration still holds the hostname. An order runs
+        // across several awaits: if the domain was offboarded and re-registered
+        // meanwhile — by another tenant or the same one — charging the failure
+        // here would put a dead order's reason and backoff on the successor.
         match self
             .registry
-            .record_failure_for(hostname, tenant, now_unix, reason.clone(), backoff)
+            .record_failure_for_registration(
+                hostname,
+                tenant,
+                token,
+                now_unix,
+                reason.clone(),
+                backoff,
+            )
             .await
         {
             Ok(true) => {}
@@ -1079,8 +1110,8 @@ impl CustomDomainTask {
                 tracing::debug!(
                     hostname,
                     tenant,
-                    "discarded a custom-domain failure: the hostname no longer belongs to this \
-                     tenant"
+                    "discarded a custom-domain failure: the hostname changed hands or was \
+                     re-registered while the order was in flight"
                 );
                 return;
             }

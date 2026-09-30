@@ -1360,21 +1360,8 @@ impl CustomDomainRegistry {
     ///
     /// Propagates the store's write error.
     pub async fn record_verified(&self, hostname: &str, now_unix: i64) -> io::Result<()> {
-        self.mutate(hostname, |d| {
-            // A domain that is already serving stays serving: a re-verification
-            // must never demote a live certificate back to `Verified` and
-            // trigger a fresh order.
-            if d.status == DomainStatus::PendingDns {
-                d.status = DomainStatus::Verified;
-            }
-            if d.verified_at_unix.is_none() {
-                d.verified_at_unix = Some(now_unix);
-            }
-            d.failure_reason = None;
-            d.consecutive_failures = 0;
-            d.next_attempt_unix = None;
-        })
-        .await
+        self.mutate(hostname, |d| apply_verified_mutation(d, now_unix))
+            .await
     }
 
     /// [`record_verified`](Self::record_verified), but only while the stored
@@ -1400,17 +1387,7 @@ impl CustomDomainRegistry {
         self.mutate_if(
             hostname,
             |d| d.tenant == tenant && d.verification_token.as_deref() == Some(token),
-            |d| {
-                if d.status == DomainStatus::PendingDns {
-                    d.status = DomainStatus::Verified;
-                }
-                if d.verified_at_unix.is_none() {
-                    d.verified_at_unix = Some(now_unix);
-                }
-                d.failure_reason = None;
-                d.consecutive_failures = 0;
-                d.next_attempt_unix = None;
-            },
+            |d| apply_verified_mutation(d, now_unix),
         )
         .await
     }
@@ -1564,13 +1541,21 @@ impl CustomDomainRegistry {
     }
 
     /// [`record_failure`](Self::record_failure), but only while `tenant` still
-    /// owns the hostname. Returns whether it applied.
+    /// owns the hostname AND the record is the generation the order ran
+    /// against. Returns whether it applied.
     ///
     /// An order runs across several `.await`s. If the owner is offboarded and
     /// the hostname re-registered in that window, an unconditional failure
     /// would stamp one tenant's error and backoff onto the NEW tenant's record:
     /// a domain that has done nothing wrong would show someone else's reason
     /// and wait out a backoff it did not earn.
+    ///
+    /// The owner alone is not enough: a tenant that offboards and re-registers
+    /// the SAME hostname while its previous order is in flight gets a fresh
+    /// `PendingDns` record, and an order never flies against `PendingDns` —
+    /// so a failure arriving for it is stale by construction. Discarding it
+    /// keeps the replacement's `failure_reason`, backoff, and alert silence
+    /// clean.
     ///
     /// # Errors
     ///
@@ -1585,7 +1570,7 @@ impl CustomDomainRegistry {
     ) -> io::Result<bool> {
         self.fail(
             hostname,
-            |d| d.tenant == tenant,
+            |d| d.tenant == tenant && Self::is_orderable_state(d.status),
             now_unix,
             reason,
             backoff_secs,
@@ -1593,6 +1578,48 @@ impl CustomDomainRegistry {
         .await
     }
 
+    /// [`record_failure_for`](Self::record_failure_for), but only while the
+    /// stored record is still the registration the order ran against: same
+    /// `tenant`, same ownership `token`. Returns whether it applied.
+    ///
+    /// Owner and status alone cannot tell two registrations apart. A tenant
+    /// that offboards and re-registers the SAME hostname while an order is in
+    /// flight gets a fresh record, and once that successor is itself
+    /// `Verified`, `Issuing` or `Active`, a late failure from the dead order
+    /// would pass both checks and charge the successor its reason, backoff and
+    /// alert — or reset an in-flight `Issuing` back to `Verified`. Each
+    /// registration mints its own token, so comparing it pins the generation.
+    /// `None` matches only a grandfathered record that has no token either.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_failure_for_registration(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+        reason: impl Into<String>,
+        backoff_secs: i64,
+    ) -> io::Result<bool> {
+        self.fail(
+            hostname,
+            |d| {
+                d.tenant == tenant
+                    && d.verification_token.as_deref() == token
+                    && Self::is_orderable_state(d.status)
+            },
+            now_unix,
+            reason,
+            backoff_secs,
+        )
+        .await
+    }
+
+    /// The failure-writing core of [`record_failure`](Self::record_failure)
+    /// and its guarded variants. `guard` runs inside the write lock, against the record as
+    /// it is at write time — never against a snapshot taken before an await.
     async fn fail(
         &self,
         hostname: &str,
@@ -1767,6 +1794,25 @@ impl CustomDomainRegistry {
 }
 
 // ── Issuance budget ──────────────────────────────────────────────────────
+
+/// The promotion half of [`CustomDomainRegistry::record_verified`]: shared by
+/// the unconditional variant and the registration-guarded
+/// [`CustomDomainRegistry::record_verified_for`].
+///
+/// A domain that is already serving stays serving: a re-verification must
+/// never demote a live certificate back to `Verified` and trigger a fresh
+/// order.
+fn apply_verified_mutation(d: &mut CustomDomain, now_unix: i64) {
+    if d.status == DomainStatus::PendingDns {
+        d.status = DomainStatus::Verified;
+    }
+    if d.verified_at_unix.is_none() {
+        d.verified_at_unix = Some(now_unix);
+    }
+    d.failure_reason = None;
+    d.consecutive_failures = 0;
+    d.next_attempt_unix = None;
+}
 
 /// Is a certificate expiring at `not_after_unix` inside its renew-before
 /// window at `now_unix`?
