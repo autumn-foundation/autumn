@@ -20,6 +20,11 @@ use crate::wire::WireError;
 pub enum EdgeCapability {
     /// A non-authoritative key/value read replica; see [`crate::kv::EdgeKv`].
     Kv,
+    /// Host-verified, normalized identity claims; see
+    /// [`EdgeIdentity`](crate::identity::EdgeIdentity). Unlike `kv`, this is
+    /// provided per request: it counts as provided exactly when the request
+    /// frame carries an identity, whatever the host lists.
+    Identity,
 }
 
 impl EdgeCapability {
@@ -28,6 +33,7 @@ impl EdgeCapability {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Kv => "kv",
+            Self::Identity => "identity",
         }
     }
 }
@@ -44,6 +50,7 @@ impl FromStr for EdgeCapability {
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
             "kv" => Ok(Self::Kv),
+            "identity" => Ok(Self::Identity),
             other => Err(WireError::UnknownCapability(other.to_owned())),
         }
     }

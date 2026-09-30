@@ -602,11 +602,15 @@ impl std::fmt::Display for ScrubError {
                  is what points psql at the right database. These targets are configured \
                  with a keyword-form connection string (`host=... password=...`), which \
                  cannot be printed with its password removed for certain — libpq allows \
-                 whitespace around the `=` and quoted values with escapes — so the \
-                 boundary is withheld. A script without it does not fail: it runs this \
-                 target's plan against whichever database the pasting session is already \
-                 on, which in a multi-target stream is the previous target. Configure the \
-                 target as a URI (`postgres://user@host/db`), or run without `--dry-run`.",
+                 whitespace around the `=` and quoted values with escapes — or with a \
+                 connection-string parameter this command does not recognise, which it \
+                 refuses to print rather than guess about (`password_free_conninfo` \
+                 allowlists known-non-secret keywords and strips known credentials; \
+                 anything else fails closed). A script without the boundary does not fail: \
+                 it runs this target's plan against whichever database the pasting session \
+                 is already on, which in a multi-target stream is the previous target. \
+                 Configure the target as a URI (`postgres://user@host/db`), or run without \
+                 `--dry-run`.",
                 targets.len(),
                 bullet_list(targets),
             ),
@@ -3139,6 +3143,18 @@ fn classify_and_apply(
             for (table, _) in &phases.final_pass {
                 eprintln!("  {};", emptiness_assertion(table));
             }
+            // And the sample's own postconditions, in the position
+            // `verify_sample_survived_refreshes` runs in the executed path —
+            // after every write in the block, the refreshes included, because
+            // a view's query can call a function that INSERTs into a sampled
+            // table. The dry run advertised the same "exact SQL" without
+            // this, and a pasted script committed a subset the real command
+            // rolls back. See `sample_postcondition_statements`.
+            if let Some(sampling) = sampling {
+                for (statement, comment) in sample_postcondition_statements(sampling) {
+                    eprintln!("  {statement}; -- {comment}");
+                }
+            }
             // The last statement inside the transaction, and the whole reason
             // the compaction below can tell a scrubbed target from an aborted
             // one. In an aborted transaction this SELECT is refused like every
@@ -3421,6 +3437,134 @@ fn report_sample_sql(plan: &sample::SamplePlan, counts: Option<&BTreeMap<String,
             integrity_assertion(&statement)
         );
     }
+    // Capture every sampled table's post-sample row count where the executor
+    // captures its own `after` counts — after the deletes and the integrity
+    // checks, and before the rewrites, purges and refreshes that follow in the
+    // printed sequence. The printed half of `verify_sample_survived_refreshes`
+    // asserts against these after the refreshes: the subset is what must
+    // survive, and its size is data-dependent, so it is captured at paste
+    // time rather than baked at print time.
+    for statement in sample_count_capture_statements(plan) {
+        eprintln!("  {statement};");
+    }
+}
+
+/// Statements capturing every sampled table's post-sample row count.
+///
+/// The printed equivalent of the `after` snapshot in
+/// `sample::apply`'s `SettledSampleCounts`: a temporary table (`ON COMMIT
+/// DROP`, like the sample's own keep sets) holding `(table_index, n)` for
+/// every sampled table, captured exactly where the executor captures its own
+/// counts — after the deletes and the integrity checks, before everything
+/// that follows in the printed sequence.
+///
+/// A temp table rather than `\gset` variables: psql does not interpolate
+/// variables inside dollar-quoted `DO` blocks, where the assertion below
+/// reads them back — and a variable per table would need a `\if`/`\else`
+/// pair each, a new idiom for this script. One table, one index, no escaping
+/// puzzles: the counts never pass through a string literal.
+fn sample_count_capture_statements(plan: &sample::SamplePlan) -> Vec<String> {
+    if plan.tables.is_empty() {
+        return Vec::new();
+    }
+    let selects = plan
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(index, table)| {
+            format!(
+                "SELECT {index} AS table_index, (SELECT count(*) FROM {}) AS n",
+                qualified_ident(&table.table)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    vec![format!(
+        "CREATE TEMPORARY TABLE {SAMPLE_COUNTS_TABLE} ON COMMIT DROP AS {selects}"
+    )]
+}
+
+/// The temp table the printed sample captures its counts into.
+///
+/// `pg_temp` is searched first for unqualified relation names, so for the
+/// rest of the pasted transaction this table would shadow an application
+/// relation of the same name — a rewrite trigger doing an unqualified
+/// `INSERT` would write here instead, and the dry run would diverge from the
+/// executed path, which creates no such table. The suffix makes a collision
+/// implausible, and every read goes through `pg_temp.` explicitly.
+const SAMPLE_COUNTS_TABLE: &str = "autumn_scrub_sample_counts_7c3e91d4a2";
+
+/// Statements re-proving the sample's postconditions after the refreshes.
+///
+/// This is the printed half of `verify_sample_survived_refreshes`, which the
+/// executed path runs in exactly this position. The dry run advertised the
+/// same "exact SQL" without it, so a pasted script committed a subset the
+/// real command rolls back: a refresh's query can call a function whose body
+/// INSERTs — measured, a tracked `BEGIN ATOMIC` function writing into a
+/// `never_include` table left the run reporting `audit_logs: 503 -> 0 row(s)`
+/// and `✓ Scrub complete` while three rows carrying real addresses survived.
+///
+/// The counts are asserted against [`SAMPLE_COUNTS_TABLE`]
+/// (`sample_count_capture_statements`): the printer has no live values at
+/// print time, and baking the print-time source counts would assert the
+/// wrong thing — the subset is what must survive, not the source. The
+/// foreign-key half re-runs the same statements `report_sample_sql` prints: a
+/// refresh that UPDATEs in place moves no count, and the re-count misses the
+/// part of that which breaks the subset's integrity. An in-place edit that
+/// keeps every reference valid is not visible here either, and is not claimed
+/// to be — the same limit the executor documents.
+///
+/// Each pair is `(statement, comment)` so the caller can terminate the
+/// statement before the `--` comment, the way `integrity_assertion`'s callers
+/// do: a `;` after a `--` comment is inside the comment, and the statement
+/// would never terminate. The single `DO` block raises once and aborts the
+/// transaction, like every other generated assertion here. Table names appear
+/// only as quoted identifiers — nothing is escaped into a string literal;
+/// the comment carries the `comment_safe`d names for the auditor instead.
+/// Same dollar-tag rule as `integrity_assertion`: an identifier may legally
+/// contain `$`.
+fn sample_postcondition_statements(plan: &sample::SamplePlan) -> Vec<(String, String)> {
+    if plan.tables.is_empty() {
+        return Vec::new();
+    }
+    let tables = plan
+        .tables
+        .iter()
+        .map(|table| sample::comment_safe(&table.table))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mismatches = plan
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(index, table)| {
+            format!(
+                "(SELECT count(*) FROM {}) <> \
+                 (SELECT n FROM pg_temp.{SAMPLE_COUNTS_TABLE} WHERE table_index = {index})",
+                qualified_ident(&table.table)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let body = format!(
+        "BEGIN IF {mismatches} THEN \
+         RAISE EXCEPTION 'a sampled table''s row count moved during the materialized-view refreshes'; \
+         END IF; END"
+    );
+    let tag = sample::dollar_tag(&body);
+    let mut statements = vec![(
+        format!("DO {tag} {body} {tag}"),
+        format!(
+            "sampled tables ({tables}): row counts still the sampled subset after the refreshes"
+        ),
+    )];
+    for (constraint, statement) in plan.integrity_statements() {
+        statements.push((
+            integrity_assertion(&statement),
+            format!("re-verifies {constraint} after the refreshes"),
+        ));
+    }
+    statements
 }
 
 /// Report what the sample kept, per table and in total (AC #6).
@@ -4913,10 +5057,27 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
             ]
         },
         |conninfo| {
-            vec![format!(
-                "\\connect -reuse-previous=off {}",
-                quote_psql_arg(&conninfo)
-            )]
+            vec![
+                // Pin the endpoint against the PASTING session's environment.
+                // libpq resolves `PGHOSTADDR` and `PGSERVICE` at connect time,
+                // so a script generated with them unset and pasted where they
+                // are set reaches a different server than the reconnect proof
+                // below asserts — while psql still reports the conninfo's own
+                // host as `:HOST`, so the proof cannot catch it. The
+                // generation-time guard (`endpoint_can_come_from_elsewhere`)
+                // refuses targets whose environment already sets them; this
+                // covers the other half, the session that pastes the script.
+                // `\setenv` with no value unsets the variable. Unsetting is
+                // safe for every printed target: one naming `service=` or
+                // `hostaddr` in its conninfo is refused before printing, so no
+                // printed `\connect` can depend on either variable.
+                "\\setenv PGHOSTADDR".to_owned(),
+                "\\setenv PGSERVICE".to_owned(),
+                format!(
+                    "\\connect -reuse-previous=off {}",
+                    quote_psql_arg(&conninfo)
+                ),
+            ]
         },
     )
 }
@@ -5321,15 +5482,86 @@ fn post_commit_fence(endpoint: &ServerEndpoint) -> Vec<String> {
     ]
 }
 
-/// Connection-string keywords whose value is a credential.
+/// Connection-string keywords whose value is a credential, stripped before
+/// printing.
 ///
 /// A URI carries these two ways — `postgres://user:secret@host/db` and
 /// `postgres://host/db?password=secret` — and the query form wins where both
 /// appear, which `pg::sanitize_prefers_query_user_password_dbname_over_url_structure`
 /// pins. Clearing only the userinfo therefore prints the effective password.
-const SECRET_KEYWORDS: [&str; 2] = ["password", "sslpassword"];
+///
+/// `oauth_client_secret` (Postgres 18) authenticates the same way a password
+/// does, and the old two-keyword denylist printed it verbatim into `--dry-run`
+/// output — the output that exists to be pasted and shared.
+const SECRET_KEYWORDS: [&str; 3] = ["password", "sslpassword", "oauth_client_secret"];
 
-/// `url` with every password removed, or `None` if that cannot be guaranteed.
+/// Connection-string keywords known to carry no credential.
+///
+/// An allowlist, not a denylist: this function's contract is credential-free
+/// output, and a denylist fails open the day a Postgres release adds a
+/// parameter nobody here has heard of — which is exactly how
+/// `oauth_client_secret` arrived above. A keyword on neither list makes the
+/// whole conninfo unprintable: the dry run refuses the target
+/// (`UnprintableTarget`) rather than guessing about a parameter it cannot
+/// vouch for. Dropping the unknown keyword instead would be the worse
+/// failure — dropping `hostaddr` reconnects somewhere else, and dropping a
+/// future credential parameter prints a conninfo that cannot do what the run
+/// did.
+///
+/// Compared without case, because a URI query key is not normalised for us.
+/// `passfile`, `sslcert` and friends name files, not secrets — printing the
+/// path does not print the credential — so they stay printable.
+const PRINTABLE_KEYWORDS: [&str; 47] = [
+    "application_name",
+    "channel_binding",
+    "client_encoding",
+    "connect_timeout",
+    "dbname",
+    "fallback_application_name",
+    "gssdelegation",
+    "gssencmode",
+    "gsslib",
+    "host",
+    "hostaddr",
+    "keepalives",
+    "keepalives_count",
+    "keepalives_idle",
+    "keepalives_interval",
+    "krbsrvname",
+    "load_balance_hosts",
+    "max_protocol_version",
+    "min_protocol_version",
+    "oauth_client_id",
+    "oauth_discovery_url",
+    "oauth_issuer",
+    "oauth_scope",
+    "options",
+    "passfile",
+    "port",
+    "replication",
+    "require_auth",
+    "requirepeer",
+    "requiressl",
+    "service",
+    "ssl_max_protocol_version",
+    "ssl_min_protocol_version",
+    "sslcert",
+    "sslcertmode",
+    "sslcompression",
+    "sslcrl",
+    "sslcrldir",
+    "sslkey",
+    "sslkeylogfile",
+    "sslmode",
+    "sslnegotiation",
+    "sslrootcert",
+    "sslsni",
+    "target_session_attrs",
+    "tcp_user_timeout",
+    "user",
+];
+
+/// `url` with every credential removed, or `None` if that cannot be guaranteed.
 ///
 /// Only the URI form is handled. Keyword form (`host=db password = secret`)
 /// looks tokenizable and is not: `libpq` allows whitespace around the `=`, and
@@ -5338,6 +5570,12 @@ const SECRET_KEYWORDS: [&str; 2] = ["password", "sslpassword"];
 /// quoted value, once for a spaced `=`. Rather than reach for a third
 /// tokenizer, that form is declined outright, which makes the promise above
 /// true by construction instead of by enumerating the ways it can be written.
+///
+/// The query half is an allowlist (`PRINTABLE_KEYWORDS`), not a denylist: any
+/// keyword that is neither a stripped credential nor known-non-secret refuses
+/// the whole conninfo, so a parameter a future Postgres release invents —
+/// the way 18's `oauth_client_secret` arrived — cannot slip a credential into
+/// printed output.
 fn password_free_conninfo(url: &str) -> Option<String> {
     let mut parsed = url::Url::parse(url).ok()?;
     // `set_password` returns Err only for a URL that cannot have one
@@ -5357,11 +5595,24 @@ fn password_free_conninfo(url: &str) -> Option<String> {
     // which is the failure mode the target guard exists for. `pg.rs` already
     // holds both halves of the libpq grammar, with the reasoning; this uses
     // them rather than keeping a second opinion about encoding here.
-    let kept: Vec<(String, String)> =
-        crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or(""))
-            .into_iter()
-            .filter(|(key, _)| !is_secret_keyword(key))
-            .collect();
+    let pairs = crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or(""));
+    // Fail closed on a keyword on neither list: this is the allowlist half —
+    // a parameter this code has never heard of refuses the whole conninfo
+    // rather than being printed. Dropping it instead would be the worse
+    // failure: dropping `hostaddr` reconnects somewhere else, and dropping a
+    // future credential parameter prints a conninfo that cannot do what the
+    // run did. The dry run refuses such a target up front
+    // (`UnprintableTarget`).
+    if pairs
+        .iter()
+        .any(|(key, _)| !is_secret_keyword(key) && !is_printable_keyword(key))
+    {
+        return None;
+    }
+    let kept: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(key, _)| !is_secret_keyword(key))
+        .collect();
     if kept.is_empty() {
         parsed.set_query(None);
     } else {
@@ -5387,6 +5638,14 @@ fn is_secret_keyword(key: &str) -> bool {
     SECRET_KEYWORDS
         .iter()
         .any(|secret| key.eq_ignore_ascii_case(secret))
+}
+
+/// Whether a connection-string keyword is known to carry no credential.
+/// Compared without case, like `is_secret_keyword`.
+fn is_printable_keyword(key: &str) -> bool {
+    PRINTABLE_KEYWORDS
+        .iter()
+        .any(|known| key.eq_ignore_ascii_case(known))
 }
 
 /// One `psql` meta-command argument, double-quoted with backslash escapes —
@@ -6391,13 +6650,23 @@ mod tests {
         // A bare `\\connect dbname` inherits host, port and user, so a fleet whose
         // shards share a database name on different servers would keep running
         // against the first one while looking like it had moved.
-        let line = super::psql_connect(
+        let lines = super::psql_connect(
             "control",
             "postgres://scrubby:hunter2@db1.internal:6543/app",
-        )
-        .join("\n");
+        );
+        // The boundary pins the endpoint against the PASTING session's
+        // environment first: a libpq `PGHOSTADDR` or `PGSERVICE` set where the
+        // script is pasted would otherwise reroute the `\connect` while the
+        // reconnect proof below still reports the conninfo's own host — and
+        // psql cannot see the difference.
+        assert_eq!(
+            &lines[..2],
+            &[r"\setenv PGHOSTADDR", r"\setenv PGSERVICE"],
+            "the boundary must clear libpq's environment-routed endpoint knobs first: {lines:?}"
+        );
+        let line = lines.join("\n");
         assert!(
-            line.starts_with(r#"\connect -reuse-previous=off ""#),
+            lines[2].starts_with(r#"\connect -reuse-previous=off ""#),
             "the boundary must inherit nothing from the previous connection: {line}"
         );
         assert!(
@@ -6512,6 +6781,266 @@ mod tests {
             both.contains("application_name=x"),
             "and every non-secret parameter must stay: {both}"
         );
+    }
+
+    /// Postgres 18's `oauth_client_secret` authenticates like a password,
+    /// and the old two-keyword denylist printed it verbatim into `--dry-run`
+    /// output — the output that exists to be pasted and shared.
+    #[test]
+    fn oauth_client_secret_is_stripped_not_printed() {
+        let printed = super::psql_connect(
+            "control",
+            "postgres://u@db/app?oauth_client_secret=s3cr3t&oauth_issuer=https%3A%2F%2Fidp.example",
+        )
+        .join("\n");
+        assert!(
+            printed.contains("\\connect"),
+            "the target must stay printable: {printed}"
+        );
+        assert!(
+            !printed.contains("s3cr3t"),
+            "the OAuth client secret must never reach the printed script: {printed}"
+        );
+        assert!(
+            printed.contains("oauth_issuer="),
+            "the non-secret OAuth parameters must survive: {printed}"
+        );
+        // The keyword match is case-insensitive, like libpq's.
+        let upper = super::password_free_conninfo("postgres://u@db/app?OAUTH_CLIENT_SECRET=s3cr3t")
+            .expect("a URI must stay printable");
+        assert!(
+            !upper.contains("s3cr3t"),
+            "OAUTH_CLIENT_SECRET must strip like oauth_client_secret: {upper}"
+        );
+    }
+
+    /// A connection-string parameter this command has never heard of refuses
+    /// the target instead of being printed or dropped: dropping `hostaddr`
+    /// would reconnect somewhere else, and printing a future credential
+    /// parameter would repeat the `oauth_client_secret` disclosure above. A
+    /// denylist cannot know the next Postgres release; the allowlist fails
+    /// closed.
+    #[test]
+    fn an_unknown_keyword_refuses_the_target() {
+        assert!(
+            super::password_free_conninfo("postgres://u@db/app?widgets=1").is_none(),
+            "an unrecognised keyword must make the conninfo unprintable"
+        );
+        let refused = super::psql_connect("control", "postgres://u@db/app?widgets=1").join("\n");
+        assert!(
+            !refused.contains("\\connect"),
+            "and the boundary must not claim to move the session: {refused}"
+        );
+        assert!(
+            refused.contains("\\quit"),
+            "a boundary that cannot be printed must halt psql: {refused}"
+        );
+    }
+
+    /// Supported non-secret libpq options (`sslcertmode`, `sslsni`, 18's
+    /// protocol-version bounds and `oauth_client_id`) print, so a target that
+    /// uses them still dry-runs; the SCRAM key parameters are credentials
+    /// and stay unlisted, so they still refuse the target.
+    #[test]
+    fn supported_non_secret_libpq_options_print() {
+        let url = "postgres://u@db/app?sslcertmode=allow&sslsni=1&min_protocol_version=3.0\
+                   &max_protocol_version=latest&oauth_client_id=cli";
+        let conninfo =
+            super::password_free_conninfo(url).expect("supported non-secret options must print");
+        for key in [
+            "sslcertmode",
+            "sslsni",
+            "min_protocol_version",
+            "max_protocol_version",
+            "oauth_client_id",
+        ] {
+            assert!(conninfo.contains(key), "{key} must be kept: {conninfo}");
+        }
+        assert!(
+            super::password_free_conninfo("postgres://u@db/app?scram_client_key=AAAA").is_none(),
+            "a SCRAM key is a credential, not a printable option"
+        );
+    }
+
+    /// The allowlist must not become a refusal list for ordinary
+    /// connections: every keyword below is a real libpq parameter that
+    /// carries no credential, and a target using them must stay printable.
+    #[test]
+    fn the_allowlist_keeps_ordinary_parameters() {
+        let printed = super::password_free_conninfo(
+            "postgres://u@db/app?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem&connect_timeout=10&target_session_attrs=read-write&application_name=autumn-scrub&hostaddr=10.0.0.5&keepalives_idle=60&tcp_user_timeout=5000&passfile=%2Frun%2Fsecrets%2Fpgpass&options=-c%20search_path%3Dapp",
+        )
+        .expect("ordinary libpq parameters must stay printable");
+        for keyword in [
+            "sslmode=",
+            "sslrootcert=",
+            "connect_timeout=",
+            "target_session_attrs=",
+            "application_name=",
+            "hostaddr=",
+            "keepalives_idle=",
+            "tcp_user_timeout=",
+            "passfile=",
+            "options=",
+        ] {
+            assert!(
+                printed.contains(keyword),
+                "a known-non-secret parameter must survive: {printed}"
+            );
+        }
+    }
+
+    /// URI query keys are not normalised for us, so both lists compare
+    /// without case — the way libpq treats them.
+    #[test]
+    fn keyword_matching_is_case_insensitive() {
+        let printed = super::password_free_conninfo(
+            "postgres://u@db/app?PASSWORD=s3cr3t&HOST=db.internal&AppLICATION_Name=x",
+        )
+        .expect("a URI must stay printable");
+        assert!(
+            !printed.contains("s3cr3t"),
+            "PASSWORD must strip like password: {printed}"
+        );
+        assert!(
+            printed.contains("HOST=db.internal"),
+            "HOST must survive like host: {printed}"
+        );
+        assert!(
+            printed.contains("AppLICATION_Name=x"),
+            "the key keeps its own spelling: {printed}"
+        );
+    }
+
+    /// The printed sample re-proves its postconditions after the refreshes,
+    /// the way `verify_sample_survived_refreshes` does in the executed path:
+    /// the counts are captured where the executor takes its own `after`
+    /// snapshot, and asserted against after every write in the block.
+    #[test]
+    fn the_printed_sample_reproves_its_postconditions_after_refresh() {
+        use super::sample::{
+            ForeignKeyConstraint, SampleAmount, SampleInputs, SampleRules, SampleSpec, build_plan,
+        };
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let tables = vec![
+            ("users".to_owned(), vec!["id".to_owned()]),
+            ("orders".to_owned(), vec!["id".to_owned()]),
+        ];
+        let keys = vec![ForeignKeyConstraint {
+            name: "orders_user_fk".to_owned(),
+            child_table: "orders".to_owned(),
+            child_columns: vec!["user_id".to_owned()],
+            parent_table: "users".to_owned(),
+            parent_columns: vec!["id".to_owned()],
+            match_full: false,
+        }];
+        let roots = vec![SampleSpec {
+            table: "users".to_owned(),
+            amount: SampleAmount::Count(10),
+        }];
+        let rules = SampleRules::default();
+        let plan = build_plan(&SampleInputs {
+            roots: &roots,
+            seed: 7,
+            rules: &rules,
+            tables: &tables,
+            foreign_keys: &keys,
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .expect("the fixture plan must build");
+
+        // The capture: one temp table holding every sampled table's
+        // post-sample count — the printed half of the executor's `after`
+        // snapshot, taken in the same position.
+        let capture = super::sample_count_capture_statements(&plan);
+        assert_eq!(capture.len(), 1, "one capture statement: {capture:?}");
+        let capture = &capture[0];
+        assert!(
+            capture.starts_with(&format!(
+                "CREATE TEMPORARY TABLE {} ON COMMIT DROP AS ",
+                super::SAMPLE_COUNTS_TABLE
+            )),
+            "the counts must live in a temp table, not psql variables — psql does not \
+             interpolate variables inside dollar-quoted DO blocks: {capture}"
+        );
+        for table in &plan.tables {
+            assert!(
+                capture.contains(&format!(
+                    "(SELECT count(*) FROM {})",
+                    super::qualified_ident(&table.table)
+                )),
+                "every sampled table must be captured: {capture}"
+            );
+        }
+
+        // The assertion: one `DO` block comparing live counts against the
+        // capture, then the same FK statements the sample printed — re-run,
+        // not re-derived.
+        let postconditions = super::sample_postcondition_statements(&plan);
+        let integrity: Vec<String> = plan
+            .integrity_statements()
+            .iter()
+            .map(|(_, statement)| super::integrity_assertion(statement))
+            .collect();
+        assert_eq!(
+            postconditions.len(),
+            1 + integrity.len(),
+            "one count check plus the same FK statements the sample printed: {postconditions:?}"
+        );
+        let (block, comment) = &postconditions[0];
+        assert!(
+            block.contains("RAISE EXCEPTION")
+                && block.contains(&format!("pg_temp.{}", super::SAMPLE_COUNTS_TABLE)),
+            "the count check must abort the transaction on mismatch, reading the captured \
+             counts rather than print-time values: {block}"
+        );
+        for table in &plan.tables {
+            assert!(
+                block.contains(&super::qualified_ident(&table.table)),
+                "every sampled table must be re-counted: {block}"
+            );
+        }
+        assert!(
+            comment.contains("after the refreshes"),
+            "the comment must say when it runs: {comment}"
+        );
+        for (index, expected) in integrity.iter().enumerate() {
+            let (statement, comment) = &postconditions[index + 1];
+            assert_eq!(
+                statement, expected,
+                "the FK half must re-run the printed statements, not new ones"
+            );
+            assert!(
+                comment.contains("after the refreshes"),
+                "and say so: {comment}"
+            );
+        }
+    }
+
+    /// An unsampled target emits nothing: no capture, no assertions.
+    #[test]
+    fn an_unsampled_target_prints_no_postconditions() {
+        use super::sample::{SampleInputs, SampleRules, build_plan};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let rules = SampleRules::default();
+        let empty = build_plan(&SampleInputs {
+            roots: &[],
+            seed: 7,
+            rules: &rules,
+            tables: &[],
+            foreign_keys: &[],
+            framework_tables: &BTreeSet::new(),
+            purged: &BTreeSet::new(),
+            partitions: &BTreeMap::new(),
+        })
+        .expect("an empty plan must build");
+        assert!(empty.tables.is_empty());
+        assert!(super::sample_count_capture_statements(&empty).is_empty());
+        assert!(super::sample_postcondition_statements(&empty).is_empty());
     }
 
     #[test]

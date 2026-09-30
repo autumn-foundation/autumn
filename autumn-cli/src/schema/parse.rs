@@ -682,6 +682,17 @@ fn build_table(
         let is_reference = raw.attrs.reference != ReferenceSpec::None;
         let column_ty = if is_reference {
             Some(ColumnType::Int64)
+        } else if raw.attrs.is_translatable
+            && ColumnType::rust_type_leaf(&raw.rust_type) == "Translated"
+        {
+            // #2292: the `#[translatable]` MARKER is what makes a
+            // `Translated`-typed field a managed `TEXT` column — not the type
+            // name. `ColumnType::from_rust_type` no longer claims the
+            // `Translated` leaf, so an unmarked look-alike
+            // (`domain::Translated`, or a bare `Translated` without the
+            // marker) falls through to the type-driven mapping below and is
+            // skipped with a diagnostic, exactly like any other unknown type.
+            Some(ColumnType::Text)
         } else {
             ColumnType::from_rust_type(&raw.rust_type)
         };
@@ -1086,6 +1097,67 @@ mod tests {
             }
         "#;
         assert_eq!(col(&parse_one(src), "title").default, None);
+    }
+
+    /// #2292: the `Translated` leaf alone does not make a managed column. An
+    /// application type that happens to share the name (`domain::Translated`)
+    /// — or even a bare `Translated` — is skipped with a diagnostic unless the
+    /// field carries the `#[translatable]` marker.
+    #[test]
+    fn unmarked_translated_lookalikes_are_skipped() {
+        for rust_type in ["domain::Translated", "Translated"] {
+            let src = format!(
+                r#"
+                #[autumn_web::model]
+                pub struct Post {{
+                    #[id]
+                    pub id: i64,
+                    pub title: {rust_type},
+                }}
+                "#
+            );
+            let parsed = parse_model_source(&src, Backend::Postgres).expect("parse");
+            let table = &parsed.tables[0];
+            assert!(
+                table.columns.iter().all(|c| c.name != "title"),
+                "`{rust_type}` without `#[translatable]` must be skipped"
+            );
+            assert!(
+                parsed.diagnostics.iter().any(|d| d.field == "title"),
+                "a diagnostic must name the skipped `{rust_type}` field"
+            );
+        }
+    }
+
+    /// #2292: the marker still wins for the real container, however the path is
+    /// spelled — including the `quote!`-introduced spacing the parser sees.
+    #[test]
+    fn marked_translated_maps_to_text_for_any_path_spelling() {
+        for rust_type in [
+            "autumn_web::i18n::Translated",
+            "crate::i18n::Translated",
+            "Translated",
+        ] {
+            let src = format!(
+                r#"
+                #[autumn_web::model]
+                pub struct Post {{
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: {rust_type},
+                }}
+                "#
+            );
+            let table = parse_one(&src);
+            let title = col(&table, "title");
+            assert_eq!(title.ty, ColumnType::Text, "`{rust_type}` storage");
+            assert_eq!(
+                title.default,
+                Some(ColumnDefault::Sql("'{}'".to_owned())),
+                "`{rust_type}` keeps the empty-container default"
+            );
+        }
     }
 
     #[test]

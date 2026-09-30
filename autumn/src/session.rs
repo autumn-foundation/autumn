@@ -675,6 +675,33 @@ pub(crate) fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String
     found_token
 }
 
+/// Resolve a session id using the canonical cookie parser and signing-key
+/// rotation rules.  Keeping this helper here prevents edge identity adapters
+/// and backend plugins from growing subtly different authentication rules.
+pub(crate) fn verified_session_id(
+    headers: &http::HeaderMap,
+    cookie_name: &str,
+    signing_keys: &crate::security::config::ResolvedSigningKeys,
+) -> Option<String> {
+    let raw = get_cookie(headers, cookie_name)?;
+    let (id, signature) = raw.split_once('.')?;
+    signing_keys
+        .verify(id.as_bytes(), signature)
+        .then(|| id.to_owned())
+}
+
+/// Apply the exact optional-signing policy used by [`SessionLayer`].
+pub(crate) fn session_id_from_headers(
+    headers: &http::HeaderMap,
+    cookie_name: &str,
+    signing_keys: Option<&crate::security::config::ResolvedSigningKeys>,
+) -> Option<String> {
+    signing_keys.map_or_else(
+        || get_cookie(headers, cookie_name),
+        |keys| verified_session_id(headers, cookie_name, keys),
+    )
+}
+
 /// Fuzzing seam: exercise the cookie-header parser plus the signed-session
 /// cookie verification path (`{session_id}.{hmac_hex}` split + HMAC verify)
 /// over arbitrary bytes. Mirrors the decode performed by `SessionLayer`.
@@ -881,23 +908,11 @@ where
 
         Box::pin(async move {
             // 1. Extract or create session ID (verify HMAC if signing is active)
-            let raw_cookie = get_cookie(req.headers(), &config.cookie_name);
-            let existing_id: Option<String> = match (raw_cookie, &signing_keys) {
-                (None, _) => None,
-                (Some(raw), None) => Some(raw),
-                (Some(raw), Some(keys)) => {
-                    // Signed format: "{session_id}.{hmac_hex}"
-                    if let Some((id, sig)) = raw.split_once('.') {
-                        if keys.verify(id.as_bytes(), sig) {
-                            Some(id.to_owned())
-                        } else {
-                            None // bad HMAC — treat as no session
-                        }
-                    } else {
-                        None // unsigned cookie when signing is required
-                    }
-                }
-            };
+            let existing_id = session_id_from_headers(
+                req.headers(),
+                &config.cookie_name,
+                signing_keys.as_deref(),
+            );
 
             let mut stale_cookie_session_id = None;
             let (session_id, data) = if let Some(ref id) = existing_id {
