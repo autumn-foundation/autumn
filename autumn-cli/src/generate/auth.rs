@@ -2037,12 +2037,20 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                             break;
                         }
                         let code = strip_line_comment(tj);
-                        if code.contains(FEATURE) {
-                            already_present = true;
-                        }
-                        if find_unquoted(code, ']').is_some() {
+                        if let Some(close_idx) = find_unquoted(code, ']') {
+                            // Only the portion before `]` is still the
+                            // array — text after it is the rest of the
+                            // inline table (e.g. `], description = "mail"
+                            // }`) and must not count as the feature
+                            // already being present.
+                            if code[..close_idx].contains(FEATURE) {
+                                already_present = true;
+                            }
                             close_line = Some(j);
                             break;
+                        }
+                        if code.contains(FEATURE) {
+                            already_present = true;
                         }
                         j += 1;
                     }
@@ -16771,6 +16779,32 @@ mod tests {
             "autumn-web = { version = \"0.3\", features = [\n    \"ws\",\n    \"mail\",\n] }\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
+    }
+
+    // Codex review on #3044: the "already present?" check on the closing
+    // line scanned the whole line, so an unrelated inline-table key after
+    // the array's `]` whose value happens to equal the feature name (e.g.
+    // `], description = "mail" }`) was wrongly read as the feature already
+    // being in the *array* — only the portion before `]` is the array.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_ignores_feature_name_after_closing_bracket() {
+        let toml = "autumn-web = { version = \"0.3\", features = [\n    \"ws\",\n], description = \"mail\" }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(
+            out.matches("\"mail\"").count(),
+            2,
+            "mail must be merged into the features array in addition to the pre-existing \
+             `description = \"mail\"` value, not skipped because \"mail\" happens to appear \
+             after the array's closing bracket: {out}"
+        );
+        let close_line = out.lines().find(|l| l.contains(']')).unwrap();
+        let close_idx = close_line.find(']').unwrap();
+        assert!(
+            close_line[..close_idx].contains("\"mail\""),
+            "mail must land inside the features array, before its closing bracket: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
     }
 
     #[test]
