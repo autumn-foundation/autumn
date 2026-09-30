@@ -171,10 +171,12 @@ pub struct MtlsDimension {
 /// One mTLS entry: a route and whether it demands a verified client
 /// certificate.
 ///
-/// `mtls_required` is `true` when the listener requests certificates at all AND
-/// the route matches a configured `required_paths` prefix — mirroring the
-/// runtime `RequireClientCert` predicate. A route dropping this flag is exactly
-/// the regression the posture diff exists to catch.
+/// `mtls_required` is `true` when the route demands a verified client
+/// certificate: under `mode = "required"` that is every route (the handshake
+/// rejects every uncertified client), otherwise exactly the routes matching a
+/// configured `required_paths` prefix — mirroring the runtime
+/// `RequireClientCert` predicate. A route dropping this flag is exactly the
+/// regression the posture diff exists to catch.
 #[derive(Debug, Serialize)]
 pub struct MtlsEntry {
     pub path: String,
@@ -625,8 +627,12 @@ fn path_requires_mtls(path: &str, required_paths: &[String]) -> bool {
 }
 
 /// Build the `mtls` dimension (declared): one entry per route, flagged when the
-/// listener requests certificates AND the route matches a `required_paths`
-/// prefix.
+/// route demands a verified client certificate — under `mode = "required"`
+/// that is every route, since the handshake rejects every uncertified client,
+/// and under `optional` exactly the routes matching a `required_paths` prefix
+/// (issue #2706, item 3). Reporting `mtls_required: false` for a route the live
+/// listener protects would make the audit disagree with the listener, which is
+/// worse than no audit.
 ///
 /// Every route gets an entry, not just the required ones: the diff's job is to
 /// notice a route that *stopped* requiring mTLS, which needs the negative rows
@@ -638,13 +644,17 @@ fn build_mtls_dimension(routes: &[AuditRoute], client_auth: &ClientAuthDump) -> 
     // `mode = "off"` never requests a certificate, so no route can require one
     // — mirroring `ClientAuthMode::requests_certificate`.
     let listener_requests = client_auth.mode != "off";
+    // Under `mode = "required"` the listener protects every route, not just
+    // the ones a prefix names.
+    let requires_all = client_auth.mode == "required";
 
     let mut entries: Vec<MtlsEntry> = routes
         .iter()
         .map(|r| MtlsEntry {
             path: r.path.clone(),
             method: r.method.clone(),
-            mtls_required: listener_requests && path_requires_mtls(&r.path, &required_paths),
+            mtls_required: listener_requests
+                && (requires_all || path_requires_mtls(&r.path, &required_paths)),
         })
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
@@ -1300,6 +1310,29 @@ mod tests {
             json["dimensions"]["mtls"]["entries"][0]["mtls_required"],
             false
         );
+    }
+
+    #[test]
+    fn mtls_required_mode_flags_every_route_even_outside_the_prefixes() {
+        // Issue #2706, item 3: under `mode = "required"` the handshake rejects
+        // every uncertified client, so the manifest must not report
+        // `mtls_required: false` for a route the live listener protects — an
+        // audit that disagrees with the listener is worse than no audit.
+        let routes = vec![
+            route("GET", "/internal/keys", "keys", "gated"),
+            route("GET", "/health", "health", "framework"),
+        ];
+        let json = manifest_value(&build_manifest(
+            &routes,
+            Some(&security_dump_with_mtls("required", &["/internal/"])),
+        ));
+        let entries = json["dimensions"]["mtls"]["entries"]
+            .as_array()
+            .expect("entries");
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            assert_eq!(entry["mtls_required"], true, "{entry}");
+        }
     }
 
     #[test]

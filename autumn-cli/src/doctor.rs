@@ -7218,10 +7218,40 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
             }
         },
     };
-    let required_path_count = section
-        .get("required_paths")
-        .and_then(toml::Value::as_array)
-        .map_or(0, Vec::len);
+    let required_path_count = match section.get("required_paths") {
+        // A PRESENT `required_paths` that is not an array of strings is a
+        // config the runtime refuses to deserialize
+        // (`ClientAuthConfig.required_paths` is a `Vec<String>`), so the app
+        // cannot start. Reading it as zero paths through
+        // `as_array().map_or(0, ...)` would bless that app as Pass — the same
+        // class of lie as the non-table section and the non-string `mode`
+        // handled above, so Fail with the offending value (issue #2706,
+        // item 2).
+        None => 0,
+        Some(toml::Value::Array(paths)) => {
+            let mut count = 0;
+            for path in paths {
+                if path.as_str().is_none() {
+                    return ClientAuthDoctorData::Invalid {
+                        detail: format!(
+                            "[server.tls.client_auth] required_paths must be an array of strings; \
+                             found {path}"
+                        ),
+                    };
+                }
+                count += 1;
+            }
+            count
+        }
+        Some(other) => {
+            return ClientAuthDoctorData::Invalid {
+                detail: format!(
+                    "[server.tls.client_auth] required_paths must be an array of strings; \
+                     found {other}"
+                ),
+            };
+        }
+    };
 
     if mode == "off" {
         // `ClientAuthConfig::validate` refuses this combination — no
@@ -13262,6 +13292,48 @@ pub struct Vault {
         let result = check_client_auth_impl(&data);
         assert!(matches!(result.status, CheckStatus::Fail));
         assert!(result.detail.unwrap().contains("required_paths"));
+    }
+
+    #[test]
+    fn client_auth_fails_when_required_paths_is_not_an_array_of_strings() {
+        // Issue #2706, item 2: a string here used to read as zero paths through
+        // `as_array().map_or(0, ...)`, grading an app that cannot start as
+        // Pass. The runtime deserializes `required_paths` as `Vec<String>`,
+        // so any other shape fails the boot — doctor must Fail with the
+        // offending value in the detail, in every mode.
+        for (mode, bad) in [
+            ("required", toml::Value::String("/internal/".to_owned())),
+            ("required", toml::Value::Integer(7)),
+            (
+                "required",
+                toml::Value::Array(vec![
+                    toml::Value::String("/internal/".to_owned()),
+                    toml::Value::Integer(7),
+                ]),
+            ),
+            ("off", toml::Value::String("/internal/".to_owned())),
+        ] {
+            let mut section = toml::Table::new();
+            section.insert("mode".to_owned(), toml::Value::String(mode.to_owned()));
+            section.insert("required_paths".to_owned(), bad.clone());
+            section.insert(
+                "ca_bundle_path".to_owned(),
+                toml::Value::String("ca.pem".to_owned()),
+            );
+            let mut tls = toml::Table::new();
+            tls.insert("client_auth".to_owned(), toml::Value::Table(section));
+
+            let data = resolve_client_auth_doctor_data(Some(&tls));
+            assert!(
+                matches!(data, ClientAuthDoctorData::Invalid { .. }),
+                "mode = {mode}, required_paths = {bad} should be graded invalid, got {data:?}"
+            );
+            let result = check_client_auth_impl(&data);
+            assert!(matches!(result.status, CheckStatus::Fail));
+            let detail = result.detail.expect("invalid state carries a detail");
+            assert!(detail.contains("required_paths"), "{detail}");
+            assert!(detail.contains("array of strings"), "{detail}");
+        }
     }
 
     #[test]
