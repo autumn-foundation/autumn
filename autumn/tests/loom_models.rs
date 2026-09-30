@@ -343,6 +343,93 @@ fn metrics_active_gauge_balance() {
     });
 }
 
+#[test]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the model is about whether the state lock is held across the publish"
+)]
+fn presence_event_ordering_race() {
+    let show_bug = std::env::var_os("_LOOM_SHOW_BUG").is_some();
+
+    loom::model(move || {
+        // State represents the number of active connections for a user.
+        // 1 means user is present, 0 means user has left.
+        let state = Arc::new(Mutex::new(1));
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let t1 = {
+            let state = state.clone();
+            let events = events.clone();
+            thread::spawn(move || {
+                // Thread 1: drop(PresenceHandle) for the LAST connection
+                if show_bug {
+                    // BUGGY: update state, release lock, then publish
+                    let fully_removed = {
+                        let mut st = state.lock().unwrap();
+                        if *st == 1 {
+                            *st = 0;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if fully_removed {
+                        events.lock().unwrap().push("Leave");
+                    }
+                } else {
+                    // CORRECT: publish while holding the state lock
+                    let mut st = state.lock().unwrap();
+                    if *st == 1 {
+                        *st = 0;
+                        events.lock().unwrap().push("Leave");
+                    }
+                }
+            })
+        };
+
+        let t2 = {
+            let state = state.clone();
+            let events = events.clone();
+            thread::spawn(move || {
+                // Thread 2: track() a NEW connection
+                let mut st = state.lock().unwrap();
+                *st = 1;
+                if show_bug {
+                    // BUGGY: release the state lock, then publish
+                    drop(st);
+                    events.lock().unwrap().push("Join");
+                } else {
+                    // CORRECT: publish while still holding the state lock
+                    events.lock().unwrap().push("Join");
+                    drop(st);
+                }
+            })
+        };
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let final_state = *state.lock().unwrap();
+        let evs = events.lock().unwrap();
+
+        // The sequence of events must be consistent with the final state.
+        if !evs.is_empty() {
+            let last_event = evs.last().unwrap();
+            if final_state == 1 {
+                assert_eq!(
+                    *last_event, "Join",
+                    "state is 1 (present) but last event is {last_event}"
+                );
+            } else {
+                assert_eq!(
+                    *last_event, "Leave",
+                    "state is 0 (absent) but last event is {last_event}"
+                );
+            }
+        }
+    });
+}
+
 /// Models the process-global job tracking store's first-initialisation race
 /// (`GLOBAL_TRACKING_STORE` in `autumn/src/job_tracking.rs`).
 ///
