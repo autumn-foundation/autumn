@@ -301,7 +301,8 @@ impl CircuitBreaker {
                 if inner.history.len() as u64 >= min_sample {
                     let ratio = inner.failure_ratio();
                     if ratio >= failure_ratio_threshold {
-                        inner.open_until = Some(now + open_duration);
+                        inner.open_until =
+                            Some(crate::time_math::saturating_deadline(now, open_duration));
                         inner.transition_to(&self.name, CircuitState::Open, ratio);
                     }
                 }
@@ -320,7 +321,8 @@ impl CircuitBreaker {
                     }
                 } else {
                     inner.half_open_failures += 1;
-                    inner.open_until = Some(now + open_duration);
+                    inner.open_until =
+                        Some(crate::time_math::saturating_deadline(now, open_duration));
                     inner.transition_to(&self.name, CircuitState::Open, 1.0);
                 }
             }
