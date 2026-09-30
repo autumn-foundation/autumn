@@ -685,6 +685,9 @@ fn compile_pass_tests_a() {
     // convention-derived names asserted at run time.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_counter_cache.rs");
+    // #2662: the `parent_pk` override reaches the preload loader.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_counter_cache_parent_pk.rs");
 
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]
