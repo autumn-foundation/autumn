@@ -34,6 +34,7 @@ mod cache_coherence;
 mod cache_stampede;
 #[cfg(all(feature = "db", feature = "cache-moka"))]
 mod cached_tenant_scope;
+mod chaos_cache_jitter_proptest;
 #[cfg(feature = "ws")]
 mod chaos_channels;
 #[cfg(feature = "ws")]
