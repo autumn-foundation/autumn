@@ -3956,6 +3956,20 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
                         }
                         let take = HOST_IO_CHUNK_BYTES.min(length.saturating_sub(offset));
                         charge_bytes(&mut caller, take)?;
+                        if fd == 1 {
+                            // Priced per byte, not at the bulk-copy rate. Every
+                            // completed stdout line is parsed with
+                            // `serde_json::from_str`, which inspects each byte —
+                            // whitespace skipping included — synchronously on a
+                            // blocking worker, so this is per-byte host work
+                            // that the copy rate did not price. Bytes still
+                            // pending in `stdout_line` when the request ends
+                            // are never parsed, which slightly over-charges;
+                            // that is the safe direction for a ceiling.
+                            // Stderr (`fd == 2`) is only ever copied, so it
+                            // keeps the copy rate.
+                            charge_units(&mut caller, u64::try_from(take).unwrap_or(u64::MAX))?;
+                        }
                         let mut scratch = vec![0u8; take];
                         let at = pointer.saturating_add(offset);
                         if memory.read(&caller, at, &mut scratch).is_err() {
@@ -6368,6 +6382,38 @@ path = "/hello/greet"
     }
 
     #[test]
+    fn a_padded_response_frame_is_priced_for_the_parse_not_just_the_copy() {
+        // Every completed stdout line is parsed with `serde_json::from_str`,
+        // which inspects each byte — JSON whitespace skipping included — on a
+        // blocking worker, while `fd_write`'s `charge_bytes` priced only the
+        // memcpy. A guest could buy a ~128 MiB whitespace scan at the copy
+        // rate and hold the worker for the whole parse. Measured through the
+        // fuel the host actually charges: two modules identical except the one
+        // `i32.const` handed to `fd_write`, so the whole gap is host work.
+        // Both answer 200, which proves the parser really did scan the padding
+        // rather than reject it.
+        let unpadded =
+            host(&guests::whitespace_padded_frame(0)).run(&request("GET", "/hello/greet"));
+        let padded =
+            host(&guests::whitespace_padded_frame(65536)).run(&request("GET", "/hello/greet"));
+        assert_eq!(
+            unpadded.result.expect("the unpadded guest answers").status,
+            200
+        );
+        assert_eq!(padded.result.expect("the padded guest answers").status, 200);
+
+        let gap = padded.fuel_used.saturating_sub(unpadded.fuel_used);
+        // At the copy rate 64 KiB is about 1,025 units; with the parse priced
+        // per byte it is 65,536 on top of that. Halfway between separates the
+        // two rates without pinning either.
+        assert!(
+            gap > 32768,
+            "a 64 KiB whitespace prefix cost {gap} fuel — the bulk-copy rate \
+             would charge about 1,025, so the parser's scan is being sold at a \
+             memcpy's price",
+        );
+    }
+
     fn the_pending_frame_never_allocates_past_the_budget_it_is_bounded_by() {
         // The pending-line ceiling bounds the buffer's *length*. Its
         // *capacity* is what the host actually holds, and `Vec`'s doubling puts
