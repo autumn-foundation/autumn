@@ -1791,6 +1791,108 @@ mod tests {
         );
     }
 
+    /// A lookup that answers `A` per (recursive server, name), so one server's
+    /// successful-but-empty answer can be scripted without a network.
+    struct PerServerLookup {
+        ns: Vec<String>,
+        a: std::collections::HashMap<(SocketAddr, String), Vec<std::net::Ipv4Addr>>,
+        asked: Mutex<Vec<(SocketAddr, String, u16)>>,
+    }
+
+    impl DnsLookup for PerServerLookup {
+        fn query<'a>(
+            &'a self,
+            server: SocketAddr,
+            name: &'a str,
+            qtype: u16,
+            _recursion_desired: bool,
+        ) -> BoxFuture<'a, Result<DnsAnswer, String>> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((server, name.to_owned(), qtype));
+            let owner = normalize_name(name);
+            let records = match qtype {
+                QTYPE_NS if owner == "myapp.com" => self
+                    .ns
+                    .iter()
+                    .map(|server| ResourceRecord {
+                        name: owner.clone(),
+                        rtype: QTYPE_NS,
+                        rdata: Rdata::Name(server.clone()),
+                    })
+                    .collect(),
+                QTYPE_A => self
+                    .a
+                    .get(&(server, owner.clone()))
+                    .map(|addrs| {
+                        addrs
+                            .iter()
+                            .map(|addr| ResourceRecord {
+                                name: owner.clone(),
+                                rtype: QTYPE_A,
+                                rdata: Rdata::A(*addr),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            Box::pin(async move { Ok(DnsAnswer { rcode: 0, records }) })
+        }
+    }
+
+    // Regression (#2478): a successful-but-empty A answer for a nameserver must
+    // not silently drop it from the authoritative probe set. The remaining
+    // recursive servers still get asked, and the address they report lands in
+    // the set.
+    #[tokio::test]
+    async fn an_empty_a_answer_does_not_drop_a_nameserver_from_the_probe_set() {
+        let primary = SocketAddr::from(([127, 0, 0, 1], 53));
+        let secondary = SocketAddr::from(([127, 0, 0, 2], 53));
+        let lookup = PerServerLookup {
+            ns: vec!["ns1.provider.net".to_owned(), "ns2.provider.net".to_owned()],
+            a: [
+                (
+                    (primary, "ns1.provider.net".to_owned()),
+                    vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+                ),
+                // The primary answers `ns2` successfully, but empty…
+                ((primary, "ns2.provider.net".to_owned()), Vec::new()),
+                // …while the secondary knows its address.
+                (
+                    (secondary, "ns2.provider.net".to_owned()),
+                    vec![std::net::Ipv4Addr::new(198, 51, 100, 7)],
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            asked: Mutex::new(Vec::new()),
+        };
+        let found =
+            authoritative_resolvers("_acme-challenge.myapp.com", &[primary, secondary], &lookup)
+                .await;
+        assert!(
+            found.contains(&SocketAddr::from(([192, 0, 2, 10], 53))),
+            "the first nameserver's address is kept: {found:?}"
+        );
+        assert!(
+            found.contains(&SocketAddr::from(([198, 51, 100, 7], 53))),
+            "the empty answer from the primary must not hide the secondary's address: {found:?}"
+        );
+        // The secondary really was asked about `ns2`'s address: an empty
+        // answer from the first server must not count as "resolved".
+        assert!(
+            lookup.asked.lock().unwrap().contains(&(
+                secondary,
+                "ns2.provider.net".to_owned(),
+                QTYPE_A
+            )),
+            "got: {:?}",
+            lookup.asked.lock().unwrap()
+        );
+    }
+
     #[test]
     fn missing_values_compares_sets() {
         let expected = vec!["a".to_owned(), "b".to_owned()];

@@ -8,7 +8,9 @@ use serde::Deserialize;
 use crate::capabilities::Capability;
 use crate::content;
 use crate::models::{NewMenuItem, NewWidget, UpdateWidget, User};
-use crate::repositories::{MenuItemRepository as _, WidgetRepository as _};
+use crate::repositories::{
+    MenuItemRepository as _, PostRepository as _, TermRepository as _, WidgetRepository as _,
+};
 use crate::require_capability;
 use crate::theme::WidgetKind;
 
@@ -102,6 +104,30 @@ pub struct AppearanceFilter {
 /// `users.rs`'s `AddUserValues`.
 type NewMenuValues<'a> = (&'a str, &'a str);
 
+/// A menu-item or widget submission the Appearance screen could not save,
+/// carried back into the card it came from together with the reason.
+enum Rejected<'a> {
+    MenuItem {
+        menu_id: i64,
+        form: &'a MenuItemForm,
+        message: &'a str,
+    },
+    Widget {
+        form: &'a WidgetForm,
+        message: &'a str,
+    },
+}
+
+/// The message to show for a refused write, or the error itself when it is not
+/// one the administrator can act on by resubmitting — the same distinction
+/// `create_menu` draws between "fix the form" and "something else broke".
+fn actionable(error: AutumnError) -> Result<String, AutumnError> {
+    match error.status() {
+        StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY => Ok(error.to_string()),
+        _ => Err(error),
+    }
+}
+
 #[get("/admin/appearance")]
 pub async fn show(
     repos: Repos,
@@ -110,7 +136,7 @@ pub async fn show(
     Query(filter): Query<AppearanceFilter>,
 ) -> AutumnResult<Response> {
     let user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
-    let body = appearance_page(&repos, &csrf, &filter, ("", ""), None).await?;
+    let body = appearance_page(&repos, &csrf, &filter, ("", ""), None, None).await?;
     Ok(layout(&user, &csrf, "/admin/appearance", "Appearance", body).into_response())
 }
 
@@ -125,6 +151,7 @@ async fn appearance_page(
     filter: &AppearanceFilter,
     new_menu: NewMenuValues<'_>,
     new_menu_error: Option<&str>,
+    rejected: Option<&Rejected<'_>>,
 ) -> AutumnResult<Markup> {
     // Bounded and batched. Every menu was loaded and then queried for its items
     // one at a time, so the screen's cost was the number of menus times the size
@@ -138,13 +165,26 @@ async fn appearance_page(
         let total = content::menu_count(&mut conn).await?;
         let ids: Vec<i64> = menus.iter().map(|menu| menu.id).collect();
         let mut items = content::menu_items_for(&mut conn, &ids, MENU_ITEMS_SHOWN).await?;
-        let blocks: Vec<(crate::models::Menu, Vec<crate::models::MenuItem>)> = menus
+        let mut blocks: Vec<(crate::models::Menu, Vec<crate::models::MenuItem>)> = menus
             .into_iter()
             .map(|menu| {
                 let own = items.remove(&menu.id).unwrap_or_default();
                 (menu, own)
             })
             .collect();
+        // A refused item must be redisplayed beside its own menu, and menus
+        // are paged by name — so the menu may not be on this page (another
+        // administrator renamed or added one since the form was rendered).
+        // Show it first, whichever page it belongs to, rather than a 422
+        // that carries neither the message nor the input.
+        if let Some(Rejected::MenuItem { menu_id, .. }) = rejected
+            && !blocks.iter().any(|(menu, _)| menu.id == *menu_id)
+            && let Some(menu) = content::menu_by_id(&mut conn, *menu_id).await?
+        {
+            let mut own = content::menu_items_for(&mut conn, &[menu.id], MENU_ITEMS_SHOWN).await?;
+            let items = own.remove(&menu.id).unwrap_or_default();
+            blocks.insert(0, (menu, items));
+        }
         (blocks, total)
     };
     let last_menu_page = ((menu_total + MENUS_PER_PAGE - 1) / MENUS_PER_PAGE).max(1);
@@ -158,17 +198,42 @@ async fn appearance_page(
         })
         .await?;
 
-    let pages = repos.published_posts("page", 200).await?;
+    let mut pages = repos.published_posts("page", 200).await?;
+    // Both target lists are bounded, so a target the administrator picked can
+    // be absent from them by the time the form is redisplayed — the browser
+    // would then select "No page"/"No category" and the resubmitted item would
+    // silently lose its target. Keep the submitted one, as the settings screen
+    // does for its configured front page.
+    let kept_form = match rejected {
+        Some(Rejected::MenuItem { form, .. }) => Some(*form),
+        _ => None,
+    };
+    let kept_id = |raw: Option<&str>| raw.and_then(|v| v.trim().parse::<i64>().ok());
+    if let Some(id) = kept_id(kept_form.map(|f| f.post_id.as_str()))
+        && !pages.iter().any(|page| page.id == id)
+        && let Some(page) = repos.posts.find_by_id(id).await?
+        && page.post_type == "page"
+        && page.is_public()
+    {
+        pages.insert(0, page);
+    }
     // Bounded like `pages` above, and for the same reason: this is a
     // *create* control — every menu on the screen renders the whole set as
     // `<option>`s, so an unbounded finder here made the Appearance screen the
     // one that broke on a large taxonomy while the taxonomy and authoring
     // screens stayed responsive. There is no current selection to retain: the
     // control always starts at "No category".
-    let (categories, category_count) = {
+    let (mut categories, category_count) = {
         let mut conn = repos.conn().await?;
         crate::content::terms_page_with_total(&mut conn, "category", 0, MENU_TERM_LIMIT).await?
     };
+    if let Some(id) = kept_id(kept_form.map(|f| f.term_id.as_str()))
+        && !categories.iter().any(|term| term.id == id)
+        && let Some(term) = repos.terms.find_by_id(id).await?
+        && term.taxonomy == "category"
+    {
+        categories.insert(0, term);
+    }
 
     let body = html! {
         section class="mb-10" {
@@ -176,6 +241,15 @@ async fn appearance_page(
             div class="grid grid-cols-1 lg:grid-cols-3 gap-6" {
                 div class="lg:col-span-2 space-y-4" {
                     @for (menu, items) in &menu_blocks {
+                        @let refused = match rejected {
+                            Some(Rejected::MenuItem { menu_id, form, message })
+                                if *menu_id == menu.id => Some((*form, *message)),
+                            _ => None,
+                        };
+                        @let kept = refused.map(|(form, _)| form);
+                        @let kept_target = |value: &str, field: fn(&MenuItemForm) -> &str| {
+                            kept.is_some_and(|form| field(form).trim() == value)
+                        };
                         div class="bg-white rounded-lg shadow p-5" {
                             div class="flex items-baseline justify-between mb-3" {
                                 h3 class="font-medium" { (menu.name) }
@@ -223,12 +297,21 @@ async fn appearance_page(
                                  class="grid grid-cols-1 sm:grid-cols-5 gap-2 text-sm \
                                         border-t border-gray-100 pt-3" {
                                             (csrf.input())
+                                @if let Some((_, message)) = refused {
+                                    p class="sm:col-span-5 text-red-700 whitespace-pre-line"
+                                      id=(format!("item-error-{}", menu.id)) role="alert" {
+                                        (message)
+                                    }
+                                }
                                 div class="sm:col-span-2" {
                                     label for=(format!("label-{}", menu.id)) class="sr-only" {
                                         "Label"
                                     }
                                     input #(format!("label-{}", menu.id)) type="text" name="label"
+                                          value=[kept.map(|form| form.label.as_str())]
                                           required placeholder="Label"
+                                          autofocus[refused.is_some()]
+                                          aria-describedby=[refused.map(|_| format!("item-error-{}", menu.id))]
                                           class="w-full border rounded px-2 py-1.5";
                                 }
                                 div {
@@ -238,8 +321,11 @@ async fn appearance_page(
                                     select #(format!("target-{}", menu.id)) name="post_id"
                                            class="w-full border rounded px-2 py-1.5" {
                                         option value="" { "No page" }
-                                        @for page in &pages {
-                                            option value=(page.id) { (page.title) }
+                                        @for target in &pages {
+                                            option value=(target.id)
+                                                   selected[kept_target(&target.id.to_string(), |f| &f.post_id)] {
+                                                (target.title)
+                                            }
                                         }
                                     }
                                 }
@@ -251,7 +337,10 @@ async fn appearance_page(
                                            class="w-full border rounded px-2 py-1.5" {
                                         option value="" { "No category" }
                                         @for term in &categories {
-                                            option value=(term.id) { (term.name) }
+                                            option value=(term.id)
+                                                   selected[kept_target(&term.id.to_string(), |f| &f.term_id)] {
+                                                (term.name)
+                                            }
                                         }
                                     }
                                     @if category_count > MENU_TERM_LIMIT {
@@ -265,6 +354,7 @@ async fn appearance_page(
                                         "Custom URL"
                                     }
                                     input #(format!("url-{}", menu.id)) type="text" name="url"
+                                          value=[kept.map(|form| form.url.as_str())]
                                           placeholder="/custom-url"
                                           class="w-full border rounded px-2 py-1.5";
                                 }
@@ -279,7 +369,10 @@ async fn appearance_page(
                                            class="w-full border rounded px-2 py-1.5" {
                                         option value="" { "Top level" }
                                         @for item in items.iter().filter(|i| i.parent_id.is_none()) {
-                                            option value=(item.id) { "Under " (item.label) }
+                                            option value=(item.id)
+                                                   selected[kept_target(&item.id.to_string(), |f| &f.parent_id)] {
+                                                "Under " (item.label)
+                                            }
                                         }
                                     }
                                 }
@@ -359,6 +452,11 @@ async fn appearance_page(
             }
         }
 
+        @let refused_widget = match rejected {
+            Some(Rejected::Widget { form, message }) => Some((*form, *message)),
+            _ => None,
+        };
+        @let kept_widget = refused_widget.map(|(form, _)| form);
         section {
             h2 class="text-lg font-semibold mb-3" { "Widgets" }
             p class="text-sm text-gray-500 mb-3" {
@@ -399,11 +497,22 @@ async fn appearance_page(
                      class="bg-white rounded-lg shadow p-5 space-y-3 h-fit" {
                          (csrf.input())
                     h3 class="font-semibold text-sm" { "Add widget" }
+                    @if let Some((_, message)) = refused_widget {
+                        p class="text-sm text-red-700 whitespace-pre-line" id="widget-error"
+                          role="alert" {
+                            (message)
+                        }
+                    }
                     div {
                         label for="widget-kind" class="block text-sm font-medium mb-1" { "Type" }
-                        select #widget-kind name="kind" class="w-full border rounded px-3 py-2" {
+                        select #widget-kind name="kind" class="w-full border rounded px-3 py-2"
+                               autofocus[refused_widget.is_some()]
+                               aria-describedby=[refused_widget.map(|_| "widget-error")] {
                             @for kind in WidgetKind::all() {
-                                option value=(kind.slug()) { (kind.label()) }
+                                option value=(kind.slug())
+                                       selected[kept_widget.is_some_and(|f| f.kind.trim() == kind.slug())] {
+                                    (kind.label())
+                                }
                             }
                         }
                     }
@@ -412,6 +521,7 @@ async fn appearance_page(
                             "Heading " span class="text-gray-400 font-normal" { "(optional)" }
                         }
                         input #widget-title type="text" name="title"
+                              value=[kept_widget.map(|form| form.title.as_str())]
                               maxlength=(MAX_WIDGET_TITLE)
                               class="w-full border rounded px-3 py-2";
                     }
@@ -421,7 +531,8 @@ async fn appearance_page(
                                 "(Recent Posts)"
                             }
                         }
-                        input #widget-count type="number" name="count" min="1" max="20" value="5"
+                        input #widget-count type="number" name="count" min="1" max="20"
+                              value=(kept_widget.map_or("5", |form| form.count.as_str()))
                               class="w-full border rounded px-3 py-2";
                     }
                     div {
@@ -432,13 +543,16 @@ async fn appearance_page(
                         }
                         textarea #widget-text name="text" rows="3"
                                  maxlength=(MAX_WIDGET_TEXT)
-                                 class="w-full border rounded px-3 py-2 text-sm" {}
+                                 class="w-full border rounded px-3 py-2 text-sm" {
+                            (kept_widget.map_or("", |form| form.text.as_str()))
+                        }
                     }
                     div {
                         label for="widget-position" class="block text-sm font-medium mb-1" {
                             "Position"
                         }
-                        input #widget-position type="number" name="position" value="0"
+                        input #widget-position type="number" name="position"
+                              value=(kept_widget.map_or("0", |form| form.position.as_str()))
                               class="w-full border rounded px-3 py-2";
                     }
                     button type="submit"
@@ -471,6 +585,33 @@ async fn redisplay_new_menu(
         &AppearanceFilter::default(),
         new_menu,
         Some(message),
+        None,
+    )
+    .await?;
+    Ok((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        layout(user, csrf, "/admin/appearance", "Appearance", body),
+    )
+        .into_response())
+}
+
+/// Redisplays the Appearance screen at 422 with the rejected menu-item or
+/// widget submission filled back in and the reason shown inside its own card,
+/// instead of replacing the screen with the generic error page and discarding
+/// everything the administrator had typed.
+async fn redisplay_rejected(
+    repos: &Repos,
+    user: &User,
+    csrf: &Csrf,
+    rejected: &Rejected<'_>,
+) -> AutumnResult<Response> {
+    let body = appearance_page(
+        repos,
+        csrf,
+        &AppearanceFilter::default(),
+        ("", ""),
+        None,
+        Some(rejected),
     )
     .await?;
     Ok((
@@ -551,8 +692,21 @@ pub async fn create_menu_item(
     Path(menu_id): Path<i64>,
     Form(form): Form<MenuItemForm>,
 ) -> AutumnResult<Response> {
-    let _user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
+    let user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
     let parse = |raw: &str| raw.trim().parse::<i64>().ok().filter(|v| *v > 0);
+    let reject = async |message: &str| {
+        redisplay_rejected(
+            &repos,
+            &user,
+            &csrf,
+            &Rejected::MenuItem {
+                menu_id,
+                form: &form,
+                message,
+            },
+        )
+        .await
+    };
 
     // A parent has to be an item of *this* menu and itself a root item. The
     // first stops a crafted request grafting one menu's items onto another's —
@@ -565,13 +719,16 @@ pub async fn create_menu_item(
                 .menu_items
                 .find_by_id(candidate)
                 .await?
-                .filter(|item| item.menu_id == menu_id && item.parent_id.is_none())
-                .ok_or_else(|| {
-                    AutumnError::unprocessable_msg(
+                .filter(|item| item.menu_id == menu_id && item.parent_id.is_none());
+            match parent {
+                Some(parent) => Some(parent.id),
+                None => {
+                    return reject(
                         "A menu item can only nest under a top-level item of the same menu",
                     )
-                })?;
-            Some(parent.id)
+                    .await;
+                }
+            }
         }
         None => None,
     };
@@ -580,7 +737,7 @@ pub async fn create_menu_item(
     // the first `MENU_ITEMS_SHOWN` items, so accepting more produced an item
     // that appears nowhere and has no delete control — reachable only by
     // removing a visible one first.
-    repos
+    let saved = repos
         .with_conn(async |conn| {
             content::insert_menu_item(
                 conn,
@@ -597,7 +754,10 @@ pub async fn create_menu_item(
             )
             .await
         })
-        .await?;
+        .await;
+    if let Err(error) = saved {
+        return reject(&actionable(error)?).await;
+    }
     Ok(Redirect::to("/admin/appearance").into_response())
 }
 
@@ -620,9 +780,22 @@ pub async fn create_widget(
     csrf: Csrf,
     Form(form): Form<WidgetForm>,
 ) -> AutumnResult<Response> {
-    let _user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
-    let kind = WidgetKind::parse(form.kind.trim())
-        .ok_or_else(|| AutumnError::unprocessable_msg("Unknown widget type"))?;
+    let user = require_capability!(repos, session, csrf, Capability::EditThemeOptions);
+    let reject = async |message: &str| {
+        redisplay_rejected(
+            &repos,
+            &user,
+            &csrf,
+            &Rejected::Widget {
+                form: &form,
+                message,
+            },
+        )
+        .await
+    };
+    let Some(kind) = WidgetKind::parse(form.kind.trim()) else {
+        return reject("Unknown widget type").await;
+    };
 
     // Only the settings this kind actually reads are stored, so a Text widget
     // does not carry a stale `count` that a later render might pick up.
@@ -640,20 +813,22 @@ pub async fn create_widget(
     // `maxlength` is a browser convenience a crafted POST ignores.
     let title = form.title.trim();
     if title.chars().count() > MAX_WIDGET_TITLE {
-        return Err(AutumnError::unprocessable_msg(format!(
+        return reject(&format!(
             "A widget title must be at most {MAX_WIDGET_TITLE} characters"
-        )));
+        ))
+        .await;
     }
     if form.text.chars().count() > MAX_WIDGET_TEXT {
-        return Err(AutumnError::unprocessable_msg(format!(
+        return reject(&format!(
             "A text widget must be at most {MAX_WIDGET_TEXT} characters"
-        )));
+        ))
+        .await;
     }
 
     // Bounded, for the same reason `create_menu_item` is: the sidebar renders
     // its first `MAX_SIDEBAR_WIDGETS` and so does this screen, so a widget past
     // that is invisible and undeletable.
-    repos
+    let saved = repos
         .with_conn(async |conn| {
             content::insert_widget(
                 conn,
@@ -668,7 +843,10 @@ pub async fn create_widget(
             )
             .await
         })
-        .await?;
+        .await;
+    if let Err(error) = saved {
+        return reject(&actionable(error)?).await;
+    }
     Ok(Redirect::to("/admin/appearance").into_response())
 }
 

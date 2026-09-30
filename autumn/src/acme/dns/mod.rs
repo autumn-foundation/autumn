@@ -133,15 +133,33 @@ pub trait DnsProvider: Send + Sync {
     /// Same contract as [`upsert_txt_batch`](Self::upsert_txt_batch) in reverse:
     /// a set-replacing provider must remove all values sharing a name in one
     /// change, or the second removal's stale read resurrects the first value.
+    ///
+    /// Cleanup is best-effort: every record is attempted even after a failure,
+    /// and the failures are reported together. Returning on the first error
+    /// would abandon the remaining zones' records after the first hiccup
+    /// (issue #2478) — precisely when a multi-domain order needs its records
+    /// cleaned up most.
     fn delete_txt_batch<'a>(
         &'a self,
         records: &'a [TxtRecord],
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            let mut errors: Vec<String> = Vec::new();
             for record in records {
-                self.delete_txt(record).await?;
+                if let Err(error) = self.delete_txt(record).await {
+                    errors.push(format!("{}: {error}", record.fqdn));
+                }
             }
-            Ok(())
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "could not remove {} of {} challenge TXT records: {}",
+                    errors.len(),
+                    records.len(),
+                    errors.join("; ")
+                ))
+            }
         })
     }
 }
@@ -549,6 +567,90 @@ mod tests {
             challenge_fqdn("myapp.com"),
             TxtRecord::new("myapp.com", "v").fqdn
         );
+    }
+
+    /// A provider exercising the default `delete_txt_batch`: its cleanup
+    /// removes some records and fails one.
+    struct PartiallyFailingProvider {
+        attempted: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl DnsProvider for PartiallyFailingProvider {
+        fn name(&self) -> &'static str {
+            "partially-failing"
+        }
+
+        fn upsert_txt<'a>(&'a self, _record: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn delete_txt<'a>(&'a self, record: &'a TxtRecord) -> BoxFuture<'a, Result<(), String>> {
+            let attempted = &self.attempted;
+            let fqdn = record.fqdn.clone();
+            let value = record.value.clone();
+            Box::pin(async move {
+                attempted
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(fqdn.clone());
+                if value == "doomed" {
+                    Err("the provider throttled the request".to_owned())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    // Regression (#2478): the default cleanup attempts EVERY record even after
+    // a failure, and reports the failures together — returning on the first
+    // error would abandon the remaining zones' records.
+    #[tokio::test]
+    async fn default_delete_txt_batch_attempts_every_record_and_aggregates() {
+        let provider = PartiallyFailingProvider {
+            attempted: std::sync::Mutex::new(Vec::new()),
+        };
+        let records = [
+            TxtRecord::new("a.example.com", "ok-1"),
+            TxtRecord::new("b.example.com", "doomed"),
+            TxtRecord::new("c.example.com", "ok-2"),
+        ];
+
+        let error = provider
+            .delete_txt_batch(&records)
+            .await
+            .expect_err("one record fails, so the batch fails");
+
+        assert!(
+            error.contains("_acme-challenge.b.example.com"),
+            "the failing record is named: {error}"
+        );
+        assert!(
+            error.contains("1 of 3"),
+            "the aggregate counts the failures: {error}"
+        );
+        assert!(
+            error.contains("throttled"),
+            "the underlying error survives: {error}"
+        );
+        assert_eq!(
+            provider
+                .attempted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            3,
+            "every record is attempted, not just the ones before the failure"
+        );
+
+        // …and a clean batch still succeeds.
+        let provider = PartiallyFailingProvider {
+            attempted: std::sync::Mutex::new(Vec::new()),
+        };
+        provider
+            .delete_txt_batch(&[TxtRecord::new("a.example.com", "ok")])
+            .await
+            .expect("a batch with no failures succeeds");
     }
 
     // AWS answers a SigV4 mismatch by echoing the canonical request, which

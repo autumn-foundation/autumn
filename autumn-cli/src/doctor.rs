@@ -1094,6 +1094,13 @@ pub enum ClientAuthDoctorData {
         ca_count: usize,
         /// Whether a CRL is configured, and whether its `nextUpdate` has passed.
         crl_stale: Option<bool>,
+        /// Subject DNs of the CAs in the bundle that no CRL in the configured
+        /// CRL file is issued by (issue #2706). Empty when no CRL is
+        /// configured. Once any CRL is configured, the runtime refuses
+        /// handshakes whose revocation status is unknown, so these CAs'
+        /// clients would be rejected — and the server refuses to boot on this,
+        /// so `--strict` fails the run.
+        crl_coverage_gaps: Vec<String>,
         /// How many route prefixes demand a certificate.
         required_path_count: usize,
     },
@@ -1110,8 +1117,10 @@ pub enum ClientAuthDoctorData {
 ///   boot on exactly these).
 /// - Any CA in the bundle already expired → **Fail**: it verifies nothing, so a
 ///   bundle of only-expired CAs rejects every client.
-/// - A CA expiring within 30 days, a stale CRL, or `optional` with no route
-///   requiring a certificate → **Warn**.
+/// - A CRL set that does not cover every CA in the bundle, a CA expiring
+///   within 30 days, a stale CRL, or `optional` with no route requiring a
+///   certificate → **Warn**. The coverage gap is the severest Warn: the
+///   runtime refuses to boot on it, so `--strict` fails the run.
 /// - Otherwise → **Pass**.
 #[must_use]
 pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
@@ -1164,6 +1173,27 @@ pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
 /// Split out of [`check_client_auth_impl`] so each function stays readable; the
 /// caller has already handled every not-loadable state, so the fallthrough arm
 /// here is unreachable in practice.
+/// The `tls_client_auth` result when the CRL set leaves some bundle CAs
+/// uncovered (issue #2706): the runtime refuses to boot on this, so doctor
+/// warns (and fails under `--strict`).
+fn grade_crl_coverage_gaps(crl_coverage_gaps: &[String]) -> CheckResult {
+    CheckResult {
+        name: "tls_client_auth",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "the [server.tls.client_auth] revocation list has no CRL issued by {} — once any \
+             CRL is configured, the server refuses handshakes whose revocation status is \
+             unknown, so the clients of these CAs would be rejected, and the server refuses \
+             to boot on this",
+            crl_coverage_gaps.join(", ")
+        )),
+        hint: Some(
+            "Publish a CRL for each CA in the bundle, or remove the uncovered CA. Under \
+             `--strict` this warning fails the run, matching the runtime",
+        ),
+    }
+}
+
 fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
     match data {
         ClientAuthDoctorData::Healthy {
@@ -1184,6 +1214,9 @@ fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
                  nothing",
             ),
         },
+        ClientAuthDoctorData::Healthy {
+            crl_coverage_gaps, ..
+        } if !crl_coverage_gaps.is_empty() => grade_crl_coverage_gaps(crl_coverage_gaps),
         ClientAuthDoctorData::Healthy {
             crl_stale: Some(true),
             ..
@@ -7254,18 +7287,35 @@ fn grade_client_auth_trust_store(
                 };
             }
         };
-        let crl_stale = match crl {
+        let (crl_stale, crl_coverage_gaps) = match crl {
             Some(path) => {
-                match autumn_web::tls::client_auth::inspect_crl(std::path::Path::new(path)) {
-                    Ok(inspection) => Some(inspection.is_stale(now)),
+                let path = std::path::Path::new(path);
+                let inspection = match autumn_web::tls::client_auth::inspect_crl(path) {
+                    Ok(inspection) => inspection,
                     Err(e) => {
                         return ClientAuthDoctorData::Invalid {
                             detail: e.to_string(),
                         };
                     }
-                }
+                };
+                // The #2706 coverage gap: a CRL set that covers only some of
+                // the bundle's CAs makes the runtime refuse the clients of the
+                // rest (and refuse to boot). Both files already loaded through
+                // the runtime paths above, so this only compares names.
+                let gaps = match autumn_web::tls::client_auth::crl_coverage_gaps(
+                    std::path::Path::new(bundle),
+                    path,
+                ) {
+                    Ok(gaps) => gaps,
+                    Err(e) => {
+                        return ClientAuthDoctorData::Invalid {
+                            detail: e.to_string(),
+                        };
+                    }
+                };
+                (Some(inspection.is_stale(now)), gaps)
             }
-            None => None,
+            None => (None, Vec::new()),
         };
 
         let expired_cas: Vec<String> = cas
@@ -7286,6 +7336,7 @@ fn grade_client_auth_trust_store(
             near_expiry_cas,
             ca_count: cas.len(),
             crl_stale,
+            crl_coverage_gaps,
             required_path_count,
         }
     }
@@ -7952,24 +8003,53 @@ fn check_acme_domain_entries(domains: &[String], dns_configured: bool) -> Option
     None
 }
 
-/// The set of domains the `--online` doctor actively probes (port 80/443 + DNS).
+/// The set of base domains the `--online` doctor probes for `_acme-challenge`
+/// delegation visibility (one DNS check per configured domain).
 ///
 /// This is EVERY configured domain, not just the first: issuance orders an
 /// authorization for each name in `config.domains`, so probing only the first
 /// name can let doctor pass while issuance fails on an unprobed domain. Extracted
 /// as a pure helper so the "probe every configured domain" contract is
-/// unit-testable without real network I/O — `run()` enqueues one bounded port
-/// task and one DNS task for each domain returned here.
+/// unit-testable without real network I/O — `run()` enqueues one bounded DNS
+/// visibility task for each domain returned here.
+///
+/// A `*.myapp.com` entry probes as the base domain it covers: the challenge
+/// record for a wildcard lives at `_acme-challenge.myapp.com`, so the base is
+/// exactly what the CA looks up. Address and port reachability use
+/// [`acme_reachability_probe_domains`] instead — see its docs for why.
 fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
     // A `*.myapp.com` entry has no address record of its own, so probing it
     // literally would resolve to nothing and report a permanent, meaningless
-    // Warn on every wildcard deployment. Probe the base domain it covers
-    // instead — that IS the host tenants' subdomains point at — and drop the
-    // duplicate when the apex is also listed explicitly (#1620).
+    // Warn on every wildcard deployment. The challenge record lives at the
+    // base domain, so probe that — and drop the duplicate when the apex is
+    // also listed explicitly (#1620).
     let mut probed: Vec<String> = Vec::new();
     for domain in &config.domains {
         let target = domain.strip_prefix("*.").unwrap_or(domain).to_owned();
         if !target.is_empty() && !probed.contains(&target) {
+            probed.push(target);
+        }
+    }
+    probed
+}
+
+/// The hostnames the `--online` doctor actively probes for address and port
+/// reachability (port 80/443 + DNS points-here).
+///
+/// This is NOT the same set as [`acme_online_probe_domains`]: a `*.myapp.com`
+/// entry has no address record of its own, and probing its base domain reports
+/// a permanent, meaningless Warn on wildcard-only deployments that publish a
+/// wildcard `A`/`AAAA` record but no apex record. Probe a representative
+/// covered hostname instead — that IS what the CA and visitors resolve — and
+/// drop duplicates (#2478).
+fn acme_reachability_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
+    let mut probed: Vec<String> = Vec::new();
+    for domain in &config.domains {
+        let target = match domain.strip_prefix("*.") {
+            Some(base) if !base.is_empty() => format!("doctor-check.{base}"),
+            _ => domain.clone(),
+        };
+        if !probed.contains(&target) {
             probed.push(target);
         }
     }
@@ -10149,9 +10229,16 @@ pub fn run(opts: DoctorOptions) {
             // doctor while issuance fails on an unprobed domain. One port + DNS
             // check per domain, each labeled with the domain in its detail; still
             // bounded and gated behind --online.
+            //
+            // Reachability probes a representative covered hostname for
+            // wildcard entries (`doctor-check.myapp.com`, not the bare apex):
+            // a wildcard-only deployment has no apex address record, so
+            // probing the apex would warn forever on a valid setup (#2478).
+            // The `_acme-challenge` visibility probe below stays on the base
+            // domain, where the wildcard's challenge record actually lives.
             if opts.online {
                 let dns01 = acme.dns.is_some();
-                for domain in acme_online_probe_domains(&acme) {
+                for domain in acme_reachability_probe_domains(&acme) {
                     let d80 = domain.clone();
                     tasks.push(Box::new(move || {
                         let p80 = probe_port(&d80, 80);
@@ -13002,6 +13089,7 @@ pub struct Vault {
             near_expiry_cas: Vec::new(),
             ca_count: 1,
             crl_stale: None,
+            crl_coverage_gaps: Vec::new(),
             required_path_count,
         }
     }
@@ -13110,8 +13198,47 @@ pub struct Vault {
             near_expiry_cas: vec![("CN=Aging CA".to_owned(), 3)],
             ca_count: 2,
             crl_stale: Some(true),
+            crl_coverage_gaps: vec!["CN=Uncovered CA".to_owned()],
             required_path_count: 0,
         };
+        let r = check_client_auth_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn client_auth_warns_on_a_crl_coverage_gap() {
+        // Issue #2706: the CRL set names only some of the bundle's CAs, so
+        // the runtime would refuse the uncovered CAs' clients — and refuse
+        // to boot at all.
+        let mut data = healthy_client_auth("required", 1);
+        if let ClientAuthDoctorData::Healthy {
+            crl_coverage_gaps, ..
+        } = &mut data
+        {
+            crl_coverage_gaps.push("CN=New CA".to_owned());
+        }
+        let r = check_client_auth_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("CN=New CA"), "{detail}");
+        assert!(detail.contains("refuses to boot"), "{detail}");
+    }
+
+    #[test]
+    fn client_auth_grades_an_expired_ca_above_a_crl_coverage_gap() {
+        // Worst problem first: the expired CA is a Fail, the coverage gap a
+        // Warn, so the Fail must win.
+        let mut data = healthy_client_auth("required", 1);
+        if let ClientAuthDoctorData::Healthy {
+            expired_cas,
+            crl_coverage_gaps,
+            ..
+        } = &mut data
+        {
+            expired_cas.push("CN=Retired CA".to_owned());
+            crl_coverage_gaps.push("CN=New CA".to_owned());
+        }
         let r = check_client_auth_impl(&data);
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.unwrap().contains("expired"));
@@ -14788,12 +14915,11 @@ pub struct Vault {
         }
     }
 
-    // A `*.myapp.com` entry has no address record of its own: probing it
-    // literally would report a permanent, meaningless Warn on every wildcard
-    // deployment. It is probed as the base domain it covers, deduplicated
-    // against an explicitly-listed apex.
+    // A `*.myapp.com` entry's challenge record lives at the base domain, so the
+    // `_acme-challenge` delegation probe checks the base domain it covers —
+    // deduplicated against an explicitly-listed apex.
     #[test]
-    fn wildcard_domains_are_probed_as_their_base_domain() {
+    fn wildcard_challenge_probes_check_the_base_domain() {
         let mut cfg = acme_doctor_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
         cfg.dns = Some(acme_dns_cfg(
             autumn_web::config::AcmeDnsProvider::Cloudflare,
@@ -14815,6 +14941,38 @@ pub struct Vault {
         let cfg = acme_doctor_cfg(&["a.example.com", "b.example.com"], "ops@example.com");
         assert_eq!(
             acme_online_probe_domains(&cfg),
+            vec!["a.example.com".to_owned(), "b.example.com".to_owned()]
+        );
+    }
+
+    // Regression (#2478): address and port reachability must NOT probe the
+    // apex for a wildcard entry. A wildcard-only deployment (wildcard
+    // `A`/`AAAA`, no apex record) would warn forever on the apex; probing a
+    // representative covered hostname resolves through the wildcard record.
+    #[test]
+    fn wildcard_reachability_probes_a_covered_hostname() {
+        // Wildcard-only: the apex is not probed at all.
+        let cfg = acme_doctor_cfg(&["*.myapp.com"], "ops@myapp.com");
+        assert_eq!(
+            acme_reachability_probe_domains(&cfg),
+            vec!["doctor-check.myapp.com".to_owned()]
+        );
+
+        // Apex plus wildcard: the apex is probed literally, the wildcard as a
+        // covered hostname.
+        let cfg = acme_doctor_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
+        assert_eq!(
+            acme_reachability_probe_domains(&cfg),
+            vec!["myapp.com".to_owned(), "doctor-check.myapp.com".to_owned()]
+        );
+
+        // Non-wildcard configs probe their own names, duplicates dropped.
+        let cfg = acme_doctor_cfg(
+            &["a.example.com", "a.example.com", "b.example.com"],
+            "ops@example.com",
+        );
+        assert_eq!(
+            acme_reachability_probe_domains(&cfg),
             vec!["a.example.com".to_owned(), "b.example.com".to_owned()]
         );
     }
@@ -15777,11 +15935,19 @@ directory = \"production\"
         config.directory_label = "production".to_owned();
 
         // Every configured domain is scheduled for probing, not just the first.
+        // For non-wildcard configs the challenge-visibility and reachability
+        // sets coincide, so either helper exercises the "probe everything"
+        // contract.
         let domains = acme_online_probe_domains(&config);
         assert_eq!(
             domains,
             vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
             "every configured domain must be probed, not just the first"
+        );
+        assert_eq!(
+            acme_reachability_probe_domains(&config),
+            domains,
+            "non-wildcard configs probe the same names for reachability"
         );
 
         // Each domain flows through the pure graders to a domain-labeled check,

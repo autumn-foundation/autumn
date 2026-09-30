@@ -228,6 +228,7 @@ pub mod seo;
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
+pub(crate) mod accept_drain;
 #[cfg(feature = "inbound-mail")]
 pub mod inbound_mail;
 pub mod inspector;
@@ -2024,6 +2025,16 @@ pub use maud::html;
 /// }
 /// ```
 pub use crate::extract::Json;
+
+/// CSV request body extractor and response type.
+///
+/// When used as a handler parameter, deserializes the request body as a CSV list of records.
+/// When returned from a handler, serializes the value as CSV with
+/// `Content-Type: text/csv; charset=utf-8`.
+///
+/// Requires the `csv` feature.
+#[cfg(feature = "csv")]
+pub use crate::extract::Csv;
 
 /// Path extractor.
 ///

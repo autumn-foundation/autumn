@@ -43,6 +43,11 @@ const API_PREFIX: &str = "/2013-04-01";
 const SERVICE: &str = "route53";
 /// TTL for the ephemeral challenge record set.
 const CHALLENGE_TTL_SECS: u32 = 60;
+/// Upper bound on `ListHostedZonesByName` pages followed while resolving a
+/// zone. Each page carries up to ten zones, so a hundred pages scan a thousand
+/// zones — well past any sane account, and it bounds a cursor that keeps
+/// pointing at more pages forever.
+const MAX_ZONE_LOOKUP_PAGES: usize = 100;
 
 /// The AWS credentials and zone hints Route 53 issuance needs.
 #[derive(Clone)]
@@ -143,27 +148,51 @@ impl Route53Provider {
         }
         let candidates = zone_candidates(fqdn);
         for candidate in &candidates {
-            let body = self
-                .send(
-                    HttpRequest::new(
-                        "GET",
+            // `ListHostedZonesByName` answers in pages; an account holding more
+            // zones than one page answers them on later pages, past
+            // `maxitems=10`. Follow the response's pagination cursor while the
+            // names it points at can still match the candidate — claiming "no
+            // hosted zone exists" after reading only the first page would hide
+            // the public zone behind it (issue #2478).
+            let mut dnsname = format!("{candidate}.");
+            let mut hostedzoneid: Option<String> = None;
+            for _ in 0..MAX_ZONE_LOOKUP_PAGES {
+                let url = hostedzoneid.as_ref().map_or_else(
+                    || {
                         format!(
                             // More than one, because split-horizon DNS gives a
                             // name BOTH a private and a public hosted zone;
                             // `maxitems=1` would hand back whichever sorts first
                             // and hide the other.
-                            "https://{API_HOST}{API_PREFIX}/hostedzonesbyname?dnsname={candidate}.&maxitems=10"
-                        ),
-                    ),
-                    "look up the Route 53 hosted zone",
-                )
-                .await?;
-            if let Some(id) = hosted_zone_id_for(&body, candidate) {
-                self.zone_ids
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(fqdn.to_owned(), id.clone());
-                return Ok(id);
+                            "https://{API_HOST}{API_PREFIX}/hostedzonesbyname\
+                             ?dnsname={dnsname}&maxitems=10"
+                        )
+                    },
+                    |id| {
+                        format!(
+                            "https://{API_HOST}{API_PREFIX}/hostedzonesbyname\
+                             ?dnsname={dnsname}&hostedzoneid={id}&maxitems=10"
+                        )
+                    },
+                );
+                let body = self
+                    .send(
+                        HttpRequest::new("GET", url),
+                        "look up the Route 53 hosted zone",
+                    )
+                    .await?;
+                if let Some(id) = hosted_zone_id_for(&body, candidate) {
+                    self.zone_ids
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(fqdn.to_owned(), id.clone());
+                    return Ok(id);
+                }
+                let Some((next_name, next_id)) = next_zone_page(&body, candidate) else {
+                    break;
+                };
+                dnsname = next_name;
+                hostedzoneid = Some(next_id);
             }
         }
         Err(format!(
@@ -240,7 +269,18 @@ impl Route53Provider {
     /// `add` selects publish (union) or remove (difference). Distinct names are
     /// distinct record sets and cannot clobber each other, so they stay separate
     /// changes; only same-name values must share one.
-    async fn apply_batch(&self, records: &[TxtRecord], add: bool) -> Result<(), String> {
+    ///
+    /// `continue_on_error` selects the cleanup contract: removal is
+    /// best-effort, so every group's read-modify-write is attempted even after
+    /// a failure and the failures are reported together (issue #2478); publish
+    /// still fails fast, because a partially published batch cannot complete
+    /// the order anyway.
+    async fn apply_batch(
+        &self,
+        records: &[TxtRecord],
+        add: bool,
+        continue_on_error: bool,
+    ) -> Result<(), String> {
         // Grouped in first-seen order rather than through a HashMap, so the
         // request order a test observes is the order the caller asked for.
         let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -255,31 +295,49 @@ impl Route53Provider {
             }
         }
 
+        let mut errors: Vec<String> = Vec::new();
         for (fqdn, values) in groups {
-            let zone = self.zone_id(fqdn).await?;
-            let current = self.current_rrset(&zone, fqdn).await?;
-            let next: Vec<String> = if add {
-                let mut next = current.values.clone();
-                for value in &values {
-                    if !next.iter().any(|v| v == value) {
-                        next.push((*value).to_owned());
-                    }
-                }
-                next
-            } else {
-                current
-                    .values
-                    .iter()
-                    .filter(|v| !values.contains(&v.as_str()))
-                    .cloned()
-                    .collect()
-            };
-            if next == current.values {
-                continue;
+            match self.apply_group(fqdn, &values, add).await {
+                Ok(()) => {}
+                Err(error) if continue_on_error => errors.push(format!("{fqdn}: {error}")),
+                Err(error) => return Err(error),
             }
-            self.write_values(&zone, fqdn, &next, &current).await?;
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "could not change the Route 53 TXT record sets in {} of the affected zones: {}",
+                errors.len(),
+                errors.join("; ")
+            ))
+        }
+    }
+
+    /// One read-modify-write for a single challenge name.
+    async fn apply_group(&self, fqdn: &str, values: &[&str], add: bool) -> Result<(), String> {
+        let zone = self.zone_id(fqdn).await?;
+        let current = self.current_rrset(&zone, fqdn).await?;
+        let next: Vec<String> = if add {
+            let mut next = current.values.clone();
+            for value in values {
+                if !next.iter().any(|v| v == value) {
+                    next.push((*value).to_owned());
+                }
+            }
+            next
+        } else {
+            current
+                .values
+                .iter()
+                .filter(|v| !values.contains(&v.as_str()))
+                .cloned()
+                .collect()
+        };
+        if next == current.values {
+            return Ok(());
+        }
+        self.write_values(&zone, fqdn, &next, &current).await
     }
 }
 
@@ -327,16 +385,19 @@ impl DnsProvider for Route53Provider {
         &'a self,
         records: &'a [TxtRecord],
     ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(self.apply_batch(records, true))
+        Box::pin(self.apply_batch(records, true, false))
     }
 
     /// The mirror of [`upsert_txt_batch`](Self::upsert_txt_batch): removing two
     /// values at one name one at a time lets a stale read resurrect the first.
+    ///
+    /// Cleanup is best-effort: every affected zone's change is attempted even
+    /// after one fails, and the failures are reported together (issue #2478).
     fn delete_txt_batch<'a>(
         &'a self,
         records: &'a [TxtRecord],
     ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(self.apply_batch(records, false))
+        Box::pin(self.apply_batch(records, false, true))
     }
 }
 
@@ -463,6 +524,37 @@ fn hosted_zone_id_for(xml: &str, candidate: &str) -> Option<String> {
 /// zone.
 fn is_private_zone(zone: &str) -> bool {
     xml_element(zone, "PrivateZone").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+}
+
+/// The pagination cursor of a `ListHostedZonesByName` response, if following
+/// it can still turn up a public zone exactly named `candidate`.
+///
+/// Returns the next page's `(dnsname, hosted_zone_id)` — the id with Route
+/// 53's `/hostedzone/` prefix stripped, since the prefix's slashes would need
+/// escaping in the query string and the API accepts the bare id.
+///
+/// Route 53 names the next page only when the answer was truncated
+/// (`<IsTruncated>true</IsTruncated>`), and pages advance in lexicographic
+/// name order: once `NextDNSName` sorts past the candidate, no later page can
+/// carry it and the lookup is over (returning `None` rather than blindly
+/// following the cursor to the end of the account's zone list).
+fn next_zone_page(xml: &str, candidate: &str) -> Option<(String, String)> {
+    let truncated =
+        xml_element(xml, "IsTruncated").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+    let next_name = xml_element(xml, "NextDNSName")?;
+    let next_id = xml_element(xml, "NextHostedZoneId")?;
+    let wanted = candidate.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !truncated
+        || next_name.trim().trim_end_matches('.').to_ascii_lowercase() > wanted
+        || next_name.trim().is_empty()
+    {
+        return None;
+    }
+    let id = strip_zone_prefix(next_id);
+    if !is_hosted_zone_id(id) {
+        return None;
+    }
+    Some((next_name.trim().to_owned(), id.to_owned()))
 }
 
 /// The `_acme-challenge` TXT record set as Route 53 currently holds it.
@@ -1148,6 +1240,193 @@ mod tests {
             2,
             "a Route 53 DELETE must carry the set exactly as it stands: {}",
             changes[0]
+        );
+    }
+
+    /// A `ListHostedZonesByName` page naming one public zone.
+    fn zone_named(name: &str, id: &str) -> String {
+        format!(
+            "<ListHostedZonesByNameResponse><HostedZones>\
+             <HostedZone><Id>/hostedzone/{id}</Id><Name>{name}</Name>\
+             <Config><PrivateZone>false</PrivateZone></Config></HostedZone>\
+             </HostedZones><IsTruncated>false</IsTruncated></ListHostedZonesByNameResponse>"
+        )
+    }
+
+    /// A `ListHostedZonesByName` page with no zones at all — the shape a lookup
+    /// for a not-yet-tried candidate suffix answers when nothing is there.
+    fn no_zones() -> &'static str {
+        "<ListHostedZonesByNameResponse><HostedZones></HostedZones>\
+         <IsTruncated>false</IsTruncated></ListHostedZonesByNameResponse>"
+    }
+
+    /// A `ListResourceRecordSets` answer carrying `values` at exactly `fqdn`.
+    fn rrset_at(fqdn: &str, values: &[&str]) -> String {
+        let mut records = String::new();
+        for value in values {
+            use std::fmt::Write as _;
+            let _ = write!(
+                records,
+                "<ResourceRecord><Value>&quot;{value}&quot;</Value></ResourceRecord>"
+            );
+        }
+        format!(
+            "<ListResourceRecordSetsResponse><ResourceRecordSets><ResourceRecordSet>\
+             <Name>{fqdn}.</Name><Type>TXT</Type><TTL>60</TTL>\
+             <ResourceRecords>{records}</ResourceRecords></ResourceRecordSet>\
+             </ResourceRecordSets></ListResourceRecordSetsResponse>"
+        )
+    }
+
+    /// A truncated `ListHostedZonesByName` page: ten zones, none of them the
+    /// candidate, with the pagination cursor pointing at the next page.
+    fn truncated_zone_page() -> String {
+        let mut zones = String::new();
+        for n in 0..10 {
+            use std::fmt::Write as _;
+            let _ = write!(
+                zones,
+                "<HostedZone><Id>/hostedzone/Z00000000{n:02}</Id>\
+                 <Name>aaa{n}.example.com.</Name>\
+                 <Config><PrivateZone>false</PrivateZone></Config></HostedZone>"
+            );
+        }
+        format!(
+            "<ListHostedZonesByNameResponse><HostedZones>{zones}</HostedZones>\
+             <IsTruncated>true</IsTruncated>\
+             <NextDNSName>aaa9.example.com.</NextDNSName>\
+             <NextHostedZoneId>/hostedzone/Z0000000009</NextHostedZoneId>\
+             <MaxItems>10</MaxItems></ListHostedZonesByNameResponse>"
+        )
+    }
+
+    /// Regression (#2478): cleanup is best-effort. When the change for one
+    /// zone fails, the other zones' changes are still attempted, and the batch
+    /// reports the failure with the failing zone named rather than swallowing
+    /// the rest.
+    #[tokio::test]
+    async fn cleanup_attempts_every_zone_even_after_a_failure() {
+        const RRSET_LIST_A: &str = "GET /2013-04-01/hostedzone/ZA/rrset";
+        const RRSET_CHANGE_A: &str = "POST /2013-04-01/hostedzone/ZA/rrset/";
+        const RRSET_LIST_B: &str = "GET /2013-04-01/hostedzone/ZB/rrset";
+        const RRSET_CHANGE_B: &str = "POST /2013-04-01/hostedzone/ZB/rrset/";
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, no_zones()),
+            (ZONE_LOOKUP, &zone_named("a.com.", "ZA")),
+            (ZONE_LOOKUP, no_zones()),
+            (ZONE_LOOKUP, &zone_named("b.com.", "ZB")),
+            (
+                RRSET_LIST_A,
+                &rrset_at("_acme-challenge.a.com", &["value-a"]),
+            ),
+            (
+                RRSET_LIST_B,
+                &rrset_at("_acme-challenge.b.com", &["value-b"]),
+            ),
+            (RRSET_CHANGE_B, changed()),
+        ]);
+        // Zone A's change is throttled; it must not take zone B's cleanup
+        // down with it.
+        let transport = transport.then(
+            RRSET_CHANGE_A,
+            400,
+            "<ErrorResponse><Error><Message>Rate exceeded</Message></Error></ErrorResponse>",
+        );
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        let error = provider
+            .delete_txt_batch(&[
+                TxtRecord::new("a.com", "value-a"),
+                TxtRecord::new("b.com", "value-b"),
+            ])
+            .await
+            .expect_err("one zone's change fails, so the batch fails");
+
+        // Both zones' changes were attempted — zone B is not abandoned.
+        let calls = transport.calls();
+        assert!(
+            calls.contains(&RRSET_CHANGE_A.to_owned()),
+            "zone A's change was sent: {calls:?}"
+        );
+        assert!(
+            calls.contains(&RRSET_CHANGE_B.to_owned()),
+            "zone B's change was sent even though A's failed: {calls:?}"
+        );
+        // And the failure is reported with the failing zone named.
+        assert!(
+            error.contains("_acme-challenge.a.com"),
+            "the failing zone is named: {error}"
+        );
+        assert!(
+            error.contains("Rate exceeded"),
+            "the underlying error survives aggregation: {error}"
+        );
+        assert!(
+            !error.contains("_acme-challenge.b.com"),
+            "the successful zone is not blamed: {error}"
+        );
+    }
+
+    /// Regression (#2478): an account with more zones than one `maxitems=10`
+    /// page answers the public zone on a LATER page. The lookup follows the
+    /// pagination cursor instead of claiming no hosted zone exists.
+    #[tokio::test]
+    async fn zone_lookup_follows_pagination_to_a_later_page() {
+        let transport = RecordingTransport::new(&[
+            (ZONE_LOOKUP, &truncated_zone_page()),
+            (ZONE_LOOKUP, &zone_named("myapp.com.", "ZPUBLIC")),
+        ]);
+        let provider = r53(std::sync::Arc::clone(&transport));
+
+        let id = provider
+            .zone_id("myapp.com")
+            .await
+            .expect("the public zone on the second page is found");
+        assert_eq!(id, "ZPUBLIC");
+
+        let lookups: Vec<String> = transport
+            .sent()
+            .into_iter()
+            .filter(|r| r.method == "GET")
+            .map(|r| r.url)
+            .collect();
+        assert_eq!(lookups.len(), 2, "exactly two pages were read: {lookups:?}");
+        assert!(
+            lookups[1].contains("dnsname=aaa9.example.com."),
+            "the second page follows the response's cursor: {}",
+            lookups[1]
+        );
+        assert!(
+            lookups[1].contains("hostedzoneid=Z0000000009"),
+            "the cursor carries the bare zone id: {}",
+            lookups[1]
+        );
+    }
+
+    /// The pagination cursor is followed only while the names it points at can
+    /// still match the candidate.
+    #[test]
+    fn zone_page_cursor_stops_past_the_candidate() {
+        // The cursor already moved past `myapp.com`: no later page can carry
+        // it, so following the cursor would page through the whole account.
+        let xml = "<ListHostedZonesByNameResponse><IsTruncated>true</IsTruncated>\
+                   <NextDNSName>zzz.example.com.</NextDNSName>\
+                   <NextHostedZoneId>/hostedzone/Z9999999999</NextHostedZoneId>\
+                   </ListHostedZonesByNameResponse>";
+        assert_eq!(next_zone_page(xml, "myapp.com"), None);
+
+        // Not truncated: there is no next page to follow.
+        let xml = truncated_zone_page().replace(
+            "<IsTruncated>true</IsTruncated>",
+            "<IsTruncated>false</IsTruncated>",
+        );
+        assert_eq!(next_zone_page(&xml, "myapp.com"), None);
+
+        // Truncated mid-list: the cursor is followed, the id stripped of
+        // Route 53's `/hostedzone/` prefix.
+        assert_eq!(
+            next_zone_page(&truncated_zone_page(), "myapp.com"),
+            Some(("aaa9.example.com.".to_owned(), "Z0000000009".to_owned()))
         );
     }
 
