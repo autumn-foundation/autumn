@@ -5,7 +5,7 @@
 //! from a [`crate::entropy::SeededEntropy`], as it does under
 //! [`#[sim_test]`](crate::sim_test) — reproducible.
 //!
-//! Five gates run before the sample rate is even consulted, cheapest first:
+//! Six gates run before the sample rate is even consulted, cheapest first:
 //!
 //! 1. **Method.** Only [`MIRRORABLE_METHODS`] (`GET`/`HEAD`). This slice
 //!    mirrors idempotent traffic only, and the set is a constant rather than a
@@ -14,7 +14,15 @@
 //!    mirrored request. Mirroring it again — which is what happens the moment
 //!    someone points a shadow target at the app itself, or chains two shadows —
 //!    would multiply traffic without bound.
-//! 3. **Conditional requests.** A `GET`/`HEAD` carrying `If-None-Match`,
+//! 3. **Request body.** A request that carries a body (issue #2332) is
+//!    never mirrored — whether the body is declared by the headers or
+//!    undeclared (frames with no `Content-Length`/`Transfer-Encoding`,
+//!    reachable on HTTP/2). The mirror replays method, target, and headers
+//!    but no body, so mirroring one would ask the candidate a *different*
+//!    request than the live build answered and record the manufactured
+//!    difference as a divergence. Until the mutating-traffic follow-up
+//!    brings real request-body replay, these requests sit out quietly.
+//! 4. **Conditional requests.** A `GET`/`HEAD` carrying `If-None-Match`,
 //!    `If-Modified-Since`, `If-Range` (or `If-Match`/`If-Unmodified-Since`)
 //!    is a cache revalidation, and a validator is scoped to the build that
 //!    issued it. Replaying the primary's validator to the candidate makes the
@@ -25,11 +33,11 @@
 //!    that masks a genuine body regression. Conditional traffic is never
 //!    mirrored (issue #2335); the skip is counted separately so the report
 //!    shows how much coverage this costs on cache-heavy routes.
-//! 4. **Exempt paths.** The actuator prefix and the platform probe paths. A
+//! 5. **Exempt paths.** The actuator prefix and the platform probe paths. A
 //!    load balancer's health checks are the highest-rate, least-interesting
 //!    traffic an app serves; mirroring them buys nothing and drowns the
 //!    candidate.
-//! 5. **Route allowlist.** Empty means "every eligible route".
+//! 6. **Route allowlist.** Empty means "every eligible route".
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
@@ -49,7 +57,10 @@
     )
 )]
 
-use axum::http::{HeaderMap, Method};
+use axum::http::{
+    HeaderMap, Method,
+    header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+};
 
 use crate::entropy::Entropy;
 
@@ -84,6 +95,11 @@ pub enum SkipReason {
     Method,
     /// The request is itself a mirrored request.
     LoopGuard,
+    /// The request carries a body the mirror cannot replay (issue #2332) —
+    /// declared by its headers or undeclared. Mirroring it would ask the
+    /// candidate a different request than the live build answered and record
+    /// the manufactured difference as a divergence.
+    HasRequestBody,
     /// A conditional request (`If-None-Match`, `If-Modified-Since`,
     /// `If-Range`, `If-Match`, `If-Unmodified-Since`): a cache revalidation
     /// whose validator belongs to the primary's build, so mirroring it would
@@ -105,6 +121,7 @@ impl SkipReason {
         match self {
             Self::Method => "method",
             Self::LoopGuard => "loop_guard",
+            Self::HasRequestBody => "has_request_body",
             Self::Conditional => "conditional",
             Self::ExemptPath => "exempt_path",
             Self::RouteNotOptedIn => "route_not_opted_in",
@@ -201,7 +218,17 @@ impl MirrorSelector {
 
     /// Decide whether to mirror one request.
     ///
-    /// `roll` is a **thunk**, not a value: it is called only once the five
+    /// `body_known_empty` is the request body's own end-of-stream signal
+    /// (`http_body::Body::is_end_stream`, read by the caller — the decision
+    /// point never sees the body itself): `true` means the body is
+    /// definitely empty. Together with the header check in
+    /// `request_carries_body` this catches both declared bodies and
+    /// *undeclared* ones — frames with no `Content-Length` or
+    /// `Transfer-Encoding`, reachable on HTTP/2 (issue #2332). When in doubt
+    /// the request sits out: a skipped mirror costs coverage, a mirrored
+    /// body-carrying request manufactures divergences.
+    ///
+    /// `roll` is a **thunk**, not a value: it is called only once the six
     /// cheap gates above have passed. On an app with mirroring enabled this
     /// runs on every inbound request, and the entropy source behind
     /// [`roll_from`] takes a lock — so drawing eagerly would put a lock
@@ -213,6 +240,7 @@ impl MirrorSelector {
         method: &Method,
         target: &str,
         headers: &HeaderMap,
+        body_known_empty: bool,
         roll: impl FnOnce() -> f64,
     ) -> MirrorDecision {
         if !MIRRORABLE_METHODS.contains(method) {
@@ -220,6 +248,13 @@ impl MirrorSelector {
         }
         if headers.contains_key(SHADOW_HEADER) {
             return MirrorDecision::Skip(SkipReason::LoopGuard);
+        }
+        // A body-carrying GET/HEAD is never mirrored (issue #2332): declared
+        // via `request_carries_body`, or undeclared — frames with no
+        // `Content-Length`/`Transfer-Encoding` — via the body's own
+        // end-of-stream signal. Fails closed: doubt means no mirror.
+        if !body_known_empty || request_carries_body(headers) {
+            return MirrorDecision::Skip(SkipReason::HasRequestBody);
         }
         if is_conditional(headers) {
             return MirrorDecision::Skip(SkipReason::Conditional);
@@ -279,6 +314,46 @@ fn path_of(target: &str) -> &str {
     target.split('?').next().unwrap_or(target)
 }
 
+/// Whether the request's headers promise a body.
+///
+/// This is the header half of the #2332 body check in [`decide`]: the other
+/// half is the body's own end-of-stream signal, which catches *undeclared*
+/// bodies — frames with no `Content-Length`/`Transfer-Encoding`.
+///
+/// A `GET`/`HEAD` carrying a request body is unusual but legal: RFC 9110
+/// does not forbid it, and search APIs do use it. The mirror replays
+/// method, target, and headers but no body — it cannot carry the promise
+/// across — so mirroring such a request would ask the candidate a
+/// *different* question than the live build answered and record the
+/// manufactured difference as a divergence (issue #2332). The
+/// mutating-traffic follow-up owns real request-body replay; until then
+/// the safe stopgap the issue endorses is to sit these requests out.
+///
+/// Any `Transfer-Encoding` means a framed body follows. A non-zero
+/// `Content-Length` promises body bytes; `0` and absent mean none. An
+/// unparseable `Content-Length` fails closed to carrying: the request is
+/// malformed, and the live build may answer with a `400` the mirror could
+/// not replay.
+#[must_use]
+fn request_carries_body(headers: &HeaderMap) -> bool {
+    if headers.contains_key(TRANSFER_ENCODING) {
+        return true;
+    }
+    headers.get(CONTENT_LENGTH).is_some_and(|value| {
+        // Only `Some(0)` promises no body. A present-but-unparseable value
+        // fails closed to carrying (the doc comment's contract): the request
+        // is malformed, and the live build may answer with a `400` the
+        // mirror could not replay.
+        !matches!(
+            value
+                .to_str()
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok()),
+            Some(0)
+        )
+    })
+}
+
 /// Whether the request is a conditional one — a cache revalidation carrying a
 /// validator (`If-None-Match`, `If-Modified-Since`, `If-Range`), or a
 /// conditional write guard (`If-Match`, `If-Unmodified-Since`) which cannot
@@ -329,7 +404,7 @@ mod tests {
         let selector = selector();
         for method in [Method::GET, Method::HEAD] {
             assert_eq!(
-                selector.decide(&method, "/api/orders", &HeaderMap::new(), || 0.0),
+                selector.decide(&method, "/api/orders", &HeaderMap::new(), true, || 0.0),
                 MirrorDecision::Mirror
             );
         }
@@ -346,7 +421,7 @@ mod tests {
             Method::OPTIONS,
         ] {
             assert_eq!(
-                selector.decide(&method, "/api/orders", &HeaderMap::new(), || 0.0),
+                selector.decide(&method, "/api/orders", &HeaderMap::new(), true, || 0.0),
                 MirrorDecision::Skip(SkipReason::Method),
                 "{method} must not be mirrored"
             );
@@ -359,8 +434,33 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(SHADOW_HEADER, HeaderValue::from_static(SHADOW_HEADER_VALUE));
         assert_eq!(
-            selector.decide(&Method::GET, "/api/orders", &headers, || 0.0),
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
             MirrorDecision::Skip(SkipReason::LoopGuard)
+        );
+    }
+
+    #[test]
+    fn a_get_with_a_nonzero_content_length_is_never_mirrored() {
+        let selector = selector();
+        for length in ["1", "42", " 17 "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static(length));
+            assert_eq!(
+                selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+                MirrorDecision::Skip(SkipReason::HasRequestBody),
+                "a GET with Content-Length {length} must not be mirrored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_head_with_a_nonzero_content_length_is_never_mirrored() {
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("9"));
+        assert_eq!(
+            selector.decide(&Method::HEAD, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Skip(SkipReason::HasRequestBody)
         );
     }
 
@@ -382,7 +482,7 @@ mod tests {
                 let mut headers = HeaderMap::new();
                 headers.insert(name, HeaderValue::from_str(value).expect("header value"));
                 assert_eq!(
-                    selector.decide(&method, "/api/orders", &headers, || 0.0),
+                    selector.decide(&method, "/api/orders", &headers, true, || 0.0),
                     MirrorDecision::Skip(SkipReason::Conditional),
                     "{method} with {name} must not be mirrored"
                 );
@@ -395,9 +495,119 @@ mod tests {
             HeaderValue::from_static("application/json"),
         );
         assert_eq!(
-            selector.decide(&Method::GET, "/api/orders", &headers, || 0.0),
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
             MirrorDecision::Mirror
         );
+    }
+
+    #[test]
+    fn any_transfer_encoding_marks_a_get_as_body_carrying() {
+        let selector = selector();
+        for encoding in ["chunked", "gzip, chunked"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(TRANSFER_ENCODING, HeaderValue::from_static(encoding));
+            assert_eq!(
+                selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+                MirrorDecision::Skip(SkipReason::HasRequestBody),
+                "Transfer-Encoding: {encoding} means a framed body follows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_get_with_a_zero_or_absent_content_length_is_still_mirrored() {
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Mirror,
+            "Content-Length: 0 promises no body"
+        );
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || 0.0),
+            MirrorDecision::Mirror,
+            "a GET with no framing headers is the normal mirrorable case"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_content_length_fails_closed_to_skipping() {
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("seventeen"));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Skip(SkipReason::HasRequestBody),
+            "a malformed Content-Length cannot be proven empty"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_body_on_a_get_is_never_mirrored() {
+        // No `Content-Length`, no `Transfer-Encoding`: on HTTP/2 a client can
+        // legally send DATA frames on a GET stream without declaring them.
+        // The headers alone would wave this through; the body's own
+        // end-of-stream signal is what catches it (issue #2332, option 1).
+        let selector = selector();
+        let drew = std::cell::Cell::new(false);
+        assert_eq!(
+            selector.decide(
+                &Method::GET,
+                "/api/orders",
+                &HeaderMap::new(),
+                false,
+                || {
+                    drew.set(true);
+                    0.0
+                }
+            ),
+            MirrorDecision::Skip(SkipReason::HasRequestBody),
+            "an undeclared body must not be mirrored"
+        );
+        assert!(!drew.get(), "the body gate must decide before the roll");
+    }
+
+    #[test]
+    fn an_undeclared_body_beats_a_zero_content_length() {
+        // The headers say "no body" but the stream disagrees. Fail closed:
+        // the live build may be reading frames the mirror cannot replay.
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, false, || 0.0),
+            MirrorDecision::Skip(SkipReason::HasRequestBody)
+        );
+    }
+
+    #[test]
+    fn a_declared_body_skips_even_when_the_stream_reports_empty() {
+        // The two signals are ORed, not ANDed: either one alone is enough to
+        // sit the request out.
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Skip(SkipReason::HasRequestBody)
+        );
+    }
+
+    #[test]
+    fn the_body_gate_runs_before_the_sampling_roll() {
+        // Like the other cheap gates, a body-carrying GET must decide without
+        // touching the entropy source.
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let drew = std::cell::Cell::new(false);
+        let decision = selector.decide(&Method::GET, "/api/orders", &headers, true, || {
+            drew.set(true);
+            0.0
+        });
+        assert_eq!(decision, MirrorDecision::Skip(SkipReason::HasRequestBody));
+        assert!(!drew.get(), "the body gate must decide before the roll");
     }
 
     #[test]
@@ -405,7 +615,7 @@ mod tests {
         let selector = selector();
         for path in ["/actuator", "/actuator/health", "/healthz"] {
             assert_eq!(
-                selector.decide(&Method::GET, path, &HeaderMap::new(), || 0.0),
+                selector.decide(&Method::GET, path, &HeaderMap::new(), true, || 0.0),
                 MirrorDecision::Skip(SkipReason::ExemptPath),
                 "{path} must be exempt"
             );
@@ -416,6 +626,7 @@ mod tests {
                 &Method::GET,
                 "/actuatorsomething",
                 &HeaderMap::new(),
+                true,
                 || 0.0
             ),
             MirrorDecision::Mirror
@@ -426,7 +637,13 @@ mod tests {
     fn an_empty_route_list_opts_every_route_in() {
         let selector = selector();
         assert_eq!(
-            selector.decide(&Method::GET, "/anything/at/all", &HeaderMap::new(), || 0.0),
+            selector.decide(
+                &Method::GET,
+                "/anything/at/all",
+                &HeaderMap::new(),
+                true,
+                || 0.0
+            ),
             MirrorDecision::Mirror
         );
     }
@@ -441,14 +658,14 @@ mod tests {
         );
         for path in ["/api/orders", "/api/", "/status"] {
             assert_eq!(
-                selector.decide(&Method::GET, path, &HeaderMap::new(), || 0.0),
+                selector.decide(&Method::GET, path, &HeaderMap::new(), true, || 0.0),
                 MirrorDecision::Mirror,
                 "{path} must match"
             );
         }
         for path in ["/apiary", "/status/detail", "/"] {
             assert_eq!(
-                selector.decide(&Method::GET, path, &HeaderMap::new(), || 0.0),
+                selector.decide(&Method::GET, path, &HeaderMap::new(), true, || 0.0),
                 MirrorDecision::Skip(SkipReason::RouteNotOptedIn),
                 "{path} must not match"
             );
@@ -463,6 +680,7 @@ mod tests {
                 &Method::GET,
                 "/api/orders?page=2",
                 &HeaderMap::new(),
+                true,
                 || 0.0
             ),
             MirrorDecision::Mirror
@@ -474,7 +692,9 @@ mod tests {
         let selector = MirrorSelector::new(0.0, &[], "/actuator", &[]);
         for roll in [0.0, 0.5, 0.999] {
             assert_eq!(
-                selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), || roll),
+                selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || {
+                    roll
+                }),
                 MirrorDecision::Skip(SkipReason::NotSampled)
             );
         }
@@ -484,11 +704,11 @@ mod tests {
     fn sample_rate_is_a_deterministic_function_of_the_roll() {
         let selector = MirrorSelector::new(0.25, &[], "/actuator", &[]);
         assert_eq!(
-            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), || 0.1),
+            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || 0.1),
             MirrorDecision::Mirror
         );
         assert_eq!(
-            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), || 0.9),
+            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || 0.9),
             MirrorDecision::Skip(SkipReason::NotSampled)
         );
     }
@@ -514,22 +734,28 @@ mod tests {
 
         // Wrong method, conditional request, exempt path, and un-opted-in route
         // must all decide without touching the entropy source.
-        let _ = selector.decide(&Method::POST, "/api/orders", &HeaderMap::new(), roll);
+        let _ = selector.decide(&Method::POST, "/api/orders", &HeaderMap::new(), true, roll);
         assert_eq!(draws.get(), 0);
         let mut conditional = HeaderMap::new();
         conditional.insert(
             axum::http::header::IF_NONE_MATCH,
             HeaderValue::from_static("\"x\""),
         );
-        let _ = selector.decide(&Method::GET, "/api/orders", &conditional, roll);
+        let _ = selector.decide(&Method::GET, "/api/orders", &conditional, true, roll);
         assert_eq!(draws.get(), 0);
-        let _ = selector.decide(&Method::GET, "/actuator/health", &HeaderMap::new(), roll);
+        let _ = selector.decide(
+            &Method::GET,
+            "/actuator/health",
+            &HeaderMap::new(),
+            true,
+            roll,
+        );
         assert_eq!(draws.get(), 0);
-        let _ = selector.decide(&Method::GET, "/elsewhere", &HeaderMap::new(), roll);
+        let _ = selector.decide(&Method::GET, "/elsewhere", &HeaderMap::new(), true, roll);
         assert_eq!(draws.get(), 0);
 
         // An eligible request does draw.
-        let _ = selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), roll);
+        let _ = selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, roll);
         assert_eq!(draws.get(), 1);
     }
 
@@ -537,10 +763,11 @@ mod tests {
     fn a_zero_sample_rate_never_draws_at_all() {
         let selector = MirrorSelector::new(0.0, &[], "/actuator", &[]);
         let drew = std::cell::Cell::new(false);
-        let decision = selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), || {
-            drew.set(true);
-            0.0
-        });
+        let decision =
+            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || {
+                drew.set(true);
+                0.0
+            });
         assert_eq!(decision, MirrorDecision::Skip(SkipReason::NotSampled));
         assert!(!drew.get(), "a disabled sample rate must not draw entropy");
     }
@@ -549,6 +776,7 @@ mod tests {
     fn skip_reasons_have_stable_metric_labels() {
         assert_eq!(SkipReason::Method.as_str(), "method");
         assert_eq!(SkipReason::LoopGuard.as_str(), "loop_guard");
+        assert_eq!(SkipReason::HasRequestBody.as_str(), "has_request_body");
         assert_eq!(SkipReason::Conditional.as_str(), "conditional");
         assert_eq!(SkipReason::ExemptPath.as_str(), "exempt_path");
         assert_eq!(SkipReason::RouteNotOptedIn.as_str(), "route_not_opted_in");
