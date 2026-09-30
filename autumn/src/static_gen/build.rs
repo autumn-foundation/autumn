@@ -282,10 +282,14 @@ pub async fn render_static_routes(
 
     // Render concurrently
     let results: Vec<Result<(String, ManifestEntry), BuildError>> =
-        futures::stream::iter(jobs.iter().map(|job| {
+        // Consume `jobs` by value: a `|job: &RenderJob|` closure makes rustc
+        // infer a single concrete region for the returned `async move` block,
+        // and the `Send` check then fails with "implementation of `FnOnce` is
+        // not general enough", poisoning every future that awaits this fn.
+        futures::stream::iter(jobs.into_iter().map(|job| {
             let router = router.clone();
             let staging = staging.clone();
-            let url = job.url.clone();
+            let url = job.url;
             let revalidate = job.revalidate;
             async move {
                 eprintln!("  Rendering {url} ...");
@@ -445,6 +449,15 @@ mod tests {
 
     /// Router whose handler declares `text/html; charset=utf-8`, the shape a
     /// real `#[static_get]` page handler (returning `Markup`) produces.
+    /// Regression: the render future must be provably `Send` so `run()` can be
+    /// spawned. A by-reference job closure breaks this at compile time.
+    #[test]
+    fn render_static_routes_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let fut = render_static_routes(axum::Router::new(), &[], Path::new("unused"));
+        assert_send(&fut);
+    }
+
     fn html_router() -> axum::Router {
         axum::Router::new().fallback(axum::routing::get(|uri: axum::http::Uri| async move {
             axum::response::Html(format!("<h1>{}</h1>", uri.path()))
