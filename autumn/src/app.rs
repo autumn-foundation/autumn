@@ -5395,16 +5395,27 @@ impl AppBuilder {
             Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
         > = match bound_listener {
             BoundListener::Tcp(listener) => {
+                // The listener is wrapped (`StopAcceptingOnShutdown`), so the
+                // connect info is `TcpPeer`; this re-stamps the
+                // `ConnectInfo<SocketAddr>` everything below reads.
+                let service = tower::Layer::layer(
+                    &axum::middleware::from_fn(crate::accept_drain::stamp_tcp_peer),
+                    service,
+                );
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                        std::net::SocketAddr,
+                        crate::accept_drain::TcpPeer,
                     >(service);
                 Box::pin(async move {
-                    axum::serve(listener, make_service)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown_wait.cancelled().await;
-                        })
-                        .await
+                    axum::serve(
+                        crate::accept_drain::StopAcceptingOnShutdown::new(
+                            listener,
+                            server_shutdown_wait.clone(),
+                        ),
+                        make_service,
+                    )
+                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
+                    .await
                 })
             }
             #[cfg(unix)]
@@ -5422,11 +5433,15 @@ impl AppBuilder {
                         UdsConnectInfo,
                     >(service);
                 Box::pin(async move {
-                    axum::serve(listener, make_service)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown_wait.cancelled().await;
-                        })
-                        .await
+                    axum::serve(
+                        crate::accept_drain::StopAcceptingOnShutdown::new(
+                            listener,
+                            server_shutdown_wait.clone(),
+                        ),
+                        make_service,
+                    )
+                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
+                    .await
                 })
             }
             // HTTPS arm: mirrors the TCP arm. The connect info is
@@ -5458,11 +5473,15 @@ impl AppBuilder {
                         crate::tls::TlsConnectInfo,
                     >(service);
                 Box::pin(async move {
-                    axum::serve(listener, make_service)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown_wait.cancelled().await;
-                        })
-                        .await
+                    axum::serve(
+                        crate::accept_drain::StopAcceptingOnShutdown::new(
+                            listener,
+                            server_shutdown_wait.clone(),
+                        ),
+                        make_service,
+                    )
+                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
+                    .await
                 })
             }
         };
@@ -10135,6 +10154,27 @@ impl
     > for UdsConnectInfo
 {
     fn connect_info(_stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        Self
+    }
+}
+
+/// The UDS serve path wraps its listener in `StopAcceptingOnShutdown` (see
+/// `accept_drain`), so the connect info must be available for the wrapper too.
+#[cfg(unix)]
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<tokio::net::UnixListener>,
+        >,
+    > for UdsConnectInfo
+{
+    fn connect_info(
+        _stream: axum::serve::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<tokio::net::UnixListener>,
+        >,
+    ) -> Self {
         Self
     }
 }
