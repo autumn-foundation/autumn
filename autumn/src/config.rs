@@ -612,6 +612,31 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
     toml::Value::Table(table)
 }
 
+/// The profile's smart defaults for `(prestop_grace_secs, shutdown_timeout_secs)`,
+/// read from the same source the runtime loader applies: the normalized
+/// profile's smart-default TOML over the schema defaults (#2442).
+///
+/// External tooling (`autumn serve`, `autumn dev`) seeds its shutdown-budget
+/// resolver from this so a parent process waits the budget the child daemon will
+/// actually use — for an unconfigured `dev` project that is 0+1, not 5+30.
+#[must_use]
+pub fn shutdown_budget_profile_defaults(profile: Option<&str>) -> (u64, u64) {
+    let canonical = profile.and_then(normalize_profile_name);
+    let defaults = profile_defaults_as_toml(canonical.as_deref().unwrap_or_default());
+    let server = defaults.get("server");
+    let prestop = server
+        .and_then(|s| s.get("prestop_grace_secs"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or_else(default_prestop_grace);
+    let shutdown = server
+        .and_then(|s| s.get("shutdown_timeout_secs"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or_else(default_shutdown_timeout);
+    (prestop, shutdown)
+}
+
 #[cfg(feature = "mail")]
 fn has_mail_transport_source(merged: &toml::Value, env: &dyn Env) -> bool {
     merged
@@ -17895,6 +17920,43 @@ path = "/healthz"
         assert!(
             !config.security.headers.strict_transport_security,
             "dev profile must not force HSTS on (local http development)"
+        );
+    }
+
+    #[test]
+    fn shutdown_budget_profile_defaults_follow_the_profile_smart_defaults() {
+        // The budget a parent process waits on must equal the runtime's own
+        // smart defaults for the profile (issue #2442). Asserted explicitly
+        // against the parsed AutumnConfig so the two cannot drift silently.
+        for (profile, prestop, shutdown) in [
+            ("dev", 0u64, 1u64),
+            ("development", 0u64, 1u64),
+            ("prod", 5u64, 30u64),
+            ("production", 5u64, 30u64),
+            ("staging", 5u64, 30u64),
+        ] {
+            let defaults =
+                profile_defaults_as_toml(&normalize_profile_name(profile).unwrap_or_default());
+            let config: AutumnConfig =
+                toml::from_str(&toml::to_string(&defaults).unwrap()).unwrap();
+            assert_eq!(
+                shutdown_budget_profile_defaults(Some(profile)),
+                (prestop, shutdown),
+                "profile {profile}"
+            );
+            assert_eq!(
+                config.server.prestop_grace_secs, prestop,
+                "runtime smart default for profile {profile}"
+            );
+            assert_eq!(
+                config.server.shutdown_timeout_secs, shutdown,
+                "runtime smart default for profile {profile}"
+            );
+        }
+        assert_eq!(
+            shutdown_budget_profile_defaults(None),
+            (default_prestop_grace(), default_shutdown_timeout()),
+            "no profile falls back to the schema defaults"
         );
     }
 

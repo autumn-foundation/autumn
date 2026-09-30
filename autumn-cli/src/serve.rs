@@ -2001,8 +2001,10 @@ fn effective_pin_from(
 }
 
 /// Resolve `(prestop_grace_secs, shutdown_timeout_secs)` with the app's layering
-/// for the given active `profile`. Defaults match the prod/dev profile
-/// smart-defaults for these keys.
+/// for the given active `profile`. Seeded from the profile's own smart defaults
+/// ([`autumn_web::config::shutdown_budget_profile_defaults`]) — the same base
+/// the runtime loader applies — so a parent process waits the budget the child
+/// daemon will actually use (#2442).
 pub fn resolve_shutdown_budget(base_dir: &Path, profile: Option<&str>) -> (u64, u64) {
     resolve_shutdown_budget_from(base_dir, profile, &|key| std::env::var(key).ok())
 }
@@ -2023,8 +2025,10 @@ pub fn resolve_shutdown_budget_from(
     profile: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> (u64, u64) {
-    let mut prestop = 5u64;
-    let mut shutdown = 30u64;
+    // Seed from the profile's own smart defaults — the same base layer the
+    // runtime's config loader applies — so the resolved budget matches what
+    // the child daemon will actually use (#2442).
+    let (mut prestop, mut shutdown) = autumn_web::config::shutdown_budget_profile_defaults(profile);
 
     // Base autumn.toml [server], then inline [profile.<name>].server overrides.
     if let Ok(contents) = std::fs::read_to_string(base_dir.join("autumn.toml"))
@@ -2728,6 +2732,52 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         temp_env::with_vars(clear_shutdown_env(), || {
             assert_eq!(resolve_shutdown_budget(dir.path(), None), (5, 30));
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_seeds_from_the_profile_smart_defaults() {
+        // The resolver must seed from the selected profile's own smart
+        // defaults — the same base the runtime loader applies — so a parent
+        // process waits the budget the child daemon will actually use
+        // (issue #2442). The dev smart defaults are prestop_grace_secs = 0,
+        // shutdown_timeout_secs = 1; prod (and custom/no profile) fall back
+        // to the schema defaults 5/30.
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("dev")), (0, 1));
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("prod")), (5, 30));
+            assert_eq!(
+                resolve_shutdown_budget(dir.path(), Some("staging")),
+                (5, 30)
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_dev_config_overrides_still_win() {
+        // The profile seed is only the base layer: base autumn.toml,
+        // inline [profile.dev], autumn-dev.toml, and the AUTUMN_SERVER__*
+        // environment must each still override it in order.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nshutdown_timeout_secs = 11\n",
+        )
+        .expect("write");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            // Base [server] wins over the (0, 1) dev seed.
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("dev")), (0, 11));
+            // Env wins over everything below it.
+            let injected = |key: &str| match key {
+                "AUTUMN_SERVER__PRESTOP_GRACE_SECS" => Some("4".to_owned()),
+                "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS" => Some("9".to_owned()),
+                _ => None,
+            };
+            assert_eq!(
+                resolve_shutdown_budget_from(dir.path(), Some("dev"), &injected),
+                (4, 9)
+            );
         });
     }
 
