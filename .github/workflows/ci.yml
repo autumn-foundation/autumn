@@ -1622,6 +1622,11 @@ jobs:
           # autumn-search (#1191): the Postgres SearchBackend + DocumentSource
           # suites are testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-search -- --ignored
+          # examples/wiki: autumn-search mounted on Page (issue #2320 T3 Gap
+          # 6) — proves the plugin wiring end to end through the real app,
+          # not just the crate's own generic suite above. Testcontainer-
+          # managed, so no `services:` block is needed.
+          cargo test -p wiki --test search_plugin_integration -- --ignored
           # autumn-billing (#1190): the Postgres `DbBillingStore` contract suite
           # is testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-billing --test mirror_db -- --ignored

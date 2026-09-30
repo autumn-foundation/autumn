@@ -137,6 +137,51 @@ pub async fn search(
     Ok(pages_list_snippet(&pages))
 }
 
+/// Ranked, paginated keyword search through the `autumn-search` plugin
+/// (`lib.rs::search_plugin`, docs/guide/search.md), alongside — not instead
+/// of — the hand-rolled `/search` above.
+///
+/// The plugin's index carries hit identity only (`{index, id, score}`), never
+/// column contents, so results are hydrated back into real `Page` rows via
+/// `search_hydrated` — the same pattern any app follows to turn ranked ids
+/// into displayable records.
+///
+/// Takes `LazyDb`, not `Db`: `search_hydrated` checks out its own connection
+/// from the same pool to query the search backend, before ever calling the
+/// loader below. An eager `Db` would hold a connection for the handler's
+/// whole lifetime while that backend query waited on another one from the
+/// same pool — a self-deadlock at `pool_size = 1`, pool exhaustion under
+/// concurrency otherwise. `LazyDb::checkout` is only called inside the
+/// loader, which `search_hydrated` invokes after the backend query has
+/// already returned and released its connection.
+#[get("/api/v1/search")]
+pub async fn search_ranked(
+    State(state): State<AppState>,
+    Query(params): Query<SearchParams>,
+    page_req: autumn_search::PageRequest,
+    lazy_db: LazyDb,
+) -> AutumnResult<Json<autumn_search::Page<Page>>> {
+    let search = state
+        .extension::<autumn_search::SearchClient>()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("SearchPlugin is not installed"))?;
+    let results = search
+        .search_hydrated::<Page, _, _>(params.q.trim(), &page_req, |ids| async move {
+            let mut db = lazy_db
+                .checkout()
+                .await
+                .map_err(autumn_search::SearchError::backend)?;
+            pages::table
+                .filter(pages::id.eq_any(ids))
+                .select(Page::as_select())
+                .load(&mut db)
+                .await
+                .map_err(autumn_search::SearchError::backend)
+        })
+        .await
+        .map_err(autumn_search::SearchError::into_autumn_error)?;
+    Ok(Json(results))
+}
+
 #[get("/pages/{slug}")]
 pub async fn show(
     Path(slug): Path<String>,
