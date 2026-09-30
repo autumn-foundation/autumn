@@ -119,70 +119,16 @@ impl Default for DevBadgeContext {
 /// Styled like Next.js/Phoenix: dark overlay, monospace font, red accent,
 /// expandable stack frames with source context.
 #[allow(clippy::too_many_lines)]
-pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
-    let status = ctx.status_code;
-    let reason = &ctx.status_reason;
-    let message = &ctx.message;
-    let path = &ctx.path;
-    let request_id = ctx.request_id.as_deref().unwrap_or("n/a");
-    let source_loc = ctx.source_location.as_deref().unwrap_or("");
-    let query = ctx.query.as_deref().unwrap_or("n/a");
-    let headers_str = ctx.headers.to_string();
-    let has_path_params = !ctx
-        .path_params
-        .as_object()
-        .is_none_or(serde_json::Map::is_empty);
-    let has_cookies = !ctx
-        .cookies
-        .as_object()
-        .is_none_or(serde_json::Map::is_empty);
-
+fn render_stack_frames(frames: &[StackFrame]) -> Markup {
     html! {
-        (PreEscaped(DEV_BADGE_STYLES))
-        div #autumn-dev-error-badge {
-            input #autumn-dev-badge-toggle type="checkbox" class="autumn-dev-toggle";
-
-            // Collapsed badge (always visible)
-            label #autumn-dev-badge-collapsed
-                for="autumn-dev-badge-toggle"
-                tabindex="0"
-            {
-                span class="autumn-dev-badge-dot" {}
-                span class="autumn-dev-badge-code" { (status) }
-                span class="autumn-dev-badge-label" { (reason) }
-            }
-
-            // Expanded overlay
-            div #autumn-dev-badge-expanded style="display:none" {
-                div class="autumn-dev-overlay-header" {
-                    div class="autumn-dev-overlay-title" {
-                        span class="autumn-dev-badge-dot" {}
-                        (status) " " (reason)
-                    }
-                    label class="autumn-dev-overlay-close"
-                        for="autumn-dev-badge-toggle"
-                        role="button"
-                        aria-label="Close error details"
-                    {
-                        "\u{00d7}"
-                    }
-                }
-                div class="autumn-dev-overlay-body" {
-
-                    // ── Error message ─────────────────────────────────
-                    div class="autumn-dev-overlay-section" {
-                        div class="autumn-dev-overlay-label" { "Message" }
-                        div class="autumn-dev-overlay-value" { (message) }
-                    }
-
                     // ── Stack trace with source context ───────────────
-                    @if !ctx.stack_frames.is_empty() {
+                    @if !frames.is_empty() {
                         div class="autumn-dev-overlay-section" {
                             div class="autumn-dev-overlay-label" {
-                                "Stack Trace (" (ctx.stack_frames.len()) " frames)"
+                                "Stack Trace (" (frames.len()) " frames)"
                             }
                             div class="autumn-dev-stack-frames" {
-                                @for (i, frame) in ctx.stack_frames.iter().enumerate() {
+                                @for (i, frame) in frames.iter().enumerate() {
                                     @let frame_id = format!("autumn-dev-frame-{i}");
                                     @let is_primary = i == 0 && frame.is_in_workspace;
                                     @if frame.is_in_workspace && !frame.source_context.is_empty() {
@@ -227,6 +173,25 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
                         }
                     }
 
+    }
+}
+
+fn render_request_details(ctx: &DevBadgeContext) -> Markup {
+    let path = &ctx.path;
+    let request_id = ctx.request_id.as_deref().unwrap_or("n/a");
+    let source_loc = ctx.source_location.as_deref().unwrap_or("");
+    let query = ctx.query.as_deref().unwrap_or("n/a");
+    let headers_str = ctx.headers.to_string();
+    let has_path_params = !ctx
+        .path_params
+        .as_object()
+        .is_none_or(serde_json::Map::is_empty);
+    let has_cookies = !ctx
+        .cookies
+        .as_object()
+        .is_none_or(serde_json::Map::is_empty);
+
+    html! {
                     // ── Request section ───────────────────────────────
                     @if let Some(method) = &ctx.method {
                         div class="autumn-dev-overlay-section" {
@@ -281,14 +246,19 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
                         }
                     }
 
+    }
+}
+
+fn render_sql_queries(queries: &[SqlQueryInfo]) -> Markup {
+    html! {
                     // ── SQL queries ───────────────────────────────────
-                    @if !ctx.sql_queries.is_empty() {
+                    @if !queries.is_empty() {
                         div class="autumn-dev-overlay-section" {
                             div class="autumn-dev-overlay-label" {
-                                "SQL Queries (" (ctx.sql_queries.len()) ")"
+                                "SQL Queries (" (queries.len()) ")"
                             }
                             div class="autumn-dev-sql-list" {
-                                @for query in &ctx.sql_queries {
+                                @for query in queries {
                                     div class="autumn-dev-sql-item" {
                                         div class="autumn-dev-sql-stmt" { (query.statement) }
                                         div class="autumn-dev-sql-meta" {
@@ -300,6 +270,55 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
                             }
                         }
                     }
+    }
+}
+
+pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
+    let status = ctx.status_code;
+    let reason = &ctx.status_reason;
+    let message = &ctx.message;
+
+    html! {
+        (PreEscaped(DEV_BADGE_STYLES))
+        div #autumn-dev-error-badge {
+            input #autumn-dev-badge-toggle type="checkbox" class="autumn-dev-toggle";
+
+            // Collapsed badge (always visible)
+            label #autumn-dev-badge-collapsed
+                for="autumn-dev-badge-toggle"
+                tabindex="0"
+            {
+                span class="autumn-dev-badge-dot" {}
+                span class="autumn-dev-badge-code" { (status) }
+                span class="autumn-dev-badge-label" { (reason) }
+            }
+
+            // Expanded overlay
+            div #autumn-dev-badge-expanded style="display:none" {
+                div class="autumn-dev-overlay-header" {
+                    div class="autumn-dev-overlay-title" {
+                        span class="autumn-dev-badge-dot" {}
+                        (status) " " (reason)
+                    }
+                    label class="autumn-dev-overlay-close"
+                        for="autumn-dev-badge-toggle"
+                        role="button"
+                        aria-label="Close error details"
+                    {
+                        "\u{00d7}"
+                    }
+                }
+                div class="autumn-dev-overlay-body" {
+
+                    // ── Error message ─────────────────────────────────
+                    div class="autumn-dev-overlay-section" {
+                        div class="autumn-dev-overlay-label" { "Message" }
+                        div class="autumn-dev-overlay-value" { (message) }
+                    }
+
+                    (render_stack_frames(&ctx.stack_frames))
+                    (render_request_details(ctx))
+                    (render_sql_queries(&ctx.sql_queries))
                 }
             }
         }

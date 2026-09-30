@@ -4578,14 +4578,39 @@ pub mod db_suppression {
 
     use super::{MailError, SuppressionStore};
 
-    diesel::table! {
-        mail_unsubscribes (id) {
-            id -> Int8,
-            subscriber -> Text,
-            list_id -> Text,
-            unsubscribed_at -> Timestamptz,
+    // The `mail_unsubscribes` table as scaffolded by `autumn generate mailer
+    // --list-unsubscribe`. Timestamps are TIMESTAMPTZ on Postgres and RFC 3339
+    // TEXT on SQLite (diesel's `TimestamptzSqlite`), matching the DDL the
+    // generator emits per backend (issue #1927). A single un-forked
+    // `unsubscribed_at -> Timestamptz` used to sit here, which compiled only
+    // because no query touched the column — any `Selectable` over it, a
+    // full-row `Queryable`, or a `.select(mail_unsubscribes::unsubscribed_at)`
+    // broke the `sqlite` build (issue #2697), since `Timestamptz` is
+    // Postgres-only.
+    #[cfg(not(feature = "sqlite"))]
+    mod schema {
+        diesel::table! {
+            mail_unsubscribes (id) {
+                id -> Int8,
+                subscriber -> Text,
+                list_id -> Text,
+                unsubscribed_at -> Timestamptz,
+            }
         }
     }
+    #[cfg(feature = "sqlite")]
+    mod schema {
+        diesel::table! {
+            mail_unsubscribes (id) {
+                id -> Int8,
+                subscriber -> Text,
+                list_id -> Text,
+                unsubscribed_at -> TimestamptzSqlite,
+            }
+        }
+    }
+
+    use schema::mail_unsubscribes;
 
     #[derive(Insertable)]
     #[diesel(table_name = mail_unsubscribes)]
@@ -4728,6 +4753,28 @@ pub mod db_suppression {
                     })?;
                 Ok(())
             })
+        }
+    }
+
+    // Compile-time proof that the forked `unsubscribed_at` column is genuinely
+    // usable on SQLite (issue #2697), not just declared. Before the backend
+    // fork, the SQLite build declared `Timestamptz` here — which has no
+    // `FromSql<_, Sqlite>` impl (see the note in `autumn/src/ledger.rs`) — so
+    // any `.select(...)`/full-row load of the column failed the `sqlite`
+    // build. This bound fails on the old declaration and passes on
+    // `TimestamptzSqlite`, with no live database needed.
+    #[cfg(all(test, feature = "sqlite"))]
+    mod tests {
+        #[test]
+        fn suppression_timestamp_column_is_loadable_from_sqlite() {
+            fn assert_string_from_sql<ST>()
+            where
+                String: diesel::deserialize::FromSql<ST, diesel::sqlite::Sqlite>,
+            {
+            }
+            assert_string_from_sql::<
+                <super::schema::mail_unsubscribes::unsubscribed_at as diesel::Expression>::SqlType,
+            >();
         }
     }
 }

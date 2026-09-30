@@ -2290,9 +2290,13 @@ jobs:
         # `sim_chaos_mail` needs the `mail` feature for the mail
         # interceptor/transport surface, so it runs as its own invocation to
         # avoid widening the feature set of the other sqlite tests above.
+        # `sqlite_mail_suppression` (issue #2697) lives here too: it needs
+        # `mail` as well (the `mail` module is feature-gated), and exercises
+        # `DbSuppressionStore` against a real SQLite pool.
         run: |
           cargo test -p autumn-web --features "sqlite,test-support,mail" \
-            --test sim_chaos_mail
+            --test sim_chaos_mail \
+            --test sqlite_mail_suppression
       - name: Run the sim op-driver DoD suite (W6 PR2, issue #1797)
         # `sim_op_driver` needs the `sim-testing` feature (`proptest` as a
         # library dependency) — runs as its own invocation to avoid widening

@@ -30,12 +30,12 @@
 //!
 //! # Security & host responsibilities
 //!
-//! The room signaling router ([`room_router`]) ships **no built-in
-//! authentication or rate limiting** on create/join in this slice — `POST
-//! {prefix}/rooms` and `POST {prefix}/rooms/{room_id}/join` are open. It
-//! therefore **MUST be mounted behind the host application's auth / rate-limit
-//! middleware**; the plugin does not gate who may create or join a room. As a
-//! defense-in-depth backstop against unbounded memory growth from a create loop
+//! The room signaling router ([`room_router`]) requires an authenticated Autumn
+//! session to create or join a room (`POST {prefix}/rooms` and `POST
+//! {prefix}/rooms/{room_id}/join` are `#[secured]`). Hosts must install the
+//! framework's session middleware and authenticate callers before enabling
+//! rooms. Hosts should also apply rate limiting: as a defense-in-depth backstop
+//! against unbounded memory growth from a create loop
 //! (a created-but-never-joined room is only reaped when its last participant
 //! leaves), [`InMemoryRoomStore`] caps the registry at [`MAX_ROOMS`] rooms and
 //! rejects further creation with [`RoomError::RegistryFull`] (mapped to a
@@ -593,12 +593,11 @@ pub trait RoomStore: Send + Sync {
 
 /// Capacity backstop on the number of rooms an [`InMemoryRoomStore`] holds.
 ///
-/// `rooms_create` is unauthenticated in this slice and a created-but-never-joined
-/// room is only reaped when its last participant leaves, so an unbounded create
-/// loop would grow process memory for the lifetime of the process. This cap is a
-/// defense-in-depth backstop against that (mirroring the workspace's
-/// `MAX_BUCKETS` capacity-cap idiom for in-memory registries), **not** a
-/// substitute for the host app's auth / rate-limit middleware — see the
+/// A created-but-never-joined room is only reaped when its last participant
+/// leaves, so a high-volume authenticated create loop could grow process memory
+/// for the lifetime of the process. This cap is a defense-in-depth backstop
+/// against that (mirroring the workspace's `MAX_BUCKETS` capacity-cap idiom for
+/// in-memory registries), **not** a substitute for host rate limiting — see the
 /// module-level *Security & host responsibilities* note.
 pub const MAX_ROOMS: usize = 10_000;
 
@@ -685,9 +684,8 @@ impl RoomStore for InMemoryRoomStore {
             let mut rooms = self.rooms.write().expect("room store lock poisoned");
             // Registry capacity backstop: reject once the store is at `max_rooms`
             // rooms (checked under the write lock, so no create can race past it).
-            // The signaling router is unauthenticated in this slice, so this guards
-            // against unbounded memory growth from a create loop — a transient 503,
-            // not a client error.
+            // This guards against unbounded memory growth from a create loop — a
+            // transient 503, not a client error.
             if rooms.len() >= self.max_rooms {
                 return Err(RoomError::RegistryFull {
                     max: self.max_rooms,
@@ -1295,7 +1293,8 @@ fn room_service(state: &AppState) -> AutumnResult<Arc<RoomService>> {
     })
 }
 
-/// `POST {prefix}/rooms` — create a room.
+/// `POST {prefix}/rooms` — create a room for an authenticated caller.
+#[autumn_web::secured]
 async fn rooms_create(State(state): State<AppState>) -> AutumnResult<Json<RoomSnapshot>> {
     let snapshot = room_service(&state)?
         .create()
@@ -1304,7 +1303,8 @@ async fn rooms_create(State(state): State<AppState>) -> AutumnResult<Json<RoomSn
     Ok(Json(snapshot))
 }
 
-/// `POST {prefix}/rooms/{room_id}/join` — join a room.
+/// `POST {prefix}/rooms/{room_id}/join` — join a room as an authenticated caller.
+#[autumn_web::secured]
 async fn rooms_join(
     State(state): State<AppState>,
     Path(room_id): Path<String>,
@@ -1407,12 +1407,19 @@ pub fn room_router() -> Router<AppState> {
 pub fn room_route_infos(api_prefix: &str) -> Vec<RouteInfo> {
     let prefix = api_prefix.trim_end_matches('/');
     vec![
-        room_route("POST", format!("{prefix}/rooms"), "rooms::rooms_create"),
-        room_route(
+        // Create and join are `#[secured]`, so the route audit sees them as
+        // gated. The remaining three verify a per-room session token in the
+        // handler rather than an app login, so they stay unclassified here.
+        gated(room_route(
+            "POST",
+            format!("{prefix}/rooms"),
+            "rooms::rooms_create",
+        )),
+        gated(room_route(
             "POST",
             format!("{prefix}/rooms/{{room_id}}/join"),
             "rooms::rooms_join",
-        ),
+        )),
         room_route(
             "POST",
             format!("{prefix}/rooms/{{room_id}}/leave"),
@@ -1431,6 +1438,14 @@ pub fn room_route_infos(api_prefix: &str) -> Vec<RouteInfo> {
     ]
 }
 
+/// Mark a room route as guarded by `#[secured]` for `autumn routes audit`.
+fn gated(info: RouteInfo) -> RouteInfo {
+    RouteInfo {
+        classification: autumn_web::route_listing::RouteClassification::Gated,
+        ..info
+    }
+}
+
 /// Build one plugin [`RouteInfo`] (source is overwritten by
 /// `declare_plugin_routes` with the plugin attribution).
 fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
@@ -1445,19 +1460,22 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeartbeatRequest, InMemoryRoomStore, JoinRequest, LeaveRequest, MAX_REAPER_TTL_SECONDS,
-        ReapStats, Room, RoomError, RoomParticipant, RoomService, RoomStore, SessionToken,
-        bearer_token, clamp_reaper_ttl, room_participant_path, room_route_infos, rooms_create,
-        rooms_heartbeat, rooms_join, rooms_roster, validate_room_segment,
+        HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_REAPER_TTL_SECONDS, ReapStats, Room,
+        RoomError, RoomParticipant, RoomService, RoomStore, SessionToken, bearer_token,
+        clamp_reaper_ttl, room_participant_path, room_route_infos, room_router, room_service,
+        rooms_heartbeat, rooms_roster, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
     use autumn_web::AppState;
+    use autumn_web::reexports::axum::body::Body;
     use autumn_web::reexports::axum::extract::{Path, State};
-    use autumn_web::reexports::http::HeaderMap;
+    use autumn_web::reexports::http::{HeaderMap, Request, StatusCode, header};
+    use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
     use chrono::{DateTime, Duration, Utc};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tower::ServiceExt;
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -1992,6 +2010,25 @@ mod tests {
         assert_eq!(room_route_infos("/api/media/")[0].path, "/api/media/rooms");
     }
 
+    #[test]
+    fn room_route_infos_classify_secured_create_and_join_as_gated() {
+        use autumn_web::route_listing::RouteClassification;
+        let classes: Vec<RouteClassification> = room_route_infos("/api/media")
+            .iter()
+            .map(|info| info.classification)
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                RouteClassification::Gated,
+                RouteClassification::Gated,
+                RouteClassification::Unclassified,
+                RouteClassification::Unclassified,
+                RouteClassification::Unclassified,
+            ]
+        );
+    }
+
     // ── Bearer token parsing ─────────────────────────────────────────────────
 
     #[test]
@@ -2015,36 +2052,104 @@ mod tests {
         assert_eq!(bearer_token(&HeaderMap::new()), None);
     }
 
-    // ── Handler round-trip (create → join → roster through RoomService ext) ──
+    // ── Handler authentication (create/join are `#[secured]`) ────────────────
+
+    /// `POST /rooms` and `POST /rooms/{id}/join` require an authenticated
+    /// session: an anonymous request is a `401`, the same request with a
+    /// logged-in session cookie succeeds. Driven through the real router so the
+    /// `#[secured]` gate and the `SessionLayer` are exercised together.
+    #[tokio::test]
+    async fn create_and_join_require_authenticated_sessions() {
+        let store = MemoryStore::new();
+        store
+            .save(
+                "member-session",
+                HashMap::from([("user_id".to_owned(), "member-1".to_owned())]),
+            )
+            .await
+            .expect("save authenticated session");
+
+        let state = AppState::for_test();
+        let service = service("tenant-a");
+        let room_id = service.create().await.expect("create room").id;
+        state.insert_extension(service);
+        let app = room_router()
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let unauthenticated_create = app
+            .clone()
+            .oneshot(
+                Request::post("/rooms")
+                    .body(Body::empty())
+                    .expect("create request"),
+            )
+            .await
+            .expect("create response");
+        assert_eq!(unauthenticated_create.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated_create = app
+            .clone()
+            .oneshot(
+                Request::post("/rooms")
+                    .header(header::COOKIE, "autumn.sid=member-session")
+                    .body(Body::empty())
+                    .expect("authenticated create request"),
+            )
+            .await
+            .expect("authenticated create response");
+        assert_eq!(authenticated_create.status(), StatusCode::OK);
+
+        let unauthenticated_join = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/rooms/{room_id}/join"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"display_name":"Mallory"}"#))
+                    .expect("join request"),
+            )
+            .await
+            .expect("join response");
+        assert_eq!(unauthenticated_join.status(), StatusCode::UNAUTHORIZED);
+
+        let authenticated_join = app
+            .oneshot(
+                Request::post(format!("/rooms/{room_id}/join"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, "autumn.sid=member-session")
+                    .body(Body::from(r#"{"display_name":"Ada"}"#))
+                    .expect("authenticated join request"),
+            )
+            .await
+            .expect("authenticated join response");
+        assert_eq!(authenticated_join.status(), StatusCode::OK);
+    }
+
+    // ── Service round-trip (create → join → roster through RoomService ext) ──
 
     #[tokio::test]
-    async fn handlers_round_trip_create_join_roster() {
+    async fn service_round_trip_create_join_roster() {
         let state = AppState::for_test();
         state.insert_extension(service("tenant-a"));
+        let svc = room_service(&state).expect("service installed");
 
         // Create.
-        let created = rooms_create(State(state.clone())).await.expect("create").0;
+        let created = svc.create().await.expect("create");
         assert!(created.participants.is_empty());
         let room_id = created.id.clone();
 
         // Join.
-        let joined = rooms_join(
-            State(state.clone()),
-            Path(room_id.clone()),
-            axum_json(JoinRequest {
-                display_name: Some("Ada".to_owned()),
-            }),
-        )
-        .await
-        .expect("join")
-        .0;
+        let joined = svc
+            .join(&room_id, Some("Ada".to_owned()))
+            .await
+            .expect("join");
         assert!(!joined.session_token.expose().is_empty());
         assert!(!joined.participant_id.is_empty());
 
         // Roster reflects the join — read with the member's Bearer token.
         let mut headers = HeaderMap::new();
         headers.insert(
-            autumn_web::reexports::http::header::AUTHORIZATION,
+            header::AUTHORIZATION,
             format!("Bearer {}", joined.session_token.expose())
                 .parse()
                 .unwrap(),
@@ -2061,20 +2166,16 @@ mod tests {
         let unauth = rooms_roster(State(state), Path(room_id), HeaderMap::new())
             .await
             .expect_err("no bearer → not found");
-        assert_eq!(
-            unauth.status(),
-            autumn_web::reexports::http::StatusCode::NOT_FOUND
-        );
+        assert_eq!(unauth.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn handler_missing_service_extension_is_500() {
+    #[test]
+    fn room_service_missing_extension_is_500() {
         let state = AppState::for_test();
-        let err = rooms_create(State(state)).await.expect_err("no ext → 500");
-        assert_eq!(
-            err.status(),
-            autumn_web::reexports::http::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        let Err(err) = room_service(&state) else {
+            panic!("missing RoomService extension must return an error");
+        };
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Wrap a value in an axum `Json` extractor for direct handler calls.
@@ -2478,16 +2579,10 @@ mod tests {
     async fn handler_heartbeat_round_trips_and_fails_closed() {
         let state = AppState::for_test();
         state.insert_extension(service("tenant-a"));
+        let svc = room_service(&state).expect("service installed");
 
-        let created = rooms_create(State(state.clone())).await.expect("create").0;
-        let joined = rooms_join(
-            State(state.clone()),
-            Path(created.id.clone()),
-            axum_json(JoinRequest { display_name: None }),
-        )
-        .await
-        .expect("join")
-        .0;
+        let created = svc.create().await.expect("create");
+        let joined = svc.join(&created.id, None).await.expect("join");
 
         let beat = rooms_heartbeat(
             State(state.clone()),

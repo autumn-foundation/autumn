@@ -39,12 +39,17 @@ default = ["tls", "postgres"]
 # `tls`, so the resolved autumn-web set is a superset of what this feature
 # already selected.
 tls = ["autumn-web/tls", "autumn-web/acme"]
-# The pg-only `autumn-web` features the CLI enables that assume the Postgres
-# runtime and fail to compile under the `sqlite` backend-flip. Only `mail`
-# (its `DbSuppressionStore` is hard-typed to `Pool<AsyncPgConnection>`) is a
-# genuine breaker today; it is grouped here (rather than left unconditionally on)
-# so the `sqlite` build — which excludes the `postgres` bundle — resolves a
-# mail-free `autumn-web` set that mirrors what autumn-web's OWN sqlite CI builds.
+# `autumn-web` features the CLI keeps OUT of the `sqlite` backend-flip set.
+# `mail` used to be justified here as a "genuine breaker" on the grounds that
+# its `DbSuppressionStore` was "hard-typed to `Pool<AsyncPgConnection>`" —
+# that rationale is stale: the store is `Pool<crate::db::RuntimeConnection>`
+# (the backend-agnostic alias the flip itself switches) and its
+# `mail_unsubscribes` declaration is forked per backend (issue #2697); `mail`
+# compiles under the flip with the CLI's own feature set. It stays grouped
+# here (rather than left unconditionally on) so the `sqlite` build — which
+# excludes the `postgres` bundle — resolves a mail-free `autumn-web` set that
+# mirrors what autumn-web's OWN sqlite CI builds (the `sqlite-runtime` job
+# builds `--features sqlite` on the default set, which does not enable `mail`).
 # The CLI's own source references NO `autumn_web::mail` symbol (only generated
 # string literals), so no source `#[cfg]` gating is needed. Kept in `default`,
 # so a normal `cargo build -p autumn-cli` is byte-for-byte identical to before.
@@ -60,8 +65,9 @@ acme = ["tls", "autumn-web/acme"]
 # which flips autumn-web's `RuntimeConnection` type alias from Postgres to SQLite
 # for the WHOLE build graph, and pulls diesel's sqlite migration backend. Because
 # cargo feature unification is global AND the `postgres` bundle (a default
-# feature) pulls the pg-only `mail` path that does not compile under the flip,
-# the sqlite CLI MUST be built with default features OFF:
+# feature) would widen the flip's feature set beyond what autumn-web's OWN sqlite
+# CI lane builds (mail-free), the sqlite CLI MUST be built with default features
+# OFF:
 #   `cargo build -p autumn-cli --no-default-features --features sqlite`
 # NEVER `--all-features` (co-enables the Postgres path and fails to compile), and
 # never co-built with the `postgres` bundle. Default builds target Postgres and
