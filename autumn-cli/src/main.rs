@@ -2284,7 +2284,7 @@ enum Commands {
         /// Binary target to inspect (for packages with multiple bin targets).
         #[arg(long, value_name = "BIN")]
         bin: Option<String>,
-        /// Output format.
+        /// Output format: `table`, `json`, or `mermaid`.
         #[arg(long, default_value = "table", value_name = "FORMAT")]
         format: String,
         /// Show only routes whose path starts with PREFIX (positional shorthand for --filter).

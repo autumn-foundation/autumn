@@ -17,6 +17,7 @@ use crate::text_width::display_width;
 pub enum OutputFormat {
     Table,
     Json,
+    Mermaid,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -26,8 +27,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
+            "mermaid" => Ok(Self::Mermaid),
             other => Err(format!(
-                "unknown format '{other}'; expected 'table' or 'json'"
+                "unknown format '{other}'; expected 'table', 'json', or 'mermaid'"
             )),
         }
     }
@@ -107,6 +109,7 @@ pub fn run(opts: &RoutesOptions<'_>) {
     match &opts.format {
         OutputFormat::Table => print_table(&routes),
         OutputFormat::Json => print_json(&routes),
+        OutputFormat::Mermaid => print_mermaid(&routes),
     }
 }
 
@@ -261,6 +264,76 @@ pub fn print_json(routes: &[RouteInfo]) {
     let json =
         serde_json::to_string_pretty(routes).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     println!("{json}");
+}
+
+/// Print routes as a Mermaid flowchart.
+///
+/// An empty route table still prints a (node-less) `flowchart`, so piping the
+/// output into a renderer never receives prose instead of Mermaid.
+pub fn print_mermaid(routes: &[RouteInfo]) {
+    print!("{}", format_mermaid(routes));
+}
+
+/// Escape text for a quoted Mermaid label so route data renders literally.
+///
+/// Mermaid has no backslash escape in labels; it rewrites `#name;` entity
+/// codes into HTML entities, and with HTML labels (this formatter emits
+/// `<b>`) a raw `<`, `>` or `&` would be read as markup. So every label
+/// metacharacter becomes an entity code. `#` goes first, so a literal
+/// `#quot;` in a route cannot be mistaken for an entity code either.
+fn mermaid_label(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '#' => out.push_str("#35;"),
+            '"' => out.push_str("#quot;"),
+            '&' => out.push_str("#amp;"),
+            '<' => out.push_str("#lt;"),
+            '>' => out.push_str("#gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build the Mermaid string (extracted for testability).
+///
+/// Routes are grouped into one `subgraph` per source. A source is free text
+/// (a plugin name may hold `@`, `/` or whitespace), so it is never used as an
+/// identifier: each subgraph gets a generated id (`src1`, `src2`, …) and the
+/// source is rendered as its quoted title. Distinct sources therefore never
+/// collide, however similar their names.
+pub fn format_mermaid(routes: &[RouteInfo]) -> String {
+    use std::fmt::Write as _;
+
+    let mut by_source: std::collections::BTreeMap<&str, Vec<&RouteInfo>> =
+        std::collections::BTreeMap::new();
+    for route in routes {
+        by_source.entry(&route.source).or_default().push(route);
+    }
+
+    let mut out = String::from("flowchart LR\n");
+    let mut node_id = 0_usize;
+    for (source_id, (source, source_routes)) in by_source.into_iter().enumerate() {
+        // Writing into a `String` cannot fail.
+        let _ = writeln!(
+            out,
+            "    subgraph src{}[\"{}\"]",
+            source_id + 1,
+            mermaid_label(source)
+        );
+        for route in source_routes {
+            node_id += 1;
+            let _ = writeln!(
+                out,
+                "        route{node_id}(\"<b>{}</b> {}\")",
+                mermaid_label(&route.method),
+                mermaid_label(&route.path)
+            );
+        }
+        out.push_str("    end\n");
+    }
+    out
 }
 
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
@@ -626,6 +699,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_format_mermaid() {
+        let f: OutputFormat = "mermaid".parse().unwrap();
+        assert_eq!(f, OutputFormat::Mermaid);
+    }
+
+    #[test]
     fn parse_format_unknown_is_error() {
         let result: Result<OutputFormat, _> = "xml".parse();
         assert!(result.is_err());
@@ -805,6 +884,68 @@ mod tests {
         let json_str = serde_json::to_string_pretty(&routes).unwrap();
         let parsed: Vec<RouteInfo> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.len(), routes.len());
+    }
+
+    // ── format_mermaid ─────────────────────────────────────────────────────
+
+    #[test]
+    fn format_mermaid_contains_expected_nodes() {
+        let routes = sample_routes();
+        let mermaid = format_mermaid(&routes);
+        assert!(mermaid.starts_with("flowchart LR"));
+        assert!(mermaid.contains("subgraph src1[\"framework\"]"));
+        assert!(mermaid.contains("subgraph src2[\"plugin:harvest\"]"));
+        assert!(mermaid.contains("subgraph src3[\"user\"]"));
+
+        // Check for specific routes
+        assert!(mermaid.contains("\"<b>GET</b> /about\""));
+        assert!(mermaid.contains("\"<b>GET</b> /api/posts\""));
+        assert!(mermaid.contains("\"<b>GET</b> /actuator/health\""));
+        assert!(mermaid.contains("\"<b>POST</b> /posts\""));
+        assert!(mermaid.contains("\"<b>GET</b> /posts/{id}\""));
+    }
+
+    #[test]
+    fn mermaid_label_encodes_every_metacharacter() {
+        assert_eq!(
+            mermaid_label(r#"sales <beta> & "x" #quot;"#),
+            "sales #lt;beta#gt; #amp; #quot;x#quot; #35;quot;"
+        );
+        assert_eq!(mermaid_label("/posts/{id}"), "/posts/{id}");
+    }
+
+    #[test]
+    fn format_mermaid_empty_is_valid_flowchart() {
+        assert_eq!(format_mermaid(&[]), "flowchart LR\n");
+    }
+
+    #[test]
+    fn format_mermaid_quotes_unsafe_sources_and_keeps_them_distinct() {
+        let mut routes = sample_routes();
+        let base = routes[0].clone();
+        routes.push(RouteInfo {
+            source: "plugin:foo-bar".to_owned(),
+            ..base.clone()
+        });
+        routes.push(RouteInfo {
+            source: "plugin:foo_bar".to_owned(),
+            ..base.clone()
+        });
+        routes.push(RouteInfo {
+            source: "plugin:react_graphql::GraphqlPlugin@/graphql \"x\"".to_owned(),
+            ..base
+        });
+        let mermaid = format_mermaid(&routes);
+        assert!(mermaid.contains("[\"plugin:foo-bar\"]"));
+        assert!(mermaid.contains("[\"plugin:foo_bar\"]"));
+        assert!(
+            mermaid.contains("[\"plugin:react_graphql::GraphqlPlugin@/graphql #quot;x#quot;\"]")
+        );
+        let subgraphs = mermaid
+            .lines()
+            .filter(|l| l.trim_start().starts_with("subgraph "))
+            .count();
+        assert_eq!(subgraphs, 6);
     }
 
     // ── resolve_binary_from_metadata ──────────────────────────────────────
