@@ -1939,7 +1939,7 @@ mod replay_cleanup_service_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod payload_extractor_tests {
     use super::*;
     use serde_json::json;
 
