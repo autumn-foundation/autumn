@@ -1567,13 +1567,15 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// "discouraged", recommending WAL mode instead — and WAL does **not** fix this
 /// deadlock class (the table-lock protocol is orthogonal to the journal mode).
 ///
-/// [`Db::tx_immediate`] does **not** rescue this: under shared cache a second
-/// connection's `BEGIN IMMEDIATE` also fails with `SQLITE_LOCKED_SHAREDCACHE`
-/// immediately, since `SQLite` never invokes the busy handler for
-/// `SQLITE_LOCKED` (this pool does not wire `sqlite3_unlock_notify`).
-/// Concurrent shared-cache writers must be serialized or retried with backoff
-/// by the application; the real fix is a WAL-mode file database, where
-/// `tx_immediate` does queue on the busy timeout.
+/// [`Db::tx_immediate`] avoids the all-contenders deadlock — the first
+/// connection to `BEGIN IMMEDIATE` holds the write lock before it reads, so it
+/// completes — but it does **not** make the others wait: under shared cache
+/// their `BEGIN IMMEDIATE` fails with `SQLITE_LOCKED_SHAREDCACHE` immediately,
+/// since `SQLite` never invokes the busy handler for `SQLITE_LOCKED` (this pool
+/// does not wire `sqlite3_unlock_notify`). Concurrent shared-cache writers
+/// must therefore still be serialized, or retried with backoff (each attempt
+/// through `tx_immediate`) by the application; the real fix is a WAL-mode file
+/// database, where `tx_immediate` does queue on the busy timeout.
 ///
 /// Autumn keeps supporting shared cache (the test suite uses it deliberately —
 /// see [`crate::test_urls`]), so this is a warning, not a refusal.
@@ -1734,11 +1736,11 @@ fn build_sqlite_pool(
              under shared cache: the lock upgrade fails with SQLITE_LOCKED / \
              SQLITE_BUSY_SNAPSHOT, which bypasses the busy-timeout handler, and \
              WAL mode does not fix this deadlock class (issue #2885). An up-front \
-             BEGIN IMMEDIATE does not help either: shared-cache lock contention \
-             returns SQLITE_LOCKED without consulting the busy timeout, so \
-             concurrent writers fail fast. Prefer a WAL-mode file database; if \
-             shared cache is required, serialize writers or retry them with \
-             backoff. SQLite itself discourages shared-cache mode: \
+             BEGIN IMMEDIATE (Db::tx_immediate) lets one writer proceed, but the \
+             others still get SQLITE_LOCKED without consulting the busy timeout, \
+             so concurrent writers fail fast rather than queue. Prefer a WAL-mode \
+             file database; if shared cache is required, serialize writers or \
+             retry each one through Db::tx_immediate with backoff. SQLite itself discourages shared-cache mode: \
              https://www.sqlite.org/sharedcache.html"
         );
     }
@@ -2909,11 +2911,14 @@ impl Db {
     /// write-heavy: read-modify-write cycles, queue claims, session writes,
     /// outbox/idempotency inserts.
     ///
-    /// This does **not** help on a shared-cache target (`cache=shared`): there
-    /// a second connection's `BEGIN IMMEDIATE` fails at once with
-    /// `SQLITE_LOCKED_SHAREDCACHE`, because `SQLite` never consults the busy
-    /// handler for `SQLITE_LOCKED`. Serialize or retry shared-cache writers in
-    /// the application, or move to a WAL-mode file database.
+    /// On a shared-cache target (`cache=shared`) it still lets one writer
+    /// proceed — the first `BEGIN IMMEDIATE` holds the write lock before it
+    /// reads, so contenders cannot all deadlock on the read→write upgrade —
+    /// but it does **not** make the others queue: their `BEGIN IMMEDIATE`
+    /// fails at once with `SQLITE_LOCKED_SHAREDCACHE`, because `SQLite` never
+    /// consults the busy handler for `SQLITE_LOCKED`. Serialize shared-cache
+    /// writers in the application or retry each through `tx_immediate` with
+    /// backoff — or move to a WAL-mode file database.
     ///
     /// The tradeoff is deliberate: an immediate transaction holds the write
     /// lock for its whole lifetime, so a long-running `tx_immediate` serializes
