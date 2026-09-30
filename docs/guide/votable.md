@@ -9,6 +9,20 @@ recompute is a race with *every other voter*, and the two writes are usually
 not in the same transaction, so readers can see a vote that the score does not
 reflect.
 
+The hidden target projection and the reaction lock/update filters address the
+model's physical primary-key column: if the `#[id]` field is renamed in the
+database with `#[diesel(column_name = "…")]`, the generated SQL names the
+renamed column, not the Rust field. (Child-side maintenance — counter caches
+and derivations — cannot see the parent's fields, so those take an explicit
+`parent_pk = "…"` override instead; see the counter-cache and derivations
+guides.)
+
+Diesel's `column_name` is the *schema identifier*, which is the SQL column
+unless `schema.rs` maps it with `#[sql_name = "…"]` (Diesel emits that only for
+a column whose name is not a valid Rust identifier, e.g. `post-id`). The macro
+cannot see `schema.rs`, so a primary key mapped through `sql_name` is not
+supported here: rename the column to a valid identifier.
+
 `#[votable]` makes that a declaration. You name the reactor model and the
 aggregate mode; the `#[model]` macro generates the edge table's typed
 `diesel::table!`, a `react()` that toggles/flips/inserts, and an aggregate

@@ -227,8 +227,8 @@ qualifier naming where they actually came from.
 
 The sidecar SBOM is generated from `cargo metadata` and is therefore *broader*:
 it covers the whole resolved graph for the image's own target triple and
-feature set, including dev-dependencies, which are resolved but never linked
-into the release binary.
+feature set — minus dev-dependencies, which are resolved but never linked into
+the release binary and are therefore excluded from the inventory.
 
 (The image's SBOM is narrowed with `--filter-platform` to the target that built
 it — without that, it would list every platform's target-specific dependencies,
@@ -239,8 +239,9 @@ it would understate what was published.)
 (`--all-features` widens it further, to crates no single build can contain — it
 is available deliberately, and deliberately not the default.) The embedded list
 is what actually went into the binary. Entries appearing only in
-`from-image.txt` are expected; an entry appearing only in `from-binary.txt` is
-not, and is worth investigating.
+`from-image.txt` are expected only for optional features that were resolved
+but not linked into this build; an entry appearing only in `from-binary.txt`
+is not, and is worth investigating.
 
 ### 2.4 Verify the image's provenance
 

@@ -4515,6 +4515,19 @@ pub async fn menus_page(
         .await?)
 }
 
+/// One menu by id, for a screen that must show it whichever page it is on.
+pub async fn menu_by_id(
+    conn: &mut AsyncPgConnection,
+    menu_id: i64,
+) -> AutumnResult<Option<crate::models::Menu>> {
+    Ok(menus::table
+        .find(menu_id)
+        .select(crate::models::Menu::as_select())
+        .first(conn)
+        .await
+        .optional()?)
+}
+
 /// How many menus the site holds, for the pager.
 pub async fn menu_count(conn: &mut AsyncPgConnection) -> AutumnResult<i64> {
     Ok(menus::table.count().get_result(conn).await?)
