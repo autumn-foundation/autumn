@@ -2001,21 +2001,54 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             if let Some(feat_bracket) =
                 find_unquoted_str(strip_line_comment(&trimmed), "features = [")
             {
-                // Add to existing features list.
                 let list_start = feat_bracket + "features = [".len();
-                let list_end = find_unquoted(&trimmed[list_start..], ']').unwrap() + list_start;
-                let existing = trimmed[list_start..list_end].trim();
-                let new_list = if existing.is_empty() {
-                    FEATURE.to_owned()
+                if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
+                    // Add to existing, single-line features list.
+                    let list_end = close_bracket + list_start;
+                    let existing = trimmed[list_start..list_end].trim();
+                    let new_list = if existing.is_empty() {
+                        FEATURE.to_owned()
+                    } else {
+                        format!("{existing}, {FEATURE}")
+                    };
+                    lines[i] = format!(
+                        "{indent}{}{}{}",
+                        &trimmed[..list_start],
+                        new_list,
+                        &trimmed[list_end..]
+                    );
                 } else {
-                    format!("{existing}, {FEATURE}")
-                };
-                lines[i] = format!(
-                    "{indent}{}{}{}",
-                    &trimmed[..list_start],
-                    new_list,
-                    &trimmed[list_end..]
-                );
+                    // The inline table's `features = [` array spans multiple
+                    // lines (e.g. `autumn-web = { version = "0.3", features = [\n
+                    // "ws",\n] }`): scan forward to its actual closing line and
+                    // append there, mirroring the oauth2/webauthn siblings'
+                    // already-correct handling of this shape.
+                    let mut j = i + 1;
+                    while j < lines.len() {
+                        let tj = lines[j].trim();
+                        if tj.starts_with('[') {
+                            break;
+                        }
+                        if let Some(close_idx) = find_unquoted(strip_line_comment(tj), ']') {
+                            let before_close = tj[..close_idx].trim();
+                            let sep = if before_close.is_empty() || before_close.ends_with(',') {
+                                ""
+                            } else {
+                                ", "
+                            };
+                            let indent_j: String = lines[j]
+                                .chars()
+                                .take_while(char::is_ascii_whitespace)
+                                .collect();
+                            lines[j] = format!(
+                                "{indent_j}{before_close}{sep}{FEATURE}{}",
+                                &tj[close_idx..]
+                            );
+                            break;
+                        }
+                        j += 1;
+                    }
+                }
             } else {
                 // No features key — insert before closing `}`.
                 let close = trimmed.rfind('}').unwrap();
@@ -16655,6 +16688,36 @@ mod tests {
             1,
             "oauth2 duplicated: {out}"
         );
+    }
+
+    // Echo probe (#2753 missed-fix #2, inline-table variant): does the
+    // `crate = { ... }` inline-table branch — distinct from the
+    // `[dependencies.crate]` subtable branch #2948 already fixed — handle a
+    // `features = [...]` array that spans multiple lines inside the inline
+    // table? If `mail` panics here while `oauth2`/`webauthn` do not, the
+    // `#2948` fix never reached this branch.
+    #[test]
+    fn echo_probe_inline_table_multiline_array_oauth2() {
+        let toml = "autumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(out.contains("\"oauth2\""), "oauth2 must be merged: {out}");
+    }
+
+    #[test]
+    fn echo_probe_inline_table_multiline_array_webauthn() {
+        let toml = "autumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"webauthn\""),
+            "webauthn must be merged: {out}"
+        );
+    }
+
+    #[test]
+    fn echo_probe_inline_table_multiline_array_mail() {
+        let toml = "autumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(out.contains("\"mail\""), "mail must be merged: {out}");
     }
 
     #[test]
