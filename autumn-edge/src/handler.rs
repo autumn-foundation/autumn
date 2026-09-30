@@ -116,7 +116,7 @@ impl<H, T> sealed::Sealed<T> for H where H: axum::handler::Handler<T, EdgeState>
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot serve as an `#[edge]` handler",
     label = "this handler uses an extractor or return type unavailable at the edge",
-    note = "edge handlers may use only `Path`, `Query`, `HeaderMap`, `EdgeCache`, and tuples of \
+    note = "edge handlers may use only `Path`, `Query`, `HeaderMap`, `EdgeCache`, `EdgeIdentity`, and tuples of \
             these — nothing else, including `Extension<T>` (even through a type alias) and the \
             whole-`Request` extractor, satisfies this bound",
     note = "remove `#[edge]` from this route, or replace the offending extractor; see docs/guide/edge.md"
@@ -134,6 +134,7 @@ where
 ///
 /// Blanket-implemented for exactly [`axum::extract::Path`],
 /// [`axum::extract::Query`], [`http::HeaderMap`], [`EdgeCache`](crate::extract::EdgeCache),
+/// [`EdgeIdentity`](crate::identity::EdgeIdentity),
 /// the empty tuple (a handler with no extractors), and tuples of up to
 /// sixteen [`EdgeLeaf`] types — nothing else. This is what makes
 /// [`EdgeHandler`] a whitelist rather than a blacklist: a new native-only
@@ -145,7 +146,7 @@ where
 /// layers" section for why that distinction is load-bearing, not stylistic.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not one of the extractors an `#[edge]` handler may use",
-    note = "allowed: `Path`, `Query`, `HeaderMap`, `EdgeCache`, and tuples of these"
+    note = "allowed: `Path`, `Query`, `HeaderMap`, `EdgeCache`, `EdgeIdentity`, and tuples of these"
 )]
 pub trait EdgeExtract: sealed::ExtractSealed {}
 
@@ -178,7 +179,7 @@ impl EdgeExtract for ((),) {}
 /// tuple impl of its own.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not one of the extractors an `#[edge]` handler may use",
-    note = "allowed: `Path`, `Query`, `HeaderMap`, `EdgeCache`"
+    note = "allowed: `Path`, `Query`, `HeaderMap`, `EdgeCache`, `EdgeIdentity`"
 )]
 pub trait EdgeLeaf: sealed::LeafSealed {}
 
@@ -192,7 +193,9 @@ impl sealed::LeafSealed for http::HeaderMap {}
 impl EdgeLeaf for http::HeaderMap {}
 
 impl sealed::LeafSealed for crate::extract::EdgeCache {}
+impl sealed::LeafSealed for crate::identity::EdgeIdentity {}
 impl EdgeLeaf for crate::extract::EdgeCache {}
+impl EdgeLeaf for crate::identity::EdgeIdentity {}
 
 // axum implements `FromRequestParts<S> for ()` directly (see
 // `axum_core::extract::tuple`), so a handler can explicitly take a unit

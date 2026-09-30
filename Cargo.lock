@@ -870,7 +870,7 @@ dependencies = [
  "serde_path_to_error",
  "serde_urlencoded",
  "serde_yaml",
- "sha1 0.10.7",
+ "sha1 0.11.0",
  "sha2 0.10.9",
  "socket2",
  "subtle",
@@ -886,7 +886,7 @@ dependencies = [
  "tokio-postgres-rustls",
  "tokio-rustls",
  "tokio-stream",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.30.0",
  "tokio-util",
  "toml 1.1.6+spec-1.1.0",
  "tower",
@@ -1374,7 +1374,7 @@ dependencies = [
  "sha1 0.10.7",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.29.0",
  "tower",
  "tower-layer",
  "tower-service",
@@ -9476,6 +9476,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite 0.30.0",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9835,6 +9847,22 @@ dependencies = [
  "log",
  "rand 0.9.5",
  "sha1 0.10.7",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.5.0",
+ "httparse",
+ "log",
+ "rand 0.10.2",
+ "sha1 0.11.0",
  "thiserror 2.0.21",
 ]
 
@@ -11073,6 +11101,7 @@ dependencies = [
  "lazy_static",
  "nom 7.1.3",
  "oid-registry 0.7.1",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",
