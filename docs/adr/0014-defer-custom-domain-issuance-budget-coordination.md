@@ -147,37 +147,48 @@ Reproduce with the commands in **Reproduce** below.
    since an operator can misconfigure past a documented recommendation.
 7. **The limiter's own "well inside [the limit]" claim holds only for one
    process, not for the account — but one process is the only topology this
-   feature supports today.** The shipped defaults are
+   feature supports today, and "the account" is itself per-replica by
+   default, which narrows exactly which multi-replica misconfiguration this
+   arithmetic describes.** The shipped defaults are
    `issuance_per_domain_per_day = 5` and `issuance_global_per_hour = 50`
    (`config.rs:10228-10235`). At 50/hour, one process can attempt 150 orders
    in any rolling 3-hour window — the same window Let's Encrypt measures
-   its 300-orders-per-account limit over. Two replicas, each independently
-   enforcing that same per-process ceiling (the durable-state-option-1 fix
-   makes each one *reliable*, not smaller), together reach 150 + 150 = 300
-   orders in 3 hours: the account's entire quota, before counting a single
-   order from any other source. Three replicas reach 450 — 1.5× over. "Well
-   inside the limit... at the defaults" is true at N=1 and false starting
-   at N=2 — but `docs/guide/tls.md:901-907` and `:426-427` already document,
-   independently of this ADR, that custom domains are **single-host only**:
-   "the HTTP-01 token map and the certificate store are per-process, so
-   behind a load balancer the CA's validation request usually reaches a
-   replica that never published the token. Run custom domains on a single
-   host." A deployment cannot run this feature *correctly* on ≥2 replicas
-   today — HTTP-01 validation itself breaks first, for a reason that has
-   nothing to do with the issuance budget. But "breaks first" is about
-   whether a certificate is *issued*, not about whether an attempt
-   *consumes budget*: `AcmeDomainIssuer::order` calls `new_order`
-   (`tenant_domains.rs:106-109`) — the call Let's Encrypt counts against its
-   300-per-3-hours limit — *before* `answer_http01`/`await_order_ready`
-   (`:114-115`) validates the challenge. An operator who runs ≥2 replicas
-   despite the documented requirement still creates a real order, spending
-   real account quota, on every attempt that lands on a replica without the
-   winning token — even though that order then fails validation and no
-   certificate issues. N=2's arithmetic is therefore not purely about an
-   unreachable *successful* configuration; the quota consumption it
-   describes is live the moment someone ignores the single-host requirement,
-   whether or not the feature works for them (see Do nothing below for what
-   that changes).
+   its 300-orders-per-account limit over. `FsAcmeStore` keeps the ACME
+   account (`account.json`) under each replica's own local `cache_dir`
+   (`autumn/src/acme/store.rs:1-9,128-134`), and `docs/guide/tls.md:426-445`
+   says that store is local disk by default — "to run ACME across replicas
+   at all, `cache_dir` must be on storage every replica shares." So the
+   "two replicas sum to 150+150=300, the account's entire quota" arithmetic
+   assumes replicas sharing that storage (and hence one `account.json`); a
+   deployment that instead runs ≥2 replicas each with its own local
+   `cache_dir` — the more naive misconfiguration — gets ≥2 *separate* ACME
+   accounts, each with its own separate 300-per-3-hours allowance, and
+   50/hour (150/3h) stays under that on its own. "Well inside the
+   limit... at the defaults" is true at N=1 and, for a deployment with
+   per-replica accounts, stays true per-account at N=2 as well; it is the
+   shared-`cache_dir` case where N=2 already *equals* the one account's
+   entire quota and N=3 exceeds it by 50%. Separately from that
+   shared-account arithmetic, `docs/guide/tls.md:901-907` and `:426-427`
+   document, independently of this ADR, that custom domains are
+   **single-host only** regardless of storage sharing: "the HTTP-01 token
+   map and the certificate store are per-process, so behind a load balancer
+   the CA's validation request usually reaches a replica that never
+   published the token. Run custom domains on a single host." A deployment
+   cannot run this feature *correctly* on ≥2 replicas today either way —
+   HTTP-01 validation breaks first, for a reason that has nothing to do
+   with the issuance budget. But "breaks first" is about whether a
+   certificate is *issued*, not about whether an attempt *consumes budget*:
+   `AcmeDomainIssuer::order` calls `new_order` (`tenant_domains.rs:106-109`)
+   — the call Let's Encrypt counts — *before*
+   `answer_http01`/`await_order_ready` (`:114-115`) validates the
+   challenge. An operator who runs ≥2 replicas despite the documented
+   requirement still creates a real order, spending real quota against
+   *whichever* account that replica holds, on every attempt that lands on a
+   replica without the winning token — even though that order then fails
+   validation and no certificate issues. That per-account waste is live
+   regardless of whether `cache_dir` is shared; only the *shared-quota*,
+   N-sums-to-one-account version of the arithmetic needs shared storage
+   (see Do nothing below for what that changes).
 
 ## Do nothing / decide later — 12-month baseline
 
@@ -197,34 +208,44 @@ If durable-state option 3 is deferred and only items 1, 3, and 4 are
 fixed (via durable-state option 1 for item 1): a deployment running
 multiple replicas that are all actively issuing custom-domain certificates
 would get up to N× the advertised `global_per_hour` budget, same as today,
-where N is replica count — and per Evidence item 7, N=2 already *equals*
-Let's Encrypt's outer limit (300 orders/3h/account) rather than staying
-safely under it. `docs/guide/tls.md` already documents custom domains as
-single-host only, for the independent reason that HTTP-01 validation does
-not survive a load balancer today — so the *feature* cannot succeed on
-≥2 replicas. The 12-month baseline is **not**, however, zero: per Evidence
-item 7's `new_order`-before-validation ordering, an operator who runs ≥2
-replicas anyway still spends real order quota on every attempt, whether or
-not that attempt goes on to fail HTTP-01. Nothing in the record shows a
-deployment currently doing this (Evidence item 6) — but if one did, the
-exposure is live today, not contingent on multi-replica support shipping:
-enough failed attempts across enough replicas can exhaust the shared
+where N is replica count. Per Evidence item 7, what that N× buys depends on
+whether replicas share `cache_dir` (and so one ACME account): sharing it,
+N=2 already *equals* Let's Encrypt's outer limit (300 orders/3h/account)
+rather than staying safely under it; not sharing it — the more naive
+misconfiguration — gives each replica its own separate account and its own
+separate 300/3h allowance, under which 50/hour stays safely regardless of
+N. `docs/guide/tls.md` already documents custom domains as single-host
+only, for the independent reason that HTTP-01 validation does not survive
+a load balancer today — so the *feature* cannot succeed on ≥2 replicas
+either way. The 12-month baseline is **not**, however, zero even in the
+separate-accounts case: per Evidence item 7's `new_order`-before-validation
+ordering, an operator who runs ≥2 replicas anyway still spends real order
+quota, against whichever account each replica holds, on every attempt —
+whether or not that attempt goes on to fail HTTP-01. Nothing in the record
+shows a deployment currently doing this (Evidence item 6) — but if one did
+with a *shared* `cache_dir`, the exposure is more than wasted throughput:
+enough failed attempts across enough replicas can exhaust that one shared
 account's rate limit, which then blocks the deployment's *own* certificate
 too, since `docs/guide/tls.md` also documents that "every tenant order uses
-the same ACME account as your own certificate." That risk is gated by an
-operator ignoring a documented requirement, not by a design flaw this
-review can fix with a default-value change — no value of `global_per_hour`
-stops N independent processes from each spending their own share
-unaware of the others; only genuine fleet coordination (durable-state
-option 3, still correctly deferred above) or detecting/refusing multi-
-replica operation (a different, smaller fix this ADR does not scope) closes
-it. That is not true of items 1, 3, and 4, which are live single-instance
-bugs today regardless. The N=2 arithmetic and the quota-before-validation
-finding are recorded here so that whoever eventually externalizes the
-per-process pieces standing between here and real multi-replica support —
-the HTTP-01 token map, the certificate store, and (per the Trigger section
-below) the domain registry — does not also have to rediscover that the
-issuance budget needs the same trip.
+the same ACME account as your own certificate" (true within one replica's
+account regardless of sharing — the sharing question is only about whether
+*multiple replicas'* attempts land on that same account). With separate
+per-replica accounts, the exposure narrows to each replica separately
+wasting its own account's quota, potentially affecting only that replica's
+own certificate. Either way, this is gated by an operator ignoring a
+documented requirement, not by a design flaw this review can fix with a
+default-value change — no value of `global_per_hour` stops N independent
+processes from each spending their own share unaware of the others; only
+genuine fleet coordination (durable-state option 3, still correctly
+deferred above) or detecting/refusing multi-replica operation (a
+different, smaller fix this ADR does not scope) closes it. That is not
+true of items 1, 3, and 4, which are live single-instance bugs today
+regardless. The N=2 arithmetic and the quota-before-validation finding are
+recorded here so that whoever eventually externalizes the per-process
+pieces standing between here and real multi-replica support — the HTTP-01
+token map, the certificate store, and (per the Trigger section below) the
+domain registry — does not also have to rediscover that the issuance
+budget, and its dependence on account sharing, needs the same trip.
 
 ## Impact floor check
 
@@ -250,8 +271,9 @@ not mis-scoped copies of this same problem).
 design fails a committed requirement — deserves a real look, and a first
 pass through this review concluded it was met. On closer reading it is
 not, which is worth recording rather than quietly dropping.** Evidence item
-7's arithmetic (N=2 replicas exactly consume Let's Encrypt's 3-hour limit)
-looked like exactly the proof condition 4 asks for: not "might struggle
+7's arithmetic (N=2 replicas sharing one ACME account exactly consume
+Let's Encrypt's 3-hour limit for it) looked like exactly the proof
+condition 4 asks for: not "might struggle
 with," but an exact failure of the limiter's own documented guarantee at a
 specific, named N. But a "committed requirement" a design can fail has to
 describe a configuration the design is actually committed to supporting —
@@ -425,6 +447,14 @@ grep -n "single-host\|single host\|token map" docs/guide/tls.md
 # — so a misconfigured multi-replica attempt still spends real quota even
 # though it then fails validation and issues nothing
 sed -n '99,118p' autumn/src/acme/tenant_domains.rs
+
+# The ACME account is per-replica local disk by default, not fleet-shared —
+# so the "N replicas sum to one account's limit" arithmetic needs a shared
+# cache_dir; separate cache_dirs give separate accounts, each under its own
+# 300/3h cap, which the default global_per_hour=50 (150/3h) stays under alone
+sed -n '1,9p' autumn/src/acme/store.rs
+sed -n '128,134p' autumn/src/acme/store.rs
+sed -n '426,445p' docs/guide/tls.md
 
 # CustomDomainRegistry is a third per-process piece (beyond the token map and
 # cert store): a one-time boot-time hydration with no cross-replica sync
