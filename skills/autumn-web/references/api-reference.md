@@ -647,9 +647,10 @@ delete actions remain last-write-wins.
   `BEGIN IMMEDIATE`, so a concurrent writer on a file database queues on
   `busy_timeout` instead of failing its read→write upgrade with
   `SQLITE_BUSY_SNAPSHOT`. Use it for write-heavy closures; keep pure reads on
-  `Db::tx`. On a `cache=shared` target it lets one writer proceed but the
-  others get `SQLITE_LOCKED` immediately (no queueing), so pair it with a
-  backoff retry there. `ShardedDb::tx_immediate` delegates.
+  `Db::tx`. On a `cache=shared` target it only stops writers from all
+  reading before they upgrade; any writer can still get `SQLITE_LOCKED`
+  immediately (no queueing, no guaranteed winner), so pair it with a backoff
+  retry there. `ShardedDb::tx_immediate` delegates.
 - `autumn_web::db::IsolationLevel` {`ReadCommitted` (default),
   `RepeatableRead`, `Serializable`}; `TxOptions` builders
   `::read_committed()` / `::repeatable_read()` / `::serializable()` +

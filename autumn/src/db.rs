@@ -1567,10 +1567,12 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// "discouraged", recommending WAL mode instead — and WAL does **not** fix this
 /// deadlock class (the table-lock protocol is orthogonal to the journal mode).
 ///
-/// [`Db::tx_immediate`] avoids the all-contenders deadlock — the first
-/// connection to `BEGIN IMMEDIATE` holds the write lock before it reads, so it
-/// completes — but it does **not** make the others wait: under shared cache
-/// their `BEGIN IMMEDIATE` fails with `SQLITE_LOCKED_SHAREDCACHE` immediately,
+/// [`Db::tx_immediate`] only stops the participating writers from all reading
+/// before their upgrade attempts — the first `BEGIN IMMEDIATE` takes the write
+/// transaction up front. It is not a completion guarantee (a concurrent
+/// reader's table lock can still fail that writer's write with
+/// `SQLITE_LOCKED_SHAREDCACHE`), and it does **not** make the other writers
+/// wait: under shared cache their `BEGIN IMMEDIATE` fails immediately,
 /// since `SQLite` never invokes the busy handler for `SQLITE_LOCKED` (this pool
 /// does not wire `sqlite3_unlock_notify`). Concurrent shared-cache writers
 /// must therefore still be serialized, or retried with backoff (each attempt
@@ -1736,12 +1738,14 @@ fn build_sqlite_pool(
              under shared cache: the lock upgrade fails with SQLITE_LOCKED / \
              SQLITE_BUSY_SNAPSHOT, which bypasses the busy-timeout handler, and \
              WAL mode does not fix this deadlock class (issue #2885). An up-front \
-             BEGIN IMMEDIATE (Db::tx_immediate) lets one writer proceed, but the \
-             others still get SQLITE_LOCKED without consulting the busy timeout, \
-             so concurrent writers fail fast rather than queue. Prefer a WAL-mode \
-             file database; if shared cache is required, serialize writers or \
-             retry each one through Db::tx_immediate with backoff. SQLite itself discourages shared-cache mode: \
-             https://www.sqlite.org/sharedcache.html"
+             BEGIN IMMEDIATE (Db::tx_immediate) stops writers from all reading \
+             before they upgrade, but it guarantees no winner: other writers, and \
+             a writer blocked by a concurrent reader's table lock, still get \
+             SQLITE_LOCKED without consulting the busy timeout, so they fail fast \
+             rather than queue. Prefer a WAL-mode file database; if shared \
+             cache is required, serialize writers or retry each one through \
+             Db::tx_immediate with backoff. SQLite itself discourages \
+             shared-cache mode: https://www.sqlite.org/sharedcache.html"
         );
     }
     let max_size = if sqlite_target_is_memory(&target) {
@@ -2911,12 +2915,13 @@ impl Db {
     /// write-heavy: read-modify-write cycles, queue claims, session writes,
     /// outbox/idempotency inserts.
     ///
-    /// On a shared-cache target (`cache=shared`) it still lets one writer
-    /// proceed — the first `BEGIN IMMEDIATE` holds the write lock before it
-    /// reads, so contenders cannot all deadlock on the read→write upgrade —
-    /// but it does **not** make the others queue: their `BEGIN IMMEDIATE`
-    /// fails at once with `SQLITE_LOCKED_SHAREDCACHE`, because `SQLite` never
-    /// consults the busy handler for `SQLITE_LOCKED`. Serialize shared-cache
+    /// On a shared-cache target (`cache=shared`) it only stops the
+    /// participating writers from all reading before their read→write upgrade
+    /// attempts. It is not a completion guarantee — a concurrent reader's
+    /// table lock can still fail the write with `SQLITE_LOCKED_SHAREDCACHE` —
+    /// and it does **not** make other writers queue: their `BEGIN IMMEDIATE`
+    /// fails at once, because `SQLite` never consults the busy handler for
+    /// `SQLITE_LOCKED`. Serialize shared-cache
     /// writers in the application or retry each through `tx_immediate` with
     /// backoff — or move to a WAL-mode file database.
     ///

@@ -203,10 +203,10 @@ contention *all* contenders can fail instantly in the same round, with no wait
 between them (issue #2881). A bare "retry once" is not enough there — use an
 exponential-backoff retry loop, or prefer a WAL-mode file database for hot
 write tables. Run each attempt through `Db::tx_immediate`, which takes the
-write lock up front with `BEGIN IMMEDIATE`: one contender then holds the write
-transaction before it reads and completes, and only the others fail — instead
-of every contender reading first and all failing the lock upgrade together.
-It does not make the losers queue, though: under shared cache a contending
+write lock up front with `BEGIN IMMEDIATE`, so the posting writers cannot all
+read first and then all fail the lock upgrade together. It is not a completion
+guarantee — a concurrent reader's table lock can still fail a writer — and it
+does not make the losers queue: under shared cache a contending
 `BEGIN IMMEDIATE` also returns `SQLITE_LOCKED` without consulting the busy
 handler, so it still needs the backoff loop. See
 `docs/guide/sqlite-in-production.md` for the production SQLite story.

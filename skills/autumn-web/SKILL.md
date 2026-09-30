@@ -1154,8 +1154,9 @@ On SQLite, a write-heavy closure (read-modify-write, queue claims, outbox
 inserts) should use `Db::tx_immediate(f)` (unreleased, #2885): it begins
 `BEGIN IMMEDIATE`, so a concurrent writer on a file database waits on
 `busy_timeout` instead of failing with `SQLITE_BUSY_SNAPSHOT`. On a
-`cache=shared` target it lets one writer proceed but the rest fail at once with
-`SQLITE_LOCKED`, so retry with backoff — or use a WAL-mode file database.
+`cache=shared` target it only stops writers from all reading before they
+upgrade; any writer can still fail at once with `SQLITE_LOCKED` (no queueing, no
+guaranteed winner), so retry with backoff — or use a WAL-mode file database.
 
 `TxOptions::default()` is identical to `Db::tx`. See
 `docs/guide/transactions.md` and `docs/guide/hooks-and-transactions.md`.

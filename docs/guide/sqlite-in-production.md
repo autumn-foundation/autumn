@@ -293,9 +293,12 @@ Two things Autumn does about it (issue #2885):
   `find_or_create_by`) already issue `BEGIN IMMEDIATE` since #1996.
 
 `Db::tx_immediate` is only half a shared-cache remedy. Under `cache=shared`
-the first `BEGIN IMMEDIATE` holds the write lock before it reads, so one
-writer always completes instead of every contender failing the read→write
-upgrade together. But a second connection's `BEGIN IMMEDIATE` fails at once
+the first `BEGIN IMMEDIATE` takes the write transaction before it reads, so the
+participating writers cannot all read first and then fail the read→write
+upgrade together. It is not a completion guarantee: a concurrent reader holding
+a table read lock can still fail that writer's write with
+`SQLITE_LOCKED_SHAREDCACHE`, so a retry round need not have a winner. And a
+second connection's `BEGIN IMMEDIATE` fails at once
 with `SQLITE_LOCKED_SHAREDCACHE`: SQLite never consults the busy handler for
 `SQLITE_LOCKED`, so the losers do not queue. On a shared-cache target,
 concurrent writers must be serialized, or retried with backoff by the
