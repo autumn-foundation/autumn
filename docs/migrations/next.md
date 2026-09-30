@@ -1470,7 +1470,7 @@ from. The macro only checked that it was an identifier, so a typo
 (`author_name = usernme`) or a non-text column compiled and then failed on
 the first request with an undefined-column or decoding error. With
 `by = <AuthorModel>`, the macro now reads the same-named field on the author
-struct and requires it to be a `String` or `Option<String>`.
+struct and requires it to be text.
 
 A correct declaration can now fail to compile in one case: the author struct
 renames the display-name column, so the field is not spelled like the column.
@@ -1506,9 +1506,23 @@ Keep `author_name` on the column, and name the field with
 #[commentable(by = User, author_name = screen_name, author_name_field = username)]
 ```
 
+A keyword-named field is written raw: `author_name_field = r#type`.
+
+The field must also be text. `String`, `Box<str>`, and `Option<T>` of either
+are accepted as they are. A field typed as a domain newtype that Diesel
+decodes from `Text` now fails with an unsatisfied `CommentAuthorName` bound.
+Opt it in with one line:
+
+```rust
+impl autumn_web::commentable::CommentAuthorName for Username {}
+```
+
+`Option<Username>` is then accepted too. Implement it only for a type whose
+column really is text.
+
 Nothing else changes: the generated SQL still selects `screen_name`. A
-declaration whose field and column share a name, or that has no `by`, needs
-no edit. See [Commentable](../guide/commentable.md#options).
+declaration whose field and column share a name and whose field is a
+`String`, or that has no `by`, needs no edit. See [Commentable](../guide/commentable.md#options).
 
 **Automation:** `manual` — the field name lives on a struct the macro cannot
 see from the commented model.

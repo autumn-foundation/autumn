@@ -362,7 +362,8 @@ Two of these are worth a second look:
   *public* display name to it would leak addresses into every rendered thread.
 - **`author_name`** names the *column* the SQL selects, and with `by` the
   macro checks it at compile time by reading the same-named *field* on the
-  author struct, which must be a `String` or `Option<String>`. A typo is a
+  author struct, which must be text: a `String`, `Box<str>`, an opted-in
+  newtype, or an `Option` of one. A typo is a
   compile error, not a failed first request. When the author struct renames
   the column (`#[diesel(column_name = screen_name)] pub username: String`),
   the field and column are spelled differently: keep `author_name` on the
@@ -371,6 +372,12 @@ Two of these are worth a second look:
   ```rust,ignore
   #[commentable(by = User, author_name = screen_name, author_name_field = username)]
   ```
+
+  A keyword-named field is written raw: `author_name_field = r#type`. The
+  field may also be a text-backed domain newtype (a `Username` that Diesel
+  decodes from `Text`); opt it in with one line,
+  `impl autumn_web::commentable::CommentAuthorName for Username {}`.
+  `Option<T>` of an admitted type covers a nullable column.
 
 ## Multi-tenancy
 

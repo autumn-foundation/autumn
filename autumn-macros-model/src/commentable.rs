@@ -331,8 +331,12 @@ pub fn parse_commentable_attr(
     let author_name_field = match pairs.get("author_name_field") {
         None => None,
         Some(parsed) => {
+            // A Rust field name, never spliced into SQL: a keyword-named field
+            // is spelled `r#type`, so the raw prefix is allowed here (and only
+            // here) and the rest must still be a plain identifier.
             let key_ident = syn::Ident::new("author_name_field", parsed.span);
-            check_ident_value(&key_ident, &parsed.value, parsed.span)?;
+            let bare = parsed.value.strip_prefix("r#").unwrap_or(&parsed.value);
+            check_ident_value(&key_ident, bare, parsed.span)?;
             if author_name_column.is_none() {
                 return Err(syn::Error::new(
                     parsed.span,
@@ -700,8 +704,9 @@ pub fn emit_commentable_items(
     // SQL references the column in both `insert_comment` and `comment_thread`.
     // Read through the FIELD here, exactly as `author_guard` reads the key
     // field, so a misspelled column is a name-resolution error at compile
-    // time. The bound is on the field's type, on autumn's own sealed
-    // `CommentAuthorName` (`String` / `Option<String>`): a non-text field is a
+    // time. The bound is on the field's type, on autumn's own
+    // `CommentAuthorName` (`String`, `Box<str>`, `Option<T>` of either, or a
+    // text-backed newtype that opts in with one impl): a non-text field is a
     // schema mismatch the same way a non-i64 key is, and a trait bound would
     // have demanded `#[model]`, which hand-written author structs deliberately
     // do not derive. Only emitted when the author MODEL is available — an
@@ -713,8 +718,15 @@ pub fn emit_commentable_items(
     // field is spelled differently and `author_name_field` names it.
     let author_name_guard = match (spec.author_model.as_ref(), spec.author_name_column.as_ref()) {
         (Some(author_model), Some(column)) => {
-            let field = spec.author_name_field.as_deref().unwrap_or(column);
-            let author_name_ident = format_ident!("{field}");
+            let author_name_ident = spec.author_name_field.as_deref().map_or_else(
+                || format_ident!("{column}"),
+                |field| {
+                    field.strip_prefix("r#").map_or_else(
+                        || format_ident!("{field}"),
+                        |raw| syn::Ident::new_raw(raw, proc_macro2::Span::call_site()),
+                    )
+                },
+            );
             Some(quote! {
                 const _: fn(&#author_model) = |__autumn_commentable_author| {
                     fn __autumn_commentable_author_name<
@@ -1427,7 +1439,7 @@ mod tests {
 
     /// A typo'd `author_name` used to pass macro expansion and fail at run
     /// time; the guard reads the field on the author model, so a misspelled
-    /// column is a compile error, and the sealed `CommentAuthorName` bound
+    /// column is a compile error, and the `CommentAuthorName` bound
     /// rejects a non-text field the same way `CommentAuthorKey` rejects a
     /// non-i64 key.
     #[test]
@@ -1494,6 +1506,30 @@ mod tests {
             emitted.contains("__autumn_commentable_author . username"),
             "no override reads the column's own name, {emitted}"
         );
+    }
+
+    /// A keyword-named author field is spelled `r#type`: the raw prefix is
+    /// accepted for `author_name_field` (a Rust field, never SQL) and the
+    /// guard reads it as a raw identifier (Codex review on #3038).
+    #[test]
+    fn author_name_field_accepts_a_raw_identifier() {
+        let spec = parse(&quote! {
+            (by = User, author_name = kind, author_name_field = r#type)
+        })
+        .expect("a raw field name is valid");
+        assert_eq!(spec.author_name_field.as_deref(), Some("r#type"));
+        let emitted = emit(&quote! {
+            (by = User, author_name = kind, author_name_field = r#type)
+        });
+        assert!(
+            emitted.contains("__autumn_commentable_author . r#type"),
+            "the guard reads the raw field, {emitted}"
+        );
+        // The prefix is not a licence for anything else after it.
+        let message = error(&quote! {
+            (by = User, author_name = kind, author_name_field = "r#ty pe")
+        });
+        assert!(message.contains("not a valid identifier"), "{message}");
     }
 
     /// `author_name_field` is meaningless without a column to guard, and has

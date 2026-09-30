@@ -131,23 +131,29 @@ impl CommentAuthorKey for i32 {}
 /// request; a non-text field (say, an `i64`) would do the same. Nothing said
 /// so until the column was actually read.
 ///
-/// `String` and `Option<String>` are admitted: a non-nullable name column
-/// surfaces as `String`, a nullable one as `Option<String>`, and both decode
-/// into the `Option<String>` the public surface carries.
+/// `String` and `Box<str>` are admitted, and `Option<T>` of any admitted `T`
+/// for a nullable column. The SQL never loads the author struct's field — it
+/// decodes the *column* as text — so the field type is only the guard's proxy
+/// for "this column is text". A domain newtype that Diesel maps to `Text`
+/// (e.g. a `Username` implementing `FromSql<Text, _>`) opts in with one line:
 ///
-/// Sealed, because implementing it for a wider type would re-open exactly the
-/// runtime failure it exists to prevent.
-pub trait CommentAuthorName: sealed::Sealed {}
+/// ```rust,ignore
+/// impl autumn_web::commentable::CommentAuthorName for Username {}
+/// ```
+///
+/// Not sealed, for that reason — but implement it only for a type whose
+/// column really is text, or the runtime decoding error it exists to catch
+/// comes back.
+pub trait CommentAuthorName {}
 
 impl CommentAuthorName for String {}
-impl CommentAuthorName for Option<String> {}
+impl CommentAuthorName for Box<str> {}
+impl<T: CommentAuthorName> CommentAuthorName for Option<T> {}
 
 mod sealed {
     pub trait Sealed {}
     impl Sealed for i64 {}
     impl Sealed for i32 {}
-    impl Sealed for String {}
-    impl Sealed for Option<String> {}
 }
 
 /// The soft-delete marker column. Autumn's `soft_delete` convention is fixed,
@@ -1719,6 +1725,24 @@ impl<T> OptionalRow<T> for Result<T, diesel::result::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The author-name guard's bound admits the plain text types, `Option` of
+    /// any of them, and a text-backed domain newtype that opts in with one
+    /// impl line (Codex review on #3038) — a compile-time test: it passes by
+    /// compiling.
+    #[test]
+    fn comment_author_name_admits_text_types_and_opted_in_newtypes() {
+        struct Username(#[allow(dead_code)] String);
+        impl CommentAuthorName for Username {}
+
+        fn admitted<T: CommentAuthorName>() {}
+        admitted::<String>();
+        admitted::<Option<String>>();
+        admitted::<Box<str>>();
+        admitted::<Option<Box<str>>>();
+        admitted::<Username>();
+        admitted::<Option<Username>>();
+    }
 
     fn comment(id: i64, parent_id: Option<i64>, body: &str) -> Comment {
         Comment {
