@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 /// worker thread for the whole run.
 const PER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Floor on a request's timeout, so the last request of a run still has time
+/// to complete against a healthy local app.
+const MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// Totals from one [`run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimulationReport {
@@ -20,9 +24,11 @@ pub struct SimulationReport {
 
 /// Drive GET requests at `url` from `concurrency` threads for `duration`.
 ///
-/// No request is started after the deadline, and each request's timeout is
-/// capped at the time left, so a hanging endpoint cannot stretch the run far
-/// past `duration`.
+/// The clock starts once every worker's HTTP client is built, so client setup
+/// never eats into `duration`. Each worker sends at least one request; after
+/// that none is started past the deadline, and each request's timeout is
+/// capped at the time left (with a short floor), so a hanging endpoint cannot
+/// stretch the run far past `duration`.
 pub fn run(url: &str, duration: Duration, concurrency: usize) -> Result<SimulationReport, String> {
     if concurrency == 0 {
         return Err("Concurrency must be > 0".into());
@@ -31,35 +37,42 @@ pub fn run(url: &str, duration: Duration, concurrency: usize) -> Result<Simulati
     let url = url.to_owned();
     let responses = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
+
+    // Build every client before the clock starts: on a loaded machine client
+    // setup can take longer than a short run, and must not use up its budget.
+    let clients: Vec<Client> = (0..concurrency)
+        .map(|_| {
+            Client::builder()
+                .timeout(PER_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| Client::new())
+        })
+        .collect();
+
     let start = Instant::now();
     let deadline = start + duration;
 
     let mut handles = Vec::with_capacity(concurrency);
 
-    for _ in 0..concurrency {
+    for client in clients {
         let url = url.clone();
         let responses = Arc::clone(&responses);
         let errors = Arc::clone(&errors);
 
         let handle = thread::spawn(move || {
-            let client = Client::builder()
-                .timeout(PER_REQUEST_TIMEOUT)
-                .build()
-                .unwrap_or_else(|_| Client::new());
-
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
                 let outcome = client
                     .get(&url)
-                    .timeout(remaining.min(PER_REQUEST_TIMEOUT))
+                    .timeout(remaining.clamp(MIN_REQUEST_TIMEOUT, PER_REQUEST_TIMEOUT))
                     .send();
                 if outcome.is_ok() {
                     responses.fetch_add(1, Ordering::Relaxed);
                 } else {
                     errors.fetch_add(1, Ordering::Relaxed);
+                }
+                if Instant::now() >= deadline {
+                    break;
                 }
             }
         });
@@ -182,6 +195,27 @@ mod tests {
             "run overran its duration: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn test_simulate_zero_duration_still_sends_one_request_per_worker() {
+        // Regression: the clock used to start before the clients were built,
+        // so a run shorter than client setup sent nothing and reported
+        // "0 responses, 0 failed" as a success.
+        let url = spawn_mock_server();
+        let report = run(&url, Duration::ZERO, 2).expect("run succeeds");
+        assert!(report.responses >= 2, "{report:?}");
+    }
+
+    #[test]
+    fn test_simulate_zero_duration_closed_port_is_an_error() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let result = run(&format!("http://127.0.0.1:{port}"), Duration::ZERO, 1);
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
