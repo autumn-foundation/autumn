@@ -601,14 +601,15 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
-    match (
-        payload.downcast_ref::<&'static str>(),
-        payload.downcast_ref::<String>(),
-    ) {
-        (Some(message), _) => (*message).to_owned(),
-        (_, Some(message)) => message.clone(),
-        (None, None) => "non-string panic payload".to_owned(),
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_owned();
     }
+
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    "non-string panic payload".to_owned()
 }
 
 /// Register a callback to run after the current database transaction commits.
@@ -1491,77 +1492,6 @@ fn sqlite_target_is_memory(target: &str) -> bool {
         || target.contains("mode=memory")
 }
 
-/// Whether a normalized `SQLite` target asks for **shared-cache** mode
-/// (`cache=shared` in the query string) — the mode in which the pool's
-/// connections share one database (one in-memory database, or one shared
-/// view of a file) and contend on table locks rather than file locks.
-///
-/// Shared-cache table-lock conflicts return `SQLITE_LOCKED` /
-/// `SQLITE_LOCKED_SHAREDCACHE` **without invoking the busy handler at all**
-/// (documented `SQLite` behavior; this pool does not wire
-/// `sqlite3_unlock_notify`), so the unconditional `PRAGMA busy_timeout = 5000`
-/// from [`sqlite_connection_pragmas`] does **not** bound those waits (issue
-/// #2881): under real contention every contender can fail instantly, with no
-/// wait between them. Kept in sync with the `cache=shared` carve-out in
-/// [`sqlite_target_is_memory`], which exists precisely so shared-cache targets
-/// are never forced single-slot.
-#[cfg(feature = "sqlite")]
-pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
-    // Only an exact `cache=shared` query pair enables shared cache; a path or
-    // another parameter merely containing that text does not.
-    sqlite_uri_has_query_pair(target, "cache", "shared")
-}
-
-/// Whether `target` is a `SQLite` URI filename whose effective `key` query
-/// parameter is exactly `value`, read the way `SQLite` reads it: only a `file:`
-/// URI has query parameters (a plain path containing `?` is just a filename),
-/// the `#fragment` is ignored, names and values are percent-decoded before the
-/// case-sensitive comparison, and a repeated parameter takes its last value. `target` may be a raw configured URL
-/// (`sqlite:file:...`) or an already-normalized one.
-#[cfg(feature = "sqlite")]
-fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
-    let target = normalize_sqlite_target(target);
-    if !target.starts_with("file:") {
-        return false;
-    }
-    let without_fragment = target
-        .split_once('#')
-        .map_or(target.as_str(), |(head, _)| head);
-    let Some((_, query)) = without_fragment.split_once('?') else {
-        return false;
-    };
-    query
-        .split('&')
-        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
-        .rfind(|(k, _)| percent_decode(k) == key.as_bytes())
-        .is_some_and(|(_, v)| percent_decode(v) == value.as_bytes())
-}
-
-/// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
-/// by two hex digits is kept literally.
-#[cfg(feature = "sqlite")]
-fn percent_decode(input: &str) -> Vec<u8> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && let (Some(hi), Some(lo)) = (
-                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
-                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
-            )
-        {
-            // Two hex digits always fit in a byte.
-            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
 /// Whether a `SQLite` database URL (any accepted spelling) resolves to **any**
 /// in-memory target — the private spellings (`sqlite::memory:` / `:memory:` /
 /// `file::memory:`) AND the shared-cache in-memory form
@@ -1623,6 +1553,93 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether a normalized `SQLite` target enables **shared-cache mode**
+/// (`cache=shared` in the URI query string).
+///
+/// Shared cache multiplexes several connections over one in-memory (or file)
+/// database inside the process, but its table-lock protocol makes concurrent
+/// deferred read→write transactions deadlock permanently: the deferred lock
+/// upgrade fails with `SQLITE_LOCKED` / `SQLITE_BUSY_SNAPSHOT`, which bypasses
+/// the busy-timeout handler, so no amount of retrying unblocks it (issue
+/// #2885). `SQLite`'s own docs call shared-cache mode "obsolete" and
+/// "discouraged", recommending WAL mode instead — and WAL does **not** fix this
+/// deadlock class (the table-lock protocol is orthogonal to the journal mode).
+///
+/// [`Db::tx_immediate`] does **not** rescue this: under shared cache a second
+/// connection's `BEGIN IMMEDIATE` also fails with `SQLITE_LOCKED_SHAREDCACHE`
+/// immediately, since `SQLite` never invokes the busy handler for
+/// `SQLITE_LOCKED` (this pool does not wire `sqlite3_unlock_notify`).
+/// Concurrent shared-cache writers must be serialized or retried with backoff
+/// by the application; the real fix is a WAL-mode file database, where
+/// `tx_immediate` does queue on the busy timeout.
+///
+/// Autumn keeps supporting shared cache (the test suite uses it deliberately —
+/// see [`crate::test_urls`]), so this is a warning, not a refusal.
+/// [`build_sqlite_pool`] logs a loud boot warning when it sees this so the
+/// deadlock mode is never a surprise.
+///
+/// The same bypass means the unconditional `PRAGMA busy_timeout = 5000` from
+/// [`sqlite_connection_pragmas`] does **not** bound shared-cache lock waits,
+/// so the `statement_timeout` rejection message is scoped by this predicate
+/// (issue #2881).
+///
+/// Only an exact `cache=shared` query pair counts; a path or another
+/// parameter merely containing that text does not.
+#[cfg(feature = "sqlite")]
+pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
+    sqlite_uri_has_query_pair(target, "cache", "shared")
+}
+
+/// Whether `target` is a `SQLite` URI filename whose effective `key` query
+/// parameter is exactly `value`, read the way `SQLite` reads it: only a `file:`
+/// URI has query parameters (a plain path containing `?` is just a filename),
+/// the `#fragment` is ignored, names and values are percent-decoded before the
+/// case-sensitive comparison, and a repeated parameter takes its last value. `target` may be a raw configured URL
+/// (`sqlite:file:...`) or an already-normalized one.
+#[cfg(feature = "sqlite")]
+fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
+    let target = normalize_sqlite_target(target);
+    if !target.starts_with("file:") {
+        return false;
+    }
+    let without_fragment = target
+        .split_once('#')
+        .map_or(target.as_str(), |(head, _)| head);
+    let Some((_, query)) = without_fragment.split_once('?') else {
+        return false;
+    };
+    query
+        .split('&')
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+        .rfind(|(k, _)| percent_decode(k) == key.as_bytes())
+        .is_some_and(|(_, v)| percent_decode(v) == value.as_bytes())
+}
+
+/// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
+/// by two hex digits is kept literally.
+#[cfg(feature = "sqlite")]
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            // Two hex digits always fit in a byte.
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
@@ -1702,6 +1719,29 @@ fn build_sqlite_pool(
 
     let timeout = Duration::from_secs(connect_timeout_secs);
     let target = normalize_sqlite_target(url);
+    // Issue #2885: shared-cache mode's table-lock protocol turns concurrent
+    // deferred read→write transactions into a *permanent* deadlock (the lock
+    // upgrade fails with SQLITE_LOCKED, bypassing the busy-timeout handler),
+    // and WAL mode does not fix it. This is a warning, not a refusal — the
+    // test suite itself uses shared-cache in-memory targets on purpose — but
+    // it must be loud: operators hitting this in production otherwise debug a
+    // hang, not a configuration choice.
+    if sqlite_target_is_shared_cache(&target) {
+        tracing::warn!(
+            target = %crate::db_url::redact_target(url),
+            "SQLite shared-cache mode (`cache=shared`) is enabled on this pool. \
+             Concurrent deferred read→write transactions can deadlock permanently \
+             under shared cache: the lock upgrade fails with SQLITE_LOCKED / \
+             SQLITE_BUSY_SNAPSHOT, which bypasses the busy-timeout handler, and \
+             WAL mode does not fix this deadlock class (issue #2885). An up-front \
+             BEGIN IMMEDIATE does not help either: shared-cache lock contention \
+             returns SQLITE_LOCKED without consulting the busy timeout, so \
+             concurrent writers fail fast. Prefer a WAL-mode file database; if \
+             shared cache is required, serialize writers or retry them with \
+             backoff. SQLite itself discourages shared-cache mode: \
+             https://www.sqlite.org/sharedcache.html"
+        );
+    }
     let max_size = if sqlite_target_is_memory(&target) {
         1
     } else {
@@ -2420,7 +2460,8 @@ where
 /// generated write-RMW paths (`with_lock`, `update`, `delete_by_id`,
 /// `find_or_create_by`); read-only transactions, [`Db::tx`], and [`savepoint`]
 /// deliberately stay on the deferred [`scoped_transaction`] so read-only user
-/// transactions keep their read concurrency.
+/// transactions keep their read concurrency. User code that wants this mode
+/// explicitly should call [`Db::tx_immediate`], not this function.
 ///
 /// This is a runtime support function for code generated by Autumn proc macros.
 /// It is semver-exempt; do not call it directly.
@@ -2756,7 +2797,12 @@ impl Db {
     ///
     /// Commits when the closure returns `Ok(_)`, rolls back when it returns
     /// `Err(_)`. For a stronger isolation level and/or automatic
-    /// serialization-failure retry, use [`Db::tx_with`].
+    /// serialization-failure retry, use [`Db::tx_with`]. For a write-heavy
+    /// closure on `SQLite` — where a deferred read→write lock upgrade can fail
+    /// with `SQLITE_BUSY_SNAPSHOT` instead of queueing — use
+    /// [`Db::tx_immediate`], which takes the write lock up front
+    /// (`BEGIN IMMEDIATE`). This method itself deliberately stays deferred so
+    /// read-only transactions keep their read concurrency.
     ///
     /// # Errors
     ///
@@ -2818,6 +2864,134 @@ impl Db {
             .scope(
                 registry.clone(),
                 scoped_transaction::<T, E, _, _>(&mut self.conn, f),
+            )
+            .await
+            .map_err(Into::into);
+
+        guard.disarmed = true;
+
+        // On commit: spawn the registered callbacks outside the transaction
+        // connection, but await them sequentially inside that task so callback
+        // dependencies observe registration order.
+        // Errors are counted and logged; they do NOT affect the committed tx.
+        // In transactional tests (outer transaction is rolled back), we suppress
+        // spawning these callbacks to prevent observing uncommitted side effects.
+        if result.is_ok() {
+            let callbacks: Vec<CommitCallback> = {
+                let mut reg = registry.lock().expect("registry lock");
+                std::mem::take(&mut *reg)
+            };
+
+            if !callbacks.is_empty() && !self.is_test_tx {
+                let _ = spawn_committed_after_commit_callbacks(callbacks);
+            }
+        }
+
+        result
+    }
+
+    /// Run an async closure inside a database transaction that takes the
+    /// `SQLite` write lock up front (`BEGIN IMMEDIATE`).
+    ///
+    /// This is the explicit, user-facing counterpart to [`Db::tx`] for
+    /// write-heavy transactions. Commits when the closure returns `Ok(_)`,
+    /// rolls back when it returns `Err(_)`. For a stronger isolation level
+    /// and/or automatic serialization-failure retry, use [`Db::tx_with`].
+    ///
+    /// # When to use this instead of [`Db::tx`]
+    ///
+    /// On Postgres this behaves exactly like [`Db::tx`]. On `SQLite` it begins
+    /// the transaction with `BEGIN IMMEDIATE`, taking the database write lock
+    /// before the closure runs. A concurrent writer then queues on the
+    /// connection's `busy_timeout` instead of failing its deferred read→write
+    /// snapshot upgrade with `SQLITE_BUSY_SNAPSHOT` (which bypasses the busy
+    /// handler — see issue #2885). Reach for this when the closure is
+    /// write-heavy: read-modify-write cycles, queue claims, session writes,
+    /// outbox/idempotency inserts.
+    ///
+    /// This does **not** help on a shared-cache target (`cache=shared`): there
+    /// a second connection's `BEGIN IMMEDIATE` fails at once with
+    /// `SQLITE_LOCKED_SHAREDCACHE`, because `SQLite` never consults the busy
+    /// handler for `SQLITE_LOCKED`. Serialize or retry shared-cache writers in
+    /// the application, or move to a WAL-mode file database.
+    ///
+    /// The tradeoff is deliberate: an immediate transaction holds the write
+    /// lock for its whole lifetime, so a long-running `tx_immediate` serializes
+    /// other writers for longer than the equivalent deferred transaction
+    /// would. Keep the closure short, and keep pure reads on [`Db::tx`], which
+    /// stays deferred precisely so read-only transactions keep their read
+    /// concurrency.
+    ///
+    /// The `BEGIN IMMEDIATE` is issued through diesel's transaction manager
+    /// (see [`scoped_immediate_transaction`]), so nested [`savepoint`] calls
+    /// inside the closure become `SAVEPOINT`s — matching Postgres — rather than
+    /// failing with "cannot start a transaction within a transaction".
+    ///
+    /// The closure receives `&mut RuntimeConnection` (the bare runtime
+    /// connection), like the generated immediate-transaction paths — not the
+    /// `&mut PooledConnection` that [`Db::tx`] hands out. Repository methods
+    /// take `&mut RuntimeConnection`, so call sites read the same either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] when:
+    ///
+    /// - the underlying transaction returns an error,
+    /// - the closure returns an error that converts into `AutumnError`,
+    /// - this `Db` is already inside a transaction,
+    /// - this `Db` has been poisoned by a previously cancelled/dropped
+    ///   transaction future.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned (only
+    /// possible if a previous thread holding the lock panicked).
+    pub async fn tx_immediate<'a, T, E, F>(
+        &'a mut self,
+        f: F,
+    ) -> Result<T, crate::error::AutumnError>
+    where
+        T: Send + 'a,
+        E: From<diesel::result::Error> + Send + Sync + 'a,
+        crate::error::AutumnError: From<E>,
+        F: for<'r> FnOnce(
+                &'r mut RuntimeConnection,
+            ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+            + Send
+            + 'a,
+    {
+        if self.tx_poisoned {
+            return Err(crate::error::AutumnError::service_unavailable_msg(
+                "Database connection is in an invalid transaction state",
+            ));
+        }
+        if self.tx_depth > 0 {
+            return Err(crate::error::AutumnError::bad_request_msg(
+                NESTED_TX_MESSAGE,
+            ));
+        }
+        reject_ambient_after_commit_registry_for_tx()?;
+        self.tx_depth += 1;
+        let mut guard = TxDepthGuard {
+            depth: &mut self.tx_depth,
+            poisoned: &mut self.tx_poisoned,
+            disarmed: false,
+        };
+
+        // Each tx gets its own callback registry shared with the task-local so
+        // that code running inside the closure (jobs, mailer, hooks) can push
+        // callbacks without having access to `Db` directly. The `Arc` lets us
+        // read the registry after the `scope` future completes.
+        let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Mirrors `tx`, but the transaction begins IMMEDIATE (through the
+        // transaction manager, so the depth counter syncs and nested savepoints
+        // keep working) instead of deferred. `&mut self.conn` derefs from the
+        // pooled connection to the bare `RuntimeConnection` the helper takes.
+        let result = AFTER_COMMIT_REGISTRY
+            .scope(
+                registry.clone(),
+                scoped_immediate_transaction(&mut self.conn, f),
             )
             .await
             .map_err(Into::into);
@@ -5034,6 +5208,7 @@ mod tests {
         // Text that merely contains `cache=shared` outside an exact query
         // pair is NOT shared-cache.
         assert!(!sqlite_target_is_shared_cache("/srv/cache=shared.db"));
+        assert!(!sqlite_target_is_shared_cache("/var/lib/cache=shared.db"));
         assert!(!sqlite_target_is_shared_cache(
             "file:/srv/app.db?note=cache=shared"
         ));

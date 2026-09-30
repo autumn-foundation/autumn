@@ -29,16 +29,10 @@ pub struct SelectSpec {
     pub values: Vec<String>,
 }
 
-/// Parse `--select` tokens of the form `field=val1,val2,...` or `field`.
-///
-/// The bare `field` form (no `=`) emits a `Select(vec![])` placeholder so the
-/// user can fill in options without editing generated internals.
-///
-/// # Errors
-/// Returns [`GenerateError::InvalidField`] if the token is blank.
-pub fn parse_select_specs(tokens: &[String]) -> Result<Vec<SelectSpec>, GenerateError> {
-    let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
+impl std::str::FromStr for SelectSpec {
+    type Err = GenerateError;
+
+    fn from_str(token: &str) -> Result<Self, Self::Err> {
         let (field, values) = match token.split_once('=') {
             Some((f, v)) => (
                 f.trim().to_owned(),
@@ -51,13 +45,23 @@ pub fn parse_select_specs(tokens: &[String]) -> Result<Vec<SelectSpec>, Generate
         };
         if field.is_empty() {
             return Err(GenerateError::InvalidField {
-                token: token.clone(),
+                token: token.to_owned(),
                 reason: "field name is empty in --select spec".into(),
             });
         }
-        out.push(SelectSpec { field, values });
+        Ok(Self { field, values })
     }
-    Ok(out)
+}
+
+/// Parse `--select` tokens of the form `field=val1,val2,...` or `field`.
+///
+/// The bare `field` form (no `=`) emits a `Select(vec![])` placeholder so the
+/// user can fill in options without editing generated internals.
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] if the token is blank.
+pub fn parse_select_specs(tokens: &[String]) -> Result<Vec<SelectSpec>, GenerateError> {
+    tokens.iter().map(|t| t.parse()).collect()
 }
 
 /// Options specific to `autumn generate admin`.

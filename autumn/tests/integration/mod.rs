@@ -45,6 +45,7 @@ mod chaos_channels_loom;
 mod chaos_channels_proptest;
 #[cfg(feature = "ws")]
 mod chaos_channels_subscribe_loom;
+mod chaos_circuit_breaker_panic;
 mod chaos_job_client_loom;
 mod chaos_job_tracking_store_loom;
 mod chaos_metrics_compute_percentiles_proptest;
