@@ -2020,33 +2020,58 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                 } else {
                     // The inline table's `features = [` array spans multiple
                     // lines (e.g. `autumn-web = { version = "0.3", features = [\n
-                    // "ws",\n] }`): scan forward to its actual closing line and
-                    // append there, mirroring the oauth2/webauthn siblings'
-                    // already-correct handling of this shape.
+                    // "ws",\n] }`): scan every line up to the closing bracket,
+                    // the same way the subtable branch below does. The feature
+                    // may already be present on a continuation line (not just
+                    // the opener), and the separator before the closing
+                    // bracket depends on the last non-empty entry, which may
+                    // be several lines back rather than on the closing line
+                    // itself.
+                    let opener_tail = &trimmed[list_start..];
+                    let mut already_present = strip_line_comment(opener_tail).contains(FEATURE);
+                    let mut close_line = None;
                     let mut j = i + 1;
                     while j < lines.len() {
                         let tj = lines[j].trim();
                         if tj.starts_with('[') {
                             break;
                         }
-                        if let Some(close_idx) = find_unquoted(strip_line_comment(tj), ']') {
-                            let before_close = tj[..close_idx].trim();
-                            let sep = if before_close.is_empty() || before_close.ends_with(',') {
-                                ""
-                            } else {
-                                ", "
-                            };
-                            let indent_j: String = lines[j]
-                                .chars()
-                                .take_while(char::is_ascii_whitespace)
-                                .collect();
-                            lines[j] = format!(
-                                "{indent_j}{before_close}{sep}{FEATURE}{}",
-                                &tj[close_idx..]
-                            );
+                        let code = strip_line_comment(tj);
+                        if code.contains(FEATURE) {
+                            already_present = true;
+                        }
+                        if find_unquoted(code, ']').is_some() {
+                            close_line = Some(j);
                             break;
                         }
                         j += 1;
+                    }
+                    if !already_present && let Some(k) = close_line {
+                        let tk = lines[k].trim().to_owned();
+                        let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
+                        let before_close = tk[..close_idx].trim();
+                        let last_entry = (i..=k).rev().find_map(|idx| {
+                            let raw: String = if idx == k {
+                                before_close.to_owned()
+                            } else if idx == i {
+                                opener_tail.to_owned()
+                            } else {
+                                lines[idx].trim().to_owned()
+                            };
+                            let raw = strip_line_comment(&raw).trim().to_owned();
+                            (!raw.is_empty()).then_some(raw)
+                        });
+                        let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
+                            ", "
+                        } else {
+                            ""
+                        };
+                        let indent_k: String = lines[k]
+                            .chars()
+                            .take_while(char::is_ascii_whitespace)
+                            .collect();
+                        lines[k] =
+                            format!("{indent_k}{before_close}{sep}{FEATURE}{}", &tk[close_idx..]);
                     }
                 }
             } else {
@@ -16718,6 +16743,34 @@ mod tests {
         let toml = "autumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(out.contains("\"mail\""), "mail must be merged: {out}");
+    }
+
+    // Codex review on #3044: a multiline inline-table `features = [...]`
+    // array whose last entry has no trailing comma before the closing line
+    // (e.g. `"ws"\n] }`) must still get a separating comma inserted, not
+    // adjacent, unterminated-looking values.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_multiline_array_without_trailing_comma_stays_valid_toml()
+     {
+        let toml = "autumn-web = { version = \"0.3\", features = [\n    \"ws\"\n] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"mail\""),
+            "mail feature must be merged: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    // Codex review on #3044: the "already present?" check for the inline-table
+    // multiline array only looked at the opener line, so a feature already
+    // merged onto a continuation line got duplicated on every re-run.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_does_not_duplicate_across_multiline_array() {
+        let toml =
+            "autumn-web = { version = \"0.3\", features = [\n    \"ws\",\n    \"mail\",\n] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
     }
 
     #[test]
