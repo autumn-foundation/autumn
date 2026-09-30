@@ -32,6 +32,14 @@ async fn noop_handler() -> StatusCode {
     StatusCode::OK
 }
 
+async fn arena_over_handler() -> Result<StatusCode, autumn_web::AutumnError> {
+    let arena = autumn_web::tenant_cell::current_tenant_arena().ok_or_else(|| {
+        autumn_web::AutumnError::internal_server_error_msg("no tenant arena bound")
+    })?;
+    let _bytes = arena.try_bytes(1001)?;
+    Ok(StatusCode::OK)
+}
+
 fn build_app() -> Router {
     build_app_with_state().0
 }
@@ -52,12 +60,23 @@ fn build_app_with_state() -> (Router, AppState) {
     let app = Router::new()
         .route("/charge", post(charge_handler))
         .route("/noop", post(noop_handler))
+        .route("/arena-over", post(arena_over_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             autumn_web::tenancy::tenancy_middleware,
         ))
         .with_state(state.clone());
     (app, state)
+}
+
+#[tokio::test]
+async fn typed_arena_quota_exhaustion_maps_to_503() {
+    let app = build_app();
+    let response = app
+        .oneshot(request_for("/arena-over", "typed"))
+        .await
+        .expect("request completes");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 fn request_for(uri: &str, tenant: &str) -> axum::http::Request<axum::body::Body> {
