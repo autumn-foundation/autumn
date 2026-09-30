@@ -11342,8 +11342,28 @@ async fn resolve_shard_set(
             // no-database path. A shard set establishing SQLite pools under a
             // nonzero timeout still fails closed.
             #[cfg(feature = "sqlite")]
-            crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout)
+            {
+                // Scope the lock-wait wording to a `cache=shared` shard when
+                // any shard is one (issue #2881). Each returned topology pairs
+                // positionally with its configured shard; prefer the target
+                // the provider actually resolved, as the control-pool guard
+                // does.
+                let target = topologies
+                    .iter()
+                    .zip(&config.database.shards)
+                    .map(|(topology, shard)| {
+                        topology
+                            .migration_url()
+                            .unwrap_or(shard.primary_url.as_str())
+                    })
+                    .find(|url| crate::db::sqlite_target_is_shared_cache(url))
+                    .unwrap_or_default();
+                crate::db::reject_sqlite_statement_timeout(
+                    config.database.statement_timeout,
+                    target,
+                )
                 .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+            }
             crate::sharding::build_shard_set(&config.database, topologies, router)
         }
         None => crate::sharding::create_shard_set(&config.database, router)
@@ -11425,8 +11445,15 @@ async fn setup_database(
     // that opt-out. The check is idempotent with the built-in factories' own, and
     // `resolve_shard_set` applies the same Some-gated guard for shards.
     #[cfg(feature = "sqlite")]
-    if topology.is_some() {
-        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout)
+    if let Some(topology) = topology.as_ref() {
+        // Prefer the provider-resolved target (a custom provider may have no
+        // static URL, or a different one) so the message describes the pool
+        // that was actually built, as the migration path below does.
+        let target = topology
+            .migration_url()
+            .or_else(|| config.database.effective_primary_url())
+            .unwrap_or_default();
+        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout, target)
             .map_err(|e| format!("Failed to create database pool: {e}"))?;
     }
 

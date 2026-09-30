@@ -292,12 +292,18 @@ Two things Autumn does about it (issue #2885):
   generated write-RMW paths (`with_lock`, `update`, `delete_by_id`,
   `find_or_create_by`) already issue `BEGIN IMMEDIATE` since #1996.
 
-`Db::tx_immediate` is **not** a shared-cache remedy. Under `cache=shared` a
-second connection's `BEGIN IMMEDIATE` fails at once with
-`SQLITE_LOCKED_SHAREDCACHE`: SQLite never consults the busy handler for
-`SQLITE_LOCKED`, so there is no queueing to move contention onto. On a
-shared-cache target, concurrent writers must be serialized or retried with
-backoff by the application — or, better, move to a WAL-mode file database.
+`Db::tx_immediate` is only half a shared-cache remedy. Under `cache=shared`
+the first `BEGIN IMMEDIATE` takes the write transaction before it reads, so the
+participating writers cannot all read first and then fail the read→write
+upgrade together. It is not a completion guarantee: a concurrent reader holding
+a table read lock can still fail that writer's write with
+`SQLITE_LOCKED_SHAREDCACHE`, so a retry round need not have a winner. And a
+second connection's `BEGIN IMMEDIATE` fails at once
+with `SQLITE_LOCKED_SHAREDCACHE`: SQLite never consults the busy handler for
+`SQLITE_LOCKED`, so the losers do not queue. On a shared-cache target,
+concurrent writers must be serialized, or retried with backoff by the
+application with each attempt through `Db::tx_immediate` — or, better, move to
+a WAL-mode file database.
 
 Rule of thumb on a file database: pure reads go through `Db::tx`, anything that
 reads-then-writes goes through `Db::tx_immediate`.

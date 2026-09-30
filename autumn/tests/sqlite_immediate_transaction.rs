@@ -785,12 +785,17 @@ async fn shared_cache_pool_construction_logs_loud_warning() {
         logs.contains("WAL-mode file database"),
         "the warning should steer toward a WAL-mode file database, got: {logs}"
     );
-    // `BEGIN IMMEDIATE` contention under shared cache returns SQLITE_LOCKED
-    // without the busy handler, so the warning must not offer
-    // `Db::tx_immediate` as the remedy.
+    // `BEGIN IMMEDIATE` lets one shared-cache writer proceed, but contention
+    // still returns SQLITE_LOCKED without the busy handler, so the warning
+    // pairs `Db::tx_immediate` with a backoff retry rather than offering it
+    // as a queueing fix.
     assert!(
-        !logs.contains("tx_immediate"),
-        "the warning must not recommend Db::tx_immediate for shared cache, got: {logs}"
+        logs.contains("Db::tx_immediate") && logs.contains("backoff"),
+        "the warning should pair Db::tx_immediate with a backoff retry, got: {logs}"
+    );
+    assert!(
+        logs.contains("fail fast rather than queue"),
+        "the warning must say the losing writers do not queue, got: {logs}"
     );
 
     // A non-shared-cache target stays silent: the warning is scoped to

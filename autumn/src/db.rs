@@ -1309,6 +1309,11 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 ///   auto-checkpoint rewrites the main database file, which would tear a base
 ///   snapshot mid-copy, and restarts the WAL under a new salt, which would force
 ///   an expensive fresh generation every 1000 pages.
+/// * The `busy_timeout` pragma is applied unconditionally, but it does **not**
+///   cover `cache=shared` table-lock conflicts: those return `SQLITE_LOCKED`
+///   without invoking the busy handler at all (the pool does not wire
+///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
+///   harmless, not harmful (issue #2881).
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
     if read_only {
@@ -1478,7 +1483,7 @@ fn normalize_sqlite_target(url: &str) -> String {
 /// so it must NOT be forced single-slot and returns `false` here.
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_memory(target: &str) -> bool {
-    if target.contains("cache=shared") {
+    if sqlite_target_is_shared_cache(target) {
         return false;
     }
     target == ":memory:"
@@ -1562,23 +1567,32 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
 /// "discouraged", recommending WAL mode instead — and WAL does **not** fix this
 /// deadlock class (the table-lock protocol is orthogonal to the journal mode).
 ///
-/// [`Db::tx_immediate`] does **not** rescue this: under shared cache a second
-/// connection's `BEGIN IMMEDIATE` also fails with `SQLITE_LOCKED_SHAREDCACHE`
-/// immediately, since `SQLite` never invokes the busy handler for
-/// `SQLITE_LOCKED` (this pool does not wire `sqlite3_unlock_notify`).
-/// Concurrent shared-cache writers must be serialized or retried with backoff
-/// by the application; the real fix is a WAL-mode file database, where
-/// `tx_immediate` does queue on the busy timeout.
+/// [`Db::tx_immediate`] only stops the participating writers from all reading
+/// before their upgrade attempts — the first `BEGIN IMMEDIATE` takes the write
+/// transaction up front. It is not a completion guarantee (a concurrent
+/// reader's table lock can still fail that writer's write with
+/// `SQLITE_LOCKED_SHAREDCACHE`), and it does **not** make the other writers
+/// wait: under shared cache their `BEGIN IMMEDIATE` fails immediately,
+/// since `SQLite` never invokes the busy handler for `SQLITE_LOCKED` (this pool
+/// does not wire `sqlite3_unlock_notify`). Concurrent shared-cache writers
+/// must therefore still be serialized, or retried with backoff (each attempt
+/// through `tx_immediate`) by the application; the real fix is a WAL-mode file
+/// database, where `tx_immediate` does queue on the busy timeout.
 ///
 /// Autumn keeps supporting shared cache (the test suite uses it deliberately —
 /// see [`crate::test_urls`]), so this is a warning, not a refusal.
 /// [`build_sqlite_pool`] logs a loud boot warning when it sees this so the
 /// deadlock mode is never a surprise.
 ///
+/// The same bypass means the unconditional `PRAGMA busy_timeout = 5000` from
+/// [`sqlite_connection_pragmas`] does **not** bound shared-cache lock waits,
+/// so the `statement_timeout` rejection message is scoped by this predicate
+/// (issue #2881).
+///
 /// Only an exact `cache=shared` query pair counts; a path or another
 /// parameter merely containing that text does not.
 #[cfg(feature = "sqlite")]
-fn sqlite_target_is_shared_cache(target: &str) -> bool {
+pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
     sqlite_uri_has_query_pair(target, "cache", "shared")
 }
 
@@ -1724,12 +1738,14 @@ fn build_sqlite_pool(
              under shared cache: the lock upgrade fails with SQLITE_LOCKED / \
              SQLITE_BUSY_SNAPSHOT, which bypasses the busy-timeout handler, and \
              WAL mode does not fix this deadlock class (issue #2885). An up-front \
-             BEGIN IMMEDIATE does not help either: shared-cache lock contention \
-             returns SQLITE_LOCKED without consulting the busy timeout, so \
-             concurrent writers fail fast. Prefer a WAL-mode file database; if \
-             shared cache is required, serialize writers or retry them with \
-             backoff. SQLite itself discourages shared-cache mode: \
-             https://www.sqlite.org/sharedcache.html"
+             BEGIN IMMEDIATE (Db::tx_immediate) stops writers from all reading \
+             before they upgrade, but it guarantees no winner: other writers, and \
+             a writer blocked by a concurrent reader's table lock, still get \
+             SQLITE_LOCKED without consulting the busy timeout, so they fail fast \
+             rather than queue. Prefer a WAL-mode file database; if shared \
+             cache is required, serialize writers or retry each one through \
+             Db::tx_immediate with backoff. SQLite itself discourages \
+             shared-cache mode: https://www.sqlite.org/sharedcache.html"
         );
     }
     let max_size = if sqlite_target_is_memory(&target) {
@@ -1879,7 +1895,7 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout)?;
+    reject_sqlite_statement_timeout(config.statement_timeout, url)?;
 
     let pool = build_pool(
         url,
@@ -1909,8 +1925,16 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
 /// [`DatabasePoolProvider`](crate::db::DatabasePoolProvider) — whose
 /// `create_topology`/`create_shard_topology` need not route through those
 /// factories — cannot bypass the guard. No configured timeout can reach a live
-/// `SQLite` pool. `busy_timeout` still bounds lock waits; a real per-statement
-/// timeout is tracked by #1996/#1910.
+/// `SQLite` pool. `busy_timeout` bounds lock waits only for lock modes that
+/// consult the busy handler; it does **not** bound `cache=shared` table-lock
+/// waits, which return `SQLITE_LOCKED` without invoking the busy handler at
+/// all (issue #2881). A real per-statement timeout is tracked by
+/// #1996/#1910.
+///
+/// `target` is the pool's database target (the raw configured URL is fine —
+/// [`sqlite_target_is_shared_cache`] only inspects the query string) and is
+/// used solely to scope the lock-wait claim in the error message so it does
+/// not lie for `cache=shared` targets.
 ///
 /// # Errors
 ///
@@ -1919,16 +1943,30 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
 #[cfg(feature = "sqlite")]
 pub(crate) fn reject_sqlite_statement_timeout(
     statement_timeout: Option<Duration>,
+    target: &str,
 ) -> Result<(), PoolError> {
     let Some(timeout) = statement_timeout.filter(|t| !t.is_zero()) else {
         return Ok(());
+    };
+    // `busy_timeout` bounds lock waits only for lock modes that consult the
+    // busy handler. A `cache=shared` target's shared-cache table-lock
+    // conflicts return `SQLITE_LOCKED` without invoking the busy handler at
+    // all (this pool does not wire `sqlite3_unlock_notify`), so stating the
+    // unqualified claim for those targets would be false (issue #2881).
+    let wait_clause = if sqlite_target_is_shared_cache(target) {
+        "and note that `cache=shared` table-lock conflicts return SQLITE_LOCKED \
+         immediately, without consulting the busy handler (this pool does not \
+         wire sqlite3_unlock_notify), so `busy_timeout` does NOT bound those \
+         waits (issue #2881)"
+    } else {
+        "(`busy_timeout` already bounds lock waits)"
     };
     Err(PoolError::UnsupportedBackend(format!(
         "SQLite backend cannot enforce database.statement_timeout ({}ms): diesel's \
          SqliteConnection exposes no interrupt/progress-handler hook through the async \
          connection wrapper, so a runaway query cannot be aborted. Unset \
-         database.statement_timeout for the SQLite backend (busy_timeout already bounds \
-         lock waits), or run on Postgres. Tracking issue: #1996/#1910.",
+         database.statement_timeout for the SQLite backend {wait_clause}, or run on Postgres. \
+         Tracking issue: #1996/#1910.",
         timeout.as_millis()
     )))
 }
@@ -1978,7 +2016,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout)?;
+    reject_sqlite_statement_timeout(config.statement_timeout, primary_url)?;
 
     let primary = build_pool(
         primary_url,
@@ -2022,7 +2060,7 @@ pub fn create_shard_topology(
     // Postgres-only), so the same fail-closed guard applies per shard. The shard
     // inherits the `[database]` `statement_timeout`.
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(defaults.statement_timeout)?;
+    reject_sqlite_statement_timeout(defaults.statement_timeout, &shard.primary_url)?;
 
     let primary = build_pool(
         &shard.primary_url,
@@ -2877,11 +2915,15 @@ impl Db {
     /// write-heavy: read-modify-write cycles, queue claims, session writes,
     /// outbox/idempotency inserts.
     ///
-    /// This does **not** help on a shared-cache target (`cache=shared`): there
-    /// a second connection's `BEGIN IMMEDIATE` fails at once with
-    /// `SQLITE_LOCKED_SHAREDCACHE`, because `SQLite` never consults the busy
-    /// handler for `SQLITE_LOCKED`. Serialize or retry shared-cache writers in
-    /// the application, or move to a WAL-mode file database.
+    /// On a shared-cache target (`cache=shared`) it only stops the
+    /// participating writers from all reading before their read→write upgrade
+    /// attempts. It is not a completion guarantee — a concurrent reader's
+    /// table lock can still fail the write with `SQLITE_LOCKED_SHAREDCACHE` —
+    /// and it does **not** make other writers queue: their `BEGIN IMMEDIATE`
+    /// fails at once, because `SQLite` never consults the busy handler for
+    /// `SQLITE_LOCKED`. Serialize shared-cache
+    /// writers in the application or retry each through `tx_immediate` with
+    /// backoff — or move to a WAL-mode file database.
     ///
     /// The tradeoff is deliberate: an immediate transaction holds the write
     /// lock for its whole lifetime, so a long-running `tx_immediate` serializes
@@ -5149,16 +5191,33 @@ mod tests {
         assert!(!sqlite_target_is_memory("/var/lib/app.db"));
     }
 
-    // The shared-cache boot warning (issue #2885) fires only for an exact
-    // `cache=shared` query pair, not for text merely containing it.
+    // `sqlite_target_is_shared_cache` is the predicate that scopes the
+    // `statement_timeout` rejection message (issue #2881): it must catch every
+    // `cache=shared` spelling, including a shared-cache file target, and must
+    // not fire for private in-memory or plain file targets.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn sqlite_target_is_shared_cache_requires_an_exact_query_pair() {
+    fn sqlite_target_is_shared_cache_covers_query_spellings() {
+        // Shared-cache in-memory spellings.
         assert!(sqlite_target_is_shared_cache("file::memory:?cache=shared"));
         assert!(sqlite_target_is_shared_cache(
             "file:app?mode=memory&cache=shared"
         ));
+        // Shared-cache also applies to file-backed targets.
+        assert!(sqlite_target_is_shared_cache(
+            "file:/srv/ref.db?cache=shared&mode=ro"
+        ));
+        // Private in-memory targets are NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache(":memory:"));
+        assert!(!sqlite_target_is_shared_cache("file::memory:"));
+        assert!(!sqlite_target_is_shared_cache("file::memory:?foo=bar"));
         assert!(!sqlite_target_is_shared_cache("file:app?mode=memory"));
+        // Plain file targets are NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache("file:/srv/ref.db"));
+        assert!(!sqlite_target_is_shared_cache("/var/lib/app.db"));
+        // Text that merely contains `cache=shared` outside an exact query
+        // pair is NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache("/srv/cache=shared.db"));
         assert!(!sqlite_target_is_shared_cache("/var/lib/cache=shared.db"));
         assert!(!sqlite_target_is_shared_cache(
             "file:/srv/app.db?note=cache=shared"
@@ -5186,6 +5245,53 @@ mod tests {
         assert!(sqlite_target_is_shared_cache(
             "file:app.db?cache=private&cache=shared"
         ));
+    }
+
+    // The `statement_timeout` rejection must not claim `busy_timeout` bounds
+    // lock waits for `cache=shared` targets (issue #2881): shared-cache
+    // table-lock conflicts return `SQLITE_LOCKED` without invoking the busy
+    // handler at all, so the claim is false there and the message says so.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_statement_timeout_scopes_lock_wait_claim() {
+        let timeout = Some(std::time::Duration::from_millis(100));
+
+        let shared = reject_sqlite_statement_timeout(timeout, "file:app?mode=memory&cache=shared");
+        let message = match shared {
+            Err(PoolError::UnsupportedBackend(message)) => message,
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        };
+        assert!(
+            message.contains("does NOT bound"),
+            "shared-cache message must disclaim the busy_timeout bound, got: {message}"
+        );
+        assert!(
+            message.contains("SQLITE_LOCKED"),
+            "shared-cache message must name the failure mode, got: {message}"
+        );
+        assert!(
+            message.contains("#2881"),
+            "shared-cache message must point at the issue, got: {message}"
+        );
+        assert!(
+            !message.contains("already bounds lock waits"),
+            "shared-cache message must not make the unqualified claim, got: {message}"
+        );
+
+        let plain = reject_sqlite_statement_timeout(timeout, "file:/srv/app.db");
+        let message = match plain {
+            Err(PoolError::UnsupportedBackend(message)) => message,
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        };
+        assert!(
+            message.contains("(`busy_timeout` already bounds lock waits)"),
+            "non-shared-cache message keeps the original claim, got: {message}"
+        );
+
+        // No configured timeout asks for no guarantee and boots cleanly on
+        // either target shape.
+        assert!(reject_sqlite_statement_timeout(None, "file:app?mode=memory&cache=shared").is_ok());
+        assert!(reject_sqlite_statement_timeout(None, "file:/srv/app.db").is_ok());
     }
 
     // `sqlite_target_is_any_in_memory` is the broader predicate the
