@@ -6,9 +6,8 @@
   through eviction until final reclamation. ADR 0012 and a Verus lifecycle
   specification precisely reject hard-isolation/RSS claims: ordinary Rust,
   framework, third-party, stack, allocator, and native allocations remain
-  outside this cooperative tracked-memory boundary. Evicted-but-live domains
-  are weakly indexed and rebound for later requests, so LRU/TTL churn cannot
-  reset usage and admit overlapping full-quota allocation generations. Arena
+  outside this cooperative tracked-memory boundary. A live arena allocation
+  keeps its tenant's accounting domain alive across eviction, so a later
+  request rebinds it instead of admitting a second full-quota generation. Arena
   allocation failures retain `TryReserveError` directly (without allocating an
-  error `String` under memory pressure), and domain misses clean only their own
-  stale weak entry rather than scanning the entire tenant index.
+  error `String` under memory pressure).

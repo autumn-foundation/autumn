@@ -206,7 +206,7 @@ maud = { version = "0.27", features = ["axum"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 ```
 
 Use `pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }`
@@ -818,7 +818,10 @@ The column defaults to `{snake(child)}_count` — **singular**, matching
 `#[votable(aggregate = count)]` — and is overridable with `counter_cache =
 "<column>"`. `counter_cache_tenant = "<column>"` confines every delta to the
 caller's tenant (both tables must carry that column); without it no tenant
-predicate is emitted. It is a **`belongs_to`** option only — on a `has_many`, on
+predicate is emitted. `parent_pk = "<column>"` names the parent's primary-key
+column when it is not `id` (a renamed `#[id]` or `#[diesel(column_name)]`) —
+the child cannot see the parent's fields, so it is never inferred (#2662). It
+is a **`belongs_to`** option only — on a `has_many`, on
 a `through =` join table, with a non-identifier column, with two legs resolving
 onto one parent column, or on a composite `#[id]`, it is a directed compile
 error.
@@ -848,8 +851,8 @@ string literal>`, `field.is_some()`/`is_none()`, `a && b` and parentheses over
 `bool`/integer/`String` fields and their `Option` forms; each filter is lowered
 to both Rust and SQL, and string ordering comparisons and float literals are
 compile errors. Other keys, each at most once: `fk`, `parent_table` (for a
-parent that overrides its table; the parent pk is always `id`), `tenant`,
-`name`. The parent column is the
+parent that overrides its table), `parent_pk` (for a parent whose primary key
+is not `id`, #2662), `tenant`, `name`. The parent column is the
 app's migration (`BIGINT NOT NULL DEFAULT 0`); the `_autumn_derivations` state
 table ships as a framework migration and is applied automatically. Each
 derivation is content-addressed, so a changed filter enqueues a resumable,
@@ -1381,6 +1384,34 @@ For jobs and the scheduler (no request scope), set a process-wide default with
 recorded as `"system"` — the `_autumn_version_history.actor` column is `NOT NULL
 DEFAULT 'system'` and the generated code falls back to `VersionEntry::SYSTEM_ACTOR`
 (#1383). See `docs/guide/version-history.md`.
+
+### Authenticated `#[edge]` routes — host-resolved identity (unreleased, feature `edge`)
+
+An `#[edge]` capsule never sees cookies, session ids, signing keys or store
+credentials. The **host** resolves identity before the capsule runs and passes
+only normalized claims: `EdgeIdentity { user_id: EdgeUserId, roles: Vec<EdgeRole> }`
+(re-exported from `autumn_web::edge_support`), taken as a handler extractor.
+`EdgeIdentity` is also in `autumn_edge::prelude`. A handler taking it must
+declare `#[edge(needs(identity))]` (a build error otherwise); a request without
+host-verified claims then falls through to origin before dispatch, so no
+extractor or handler code runs.
+
+```rust
+#[get("/me")]
+#[edge(needs(identity))]
+pub async fn whoami(identity: EdgeIdentity) -> String {
+    identity.user_id().as_str().to_owned()
+}
+```
+
+Install the source with `AppBuilder::with_edge_identity_provider(provider)`.
+The first-party one is `SessionIdentityProvider::new(store, AuthSessionProjector::new("user_id"), cookie_name, signing_keys)`:
+it reuses `SessionLayer`'s cookie and signing-key verification, so it accepts
+exactly what the session middleware accepts. A custom `EdgeIdentityProvider`
+returns `Ok(Some(_))` only after authoritative verification, `Ok(None)` for a
+missing/invalid credential, and a typed error for store/network failure (also a
+fall-through). Revocation needs an authoritative store — never back it with an
+opportunistic cache. See `docs/guide/edge.md` and ADR-0005.
 
 ## OAuth2/OIDC scaffolding
 
@@ -2712,7 +2743,11 @@ async fn build_report() -> AutumnResult<String> {
 - Eviction — manual `TenantCellRegistry::evict(tenant_id)` or automatic
   (`max_cells`/`idle_ttl_secs`) — reclaims tracked bytes on `Drop`; an in-flight
   request keeps its own cached `Arc<TenantCell>` to completion, so evicting
-  mid-request never resets a running request's state. This is a tracked-bytes
+  mid-request never resets a running request's state. While any handle is still
+  live, the next `get_or_create` for that tenant **resurrects** the same
+  domain (quota counter and scratch store) rather than minting a fresh one —
+  eviction ends cache residency, not the accounting lifetime, so do not rely on
+  it to give the next request a clean slate or purge scratch immediately. This is a tracked-bytes
   accounting boundary via `tracked_bytes()` / `total_tracked_bytes()`, **not**
   RSS — allocations made outside the cell API are invisible by design.
 

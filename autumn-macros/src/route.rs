@@ -71,6 +71,7 @@ pub fn route_macro(
             http_method,
             &input_fn,
             !interceptors.is_empty(),
+            marking.needs_identity,
             marking.span,
         )
     {
@@ -441,6 +442,12 @@ const EDGE_EXTENSION_ERROR: &str = "`#[edge]` handlers cannot take `Extension<..
                                     would be served as a 500 instead of falling through; use \
                                     `EdgeCache`, or serve this route from the origin";
 
+/// Compile error for an `#[edge]` handler taking `EdgeIdentity` without
+/// declaring it.
+const EDGE_IDENTITY_UNDECLARED_ERROR: &str = "`#[edge]` handlers that take `EdgeIdentity` must \
+     declare it with `#[edge(needs(identity))]`, so an unauthenticated request falls through to \
+     the origin before any handler code runs";
+
 /// Compile error for `#[edge]` stacked with `#[agent_operable]`.
 const EDGE_AGENT_OPERABLE_ERROR: &str = "`#[edge]` cannot be combined with `#[agent_operable(...)]` — the edge lane is \
      read-only, and the capsule has no audit sink or `AppState` to record an agent \
@@ -470,6 +477,7 @@ fn reject_ineligible_edge_route(
     http_method: &str,
     input_fn: &syn::ItemFn,
     has_interceptors: bool,
+    needs_identity: bool,
     span: Span,
 ) -> Option<TokenStream> {
     if http_method != "GET" {
@@ -494,7 +502,25 @@ fn reject_ineligible_edge_route(
     if has_extension_param(input_fn) {
         return Some(syn::Error::new(span, EDGE_EXTENSION_ERROR).to_compile_error());
     }
+    if !needs_identity && has_edge_identity_param(input_fn) {
+        return Some(syn::Error::new(span, EDGE_IDENTITY_UNDECLARED_ERROR).to_compile_error());
+    }
     None
+}
+
+/// Whether any parameter's type names `EdgeIdentity`.
+///
+/// Identity must be declared with `needs(identity)` so the runtime can refuse
+/// an unauthenticated request *before* dispatch, the same way it refuses a
+/// missing `kv`. Like [`has_extension_param`], an alias that hides the name is
+/// not resolved; the extractor's own rejection still falls through to origin.
+fn has_edge_identity_param(input_fn: &syn::ItemFn) -> bool {
+    input_fn.sig.inputs.iter().any(|arg| {
+        let syn::FnArg::Typed(pat_type) = arg else {
+            return false;
+        };
+        tokens_contain_ident(&quote! { #pat_type }, "EdgeIdentity")
+    })
 }
 
 /// Whether any parameter's type names `Extension` — `Extension<T>`,
@@ -643,11 +669,14 @@ fn emit_edge_items(
         return (TokenStream::new(), TokenStream::new());
     };
 
-    let needs = if marking.needs_kv {
-        quote! { &[::autumn_edge::EdgeCapability::Kv] }
-    } else {
-        quote! { &[] }
-    };
+    let mut capabilities = Vec::new();
+    if marking.needs_kv {
+        capabilities.push(quote! { ::autumn_edge::EdgeCapability::Kv });
+    }
+    if marking.needs_identity {
+        capabilities.push(quote! { ::autumn_edge::EdgeCapability::Identity });
+    }
+    let needs = quote! { &[#(#capabilities),*] };
     let edge_route_name = format_ident!("__autumn_edge_route_{}", fn_name);
 
     (
@@ -2199,6 +2228,39 @@ mod tests {
             edge_companion_fragment(&below),
             edge_companion_fragment(&above),
             "both stacking orders must produce the same edge route"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_needs_identity_populates_the_needs_slice() {
+        let edged = crate::edge::edge_macro(
+            quote! { needs(kv, identity) },
+            quote! { async fn me(identity: EdgeIdentity) -> String { identity.user_id().as_str().to_owned() } },
+        );
+        let generated = route_macro("GET", "get", quote! { "/me" }, edged).to_string();
+
+        assert!(
+            generated.contains(
+                "needs : & [:: autumn_edge :: EdgeCapability :: Kv , :: autumn_edge :: EdgeCapability :: Identity]"
+            ),
+            "needs(identity) must declare the Identity capability on the edge route: {generated}"
+        );
+        assert!(!generated.contains("compile_error"), "{generated}");
+    }
+
+    #[test]
+    fn route_macro_edge_rejects_undeclared_edge_identity() {
+        // Without `needs(identity)` the runtime cannot refuse an
+        // unauthenticated request before dispatch.
+        let edged = crate::edge::edge_macro(
+            quote! {},
+            quote! { async fn me(identity: EdgeIdentity) -> String { identity.user_id().as_str().to_owned() } },
+        );
+        let generated = route_macro("GET", "get", quote! { "/me" }, edged).to_string();
+        assert!(generated.contains("compile_error"), "{generated}");
+        assert!(
+            generated.contains("needs(identity)"),
+            "the error must name the missing declaration: {generated}"
         );
     }
 

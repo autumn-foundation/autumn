@@ -55,10 +55,11 @@ stateDiagram-v2
 
 Eviction removes only the registry reference. It does not invalidate an
 in-flight request; final reclamation occurs only after every outstanding
-reference and arena-owned value is dropped. A weak domain index prevents quota
-reset across generations: if a new request for the same tenant arrives while an
-evicted domain is still live, the registry rebinds that domain and its existing
-usage instead of creating a zero-usage accounting domain.
+reference and arena-owned value is dropped. The registry's weak lifecycle map
+prevents quota reset across generations: if a new request for the same tenant
+arrives while an evicted domain is still live (an arena allocation keeps it
+alive), the registry rebinds that domain and its existing usage instead of
+creating a zero-usage accounting domain.
 
 ## Verification and consequences
 
