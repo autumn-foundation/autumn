@@ -1646,6 +1646,21 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' \
             "${RUNNER_TEMP}/bookmarks-distributed-link-checker.log" \
             || { echo "::error::no link-checker mark_dead batch test ran — the ci.yml filter no longer matches"; exit 1; }
+          # examples/blog: admin CSV import per-row INSERT findings profile
+          # (Ledger, #2998). `blog` ships no library target, so this lives in
+          # `src/admin.rs`'s own `#[cfg(test)]` tree (a `--bin` unit test, not
+          # a `tests/*.rs` binary) and needs this explicit line the same way
+          # the bookmarks-distributed link-checker profile above does. Same
+          # positive-pass-count guard, for the same silent-rename reason.
+          (
+            set -o pipefail
+            cargo test -p blog --bin blog -- \
+              --ignored ledger_import_csv_row_batch_profile --test-threads=1 \
+              | tee "${RUNNER_TEMP}/blog-import-csv-profile.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' \
+            "${RUNNER_TEMP}/blog-import-csv-profile.log" \
+            || { echo "::error::no blog import-csv batch profile test ran — the ci.yml filter no longer matches"; exit 1; }
           # examples/react-graphql: the Postgres tier of its GraphQL suite
           # (rows, hooks, normalisation, validation, REST/GraphQL parity).
           # Testcontainer-managed; serial because the tests share one
