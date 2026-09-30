@@ -2684,10 +2684,10 @@ previous_secrets = []
                 || content.contains("image = var.bootstrap_image"),
             "main.tf must set the container image to var.bootstrap_image: {content}"
         );
+        // The app's list also carries `ingress[0].external_enabled` (#2312),
+        // so match the image entry rather than a one-element list.
         assert_eq!(
-            content
-                .matches("ignore_changes = [template[0].container[0].image]")
-                .count(),
+            content.matches("template[0].container[0].image").count(),
             2,
             "both the app and the migration job must ignore image drift after bootstrap: {content}"
         );
@@ -2904,6 +2904,61 @@ previous_secrets = []
         assert!(
             tfvars.contains("min_replicas        = 0") || tfvars.contains("min_replicas = 0"),
             "terraform.tfvars.example must preserve the safe bootstrap default: {tfvars}"
+        );
+    }
+
+    #[test]
+    fn azure_bootstrap_keeps_external_ingress_disabled_until_first_deploy() {
+        // Between `terraform apply` and the first real-image cutover, an
+        // inbound request to the public FQDN must not be able to start the
+        // bootstrap placeholder revision with production secret refs and the
+        // Key Vault-capable managed identity attached. `min_replicas = 0`
+        // only permits scale-to-zero; it does not stop the HTTP scale rule
+        // waking the placeholder on traffic — so external ingress itself
+        // stays disabled until the cutover opens it (#2312).
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let ingress_block = content
+            .split("ingress {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }").next())
+            .expect("main.tf must declare the app ingress block");
+        assert!(
+            ingress_block.contains("external_enabled = false"),
+            "external ingress must stay disabled until the first real deploy: {ingress_block}"
+        );
+        assert!(
+            content.contains("ingress[0].external_enabled,"),
+            "the app's lifecycle must ignore external_enabled, or a later \
+             `terraform apply` closes the ingress the cutover opened"
+        );
+        assert!(
+            !ingress_block.contains("external_enabled = true"),
+            "external_enabled = true would let inbound traffic wake the bootstrap \
+             placeholder with production secrets: {ingress_block}"
+        );
+
+        // The cutover opens ingress once the real image is serving — after
+        // the image update, never before.
+        let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        // Match the invocation (with its line continuation), not the bare
+        // text an earlier concurrency comment also contains.
+        let update_at = workflow
+            .find("az containerapp update \\")
+            .expect("workflow must cut over via az containerapp update");
+        let enable_at = workflow
+            .find("az containerapp ingress enable")
+            .expect("workflow must enable external ingress at cutover");
+        assert!(
+            enable_at > update_at,
+            "ingress must open AFTER the real image is deployed, not before: {workflow}"
+        );
+        assert!(
+            workflow.contains("--type external"),
+            "the cutover must open external (public) ingress: {workflow}"
         );
     }
 
