@@ -1094,6 +1094,13 @@ pub enum ClientAuthDoctorData {
         ca_count: usize,
         /// Whether a CRL is configured, and whether its `nextUpdate` has passed.
         crl_stale: Option<bool>,
+        /// Subject DNs of the CAs in the bundle that no CRL in the configured
+        /// CRL file is issued by (issue #2706). Empty when no CRL is
+        /// configured. Once any CRL is configured, the runtime refuses
+        /// handshakes whose revocation status is unknown, so these CAs'
+        /// clients would be rejected — and the server refuses to boot on this,
+        /// so `--strict` fails the run.
+        crl_coverage_gaps: Vec<String>,
         /// How many route prefixes demand a certificate.
         required_path_count: usize,
     },
@@ -1110,8 +1117,10 @@ pub enum ClientAuthDoctorData {
 ///   boot on exactly these).
 /// - Any CA in the bundle already expired → **Fail**: it verifies nothing, so a
 ///   bundle of only-expired CAs rejects every client.
-/// - A CA expiring within 30 days, a stale CRL, or `optional` with no route
-///   requiring a certificate → **Warn**.
+/// - A CRL set that does not cover every CA in the bundle, a CA expiring
+///   within 30 days, a stale CRL, or `optional` with no route requiring a
+///   certificate → **Warn**. The coverage gap is the severest Warn: the
+///   runtime refuses to boot on it, so `--strict` fails the run.
 /// - Otherwise → **Pass**.
 #[must_use]
 pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
@@ -1164,6 +1173,27 @@ pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
 /// Split out of [`check_client_auth_impl`] so each function stays readable; the
 /// caller has already handled every not-loadable state, so the fallthrough arm
 /// here is unreachable in practice.
+/// The `tls_client_auth` result when the CRL set leaves some bundle CAs
+/// uncovered (issue #2706): the runtime refuses to boot on this, so doctor
+/// warns (and fails under `--strict`).
+fn grade_crl_coverage_gaps(crl_coverage_gaps: &[String]) -> CheckResult {
+    CheckResult {
+        name: "tls_client_auth",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "the [server.tls.client_auth] revocation list has no CRL issued by {} — once any \
+             CRL is configured, the server refuses handshakes whose revocation status is \
+             unknown, so the clients of these CAs would be rejected, and the server refuses \
+             to boot on this",
+            crl_coverage_gaps.join(", ")
+        )),
+        hint: Some(
+            "Publish a CRL for each CA in the bundle, or remove the uncovered CA. Under \
+             `--strict` this warning fails the run, matching the runtime",
+        ),
+    }
+}
+
 fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
     match data {
         ClientAuthDoctorData::Healthy {
@@ -1184,6 +1214,9 @@ fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
                  nothing",
             ),
         },
+        ClientAuthDoctorData::Healthy {
+            crl_coverage_gaps, ..
+        } if !crl_coverage_gaps.is_empty() => grade_crl_coverage_gaps(crl_coverage_gaps),
         ClientAuthDoctorData::Healthy {
             crl_stale: Some(true),
             ..
@@ -5125,7 +5158,28 @@ fn check_queue_coverage_topology(
     pin: &[String],
     declared_queues: &[String],
     fleet: Option<&FleetTopology>,
+    declared_queues_manifest_error: Option<&DeclaredQueuesManifestError>,
 ) -> CheckResult {
+    // A corrupt jobs manifest cannot contribute its declared set: Fail rather
+    // than reason about a silently narrowed one (#2419). The writer (`autumn
+    // jobs manifest`) refuses to emit this shape, so the reader refuses to
+    // trust it.
+    if let Some(err) = declared_queues_manifest_error {
+        return CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[jobs.fleet] manifest at `{}` is corrupt ({}), so doctor cannot \
+                 determine the #[job(queue)]-declared queue set and refuses to \
+                 guess rather than silently narrowing it",
+                err.manifest_path, err.detail
+            )),
+            hint: Some(
+                "Regenerate the manifest with `autumn jobs manifest`, or unset \
+                 `[jobs.fleet] manifest` to fall back to `declared_queues`",
+            ),
+        };
+    }
     // No topology declared → informational-only, exactly as today. The hard-fail
     // only activates once the operator supplies the topology that makes coverage
     // provable, so existing deployments never regress.
@@ -6384,6 +6438,20 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
     })
 }
 
+/// A `[jobs.fleet] manifest` file doctor could read, whose `queues` array is
+/// corrupt in exactly the shape `autumn jobs manifest` refuses to emit (a
+/// non-array `queues`, or a non-string element). The reader must be as strict
+/// as the emitter (#2419): silently dropping the element narrows the declared
+/// set, and the coverage check then Passes a deployment with an uncovered
+/// queue — the exact failure the check exists to catch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredQueuesManifestError {
+    /// The `[jobs.fleet] manifest` path whose `queues` array was corrupt.
+    manifest_path: String,
+    /// What was wrong with it.
+    detail: String,
+}
+
 /// Resolve the compiled `#[job(queue = "…")]`-declared queue set for the
 /// coverage check (#1756), so doctor's view of "queues that must be drained"
 /// matches what the runtime actually drains. Two sources, in precedence order:
@@ -6400,13 +6468,21 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
 /// unreadable, unparseable, or no `queues` array) falls through to the inline
 /// list.
 ///
-/// Returns an empty `Vec` when neither is present; an unknown declared set only
-/// shrinks the needed set, so it can never cause a false failure.
-fn resolve_declared_queues(table: Option<&toml::Table>) -> Vec<String> {
+/// A manifest that says something *corrupt* — `queues` present but not an array
+/// of strings — is an `Err` naming the path, never a silently narrowed list
+/// (#2419). The emitter rejects exactly this shape, so the reader must too.
+///
+/// Returns an empty `Vec` when neither source is present.
+fn resolve_declared_queues(
+    table: Option<&toml::Table>,
+) -> Result<Vec<String>, DeclaredQueuesManifestError> {
     resolve_declared_queues_from_sources(|p| std::fs::read_to_string(p).ok(), table)
 }
 
-fn resolve_declared_queues_from_sources<F>(read_file: F, table: Option<&toml::Table>) -> Vec<String>
+fn resolve_declared_queues_from_sources<F>(
+    read_file: F,
+    table: Option<&toml::Table>,
+) -> Result<Vec<String>, DeclaredQueuesManifestError>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -6416,7 +6492,7 @@ where
         .and_then(|j| j.get("fleet"))
         .and_then(toml::Value::as_table)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     // 1. A jobs manifest the app emits: TOML `queues = [...]`.
@@ -6430,20 +6506,28 @@ where
     //
     // The fall-through is reserved for a manifest that genuinely says nothing: an
     // absent path, an unreadable file, unparseable TOML, or no `queues` array.
+    // A manifest whose `queues` array is *present but malformed* is corrupt, not
+    // silent — fail loudly (#2419).
     if let Some(path) = fleet.get("manifest").and_then(toml::Value::as_str)
         && let Some(contents) = read_file(path)
-        && let Ok(manifest) = toml::from_str::<toml::Table>(&contents)
-        && let Some(queues) = manifest.get("queues").and_then(toml::Value::as_array)
     {
-        return queues
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .map(str::to_owned)
-            .collect();
+        match crate::jobs::parse_manifest_queues(&contents) {
+            Ok(crate::jobs::ManifestQueues::Present(queues)) => return Ok(queues),
+            Ok(crate::jobs::ManifestQueues::Absent)
+            | Err(crate::jobs::ManifestQueuesError::NotToml(_)) => {
+                // Says nothing: fall through to the inline list.
+            }
+            Err(crate::jobs::ManifestQueuesError::BadQueuesArray(detail)) => {
+                return Err(DeclaredQueuesManifestError {
+                    manifest_path: path.to_owned(),
+                    detail,
+                });
+            }
+        }
     }
 
     // 2. Inline declared-queues list (MVP).
-    fleet
+    Ok(fleet
         .get("declared_queues")
         .and_then(toml::Value::as_array)
         .map(|a| {
@@ -6452,7 +6536,7 @@ where
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 fn first_env<F>(env_var: &F, keys: &[&str]) -> Option<String>
@@ -7203,18 +7287,35 @@ fn grade_client_auth_trust_store(
                 };
             }
         };
-        let crl_stale = match crl {
+        let (crl_stale, crl_coverage_gaps) = match crl {
             Some(path) => {
-                match autumn_web::tls::client_auth::inspect_crl(std::path::Path::new(path)) {
-                    Ok(inspection) => Some(inspection.is_stale(now)),
+                let path = std::path::Path::new(path);
+                let inspection = match autumn_web::tls::client_auth::inspect_crl(path) {
+                    Ok(inspection) => inspection,
                     Err(e) => {
                         return ClientAuthDoctorData::Invalid {
                             detail: e.to_string(),
                         };
                     }
-                }
+                };
+                // The #2706 coverage gap: a CRL set that covers only some of
+                // the bundle's CAs makes the runtime refuse the clients of the
+                // rest (and refuse to boot). Both files already loaded through
+                // the runtime paths above, so this only compares names.
+                let gaps = match autumn_web::tls::client_auth::crl_coverage_gaps(
+                    std::path::Path::new(bundle),
+                    path,
+                ) {
+                    Ok(gaps) => gaps,
+                    Err(e) => {
+                        return ClientAuthDoctorData::Invalid {
+                            detail: e.to_string(),
+                        };
+                    }
+                };
+                (Some(inspection.is_stale(now)), gaps)
             }
-            None => None,
+            None => (None, Vec::new()),
         };
 
         let expired_cas: Vec<String> = cas
@@ -7235,6 +7336,7 @@ fn grade_client_auth_trust_store(
             near_expiry_cas,
             ca_count: cas.len(),
             crl_stale,
+            crl_coverage_gaps,
             required_path_count,
         }
     }
@@ -9296,7 +9398,13 @@ pub fn run(opts: DoctorOptions) {
     // informational-only per-process report, so existing deployments never
     // regress.
     let fleet_topology = resolve_fleet_topology(Some(&merged_jobs_toml));
-    let declared_queues = resolve_declared_queues(Some(&merged_jobs_toml));
+    let (declared_queues, declared_queues_manifest_error) =
+        match resolve_declared_queues(Some(&merged_jobs_toml)) {
+            Ok(queues) => (queues, None),
+            // A corrupt manifest is a hard Fail below, never a silently narrowed
+            // declared set (#2419).
+            Err(err) => (Vec::new(), Some(err)),
+        };
     tasks.push(Box::new(move || {
         check_queue_coverage_topology(
             queue_coverage_role,
@@ -9304,6 +9412,7 @@ pub fn run(opts: DoctorOptions) {
             &jobs_pin,
             &declared_queues,
             fleet_topology.as_ref(),
+            declared_queues_manifest_error.as_ref(),
         )
     }));
 
@@ -12944,6 +13053,7 @@ pub struct Vault {
             near_expiry_cas: Vec::new(),
             ca_count: 1,
             crl_stale: None,
+            crl_coverage_gaps: Vec::new(),
             required_path_count,
         }
     }
@@ -13052,8 +13162,47 @@ pub struct Vault {
             near_expiry_cas: vec![("CN=Aging CA".to_owned(), 3)],
             ca_count: 2,
             crl_stale: Some(true),
+            crl_coverage_gaps: vec!["CN=Uncovered CA".to_owned()],
             required_path_count: 0,
         };
+        let r = check_client_auth_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn client_auth_warns_on_a_crl_coverage_gap() {
+        // Issue #2706: the CRL set names only some of the bundle's CAs, so
+        // the runtime would refuse the uncovered CAs' clients — and refuse
+        // to boot at all.
+        let mut data = healthy_client_auth("required", 1);
+        if let ClientAuthDoctorData::Healthy {
+            crl_coverage_gaps, ..
+        } = &mut data
+        {
+            crl_coverage_gaps.push("CN=New CA".to_owned());
+        }
+        let r = check_client_auth_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("CN=New CA"), "{detail}");
+        assert!(detail.contains("refuses to boot"), "{detail}");
+    }
+
+    #[test]
+    fn client_auth_grades_an_expired_ca_above_a_crl_coverage_gap() {
+        // Worst problem first: the expired CA is a Fail, the coverage gap a
+        // Warn, so the Fail must win.
+        let mut data = healthy_client_auth("required", 1);
+        if let ClientAuthDoctorData::Healthy {
+            expired_cas,
+            crl_coverage_gaps,
+            ..
+        } = &mut data
+        {
+            expired_cas.push("CN=Retired CA".to_owned());
+            crl_coverage_gaps.push("CN=New CA".to_owned());
+        }
         let r = check_client_auth_impl(&data);
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.unwrap().contains("expired"));
@@ -18665,6 +18814,7 @@ foo = "bar"
             &pin,
             &[],  // no declared queues
             None, // no fleet topology → informational fallback
+            None, // no manifest error
         );
         assert_eq!(result.status, CheckStatus::Pass);
         // Same detail the informational-only path produces (names the unclaimed).
@@ -18698,6 +18848,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
         let summary = Summary {
@@ -18733,6 +18884,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_ne!(
             result.status,
@@ -18763,6 +18915,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
         assert!(
@@ -18796,6 +18949,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
     }
@@ -18819,6 +18973,7 @@ foo = "bar"
             &["default".to_string(), "email".to_string()],
             &declared,
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
 
@@ -18830,6 +18985,7 @@ foo = "bar"
             &["default".to_string(), "email".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(
             result_no_manifest.status,
@@ -18909,7 +19065,8 @@ foo = "bar"
 
             let fleet = resolve_fleet_topology(Some(&table))
                 .expect("a block containing [jobs.fleet] tiers declares a topology");
-            let declared = resolve_declared_queues_from_sources(|_| None, Some(&table));
+            let declared = resolve_declared_queues_from_sources(|_| None, Some(&table))
+                .expect("docs example manifests are well-formed");
             let configured: Vec<String> = table
                 .get("jobs")
                 .and_then(|j| j.get("queues"))
@@ -18925,6 +19082,7 @@ foo = "bar"
                 &pin,
                 &declared,
                 Some(&fleet),
+                None,
             );
             assert_eq!(
                 result.status,
@@ -18953,6 +19111,7 @@ foo = "bar"
             &["default".to_string()],
             &declared,
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
         assert!(result.detail.unwrap().contains("email"));
@@ -18973,6 +19132,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
     }
@@ -19024,7 +19184,8 @@ foo = "bar"
             "doctor and the app must read the same `tiers` from one autumn.toml",
         );
         assert_eq!(
-            resolve_declared_queues_from_sources(|_| None, Some(&table)),
+            resolve_declared_queues_from_sources(|_| None, Some(&table))
+                .expect("docs example has a well-formed manifest"),
             app_view.declared_queues,
             "doctor and the app must read the same `declared_queues`",
         );
@@ -19076,6 +19237,7 @@ foo = "bar"
                 &["critical".to_string()],
                 &[],
                 Some(&fleet),
+                None,
             );
             assert_eq!(
                 result.status,
@@ -19119,6 +19281,7 @@ foo = "bar"
                 &[],
                 &[],
                 Some(&unpinned),
+                None,
             )
             .status,
             CheckStatus::Pass,
@@ -19159,7 +19322,8 @@ foo = "bar"
             "[jobs.fleet]\ntiers = [[\"default\"]]\ndeclared_queues = [\"email\", \"sms\"]\n",
         )
         .expect("parse toml");
-        let declared = resolve_declared_queues_from_sources(|_| None, Some(&inline));
+        let declared = resolve_declared_queues_from_sources(|_| None, Some(&inline))
+            .expect("inline list is well-formed");
         assert_eq!(declared, vec!["email".to_string(), "sms".to_string()]);
 
         // Emitted manifest takes precedence over the inline list.
@@ -19173,7 +19337,8 @@ foo = "bar"
                     .then(|| "queues = [\"critical\", \"email\"]\n".to_string())
             },
             Some(&with_manifest),
-        );
+        )
+        .expect("well-formed manifest is authoritative");
         assert_eq!(
             declared_from_manifest,
             vec!["critical".to_string(), "email".to_string()]
@@ -19187,7 +19352,8 @@ foo = "bar"
         let empty_manifest = resolve_declared_queues_from_sources(
             |path| (path == "target/jobs-manifest.toml").then(|| "queues = []\n".to_string()),
             Some(&with_manifest),
-        );
+        )
+        .expect("empty manifest is a real answer");
         assert!(
             empty_manifest.is_empty(),
             "an empty manifest must win over declared_queues, got {empty_manifest:?}",
@@ -19201,7 +19367,8 @@ foo = "bar"
             ("no queues key", Some("other = 1\n".to_string())),
         ] {
             let fell_through =
-                resolve_declared_queues_from_sources(|_| read.clone(), Some(&with_manifest));
+                resolve_declared_queues_from_sources(|_| read.clone(), Some(&with_manifest))
+                    .expect("a silent manifest falls through to the inline list");
             assert_eq!(
                 fell_through,
                 vec!["stale".to_string()],
@@ -19212,7 +19379,77 @@ foo = "bar"
         // No `[jobs.fleet]` → empty.
         let none: toml::Table =
             toml::from_str("[jobs]\nqueues = [\"critical\"]\n").expect("parse toml");
-        assert!(resolve_declared_queues_from_sources(|_| None, Some(&none)).is_empty());
+        assert!(
+            resolve_declared_queues_from_sources(|_| None, Some(&none))
+                .expect("absent section reads empty")
+                .is_empty()
+        );
+    }
+
+    /// #2419: a jobs manifest whose `queues` array carries a non-string element
+    /// is corrupt, not partially readable — doctor must fail loudly, naming the
+    /// manifest, instead of silently narrowing the declared set.
+    #[test]
+    fn resolve_declared_queues_rejects_a_manifest_with_non_string_queues() {
+        let with_manifest: toml::Table = toml::from_str(
+            "[jobs.fleet]\nmanifest = \"target/jobs-manifest.toml\"\ndeclared_queues = [\"stale\"]\n",
+        )
+        .expect("parse toml");
+
+        for (label, manifest) in [
+            (
+                "non-string element",
+                "queues = [\"critical\", \"thumbnails\", 1]\n",
+            ),
+            ("all non-string", "queues = [1]\n"),
+            ("non-array queues", "queues = \"critical\"\n"),
+        ] {
+            let err = resolve_declared_queues_from_sources(
+                |path| (path == "target/jobs-manifest.toml").then(|| manifest.to_string()),
+                Some(&with_manifest),
+            )
+            .expect_err("a corrupt manifest must not be trusted");
+            assert_eq!(
+                err.manifest_path, "target/jobs-manifest.toml",
+                "the failure must name the manifest ({label})"
+            );
+            // …and must NOT fall through to the stale inline list.
+            assert!(
+                !err.detail.is_empty(),
+                "the failure must say what was wrong ({label})"
+            );
+        }
+    }
+
+    /// #2419: the issue's reproduction — a corrupt manifest must turn the
+    /// topology coverage check into a hard Fail, even on a topology that would
+    /// otherwise Pass.
+    #[test]
+    fn check_queue_coverage_topology_fails_on_corrupt_manifest() {
+        let err = DeclaredQueuesManifestError {
+            manifest_path: "target/jobs-manifest.toml".to_string(),
+            detail: "`queues` is not an array of strings".to_string(),
+        };
+        let fleet = FleetTopology {
+            // Every needed queue IS drained — the verdict must still Fail,
+            // because the declared set is unreadable.
+            tiers: vec![vec!["critical".to_string(), "thumbnails".to_string()]],
+            malformed: false,
+        };
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &["critical".to_string()],
+            &["critical".to_string()],
+            &[],
+            Some(&fleet),
+            Some(&err),
+        );
+        assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
+        let detail = result.detail.expect("detail names the manifest");
+        assert!(
+            detail.contains("target/jobs-manifest.toml"),
+            "the failure must name the manifest, got: {detail}"
+        );
     }
 
     // ── Jobs manifest emit → consume loop (#1756) ──────────────────────────
@@ -19242,7 +19479,8 @@ foo = "bar"
         .expect("parse toml");
 
         // Doctor reads the emitted manifest, not the stale inline list.
-        let declared = resolve_declared_queues(Some(&table));
+        let declared =
+            resolve_declared_queues(Some(&table)).expect("the emitted manifest is well-formed");
         assert_eq!(
             declared,
             vec!["critical".to_string(), "email".to_string()],
@@ -19256,6 +19494,7 @@ foo = "bar"
             &["critical".to_string()],
             &declared,
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
         assert!(
@@ -19284,7 +19523,8 @@ foo = "bar"
         ))
         .expect("parse toml");
 
-        let declared = resolve_declared_queues(Some(&table));
+        let declared =
+            resolve_declared_queues(Some(&table)).expect("the emitted manifest is well-formed");
         let fleet = resolve_fleet_topology(Some(&table)).expect("topology declared");
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -19292,6 +19532,7 @@ foo = "bar"
             &["critical".to_string()],
             &declared,
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
     }

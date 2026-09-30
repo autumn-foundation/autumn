@@ -510,6 +510,16 @@ container, another port, another machine) and point `target` at it.
 - **Only idempotent methods are mirrored.** `GET` and `HEAD`, and the set is not
   configurable. Mirroring a `POST` would let the candidate's writes land for
   real; that needs effect virtualization, which is a follow-up.
+- **A `GET`/`HEAD` carrying a request body is not mirrored.** The mirror
+  replays method, target, and headers but no body, so mirroring one would ask
+  the candidate a different request than the live build answered and record
+  the manufactured difference as a divergence. Both declared bodies (a
+  non-zero `Content-Length`, any `Transfer-Encoding`) and undeclared ones
+  (body frames with no declaring headers, reachable on HTTP/2) sit out
+  quietly (skip reason `has_request_body`) until the mutating-traffic
+  follow-up brings real request-body replay — see
+  [#2332](https://github.com/autumn-foundation/autumn/issues/2332).
+
 - **Mirrored requests never touch primary state.** The mirror path performs no
   database, cache, mail, or job work of its own — it copies request bytes and
   compares response bytes.
