@@ -25,6 +25,7 @@
 //! `column "commentable_type" does not exist` at request time. Failing the
 //! migration says so at `migrate`, where it is fixable.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::generate::emit::Plan;
@@ -174,152 +175,431 @@ pub fn conflicting_comments_table(project_root: &Path) -> bool {
 }
 
 /// Replay the history once: does a `comments` table exist, and is it polymorphic.
+/// Replay the history once: does a `comments` table exist, and is it the
+/// polymorphic one (every helper's column present).
 fn comments_table_state(project_root: &Path) -> (bool, bool) {
-    // Replayed in version order, because a migration history is a sequence of
-    // edits and not a bag of facts. Flags that only ever get SET would report a
-    // table that a later `DROP TABLE comments` removed as still present -- the
-    // generator would skip recreating it, and every helper would fail at
-    // runtime on a table that is not there.
-    // One running picture of the table: does it exist, and does it currently
-    // have each discriminator column. Every event edits that picture, so a
-    // column added by a CREATE body and one added by a later ALTER are the same
-    // kind of fact -- which they are, and treating them differently is what let
-    // a rename INTO the discriminator name go unrecognised.
-    let mut creates = false;
-    let mut present: Vec<&'static str> = Vec::new();
+    let tables = replay_migration_history(&migration_up_sql(project_root));
+    let state = tables.get(&TableRef::comments());
+    let exists = state.is_some_and(|table| table.exists);
+    let complete = state.is_some_and(|table| {
+        REQUIRED_COLUMNS
+            .iter()
+            .all(|column| table.columns.contains(column))
+    });
+    (exists, complete)
+}
 
-    for sql in migration_up_sql(project_root) {
-        for event in comments_table_events(&sql) {
-            match event {
-                CommentsEvent::Create(columns) => {
-                    creates = true;
-                    present = columns;
+/// A table reference parsed from DDL: `[schema.]name`, each half optionally
+/// double-quoted.
+///
+/// Quoting is load-bearing. The pipeline lowercases unquoted text but preserves
+/// quoted identifiers, so `comments` (unquoted, folded) and `"comments"`
+/// (quoted, exact) both land on `comments`, while `"Comments"` stays distinct —
+/// exactly `PostgreSQL`'s case-folding rule. A `public` schema (quoted or not,
+/// both spell the same schema) is normalised away: `public.comments` IS
+/// `comments` under the default search path, and the old fixed-spelling scan
+/// already treated the two as one table. Any other schema stays distinct —
+/// guessing at the app's `search_path` would trade a false negative for a
+/// false positive.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct TableRef {
+    /// `None` for unqualified and `public`-qualified names.
+    schema: Option<String>,
+    name: String,
+}
+
+impl TableRef {
+    fn comments() -> Self {
+        Self {
+            schema: None,
+            name: COMMENTS_TABLE.to_owned(),
+        }
+    }
+}
+
+/// One table's running picture in the replay.
+#[derive(Default, Debug)]
+struct TableState {
+    exists: bool,
+    /// Which of [`REQUIRED_COLUMNS`] the table currently carries.
+    columns: Vec<&'static str>,
+}
+
+/// What one statement does to one table in the replayed history.
+#[derive(Debug)]
+enum TableEvent {
+    /// `CREATE TABLE name (…)`, and which of [`REQUIRED_COLUMNS`] its body
+    /// declares. A fresh table replaces whatever was known about the old one.
+    Create(TableRef, Vec<&'static str>),
+    /// `ALTER TABLE name … <column>`, adding it.
+    Add(TableRef, &'static str),
+    /// `ALTER TABLE name DROP COLUMN <column>` (or a rename away).
+    Remove(TableRef, &'static str),
+    /// `DROP TABLE name`.
+    Drop(TableRef),
+    /// `ALTER TABLE old RENAME TO new`: the record moves with the table, so a
+    /// rename INTO `comments` carries the source table's columns across.
+    Rename { from: TableRef, to: TableRef },
+}
+
+/// Replay every migration's `up.sql` in version order: for every table, does it
+/// exist, and which discriminator columns does it currently carry.
+///
+/// A migration history is a sequence of edits, not a bag of facts: flags that
+/// only ever get SET would report a table a later `DROP TABLE` removed as
+/// still present — the generator would skip recreating it, and every helper
+/// would fail at runtime on a table that is not there. Every event edits one
+/// running picture per table, so a column added by a CREATE body and one added
+/// by a later ALTER are the same kind of fact.
+///
+/// Generalised per #2282: the old scan only understood the `comments`
+/// spellings, so a `RENAME TO comments` landed on an empty column list — wrong
+/// when the renamed table already carried the discriminator columns
+/// (`CREATE TABLE legacy_comments (commentable_type …)` then `RENAME TO
+/// comments`). Now every table is tracked and the rename carries its columns
+/// across; the final answer is a lookup on the `comments` ref.
+fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
+    let mut tables: HashMap<TableRef, TableState> = HashMap::new();
+    for sql in files {
+        let mut events: Vec<(usize, TableEvent)> = Vec::new();
+        for (at, table, body) in create_tables(sql) {
+            let columns = REQUIRED_COLUMNS
+                .iter()
+                .copied()
+                .filter(|column| declares_column(body, column))
+                .collect();
+            events.push((at, TableEvent::Create(table, columns)));
+        }
+        for (at, dropped) in drop_tables(sql) {
+            for table in dropped {
+                events.push((at, TableEvent::Drop(table)));
+            }
+        }
+        for (at, table, statement) in alter_tables(sql) {
+            // A table rename moves the whole record; it mentions no column.
+            if let Some(to) = table_rename_target(statement) {
+                events.push((at, TableEvent::Rename { from: table, to }));
+                continue;
+            }
+            // An ALTER naming the column may be adding it, dropping it, or
+            // renaming it away. Treating every mention as an add would let
+            // `DROP COLUMN commentable_type` read as proof the column is
+            // present.
+            for column in REQUIRED_COLUMNS.iter().copied() {
+                if !mentions_column(statement, column) {
+                    continue;
                 }
-                CommentsEvent::Add(column) => {
-                    if !present.contains(&column) {
-                        present.push(column);
+                if alter_removes_column(statement, column) {
+                    events.push((at, TableEvent::Remove(table.clone(), column)));
+                } else {
+                    events.push((at, TableEvent::Add(table.clone(), column)));
+                }
+            }
+        }
+        events.sort_by_key(|(at, _)| *at);
+        for (_, event) in events {
+            match event {
+                TableEvent::Create(table, columns) => {
+                    tables.insert(
+                        table,
+                        TableState {
+                            exists: true,
+                            columns,
+                        },
+                    );
+                }
+                TableEvent::Add(table, column) => {
+                    let state = tables.entry(table).or_default();
+                    if !state.columns.contains(&column) {
+                        state.columns.push(column);
                     }
                 }
-                CommentsEvent::Remove(column) => present.retain(|held| *held != column),
-                CommentsEvent::Drop => {
-                    creates = false;
-                    present.clear();
+                TableEvent::Remove(table, column) => {
+                    if let Some(state) = tables.get_mut(&table) {
+                        state.columns.retain(|held| *held != column);
+                    }
+                }
+                TableEvent::Drop(table) => {
+                    let state = tables.entry(table).or_default();
+                    state.exists = false;
+                    state.columns.clear();
+                }
+                TableEvent::Rename { from, to } => {
+                    // A rename is positive evidence the table exists: the
+                    // author just renamed it, and in a valid history the
+                    // statement would fail otherwise. The old scan read every
+                    // `RENAME TO comments` as the table existing; the
+                    // generalisation keeps that and additionally carries the
+                    // source table's columns across (#2282). When the history
+                    // never saw the source, its columns are unknown — present
+                    // but not polymorphic, so generation stays loud instead of
+                    // claiming a reuse it cannot verify.
+                    //
+                    // `RENAME TO` takes a bare relation name: the table stays
+                    // in its schema, so `archive.legacy_comments RENAME TO
+                    // comments` yields `archive.comments`, not `comments`.
+                    let to = TableRef {
+                        schema: to.schema.or_else(|| from.schema.clone()),
+                        name: to.name,
+                    };
+                    let mut state = tables.remove(&from).unwrap_or_default();
+                    state.exists = true;
+                    tables.insert(to, state);
                 }
             }
         }
     }
-
-    let complete = REQUIRED_COLUMNS
-        .iter()
-        .all(|column| present.contains(column));
-    (creates, complete)
+    tables
 }
 
-/// Every spelling of the shared comments table this scan accepts after `verb`.
+/// Whether `c` can continue a bare SQL identifier.
+const fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+}
+
+/// Strip a leading keyword (`only`, …) when it is a whole word.
+fn strip_keyword<'a>(text: &'a str, keyword: &str) -> &'a str {
+    if let Some(after) = text.strip_prefix(keyword)
+        && (after.is_empty() || after.starts_with(|c: char| c.is_whitespace()))
+    {
+        after.trim_start()
+    } else {
+        text
+    }
+}
+
+/// One identifier segment: `"quoted"` (with `""` escapes, case preserved) or a
+/// bare word (already lowercased by the pipeline). Returns the segment text and
+/// the bytes consumed, including leading whitespace.
+fn parse_ident_segment(text: &str) -> Option<(String, usize)> {
+    let trimmed = text.trim_start();
+    let skip = text.len() - trimmed.len();
+    if trimmed.starts_with('"') {
+        let mut name = String::new();
+        // Past the opening quote; byte indices stay on `"` boundaries.
+        let mut i = 1;
+        loop {
+            let close = trimmed[i..].find('"')?;
+            name.push_str(&trimmed[i..i + close]);
+            i += close + 1;
+            // `""` inside a quoted identifier is an escaped quote.
+            if trimmed[i..].starts_with('"') {
+                name.push('"');
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        Some((name, skip + i))
+    } else {
+        let len = trimmed
+            .find(|c: char| !is_ident_char(c))
+            .unwrap_or(trimmed.len());
+        if len == 0 {
+            return None;
+        }
+        Some((trimmed[..len].to_owned(), skip + len))
+    }
+}
+
+/// Parse `[IF [NOT] EXISTS] [ONLY] [schema.]name` from the start of `text`.
 ///
-/// Unqualified and `public.`-qualified, each half optionally quoted, with the
-/// optional `IF [NOT] EXISTS`. `CREATE TABLE public.comments (…)` is an
-/// ordinary spelling that targets the same relation as the unqualified one
-/// under the default search path, so failing to recognise it makes the
-/// generator emit a second `CREATE TABLE comments` and the next `migrate` fail
-/// on "already exists".
-///
-/// Only `public` is accepted. Another schema is a genuinely different table
-/// unless the app's `search_path` says otherwise, and guessing at that would
-/// trade this false negative for a false positive.
-/// The `CREATE` verbs that produce a PERSISTENT `comments` relation.
+/// Returns the canonical ref and the bytes consumed (through the name), so
+/// callers can slice what follows. `None` when no table reference starts here.
+fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
+    let mut rest = text.trim_start();
+    // `IF EXISTS` / `IF NOT EXISTS`: valid on CREATE, DROP and ALTER alike.
+    // The longer keyword first — it starts with the shorter one.
+    rest = strip_keyword(rest, "if not exists");
+    rest = strip_keyword(rest, "if exists");
+    // `ONLY` is PostgreSQL's "do not recurse to inheritance children" marker,
+    // and it does NOT sit where `IF EXISTS` does — the grammar is
+    // `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]`, so the two COMBINE.
+    // Listing them as alternatives missed `ALTER TABLE IF EXISTS ONLY
+    // comments`, a valid spelling whose ALTERs were then ignored: the scan
+    // reported an incomplete schema and the generator emitted a duplicate
+    // `CREATE TABLE comments` that fails on the next `migrate`.
+    rest = strip_keyword(rest, "only");
+    let (first, used) = parse_ident_segment(rest)?;
+    rest = &rest[used..];
+    let (schema, name) = if let Some(dot) = rest.strip_prefix('.') {
+        let (second, used) = parse_ident_segment(dot)?;
+        rest = &dot[used..];
+        (Some(first), second)
+    } else {
+        (None, first)
+    };
+    let consumed = text.len() - rest.len();
+    // `public` (however spelled — quoted `"public"` names the same schema) is
+    // the default schema: `public.comments` and `comments` name the same
+    // relation, so they share one record.
+    let schema = schema.filter(|schema| schema != "public");
+    Some((TableRef { schema, name }, consumed))
+}
+
+/// The `CREATE` verbs that produce a PERSISTENT table.
 ///
 /// `UNLOGGED` is a durability setting, not a different kind of object: the
 /// relation is still permanent and still occupies the name, so a later
 /// `CREATE TABLE comments` fails with "already exists" — confirmed against
-/// `PostgreSQL`, not assumed. Missing it made the scan report no table and emit a
-/// duplicate migration.
+/// `PostgreSQL`, not assumed. Missing it made the scan report no table and emit
+/// a duplicate migration.
 ///
 /// `TEMPORARY`/`TEMP` is deliberately NOT here, and that is the more
 /// interesting half. A temp table lives in a session-local schema and does
 /// **not** collide with a permanent one — also confirmed — so a migration that
-/// creates a temp `comments` must not suppress the shared table. Accepting
-/// every modifier would have traded one bug for its mirror image.
-const CREATE_VERBS: &[&str] = &["create table", "create unlogged table"];
+/// creates a temp table must not register it. Accepting every modifier would
+/// have traded one bug for its mirror image.
+const CREATE_VERBS: &[&str] = &["table", "unlogged table"];
 
-/// Offsets of every `DROP TABLE` that takes the shared `comments` table away.
-///
-/// `DROP TABLE [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]` — the LIST is
-/// the point. Requiring `comments` immediately after the verb missed
-/// `DROP TABLE audit_log, comments;`, which really does drop it (confirmed
-/// against `PostgreSQL`). The replay then kept a table the database no longer
-/// has, the next scaffold skipped creating it, and every generated helper
-/// queried a missing relation — silently, until the first request.
-fn comments_drops(lowered: &str) -> Vec<usize> {
-    let names = comments_table_names();
+/// Every persistent `CREATE TABLE` in `sql`: (offset, table, column-list body).
+fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
     let mut found = Vec::new();
-    for (at, _) in lowered.match_indices("drop table") {
-        let rest = lowered[at + "drop table".len()..].trim_start();
-        let rest = rest.strip_prefix("if exists").unwrap_or(rest).trim_start();
+    let mut base = 0usize;
+    while let Some(at) = sql[base..].find("create ") {
+        let start = base + at;
+        base = start + "create ".len();
+        // A leading boundary: `recreate table` is not a CREATE.
+        if start > 0 && sql[..start].ends_with(is_ident_char) {
+            continue;
+        }
+        let rest = &sql[start + "create ".len()..];
+        let verb = CREATE_VERBS.iter().find(|verb| {
+            rest.strip_prefix(*verb)
+                .is_some_and(|after| after.starts_with(|c: char| c.is_whitespace()))
+        });
+        let Some(verb) = verb else {
+            // `CREATE INDEX`, `CREATE TRIGGER`, `CREATE TEMPORARY TABLE`, …
+            continue;
+        };
+        let after_verb = &rest[verb.len()..];
+        let Some((table, used)) = parse_table_ref(after_verb) else {
+            continue;
+        };
+        let body_start = start + "create ".len() + verb.len() + used;
+        let Some(body) = create_table_body(sql, body_start) else {
+            continue;
+        };
+        found.push((start, table, body));
+    }
+    found
+}
+
+/// The column list of a `CREATE TABLE` whose name ends at `from`: the text
+/// between the statement's outer parentheses, so callers can ask what *this*
+/// table declares rather than what the file mentions anywhere.
+///
+/// Paren-balanced, because a column can carry its own (`NUMERIC(10, 2)`).
+/// Unbalanced SQL yields the rest of the file rather than a silent "no such
+/// table" for a migration that does create one. `None` only when there is no
+/// opening paren in this statement (e.g. `CREATE TABLE x AS SELECT 1;`): the
+/// search stops at the statement's `;`, so a later statement's column list is
+/// never borrowed as this table's. Likewise `None` when an `AS` precedes the
+/// paren: in `CREATE TABLE x AS SELECT jsonb_build_object('id', id) …` the
+/// parens belong to the query, and the table's columns are whatever it
+/// projects — unknowable here, so never read as a column list.
+fn create_table_body(sql: &str, from: usize) -> Option<&str> {
+    let open = sql[from..].find(['(', ';'])? + from;
+    if sql[open..].starts_with(';') {
+        return None;
+    }
+    if sql[from..open]
+        .split(|c: char| !is_ident_char(c))
+        .any(|word| word == "as")
+    {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, ch) in sql[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&sql[open + 1..open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(&sql[open + 1..])
+}
+
+/// Every `DROP TABLE` in `sql`: (offset, tables dropped).
+///
+/// `DROP TABLE [ IF EXISTS ] name [, ...]` — the LIST is the point. Requiring
+/// the name right after the verb missed `DROP TABLE audit_log, comments;`,
+/// which really does drop it (confirmed against `PostgreSQL`). The replay then
+/// kept a table the database no longer has, the next scaffold skipped creating
+/// it, and every generated helper queried a missing relation — silently, until
+/// the first request.
+fn drop_tables(sql: &str) -> Vec<(usize, Vec<TableRef>)> {
+    let mut found = Vec::new();
+    let mut base = 0usize;
+    while let Some(at) = sql[base..].find("drop table") {
+        let start = base + at;
+        base = start + "drop table".len();
+        if start > 0 && sql[..start].ends_with(is_ident_char) {
+            continue;
+        }
+        let rest = &sql[start + "drop table".len()..];
+        // Not `DROP TABLESPACE`: the verb has to end where the words end.
+        if rest.starts_with(is_ident_char) {
+            continue;
+        }
         // Only this statement's own name list.
         let statement = rest.split(';').next().unwrap_or(rest);
-        let drops_comments = statement.split(',').any(|entry| {
-            // The name is the first token: `CASCADE` / `RESTRICT` trail the
-            // list, and `ONLY` may lead an entry.
-            let entry = entry.trim();
-            let entry = entry.strip_prefix("only ").unwrap_or(entry).trim_start();
-            entry
-                .split_whitespace()
-                .next()
-                .is_some_and(|name| names.iter().any(|accepted| accepted == name))
-        });
-        if drops_comments {
-            found.push(at);
+        let tables: Vec<TableRef> = statement
+            .split(',')
+            .filter_map(|entry| {
+                // The name is the first reference: `CASCADE` / `RESTRICT`
+                // trail the list, `ONLY` may lead an entry, `*` may trail it.
+                parse_table_ref(entry).map(|(table, _)| table)
+            })
+            .collect();
+        if !tables.is_empty() {
+            found.push((start, tables));
         }
     }
     found
 }
 
-/// Every spelling of the shared table's NAME, without a verb in front.
-///
-/// Split out because `DROP TABLE` takes a LIST — `name [, ...]` — so the name
-/// is not always the token after the verb, and a scan anchored on the verb
-/// missed `DROP TABLE audit_log, comments;` entirely.
-fn comments_table_names() -> Vec<String> {
-    vec![
-        COMMENTS_TABLE.to_owned(),
-        format!("\"{COMMENTS_TABLE}\""),
-        format!("public.{COMMENTS_TABLE}"),
-        format!("public.\"{COMMENTS_TABLE}\""),
-        format!("\"public\".{COMMENTS_TABLE}"),
-        format!("\"public\".\"{COMMENTS_TABLE}\""),
-    ]
+/// Every `ALTER TABLE` in `sql`: (offset, table, statement text after the name).
+fn alter_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
+    let mut found = Vec::new();
+    let mut base = 0usize;
+    while let Some(at) = sql[base..].find("alter table") {
+        let start = base + at;
+        base = start + "alter table".len();
+        if start > 0 && sql[..start].ends_with(is_ident_char) {
+            continue;
+        }
+        let rest = &sql[start + "alter table".len()..];
+        if rest.starts_with(is_ident_char) {
+            continue;
+        }
+        let Some((table, used)) = parse_table_ref(rest) else {
+            continue;
+        };
+        let after = &rest[used..];
+        let statement = after.split(';').next().unwrap_or(after);
+        found.push((start, table, statement));
+    }
+    found
 }
 
-fn comments_table_spellings(verb: &str) -> Vec<String> {
-    let names = comments_table_names();
-    // `ONLY` is PostgreSQL's "do not recurse to inheritance children" marker,
-    // and it does NOT sit where `IF EXISTS` does — the grammar is
-    // `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]`, so the two COMBINE.
-    // Listing them as alternatives missed `ALTER TABLE IF EXISTS ONLY comments`,
-    // a valid spelling whose ALTERs were then ignored: the scan reported an
-    // incomplete schema and the generator emitted a duplicate `CREATE TABLE
-    // comments` that fails on the next `migrate`.
-    //
-    // `if not exists` belongs to CREATE and never combines with `only`; the
-    // pairing is generated anyway because a spelling that cannot occur simply
-    // never matches, and enumerating the grammar beats hand-picking which
-    // halves may meet.
-    let existence = [
-        "",
-        "if exists ",
-        "if not exists ",
-        "only ",
-        "if exists only ",
-        "if not exists only ",
-    ];
-    let mut spellings = Vec::with_capacity(names.len() * existence.len());
-    for exists in existence {
-        for name in &names {
-            spellings.push(format!("{verb} {exists}{name}"));
-        }
+/// The destination of an `ALTER TABLE … RENAME TO <name>`, if `statement` (the
+/// text after the table name) renames the TABLE rather than a column.
+///
+/// Scanned by destination because a rename INTO `comments` begins with whatever
+/// the table used to be called, which the caller has no other way to know.
+fn table_rename_target(statement: &str) -> Option<TableRef> {
+    let at = statement.find(" rename to ")?;
+    // `RENAME COLUMN … TO …` is a column rename, classified with the columns.
+    if statement[..at].contains("rename column") {
+        return None;
     }
-    spellings
+    parse_table_ref(&statement[at + " rename to ".len()..]).map(|(table, _)| table)
 }
 
 /// Whether `haystack` mentions `column` as a complete SQL identifier.
@@ -330,6 +610,51 @@ fn comments_table_spellings(verb: &str) -> Vec<String> {
 /// reporting that it reused the table — with every helper then failing at
 /// runtime on columns that are not there. The same identifier-boundary rule the
 /// table name gets; columns had been left as substrings.
+/// Whether a `CREATE TABLE` column-list `body` DECLARES `column` — as the name
+/// at the head of one of its top-level elements — rather than merely
+/// mentioning it. A mention is not a declaration: `author_id BIGINT
+/// REFERENCES users(id)` names `id`, but the table has no `id` column, and
+/// reading it as one made a table lacking the key look like the shared
+/// comments table.
+///
+/// Elements split at top-level commas (not inside parens or a `'…'` literal);
+/// table constraints (`PRIMARY KEY (…)`, `CONSTRAINT …`, `FOREIGN KEY`, …)
+/// declare no column and are skipped.
+fn declares_column(body: &str, column: &str) -> bool {
+    const TABLE_CONSTRAINTS: &[&str] = &[
+        "constraint",
+        "primary",
+        "foreign",
+        "unique",
+        "check",
+        "exclude",
+        "like",
+    ];
+    let mut elements = Vec::new();
+    let (mut depth, mut in_literal, mut start) = (0usize, false, 0usize);
+    for (at, ch) in body.char_indices() {
+        match ch {
+            '\'' => in_literal = !in_literal,
+            '(' if !in_literal => depth += 1,
+            ')' if !in_literal => depth = depth.saturating_sub(1),
+            ',' if !in_literal && depth == 0 => {
+                elements.push(&body[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    elements.push(&body[start..]);
+    elements.into_iter().any(|element| {
+        let element = element.trim_start();
+        // A constraint keyword is only one when unquoted: `"check"` is a column.
+        let quoted = element.starts_with('"');
+        parse_ident_segment(element).is_some_and(|(name, _)| {
+            name == column && (quoted || !TABLE_CONSTRAINTS.contains(&name.as_str()))
+        })
+    })
+}
+
 fn mentions_column(haystack: &str, column: &str) -> bool {
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut base = 0usize;
@@ -344,20 +669,6 @@ fn mentions_column(haystack: &str, column: &str) -> bool {
         base = end;
     }
     false
-}
-
-/// What one statement does to the shared comments table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CommentsEvent {
-    /// `CREATE TABLE comments (…)`, and which of [`REQUIRED_COLUMNS`] its body
-    /// declares. A fresh table replaces whatever was known about the old one.
-    Create(Vec<&'static str>),
-    /// `ALTER TABLE comments … <column>`, adding it.
-    Add(&'static str),
-    /// `ALTER TABLE comments DROP COLUMN <column>` (or a rename away).
-    Remove(&'static str),
-    /// `DROP TABLE comments`.
-    Drop,
 }
 
 /// Every column the generated helpers read or write on the shared table.
@@ -443,113 +754,6 @@ fn alter_removes_column(statement: &str, column: &str) -> bool {
         }
     }
     false
-}
-
-/// Every statement in `sql` touching the shared comments table, **in source
-/// order**, so a create and a later drop in one file are seen as a sequence.
-fn comments_table_events(sql: &str) -> Vec<CommentsEvent> {
-    let mut events: Vec<(usize, CommentsEvent)> = Vec::new();
-
-    // EVERY create, not just the first. One `up.sql` may legitimately recreate
-    // the table (`CREATE …; DROP …; CREATE …;`), and since the drop scanner
-    // already reports every drop, recording only the first create left the
-    // replay ending on the drop — reporting no table, and emitting a duplicate
-    // `CREATE TABLE comments` that fails when applied.
-    for (start, body) in comments_creations(sql) {
-        events.push((
-            start,
-            CommentsEvent::Create(
-                REQUIRED_COLUMNS
-                    .iter()
-                    .copied()
-                    .filter(|column| mentions_column(body, column))
-                    .collect(),
-            ),
-        ));
-    }
-    for (at, statement) in comments_statements(sql, "alter table") {
-        // An ALTER naming the column may be adding it, dropping it, or renaming
-        // it away. Treating every mention as an add would let
-        // `DROP COLUMN commentable_type` read as proof the column is present.
-        for column in REQUIRED_COLUMNS.iter().copied() {
-            if !mentions_column(statement, column) {
-                continue;
-            }
-            if alter_removes_column(statement, column) {
-                events.push((at, CommentsEvent::Remove(column)));
-            } else {
-                events.push((at, CommentsEvent::Add(column)));
-            }
-        }
-    }
-    for at in comments_drops(sql) {
-        events.push((at, CommentsEvent::Drop));
-    }
-    // `ALTER TABLE comments RENAME TO archived_comments` mentions no
-    // discriminator column, so the column loop above emits nothing for it — and
-    // the table is gone all the same. Without this the scan would report a
-    // `comments` table that no longer exists and skip generating one.
-    for (at, statement) in comments_statements(sql, "alter table") {
-        let Some(rest) = statement.split(" rename to ").nth(1) else {
-            continue;
-        };
-        // `RENAME COLUMN … TO …` is a column rename, handled above.
-        if statement.contains("rename column") {
-            continue;
-        }
-        let new_name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(';');
-        if !is_comments_table_name(new_name) {
-            events.push((at, CommentsEvent::Drop));
-        }
-    }
-    // …and the reverse: a table renamed INTO `comments` becomes the table. Its
-    // statement starts with the OLD name, so `comments_statements` cannot find
-    // it; the scan is by the destination instead.
-    for (at, new_name_at) in rename_targets(sql) {
-        if is_comments_table_name(new_name_at) {
-            // Columns recorded as absent, which is right when the renamed
-            // table is new and wrong when it already carried the discriminator
-            // pair (`CREATE TABLE legacy_comments (commentable_type …)` then
-            // `RENAME TO comments`). Knowing the difference means tracking
-            // columns for EVERY table so the rename can carry them across —
-            // a generalisation of this whole scanner, which is deliberately not
-            // bolted on here. See #2282.
-            //
-            // The failure is loud, not silent: the generator emits a second
-            // `CREATE TABLE comments` and `migrate` stops on "already exists".
-            // The conservative direction, since claiming the table IS
-            // polymorphic would instead produce helpers querying columns that
-            // may not be there.
-            events.push((at, CommentsEvent::Create(Vec::new())));
-        }
-    }
-
-    events.sort_by_key(|(at, _)| *at);
-    events.into_iter().map(|(_, event)| event).collect()
-}
-
-/// Every `CREATE TABLE comments (…)` in `sql`, as (offset, column list).
-fn comments_creations(sql: &str) -> Vec<(usize, &str)> {
-    let mut found = Vec::new();
-    let mut base = 0usize;
-    while let Some(start) = comments_table_statement_start(&sql[base..]) {
-        let absolute = base + start;
-        let Some(body) = comments_table_body(&sql[absolute..]) else {
-            break;
-        };
-        found.push((absolute, body));
-        // Continue past this statement's opening paren so the next search
-        // cannot rediscover the same one.
-        match sql[absolute..].find('(') {
-            Some(open) => base = absolute + open + 1,
-            None => break,
-        }
-    }
-    found
 }
 
 /// The plpgsql function behind every parent's cleanup trigger.
@@ -654,69 +858,6 @@ pub fn parent_cleanup_down_sql(
     }
 }
 
-/// Whether `name` is one of the accepted spellings of the shared comments
-/// table, quoted or `public.`-qualified.
-fn is_comments_table_name(name: &str) -> bool {
-    let trimmed = name.trim();
-    [
-        COMMENTS_TABLE.to_owned(),
-        format!("\"{COMMENTS_TABLE}\""),
-        format!("public.{COMMENTS_TABLE}"),
-        format!("public.\"{COMMENTS_TABLE}\""),
-        format!("\"public\".{COMMENTS_TABLE}"),
-        format!("\"public\".\"{COMMENTS_TABLE}\""),
-    ]
-    .iter()
-    .any(|accepted| accepted == trimmed)
-}
-
-/// Every `ALTER TABLE … RENAME TO <name>` in `sql`, as (offset, new name).
-///
-/// Scanned by destination because a rename INTO `comments` begins with whatever
-/// the table used to be called, which this scan has no way to know.
-fn rename_targets(lowered: &str) -> Vec<(usize, &str)> {
-    let mut found = Vec::new();
-    let mut base = 0usize;
-    while let Some(at) = lowered[base..].find(" rename to ") {
-        let start = base + at;
-        let rest = &lowered[start + " rename to ".len()..];
-        // Column renames are a different statement shape.
-        let statement_start = lowered[..start].rfind(';').map_or(0, |semi| semi + 1);
-        if !lowered[statement_start..start].contains("rename column") {
-            let name = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_end_matches(';');
-            found.push((start, name));
-        }
-        base = start + " rename to ".len();
-    }
-    found
-}
-
-/// Statements of the form `<verb> [if exists] comments …`, as (offset, body).
-///
-/// Identifier-exact, so `comments_archive` is never mistaken for `comments`.
-fn comments_statements<'a>(lowered: &'a str, verb: &str) -> Vec<(usize, &'a str)> {
-    let mut found = Vec::new();
-    for prefix in comments_table_spellings(verb) {
-        let mut base = 0usize;
-        while let Some(at) = lowered[base..].find(&prefix) {
-            let start = base + at;
-            let after = &lowered[start + prefix.len()..];
-            if prefix.ends_with('"')
-                || after.is_empty()
-                || after.starts_with(|c: char| c.is_whitespace() || c == ';')
-            {
-                found.push((start, after.split(';').next().unwrap_or(after)));
-            }
-            base = start + prefix.len();
-        }
-    }
-    found
-}
-
 /// Every migration's `up.sql`, lowercased with SQL comments stripped.
 fn migration_up_sql(project_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(project_root.join("migrations")) else {
@@ -804,8 +945,8 @@ fn strip_sql_comments(sql: &str) -> String {
             // `DEFAULT ')'` closes a column list early.
             //
             // Length is preserved (one space per byte) so byte offsets stay
-            // valid: `comments_table_events` sorts events by position, and the
-            // body slice is taken by index.
+            // valid: `replay_migration_history` sorts events by position, and
+            // the body slice is taken by index.
             b'\'' => {
                 // In an E-STRING — and ONLY there — a backslash escapes the
                 // next character, so `E'can\'t; DROP TABLE comments;'` does not
@@ -947,73 +1088,6 @@ fn strip_sql_comments(sql: &str) -> String {
         }
     }
     out
-}
-
-/// The column list of a `CREATE TABLE` naming **exactly** the shared comments
-/// table, or `None` when `lowered` creates no such table.
-///
-/// Returns the text between the statement's outer parentheses, so callers can
-/// ask what *this* table declares rather than what the file mentions anywhere.
-fn comments_table_body(lowered: &str) -> Option<&str> {
-    let start = comments_table_statement_start(lowered)?;
-    let open = lowered[start..].find('(')? + start;
-    // Balance parens: a column can carry its own, e.g. `NUMERIC(10, 2)`.
-    let mut depth = 0usize;
-    for (offset, ch) in lowered[open..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&lowered[open + 1..open + offset]);
-                }
-            }
-            _ => {}
-        }
-    }
-    // Unbalanced SQL: treat the rest of the file as the body rather than
-    // silently reporting "no such table" for a migration that does create one.
-    Some(&lowered[open + 1..])
-}
-
-/// Where a `CREATE TABLE` naming exactly the shared comments table begins.
-///
-/// A prefix match is not enough: `CREATE TABLE comments_archive (...)` carrying
-/// the discriminator columns would satisfy every other check, and the generator
-/// would then skip the real table while reporting that it was reused. The name
-/// has to end where the identifier ends -- at whitespace, an opening paren, or
-/// the closing quote of a quoted identifier.
-fn comments_table_statement_start(lowered: &str) -> Option<usize> {
-    // `create` is part of the match, not assumed: `DROP TABLE comments;`
-    // followed by an archive table carrying the discriminator columns would
-    // otherwise read as "the shared table is already here", and the generator
-    // would emit nothing while the table it reported is gone.
-    //
-    // The name must also end where the identifier ends -- at whitespace, an
-    // opening paren, or a closing quote -- so `comments_archive` is not
-    // mistaken for `comments`.
-    let mut best: Option<usize> = None;
-    for prefix in CREATE_VERBS
-        .iter()
-        .flat_map(|verb| comments_table_spellings(verb))
-    {
-        let mut base = 0usize;
-        while let Some(at) = lowered[base..].find(&prefix) {
-            let start = base + at;
-            let after = &lowered[start + prefix.len()..];
-            if prefix.ends_with('"')
-                || after.is_empty()
-                || after.starts_with(|c: char| c.is_whitespace() || c == '(' || c == ';')
-            {
-                // Earliest match wins, so the body belongs to the first such
-                // statement in the file.
-                best = Some(best.map_or(start, |b: usize| b.min(start)));
-                break;
-            }
-            base = start + prefix.len();
-        }
-    }
-    best
 }
 
 /// Push the shared comments migration onto `plan`, unless the project already
@@ -1869,7 +1943,8 @@ mod tests {
         assert!(already_migrated(tmp.path()), "quoted identifiers are names");
     }
 
-    /// Renaming the table away removes it just as surely as dropping it.
+    /// Renaming the table away removes it just as surely as dropping it — and
+    /// renaming it back restores it, columns and all (#2282).
     #[test]
     fn renaming_the_comments_table_moves_the_table() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1897,6 +1972,9 @@ mod tests {
 
         // Renaming a table INTO `comments` brings one back — with no columns
         // claimed, so it is not polymorphic until an ALTER adds them.
+        // Renaming it back restores the polymorphic table: the rename carries
+        // the source table's columns across (#2282) — the old scan landed on
+        // an empty column list here and could not know them.
         let back = migrations.join("0003_rename_back");
         std::fs::create_dir_all(&back).expect("mkdir");
         std::fs::write(
@@ -1905,25 +1983,273 @@ mod tests {
         )
         .expect("write");
         assert!(
-            !already_migrated(tmp.path()),
-            "the table is back but the scan cannot know its columns"
+            already_migrated(tmp.path()),
+            "the rename carried the discriminator columns back with the table"
         );
+    }
 
-        let columns = migrations.join("0004_columns");
-        std::fs::create_dir_all(&columns).expect("mkdir");
+    /// A table renamed INTO `comments` brings its columns with it (#2282).
+    #[test]
+    fn a_rename_into_comments_carries_the_source_columns_across() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
-            columns.join("up.sql"),
-            "ALTER TABLE comments ADD COLUMN commentable_type TEXT;\n\
-             ALTER TABLE comments ADD COLUMN commentable_id BIGINT;\n\
-             ALTER TABLE comments ADD COLUMN id BIGINT;\n\
-             ALTER TABLE comments ADD COLUMN parent_id BIGINT;\n\
-             ALTER TABLE comments ADD COLUMN author_id BIGINT;\n\
-             ALTER TABLE comments ADD COLUMN body TEXT;\n\
-             ALTER TABLE comments ADD COLUMN created_at TIMESTAMP;\n\
-             ALTER TABLE comments ADD COLUMN deleted_at TIMESTAMP;\n",
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
         )
         .expect("write");
-        assert!(already_migrated(tmp.path()));
+        assert!(
+            already_migrated(tmp.path()),
+            "the renamed table already carried the full discriminator schema"
+        );
+    }
+
+    /// …but a rename cannot conjure columns the source never had.
+    #[test]
+    fn a_rename_into_comments_without_the_columns_is_not_the_shared_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the source table carried no discriminator columns"
+        );
+        assert!(
+            conflicting_comments_table(tmp.path()),
+            "the name is taken, loudly, rather than silently reused"
+        );
+    }
+
+    /// `RENAME TO` keeps the table in its schema: a table renamed within
+    /// another schema is not the default-schema `comments`.
+    #[test]
+    fn a_rename_within_another_schema_stays_in_that_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE archive.legacy_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, \
+             parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, \
+             deleted_at TIMESTAMP);\n\
+             ALTER TABLE archive.legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the renamed table is archive.comments, not the shared comments table"
+        );
+    }
+
+    /// A parenthesis-free `CREATE TABLE … AS` does not borrow the column list of
+    /// a later statement.
+    #[test]
+    fn a_create_table_as_does_not_borrow_a_later_column_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments AS SELECT 1 AS id;\n\
+             CREATE TABLE other_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, \
+             parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, \
+             deleted_at TIMESTAMP);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "legacy_comments never had the discriminator columns"
+        );
+    }
+
+    /// The parens of a `CREATE TABLE … AS SELECT` query are not a column list,
+    /// even when the query names every discriminator column.
+    #[test]
+    fn a_create_table_as_query_is_not_read_as_a_column_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments AS SELECT jsonb_build_object(\
+             commentable_type, commentable_id, id, parent_id, author_id, body, \
+             created_at, deleted_at) AS payload FROM source;\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the table only has `payload`, whatever its query mentions"
+        );
+    }
+
+    /// A column the body only REFERENCES is not declared: `REFERENCES
+    /// users(id)` does not give the table an `id` column.
+    #[test]
+    fn a_referenced_column_is_not_a_declared_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (commentable_type TEXT, commentable_id BIGINT, \
+             parent_id BIGINT, author_id BIGINT REFERENCES users(id), body TEXT, \
+             created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "legacy_comments has no `id` column of its own"
+        );
+    }
+
+    #[test]
+    fn declares_column_reads_element_heads_only() {
+        let body = "id BIGSERIAL PRIMARY KEY, \"check\" TEXT, note TEXT DEFAULT 'a, id', \
+                    CONSTRAINT body_fk FOREIGN KEY (body) REFERENCES t(body), \
+                    PRIMARY KEY (parent_id)";
+        assert!(declares_column(body, "id"));
+        assert!(declares_column(body, "check"));
+        assert!(declares_column(body, "note"));
+        assert!(
+            !declares_column(body, "body"),
+            "only named inside a constraint"
+        );
+        assert!(
+            !declares_column(body, "parent_id"),
+            "only named in PRIMARY KEY (…)"
+        );
+    }
+
+    /// Columns added to the source table BEFORE the rename carry across too:
+    /// the replay tracks every table, not just `comments`.
+    #[test]
+    fn columns_added_before_the_rename_carry_across() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (id BIGSERIAL PRIMARY KEY);\n\
+             ALTER TABLE legacy_comments ADD COLUMN commentable_type TEXT;\n\
+             ALTER TABLE legacy_comments ADD COLUMN commentable_id BIGINT;\n\
+             ALTER TABLE legacy_comments ADD COLUMN parent_id BIGINT;\n\
+             ALTER TABLE legacy_comments ADD COLUMN author_id BIGINT;\n\
+             ALTER TABLE legacy_comments ADD COLUMN body TEXT;\n\
+             ALTER TABLE legacy_comments ADD COLUMN created_at TIMESTAMP;\n\
+             ALTER TABLE legacy_comments ADD COLUMN deleted_at TIMESTAMP;\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "ALTERs on the old name count once the table is renamed in"
+        );
+    }
+
+    /// Rename in, then drop a discriminator column: not the shared table.
+    #[test]
+    fn dropping_a_column_after_a_rename_in_unmakes_the_shared_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n\
+             ALTER TABLE comments DROP COLUMN commentable_id;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the discriminator column is gone even though the rename brought it"
+        );
+    }
+
+    /// Rename in, then rename out again: no `comments` table remains.
+    #[test]
+    fn renaming_out_again_after_a_rename_in_leaves_no_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n\
+             ALTER TABLE comments RENAME TO archived_comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the table moved away again; `comments` has to be created again"
+        );
+    }
+
+    /// Two renames into `comments` in one file: the last one wins.
+    #[test]
+    fn two_renames_into_comments_in_one_file_last_wins() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_two_renames");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE good_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             CREATE TABLE bare_comments (id BIGSERIAL PRIMARY KEY);\n\
+             ALTER TABLE good_comments RENAME TO comments;\n\
+             ALTER TABLE bare_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the second rename replaced the polymorphic table with a bare one"
+        );
+
+        // …and in the other order the polymorphic one stands.
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE bare_comments (id BIGSERIAL PRIMARY KEY);\n\
+             CREATE TABLE good_comments (commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             ALTER TABLE bare_comments RENAME TO comments;\n\
+             ALTER TABLE good_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "the last rename brought the full discriminator schema"
+        );
+    }
+
+    /// A rename from a table the history never created: the conservative read
+    /// is "present, columns unknown" — loud, not silent.
+    #[test]
+    fn a_rename_from_an_unknown_table_is_present_but_not_polymorphic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            !already_migrated(tmp.path()),
+            "the scan cannot verify columns it never saw"
+        );
+        assert!(
+            conflicting_comments_table(tmp.path()),
+            "the name is taken: generation emits and migrate fails loudly \
+             rather than claiming a reuse"
+        );
     }
 
     /// One file may legitimately recreate the table. Recording only the first
