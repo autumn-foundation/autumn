@@ -2047,20 +2047,26 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                     find_unquoted_str(strip_line_comment(&feat_trimmed), "features = [").unwrap();
                 let list_start = feat_bracket + "features = [".len();
                 if let Some(close_bracket) = find_unquoted(&feat_trimmed[list_start..], ']') {
-                    // Add to existing, single-line features list.
+                    // Add to existing, single-line features list — unless
+                    // it's already there. When `feat_line_idx` isn't the
+                    // opener line, the top-level guard above (which only
+                    // checked the opener) never saw this line, so an
+                    // existing mention here must be checked explicitly.
                     let list_end = close_bracket + list_start;
                     let existing = feat_trimmed[list_start..list_end].trim();
-                    let new_list = if existing.is_empty() {
-                        FEATURE.to_owned()
-                    } else {
-                        format!("{existing}, {FEATURE}")
-                    };
-                    lines[feat_line_idx] = format!(
-                        "{feat_indent}{}{}{}",
-                        &feat_trimmed[..list_start],
-                        new_list,
-                        &feat_trimmed[list_end..]
-                    );
+                    if !existing.contains(FEATURE) {
+                        let new_list = if existing.is_empty() {
+                            FEATURE.to_owned()
+                        } else {
+                            format!("{existing}, {FEATURE}")
+                        };
+                        lines[feat_line_idx] = format!(
+                            "{feat_indent}{}{}{}",
+                            &feat_trimmed[..list_start],
+                            new_list,
+                            &feat_trimmed[list_end..]
+                        );
+                    }
                 } else {
                     // The `features = [` array spans multiple lines: scan
                     // every line up to the closing bracket, the same way
@@ -16916,6 +16922,21 @@ mod tests {
             out.contains("\"mail\""),
             "mail feature must be merged: {out}"
         );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    // Codex review (6th round) on #3044: a single-line `features = [...]`
+    // array on a continuation line (not the opener) already containing
+    // "mail" must not get a duplicate appended — the top-level "already
+    // present?" guard only ever checked the opener line, so this line's
+    // own content has to be checked explicitly once it's found.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_single_line_array_on_continuation_line_no_duplicate()
+     {
+        let toml = "autumn-web = {\n    version = \"0.3\",\n    features = [\"mail\"]\n}\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
         toml::from_str::<toml::Value>(&out)
             .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
     }
