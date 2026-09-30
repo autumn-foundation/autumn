@@ -24,9 +24,9 @@ built now, alongside the fix, or deferred.
 ## Door class and reversal cost
 
 **Two-way door**, but reversal is not the bare storage swap this ADR
-originally described. `check` (`tenant_domains.rs:483`) runs before the
+originally described. `check` (`tenant_domains.rs:851`) runs before the
 per-hostname fleet lease is even acquired, and `record_attempt`
-(`tenant_domains.rs:561`) runs after two subsequent awaited calls
+(`tenant_domains.rs:931`) runs after two subsequent awaited calls
 (`try_acquire`, `record_issuing_for`) — a real gap, not a formality. The
 per-hostname lease excludes a second replica from racing the *same*
 hostname through that gap, but does nothing for two replicas each ordering
@@ -57,8 +57,10 @@ Reproduce with the commands in **Reproduce** below.
    documents four concrete failure modes against `autumn/src/custom_domain.rs`'s
    `IssuanceLimiter`, which keeps both its per-domain and global attempt
    windows in a plain in-process `RwLock<Attempts>` (`HashMap<String, Vec<i64>>`
-   plus a `Vec<i64>`), rebuilt empty on every process start
-   (`autumn/src/app.rs:10047`).
+   plus a `Vec<i64>`), rebuilt empty on every process start — `app.rs`
+   constructs a fresh `IssuanceLimiter` at both of its call sites
+   (`autumn/src/app.rs:10126,10200`, one for the one-shot retention pruner,
+   one for the running web app's custom-domain task).
 2. **Three of the four failure modes are single-instance bugs, not
    multi-replica ones.** Restart-resets-the-window (item 1), tick-start
    timestamp skew (item 3), and budget-deferral misclassified as failure
@@ -76,9 +78,9 @@ Reproduce with the commands in **Reproduce** below.
    no new abstraction for the per-domain half; it is additive data on a
    trait that already exists and is already exercised by tests. The global
    half needs its own small durable store, not a ride on `CustomDomainStore`:
-   `CustomDomainRegistry::remove_if` (`custom_domain.rs:1606`) deletes a
+   `CustomDomainRegistry::remove_if` (`custom_domain.rs:1670`) deletes a
    domain's record outright, while `IssuanceLimiter::forget`
-   (`custom_domain.rs:1927`) only clears that domain's *per-domain* history
+   (`custom_domain.rs:2010`) only clears that domain's *per-domain* history
    and intentionally leaves its attempts in the global vector — so a global
    window reconstructed from per-domain records would lose an offboarded
    domain's still-counting attempts on the next restart, letting the
@@ -153,7 +155,7 @@ Reproduce with the commands in **Reproduce** below.
    orders in 3 hours: the account's entire quota, before counting a single
    order from any other source. Three replicas reach 450 — 1.5× over. "Well
    inside the limit... at the defaults" is true at N=1 and false starting
-   at N=2 — but `docs/guide/tls.md:894-899` and `:426-427` already document,
+   at N=2 — but `docs/guide/tls.md:901-907` and `:426-427` already document,
    independently of this ADR, that custom domains are **single-host only**:
    "the HTTP-01 token map and the certificate store are per-process, so
    behind a load balancer the CA's validation request usually reaches a
@@ -198,7 +200,7 @@ does not exist yet. That is not true of items 1, 3, and 4, which are live
 single-instance bugs today regardless. The N=2 arithmetic is recorded here
 so that whoever eventually externalizes the HTTP-01 token map and
 certificate store — the actual multi-replica prerequisite,
-`docs/guide/tls.md:894-899`'s documented gap, with no tracked issue found
+`docs/guide/tls.md:901-907`'s documented gap, with no tracked issue found
 for it in this pass — does not also have to rediscover that the issuance
 budget default needs the same trip.
 
@@ -228,7 +230,7 @@ looked like exactly the proof condition 4 asks for: not "might struggle
 with," but an exact failure of the limiter's own documented guarantee at a
 specific, named N. But a "committed requirement" a design can fail has to
 describe a configuration the design is actually committed to supporting —
-and `docs/guide/tls.md:894-899` already documents, independently of this
+and `docs/guide/tls.md:901-907` already documents, independently of this
 ADR and for an unrelated reason (HTTP-01 token-map and certificate-store
 locality), that custom domains run single-host only. The limiter's "well
 inside the limit... at the defaults" guarantee is implicitly scoped to the
@@ -310,7 +312,7 @@ any of the following occurs:
 
 - **The HTTP-01 token map and certificate store are externalized**, making
   multi-replica custom domains a supported topology for the first time
-  (`docs/guide/tls.md:894-899` is the documented gap this closes). At that
+  (`docs/guide/tls.md:901-907` is the documented gap this closes). At that
   point Evidence item 7's N=2 arithmetic stops being about an unreachable
   configuration and starts being about the one operators can actually run —
   recalibrate `global_per_hour`'s default and re-open this decision before
@@ -342,7 +344,7 @@ any of the following occurs:
 # https://github.com/autumn-foundation/autumn/issues/2644
 
 # The in-process-only limiter state
-sed -n '1810,1840p' autumn/src/custom_domain.rs
+sed -n '1890,1920p' autumn/src/custom_domain.rs
 
 # Where it is constructed fresh per process, at boot
 grep -n "IssuanceLimiter::new" autumn/src/app.rs
