@@ -436,19 +436,24 @@ fn escape(s: &str) -> String {
         return s.to_owned();
     }
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if !is_xml_char(c) {
-            continue;
-        }
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
+    // Copy maximal runs of characters that pass through unchanged with one
+    // `push_str` each, flushing only around a dropped or escaped character.
+    let mut run_start = 0;
+    for (i, c) in s.char_indices() {
+        let replacement = match c {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&apos;",
+            _ if is_xml_char(c) => continue,
+            _ => "",
+        };
+        out.push_str(&s[run_start..i]);
+        out.push_str(replacement);
+        run_start = i + c.len_utf8();
     }
+    out.push_str(&s[run_start..]);
     out
 }
 
