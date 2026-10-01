@@ -617,7 +617,7 @@ impl Plugin for MyPlugin {
         Some(
             PluginContract::new(env!("CARGO_PKG_NAME"))
                 .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web("0.7"),
+                .autumn_web("0.8"),
         )
     }
 
@@ -707,7 +707,7 @@ If your plugin uses an API declared `experimental` above, say so:
 
 ```rust,ignore
 PluginContract::new(env!("CARGO_PKG_NAME"))
-    .autumn_web("0.7")
+    .autumn_web("0.8")
     .uses_experimental("AppBuilder::with_edge_kv")
 ```
 

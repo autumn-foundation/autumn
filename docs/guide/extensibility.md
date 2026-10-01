@@ -199,7 +199,7 @@ fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
     Some(
         autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
             .plugin_version(env!("CARGO_PKG_VERSION"))
-            .autumn_web("0.7"),
+            .autumn_web("0.8"),
     )
 }
 ```

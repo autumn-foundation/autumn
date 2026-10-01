@@ -17,12 +17,14 @@ description: >
 **Version identity trip wire**: the workspace on `trunk-dev` is versioned
 0.8.0, and `v0.8.0` is the current release line — `autumn-web = "0.8"`,
 `cargo install autumn-cli --version 0.8.0`. Features below carry the release
-they arrived in — **(0.7.0)** is **absent from 0.6.x and earlier**, and
-**(0.6.0)** is absent from 0.5.x: if an app pins an older line, check
+they arrived in — **(0.8.0)** is **absent from 0.7.x and earlier**,
+**(0.7.0)** is absent from 0.6.x and earlier, and **(0.6.0)** is absent from
+0.5.x: if an app pins an older line, check
 [`CHANGELOG.md`](../../CHANGELOG.md) before using them. Unmarked features
-predate 0.6.0. An app moving up from 0.6.x follows
-[`docs/migrations/0.7.0.md`](../../docs/migrations/0.7.0.md); run
-`autumn upgrade` first.
+predate 0.6.0. An app moving up from 0.7.x follows
+[`docs/migrations/0.8.0.md`](../../docs/migrations/0.8.0.md); one moving up from
+0.6.x follows [`docs/migrations/0.7.0.md`](../../docs/migrations/0.7.0.md) and
+then the 0.8.0 guide. Run `autumn upgrade` first.
 
 autumn-web is a Spring Boot-style web framework for Rust, built on Axum. It
 assembles Axum, Diesel, Maud, htmx, Tailwind, Tokio, tracing, and production
@@ -41,7 +43,7 @@ when their details matter:
   exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
-- `references/examples.md` - official 0.7.0 example patterns for minimal apps,
+- `references/examples.md` - official 0.8.0 example patterns for minimal apps,
   CRUD, production-ish jobs, Redis channels, S3 storage plugins, and signed
   webhooks. Use this before generating full app code.
 - `docs/guide/accessibility.md` - accessible-by-construction UI. Prefer the
@@ -1890,7 +1892,7 @@ fn contract(&self) -> Option<PluginContract> {
     Some(
         PluginContract::new(env!("CARGO_PKG_NAME"))
             .plugin_version(env!("CARGO_PKG_VERSION"))
-            .autumn_web("0.7")            // Cargo requirement: "0.7", ">=0.6, <0.9", "=0.7.1"
+            .autumn_web("0.8")            // Cargo requirement: "0.8", ">=0.7, <0.10", "=0.8.1"
             .uses_experimental("AppBuilder::with_edge_kv"),  // only if you actually do
     )
 }
