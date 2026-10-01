@@ -987,16 +987,15 @@ impl CollabText {
                     },
                 );
                 self.index.insert(id.clone());
-                true
             }
             CollabOp::Delete { target } => {
                 let Some(pos) = self.position_of(target) else {
                     return false;
                 };
                 self.elems[pos].deleted = true;
-                true
             }
         }
+        true
     }
 
     /// Retry the buffer until nothing more integrates.
