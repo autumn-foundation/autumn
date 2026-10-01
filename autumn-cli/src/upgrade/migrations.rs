@@ -512,7 +512,7 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         version: "0.8.0",
         title: "`plugin_conformance::ConformanceConfig` is `#[non_exhaustive]`; build it with its constructors",
         confidence: Confidence::Manual,
-        guide: "docs/migrations/0.8.0.md#plugin-authors",
+        guide: "docs/migrations/0.8.0.md#plugin-conformance-conformanceconfig-is-non_exhaustive",
         rewrite: Rewrite::GuideOnly,
     },
     AppMigration {
@@ -520,7 +520,7 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         version: "0.8.0",
         title: "`#[derive(Validate)]` needs `validator = \"0.21\"` in the app's own manifest",
         confidence: Confidence::Manual,
-        guide: "docs/migrations/0.8.0.md#upstream-dependency-updates",
+        guide: "docs/migrations/0.8.0.md#dependencies-validator-moves-to-021",
         rewrite: Rewrite::GuideOnly,
     },
 ];
