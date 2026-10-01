@@ -1,12 +1,12 @@
-# autumn-web API Reference (0.7.0)
+# autumn-web API Reference (0.8.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.7.0**, the current release line,
+Version identity: this reference tracks **0.8.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
-arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
-0.6.x and earlier. Unmarked entries predate 0.6.0.
+arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
+earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries predate 0.6.0.
 
 ## Published crates
 
@@ -25,7 +25,7 @@ arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.7.0`. This table lists the same crates, in the same order, as
+together at `0.8.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 

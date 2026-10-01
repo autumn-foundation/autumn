@@ -453,7 +453,7 @@ pub type ReapFuture<'a> = Pin<Box<dyn Future<Output = ReapStats> + Send + 'a>>;
 ///
 /// **Implementors:** [`heartbeat`](RoomStore::heartbeat) is new in this release
 /// and has no default body, so an out-of-tree store must implement it (see
-/// `docs/migrations/next.md`).
+/// `docs/migrations/0.8.0.md`).
 ///
 /// Every method keys on the `(namespace, room_id)` pair and **fails closed**: a
 /// namespace mismatch resolves to [`RoomError::RoomNotFound`], never another

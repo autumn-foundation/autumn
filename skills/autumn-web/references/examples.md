@@ -1,8 +1,8 @@
-# autumn-web Example Reference (0.7.0)
+# autumn-web Example Reference (0.8.0)
 
 Use these patterns when generating or reviewing Autumn apps. The official
 examples live under `examples/`; prefer current source when exact code matters.
-Everything here works on the published 0.7.0 crates unless marked otherwise.
+Everything here works on the published 0.8.0 crates unless marked otherwise.
 
 ## Status field with a state machine (replaces hand-rolled hook validation)
 
@@ -447,7 +447,7 @@ impl<Q, M, S> Plugin for GraphqlPlugin<Q, M, S> {
         app.nest(&self.path, router)                   // raw router...
             .declare_plugin_routes(self.route_infos()) // ...made visible to `autumn routes` and audit-clean
     }
-    fn contract(&self) -> Option<PluginContract> { /* .autumn_web("0.7") */ }
+    fn contract(&self) -> Option<PluginContract> { /* .autumn_web("0.8") */ }
 }
 // per request:  schema.execute(request.data(state))   // AppState into the GraphQL context
 ```
