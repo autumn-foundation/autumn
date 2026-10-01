@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
-## [0.8.0] - 2026-09-30
+## [0.8.0] - 2026-10-01
 
 For a narrative tour of this release, see the
 [0.8.0 release walkthrough](docs/releases/0.8.0.md); for the upgrade path from
