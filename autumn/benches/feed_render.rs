@@ -12,6 +12,11 @@
 //! fast path). This mirrors real blog content rather than gaming the
 //! benchmark toward one path.
 //!
+//! Marginal per-render baseline (callgrind `--iterations 1000` minus
+//! `--iterations 0`; dhat likewise): 382,993 instructions, 336 allocations,
+//! 77.7 KB per `Feed::render` of the 30-entry feed. `feed::escape` is 53.8% of
+//! self instructions.
+//!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing: it is a workload to point a profiler at.
 //!
