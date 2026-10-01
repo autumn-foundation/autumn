@@ -12,7 +12,7 @@ full quarter of business time forward in less than one second, with no
 > **Status:** opt-in. Enable the `sla` Cargo feature. Issue #1826.
 >
 > ```toml
-> autumn-web = { version = "0.7", features = ["sla"] }
+> autumn-web = { version = "0.8", features = ["sla"] }
 > ```
 
 ---

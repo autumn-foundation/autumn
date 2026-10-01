@@ -39,6 +39,9 @@ ALLOW=(
   # Marks `from_shard`/`with_pool_untracked` (0.6.0); cites #1629 only for the
   # `autumn upgrade` tooling that applies its codemod, which is 0.7.0.
   'with_pool_untracked` is the 0.6.0 rename'
+  # `find_or_create_by_<field>` is a 0.6.0 API; #2586 is a later 0.8.0 fix to
+  # how it validates a new row, cited inline as a behaviour note.
+  '#2586 — an existing row still wins'
 )
 
 # Every released version, from the CHANGELOG's own section headings. Anything

@@ -45,7 +45,7 @@ In your app's `Cargo.toml`:
 
 ```toml
 [dev-dependencies]
-autumn-web = { version = "0.7", features = ["system-tests"] }
+autumn-web = { version = "0.8", features = ["system-tests"] }
 
 [features]
 system-tests = ["autumn-web/system-tests"]

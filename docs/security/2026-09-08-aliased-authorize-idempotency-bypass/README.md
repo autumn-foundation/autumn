@@ -593,7 +593,7 @@ Since this closes a genuinely pre-existing (not this-PR-introduced) gap —
 `#[feature_flag] + #[static_get]` compiled and silently under-protected on
 trunk before any of this PR's changes — it has its own `CHANGELOG.md`
 `### Security` entry and
-[migration guide section](../../migrations/next.md#static_get-feature_flag-is-now-a-compile-error),
+[migration guide section](../../migrations/0.8.0.md#static_get-feature_flag-is-now-a-compile-error),
 separate from the `#[authorize]` aliasing entry.
 
 ## 🗂 Ledger

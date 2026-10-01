@@ -270,8 +270,16 @@ fn scaffold_dockerfile_bakes_an_sbom_into_the_image() {
     let pin = pinned_cli_version(&dockerfile);
 
     if pin_ships_autumn_sbom(&pin) {
+        // The generated step is a `\`-continued RUN (`autumn sbom` with a
+        // `--filter-platform` line before `--output`), so assert on the
+        // logical command rather than one physical line.
+        let logical = dockerfile
+            .replace("\\\n", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            dockerfile.contains("autumn sbom --output"),
+            logical.contains("autumn sbom") && logical.contains("--output /app/sbom.cdx.json"),
             "the builder stage must generate a CycloneDX SBOM, got:\n{dockerfile}"
         );
         assert!(

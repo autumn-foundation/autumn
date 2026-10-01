@@ -112,7 +112,7 @@ gh attestation verify autumn-x86_64-unknown-linux-musl.tar.gz \
 Run the gate locally before tagging:
 
 ```bash
-RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh
+RELEASE_TAG=v0.8.0 ./scripts/check-sbom.sh
 ```
 
 ### Dependency advisories
@@ -303,7 +303,7 @@ are actually there. It is therefore a **post-publish, pre-announce** gate:
 - [ ] After `cargo publish` completes for the release candidate, trigger the
   `Quickstart Gate` workflow manually (Actions → Quickstart Gate → *Run
   workflow*) with the `cli-version` input set to the candidate version
-  (e.g. `0.7.0`), or via the CLI:
+  (e.g. `0.8.0`), or via the CLI:
 
   ```bash
   gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z
@@ -482,6 +482,12 @@ Before pushing the release tag:
 1. **Bump the workspace version** in `Cargo.toml` under `[workspace.package]`.
 2. **Update internal version pins** for inter-crate dependencies
    (e.g. `autumn-web = { version = "X.Y.Z", path = "../autumn" }`).
+   Also bump any hard-coded plugin compatibility range that boots against the
+   workspace: `.autumn_web("X.Y")` in `examples/` (e.g.
+   `examples/react-graphql/src/graphql_plugin.rs`). A stale range makes the
+   plugin-contract check refuse to start the example, and the *Example fleet
+   e2e gate* fails. Plugins in this repo that release in lockstep use
+   `lockstep_contract(..)` and need nothing.
 3. **Fold the changelog fragments in** — `./scripts/update-changelog.sh`
    merges every `changelog.d/` file into `## [Unreleased]` under the kind it
    declares, then deletes the files. Read the result: it is the release note
@@ -517,8 +523,8 @@ Before pushing the release tag:
    ```
 8. **Tag and push:**
    ```bash
-   git tag v0.7.0
-   git push origin v0.7.0
+   git tag v0.8.0
+   git push origin v0.8.0
    ```
    The `publish-gate` workflow runs automatically. The `release` workflow runs
    only after `publish-gate` succeeds.

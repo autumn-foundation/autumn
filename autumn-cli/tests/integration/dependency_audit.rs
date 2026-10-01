@@ -954,7 +954,7 @@ fn the_guide_no_longer_defers_vulnerability_scanning() {
 /// satisfy.
 #[test]
 fn the_migration_note_keeps_the_donor_policy_flavor_correct() {
-    let guide = read_repo_file("docs/migrations/next.md");
+    let guide = read_repo_file("docs/migrations/0.8.0.md");
     let note = guide
         .split("### CI: `autumn upgrade` adds a blocking dependency audit")
         .nth(1)

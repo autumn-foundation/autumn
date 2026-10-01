@@ -308,7 +308,7 @@ Run the same gate yourself against any checkout:
 
 ```bash
 ./scripts/check-sbom.sh                     # against the working tree
-RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh  # also enforce tag agreement
+RELEASE_TAG=v0.8.0 ./scripts/check-sbom.sh  # also enforce tag agreement
 ```
 
 **Downloads during an image build are checksum-verified.** Every artifact the
@@ -386,7 +386,7 @@ error[vulnerability]: Marvin Attack: potential key recovery through timing sidec
     ├ Solution: No safe upgrade is available!
     ├ rsa v0.9.10
       └── jsonwebtoken v10.1.0
-          └── autumn-web v0.7.0
+          └── autumn-web v0.8.0
               └── my-app v0.1.0
 
 advisories FAILED

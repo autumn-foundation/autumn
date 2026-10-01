@@ -151,7 +151,7 @@ fn the_non_exhaustive_scan_can_fail() {
     assert_eq!(carries_non_exhaustive(bare, "pub enum Missing {"), None);
 }
 
-/// `CHANGELOG.md` and `docs/migrations/next.md` both tell plugin authors that
+/// `CHANGELOG.md` and `docs/migrations/0.8.0.md` both tell plugin authors that
 /// the plugin-facing types are `#[non_exhaustive]`. That promise is what lets a
 /// later release add a verdict, a tier, or a check's configuration without
 /// breaking every plugin — so it has to be kept, and an annotation is exactly
@@ -207,7 +207,7 @@ fn every_type_the_docs_promise_as_non_exhaustive_carries_the_attribute() {
             carries,
             "`{decl}` in {module} is documented as #[non_exhaustive] but does not carry the \
              attribute. Either add it back, or stop promising it in CHANGELOG.md and \
-             docs/migrations/next.md."
+             docs/migrations/0.8.0.md."
         );
     }
 }

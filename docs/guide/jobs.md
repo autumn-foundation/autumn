@@ -823,7 +823,7 @@ work off the request thread.
 `autumn_web::data::csv` is behind the non-default `csv` feature:
 
 ```toml
-autumn-web = { version = "0.7", features = ["csv"] }
+autumn-web = { version = "0.8", features = ["csv"] }
 ```
 
 ```rust,ignore

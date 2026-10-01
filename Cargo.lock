@@ -207,7 +207,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -218,7 +218,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -528,7 +528,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "autumn-admin-plugin"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "axum",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-billing"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "chrono",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-cache-redis"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "redis",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-schema-core",
  "autumn-web",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-edge"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-macros",
  "axum",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-model"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-repository"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-support"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-media-plugin"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "aws-config",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-plugin-reference"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "maud",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-schema-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-search"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "diesel",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-storage-s3"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "aws-config",
@@ -790,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-web"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "allocation-counter",
@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "bookmarks"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "chrono",
@@ -1759,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "bookmarks-distributed"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-cache-redis",
  "autumn-web",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "bookmarks-sharded"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "chrono",
@@ -2163,7 +2163,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cms"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-web",
  "chrono",
@@ -3162,7 +3162,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3526,7 +3526,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5603,7 +5603,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7064,7 +7064,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7343,7 +7343,7 @@ dependencies = [
 
 [[package]]
 name = "reddit-clone"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-stream",
  "autumn-storage-s3",
@@ -7923,7 +7923,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7982,7 +7982,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8577,7 +8577,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9083,7 +9083,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9114,7 +9114,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "rustix",
  "signal-hook",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10659,7 +10659,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "wiki"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "autumn-search",
  "autumn-web",
@@ -10702,7 +10702,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
