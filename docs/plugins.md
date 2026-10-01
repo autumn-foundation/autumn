@@ -141,7 +141,7 @@ Each listing records:
 
 ```text
 Listed in the Autumn plugin index:
-  autumn-admin-plugin  0.7.0  Out-of-the-box admin panel plugin for autumn-web applications
+  autumn-admin-plugin  0.8.0  Out-of-the-box admin panel plugin for autumn-web applications
       first-party · full trust: native code · stable API · plugin-check pass on autumn-web 0.8.0
   autumn-plugin-feed   0.3.0  Live feeds  [EXPERIMENTAL API]
       community · full trust: native code · experimental API: … · plugin-check pass on autumn-web 0.8.0
