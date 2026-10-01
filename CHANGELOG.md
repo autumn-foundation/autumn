@@ -5329,6 +5329,11 @@ For a narrative tour of this release, see the
 
 ### Fixed
 
+- **static_gen:** `render_static_routes` no longer breaks `Send` inference.
+  The by-reference job closure made rustc report "implementation of `FnOnce`
+  is not general enough", so `autumn_web::app().run()` could not be spawned.
+  Jobs are now consumed by value.
+
 - **🧭 Wayfinder: redisplay the "Send Invitation" form on failure in
   `examples/teams` (error-path 0/3 → 3/3, email preserved):**
   `POST /invitations` — the admin-facing "Send Invitation" form on
