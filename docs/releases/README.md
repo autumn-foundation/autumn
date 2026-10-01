@@ -13,6 +13,10 @@ new in this one?" and does not want 145 changelog entries.
 
 ## Index
 
+- [`0.8.0.md`](0.8.0.md) — *Prove it, then run it anywhere*: simulated
+  networks and build-time query budgets, SQLite as a full backend, `Money`,
+  ledgered and confidential data, mTLS and DNS-01 certificates, shadow deploys,
+  and capability-sandboxed plugins.
 - [`0.7.0.md`](0.7.0.md) — *Ship it, then prove it*: host-preparing deploys and
   fleets, deterministic simulation testing, `#[translatable]` /
   `#[commentable]` / `#[votable]` / `position`, failure-capsule replay,

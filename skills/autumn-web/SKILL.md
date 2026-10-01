@@ -4,7 +4,7 @@ description: >
   Use when building, debugging, documenting, or upgrading Rust web applications
   with autumn-web, autumn-cli, or first-party Autumn crates; also use for
   Autumn route/model/repository/job/webhook/admin macros, AppBuilder setup,
-  Maud + htmx server-rendered UI, Diesel async Postgres, and Autumn 0.7.x
+  Maud + htmx server-rendered UI, Diesel async Postgres, and Autumn 0.8.x
   migration or release work.
 ---
 
@@ -12,11 +12,11 @@ description: >
 
 **Repository**: https://github.com/autumn-foundation/autumn
 **Branch**: `trunk-dev`
-**Latest release**: 0.7.0 | **Edition**: 2024 | **MSRV**: 1.88.0
+**Latest release**: 0.8.0 | **Edition**: 2024 | **MSRV**: 1.88.0
 
 **Version identity trip wire**: the workspace on `trunk-dev` is versioned
-0.7.0, and `v0.7.0` is the current release line — `autumn-web = "0.7"`,
-`cargo install autumn-cli --version 0.7.0`. Features below carry the release
+0.8.0, and `v0.8.0` is the current release line — `autumn-web = "0.8"`,
+`cargo install autumn-cli --version 0.8.0`. Features below carry the release
 they arrived in — **(0.7.0)** is **absent from 0.6.x and earlier**, and
 **(0.6.0)** is absent from 0.5.x: if an app pins an older line, check
 [`CHANGELOG.md`](../../CHANGELOG.md) before using them. Unmarked features
@@ -108,7 +108,7 @@ the framework almost certainly already generates or ships it:
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
-| A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.7.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
+| A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0) |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | `Db` taken before a body extractor (`Form`/`Json`/`Multipart`) in the same handler — pins a pooled connection for as long as the client takes to send the body | `LazyDb` in the same argument spot; call `.checkout().await?` after the body extractor runs — for `Form`/`Json` that means right at handler entry, but `Multipart` doesn't buffer anything during extraction, so checkout must wait until every field this handler needs has been read from the `next_field()` loop, not before it (issue #2264) |
@@ -121,8 +121,8 @@ the framework almost certainly already generates or ships it:
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument, 256 instruments, 8 labels/series by default) instead of leaking series (0.7.0, issue #1378); those three are the `[metrics]` section — `max_series_per_metric` / `max_instruments` / `max_labels_per_series`, plus `AUTUMN_METRICS__*` — so an app with a genuinely larger label space raises them rather than losing series, while the name/value/help-length caps stay fixed. Lowering a cap never evicts a retained series (that would reset a counter); an out-of-range value fails the boot naming the key. `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
-| Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598/#1634) |
-| Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.7.0, #1634) |
+| Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598; 0.8.0, #1634) |
+| Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.8.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
 | A `#[sim_test]` that calls a real downstream service, hopes for a timing race, or reads `Utc::now()` / `Instant::now()` in code with no clock in scope | `Sim::net(SimNet::new().host("payments", router).latency(..).drop_rate(..))` serves outbound `http_client` calls in-process with seeded latency, drops and `partition`/`heal`; `Sim::interleave` / `Sim::spawn` reorder ready work from the seed; `sim::crash_at(i, op)` drops an op at any await; `time::ambient_now()` / `ambient_instant()` follow the running `Sim`. See `docs/guide/simulation-testing.md` (#2967) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
@@ -197,7 +197,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autumn-web = { version = "0.7", features = ["db", "htmx", "maud"] }
+autumn-web = { version = "0.8", features = ["db", "htmx", "maud"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -214,7 +214,7 @@ when avoiding a system libpq install.
 
 For a reddit-clone-style app with live feeds, file uploads, and blob variants:
 ```toml
-autumn-web = { version = "0.7", features = [
+autumn-web = { version = "0.8", features = [
     "mail",       # transactional email + mailer previews
     "ws",         # WebSocket routes, SSE, broadcast channels
     "presence",   # Presence extractor for online-user tracking
@@ -251,8 +251,8 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `offline-sync` | Offline-first local `SQLite` store plus a background sync engine |
 | `collab` | `#[collaborative]` text fields merged by an in-tree CRDT, with live sessions over the channel/presence seams — see [collaboration](../../docs/guide/collaboration.md) |
 
-For S3 storage add `autumn-storage-s3 = "0.7"`; `storage-s3` is no longer an
-`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.7"`.
+For S3 storage add `autumn-storage-s3 = "0.8"`; `storage-s3` is no longer an
+`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.8"`.
 For keyword + vector search with lifecycle-synced indexes add `autumn-search`.
 
 ## main.rs pattern
@@ -840,7 +840,7 @@ paths are **not** yet maintained: a derived `delete_by_<field>` and
 `docs/guide/counter-cache.md`.
 
 **For a filtered or weighted count, use `#[derivation]`** on the child, below
-`#[model]` **(0.7.0, #1769)**: `#[derivation(Post, column =
+`#[model]` **(0.8.0, #1769)**: `#[derivation(Post, column =
 "published_comment_count", filter = published)]`, or `#[derivation(Post, column
 = "visible_score", transform = sum(score), filter = published && score > 0)]`.
 It is a superset of `counter_cache` (which is the unfiltered case) and rides the
@@ -1002,14 +1002,14 @@ raw Diesel:
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
 | `find_in_batches(batch_size)`, `find_each(batch_size)` | **(0.6.0)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
 | `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.6.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware, canonicalizing a `#[normalize]` lookup column), else normalizes and validates the payload (#2586 — an existing row still wins over a rejected one, re-checked on the primary) and inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
-| `ledgered = true` / `ledgered(valid_time = "col")` (attr) | **(0.7.0, issue #1699)** Makes the entity bitemporal and tamper-evident: every insert, update and soft-delete appends an immutable, hash-chained revision carrying a **full row snapshot** to `_autumn_ledger_revisions`. Adds `ledger_as_of(id, at)`, `ledger_as_of_at(id, LedgerAsOf)`, `ledger_diff(id, from, to)`, `ledger_revisions(id)`, `ledger_verify(id)`, `ledger_head(id)`, `ledger_high_water(id)` and `ledger_pin(id)` (both at once, from one snapshot — what an audit posture pins outside the database). Implies `versioned = true` and **requires `soft_delete`** (a hard DELETE would erase the row the ledger reconstructs); `purge` is not generated, and `#[version_history(sensitive = [...])]` / `no_versioned_record_impl` are compile errors. See "Ledgered entities" below |
+| `ledgered = true` / `ledgered(valid_time = "col")` (attr) | **(0.8.0, issue #1699)** Makes the entity bitemporal and tamper-evident: every insert, update and soft-delete appends an immutable, hash-chained revision carrying a **full row snapshot** to `_autumn_ledger_revisions`. Adds `ledger_as_of(id, at)`, `ledger_as_of_at(id, LedgerAsOf)`, `ledger_diff(id, from, to)`, `ledger_revisions(id)`, `ledger_verify(id)`, `ledger_head(id)`, `ledger_high_water(id)` and `ledger_pin(id)` (both at once, from one snapshot — what an audit posture pins outside the database). Implies `versioned = true` and **requires `soft_delete`** (a hard DELETE would erase the row the ledger reconstructs); `purge` is not generated, and `#[version_history(sensitive = [...])]` / `no_versioned_record_impl` are compile errors. See "Ledgered entities" below |
 | `retention(after = "30d", basis = created_at)` / `retention(purge_deleted_after = "90d")` (attr) | **(0.7.0)** Declarative data-retention: reach for this instead of hand-writing a `#[scheduled]` cleanup fn for expiring sessions, drafts, one-time codes, or other transient rows. Compiles to a batched (`batch_size`, default 500), cursor-paginated sweep auto-registered with fleet coordination — no `tasks![...]` entry needed. On a `soft_delete` repository, `after` soft-deletes (never re-touching an already-deleted row) and `purge_deleted_after` hard-purges (re-checking `deleted_at` at delete time so a concurrent `restore()` survives); without `soft_delete`, `after` hard-deletes. Sweeps run across **all** tenants on a `tenant_scoped` repository (no per-tenant opt-out) and are not supported on `sharded` repositories (compile error). `autumn retention --dry-run [--model NAME]` reports rows-that-would-be-swept without deleting. Emits `retention_sweep_rows_total` / `retention_sweep_duration_seconds` metrics + a structured log line per run. See `docs/guide/retention-sweeps.md` |
 
 Read routing: with `database.replica_url` set, all generated reads use the
 replica automatically; writes always hit the primary. See
 `docs/guide/repositories.md` and `docs/guide/pagination.md`.
 
-### Ledgered entities — time travel + tamper evidence (0.7.0, issue #1699)
+### Ledgered entities — time travel + tamper evidence (0.8.0, issue #1699)
 
 Reach for this when an entity's *past* is part of the product: regulated
 records, anything an auditor will ask about, anything you may need to undo.
@@ -1629,7 +1629,7 @@ this is *provider-reported* failure.
   the store and `with_mail_suppression_store` above are not:
 
   ```toml
-  autumn-web = { version = "0.7", features = ["mail", "inbound-mail"] }
+  autumn-web = { version = "0.8", features = ["mail", "inbound-mail"] }
   ```
 
   ```rust
@@ -2020,8 +2020,8 @@ reports leftovers as `plugin_residue` — see the doctor skill.
 For local or pluggable file storage:
 
 ```toml
-autumn-web = { version = "0.7", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.7" # when storage.backend = "s3"
+autumn-web = { version = "0.8", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.8" # when storage.backend = "s3"
 ```
 
 ```rust
@@ -2034,7 +2034,7 @@ autumn_web::app().with_blob_store(store).run().await;
 For keyword **and** vector search with an index that stays in sync:
 
 ```toml
-autumn-search = "0.7"
+autumn-search = "0.8"
 ```
 
 ```rust
@@ -2075,8 +2075,8 @@ let hits = search.similar::<Article>("how do I add auth?", 5).await?; // k-NN
 For shared Redis cache:
 
 ```toml
-autumn-web = { version = "0.7", features = ["redis"] }
-autumn-cache-redis = "0.7"
+autumn-web = { version = "0.8", features = ["redis"] }
+autumn-cache-redis = "0.8"
 ```
 
 ```rust
@@ -2617,7 +2617,7 @@ in a `--release` binary with the cargo env unset at runtime. Sample payload:
 ```json
 {
   "app":     { "name": "my_app", "version": "1.4.2" },
-  "autumn":  { "version": "0.7.0", "profile": "prod" },
+  "autumn":  { "version": "0.8.0", "profile": "prod" },
   "runtime": { "uptime": "3h 12m" },
   "build": {
     "version": "1.4.2",
@@ -2910,7 +2910,7 @@ will see the mirror rather than the real client.
 
 See `docs/guide/staged-deploys.md`.
 
-## Sandboxed plugins (0.7.0, issue #1609, feature `plugin-sandbox`)
+## Sandboxed plugins (0.8.0, issue #1609, feature `plugin-sandbox`)
 
 Two plugin lanes now. The native `Plugin` trait is unchanged and full-trust: its
 `build(self, app)` gets the whole `AppBuilder`. A **sandboxed** plugin is the
@@ -3065,7 +3065,7 @@ Guide: `docs/guide/sandboxed-plugins.md`. Trust model: `docs/plugins.md`.
 ## CLI
 
 ```bash
-cargo install autumn-cli --version 0.7.0
+cargo install autumn-cli --version 0.8.0
 
 autumn new my-app
 autumn setup
@@ -3194,7 +3194,7 @@ over-reported; the document carries its own `limits` section, and the biggest
 one is that a call into a helper in another module is not followed. See
 `docs/guide/architecture-graph.md`.
 
-### Upgrading an app across releases — `autumn upgrade` (0.7.0, issues #1629 and #1593)
+### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 
 **Reach for this before hand-editing call sites out of a migration guide, or
 hand-diffing a throwaway `autumn new` project.** One run covers both halves of
@@ -3504,7 +3504,7 @@ shards, `--sample users=500` selects up to 500 rows from each database.
 
 See `docs/guide/data-scrubbing.md`.
 
-### `[retention]` + `autumn db retention` (0.7.0, issue #1605)
+### `[retention]` + `autumn db retention` (0.8.0, issue #1605)
 
 Autumn's *own* tables and stores grow forever by default. `[retention]` in
 `autumn.toml` declares one window per framework-owned dataset and the framework
@@ -3617,7 +3617,7 @@ Pointing the offsite bucket at the app's
 own `[storage.s3]` bucket at the same endpoint needs `allow_shared_bucket = true`. See
 `docs/guide/daemon.md`.
 
-### Continuous SQLite replication + point-in-time restore (0.7.0, issue #1628)
+### Continuous SQLite replication + point-in-time restore (0.8.0, issue #1628)
 
 On the zero-ops **SQLite** tier (#1614), `[replication]` ships the write-ahead
 log to an offsite destination continuously **from inside the running process** —
@@ -3680,7 +3680,7 @@ on `/actuator/health` under the `sqlite-replication` indicator; the indicator go
 Verification is a **real restore** on an interval, not a checksum. See
 `docs/guide/sqlite-in-production.md`.
 
-### Durable jobs and a single-host scheduler on SQLite (0.7.0, issue #1907)
+### Durable jobs and a single-host scheduler on SQLite (0.8.0, issue #1907)
 
 On the **SQLite** tier, `#[job]` work is durable with no Redis and no Postgres.
 `jobs.backend = "sqlite"` puts the queue in an `autumn_jobs` table in the app's
@@ -3986,7 +3986,7 @@ Full API: `skills/autumn-web/references/api-reference.md`; guide:
 ## 0.7.0 release traps
 
 - `AUTUMN_SECURITY__SIGNING_SECRET` is required in `prod` / `production`.
-- Use `autumn-storage-s3 = "0.7"` and `autumn-cache-redis = "0.7"`; these
+- Use `autumn-storage-s3 = "0.8"` and `autumn-cache-redis = "0.8"`; these
   are companion crates, not `autumn-web` feature names.
 - Repository-generated APIs require a policy in production unless
   `security.allow_unauthorized_repository_api = true` is explicit.
@@ -4010,7 +4010,7 @@ Full API: `skills/autumn-web/references/api-reference.md`; guide:
 ## Release and PR workflow
 
 - Base branch is `trunk-dev`, not `trunk`.
-- Release tag for this line is `v0.7.0`.
+- Release tag for this line is `v0.8.0`.
 - Published crates are released together at the same workspace version:
   `autumn-macros`, `autumn-web`, `autumn-cli`, `autumn-admin-plugin`,
   `autumn-storage-s3`, `autumn-cache-redis`, and `autumn-search`.

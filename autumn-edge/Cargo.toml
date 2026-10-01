@@ -24,7 +24,7 @@ categories = ["web-programming", "wasm"]
 # crate's database codegen now lives in the separate `autumn-macros-model` /
 # `autumn-macros-repository` crates, which this crate never depends on — so
 # there is no feature-unification hazard from this edge at all (issue #2309).
-autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
+autumn-macros = { version = "0.8.0", path = "../autumn-macros", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["json", "query"] }
 # Not pinned in `[workspace.dependencies]`; matches the `base64 = "0.22"` line
 # already used by `autumn`, `autumn-cli`, and `examples/todo-app`.

@@ -8,7 +8,7 @@ Liveblocks, no Yjs server, no PartyKit.
 > `presence` (which implies `ws`).
 >
 > ```toml
-> autumn-web = { version = "0.7", features = ["collab", "presence"] }
+> autumn-web = { version = "0.8", features = ["collab", "presence"] }
 > ```
 
 ## Declare the field
@@ -226,7 +226,7 @@ which discards the older write. For a collaborative field that is data loss.
 `offline-sync` Cargo feature alongside `collab`:
 
 ```toml
-autumn-web = { version = "0.7", features = ["collab", "presence", "offline-sync"] }
+autumn-web = { version = "0.8", features = ["collab", "presence", "offline-sync"] }
 ```
 
 

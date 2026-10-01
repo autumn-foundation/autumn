@@ -29,7 +29,7 @@ what `Channels` needs:
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.7", features = ["presence"] }
+autumn-web = { version = "0.8", features = ["presence"] }
 ```
 
 `presence = ["ws"]` in the manifest, so enabling `presence` turns `ws` on for

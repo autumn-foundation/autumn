@@ -45,7 +45,7 @@ from mail they actually need — keep those mailers plain.
 Mailers are behind the non-default `mail` feature:
 
 ```toml
-autumn-web = { version = "0.7", features = ["mail"] }
+autumn-web = { version = "0.8", features = ["mail"] }
 ```
 
 ### 1. Scaffold a list mailer

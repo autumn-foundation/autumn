@@ -12,7 +12,7 @@ keywords = ["web", "media", "streaming", "webrtc", "axum"]
 categories = ["web-programming", "multimedia"]
 
 [dependencies]
-autumn-web = { version = "0.7.0", path = "../autumn" }
+autumn-web = { version = "0.8.0", path = "../autumn" }
 chrono = { workspace = true }
 # Diesel is used ONLY by the optional DB-backed `RoomStore` (rooms_db).
 # Backend selection (postgres / sqlite) is inherited from autumn-web's `db`

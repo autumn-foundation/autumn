@@ -23,7 +23,7 @@ on-screen detail page.
 `Pdf` is behind the non-default `pdf` feature, so enable it first:
 
 ```toml
-autumn-web = { version = "0.7", features = ["maud", "pdf"] }
+autumn-web = { version = "0.8", features = ["maud", "pdf"] }
 ```
 
 ```rust

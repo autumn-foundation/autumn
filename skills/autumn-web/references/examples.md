@@ -75,7 +75,7 @@ Published-user dependency:
 
 ```toml
 [dependencies]
-autumn-web = "0.7"
+autumn-web = "0.8"
 ```
 
 Workspace examples use `autumn-web = { path = "../../autumn" }` plus the root
@@ -189,7 +189,7 @@ async fn main() {
 Feature set:
 
 ```toml
-autumn-web = { version = "0.7", features = ["mail", "ws", "storage", "multipart", "redis"] }
+autumn-web = { version = "0.8", features = ["mail", "ws", "storage", "multipart", "redis"] }
 ```
 
 Keep Harvest out of core web examples. Use built-in jobs for app-local work and
@@ -373,8 +373,8 @@ backend = "postgres"
 Install the first-party admin UI:
 
 ```toml
-autumn-web = { version = "0.7", features = ["db", "flash", "htmx", "maud"] }
-autumn-admin-plugin = "0.7"
+autumn-web = { version = "0.8", features = ["db", "flash", "htmx", "maud"] }
+autumn-admin-plugin = "0.8"
 ```
 
 ```rust
@@ -397,8 +397,8 @@ surfaces.
 ## S3 storage plugin
 
 ```toml
-autumn-web = { version = "0.7", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.7"
+autumn-web = { version = "0.8", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.8"
 ```
 
 ```rust
@@ -613,7 +613,7 @@ identity, so set it before the app ships.
 Enable test support for integration-style app tests:
 
 ```toml
-autumn-web = { version = "0.7", features = ["test-support"] }
+autumn-web = { version = "0.8", features = ["test-support"] }
 ```
 
 Use `TestApp`, `TestClient`, `TestResponse`, and `TestDb` from

@@ -109,7 +109,7 @@ That is also the path to follow when you would rather wire a plugin yourself:
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-admin-plugin = "0.7.0"
+autumn-admin-plugin = "0.8.0"
 ```
 
 ```rust,ignore
@@ -142,9 +142,9 @@ Each listing records:
 ```text
 Listed in the Autumn plugin index:
   autumn-admin-plugin  0.7.0  Out-of-the-box admin panel plugin for autumn-web applications
-      first-party · full trust: native code · stable API · plugin-check pass on autumn-web 0.7.0
+      first-party · full trust: native code · stable API · plugin-check pass on autumn-web 0.8.0
   autumn-plugin-feed   0.3.0  Live feeds  [EXPERIMENTAL API]
-      community · full trust: native code · experimental API: … · plugin-check pass on autumn-web 0.7.0
+      community · full trust: native code · experimental API: … · plugin-check pass on autumn-web 0.8.0
 
 Unlisted (not in the plugin index, not verified):
   autumn-plugin-other  0.1.0  Something  [unlisted: not verified]
@@ -674,8 +674,8 @@ application startup, before anything binds — and **panics** on a range that
 excludes the framework in the build:
 
 ```text
-plugin `autumn-plugin-example 0.6.2` supports autumn-web 0.6, but this application builds against autumn-web 0.7.0.
-  → upgrade the plugin to a release built for autumn-web 0.7.0 (`cargo update -p autumn-plugin-example`), or
+plugin `autumn-plugin-example 0.6.2` supports autumn-web 0.6, but this application builds against autumn-web 0.8.0.
+  → upgrade the plugin to a release built for autumn-web 0.8.0 (`cargo update -p autumn-plugin-example`), or
   → pin the framework the plugin supports: autumn-web = "0.6"
   → or, to boot anyway while you sort it out, set AUTUMN_PLUGIN_CONTRACT=warn
 ```

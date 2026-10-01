@@ -12,7 +12,7 @@ keywords = ["web", "billing", "stripe", "subscriptions", "axum"]
 categories = ["web-programming"]
 
 [dependencies]
-autumn-web = { version = "0.7.0", path = "../autumn" }
+autumn-web = { version = "0.8.0", path = "../autumn" }
 chrono = { workspace = true }
 # Diesel is used ONLY by the optional DB-backed mirror (`store::db`). Backend
 # selection is inherited from autumn-web's `db` feature. This crate never

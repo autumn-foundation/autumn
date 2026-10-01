@@ -259,7 +259,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   be declared `#[translatable]` with **no data migration**; keys are never gated
   on locale-tag shape, so every key an app can write round-trips through the
   column.
-- **(0.7.0)** `#[collaborative]` (issue #1806, needs the `collab` feature) — the column
+- **(0.8.0)** `#[collaborative]` (issue #1806, needs the `collab` feature) — the column
   stores a **text CRDT** instead of a plain string, so two people editing the
   same field merge character by character rather than overwriting each other.
   The field type becomes `autumn_web::collab::CollabText`, a Replicated
@@ -308,7 +308,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   character list, so it suits note-sized and comment-sized fields. See
   [collaboration](../../../docs/guide/collaboration.md) and
   `examples/collab-notes`.
-- **(0.7.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
+- **(0.8.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
   non-null `String` column as **personal data** and carries that classification
   on the *type*, not in a name denylist. The generated field becomes
   `autumn_web::classify::Classified<String, {Model}{Column}Classified>` — a
@@ -349,7 +349,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
-- **(0.7.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
+- **(0.8.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
   marks a column **operator-blind**: the value is sealed on the client under a
   key the server never receives, so the server holds only ciphertext. Unlike
   `#[encrypted]` (operator-held keys, `String` field, transparent plaintext in
@@ -1434,7 +1434,7 @@ csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.7"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.8"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 

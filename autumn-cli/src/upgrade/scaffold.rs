@@ -1708,7 +1708,7 @@ mod tests {
         for (path, contents) in &files {
             write(tmp.path(), path, contents);
         }
-        Manifest::for_files("0.7.0", opts, &files)
+        Manifest::for_files(env!("CARGO_PKG_VERSION"), opts, &files)
             .save(tmp.path())
             .unwrap();
         tmp
@@ -1869,7 +1869,7 @@ mod tests {
     // --- report, apply, rendering ---
 
     fn plan_in(root: &std::path::Path) -> ScaffoldReport {
-        plan(root, "0.7.0")
+        plan(root, env!("CARGO_PKG_VERSION"))
     }
 
     #[test]
@@ -1900,7 +1900,7 @@ mod tests {
 
         let report = plan_in(tmp.path());
         assert_eq!(report.baseline.as_deref(), Some("0.5.0"));
-        assert_eq!(report.target, "0.7.0");
+        assert_eq!(report.target, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -1908,7 +1908,9 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         let report = plan_in(tmp.path());
         assert!(
-            report.guide.contains("docs/migrations/0.7.0.md"),
+            report
+                .guide
+                .contains(&format!("docs/migrations/{}.md", env!("CARGO_PKG_VERSION"))),
             "{}",
             report.guide
         );
@@ -2010,7 +2012,7 @@ mod tests {
 
         let second = plan_in(tmp.path());
         assert!(!second.drifted(), "{}", render_text(&second));
-        assert_eq!(second.baseline.as_deref(), Some("0.7.0"));
+        assert_eq!(second.baseline.as_deref(), Some(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
@@ -2110,7 +2112,7 @@ mod tests {
         manifest.save(tmp.path()).unwrap();
 
         let value = json(&plan_in(tmp.path()));
-        assert_eq!(value["target"], "0.7.0");
+        assert_eq!(value["target"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["drift"], true);
         let files = value["files"].as_array().unwrap();
         let entry = files
@@ -3003,7 +3005,7 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         assert_eq!(
             Manifest::load(tmp.path()).unwrap().written_by.as_deref(),
-            Some("0.7.0")
+            Some(env!("CARGO_PKG_VERSION"))
         );
     }
 
@@ -3020,7 +3022,7 @@ mod tests {
             fs::write(
                 tmp.path().join(MANIFEST_PATH),
                 text.replace(
-                    &format!("{field} = \"0.7.0\""),
+                    &format!("{field} = \"{}\"", env!("CARGO_PKG_VERSION")),
                     &format!("{field} = \"not-a-version\""),
                 ),
             )
