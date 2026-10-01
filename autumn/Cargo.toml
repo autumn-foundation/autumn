@@ -585,6 +585,13 @@ harness = false
 name = "form_render"
 harness = false
 
+# Query-string decode workload for profilers: realistic list-page query strings
+# (flat paging, faceted nested filter, percent-encoded search) through
+# `query_string::from_query_str`. Asserts nothing — see the file header.
+[[bench]]
+name = "query_string_decode"
+harness = false
+
 # Atom feed rendering workload for profilers: drives `Feed::render` over a
 # realistic 30-entry blog feed (the same `Feed::atom(...).entries(...)` shape
 # `examples/blog`'s `feed_xml` handler builds) so the private `escape`
