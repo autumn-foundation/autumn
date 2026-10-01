@@ -112,7 +112,7 @@ gh attestation verify autumn-x86_64-unknown-linux-musl.tar.gz \
 Run the gate locally before tagging:
 
 ```bash
-RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh
+RELEASE_TAG=v0.8.0 ./scripts/check-sbom.sh
 ```
 
 ### Dependency advisories
@@ -303,7 +303,7 @@ are actually there. It is therefore a **post-publish, pre-announce** gate:
 - [ ] After `cargo publish` completes for the release candidate, trigger the
   `Quickstart Gate` workflow manually (Actions → Quickstart Gate → *Run
   workflow*) with the `cli-version` input set to the candidate version
-  (e.g. `0.7.0`), or via the CLI:
+  (e.g. `0.8.0`), or via the CLI:
 
   ```bash
   gh workflow run quickstart-gate.yml -f cli-version=X.Y.Z
@@ -517,8 +517,8 @@ Before pushing the release tag:
    ```
 8. **Tag and push:**
    ```bash
-   git tag v0.7.0
-   git push origin v0.7.0
+   git tag v0.8.0
+   git push origin v0.8.0
    ```
    The `publish-gate` workflow runs automatically. The `release` workflow runs
    only after `publish-gate` succeeds.

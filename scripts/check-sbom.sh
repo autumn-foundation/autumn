@@ -25,7 +25,7 @@
 # Called from the `publish-gate` workflow. Run locally with:
 #
 #     ./scripts/check-sbom.sh
-#     RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh
+#     RELEASE_TAG=v0.8.0 ./scripts/check-sbom.sh
 
 set -euo pipefail
 
