@@ -482,6 +482,12 @@ Before pushing the release tag:
 1. **Bump the workspace version** in `Cargo.toml` under `[workspace.package]`.
 2. **Update internal version pins** for inter-crate dependencies
    (e.g. `autumn-web = { version = "X.Y.Z", path = "../autumn" }`).
+   Also bump any hard-coded plugin compatibility range that boots against the
+   workspace: `.autumn_web("X.Y")` in `examples/` (e.g.
+   `examples/react-graphql/src/graphql_plugin.rs`). A stale range makes the
+   plugin-contract check refuse to start the example, and the *Example fleet
+   e2e gate* fails. Plugins in this repo that release in lockstep use
+   `lockstep_contract(..)` and need nothing.
 3. **Fold the changelog fragments in** — `./scripts/update-changelog.sh`
    merges every `changelog.d/` file into `## [Unreleased]` under the kind it
    declares, then deletes the files. Read the result: it is the release note

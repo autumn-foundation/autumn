@@ -203,7 +203,7 @@ where
         Some(
             PluginContract::new(PLUGIN_NAME)
                 .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web("0.7"),
+                .autumn_web("0.8"),
         )
     }
 
