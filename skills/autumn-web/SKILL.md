@@ -290,7 +290,7 @@ builds — `flavor` (`"multi_thread"`, the default, or `"current_thread"`),
 `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`,
 `thread_keep_alive = "30s"`, and `configure = path::to::fn`, a
 `fn(&mut tokio::runtime::Builder)` run after the others as the escape hatch for
-`Builder` methods the list doesn't name (unreleased). Numeric arguments take
+`Builder` methods the list doesn't name (0.8.0). Numeric arguments take
 expressions, not only literals. Reach for them only with a measurement in hand:
 with no arguments the runtime is tokio's defaults, and the job runner,
 scheduled tasks, and mailer share it, so an undersized worker count throttles
@@ -373,7 +373,7 @@ Route functions are collected with `routes![...]`. Static routes also need
 `static_routes![...]` so `autumn build` can pre-render them.
 
 **Declare the `Content-Type` on a `#[static_get]` route that is not HTML
-(unreleased, #1832).** `autumn build` records the type each handler's response
+(0.8.0, #1832).** `autumn build` records the type each handler's response
 declares into `dist/manifest.json`, and the static-first middleware serves that
 value verbatim — it no longer guesses from the route slug, which it had to do
 because every non-root route is stored as `<route>/index.html`. So the handler's
@@ -1153,7 +1153,7 @@ db.tx_with(opts, |conn| async move { /* &mut AsyncPgConnection */ }.scope_boxed(
 ```
 
 On SQLite, a write-heavy closure (read-modify-write, queue claims, outbox
-inserts) should use `Db::tx_immediate(f)` (unreleased, #2885): it begins
+inserts) should use `Db::tx_immediate(f)` (0.8.0, #2885): it begins
 `BEGIN IMMEDIATE`, so a concurrent writer on a file database waits on
 `busy_timeout` instead of failing with `SQLITE_BUSY_SNAPSHOT`. On a
 `cache=shared` target it only stops writers from all reading before they
@@ -1163,7 +1163,7 @@ guaranteed winner), so retry with backoff — or use a WAL-mode file database.
 `TxOptions::default()` is identical to `Db::tx`. See
 `docs/guide/transactions.md` and `docs/guide/hooks-and-transactions.md`.
 
-## Money and the double-entry ledger (unreleased, issue #1837)
+## Money and the double-entry ledger (0.8.0, issue #1837)
 
 Do **not** hand-roll a money type or a ledger. `autumn_web::money` has both.
 Not to be confused with `autumn_web::ledger` (`ledgered = true` above), which
@@ -1306,7 +1306,7 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
 
-### Admin impersonation (unreleased, issue #1394)
+### Admin impersonation (0.8.0, issue #1394)
 
 "Log in as this user" without breaking the audit trail. Never hand-roll it
 with `session.insert("user_id", target)` — that makes every subsequent version
@@ -1395,7 +1395,7 @@ recorded as `"system"` — the `_autumn_version_history.actor` column is `NOT NU
 DEFAULT 'system'` and the generated code falls back to `VersionEntry::SYSTEM_ACTOR`
 (#1383). See `docs/guide/version-history.md`.
 
-### Authenticated `#[edge]` routes — host-resolved identity (unreleased, feature `edge`)
+### Authenticated `#[edge]` routes — host-resolved identity (0.8.0, feature `edge`)
 
 An `#[edge]` capsule never sees cookies, session ids, signing keys or store
 credentials. The **host** resolves identity before the capsule runs and passes
@@ -1849,7 +1849,7 @@ that already gates migrations, `#[scheduled]` leader election, and ISR.
 See `docs/guide/distributed-locks.md` and
 `docs/adr/0010-app-facing-distributed-lock.md`.
 
-## Postgres-only subsystems on a SQLite app (unreleased, issue #1905)
+## Postgres-only subsystems on a SQLite app (0.8.0, issue #1905)
 
 Some subsystems are Postgres-only by construction: they open a
 `diesel::PgConnection` and issue `pg_notify` / `pg_advisory_xact_lock` / `jsonb`
@@ -1871,7 +1871,7 @@ backend-conditionally rather than assuming Postgres.
 `docs/guide/sqlite-in-production.md` carries a support-matrix row per
 subsystem; `docs/guide/feature-flags.md` shows the branching shape.
 
-## The plugin API stability contract (unreleased, issue #1601)
+## The plugin API stability contract (0.8.0, issue #1601)
 
 **When advising a plugin author, start here.** Autumn declares which
 plugin-facing APIs are stable and which are experimental, and a plugin declares
@@ -1929,7 +1929,7 @@ Three things to know before advising on it:
   `scripts/check-plugin-surface.sh` fails on it, and on a `docs/plugins.md`
   table that has drifted from the registry.
 
-## Installing a plugin — `autumn plugin add` (unreleased, issue #1606)
+## Installing a plugin — `autumn plugin add` (0.8.0, issue #1606)
 
 **Reach for this instead of hand-editing `Cargo.toml` and the builder chain.**
 One command adds the dependency at a version compatible with the app's
@@ -1983,7 +1983,7 @@ plugin crate already carries the features its mount needs and Cargo unifies
 them. `autumn plugin-check` is the separate, author-facing conformance gate;
 `autumn generate plugin` scaffolds a new plugin crate.
 
-## Removing a plugin, and installing one on day zero (unreleased, issue #1631)
+## Removing a plugin, and installing one on day zero (0.8.0, issue #1631)
 
 The lifecycle runs both ways, and a plugin can be wired at scaffold time:
 
@@ -2194,7 +2194,7 @@ decode the flat submission back into parent + children with
 `decode_nested_urlencoded`, so the parent and its children validate and persist
 as one transaction.
 
-## Service-to-service wire contracts (unreleased, issue #1755)
+## Service-to-service wire contracts (0.8.0, issue #1755)
 
 Don't hand-write an HTTP client to call another Autumn service in the same
 workspace, and don't keep a schema alongside it. The callee's handler
@@ -2487,7 +2487,7 @@ discord_severities = "all"
 
 (issue #1630). See `docs/guide/operator-alerts.md`.
 
-## Supply chain — SBOM + provenance (unreleased, issue #1615)
+## Supply chain — SBOM + provenance (0.8.0, issue #1615)
 
 Every autumn release asset carries a CycloneDX SBOM and a keyless SLSA
 build-provenance attestation, and `autumn release init` makes the same posture
@@ -2512,7 +2512,7 @@ build?", "where did this binary come from?", or for compliance/audit evidence.
 See `docs/guide/supply-chain.md` for the end-to-end walkthrough, including the
 negative case (tamper with a byte, watch verification fail).
 
-## Dependency advisories — the audit gate (unreleased, issue #1600)
+## Dependency advisories — the audit gate (gate since 0.6.0, on by default for scaffolds since 0.8.0, issue #1600)
 
 Every app `autumn new` generates audits its whole dependency tree on each push
 and pull request: the scaffolded `.github/workflows/ci.yml` installs a pinned
@@ -3143,11 +3143,11 @@ autumn release init --target aws-ecs             # Production AWS path: main.tf/
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
 autumn migrate new add_widget_archived_at   # collision-free migration dir: prefer this (or `generate migration`) over hand-creating one — see "Migration version collisions" below
 autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
-autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (unreleased, issue #1615)
+autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (0.8.0, issue #1615)
 autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
 autumn sbom --verify sbom.cdx.json --expect-version 0.8.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
 autumn sbom --binary /usr/local/bin/my-app         # crate versions compiled INTO a binary (cargo-auditable `.dep-v0`; ELF/Mach-O/PE) — no source tree, no lockfile
-autumn build --auditable         # compile through `cargo auditable` so the binary carries its own dependency list (the generated release Dockerfile passes this) (unreleased, issue #1615)
+autumn build --auditable         # compile through `cargo auditable` so the binary carries its own dependency list (the generated release Dockerfile passes this) (0.8.0, issue #1615)
 autumn upgrade                   # preview BOTH halves as per-file diffs, writing nothing: each release's mechanical app-code migrations (renames), and drift between the project's framework-owned files and this release's scaffold (#1629, #1593)
 autumn upgrade --apply           # take them; --from/--to override the codemod range, --list-migrations shows what ships
 autumn upgrade --check           # scaffold files only, writes nothing, exit 3 on drift — the CI gate for scaffold freshness (#1593)
@@ -3350,7 +3350,7 @@ legacy migrations applied before the checksum feature existed; use
 `autumn migrate baseline --force <version>` only when a deliberate edit
 is intended and the fork risk is accepted.
 
-### Migration version collisions (unreleased — trunk-dev)
+### Migration version collisions (0.8.0)
 
 Diesel records applied migrations **by version** (the leading
 `YYYYMMDDHHMMSS` directory prefix). If two differently-named migrations
@@ -3382,7 +3382,7 @@ collision; only a narrow ambiguous-history case on `SQLite` (adopting a
 pre-fork database whose applied history can't be safely rewritten) is
 rejected as a hard error.
 
-### `autumn test` — isolated test DB (unreleased — trunk-dev, issue #1056)
+### `autumn test` — isolated test DB (0.6.0, issue #1056)
 
 `autumn test` resolves the test DB URL with the same precedence as
 `autumn migrate` (`AUTUMN_DATABASE__PRIMARY_URL` → `AUTUMN_DATABASE__URL` →
@@ -3856,7 +3856,7 @@ URL that calls it. Tell users that customizing a port means updating its base
 URL — a mismatch blocks the deploy when the base addresses loopback, a proxied
 or CDN-fronted base is skipped (its public port is its own), and an unset base
 only warns, because the app may take it from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`
-(unreleased, issue #1974). `deploy up` creates the config parent and
+(Rooms since 0.6.0, this preflight 0.8.0, issue #1974). `deploy up` creates the config parent and
 `recordings_dir` (mode `0750`); an absent recordings dir under a writable parent
 passes, so a fresh host is not blocked. Installing the `mediamtx` binary stays a
 host-bootstrap step the deploy only preflights. Mesh rooms hold a seat by
