@@ -2003,19 +2003,55 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
             {
                 // Add to existing features list.
                 let list_start = feat_bracket + "features = [".len();
-                let list_end = find_unquoted(&trimmed[list_start..], ']').unwrap() + list_start;
-                let existing = trimmed[list_start..list_end].trim();
-                let new_list = if existing.is_empty() {
-                    FEATURE.to_owned()
+                if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
+                    let list_end = close_bracket + list_start;
+                    let existing = trimmed[list_start..list_end].trim();
+                    let new_list = if existing.is_empty() {
+                        FEATURE.to_owned()
+                    } else {
+                        format!("{existing}, {FEATURE}")
+                    };
+                    lines[i] = format!(
+                        "{indent}{}{}{}",
+                        &trimmed[..list_start],
+                        new_list,
+                        &trimmed[list_end..]
+                    );
                 } else {
-                    format!("{existing}, {FEATURE}")
-                };
-                lines[i] = format!(
-                    "{indent}{}{}{}",
-                    &trimmed[..list_start],
-                    new_list,
-                    &trimmed[list_end..]
-                );
+                    // Multiline `features = [` … `]` array inside the
+                    // inline-table form (legal TOML since 1.0, and the
+                    // subtable branch below already handles its own version
+                    // of this): scan forward for the line holding the actual
+                    // closing `]` and append there instead of indexing past
+                    // the end of this line — missed-fix #3 (#2753):
+                    // `oauth2`/`webauthn` already scan ahead here; `mail`
+                    // used to `.unwrap()` the same-line search and panic.
+                    let mut j = i + 1;
+                    while j < lines.len() {
+                        let tj = lines[j].trim();
+                        if tj.starts_with('[') {
+                            break;
+                        }
+                        if let Some(close_idx) = find_unquoted(strip_line_comment(tj), ']') {
+                            let before_close = tj[..close_idx].trim();
+                            let sep = if before_close.is_empty() || before_close.ends_with(',') {
+                                ""
+                            } else {
+                                ", "
+                            };
+                            let indent_j: String = lines[j]
+                                .chars()
+                                .take_while(char::is_ascii_whitespace)
+                                .collect();
+                            lines[j] = format!(
+                                "{indent_j}{before_close}{sep}{FEATURE}{}",
+                                &tj[close_idx..]
+                            );
+                            break;
+                        }
+                        j += 1;
+                    }
+                }
             } else {
                 // No features key — insert before closing `}`.
                 let close = trimmed.rfind('}').unwrap();
@@ -16266,6 +16302,59 @@ mod tests {
             out.matches("\"oauth2\"").count(),
             2,
             "oauth2 must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+    }
+
+    // #2753 missed-fix #3: a multiline `features = [` array inside the
+    // *inline-table* form (`autumn-web = { ..., features = [\n ... \n] }`,
+    // legal TOML since 1.0) was only handled by two of the three autumn-web
+    // copies. `oauth2`/`webauthn` already scanned forward for the real
+    // closing `]`; `mail` indexed the same-line search result with `.unwrap()`
+    // and panicked on this exact input instead of silently no-op'ing like
+    // missed-fix #1/#2 — a worse failure mode (CLI crash, not silent no-op).
+    #[test]
+    fn ensure_autumn_web_mail_feature_merges_multiline_inline_table_array() {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"mail\""),
+            "multiline inline-table features must be merged: {out}"
+        );
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_merges_multiline_inline_table_array() {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"webauthn\""),
+            "multiline inline-table features must be merged: {out}"
+        );
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            1,
+            "webauthn duplicated: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_merges_multiline_inline_table_array() {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"oauth2\""),
+            "multiline inline-table features must be merged: {out}"
+        );
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            1,
+            "oauth2 duplicated: {out}"
         );
     }
 
