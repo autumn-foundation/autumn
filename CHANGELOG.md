@@ -3090,7 +3090,7 @@ For a narrative tour of this release, see the
 
   ```rust
   fn contract(&self) -> Option<PluginContract> {
-      Some(PluginContract::new(env!("CARGO_PKG_NAME")).autumn_web("0.7"))
+      Some(PluginContract::new(env!("CARGO_PKG_NAME")).autumn_web("0.8"))
   }
   ```
 

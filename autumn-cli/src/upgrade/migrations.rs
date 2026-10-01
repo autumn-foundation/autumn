@@ -515,6 +515,14 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.8.0.md#plugin-authors",
         rewrite: Rewrite::GuideOnly,
     },
+    AppMigration {
+        id: "0.8.0-validator-0-21",
+        version: "0.8.0",
+        title: "`#[derive(Validate)]` needs `validator = \"0.21\"` in the app's own manifest",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#upstream-dependency-updates",
+        rewrite: Rewrite::GuideOnly,
+    },
 ];
 
 /// The full registry.
