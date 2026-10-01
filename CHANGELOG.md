@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Require a fresh, registration-specific DNS TXT proof before custom-domain
+  certificate issuance, preventing another tenant from claiming a dangling
+  hostname that still points at the shared ingress.
+
 ### Added
 
 - **`cms` built-in starter and `examples/cms`: a WordPress-core-parity content

@@ -49,6 +49,23 @@ impl DomainVerifier for TableVerifier {
                 .unwrap_or(ObservedTarget::None)
         })
     }
+
+    fn confirms_ownership<'a>(
+        &'a self,
+        _hostname: &'a str,
+        _token: &'a str,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+}
+
+#[derive(Debug)]
+struct MissingOwnershipVerifier;
+
+impl DomainVerifier for MissingOwnershipVerifier {
+    fn observe<'a>(&'a self, _hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+        Box::pin(async { points_here() })
+    }
 }
 
 /// An issuer that records every hostname it was asked about and fails for the
@@ -286,6 +303,28 @@ async fn a_domain_pointing_elsewhere_is_never_ordered() {
         0,
         "zero ACME orders for an unverified domain"
     );
+}
+
+#[tokio::test]
+async fn a_dangling_domain_at_the_ingress_without_the_fresh_txt_proof_is_not_issued() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(MissingOwnershipVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    let registered = h
+        .registry
+        .register("dangling.clientco.com", "tenant-attacker", NOW)
+        .await
+        .unwrap();
+    assert_eq!(registered.ownership_token.len(), 64);
+
+    h.task.tick(NOW).await;
+
+    let record = h.registry.get("dangling.clientco.com").unwrap();
+    assert_eq!(record.status, DomainStatus::PendingDns);
+    assert!(record.failure_reason.unwrap().contains("ownership token"));
+    assert_eq!(issuer.count(), 0);
 }
 
 #[tokio::test]

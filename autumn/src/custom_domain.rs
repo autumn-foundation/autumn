@@ -43,6 +43,8 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+const OWNERSHIP_LABEL: &str = "_autumn-domain";
+
 /// Boxed future returned by the async [`CustomDomainStore`] methods.
 pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -419,6 +421,10 @@ pub struct CustomDomain {
     pub hostname: String,
     /// The tenant id requests on this hostname resolve to.
     pub tenant: String,
+    /// Fresh proof bound to this registration. The tenant must publish it at
+    /// `_autumn-domain.<hostname>` before Autumn will issue a certificate.
+    #[serde(default)]
+    pub ownership_token: String,
     /// Current lifecycle state.
     pub status: DomainStatus,
     /// Why the domain is stuck, if it is. Cleared on the next success.
@@ -440,10 +446,11 @@ pub struct CustomDomain {
 impl CustomDomain {
     /// A freshly registered domain, awaiting DNS.
     #[must_use]
-    const fn new(hostname: String, tenant: String, now_unix: i64) -> Self {
+    const fn new(hostname: String, tenant: String, now_unix: i64, ownership_token: String) -> Self {
         Self {
             hostname,
             tenant,
+            ownership_token,
             status: DomainStatus::PendingDns,
             failure_reason: None,
             registered_at_unix: now_unix,
@@ -453,6 +460,15 @@ impl CustomDomain {
             consecutive_failures: 0,
             next_attempt_unix: None,
         }
+    }
+
+    /// The TXT record which proves control of this registration.
+    #[must_use]
+    pub fn ownership_dns_instruction(&self) -> (String, String) {
+        (
+            format!("{OWNERSHIP_LABEL}.{}", self.hostname),
+            self.ownership_token.clone(),
+        )
     }
 
     /// May this domain be worked on at `now_unix`, or is it still in backoff?
@@ -914,7 +930,16 @@ impl CustomDomainRegistry {
                     max: self.max_domains,
                 });
             }
-            let record = CustomDomain::new(host.clone(), tenant.to_owned(), now_unix);
+            let mut token = [0_u8; 32];
+            getrandom::getrandom(&mut token).map_err(|e| {
+                RegisterError::Store(format!("could not generate domain ownership token: {e}"))
+            })?;
+            let record = CustomDomain::new(
+                host.clone(),
+                tenant.to_owned(),
+                now_unix,
+                hex::encode(token),
+            );
             index.insert(host.clone(), record.clone());
             record
         };
@@ -1669,6 +1694,18 @@ pub trait DomainIssuer: Send + Sync {
 pub trait DomainVerifier: Send + Sync {
     /// Observe `hostname`'s current DNS target.
     fn observe<'a>(&'a self, hostname: &'a str) -> futures::future::BoxFuture<'a, ObservedTarget>;
+
+    /// Confirm the registration-specific TXT proof. Implementations must fail
+    /// closed: ingress reachability alone does not prove which tenant controls
+    /// a dangling hostname.
+    #[cfg(feature = "acme")]
+    fn confirms_ownership<'a>(
+        &'a self,
+        _hostname: &'a str,
+        _token: &'a str,
+    ) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
 }
 
 /// A [`DomainVerifier`] backed by the system resolver.
@@ -1696,6 +1733,33 @@ impl DomainVerifier for SystemDomainVerifier {
                 Ok(Ok(addrs)) if !addrs.is_empty() => ObservedTarget::Addresses(addrs),
                 _ => ObservedTarget::None,
             }
+        })
+    }
+
+    #[cfg(feature = "acme")]
+    fn confirms_ownership<'a>(
+        &'a self,
+        hostname: &'a str,
+        token: &'a str,
+    ) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let name = format!("{OWNERSHIP_LABEL}.{hostname}");
+            let token = token.to_owned();
+            tokio::task::spawn_blocking(move || {
+                ["1.1.1.1:53", "8.8.8.8:53"].iter().any(|resolver| {
+                    let Ok(resolver) = resolver.parse() else {
+                        return false;
+                    };
+                    crate::acme::dns::resolver::lookup_txt_blocking(
+                        resolver,
+                        &name,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .is_ok_and(|answer| answer.values.iter().any(|value| value == &token))
+                })
+            })
+            .await
+            .unwrap_or(false)
         })
     }
 }
@@ -2174,7 +2238,12 @@ mod tests {
     async fn the_filesystem_store_round_trips_and_deletes() {
         let dir = tempfile::tempdir().unwrap();
         let store = FsCustomDomainStore::new(dir.path());
-        let domain = CustomDomain::new("app.clientco.com".to_owned(), "t1".to_owned(), 100);
+        let domain = CustomDomain::new(
+            "app.clientco.com".to_owned(),
+            "t1".to_owned(),
+            100,
+            "proof".to_owned(),
+        );
         store.save(&domain).await.unwrap();
 
         let loaded = store.load_all().await.unwrap();

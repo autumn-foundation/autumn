@@ -1626,8 +1626,11 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 The app drives the journey through
 `autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
 `register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
-renders the exact record to show the tenant, and `list_for_tenant` renders
-status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+renders the ingress record, and `domain.ownership_dns_instruction()` returns
+the registration-specific TXT record the tenant must also publish. The proof
+changes after offboarding and re-registration, so dangling ingress DNS cannot
+be claimed by a different tenant. `list_for_tenant` renders status. States are
+`pending_dns` → `verified` → `issuing` → `active`; a stuck
 domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
 active and serving.
 
@@ -1638,9 +1641,10 @@ routing, but the certificate and its private key stay in the ACME store until a
 `[retention] custom_domains` window prunes them, which is unset by default.
 `CustomDomainPruner` does both.
 
-Three gates stand between a tenant-supplied hostname and an ACME order: the app
-registered it, DNS independently resolves to this deployment, and the budget has
-headroom. An SNI hostname nobody registered is refused at the handshake without
+Four gates stand between a tenant-supplied hostname and an ACME order: the app
+registered it, its fresh ownership TXT proof is visible, DNS independently
+resolves to this deployment, and the budget has headroom. An SNI hostname nobody
+registered is refused at the handshake without
 contacting the CA. A hostname the deployment already owns (under
 `[server.tls.acme] domains` or `[tenancy] base_domain`) is refused at
 registration, so a tenant cannot claim another tenant's subdomain.

@@ -354,6 +354,33 @@ impl CustomDomainTask {
 
     /// Check where one hostname points and record the result.
     async fn verify_one(&self, hostname: &str, now_unix: i64) {
+        let Some(domain) = self.registry.get(hostname) else {
+            return;
+        };
+        if domain.ownership_token.is_empty()
+            || !self
+                .verifier
+                .confirms_ownership(hostname, &domain.ownership_token)
+                .await
+        {
+            let failures = domain.consecutive_failures;
+            let backoff = i64::try_from(self.limiter.backoff_for(failures.saturating_add(1)))
+                .unwrap_or(i64::MAX);
+            let outcome = crate::custom_domain::VerificationOutcome::PointsElsewhere {
+                detail: format!(
+                    "TXT _autumn-domain.{hostname} does not contain this registration's ownership token"
+                ),
+            };
+            if let Err(e) =
+                apply_verification(&self.registry, hostname, &outcome, now_unix, backoff).await
+            {
+                tracing::warn!(
+                    hostname,
+                    "failed to persist custom-domain ownership check: {e}"
+                );
+            }
+            return;
+        }
         let observed = self.verifier.observe(hostname).await;
         let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
         let failures = self

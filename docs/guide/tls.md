@@ -767,6 +767,12 @@ let ingress = config.server.tls.as_ref()
 // 1. Connect. Your app decides who may — plan, entitlement, per-tenant quota.
 let domain = registry.register("app.clientco.com", &tenant_id, now_unix).await?;
 
+// Prove this tenant controls this registration. The value is freshly generated
+// on every new registration, so DNS left pointing here by a former tenant is
+// not sufficient.
+let (proof_name, proof_value) = domain.ownership_dns_instruction();
+println!("{proof_name}\tTXT\t{proof_value}");
+
 // 2. Show the tenant exactly what to publish. Fields are tab-separated.
 let instructions = DnsInstructions::for_hostname(&domain.hostname, &ingress)?;
 println!("{}", instructions.render());   // app.clientco.com\tCNAME\tingress.myapp.com
