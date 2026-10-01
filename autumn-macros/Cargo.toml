@@ -24,7 +24,7 @@ default = ["db"]
 # crate cannot give those paths back. A direct dependant that names
 # `autumn_macros::model` must depend on the shard crate, or better, on
 # `autumn-web`, whose paths did not change. See
-# `docs/migrations/next.md`. `autumn-web` takes this crate with
+# `docs/migrations/0.8.0.md`. `autumn-web` takes this crate with
 # `default-features = false` and pulls the shards in itself, so a no-database
 # app never compiles the database codegen at all.
 db = []
