@@ -12,7 +12,10 @@ earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries pred
 
 | Crate | Directory | Notes |
 |---|---|---|
-| `autumn-macros` | `autumn-macros/` | Proc macros; publish first |
+| `autumn-macros-support` | `autumn-macros-support/` | Shared codegen helpers; no Autumn runtime deps, every macro crate pins it, so publish first |
+| `autumn-macros` | `autumn-macros/` | Core proc macros (routes, handlers, edge); depends on `autumn-macros-support` |
+| `autumn-macros-model` | `autumn-macros-model/` | `#[model]` / `#[commentable]` codegen; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
+| `autumn-macros-repository` | `autumn-macros-repository/` | `#[repository]` / `#[service]` codegen; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
 | `autumn-schema-core` | `autumn-schema-core/` | Schema primitives shared by the CLI; no Autumn runtime deps |
 | `autumn-edge` | `autumn-edge/` | Edge/WASM capsule runtime; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
 | `autumn-web` | `autumn/` | Main framework crate; import path `autumn_web` |
