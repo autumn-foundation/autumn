@@ -507,6 +507,14 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.8.0.md#acme-acmerenewaltask-gains-dns-and-recovery-acmeconfig-gains-dns",
         rewrite: Rewrite::GuideOnly,
     },
+    AppMigration {
+        id: "0.8.0-plugin-conformance-config-non-exhaustive",
+        version: "0.8.0",
+        title: "`plugin_conformance::ConformanceConfig` is `#[non_exhaustive]`; build it with its constructors",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#plugin-authors",
+        rewrite: Rewrite::GuideOnly,
+    },
 ];
 
 /// The full registry.
