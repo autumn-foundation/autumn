@@ -1584,17 +1584,28 @@ impl AppBuilder {
         mut self,
         routes: impl IntoIterator<Item = crate::route_listing::RouteInfo>,
     ) -> Self {
-        let source = self
-            .current_plugin
-            .as_deref()
-            .map_or(crate::route_listing::RouteSource::User, |name| {
-                crate::route_listing::RouteSource::Plugin(name.to_owned())
-            });
+        let source = self.current_route_source();
         for mut route in routes {
             route.source = source.clone();
+            // The asset-bundle marker is the framework's to set: only routes
+            // `plugin_assets` generated may carry it, because the conformance
+            // checks exempt a route that does.
+            route
+                .middleware
+                .retain(|label| label != crate::assets::PLUGIN_ASSETS_ROUTE_MARKER);
             self.declared_routes.push(route);
         }
         self
+    }
+
+    /// The `RouteSource` a route declared right now is attributed to: the
+    /// plugin whose `build` is running, or the user.
+    fn current_route_source(&self) -> crate::route_listing::RouteSource {
+        self.current_plugin
+            .as_deref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.to_owned())
+            })
     }
 
     /// Serve a [`PluginAssets`](crate::assets::PluginAssets) bundle: files
@@ -1651,9 +1662,15 @@ impl AppBuilder {
             );
             return self;
         }
+        // Declared directly rather than through `declare_plugin_routes`, which
+        // strips the asset-bundle marker these routes carry.
+        let source = self.current_route_source();
+        for mut route in assets.route_infos() {
+            route.source = source.clone();
+            self.declared_routes.push(route);
+        }
         let mount = assets.mount_path();
         self.nest(&mount, assets.nested_router())
-            .declare_plugin_routes(assets.route_infos())
     }
 
     /// The route manifest this builder would dump for `autumn routes` —

@@ -139,6 +139,11 @@ fn bundle_routes_are_declared_as_public_plugin_routes() {
         assert_eq!(info.method, "GET");
         assert_eq!(info.classification, RouteClassification::Public);
         assert_eq!(
+            info.middleware,
+            [autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER],
+            "bundle routes carry the asset marker the conformance checks look for"
+        );
+        assert_eq!(
             info.source,
             RouteSource::Plugin("it-charts-plugin".to_owned())
         );
@@ -240,4 +245,37 @@ fn a_non_get_route_declared_at_a_bundle_path_is_still_refused() {
 fn another_app_in_the_process_cannot_reuse_a_namespace() {
     let _first = autumn_web::app().plugin(ChartsPlugin);
     let _second = autumn_web::app().plugin(ImpostorPlugin);
+}
+
+/// The asset marker exempts a route from `autumn plugin-check`'s prefix and
+/// sensitive-name checks, so only `AppBuilder::plugin_assets` may set it: a
+/// plugin that declares a route carrying it has the label stripped.
+#[test]
+fn declare_plugin_routes_strips_a_forged_asset_marker() {
+    struct ForgingPlugin;
+    impl Plugin for ForgingPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "it-forging".into()
+        }
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            app.declare_plugin_routes(vec![autumn_web::route_listing::RouteInfo {
+                method: "GET".to_owned(),
+                path: "/static/_plugins/it-forging/admin".to_owned(),
+                middleware: vec![
+                    autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER.to_owned(),
+                    "secured".to_owned(),
+                ],
+                ..Default::default()
+            }])
+        }
+    }
+    let infos = autumn_web::app()
+        .plugin(ForgingPlugin)
+        .plugin_route_infos()
+        .expect("route infos");
+    let forged = infos
+        .iter()
+        .find(|info| info.path == "/static/_plugins/it-forging/admin")
+        .expect("declared route is listed");
+    assert_eq!(forged.middleware, ["secured"]);
 }

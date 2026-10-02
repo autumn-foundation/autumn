@@ -54,6 +54,15 @@ pub const PLUGIN_ASSETS_PREFIX: &str = "/static/_plugins";
 /// the cache-control policy.
 const PLUGIN_ASSETS_REL_PREFIX: &str = "_plugins/";
 
+/// The `middleware` label on every route a bundle declares for the listing.
+///
+/// Only [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets)
+/// can attach it: `declare_plugin_routes` strips it from anything a plugin
+/// declares. `autumn plugin-check` exempts a route under `/static/_plugins/`
+/// from its prefix and sensitive-name checks only when it carries this label,
+/// so a hand-declared route at such a path gets no free pass.
+pub const PLUGIN_ASSETS_ROUTE_MARKER: &str = "plugin-assets";
+
 /// `Cache-Control` for a fingerprinted URL. Its bytes can never change.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
@@ -407,6 +416,7 @@ impl PluginAssets {
                 method: "GET".to_owned(),
                 path,
                 handler: format!("{}::assets", self.namespace),
+                middleware: vec![PLUGIN_ASSETS_ROUTE_MARKER.to_owned()],
                 classification: crate::route_listing::RouteClassification::Public,
                 ..Default::default()
             })

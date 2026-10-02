@@ -39,7 +39,7 @@ use std::sync::RwLock;
 
 pub mod plugin;
 
-pub use plugin::{PLUGIN_ASSETS_PREFIX, PluginAsset, PluginAssets};
+pub use plugin::{PLUGIN_ASSETS_PREFIX, PLUGIN_ASSETS_ROUTE_MARKER, PluginAsset, PluginAssets};
 
 /// Filename of the fingerprint manifest within the `static/` tree.
 #[cfg(any(not(debug_assertions), feature = "embed-assets"))]

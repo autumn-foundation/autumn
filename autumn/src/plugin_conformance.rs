@@ -320,18 +320,25 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 }
 
 /// `true` for a file of the plugin's own
-/// [`PluginAssets`](crate::assets::PluginAssets) bundle, served under
-/// `/static/_plugins/<namespace>/`.
+/// [`PluginAssets`](crate::assets::PluginAssets) bundle: a route under
+/// `/static/_plugins/` that carries the
+/// [`PLUGIN_ASSETS_ROUTE_MARKER`](crate::assets::PLUGIN_ASSETS_ROUTE_MARKER).
 ///
 /// The framework mounts those, not the plugin's router: they live outside the
 /// plugin's prefix by design, and they are public static bytes, so a name like
-/// `admin.js` is not a sensitive surface. Only
-/// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets) can put
-/// a route there (the router refuses any other declared route under
-/// `/static`), so exempting the prefix exempts nothing else.
-fn is_plugin_asset_route(path: &str) -> bool {
-    path.strip_prefix(crate::assets::PLUGIN_ASSETS_PREFIX)
+/// `admin.js` is not a sensitive surface. Both conditions are required: only
+/// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets) can
+/// attach the marker (`declare_plugin_routes` strips it), so a route a plugin
+/// merely declares at such a path gets no exemption.
+fn is_plugin_asset_route(route: &RouteInfo) -> bool {
+    route
+        .path
+        .strip_prefix(crate::assets::PLUGIN_ASSETS_PREFIX)
         .is_some_and(|rest| rest.starts_with('/'))
+        && route
+            .middleware
+            .iter()
+            .any(|label| label == crate::assets::PLUGIN_ASSETS_ROUTE_MARKER)
 }
 
 /// Check that all plugin routes live under `prefix`.
@@ -366,7 +373,7 @@ pub fn check_route_prefix(
         .filter(|r| {
             !under_prefix(&r.path)
                 && !intentional_root.contains(&r.path)
-                && !is_plugin_asset_route(&r.path)
+                && !is_plugin_asset_route(r)
         })
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
@@ -496,7 +503,7 @@ pub fn check_sensitive_surfaces(
         .filter(|r| {
             matches!(&r.source, RouteSource::Plugin(n) if n == plugin_name)
                 && is_sensitive_path(&r.path)
-                && !is_plugin_asset_route(&r.path)
+                && !is_plugin_asset_route(r)
         })
         .collect();
 
@@ -1044,18 +1051,15 @@ mod tests {
     /// file is named `admin.js`. Anything else outside the prefix still fails.
     #[test]
     fn plugin_asset_routes_are_exempt_from_prefix_and_sensitive_checks() {
+        let asset = |path: &str| {
+            let mut route = make_route("GET", path, plugin("admin"));
+            route.middleware = vec![crate::assets::PLUGIN_ASSETS_ROUTE_MARKER.to_owned()];
+            route
+        };
         let routes = vec![
             make_route("GET", "/admin", plugin("admin")),
-            make_route(
-                "GET",
-                "/static/_plugins/autumn-admin/admin.js",
-                plugin("admin"),
-            ),
-            make_route(
-                "GET",
-                "/static/_plugins/autumn-admin/admin.cb7ccaab.js",
-                plugin("admin"),
-            ),
+            asset("/static/_plugins/autumn-admin/admin.js"),
+            asset("/static/_plugins/autumn-admin/admin.cb7ccaab.js"),
         ];
         let prefix = check_route_prefix("admin", "/admin", &[], &routes);
         assert_eq!(prefix.status, CheckStatus::Pass, "{}", prefix.message);
@@ -1066,14 +1070,22 @@ mod tests {
         let sensitive = check_sensitive_surfaces("admin", &routes, &declared);
         assert_eq!(sensitive.status, CheckStatus::Pass, "{}", sensitive.message);
 
-        // `/static/_pluginsX/...` is not the asset prefix.
-        let lookalike = vec![make_route(
-            "GET",
-            "/static/_pluginsx/admin.js",
-            plugin("admin"),
-        )];
+        // `/static/_pluginsX/...` is not the asset prefix, even with the marker.
+        let lookalike = vec![asset("/static/_pluginsx/admin.js")];
         let prefix = check_route_prefix("admin", "/admin", &[], &lookalike);
         assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+
+        // A route a plugin merely declared at an asset path, without the marker
+        // `AppBuilder::plugin_assets` attaches, is checked like any other.
+        let forged = vec![make_route(
+            "GET",
+            "/static/_plugins/x/admin",
+            plugin("admin"),
+        )];
+        let prefix = check_route_prefix("admin", "/admin", &[], &forged);
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+        let sensitive = check_sensitive_surfaces("admin", &forged, &declared);
+        assert_eq!(sensitive.status, CheckStatus::Fail, "{}", sensitive.message);
     }
 
     // ── check_sensitive_surfaces ───────────────────────────────────────────
