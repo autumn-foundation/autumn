@@ -116,7 +116,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: ${{ matrix.toolchain == 'stable' && '1.99.0' || matrix.toolchain }}
 
       # No diesel_cli pre-install: the Diesel CLI is a documented user-facing
       # prerequisite of the scaffold path (docs/guide/generators.md), so the
@@ -228,8 +228,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
-
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: "autumn new my-app against published autumn-web"
         # Hard-gated, deliberately no continue-on-error: `autumn new` has no
         # version pin to drift against, so a failure here is always a real
