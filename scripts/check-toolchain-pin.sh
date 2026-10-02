@@ -11,7 +11,7 @@
 # Sources checked:
 #   - .github/RUST_TOOLCHAIN                  (canonical pin, `MAJOR.MINOR.PATCH`)
 #   - Cargo.toml [workspace.package].rust-version   (MSRV, may also be pinned)
-#   - .github/workflows/*.yml
+#   - .github/workflows/*.yml and *.yaml  (Actions accepts both)
 #
 # Rules for every `dtolnay/rust-toolchain@<ref>` in a workflow:
 #   - `<ref>` is the canonical pin, the MSRV, `nightly`, or `master` (the
@@ -32,6 +32,8 @@
 #     ./scripts/check-toolchain-pin.sh --bump 1.100.0   # move the pin everywhere
 
 set -euo pipefail
+# An unmatched glob (no .yaml files, say) must expand to nothing, not to itself.
+shopt -s nullglob
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -71,7 +73,7 @@ check_tree() {
 
   local failures=0
   local wf name line ref lineno exc ok
-  for wf in .github/workflows/*.yml; do
+  for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     name="$(basename "$wf")"
     lineno=0
     while IFS= read -r line; do
@@ -137,7 +139,7 @@ bump_tree() {
   # every rewrite first and touch nothing unless at least one workflow changes,
   # so a failed bump leaves the tree as it found it.
   local staged=() out pair
-  for wf in .github/workflows/*.yml; do
+  for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     out="$(mktemp "${TMPDIR:-/tmp}/toolchain-pin.XXXXXX")"
     # Only the two constructs the checker recognises, never prose in a comment.
     sed -E \
@@ -246,6 +248,16 @@ self_test() {
   fi
   [[ "$(tr -d '[:space:]' < "$tmp/orphan/.github/RUST_TOOLCHAIN")" == "1.99.0" ]] \
     || die "self-test: a failed --bump moved RUST_TOOLCHAIN"
+
+
+  # GitHub Actions accepts .yaml as well as .yml; both are checked and bumped.
+  mk "$tmp/yaml-floating" 1.99.0 '- uses: dtolnay/rust-toolchain@stable' ci.yaml
+  expect_fail "$tmp/yaml-floating" "@stable in a .yaml workflow"
+
+  mk "$tmp/yaml-bump" 1.99.0 '- uses: dtolnay/rust-toolchain@1.99.0' extra.yaml
+  ( "$0" --bump "$tmp/yaml-bump" 1.100.0 > /dev/null 2>&1 ) || die "self-test: --bump should handle .yaml"
+  grep -q 'rust-toolchain@1.100.0$' "$tmp/yaml-bump/.github/workflows/extra.yaml" \
+    || die "self-test: --bump skipped a .yaml workflow"
 
   echo "check-toolchain-pin self-test OK"
 }
