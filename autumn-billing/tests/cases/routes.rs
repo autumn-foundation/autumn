@@ -696,31 +696,63 @@ async fn boot_accepts_a_declared_endpoint_with_a_larger_body_limit() {
     );
 }
 
-/// The guide's snippet is what an app copies into `autumn.toml`, so the entry
-/// it shows must itself pass the boot check, not just the test helper's.
-#[test]
-fn the_guides_endpoint_snippet_declares_a_sufficient_body_limit() {
-    let guide = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../docs/guide/billing.md"
-    ))
-    .expect("read the billing guide");
-    let block = guide
+/// Every `toml` code fence in `text` that declares the billing webhook endpoint,
+/// parsed as the entry an app would paste into `autumn.toml`. `//!` doc-comment
+/// markers are stripped first, so the crate's rustdoc quick start is read the
+/// same way as the markdown files.
+fn documented_billing_endpoints(text: &str) -> Vec<autumn_web::webhook::WebhookEndpointConfig> {
+    let unwrapped = text
+        .lines()
+        .map(|line| {
+            line.strip_prefix("//!")
+                .map_or(line, |rest| rest.strip_prefix(' ').unwrap_or(rest))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    unwrapped
         .split("```toml")
         .skip(1)
         .filter_map(|rest| rest.split("```").next())
-        .find(|block| block.contains("[[security.webhooks.endpoints]]"))
-        .expect("the guide shows the endpoint entry");
-    let value: toml::Value = toml::from_str(block).expect("the snippet is valid TOML");
-    let entry = value["security"]["webhooks"]["endpoints"][0].clone();
-    let endpoint: autumn_web::webhook::WebhookEndpointConfig =
-        entry.try_into().expect("the snippet is a webhook endpoint");
-    assert!(
-        endpoint.max_body_bytes >= BILLING_MIN_BODY_LIMIT,
-        "the guide's snippet declares max_body_bytes = {}, below the {BILLING_MIN_BODY_LIMIT} \
-         the billing receiver needs",
-        endpoint.max_body_bytes
-    );
+        .filter(|block| {
+            block.contains("[[security.webhooks.endpoints]]") && block.contains("/billing/webhook")
+        })
+        .map(|block| {
+            let value: toml::Value = toml::from_str(block).expect("the snippet is valid TOML");
+            value["security"]["webhooks"]["endpoints"][0]
+                .clone()
+                .try_into()
+                .expect("the snippet is a webhook endpoint")
+        })
+        .collect()
+}
+
+/// A snippet is what an app copies into `autumn.toml`, so every one the crate
+/// shows must itself pass the boot check, not just the test helper's entry. The
+/// guide, the crate README and the rustdoc quick start each show it.
+#[test]
+fn every_documented_endpoint_snippet_declares_a_sufficient_body_limit() {
+    for (what, path) in [
+        ("the billing guide", "/../docs/guide/billing.md"),
+        ("the crate README", "/README.md"),
+        ("the crate rustdoc quick start", "/src/lib.rs"),
+    ] {
+        let text = std::fs::read_to_string(format!("{}{path}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|err| panic!("read {what}: {err}"));
+        let endpoints = documented_billing_endpoints(&text);
+        // A file that stops showing the entry must not make this pass vacuously.
+        assert!(
+            !endpoints.is_empty(),
+            "{what} shows no billing endpoint entry to check"
+        );
+        for endpoint in endpoints {
+            assert!(
+                endpoint.max_body_bytes >= BILLING_MIN_BODY_LIMIT,
+                "{what} declares max_body_bytes = {}, below the {BILLING_MIN_BODY_LIMIT} the \
+                 billing receiver needs",
+                endpoint.max_body_bytes
+            );
+        }
+    }
 }
 
 #[tokio::test]

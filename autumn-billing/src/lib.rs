@@ -22,7 +22,8 @@
 //! ```
 //!
 //! Declare the webhook receiver in `autumn.toml` so `SignedWebhook` verifies
-//! it and CSRF exempts it:
+//! it and CSRF exempts it. `max_body_bytes` is required: the webhook default is
+//! 1 MiB, a large provider event can exceed it, and boot fails below 4 MiB:
 //!
 //! ```toml
 //! [[security.webhooks.endpoints]]
@@ -30,6 +31,7 @@
 //! path = "/billing/webhook"
 //! provider = "stripe"
 //! secret_env = "STRIPE_WEBHOOK_SECRET"
+//! max_body_bytes = 4194304
 //! ```
 //!
 //! Gate a route:
