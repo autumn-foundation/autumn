@@ -240,9 +240,8 @@ fn print_import_summary(html: &str, dry_run: bool) {
                 counts[3]
             );
             std::process::exit(1);
-        } else {
-            println!("Import completed successfully.");
         }
+        println!("Import completed successfully.");
     } else {
         println!("Import request accepted. Check the admin UI for details.");
     }

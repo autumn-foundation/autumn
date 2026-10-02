@@ -2029,6 +2029,10 @@ async fn spawn_background_backs_off_then_recovers() {
         attempts: std::sync::atomic::AtomicUsize,
     }
     impl FlakyBackend {
+        #[allow(
+            deprecated,
+            reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+        )]
         fn gate(&self) -> Result<(), SyncError> {
             self.attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

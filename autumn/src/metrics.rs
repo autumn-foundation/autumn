@@ -890,6 +890,10 @@ impl Series {
     /// Saturating rather than wrapping: a wrapped total looks to `PromQL`
     /// exactly like a counter reset, so `rate()` would report an enormous
     /// phantom spike. A pinned total is obviously broken instead.
+    #[allow(
+        deprecated,
+        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+    )]
     fn add(&self, amount: u64) {
         if let Self::Counter(total) = self {
             let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -955,6 +959,10 @@ impl Series {
 }
 
 /// Add `delta` to the `f64` held as a bit pattern in `cell`, atomically.
+#[allow(
+    deprecated,
+    reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+)]
 fn add_f64(cell: &AtomicU64, delta: f64) {
     let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
         // Both operands are finite (deltas and observations are validated,
