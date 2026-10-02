@@ -460,12 +460,55 @@ file, and `scripts/check-panic-gate.sh` rejects it as a spoof of the gate.
 ### Toolchain caveat
 
 `arithmetic_side_effects`, `string_slice` and `indexing_slicing` are clippy
-**restriction** lints: their exact firing set can shift between clippy releases,
-so a routine `dtolnay/rust-toolchain@stable` bump can turn an unrelated PR red in
-a gated module nobody touched. When that happens, do **not** delete a lint from
-the headers to get green. Pin the toolchain action to the previous version
-(`dtolnay/rust-toolchain@<ver>`), land the PR, and file a burn-down issue for the
-new findings. Losing a lint is permanent; a pin is a week.
+**restriction** lints: their exact firing set can shift between clippy releases.
+CI is pinned to one Rust version (see "Bumping the toolchain" below), so a Rust
+release cannot turn an unrelated PR red in a gated module nobody touched; the
+new findings surface on the scheduled drift run instead. When a bump does move
+the firing set, do **not** delete a lint from the headers to get green. Fix or
+`#[allow(..., reason = "...")]` the findings on purpose, in the bump PR. Losing
+a lint is permanent.
+
+## Bumping the toolchain
+
+CI compiles with a pinned Rust version, not `stable`. A floating `stable` meant a
+Rust release could turn every open PR red with no change in the repo (the 1.98
+and 1.99 clippy rollovers, #2252 and #3082), and the trybuild goldens, which are
+the compiler's diagnostic text verbatim, are only valid for one compiler.
+
+- The pin is the single line in `.github/RUST_TOOLCHAIN`. Every
+  `dtolnay/rust-toolchain@<version>` in `.github/workflows/` repeats it.
+  `./scripts/check-toolchain-pin.sh` (run by the `MSRV` job) fails if any
+  reference disagrees, or if something floats on `stable` again.
+- The matrix jobs keep `stable` as their *label*, so required-check names like
+  `Compile-and-serve gates (stable)` do not change, and map it to the pin.
+- `.github/workflows/toolchain-drift.yml` is the only workflow that floats on
+  `stable`. It runs `cargo fmt` and clippy weekly (and on demand), so the next
+  release's fallout is a dedicated, non-blocking signal. It is not a PR gate.
+- The MSRV (`rust-version`, currently 1.88.0) is a separate floor and is checked by
+  `scripts/check-msrv.sh`. Do not use an API newer than it because the pin has it:
+  `cargo +<msrv> check -p autumn-web -p autumn-cli` catches that.
+- `publish-gate.yml` pins its own older toolchain for `cargo-semver-checks`, for
+  the reason written next to it. `check-toolchain-pin.sh` allows exactly that one.
+
+To move to a newer Rust, in one PR targeting `trunk-dev`:
+
+1. `rustup toolchain install <version> --profile minimal -c clippy -c rustfmt`.
+2. Find what breaks on the new compiler before touching CI:
+   `cargo +<version> fmt --all -- --check`,
+   `cargo +<version> clippy --workspace --all-targets -- -D warnings`, and the
+   feature lanes in `ci.yml`'s `lint` job (the gated-feature list,
+   `plugin-sandbox`, and the `SQLite runtime` clippy steps). Fix what it finds;
+   grandfather a lint in `[workspace.lints.clippy]` only with a written reason
+   (the examples carry their own `[lints.clippy]` tables).
+3. `./scripts/check-toolchain-pin.sh --bump <version>` moves the pin and every
+   reference together and re-checks.
+4. Re-bless any trybuild goldens whose wording changed:
+   `TRYBUILD=overwrite cargo +<version> test --workspace --test integration_tests -- compile_fail::`
+   (use `--workspace`; the cases depend on the unified feature set), and review
+   the diff. It should be rustc's phrasing only, never a different error.
+
+Run local checks with the pinned version (`rustup toolchain install $(cat
+.github/RUST_TOOLCHAIN)`, then `cargo +<that>`) so they match CI.
 
 ## Determinism seam gate
 
