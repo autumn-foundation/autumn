@@ -585,6 +585,7 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `AppBuilder::on_shutdown` | stable | Register an async shutdown hook that runs during graceful drain. |
 | `AppBuilder::on_startup` | stable | Register an async startup hook that runs once before the server binds. |
 | `AppBuilder::plugin` | stable | Mount a plugin. Also the seam a cooperative plugin uses to mount a plugin of its own. |
+| `AppBuilder::plugin_assets` | stable | Serve a `PluginAssets` bundle of files compiled into the plugin crate under `/static/_plugins/<namespace>/`, at content-hashed `immutable` URLs with SRI hashes, and declare its routes. Build the bundle with `plugin_assets!` (requires the `embed-assets` feature) or `PluginAssets::from_files`. |
 | `AppBuilder::plugin_contracts` | stable | Read the contracts declared by the plugins mounted on a builder — what the route dump and `autumn plugin-check` are built on. |
 | `AppBuilder::plugin_migrations` | stable | Contribute embedded database migrations tagged with the plugin's own name. Needs `reexports::diesel_migrations` in scope, because `embed_migrations!` expands to unqualified paths (requires the `db` feature). |
 | `AppBuilder::plugins` | stable | Mount a tuple of up to eight plugins in declaration order. |

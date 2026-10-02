@@ -722,6 +722,9 @@ pub struct TestApp {
     /// whose manifest collides with a host route would mount cleanly in tests
     /// and panic at boot in production.
     declared_routes: Vec<crate::route_listing::RouteInfo>,
+    /// Asset bundles installed by plugins, so a second bundle claiming a
+    /// taken namespace is refused here exactly as `AppBuilder` refuses it.
+    plugin_asset_bundles: Vec<&'static crate::assets::PluginAssets>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
     static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     config: AutumnConfig,
@@ -824,6 +827,7 @@ impl TestApp {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             declared_routes: Vec::new(),
+            plugin_asset_bundles: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             config,
@@ -1288,6 +1292,9 @@ impl TestApp {
         app_builder
             .registered_plugins
             .clone_from(&self.registered_plugins);
+        app_builder
+            .plugin_asset_bundles
+            .clone_from(&self.plugin_asset_bundles);
         app_builder.extensions = self.extensions;
         app_builder.state_initializers = std::mem::take(&mut self.state_initializers);
 
@@ -1303,6 +1310,7 @@ impl TestApp {
         self.merge_routers.extend(app_builder.merge_routers);
         self.nest_routers.extend(app_builder.nest_routers);
         self.declared_routes.extend(app_builder.declared_routes);
+        self.plugin_asset_bundles = app_builder.plugin_asset_bundles;
         self.custom_layers.extend(app_builder.custom_layers);
         self.static_gate_layers
             .extend(app_builder.static_gate_layers);

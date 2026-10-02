@@ -167,6 +167,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Mount a plugin. Also the seam a cooperative plugin uses to mount a plugin of its own.",
     },
     PluginSurface {
+        name: "AppBuilder::plugin_assets",
+        tier: SurfaceTier::Stable,
+        note: "Serve a `PluginAssets` bundle of files compiled into the plugin crate under `/static/_plugins/<namespace>/`, at content-hashed `immutable` URLs with SRI hashes, and declare its routes. Build the bundle with `plugin_assets!` (requires the `embed-assets` feature) or `PluginAssets::from_files`.",
+    },
+    PluginSurface {
         name: "AppBuilder::plugin_contracts",
         tier: SurfaceTier::Stable,
         note: "Read the contracts declared by the plugins mounted on a builder — what the route dump and `autumn plugin-check` are built on.",

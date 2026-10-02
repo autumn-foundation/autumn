@@ -119,7 +119,17 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
 
 - **Stable surface changed:** none.
 - **Experimental surface changed:** none.
-- **New stable surface:** none.
+- **New stable surface:** `AppBuilder::plugin_assets`. A plugin that ships
+  JavaScript, CSS or fonts declares them once as a `PluginAssets` bundle
+  (`autumn_web::plugin_assets!("my-plugin")` embeds `assets/`, or
+  `PluginAssets::from_files` lists them) and installs it from `Plugin::build`.
+  The framework serves each file at a content-hashed URL under
+  `/static/_plugins/<namespace>/`, cached `immutable`, and the
+  `script_tag`/`deferred_script_tag`/`stylesheet_tag` helpers emit it with its
+  SRI hash. Nothing breaks if you keep serving assets from your own router,
+  but a fixed URL with a `max-age` and an SRI hash can serve stale bytes that
+  fail the hash after you release new ones; moving to a bundle fixes that. See
+  the [Plugin Assets guide](../guide/plugin-assets.md).
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in

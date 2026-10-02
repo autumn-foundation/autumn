@@ -379,7 +379,9 @@ impl Plugin for AdminPlugin {
             None => app,
         };
 
-        app.nest(&prefix, router).declare_plugin_routes(declared)
+        app.nest(&prefix, router)
+            .declare_plugin_routes(declared)
+            .plugin_assets(&routes::ASSETS)
     }
 }
 
@@ -446,7 +448,6 @@ pub(crate) fn admin_route_infos(
         ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
         ("GET", format!("{prefix}/{{slug}}/{{id}}/history")),
         ("POST", format!("{prefix}/{{slug}}/actions")),
-        ("GET", format!("{prefix}{}", *routes::ADMIN_JS_PATH)),
     ]);
     // The revert route is intentionally ungated (see `routes::admin_router`),
     // so it is declared separately as `Public` rather than inheriting the admin

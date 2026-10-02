@@ -25,6 +25,7 @@ AppBuilder::nest
 AppBuilder::on_shutdown
 AppBuilder::on_startup
 AppBuilder::plugin
+AppBuilder::plugin_assets
 AppBuilder::plugin_contracts
 AppBuilder::plugin_migrations
 AppBuilder::plugins

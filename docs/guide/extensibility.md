@@ -232,6 +232,8 @@ issue — adding one is mechanical and we generally welcome the patch.
   Secrets Manager, or a JSON/YAML file instead of five-layer TOML.
 - [`autumn/src/plugin.rs`](../../autumn/src/plugin.rs) — `Plugin` trait
   documentation, including the naming conventions for distributed plugins.
+- [`plugin-assets.md`](plugin-assets.md) — how a plugin ships JavaScript, CSS
+  and fonts with content-hashed URLs, `immutable` caching and SRI.
 - [`plugins.md`](../plugins.md#the-plugin-api-contract) — which plugin-facing
   APIs are stable versus experimental, the SemVer policy for each tier, and how
   a plugin declares the `autumn-web` range it supports.
