@@ -3740,7 +3740,7 @@ impl AppBuilder {
             #[cfg(feature = "maud")]
             story_gallery,
             declared_routes,
-            plugin_asset_bundles: _,
+            plugin_asset_bundles,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -4662,7 +4662,13 @@ impl AppBuilder {
                     // routes) this builder collected. Handing them to the router build is
                     // what lets the duplicate-route preflight see inside an otherwise
                     // opaque `nest` mount and refuse a collision instead of panicking.
-                    declared_routes,
+                    // Minus the routes this builder's own asset bundles declared:
+                    // the framework mounts those under `/static`, which the
+                    // preflight refuses for any declared route.
+                    declared_routes: crate::assets::plugin::without_bundle_routes(
+                        declared_routes,
+                        &plugin_asset_bundles,
+                    ),
                     custom_layers,
                     static_gate_layers,
                     #[cfg(feature = "maud")]
@@ -7960,6 +7966,7 @@ impl AppBuilder {
             // and reach the axum mount panic the preflight exists to replace
             // with a refusal.
             declared_routes,
+            plugin_asset_bundles,
             custom_layers,
             state_initializers,
             config_loader_factory,
@@ -8156,7 +8163,10 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers,
-                declared_routes,
+                declared_routes: crate::assets::plugin::without_bundle_routes(
+                    declared_routes,
+                    &plugin_asset_bundles,
+                ),
                 custom_layers,
                 static_gate_layers: Vec::new(),
                 #[cfg(feature = "maud")]

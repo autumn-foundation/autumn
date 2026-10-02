@@ -2486,7 +2486,12 @@ impl TestApp {
                 scoped_groups: self.scoped_groups,
                 merge_routers,
                 nest_routers: self.nest_routers,
-                declared_routes: self.declared_routes,
+                // Minus this app's own asset-bundle routes, exactly as
+                // `AppBuilder` does: the framework mounts those under `/static`.
+                declared_routes: crate::assets::plugin::without_bundle_routes(
+                    self.declared_routes,
+                    &self.plugin_asset_bundles,
+                ),
                 custom_layers: self.custom_layers,
                 static_gate_layers: self.static_gate_layers,
                 #[cfg(feature = "maud")]

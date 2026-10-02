@@ -204,3 +204,40 @@ async fn plugin_assets_macro_embeds_a_directory() {
         .unwrap()
     );
 }
+
+/// Installing a bundle exempts only the bundle's own `GET` routes from the
+/// `/static` namespace refusal. A plugin that declares any other method at
+/// one of those paths is still refused at startup.
+#[test]
+#[should_panic(expected = "DuplicateUserRoute")]
+fn a_non_get_route_declared_at_a_bundle_path_is_still_refused() {
+    struct PostOverAssetPlugin;
+    impl Plugin for PostOverAssetPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "it-post-over-asset".into()
+        }
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            app.plugin_assets(&CHARTS).declare_plugin_routes(vec![
+                autumn_web::route_listing::RouteInfo {
+                    method: "POST".to_owned(),
+                    path: "/static/_plugins/it-charts/charts.js".to_owned(),
+                    handler: "it-post-over-asset::post".to_owned(),
+                    ..Default::default()
+                },
+            ])
+        }
+    }
+    let _client = TestApp::new().plugin(PostOverAssetPlugin).build();
+}
+
+/// `asset_url` resolves a namespace process-wide, so a second app in the
+/// process installing a *different* bundle under a taken namespace is
+/// refused rather than silently resolved against the first app's bundle.
+#[test]
+#[should_panic(
+    expected = "two different PluginAssets bundles use the namespace `it-charts` in one process"
+)]
+fn another_app_in_the_process_cannot_reuse_a_namespace() {
+    let _first = autumn_web::app().plugin(ChartsPlugin);
+    let _second = autumn_web::app().plugin(ImpostorPlugin);
+}

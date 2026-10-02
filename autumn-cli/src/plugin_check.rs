@@ -871,7 +871,10 @@ fn check_route_prefix(
         .iter()
         .filter(|r| {
             let p = &r.path;
-            p != prefix && !p.starts_with(&format!("{prefix}/")) && !intentional_root.contains(p)
+            p != prefix
+                && !p.starts_with(&format!("{prefix}/"))
+                && !intentional_root.contains(p)
+                && !is_plugin_asset_route(p)
         })
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
@@ -894,6 +897,18 @@ fn check_route_prefix(
             diagnostics: off_prefix,
         }
     }
+}
+
+/// `true` for a file of the plugin's own `PluginAssets` bundle, served under
+/// `/static/_plugins/<namespace>/` by `AppBuilder::plugin_assets`.
+///
+/// The framework mounts those, not the plugin's router: they live outside the
+/// plugin's prefix by design and are public static bytes, so a file named
+/// `admin.js` is not a sensitive surface. The router refuses any other declared
+/// route under `/static`, so exempting the prefix exempts nothing else.
+fn is_plugin_asset_route(path: &str) -> bool {
+    path.strip_prefix(autumn_web::assets::PLUGIN_ASSETS_PREFIX)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 const SENSITIVE_KEYWORDS: &[&str] = &[
@@ -922,7 +937,9 @@ fn check_sensitive_surfaces(
     let expected = format!("plugin:{plugin_name}");
     let sensitive: Vec<&RouteInfo> = routes
         .iter()
-        .filter(|r| r.source == expected && is_sensitive_path(&r.path))
+        .filter(|r| {
+            r.source == expected && is_sensitive_path(&r.path) && !is_plugin_asset_route(&r.path)
+        })
         .collect();
 
     if sensitive.is_empty() {
@@ -1101,6 +1118,43 @@ mod tests {
 
     fn no_sensitive() -> Vec<SensitiveRouteDecl> {
         vec![]
+    }
+
+    /// A plugin's `PluginAssets` files live under `/static/_plugins/`, mounted
+    /// by the framework outside the plugin's prefix, and are public static
+    /// bytes: neither an off-prefix route nor a sensitive surface, even when a
+    /// file is named `admin.js`. Anything else outside the prefix still fails.
+    #[test]
+    fn plugin_asset_routes_are_exempt_from_prefix_and_sensitive_checks() {
+        let routes = vec![
+            make_route("GET", "/admin", "plugin:admin"),
+            make_route(
+                "GET",
+                "/static/_plugins/autumn-admin/admin.js",
+                "plugin:admin",
+            ),
+            make_route(
+                "GET",
+                "/static/_plugins/autumn-admin/admin.cb7ccaab.js",
+                "plugin:admin",
+            ),
+        ];
+        let prefix = check_route_prefix("admin", "/admin", &[], &routes);
+        assert_eq!(prefix.status, CheckStatus::Pass, "{}", prefix.message);
+        let declared = vec![SensitiveRouteDecl {
+            path_pattern: "/admin".to_owned(),
+            auth_mechanism: "Role: admin required".to_owned(),
+        }];
+        let sensitive = check_sensitive_surfaces("admin", &routes, &declared);
+        assert_eq!(sensitive.status, CheckStatus::Pass, "{}", sensitive.message);
+
+        let lookalike = vec![make_route(
+            "GET",
+            "/static/_pluginsx/admin.js",
+            "plugin:admin",
+        )];
+        let prefix = check_route_prefix("admin", "/admin", &[], &lookalike);
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
     }
 
     // ── check_route_attribution ────────────────────────────────────────────

@@ -554,11 +554,20 @@ fn fingerprinted_name(logical_path: &str, hash: &str) -> String {
     }
 }
 
-/// A relative, `/`-separated path with no empty, `.`, `..` or dotfile segment.
+/// A relative, `/`-separated path whose segments are non-empty, not dotfiles
+/// (so never `.` or `..`), and spelled only in URL-unreserved characters
+/// (`A-Z a-z 0-9 - . _ ~`). The path becomes both a URL and an axum route
+/// pattern, so anything with routing meaning (`{name}`, `*`, `:`) or that
+/// would need percent-encoding (spaces, `%`, `?`, `#`) is refused rather than
+/// turned into a capture or a route no request can match.
 fn is_valid_logical_path(path: &str) -> bool {
     !path.is_empty()
         && path.split('/').all(|segment| {
-            !segment.is_empty() && !segment.starts_with('.') && !segment.contains('\\')
+            !segment.is_empty()
+                && !segment.starts_with('.')
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
         })
 }
 
@@ -644,10 +653,15 @@ fn asset_response(
 static REGISTRY: RwLock<Vec<&'static PluginAssets>> = RwLock::new(Vec::new());
 
 /// Record `bundle` so [`asset_url`](crate::assets::asset_url) can resolve
-/// its paths. Registering the same bundle again is a no-op. A different
-/// bundle under a namespace that is already taken is ignored with a
-/// warning; [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets)
-/// refuses that case for a single app before it gets here.
+/// its paths. Registering the same bundle again is a no-op.
+///
+/// # Panics
+///
+/// Panics when a *different* bundle already registered this namespace in the
+/// process. `asset_url` has no app handle, so it could only answer for one of
+/// them, and templates of the other app would get URLs its router does not
+/// serve. [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets)
+/// refuses the same clash within one app, with a message naming the URL path.
 pub(crate) fn register(bundle: &'static PluginAssets) {
     let mut registry = REGISTRY
         .write()
@@ -656,13 +670,16 @@ pub(crate) fn register(bundle: &'static PluginAssets) {
         .iter()
         .find(|existing| existing.namespace == bundle.namespace)
     {
-        if !std::ptr::eq(*existing, bundle) {
-            tracing::warn!(
-                namespace = bundle.namespace,
-                "a different PluginAssets bundle already registered this namespace in this \
-                 process; asset_url keeps resolving against the first one"
-            );
-        }
+        let same = std::ptr::eq(*existing, bundle);
+        // Release the lock before panicking so a caught panic (a test) does
+        // not poison the registry for everyone else.
+        drop(registry);
+        assert!(
+            same,
+            "two different PluginAssets bundles use the namespace `{}` in one process; \
+             `asset_url` resolves a namespace to one bundle, so each needs its own",
+            bundle.namespace,
+        );
         return;
     }
     registry.push(bundle);
@@ -684,16 +701,35 @@ fn split_plugin_rel(rel: &str) -> Option<(&'static PluginAssets, &str)> {
     Some((registered(namespace)?, path))
 }
 
-/// `true` when `path` (an absolute URL path) is one of the URLs a registered
-/// plugin bundle serves, plain or fingerprinted.
-pub(crate) fn is_registered_bundle_path(path: &str) -> bool {
-    path.strip_prefix("/static/")
-        .and_then(split_plugin_rel)
-        .is_some_and(|(bundle, _)| {
-            bundle
-                .iter()
-                .any(|asset| asset.plain_url == path || asset.url == path)
+/// `declared` without the routes `bundles` generated: every `GET` at a URL
+/// one of them serves.
+///
+/// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets)
+/// declares a bundle's routes so `autumn routes` lists them and the audit sees
+/// its `nest` covered. They sit under `/static`, which the router's
+/// duplicate-route preflight refuses for every declared route, so the builder
+/// passes the preflight its declared routes minus these. Only the builder's
+/// *own* bundles are subtracted, and only `GET`: any other method declared at
+/// one of those paths, or any route under `/static/_plugins/` no installed
+/// bundle serves, still meets the refusal.
+pub(crate) fn without_bundle_routes(
+    declared: Vec<crate::route_listing::RouteInfo>,
+    bundles: &[&'static PluginAssets],
+) -> Vec<crate::route_listing::RouteInfo> {
+    if bundles.is_empty() {
+        return declared;
+    }
+    declared
+        .into_iter()
+        .filter(|route| {
+            !(route.method.eq_ignore_ascii_case("GET")
+                && bundles.iter().any(|bundle| {
+                    bundle
+                        .iter()
+                        .any(|asset| asset.plain_url == route.path || asset.url == route.path)
+                }))
         })
+        .collect()
 }
 
 /// The fingerprinted URL for `rel` (a path relative to `/static/`) when it
@@ -725,6 +761,10 @@ mod tests {
             (".gitkeep", b""),
             ("../escape.js", b"nope"),
             ("/abs.js", b"nope"),
+            ("{name}.js", b"capture"),
+            ("{*rest}", b"wildcard"),
+            ("a b.js", b"space"),
+            ("50%.js", b"percent"),
         ],
     );
 
@@ -809,6 +849,22 @@ mod tests {
         assert!(BUNDLE.get("../escape.js").is_none());
         assert!(BUNDLE.get("/abs.js").is_none());
         assert!(BUNDLE.get(".gitkeep").is_none());
+        assert!(BUNDLE.get("{name}.js").is_none());
+        assert!(BUNDLE.get("{*rest}").is_none());
+        assert!(BUNDLE.get("a b.js").is_none());
+        assert!(BUNDLE.get("50%.js").is_none());
+    }
+
+    /// A route-pattern filename must not become a capture that answers for
+    /// arbitrary paths.
+    #[tokio::test]
+    async fn a_route_pattern_filename_does_not_match_other_paths() {
+        assert_eq!(
+            get("/static/_plugins/unit-test/anything.js", &[])
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
@@ -969,20 +1025,12 @@ mod tests {
             "_plugins/unit-test-registry/a.js"
         ));
         assert!(!is_registered_fingerprint("js/a.js"));
-        assert!(is_registered_bundle_path(&url));
-        assert!(is_registered_bundle_path(
-            "/static/_plugins/unit-test-registry/a.js"
-        ));
-        assert!(!is_registered_bundle_path(
-            "/static/_plugins/unit-test-registry/b.js"
-        ));
-        assert!(!is_registered_bundle_path(
-            "/static/_plugins/unit-test-registry"
-        ));
-        assert!(!is_registered_bundle_path("/static/app.js"));
     }
 
     #[test]
+    #[should_panic(
+        expected = "two different PluginAssets bundles use the namespace `unit-test-takeover` in one process"
+    )]
     fn a_second_bundle_cannot_take_over_a_registered_namespace() {
         static FIRST: PluginAssets =
             PluginAssets::from_files("unit-test-takeover", &[("a.js", b"first")]);
@@ -990,10 +1038,59 @@ mod tests {
             PluginAssets::from_files("unit-test-takeover", &[("a.js", b"second")]);
         register(&FIRST);
         register(&SECOND);
+    }
+
+    #[test]
+    fn a_refused_takeover_leaves_the_first_bundle_resolving() {
+        static FIRST: PluginAssets =
+            PluginAssets::from_files("unit-test-takeover-kept", &[("a.js", b"first")]);
+        static SECOND: PluginAssets =
+            PluginAssets::from_files("unit-test-takeover-kept", &[("a.js", b"second")]);
+        register(&FIRST);
+        let refused = std::panic::catch_unwind(|| register(&SECOND));
+        assert!(refused.is_err());
         assert_eq!(
-            resolve_registered_url("_plugins/unit-test-takeover/a.js"),
+            resolve_registered_url("_plugins/unit-test-takeover-kept/a.js"),
             Some(FIRST.url("a.js"))
         );
+    }
+
+    #[test]
+    fn without_bundle_routes_strips_only_this_builders_bundle_gets() {
+        static MINE: PluginAssets = PluginAssets::from_files("unit-test-strip", &[("a.js", b"a")]);
+        let route = |method: &str, path: &str| crate::route_listing::RouteInfo {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            ..Default::default()
+        };
+        let hashed = MINE.url("a.js");
+        let declared = vec![
+            route("GET", "/static/_plugins/unit-test-strip/a.js"),
+            route("GET", &hashed),
+            route("POST", "/static/_plugins/unit-test-strip/a.js"),
+            route("GET", "/static/_plugins/unit-test-strip/other.js"),
+            route("GET", "/static/app.js"),
+        ];
+        let kept: Vec<(String, String)> = without_bundle_routes(declared.clone(), &[&MINE])
+            .into_iter()
+            .map(|r| (r.method, r.path))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (
+                    "POST".to_owned(),
+                    "/static/_plugins/unit-test-strip/a.js".to_owned()
+                ),
+                (
+                    "GET".to_owned(),
+                    "/static/_plugins/unit-test-strip/other.js".to_owned()
+                ),
+                ("GET".to_owned(), "/static/app.js".to_owned()),
+            ]
+        );
+        // A bundle this builder did not install strips nothing.
+        assert_eq!(without_bundle_routes(declared, &[]).len(), 5);
     }
 
     #[test]

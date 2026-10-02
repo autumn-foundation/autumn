@@ -116,6 +116,6 @@ html! {
 }
 ```
 
-When an app pins its own htmx with `autumn assets add htmx@…`, the built-in
-copy steps aside and `asset_url("js/htmx.min.js")` resolves against the app's
-manifest as before.
+When an app vendors its own pinned htmx into `static/` (the `autumn assets`
+commands), the built-in copy steps aside and `asset_url("js/htmx.min.js")`
+resolves against the app's manifest as before.

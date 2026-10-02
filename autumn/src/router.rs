@@ -2173,15 +2173,12 @@ fn reject_declared_framework_collisions(
         // whether it would panic (at the prefix, or a catch-all) or mount
         // quietly and shadow what the framework serves there.
         //
-        // The one exception is a file of a `PluginAssets` bundle, which the
-        // framework itself mounts under `/static/_plugins/<namespace>/` and
-        // declares for the listing. Only `AppBuilder::plugin_assets` (native,
-        // full-trust code) registers a bundle, so a sandboxed artifact cannot
-        // reach this exemption, and it covers the bundle's exact paths only.
+        // `PluginAssets` bundles mount under `/static/_plugins/` too, but their
+        // routes never reach this check: the builder that installed them
+        // strips them out first (`plugin::without_bundle_routes`).
         if let Some(namespace) = framework_namespaces()
             .iter()
             .find(|namespace| path_is_under_namespace(&declared.path, namespace))
-            && !crate::assets::plugin::is_registered_bundle_path(&declared.path)
         {
             return Err(RouterBuildError::DuplicateUserRoute {
                 method: declared.method.clone(),
