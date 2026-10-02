@@ -125,40 +125,58 @@ check_tree() {
 }
 
 # --- bump: move the pin and every reference to it, then re-check. ---
+#
+# All-or-nothing: the whole bump is staged in a scratch copy, the real checker
+# runs on that copy, and only a copy that passes is written back. So a pin the
+# checker recognises but the rewrite does not (an odd line shape, say) fails the
+# bump with the working tree untouched, instead of leaving it half-moved.
 bump_tree() {
   local dir="$1" new="$2"
   [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--bump needs MAJOR.MINOR.PATCH, got '$new'"
   cd "$dir"
   [[ -f .github/RUST_TOOLCHAIN ]] || die ".github/RUST_TOOLCHAIN is missing"
-  local old old_re wf
+  local old old_re wf rel stage changed=()
   old="$(tr -d '[:space:]' < .github/RUST_TOOLCHAIN)"
   [[ "$old" != "$new" ]] || die "the pin is already $new"
   old_re="${old//./\\.}"
-  # Rewrite via temp files, not `sed -i`: BSD/macOS sed takes the word after -i
-  # as a backup suffix, so `sed -i -E` would swallow -E and match nothing. Stage
-  # every rewrite first and touch nothing unless at least one workflow changes,
-  # so a failed bump leaves the tree as it found it.
-  local staged=() out pair
-  for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
-    out="$(mktemp "${TMPDIR:-/tmp}/toolchain-pin.XXXXXX")"
-    # Only the two constructs the checker recognises, never prose in a comment.
+
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/toolchain-pin-stage.XXXXXX")"
+  # Expanded now: `stage` is local, and the trap fires when the script exits.
+  trap "rm -rf '$stage'" EXIT
+  mkdir -p "$stage/.github"
+  cp -R .github/workflows "$stage/.github/workflows"
+  cp Cargo.toml "$stage/Cargo.toml"
+  printf '%s\n' "$new" > "$stage/.github/RUST_TOOLCHAIN"
+
+  for wf in "$stage"/.github/workflows/*.yml "$stage"/.github/workflows/*.yaml; do
+    rel="${wf#"$stage"/}"
+    # Rewrite via a temp file, not `sed -i`: BSD/macOS sed takes the word after
+    # -i as a backup suffix, so `sed -i -E` would swallow -E and match nothing.
+    # Only the two constructs the checker recognises, never prose in a comment;
+    # a trailing `# comment` on a pin line is kept. The delimiter is `|` because
+    # the comment pattern contains a literal `#`.
     sed -E \
-      -e "s#^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*dtolnay/rust-toolchain@)${old_re}[[:space:]]*\$#\1${new}#" \
-      -e "s#(matrix\\.toolchain == 'stable' && ')${old_re}(')#\1${new}\2#" \
-      "$wf" > "$out"
-    if cmp -s "$wf" "$out"; then
-      rm -f "$out"
-    else
-      staged+=("$wf|$out")
-    fi
+      -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*dtolnay/rust-toolchain@)${old_re}([[:space:]]+#.*)?[[:space:]]*\$|\1${new}\2|" \
+      -e "s|(matrix\\.toolchain == 'stable' && ')${old_re}(')|\1${new}\2|" \
+      "$wf" > "$wf.new"
+    mv "$wf.new" "$wf"
+    cmp -s "$rel" "$wf" || changed+=("$rel")
   done
-  ((${#staged[@]} > 0)) || die "no workflow references the pin $old; nothing to bump"
-  for pair in "${staged[@]}"; do
-    cat "${pair#*|}" > "${pair%%|*}"
-    rm -f "${pair#*|}"
+  if ((${#changed[@]} == 0)); then
+    rm -rf "$stage"
+    die "no workflow references the pin $old; nothing to bump"
+  fi
+  if ! ( check_tree "$stage" > /dev/null ); then
+    rm -rf "$stage"
+    die "bumping to $new would leave the tree inconsistent (see above); nothing was changed"
+  fi
+
+  for rel in "${changed[@]}"; do
+    cat "$stage/$rel" > "$rel"
   done
   printf '%s\n' "$new" > .github/RUST_TOOLCHAIN
-  echo "Moved the pin $old -> $new"
+  rm -rf "$stage"
+  echo "Moved the pin $old -> $new in ${#changed[@]} workflow file(s)"
   check_tree "$dir"
 }
 
@@ -258,6 +276,25 @@ self_test() {
   ( "$0" --bump "$tmp/yaml-bump" 1.100.0 > /dev/null 2>&1 ) || die "self-test: --bump should handle .yaml"
   grep -q 'rust-toolchain@1.100.0$' "$tmp/yaml-bump/.github/workflows/extra.yaml" \
     || die "self-test: --bump skipped a .yaml workflow"
+
+
+  # A pin line with an inline comment is rewritten and the comment kept.
+  mk "$tmp/comment" 1.99.0 '- uses: dtolnay/rust-toolchain@1.99.0 # reason
+- uses: dtolnay/rust-toolchain@1.99.0'
+  ( "$0" --bump "$tmp/comment" 1.100.0 > /dev/null 2>&1 ) || die "self-test: --bump should handle a trailing comment"
+  grep -q 'rust-toolchain@1.100.0 # reason$' "$tmp/comment/.github/workflows/ci.yml" \
+    || die "self-test: --bump dropped or skipped a pin line with a trailing comment"
+
+  # A reference the checker recognises but the rewrite cannot reach must fail
+  # the bump AND leave every file byte-identical (the all-or-nothing promise).
+  mk "$tmp/unreachable" 1.99.0 '- uses: dtolnay/rust-toolchain@1.99.0
+- run: echo prefix dtolnay/rust-toolchain@1.99.0 suffix'
+  cp -R "$tmp/unreachable" "$tmp/unreachable.before"
+  if ( "$0" --bump "$tmp/unreachable" 1.100.0 > /dev/null 2>&1 ); then
+    die "self-test: --bump should fail when a reference cannot be rewritten"
+  fi
+  diff -r "$tmp/unreachable.before" "$tmp/unreachable" > /dev/null \
+    || die "self-test: a failed --bump changed the tree"
 
   echo "check-toolchain-pin self-test OK"
 }
