@@ -74,7 +74,7 @@ impl Rng {
         // Top 24 bits give a clean, evenly spread mantissa.
         let top24 = (bits >> 40) as u32;
         let unit = top24 as f32 / (1u32 << 24) as f32;
-        unit * 2.0 - 1.0
+        unit.mul_add(2.0, -1.0)
     }
 }
 

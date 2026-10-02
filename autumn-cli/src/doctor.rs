@@ -9023,7 +9023,7 @@ where
             .and_then(|p| p.get("alerts"))
             .and_then(toml::Value::as_table)
             .and_then(|a| a.get("error_rate_threshold"))
-            .and_then(&stringify)
+            .and_then(stringify)
     {
         return v;
     }
@@ -9105,7 +9105,7 @@ fn resolve_compression_enabled() -> bool {
             .get("profile")
             .and_then(|v| v.get(&profile))
             .and_then(toml::Value::as_table)
-            .and_then(&parse_enabled)
+            .and_then(parse_enabled)
     {
         return enabled;
     }

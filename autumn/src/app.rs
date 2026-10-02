@@ -13106,13 +13106,12 @@ fn validate_repository_api_policies(
              Add `policy = SomePolicy` to each, or set `[security] allow_unauthorized_repository_api = true` to opt out explicitly."
         );
         std::process::exit(1);
-    } else {
-        tracing::warn!(
-            "the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument; \
-             auto-generated POST/PUT/PATCH/DELETE handlers will accept writes from any authenticated user:\n{listing}\n\
-             This will become a startup-time error in `prod` profile builds."
-        );
     }
+    tracing::warn!(
+        "the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument; \
+         auto-generated POST/PUT/PATCH/DELETE handlers will accept writes from any authenticated user:\n{listing}\n\
+         This will become a startup-time error in `prod` profile builds."
+    );
 }
 
 /// Refuse to start when a `#[repository(policy = X)]`-annotated

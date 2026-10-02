@@ -519,7 +519,6 @@ fn install_outbound_webhook_manager(
 }
 
 /// Asynchronous background job that delivers a webhook payload (legacy fallback).
-#[must_use]
 #[allow(clippy::redundant_closure_for_method_calls, clippy::too_many_lines)]
 pub fn deliver_webhook_job(
     state: AppState,

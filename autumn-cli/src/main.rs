@@ -6095,9 +6095,8 @@ fn run_deprecations_check(package: Option<&str>, bin: Option<&str>) {
 
     if failed {
         std::process::exit(1);
-    } else {
-        println!("\u{2705} No past-sunset routes detected.");
     }
+    println!("\u{2705} No past-sunset routes detected.");
 }
 
 fn run_routes_command(

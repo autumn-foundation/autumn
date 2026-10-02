@@ -810,6 +810,10 @@ impl ObligationStore for FlakyRelease {
         self.inner.claim_escalation(key, generation, due_at, at)
     }
 
+    #[allow(
+        deprecated,
+        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+    )]
     fn release_escalation<'a>(
         &'a self,
         key: &'a str,
