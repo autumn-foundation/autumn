@@ -170,14 +170,14 @@ SIBLING = str(ROOT / 'scripts' / 'check-docs-cli.sh')
 # corpus that existed before the gate is allowed to keep passing while the
 # backlog is worked down.
 BACKLOG = {
-    'assets add':
+    'assets list':
         'the `autumn assets` family (pin/vendor/integrity-verify JS '
-        'dependencies) is named once corpus-wide, in a parenthetical in a '
-        'table cell in upgrading.md, and none of its four subcommands appear '
-        'anywhere. Needs a guide page of its own — coverage, not findability.',
-    'assets list': 'see `assets add`.',
-    'assets update': 'see `assets add`.',
-    'assets verify': 'see `assets add`.',
+        'dependencies) has no guide page: `assets add` is named only in '
+        'passing (pinning htmx, in the 0.8.0 migration guide), and the other '
+        'three subcommands appear nowhere. Needs a guide page of its own — '
+        'coverage, not findability.',
+    'assets update': 'see `assets list`.',
+    'assets verify': 'see `assets list`.',
     'schema parse':
         '`autumn schema` is marked experimental in its own doc comment '
         '("Slices 2-3 ship `parse` and `snapshot`; `diff`/… arrive in later '

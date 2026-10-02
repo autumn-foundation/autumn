@@ -41,7 +41,7 @@ The layer uses standard content-type detection. Compressible types include:
 - `text/html`
 - `application/json`
 - `text/css`
-- `application/javascript`
+- `text/javascript`, `application/javascript`
 - `image/svg+xml`
 - `application/xml`, `text/xml`
 - `text/plain`
