@@ -59,6 +59,12 @@ async fn index() -> &'static str {
     "autumn plugin reference"
 }
 
+/// A one-file asset bundle, installed through `AppBuilder::plugin_assets`.
+static ASSETS: autumn_web::assets::PluginAssets = autumn_web::assets::PluginAssets::from_files(
+    "autumn-plugin-reference",
+    &[("reference.js", b"window.autumnPluginReference = true;\n")],
+);
+
 /// A plugin that exercises every stable plugin-facing API.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReferencePlugin;
@@ -130,6 +136,13 @@ impl Plugin for ReferencePlugin {
                 ),
                 ..Default::default()
             }]);
+
+        // surface: AppBuilder::plugin_assets
+        //
+        // Files compiled into the plugin, served at content-hashed URLs under
+        // `/static/_plugins/autumn-plugin-reference/` with their routes
+        // declared for the listing.
+        let app = app.plugin_assets(&ASSETS);
 
         // surface: AppBuilder::merge
         let app = app.merge(autumn_web::reexports::axum::Router::new());

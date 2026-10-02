@@ -37,6 +37,10 @@ use std::sync::OnceLock;
 #[cfg(feature = "embed-assets")]
 use std::sync::RwLock;
 
+pub mod plugin;
+
+pub use plugin::{PLUGIN_ASSETS_PREFIX, PluginAsset, PluginAssets};
+
 /// Filename of the fingerprint manifest within the `static/` tree.
 #[cfg(any(not(debug_assertions), feature = "embed-assets"))]
 const ASSET_MANIFEST_FILE: &str = ".autumn-manifest.json";
@@ -126,13 +130,15 @@ fn load_embedded_vendor_manifest() -> Option<VendorManifest> {
 
 /// Render a `<script>` tag for a vendored JS dependency.
 ///
-/// Resolves the asset URL through [`asset_url`] (fingerprinted in release,
-/// plain in dev) and emits `integrity` + `crossorigin="anonymous"` for SRI.
+/// Resolves the asset URL against the app's own manifest (fingerprinted in
+/// release, plain in dev) and emits `integrity` + `crossorigin="anonymous"`
+/// for SRI. Never the framework's compiled copy: the pinned `integrity` hash
+/// describes the vendored file in `static/`, not the framework's bytes.
 #[cfg(feature = "maud")]
 fn render_javascript_tag(asset: &VendorAsset) -> maud::Markup {
     maud::html! {
         script
-            src=(asset_url(&asset.file))
+            src=(app_asset_url(&asset.file))
             integrity=(asset.integrity)
             crossorigin="anonymous"
             {}
@@ -288,6 +294,15 @@ fn embedded_is_manifest_asset(rel_path: &str) -> bool {
 ///   content-hashed URL (e.g. `/static/css/autumn.a1b2c3d4.css`).
 ///   Falls back to `/static/{path}` when the manifest is absent or the path
 ///   is not listed, so the app keeps serving without fingerprinted assets.
+/// - **Files compiled into a crate** get their content-hashed URL in every
+///   build profile, because their hash comes from the compiled bytes:
+///   - `_plugins/<namespace>/<file>` names a file in a
+///     [`PluginAssets`] bundle installed with
+///     [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets).
+///   - `js/htmx.min.js`, `js/sse.js`, `js/idiomorph.min.js`,
+///     `js/autumn-htmx-csrf.js` and `js/autumn-widgets.js` name the
+///     framework's own scripts (htmx steps aside when the app pins its own
+///     copy with `autumn assets add htmx@…`).
 ///
 /// # Example
 ///
@@ -295,9 +310,24 @@ fn embedded_is_manifest_asset(rel_path: &str) -> bool {
 /// link rel="stylesheet" href=(asset_url("css/autumn.css"));
 /// // debug:   /static/css/autumn.css
 /// // release: /static/css/autumn.a1b2c3d4.css
+///
+/// script src=(asset_url("js/htmx.min.js")) {}
+/// // always:  /static/js/htmx.min.<hash>.js
+///
+/// script src=(asset_url("_plugins/motion/init.js")) {}
+/// // always:  /static/_plugins/motion/init.<hash>.js
 /// ```
 #[must_use]
 pub fn asset_url(path: &str) -> String {
+    // Files compiled into a crate (plugin bundles under `_plugins/<ns>/`, and
+    // the framework's own scripts) carry a fingerprint derived from their
+    // bytes, which is valid in every build profile and wins over any manifest.
+    compiled_asset_url(path).unwrap_or_else(|| app_asset_url(path))
+}
+
+/// [`asset_url`] for a file in the app's own `static/` tree: the manifest
+/// lookup alone, without the compiled-asset lookup.
+fn app_asset_url(path: &str) -> String {
     // When an embedded `static/` tree is registered (single-binary build), the
     // embedded manifest is the *only* source of truth — assets are served from
     // the binary, so a miss means the asset isn't fingerprinted and should use
@@ -338,6 +368,9 @@ pub fn asset_url(path: &str) -> String {
 // release/embedded arms perform non-const lookups.
 #[allow(clippy::missing_const_for_fn)]
 pub(crate) fn is_manifest_asset(rel_path: &str) -> bool {
+    if is_compiled_fingerprint(rel_path) {
+        return true;
+    }
     // When an embedded `static/` tree is registered, its manifest is the sole
     // authority for the immutable-cache decision (and is reachable in debug
     // builds too); never consult a disk sidecar manifest in that case.
@@ -358,6 +391,33 @@ pub(crate) fn is_manifest_asset(rel_path: &str) -> bool {
         let _ = rel_path;
         false
     }
+}
+
+/// The fingerprinted URL of a file compiled into a crate: a registered plugin
+/// bundle's file (`_plugins/<ns>/<path>`) or one of the framework's own
+/// scripts (`js/htmx.min.js`, …).
+fn compiled_asset_url(path: &str) -> Option<String> {
+    if let Some(url) = plugin::resolve_registered_url(path) {
+        return Some(url);
+    }
+    #[cfg(feature = "htmx")]
+    if let Some(asset) = crate::htmx::framework_script(path) {
+        return Some(asset.url().to_owned());
+    }
+    None
+}
+
+/// `true` when `rel_path` is the fingerprinted path of a file compiled into a
+/// crate. See [`compiled_asset_url`].
+fn is_compiled_fingerprint(rel_path: &str) -> bool {
+    if plugin::is_registered_fingerprint(rel_path) {
+        return true;
+    }
+    #[cfg(feature = "htmx")]
+    if crate::htmx::is_framework_script_fingerprint(rel_path) {
+        return true;
+    }
+    false
 }
 
 /// Returns `true` if the URI path segment looks like a fingerprinted asset

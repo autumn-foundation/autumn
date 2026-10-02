@@ -1431,16 +1431,13 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     }
     #[cfg(feature = "htmx")]
     {
-        // Only claim the htmx path when the built-in handler is actually
-        // mounted; when htmx is vendored via `autumn assets`, ServeDir serves
-        // the file and the path must not appear in the claimed-routes set.
-        if !crate::assets::htmx_is_vendored() {
-            claimed.insert(crate::htmx::HTMX_JS_PATH.to_owned());
+        // Both URLs of every framework script. `framework_scripts` leaves htmx
+        // out when it is vendored via `autumn assets`: ServeDir serves the
+        // file then, and the path must not appear in the claimed-routes set.
+        for asset in crate::htmx::framework_scripts() {
+            claimed.insert(asset.plain_url().to_owned());
+            claimed.insert(asset.url().to_owned());
         }
-        claimed.insert(crate::htmx::HTMX_CSRF_JS_PATH.to_owned());
-        claimed.insert(crate::htmx::AUTUMN_WIDGETS_JS_PATH.to_owned());
-        claimed.insert(crate::htmx::IDIOMORPH_JS_PATH.to_owned());
-        claimed.insert(crate::htmx::HTMX_SSE_JS_PATH.to_owned());
     }
     // Framework CSS routes (flash/widget stylesheets) merge a GET
     // unconditionally whenever their feature is on, before the late-merged
@@ -2175,9 +2172,16 @@ fn reject_declared_framework_collisions(
         // owned wholesale, so a declared route anywhere beneath them is refused
         // whether it would panic (at the prefix, or a catch-all) or mount
         // quietly and shadow what the framework serves there.
+        //
+        // The one exception is a file of a `PluginAssets` bundle, which the
+        // framework itself mounts under `/static/_plugins/<namespace>/` and
+        // declares for the listing. Only `AppBuilder::plugin_assets` (native,
+        // full-trust code) registers a bundle, so a sandboxed artifact cannot
+        // reach this exemption, and it covers the bundle's exact paths only.
         if let Some(namespace) = framework_namespaces()
             .iter()
             .find(|namespace| path_is_under_namespace(&declared.path, namespace))
+            && !crate::assets::plugin::is_registered_bundle_path(&declared.path)
         {
             return Err(RouterBuildError::DuplicateUserRoute {
                 method: declared.method.clone(),
@@ -3010,67 +3014,32 @@ fn mount_framework_routes(
     #[cfg(not(feature = "mail"))]
     let _ = config;
 
-    // Framework-provided routes
+    // Framework-provided scripts (htmx, its SSE extension, idiomorph, the
+    // CSRF helper and the widget runtime), each at its plain path and at a
+    // content-hashed path. The global `AssetCacheControlLayer` applied after
+    // this recognises the hashed paths as fingerprinted, so they are cached
+    // `immutable` and the plain paths revalidate.
     #[cfg(feature = "htmx")]
     {
-        // When htmx is vendored via `autumn assets add htmx@…`, skip the
-        // built-in handler so ServeDir serves the correctly-pinned file.
-        // Axum explicit routes beat `nest_service`, so without this guard the
-        // embedded 2.0.4 bytes would shadow any updated vendored version.
+        // When htmx is vendored via `autumn assets add htmx@…`,
+        // `framework_scripts` leaves it out so ServeDir serves the pinned file.
+        // Axum explicit routes beat `nest_service`, so without this the
+        // embedded bytes would shadow the vendored version.
         if crate::assets::htmx_is_vendored() {
             tracing::debug!(
                 path = crate::htmx::HTMX_JS_PATH,
                 "htmx vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
             );
-        } else {
-            router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
+        }
+        router = router.merge(framework_scripts_router());
+        for asset in crate::htmx::framework_scripts() {
             tracing::debug!(
                 method = "GET",
-                path = crate::htmx::HTMX_JS_PATH,
-                name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+                path = asset.plain_url(),
+                fingerprinted = asset.url(),
                 "Mounted route"
             );
         }
-        router = router.route(
-            crate::htmx::HTMX_CSRF_JS_PATH,
-            axum::routing::get(htmx_csrf_handler),
-        );
-        router = router.route(
-            crate::htmx::AUTUMN_WIDGETS_JS_PATH,
-            axum::routing::get(autumn_widgets_handler),
-        );
-        router = router.route(
-            crate::htmx::IDIOMORPH_JS_PATH,
-            axum::routing::get(idiomorph_handler),
-        );
-        router = router.route(
-            crate::htmx::HTMX_SSE_JS_PATH,
-            axum::routing::get(htmx_sse_handler),
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::HTMX_CSRF_JS_PATH,
-            name = "htmx csrf helper",
-            "Mounted route"
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::AUTUMN_WIDGETS_JS_PATH,
-            name = "autumn widget runtime",
-            "Mounted route"
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::IDIOMORPH_JS_PATH,
-            name = "idiomorph DOM morphing",
-            "Mounted route"
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::HTMX_SSE_JS_PATH,
-            name = "htmx SSE extension",
-            "Mounted route"
-        );
     }
 
     // Framework-provided flash-message stylesheet. Served as a same-origin
@@ -6440,20 +6409,11 @@ pub fn mirror_cors_headers(
     }
 }
 
+/// Router for the framework's own scripts: each served script at its plain
+/// path and its content-hashed path. See [`crate::htmx::FRAMEWORK_SCRIPTS`].
 #[cfg(feature = "htmx")]
-pub async fn htmx_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (http::header::CONTENT_TYPE, "application/javascript"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
-        ],
-        crate::htmx::HTMX_JS,
-    )
-        .into_response()
+fn framework_scripts_router() -> axum::Router<AppState> {
+    crate::assets::plugin::routes_for(crate::htmx::framework_scripts(), "/static", "/static")
 }
 
 /// Gzip/brotli encodings of a compile-time-constant CSS body, computed once
@@ -6599,113 +6559,6 @@ pub async fn widgets_css_handler(headers: http::HeaderMap) -> axum::response::Re
         crate::ui::WIDGETS_CSS,
         PRECOMPRESSED.get_or_init(|| PrecompressedCss::compute(crate::ui::WIDGETS_CSS)),
     )
-}
-
-#[cfg(feature = "htmx")]
-pub async fn htmx_csrf_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (http::header::CONTENT_TYPE, "application/javascript"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
-        ],
-        crate::htmx::HTMX_CSRF_JS,
-    )
-        .into_response()
-}
-
-#[cfg(feature = "htmx")]
-pub async fn autumn_widgets_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (http::header::CONTENT_TYPE, "application/javascript"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
-        ],
-        crate::htmx::AUTUMN_WIDGETS_JS,
-    )
-        .into_response()
-}
-
-/// Weak `ETag` for the vendored idiomorph script, derived once from the
-/// embedded bytes.
-///
-/// The idiomorph URL is **not** content-fingerprinted, so it cannot safely use
-/// an `immutable` cache. Instead the handler emits this content-derived `ETag`
-/// alongside a revalidating `Cache-Control`, letting caches confirm freshness
-/// (and pick up new bytes) whenever the vendored script changes.
-///
-/// The validator is **weak**: when compression is enabled, the response
-/// compression layer gzips/brotli-encodes this `application/javascript`
-/// response after the handler attaches the `ETag`, so the identity, gzip, and
-/// br variants share one tag despite differing byte streams. A strong `ETag`
-/// asserts byte-for-byte equivalence and would be invalid across those
-/// encodings (matching the sibling CSS asset handler).
-#[cfg(feature = "htmx")]
-static IDIOMORPH_ETAG: std::sync::LazyLock<crate::etag::ETag> = std::sync::LazyLock::new(|| {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write as _;
-
-    let digest = Sha256::digest(crate::htmx::IDIOMORPH_JS);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    crate::etag::ETag::weak(format!("idiomorph-{hex}"))
-});
-
-/// Serves the vendored idiomorph DOM-morphing library at [`crate::htmx::IDIOMORPH_JS_PATH`].
-///
-/// Idiomorph enables smooth DOM morphing via `hx-swap="morph"` in htmx.
-///
-/// Because the serving URL is not content-fingerprinted, the response uses a
-/// revalidating cache policy (`must-revalidate` plus a weak content-derived
-/// `ETag`) rather than a year-long `immutable` cache. This ensures clients that
-/// cached an earlier version of the script pick up new bytes instead of running
-/// a stale copy for up to a year.
-#[cfg(feature = "htmx")]
-pub async fn idiomorph_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let mut response = (
-        [
-            (http::header::CONTENT_TYPE, "application/javascript"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=0, must-revalidate",
-            ),
-        ],
-        crate::htmx::IDIOMORPH_JS,
-    )
-        .into_response();
-    response
-        .headers_mut()
-        .insert(http::header::ETAG, IDIOMORPH_ETAG.header_value());
-    response
-}
-
-/// Serves the vendored htmx SSE extension at [`crate::htmx::HTMX_SSE_JS_PATH`].
-///
-/// The SSE extension enables `hx-ext="sse"` for server-sent event streams.
-#[cfg(feature = "htmx")]
-pub async fn htmx_sse_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (http::header::CONTENT_TYPE, "application/javascript"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
-        ],
-        crate::htmx::HTMX_SSE_JS,
-    )
-        .into_response()
 }
 
 #[cfg(feature = "openapi")]
@@ -10780,6 +10633,10 @@ enabled = true
         for (method, path) in [
             ("GET", "/static/app.js"),
             ("GET", "/static"),
+            // `_plugins/` is exempt only for the exact files of a bundle
+            // installed through `AppBuilder::plugin_assets`; anything else
+            // declared under it is still a shadowing attempt.
+            ("GET", "/static/_plugins/not-installed/evil.js"),
             ("POST", "/_autumn/unsubscribe"),
             ("GET", "/_autumn/jobs/abc"),
         ] {
@@ -15295,59 +15152,101 @@ pub fn check_sunset(
 }
 
 #[cfg(all(test, feature = "htmx"))]
-mod idiomorph_tests {
+mod framework_scripts_tests {
     use super::*;
     use http::StatusCode;
     use http_body_util::BodyExt;
+    use tower::ServiceExt as _;
+
+    async fn get(path: &str, if_none_match: Option<&str>) -> axum::response::Response {
+        let mut request = http::Request::builder().uri(path);
+        if let Some(tag) = if_none_match {
+            request = request.header(http::header::IF_NONE_MATCH, tag);
+        }
+        framework_scripts_router()
+            .with_state(AppState::for_test())
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn header(response: &axum::response::Response, name: http::HeaderName) -> &str {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+    }
+
+    /// Every framework script keeps its historical plain path. That path is
+    /// not content-fingerprinted, so it must revalidate (with a weak,
+    /// content-derived `ETag`) rather than advertise a year-long `immutable`
+    /// cache; otherwise returning clients run a stale copy after an upgrade.
+    #[tokio::test]
+    async fn plain_paths_revalidate_with_a_weak_etag() {
+        for (path, bytes) in [
+            (crate::htmx::HTMX_JS_PATH, crate::htmx::HTMX_JS),
+            (crate::htmx::HTMX_SSE_JS_PATH, crate::htmx::HTMX_SSE_JS),
+            (crate::htmx::IDIOMORPH_JS_PATH, crate::htmx::IDIOMORPH_JS),
+            (
+                crate::htmx::AUTUMN_WIDGETS_JS_PATH,
+                crate::htmx::AUTUMN_WIDGETS_JS,
+            ),
+            (
+                crate::htmx::HTMX_CSRF_JS_PATH,
+                crate::htmx::HTMX_CSRF_JS.as_bytes(),
+            ),
+        ] {
+            let response = get(path, None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                header(&response, http::header::CONTENT_TYPE),
+                "text/javascript; charset=utf-8",
+                "{path}"
+            );
+            let cc = header(&response, http::header::CACHE_CONTROL);
+            assert!(cc.contains("must-revalidate"), "{path}: {cc}");
+            assert!(!cc.contains("immutable"), "{path}: {cc}");
+            let etag = header(&response, http::header::ETAG);
+            assert!(etag.starts_with("W/\""), "{path}: {etag}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], bytes, "{path}");
+        }
+    }
+
+    /// The hashed path of every framework script is cached `immutable`, and
+    /// `asset_url` hands it out for the plain logical path.
+    #[tokio::test]
+    async fn fingerprinted_paths_are_immutable_and_resolved_by_asset_url() {
+        let mut seen = 0;
+        for asset in crate::htmx::framework_scripts() {
+            seen += 1;
+            assert_eq!(
+                crate::assets::asset_url(asset.logical_path()),
+                asset.url(),
+                "asset_url must return the hashed URL"
+            );
+            assert_ne!(asset.url(), asset.plain_url());
+            let response = get(asset.url(), None).await;
+            assert_eq!(response.status(), StatusCode::OK, "{}", asset.url());
+            assert_eq!(
+                header(&response, http::header::CACHE_CONTROL),
+                "public, max-age=31536000, immutable"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], asset.bytes());
+        }
+        assert_eq!(seen, 5, "htmx, sse, idiomorph, csrf helper, widgets");
+    }
 
     #[tokio::test]
-    async fn idiomorph_handler_returns_js_with_correct_headers() {
-        let response = idiomorph_handler().await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let ct = response
-            .headers()
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert_eq!(ct, "application/javascript");
-
-        let cc = response
-            .headers()
-            .get(http::header::CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        // The idiomorph URL is not content-fingerprinted, so the response must
-        // revalidate rather than advertise a year-long `immutable` cache. This
-        // guards against returning clients running a stale copy after the
-        // vendored bytes change.
-        assert!(
-            cc.contains("must-revalidate"),
-            "expected revalidating cache-control, got: {cc}"
-        );
-        assert!(
-            !cc.contains("immutable"),
-            "cache-control must not be immutable for a non-fingerprinted URL, got: {cc}"
-        );
-
-        // A weak, content-derived ETag lets caches revalidate (and pick up new
-        // bytes when the script changes). It is weak rather than strong because
-        // compression middleware may re-encode this response after the handler
-        // attaches the validator, so the identity/gzip/br variants share a tag
-        // despite differing byte streams.
-        let etag = response
-            .headers()
-            .get(http::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            etag.starts_with("W/\"idiomorph-") && etag.ends_with('"'),
-            "expected a weak quoted idiomorph ETag, got: {etag}"
-        );
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(!body.is_empty(), "idiomorph JS body must be non-empty");
+    async fn revalidation_with_the_current_etag_is_not_modified() {
+        let first = get(crate::htmx::HTMX_JS_PATH, None).await;
+        let etag = header(&first, http::header::ETAG).to_owned();
+        let second = get(crate::htmx::HTMX_JS_PATH, Some(&etag)).await;
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        let body = second.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
     }
 }
 

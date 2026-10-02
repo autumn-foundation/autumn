@@ -147,6 +147,7 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "maud")]
         story_gallery: None,
         declared_routes: Vec::new(),
+        plugin_asset_bundles: Vec::new(),
         idempotency_enabled: false,
         #[cfg(feature = "mail")]
         mail_interceptor: None,
@@ -589,6 +590,10 @@ pub struct AppBuilder {
     /// harness that dropped them would mount a colliding plugin cleanly in
     /// tests and panic at boot in production.
     pub(crate) declared_routes: Vec<crate::route_listing::RouteInfo>,
+    /// Asset bundles installed via [`plugin_assets`](Self::plugin_assets),
+    /// kept so a second bundle claiming a taken namespace is refused.
+    /// `pub(crate)` so [`TestApp`](crate::test::TestApp) can carry them.
+    pub(crate) plugin_asset_bundles: Vec<&'static crate::assets::PluginAssets>,
     /// Whether `.idempotent()` was called on this builder. Applied to the
     /// loaded `AutumnConfig` before router assembly so that startup validation
     /// and `apply_middleware` both see `config.idempotency.enabled = true`.
@@ -1590,6 +1595,65 @@ impl AppBuilder {
             self.declared_routes.push(route);
         }
         self
+    }
+
+    /// Serve a [`PluginAssets`](crate::assets::PluginAssets) bundle: files
+    /// compiled into a crate, with content-hashed URLs.
+    ///
+    /// Call this from [`Plugin::build`](crate::plugin::Plugin::build). The
+    /// bundle is mounted under `/static/_plugins/<namespace>/`, each file at
+    /// its plain URL (`must-revalidate`) and its fingerprinted URL (`immutable`
+    /// for a year), and its routes are declared for `autumn routes` as public
+    /// static files. After this,
+    /// [`asset_url("_plugins/<namespace>/<file>")`](crate::assets::asset_url)
+    /// returns the fingerprinted URL.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::assets::PluginAssets;
+    ///
+    /// pub static ASSETS: PluginAssets = autumn_web::plugin_assets!("motion");
+    ///
+    /// impl Plugin for MotionPlugin {
+    ///     fn build(self, app: AppBuilder) -> AppBuilder {
+    ///         app.plugin_assets(&ASSETS)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Installing the same bundle twice is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a *different* bundle with the same namespace is already
+    /// installed. The two would fight over the same URLs.
+    #[must_use]
+    pub fn plugin_assets(mut self, assets: &'static crate::assets::PluginAssets) -> Self {
+        if let Some(existing) = self
+            .plugin_asset_bundles
+            .iter()
+            .find(|installed| installed.namespace() == assets.namespace())
+        {
+            assert!(
+                std::ptr::eq(*existing, assets),
+                "two different PluginAssets bundles use the namespace `{}`; each bundle needs \
+                 its own namespace because it becomes the URL path {}",
+                assets.namespace(),
+                assets.mount_path(),
+            );
+            return self;
+        }
+        self.plugin_asset_bundles.push(assets);
+        crate::assets::plugin::register(assets);
+        if assets.iter().next().is_none() {
+            tracing::warn!(
+                namespace = assets.namespace(),
+                "PluginAssets bundle has no files; nothing to serve"
+            );
+            return self;
+        }
+        let mount = assets.mount_path();
+        self.nest(&mount, assets.nested_router())
+            .declare_plugin_routes(assets.route_infos())
     }
 
     /// The route manifest this builder would dump for `autumn routes` —
@@ -3676,6 +3740,7 @@ impl AppBuilder {
             #[cfg(feature = "maud")]
             story_gallery,
             declared_routes,
+            plugin_asset_bundles: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -6015,6 +6080,7 @@ impl AppBuilder {
             #[cfg(feature = "maud")]
             story_gallery,
             declared_routes: _,
+            plugin_asset_bundles: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -18212,72 +18278,59 @@ mod tests {
         assert_eq!(&body[..], b"created");
     }
 
+    /// Through the full router, so the global `AssetCacheControlLayer` (which
+    /// re-stamps `Cache-Control` on every successful `/static/` response) is
+    /// in play: the plain htmx path revalidates and the hashed one, which
+    /// that layer must recognise as fingerprinted, stays `immutable`.
     #[cfg(feature = "htmx")]
     #[tokio::test]
-    async fn htmx_handler_returns_javascript_with_correct_headers() {
-        let app = axum::Router::new().route(
-            crate::htmx::HTMX_JS_PATH,
-            axum::routing::get(crate::router::htmx_handler),
-        );
+    async fn htmx_is_served_at_plain_and_fingerprinted_paths_with_matching_cache_policy() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+        let get = |uri: String| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(crate::htmx::HTMX_JS_PATH)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+        let plain = get(crate::htmx::HTMX_JS_PATH.to_owned()).await;
+        assert_eq!(plain.status(), StatusCode::OK);
+        let content_type = plain.headers()["content-type"].to_str().unwrap();
+        assert!(
+            content_type.contains("javascript"),
+            "Expected JavaScript, got {content_type}"
+        );
+        let cache_control = plain.headers()["cache-control"].to_str().unwrap();
+        assert_eq!(cache_control, "public, max-age=0, must-revalidate");
+        assert!(plain.headers().contains_key("etag"));
+        let body = axum::body::to_bytes(plain.into_body(), usize::MAX)
             .await
             .unwrap();
+        assert_eq!(&body[..], crate::htmx::HTMX_JS);
 
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(
-            content_type.contains("application/javascript"),
-            "Expected application/javascript, got {content_type}"
+        let hashed_url = crate::assets::asset_url("js/htmx.min.js");
+        assert_ne!(hashed_url, crate::htmx::HTMX_JS_PATH);
+        let hashed = get(hashed_url).await;
+        assert_eq!(hashed.status(), StatusCode::OK);
+        assert_eq!(
+            hashed.headers()["cache-control"].to_str().unwrap(),
+            "public, max-age=31536000, immutable"
         );
-
-        let cache_control = response
-            .headers()
-            .get("cache-control")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(
-            cache_control.contains("immutable"),
-            "Expected immutable cache, got {cache_control}"
-        );
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(hashed.into_body(), usize::MAX)
             .await
             .unwrap();
-
-        // Body length matches the embedded file
-        assert_eq!(body.len(), crate::htmx::HTMX_JS.len());
-
-        // Body starts with valid JavaScript
-        let start = std::str::from_utf8(&body[..50]).expect("htmx should be valid UTF-8");
-        assert!(
-            start.contains("htmx") || start.contains("function"),
-            "Response doesn't look like htmx JavaScript: {start}"
-        );
+        assert_eq!(&body[..], crate::htmx::HTMX_JS);
     }
 
     #[cfg(feature = "htmx")]
     #[tokio::test]
-    async fn htmx_csrf_handler_returns_csp_compatible_javascript() {
-        let app = axum::Router::new().route(
-            crate::htmx::HTMX_CSRF_JS_PATH,
-            axum::routing::get(crate::router::htmx_csrf_handler),
-        );
+    async fn htmx_csrf_helper_is_csp_compatible_javascript() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
 
-        let response = app
+        let response = router
             .oneshot(
                 Request::builder()
                     .uri(crate::htmx::HTMX_CSRF_JS_PATH)
@@ -18293,7 +18346,7 @@ mod tests {
                 .headers()
                 .get("content-type")
                 .and_then(|value| value.to_str().ok()),
-            Some("application/javascript")
+            Some("text/javascript; charset=utf-8")
         );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
