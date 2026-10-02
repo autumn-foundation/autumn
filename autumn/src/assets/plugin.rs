@@ -91,7 +91,7 @@ enum Mount {
 
 /// A set of files compiled into a crate and served with content-hashed URLs.
 ///
-/// Build one with [`plugin_assets!`](crate::plugin_assets) (a directory) or
+/// Build one with `plugin_assets!` (a directory; `embed-assets` feature) or
 /// [`PluginAssets::from_files`] (an explicit list), store it in a `static`,
 /// and install it with
 /// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets). See
