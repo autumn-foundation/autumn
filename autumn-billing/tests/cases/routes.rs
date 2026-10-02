@@ -634,6 +634,95 @@ async fn boot_fails_when_declared_endpoint_preset_differs_from_provider() {
     );
 }
 
+/// What `autumn.toml` gives an app that follows the guide: an endpoint entry
+/// without `max_body_bytes`, so the webhook default (1 MiB). `BillingConfig::
+/// webhook_endpoint()` raises it to 4 MiB, but only the test helpers call that.
+const WEBHOOK_DEFAULT_BODY_LIMIT: usize = 1024 * 1024;
+/// The least the billing receiver needs: provider events carrying many invoice
+/// lines outgrow the default, and an oversized body is a 400 the provider
+/// retries forever without the event ever reaching reconciliation.
+const BILLING_MIN_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+#[tokio::test]
+async fn boot_fails_when_declared_endpoint_body_limit_is_below_the_billing_minimum() {
+    let billing = support::config();
+    let mut autumn = support::autumn_config(&billing);
+    autumn
+        .security
+        .webhooks
+        .endpoints
+        .first_mut()
+        .expect("declared endpoint")
+        .max_body_bytes = WEBHOOK_DEFAULT_BODY_LIMIT;
+    let message = boot_panic_message(|| {
+        support::harness_with(
+            billing,
+            autumn,
+            MemoryBillingStore::shared(),
+            FakeProvider::new(),
+            pinned,
+        )
+    });
+    assert!(message.contains("max_body_bytes"), "{message}");
+    // Both what the entry declares and what is needed, so the fix is obvious.
+    assert!(
+        message.contains(&WEBHOOK_DEFAULT_BODY_LIMIT.to_string()),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("max_body_bytes = {BILLING_MIN_BODY_LIMIT}")),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn boot_accepts_a_declared_endpoint_with_a_larger_body_limit() {
+    let billing = support::config();
+    let mut autumn = support::autumn_config(&billing);
+    autumn
+        .security
+        .webhooks
+        .endpoints
+        .first_mut()
+        .expect("declared endpoint")
+        .max_body_bytes = BILLING_MIN_BODY_LIMIT * 2;
+    // A larger limit is the app's call; only a smaller one fails boot.
+    let _harness = support::harness_with(
+        billing,
+        autumn,
+        MemoryBillingStore::shared(),
+        FakeProvider::new(),
+        pinned,
+    );
+}
+
+/// The guide's snippet is what an app copies into `autumn.toml`, so the entry
+/// it shows must itself pass the boot check, not just the test helper's.
+#[test]
+fn the_guides_endpoint_snippet_declares_a_sufficient_body_limit() {
+    let guide = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../docs/guide/billing.md"
+    ))
+    .expect("read the billing guide");
+    let block = guide
+        .split("```toml")
+        .skip(1)
+        .filter_map(|rest| rest.split("```").next())
+        .find(|block| block.contains("[[security.webhooks.endpoints]]"))
+        .expect("the guide shows the endpoint entry");
+    let value: toml::Value = toml::from_str(block).expect("the snippet is valid TOML");
+    let entry = value["security"]["webhooks"]["endpoints"][0].clone();
+    let endpoint: autumn_web::webhook::WebhookEndpointConfig =
+        entry.try_into().expect("the snippet is a webhook endpoint");
+    assert!(
+        endpoint.max_body_bytes >= BILLING_MIN_BODY_LIMIT,
+        "the guide's snippet declares max_body_bytes = {}, below the {BILLING_MIN_BODY_LIMIT} \
+         the billing receiver needs",
+        endpoint.max_body_bytes
+    );
+}
+
 #[tokio::test]
 async fn boot_fails_when_webhook_endpoint_is_undeclared() {
     let billing = support::config();
@@ -666,6 +755,11 @@ async fn boot_fails_when_webhook_endpoint_is_undeclared() {
         "{message}"
     );
     assert!(message.contains("_WEBHOOK_SECRET"), "{message}");
+    // The entry it prints is what an app pastes in, so it carries the limit.
+    assert!(
+        message.contains(&format!("max_body_bytes = {BILLING_MIN_BODY_LIMIT}")),
+        "{message}"
+    );
 }
 
 #[tokio::test]

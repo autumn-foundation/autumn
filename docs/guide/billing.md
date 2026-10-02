@@ -35,7 +35,14 @@ name = "billing"
 path = "/billing/webhook"
 provider = "stripe"
 secret_env = "STRIPE_WEBHOOK_SECRET"
+max_body_bytes = 4194304
 ```
+
+`max_body_bytes` is not optional here. The webhook default is 1 MiB, and a
+provider event that carries many invoice lines can be larger. An oversized body
+is rejected before it is reconciled, the provider retries it unchanged, and the
+event is never applied, so billing state goes stale. Boot fails if the entry
+allows less than 4 MiB (a larger limit is yours to choose).
 
 Boot fails with this exact snippet when the endpoint is missing.
 

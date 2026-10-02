@@ -403,6 +403,20 @@ fn verify_webhook_endpoint(
         .iter()
         .find(|endpoint| endpoint.path == path);
     match declared {
+        Some(endpoint)
+            if endpoint.provider == expected.provider
+                && endpoint.max_body_bytes < config::WEBHOOK_MAX_BODY_BYTES =>
+        {
+            Err(AutumnError::internal_server_error_msg(format!(
+                "autumn-billing: the signed webhook endpoint at {path} allows request bodies of \
+                 {} bytes, but billing events can be larger (invoices with many lines) and an \
+                 oversized body is rejected before it is reconciled, so the provider retries it \
+                 forever. Set max_body_bytes = {} on the [[security.webhooks.endpoints]] entry \
+                 in autumn.toml.",
+                endpoint.max_body_bytes,
+                config::WEBHOOK_MAX_BODY_BYTES
+            )))
+        }
         Some(endpoint) if endpoint.provider == expected.provider => Ok(()),
         Some(endpoint) => Err(AutumnError::internal_server_error_msg(format!(
             "autumn-billing: the signed webhook endpoint at {path} declares provider = \"{}\", \
@@ -417,9 +431,11 @@ fn verify_webhook_endpoint(
              name = \"{}\"\n\
              path = \"{path}\"\n\
              provider = \"{preset}\"\n\
-             secret_env = \"{}_WEBHOOK_SECRET\"",
+             secret_env = \"{}_WEBHOOK_SECRET\"\n\
+             max_body_bytes = {}",
             config.endpoint_name,
-            provider.name().to_uppercase()
+            provider.name().to_uppercase(),
+            config::WEBHOOK_MAX_BODY_BYTES
         ))),
     }
 }
