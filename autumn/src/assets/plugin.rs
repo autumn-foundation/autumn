@@ -456,16 +456,46 @@ impl PluginAssets {
         files.sort_by(|a, b| a.0.cmp(&b.0));
         files.dedup_by(|a, b| a.0 == b.0);
 
+        // Hash once, then drop any file whose own path is another file's
+        // fingerprinted path (`app.js` hashing to `2d711642` next to a file
+        // literally named `app.2d711642.js`): both would claim one URL, and
+        // axum refuses to route a path twice.
+        let hashed: Vec<(String, &'static [u8], Hashes)> = files
+            .into_iter()
+            .map(|(path, bytes)| {
+                let hashes = Hashes::of(bytes);
+                (path, bytes, hashes)
+            })
+            .collect();
+        let fingerprinted_names: std::collections::HashSet<String> = hashed
+            .iter()
+            .map(|(path, _, hashes)| fingerprinted_name(path, &hashes.short))
+            .collect();
+        let hashed: Vec<(String, &'static [u8], Hashes)> = hashed
+            .into_iter()
+            .filter(|(path, _, _)| {
+                let collides = fingerprinted_names.contains(path);
+                if collides {
+                    tracing::warn!(
+                        namespace = self.namespace,
+                        asset = %path,
+                        "PluginAssets: skipping a file whose path is another file's \
+                         fingerprinted URL"
+                    );
+                }
+                !collides
+            })
+            .collect();
+
         let mount = self.mount_path();
         let rel_mount = mount.strip_prefix("/static").unwrap_or("");
         let rel_mount = rel_mount.strip_prefix('/').unwrap_or(rel_mount);
         let mut index = Index {
-            assets: Vec::with_capacity(files.len()),
-            by_logical: HashMap::with_capacity(files.len()),
-            by_fingerprinted_rel: HashMap::with_capacity(files.len()),
+            assets: Vec::with_capacity(hashed.len()),
+            by_logical: HashMap::with_capacity(hashed.len()),
+            by_fingerprinted_rel: HashMap::with_capacity(hashed.len()),
         };
-        for (logical_path, bytes) in files {
-            let hashes = Hashes::of(bytes);
+        for (logical_path, bytes, hashes) in hashed {
             let fingerprinted = fingerprinted_name(&logical_path, &hashes.short);
             let fingerprinted_rel = if rel_mount.is_empty() {
                 fingerprinted.clone()
@@ -863,6 +893,41 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// A file named like another file's fingerprinted URL would claim the same
+    /// route; it is dropped rather than letting router construction panic.
+    #[tokio::test]
+    async fn a_file_named_like_another_files_hashed_url_is_dropped() {
+        static COLLIDING: OnceLock<PluginAssets> = OnceLock::new();
+        static FILES: OnceLock<Vec<(&'static str, &'static [u8])>> = OnceLock::new();
+        let hashed_name: &'static str =
+            Box::leak(fingerprinted_name("app.js", &expected_short(b"real app")).into_boxed_str());
+        let files = FILES.get_or_init(|| {
+            vec![
+                ("app.js", b"real app".as_slice()),
+                (hashed_name, b"imposter".as_slice()),
+            ]
+        });
+        let bundle = COLLIDING.get_or_init(|| PluginAssets::from_files("unit-test-collide", files));
+
+        let paths: Vec<&str> = bundle.iter().map(PluginAsset::logical_path).collect();
+        assert_eq!(paths, ["app.js"]);
+        let response = bundle
+            .router::<()>()
+            .oneshot(
+                Request::builder()
+                    .uri(bundle.url("app.js"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"real app");
     }
 
     #[test]
