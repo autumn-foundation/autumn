@@ -1758,12 +1758,23 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                             break;
                         }
                         let code = strip_line_comment(tk);
-                        if code.contains(FEATURE) {
-                            already_present = true;
-                        }
-                        if find_unquoted(code, ']').is_some() {
+                        if let Some(close_idx) = find_unquoted(code, ']') {
+                            // Unlike the subtable form, an inline table's `}`
+                            // can carry more comma-separated fields after the
+                            // array's `]` on this same line (`], path = "…" }`)
+                            // — Codex review on #3084 found a field whose own
+                            // string value happened to equal the feature name
+                            // (`path = "oauth2"`) made this look merged
+                            // already when the array itself was not. Only the
+                            // portion before `]` is the array.
+                            if code[..close_idx].contains(FEATURE) {
+                                already_present = true;
+                            }
                             close_line = Some(k);
                             break;
+                        }
+                        if code.contains(FEATURE) {
+                            already_present = true;
                         }
                         k += 1;
                     }
@@ -2075,12 +2086,23 @@ fn ensure_autumn_web_mail_feature(toml: &str) -> String {
                             break;
                         }
                         let code = strip_line_comment(tk);
-                        if code.contains(FEATURE) {
-                            already_present = true;
-                        }
-                        if find_unquoted(code, ']').is_some() {
+                        if let Some(close_idx) = find_unquoted(code, ']') {
+                            // Unlike the subtable form, an inline table's `}`
+                            // can carry more comma-separated fields after the
+                            // array's `]` on this same line (`], path = "…" }`)
+                            // — Codex review on #3084 found a field whose own
+                            // string value happened to equal the feature name
+                            // (`path = "oauth2"`) made this look merged
+                            // already when the array itself was not. Only the
+                            // portion before `]` is the array.
+                            if code[..close_idx].contains(FEATURE) {
+                                already_present = true;
+                            }
                             close_line = Some(k);
                             break;
+                        }
+                        if code.contains(FEATURE) {
+                            already_present = true;
                         }
                         k += 1;
                     }
@@ -11447,12 +11469,23 @@ fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
                             break;
                         }
                         let code = strip_line_comment(tk);
-                        if code.contains(FEATURE) {
-                            already_present = true;
-                        }
-                        if find_unquoted(code, ']').is_some() {
+                        if let Some(close_idx) = find_unquoted(code, ']') {
+                            // Unlike the subtable form, an inline table's `}`
+                            // can carry more comma-separated fields after the
+                            // array's `]` on this same line (`], path = "…" }`)
+                            // — Codex review on #3084 found a field whose own
+                            // string value happened to equal the feature name
+                            // (`path = "oauth2"`) made this look merged
+                            // already when the array itself was not. Only the
+                            // portion before `]` is the array.
+                            if code[..close_idx].contains(FEATURE) {
+                                already_present = true;
+                            }
                             close_line = Some(k);
                             break;
+                        }
+                        if code.contains(FEATURE) {
+                            already_present = true;
                         }
                         k += 1;
                     }
@@ -16534,6 +16567,48 @@ mod tests {
             out.matches("\"oauth2\"").count(),
             1,
             "oauth2 duplicated: {out}"
+        );
+    }
+
+    // Codex review on #3084: an inline table's `}` can carry another
+    // comma-separated field after the array's `]` on the same line, unlike
+    // the subtable form. The "already present?" check read the whole
+    // closing line, so a field whose own string value happened to equal the
+    // feature name (`path = "mail"`) made the array look already merged
+    // when it was not, and the feature never got added.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_field_value_matching_feature_name_is_not_mistaken_for_already_present()
+     {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n], path = \"mail\" }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(
+            out.matches("\"mail\"").count(),
+            2,
+            "mail must be merged into the array, not mistaken for the trailing path field: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_inline_table_field_value_matching_feature_name_is_not_mistaken_for_already_present()
+     {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n], path = \"webauthn\" }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            2,
+            "webauthn must be merged into the array, not mistaken for the trailing path field: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_inline_table_field_value_matching_feature_name_is_not_mistaken_for_already_present()
+     {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n], path = \"oauth2\" }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            2,
+            "oauth2 must be merged into the array, not mistaken for the trailing path field: {out}"
         );
     }
 
