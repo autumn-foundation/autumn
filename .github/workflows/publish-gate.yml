@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Run the posture gate over the example apps
         run: ./scripts/check-posture-gate.sh
@@ -117,7 +117,7 @@ jobs:
                       /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
 
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
 
@@ -188,7 +188,7 @@ jobs:
     needs: metadata
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Verify every publishable crate can be packaged
         run: ./scripts/check-publish-dry-run.sh
@@ -202,7 +202,7 @@ jobs:
     needs: metadata
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rust-docs
       - uses: Swatinem/rust-cache@v2
@@ -224,7 +224,7 @@ jobs:
       # Pinned toolchain for cargo-semver-checks — must stay in sync with
       # AUTUMN_SEMVER_RUST_VERSION's default in scripts/check-semver.sh
       # (1.94.1: aws-smithy MSRV floor; 1.96.0 ICEs — see script comment).
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       # protoc is required by telemetry-otlp (prost/tonic) in the broadened
       # feature set check-semver.sh enables; it is not in the standard
@@ -287,7 +287,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
       # install-action skips its verified download when the pinned version is
       # already there — the auditor this gate trusts must come from the pin,
@@ -334,7 +334,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Generate and verify the workspace SBOM
         env:
@@ -393,7 +393,7 @@ jobs:
     needs: [package, docs]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Create smoke project
@@ -484,7 +484,7 @@ jobs:
       # could have been truncated, replaced, or built from a different tree.
       # `--verify` regenerates from THIS checkout and diffs component by
       # component; `--expect-version` pins it to the tag being released.
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: Re-verify the downloaded SBOM against the tagged source
         env:

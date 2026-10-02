@@ -228,7 +228,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: dtolnay/rust-toolchain@1.120.0
       - name: "autumn new my-app against published autumn-web"
         # Hard-gated, deliberately no continue-on-error: `autumn new` has no
         # version pin to drift against, so a failure here is always a real

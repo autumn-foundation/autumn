@@ -88,7 +88,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.99.0
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           targets: ${{ matrix.target }}
 
