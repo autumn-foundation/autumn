@@ -26,7 +26,7 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
-struct Page {
+struct Listing {
     page: Option<u32>,
     per_page: Option<u32>,
     sort: Option<String>,
@@ -77,7 +77,7 @@ const SEARCH: &str = "q=caf%C3%A9%20au%20lait%20%26%20cr%C3%AApes&ids[]=101&ids[
 &extra[utm_source]=newsletter&extra[utm_medium]=email&extra[ref]=home";
 
 fn round() {
-    black_box(from_query_str::<Page>(black_box(FLAT)).ok());
+    black_box(from_query_str::<Listing>(black_box(FLAT)).ok());
     black_box(from_query_str::<Faceted>(black_box(FACETED)).ok());
     black_box(from_query_str::<Search>(black_box(SEARCH)).ok());
 }
