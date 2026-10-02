@@ -2173,12 +2173,17 @@ fn reject_declared_framework_collisions(
         // whether it would panic (at the prefix, or a catch-all) or mount
         // quietly and shadow what the framework serves there.
         //
-        // `PluginAssets` bundles mount under `/static/_plugins/` too, but their
-        // routes never reach this check: the builder that installed them
-        // strips them out first (`plugin::without_bundle_routes`).
+        // The one exception is a `PluginAssets` file, which the framework
+        // itself mounts under `/static/_plugins/<namespace>/`: a `GET` there
+        // carrying the asset marker. Only `AppBuilder::plugin_assets` attaches
+        // that marker (`declare_plugin_routes`, and so every sandbox
+        // manifest, strips it), so any other declared route under `/static`
+        // is still refused. The exempt entries still reach the duplicate-route
+        // pass, so an app route at a bundle URL is a typed collision too.
         if let Some(namespace) = framework_namespaces()
             .iter()
             .find(|namespace| path_is_under_namespace(&declared.path, namespace))
+            && !crate::assets::plugin::is_framework_asset_route(declared)
         {
             return Err(RouterBuildError::DuplicateUserRoute {
                 method: declared.method.clone(),

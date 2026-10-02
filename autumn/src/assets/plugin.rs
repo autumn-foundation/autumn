@@ -711,35 +711,23 @@ fn split_plugin_rel(rel: &str) -> Option<(&'static PluginAssets, &str)> {
     Some((registered(namespace)?, path))
 }
 
-/// `declared` without the routes `bundles` generated: every `GET` at a URL
-/// one of them serves.
+/// `true` for a route `AppBuilder::plugin_assets` declared: a `GET` under
+/// `/static/_plugins/` carrying [`PLUGIN_ASSETS_ROUTE_MARKER`].
 ///
-/// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets)
-/// declares a bundle's routes so `autumn routes` lists them and the audit sees
-/// its `nest` covered. They sit under `/static`, which the router's
-/// duplicate-route preflight refuses for every declared route, so the builder
-/// passes the preflight its declared routes minus these. Only the builder's
-/// *own* bundles are subtracted, and only `GET`: any other method declared at
-/// one of those paths, or any route under `/static/_plugins/` no installed
-/// bundle serves, still meets the refusal.
-pub(crate) fn without_bundle_routes(
-    declared: Vec<crate::route_listing::RouteInfo>,
-    bundles: &[&'static PluginAssets],
-) -> Vec<crate::route_listing::RouteInfo> {
-    if bundles.is_empty() {
-        return declared;
-    }
-    declared
-        .into_iter()
-        .filter(|route| {
-            !(route.method.eq_ignore_ascii_case("GET")
-                && bundles.iter().any(|bundle| {
-                    bundle
-                        .iter()
-                        .any(|asset| asset.plain_url == route.path || asset.url == route.path)
-                }))
-        })
-        .collect()
+/// The router's duplicate-route preflight refuses every declared route under
+/// `/static`; these are the framework's own mounts, so it lets them through.
+/// The marker cannot be forged: `declare_plugin_routes` (and with it every
+/// sandbox manifest) strips it.
+pub(crate) fn is_framework_asset_route(route: &crate::route_listing::RouteInfo) -> bool {
+    route.method.eq_ignore_ascii_case("GET")
+        && route
+            .path
+            .strip_prefix(PLUGIN_ASSETS_PREFIX)
+            .is_some_and(|rest| rest.starts_with('/'))
+        && route
+            .middleware
+            .iter()
+            .any(|label| label == PLUGIN_ASSETS_ROUTE_MARKER)
 }
 
 /// The fingerprinted URL for `rel` (a path relative to `/static/`) when it
@@ -1066,41 +1054,45 @@ mod tests {
     }
 
     #[test]
-    fn without_bundle_routes_strips_only_this_builders_bundle_gets() {
-        static MINE: PluginAssets = PluginAssets::from_files("unit-test-strip", &[("a.js", b"a")]);
-        let route = |method: &str, path: &str| crate::route_listing::RouteInfo {
+    fn only_marked_get_asset_routes_count_as_framework_asset_routes() {
+        let route = |method: &str, path: &str, marked: bool| crate::route_listing::RouteInfo {
             method: method.to_owned(),
             path: path.to_owned(),
+            middleware: if marked {
+                vec![PLUGIN_ASSETS_ROUTE_MARKER.to_owned()]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         };
-        let hashed = MINE.url("a.js");
-        let declared = vec![
-            route("GET", "/static/_plugins/unit-test-strip/a.js"),
-            route("GET", &hashed),
-            route("POST", "/static/_plugins/unit-test-strip/a.js"),
-            route("GET", "/static/_plugins/unit-test-strip/other.js"),
-            route("GET", "/static/app.js"),
-        ];
-        let kept: Vec<(String, String)> = without_bundle_routes(declared.clone(), &[&MINE])
-            .into_iter()
-            .map(|r| (r.method, r.path))
-            .collect();
-        assert_eq!(
-            kept,
-            [
-                (
-                    "POST".to_owned(),
-                    "/static/_plugins/unit-test-strip/a.js".to_owned()
-                ),
-                (
-                    "GET".to_owned(),
-                    "/static/_plugins/unit-test-strip/other.js".to_owned()
-                ),
-                ("GET".to_owned(), "/static/app.js".to_owned()),
-            ]
-        );
-        // A bundle this builder did not install strips nothing.
-        assert_eq!(without_bundle_routes(declared, &[]).len(), 5);
+        assert!(is_framework_asset_route(&route(
+            "GET",
+            "/static/_plugins/ns/a.js",
+            true
+        )));
+        // No marker: a plugin declared it by hand.
+        assert!(!is_framework_asset_route(&route(
+            "GET",
+            "/static/_plugins/ns/a.js",
+            false
+        )));
+        // Bundles only ever mount GETs.
+        assert!(!is_framework_asset_route(&route(
+            "POST",
+            "/static/_plugins/ns/a.js",
+            true
+        )));
+        // Outside the bundle prefix, the marker means nothing.
+        assert!(!is_framework_asset_route(&route(
+            "GET",
+            "/static/app.js",
+            true
+        )));
+        assert!(!is_framework_asset_route(&route(
+            "GET",
+            "/static/_pluginsx/a.js",
+            true
+        )));
     }
 
     #[test]

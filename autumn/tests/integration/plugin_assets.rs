@@ -279,3 +279,46 @@ fn declare_plugin_routes_strips_a_forged_asset_marker() {
         .expect("declared route is listed");
     assert_eq!(forged.middleware, ["secured"]);
 }
+
+/// An app route at the same URL as a bundle file is a typed
+/// `DuplicateUserRoute` refusal at startup, not an axum overlapping-route
+/// panic: the bundle's routes stay visible to the duplicate-route preflight.
+#[test]
+#[should_panic(expected = "DuplicateUserRoute")]
+fn an_app_route_at_a_bundle_url_is_a_typed_collision() {
+    #[autumn_web::get("/static/_plugins/it-charts/charts.js")]
+    async fn shadow() -> &'static str {
+        "shadowed"
+    }
+    let _client = TestApp::new()
+        .routes(autumn_web::routes![shadow])
+        .plugin(ChartsPlugin)
+        .build();
+}
+
+/// A plugin that hand-declares a `GET` at a bundle path, without the marker
+/// only `AppBuilder::plugin_assets` can attach, gets no exemption: it is a
+/// typed collision with the bundle's own route, never a silent shadow. (At a
+/// `/static/_plugins/` path no bundle serves, the `/static` namespace refusal
+/// catches it instead; the router's own tests cover that case.)
+#[test]
+#[should_panic(expected = "incoming: \"it-declares-over-asset::get\"")]
+fn an_unmarked_get_declared_at_a_bundle_path_is_refused() {
+    struct DeclaresOverAssetPlugin;
+    impl Plugin for DeclaresOverAssetPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "it-declares-over-asset".into()
+        }
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            app.plugin_assets(&CHARTS).declare_plugin_routes(vec![
+                autumn_web::route_listing::RouteInfo {
+                    method: "GET".to_owned(),
+                    path: "/static/_plugins/it-charts/charts.js".to_owned(),
+                    handler: "it-declares-over-asset::get".to_owned(),
+                    ..Default::default()
+                },
+            ])
+        }
+    }
+    let _client = TestApp::new().plugin(DeclaresOverAssetPlugin).build();
+}
