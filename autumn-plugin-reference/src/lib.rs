@@ -47,7 +47,7 @@ pub const PREFIX: &str = "/reference";
 /// Derived from the crate's own version rather than hard-coded, because the
 /// reference plugin ships *inside* the framework repository and is by
 /// construction always in lockstep with it. A real out-of-tree plugin either
-/// writes a literal (`"0.7"`) or, if it too releases in lockstep, calls this
+/// writes a literal (`"0.8"`) or, if it too releases in lockstep, calls this
 /// same helper.
 #[must_use]
 pub fn declared_autumn_web_range() -> String {

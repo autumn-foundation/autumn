@@ -146,7 +146,7 @@ per-file verdict. Here is a real run in an app scaffolded before this feature
 existed — which is every app that exists today:
 
 ```text
-Scaffold files (unknown -> 0.7.0)
+Scaffold files (unknown -> 0.8.0)
   This project predates scaffold provenance, so there is no record of
   what Autumn originally wrote. Files it is missing are offered; every
   file that differs is a conflict for you to review.
@@ -176,7 +176,7 @@ Nothing was written. Re-run with `--apply` to take the writable ones.
 Each file's diff is above; `git status` and `git diff` show what is yours.
 Conflicts are never overwritten. Take what you want from this release's
 version, or `autumn upgrade --accept <path>` to keep yours for good.
-Upgrade guide: https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.7.0.md
+Upgrade guide: https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.8.0.md
 ```
 
 Once the project has a baseline — see [How it knows you edited a
@@ -287,8 +287,8 @@ contents nor its timestamp can answer that. So `autumn new` records a digest of
 every framework-owned file as it writes it, in `.autumn/scaffold.toml`:
 
 ```toml
-version = "0.7.0"
-written_by = "0.7.0"
+version = "0.8.0"
+written_by = "0.8.0"
 flavor = "fullstack"
 i18n = false
 seed = false
@@ -435,7 +435,7 @@ same `scaffold` key, so one `jq '.scaffold.drift'` works against either:
 {
   "scaffold": {
     "baseline": "0.7.0",
-    "target": "0.7.0",
+    "target": "0.8.0",
     "named": true,
     "has_manifest": true,
     "workspace_member": false,
@@ -445,7 +445,7 @@ same `scaffold` key, so one `jq '.scaffold.drift'` works against either:
     "written": 0,
     "conflicts": 1,
     "pinned": 0,
-    "guide": "https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.7.0.md",
+    "guide": "https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.8.0.md",
     "files": [
       { "path": "clippy.toml", "status": "add", "reason": "…", "applied": true }
     ]
@@ -506,7 +506,7 @@ autumn upgrade --check
 
 # 8. Now bump the library and build.
 #    (The codemods migrate FROM the version Cargo.toml records, so this is last.)
-cargo add autumn-web@0.7.0
+cargo add autumn-web@0.8.0
 cargo check
 
 # 9. Read the release's migration guide for anything mechanical rewriting

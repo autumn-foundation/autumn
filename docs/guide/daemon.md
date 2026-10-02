@@ -191,7 +191,7 @@ Postgres) into the generated `Cargo.toml` for you. Wiring the provider into an
 existing app means adding it yourself:
 
 ```toml
-autumn-web = { version = "0.7", features = ["managed-pg"] }
+autumn-web = { version = "0.8", features = ["managed-pg"] }
 ```
 
 It wires a `ManagedPostgresPoolProvider` through the existing

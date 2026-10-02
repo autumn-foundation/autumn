@@ -1,18 +1,21 @@
-# autumn-web API Reference (0.7.0)
+# autumn-web API Reference (0.8.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.7.0**, the current release line,
+Version identity: this reference tracks **0.8.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
-arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
-0.6.x and earlier. Unmarked entries predate 0.6.0.
+arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
+earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries predate 0.6.0.
 
 ## Published crates
 
 | Crate | Directory | Notes |
 |---|---|---|
-| `autumn-macros` | `autumn-macros/` | Proc macros; publish first |
+| `autumn-macros-support` | `autumn-macros-support/` | Shared codegen helpers; no Autumn runtime deps, every macro crate pins it, so publish first |
+| `autumn-macros` | `autumn-macros/` | Core proc macros (routes, handlers, edge); depends on `autumn-macros-support` |
+| `autumn-macros-model` | `autumn-macros-model/` | `#[model]` / `#[commentable]` codegen; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
+| `autumn-macros-repository` | `autumn-macros-repository/` | `#[repository]` / `#[service]` codegen; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
 | `autumn-schema-core` | `autumn-schema-core/` | Schema primitives shared by the CLI; no Autumn runtime deps |
 | `autumn-edge` | `autumn-edge/` | Edge/WASM capsule runtime; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
 | `autumn-web` | `autumn/` | Main framework crate; import path `autumn_web` |
@@ -25,7 +28,7 @@ arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.7.0`. This table lists the same crates, in the same order, as
+together at `0.8.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 
@@ -37,7 +40,7 @@ copy of the publish order.
 - `autumn_web::slugify(&str) -> String` — URL-safe slug. **Never returns
   `""`**: input with nothing to slugify (empty, all punctuation, un-folded
   non-Latin) gets a stable, deterministic hash fallback token instead.
-- `autumn_web::contains_letter_or_number(&str) -> bool` (unreleased, #2424) —
+- `autumn_web::contains_letter_or_number(&str) -> bool` (0.8.0, #2424) —
   the input check `slugify` cannot answer. Reach for it to reject content-free
   user input (`"***"`, `"🎉🔥💯"`); **never** `slugify(x).is_empty()`, which is
   always `false` and so is dead code. Deliberately broader than "`slugify`
@@ -117,10 +120,10 @@ copy of the publish order.
 |---|---|
 | `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
 | `routes![...]` | Collect route handlers |
-| `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap; optional runtime args `flavor` (`"multi_thread"` default / `"current_thread"`), `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive = "30s"`, and `configure = path::to::fn` — a `fn(&mut tokio::runtime::Builder)` run last, the escape hatch for `Builder` methods the args don't name (unreleased). Numeric args take expressions, not only literals. No args = tokio defaults; an unknown/duplicate/zero arg, or `worker_threads` under `current_thread`, is a compile error |
-| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (unreleased, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
-| `static_gen::ManifestEntry` | One `dist/manifest.json` route entry: `file`, `revalidate`, `content_type`. `#[non_exhaustive]` — build with `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)` (unreleased, #1832) |
-| `static_gen::StaticFileLayer::resolve_entry` → `ResolvedStatic` | Manifest lookup returning the file path **and** the ready-to-serve `Content-Type`; `resolve` is the file-path-only shorthand. `static_gen::resolved_content_type` is the decision function: recorded type → recognized route extension → served file name → `application/octet-stream` (unreleased, #1832) |
+| `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap; optional runtime args `flavor` (`"multi_thread"` default / `"current_thread"`), `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive = "30s"`, and `configure = path::to::fn` — a `fn(&mut tokio::runtime::Builder)` run last, the escape hatch for `Builder` methods the args don't name (0.8.0). Numeric args take expressions, not only literals. No args = tokio defaults; an unknown/duplicate/zero arg, or `worker_threads` under `current_thread`, is a compile error |
+| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (0.8.0, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
+| `static_gen::ManifestEntry` | One `dist/manifest.json` route entry: `file`, `revalidate`, `content_type`. `#[non_exhaustive]` — build with `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)` (0.8.0, #1832) |
+| `static_gen::StaticFileLayer::resolve_entry` → `ResolvedStatic` | Manifest lookup returning the file path **and** the ready-to-serve `Content-Type`; `resolve` is the file-path-only shorthand. `static_gen::resolved_content_type` is the decision function: recorded type → recognized route extension → served file name → `application/octet-stream` (0.8.0, #1832) |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
 | `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716) |
@@ -259,7 +262,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   be declared `#[translatable]` with **no data migration**; keys are never gated
   on locale-tag shape, so every key an app can write round-trips through the
   column.
-- **(0.7.0)** `#[collaborative]` (issue #1806, needs the `collab` feature) — the column
+- **(0.8.0)** `#[collaborative]` (issue #1806, needs the `collab` feature) — the column
   stores a **text CRDT** instead of a plain string, so two people editing the
   same field merge character by character rather than overwriting each other.
   The field type becomes `autumn_web::collab::CollabText`, a Replicated
@@ -308,7 +311,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   character list, so it suits note-sized and comment-sized fields. See
   [collaboration](../../../docs/guide/collaboration.md) and
   `examples/collab-notes`.
-- **(0.7.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
+- **(0.8.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
   non-null `String` column as **personal data** and carries that classification
   on the *type*, not in a name denylist. The generated field becomes
   `autumn_web::classify::Classified<String, {Model}{Column}Classified>` — a
@@ -349,7 +352,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
-- **(0.7.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
+- **(0.8.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
   marks a column **operator-blind**: the value is sealed on the client under a
   key the server never receives, so the server holds only ciphertext. Unlike
   `#[encrypted]` (operator-held keys, `String` field, transparent plaintext in
@@ -642,7 +645,7 @@ delete actions remain last-write-wins.
 - `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
   (**0.6.0**) — closure gets `&mut AsyncPgConnection`; auto-retries
   SQLSTATE 40001 with capped exponential backoff.
-- `Db::tx_immediate(f)` (unreleased, #2885) — same semantics as `Db::tx`
+- `Db::tx_immediate(f)` (0.8.0, #2885) — same semantics as `Db::tx`
   (closure gets `&mut RuntimeConnection`); on SQLite it begins
   `BEGIN IMMEDIATE`, so a concurrent writer on a file database queues on
   `busy_timeout` instead of failing its read→write upgrade with
@@ -658,7 +661,7 @@ delete actions remain last-write-wins.
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
 
-## Money and the ledger (`autumn_web::money`, unreleased, #1837)
+## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
 Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
 
@@ -699,7 +702,7 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
   (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
   framework migration set.
 
-## SLA obligations (`autumn_web::sla`, unreleased, #1826)
+## SLA obligations (`autumn_web::sla`, 0.8.0, #1826)
 
 Needs the `sla` feature. Deadlines in business time. The clock runs only in working hours and reads
 only the injected `Clock`.
@@ -1184,7 +1187,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `issue_scoped_api_token`, `#[secured(scopes = [...])]`,
   `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
   issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
-- **(unreleased, #1394)**: admin impersonation —
+- **(0.8.0, #1394)**: admin impersonation —
   `autumn_web::auth::impersonation::{begin_impersonation, end_impersonation,
   impersonator_id, is_impersonating, impersonation_state, audit_actor_id, clear,
   Impersonation, ImpersonationGate, ImpersonationPolicy, ImpersonationTarget,
@@ -1434,7 +1437,7 @@ csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.7"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.8"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 
@@ -1794,7 +1797,7 @@ In-process HTTPS termination on the same host:port (off by default).
   probes its own loopback listener over TLS instead of failing forever. See
   `docs/guide/tls.md`.
 
-### `[server.tls.client_auth]` (feature `tls`, unreleased, #1640)
+### `[server.tls.client_auth]` (feature `tls`, 0.8.0, #1640)
 
 Mutual TLS: verify the *caller's* certificate, not just prove the server's.
 Absent, the handshake is byte-for-byte the server-only TLS above.
@@ -1853,7 +1856,7 @@ default. Mutually exclusive with static `cert_path` / `key_path`.
   accept from the site.
 - Automatic HTTP-01 provisioning + hourly leader-elected renewal.
 
-### `[server.tls.acme.dns]` (feature `acme`, unreleased — trunk-dev, #1620)
+### `[server.tls.acme.dns]` (feature `acme`; ACME since 0.6.0, DNS-01 since 0.8.0, #1620)
 
 Answers every authorization over **DNS-01** instead of HTTP-01, which is what a
 **wildcard** certificate requires — so one `*.myapp.com` covers every tenant
@@ -1904,7 +1907,7 @@ provider = "cloudflare"
 
 See `docs/guide/tls.md`.
 
-### `[server.tls.acme.custom_domains]` (feature `acme`, unreleased — trunk-dev, #1635)
+### `[server.tls.acme.custom_domains]` (feature `acme`, 0.8.0, #1635)
 
 Lets a **tenant connect its own hostname** (`app.clientco.com`), each getting its
 own verified, auto-renewing certificate served by SNI. Config-only: no per-domain

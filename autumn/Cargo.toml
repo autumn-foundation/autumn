@@ -291,7 +291,7 @@ edge = ["dep:autumn-edge"]
 plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
-autumn-edge = { version = "0.7.0", path = "../autumn-edge", optional = true }
+autumn-edge = { version = "0.8.0", path = "../autumn-edge", optional = true }
 # Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
@@ -303,11 +303,11 @@ wasmi = { version = "0.40", optional = true }
 # could never reach those macros anyway (their re-exports are `#[cfg(feature =
 # "db")]` in `src/lib.rs`), and skipping them cuts macro compile time by ~90%
 # on the no-DB onboarding path (issue #2309).
-autumn-macros = { version = "0.7.0", path = "../autumn-macros", default-features = false }
+autumn-macros = { version = "0.8.0", path = "../autumn-macros", default-features = false }
 # Database-layer proc macros, split out of `autumn-macros` so a no-database
 # build never compiles their codegen. Optional: enabled by the `db` feature.
-autumn-macros-model = { version = "0.7.0", path = "../autumn-macros-model", optional = true }
-autumn-macros-repository = { version = "0.7.0", path = "../autumn-macros-repository", optional = true }
+autumn-macros-model = { version = "0.8.0", path = "../autumn-macros-model", optional = true }
+autumn-macros-repository = { version = "0.8.0", path = "../autumn-macros-repository", optional = true }
 axum.workspace = true
 # 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
 # sandbox concurrency permit and release it exactly when the last handle drops.

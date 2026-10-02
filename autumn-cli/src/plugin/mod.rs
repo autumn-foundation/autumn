@@ -1963,7 +1963,7 @@ mod tests {
         assert!(out.contains(index::FULL_TRUST_LABEL), "{out}");
         assert!(out.contains("stable API"), "{out}");
         assert!(
-            out.contains("plugin-check pass on autumn-web 0.7.0"),
+            out.contains(&format!("plugin-check pass on autumn-web {RELEASE}")),
             "{out}"
         );
         assert!(out.contains("plugin-check exempt"), "{out}");
@@ -2433,10 +2433,10 @@ mod tests {
     /// On an app older than the failed series, the reason is the range.
     #[test]
     fn the_gate_names_the_range_for_an_older_app() {
-        let mut listing = flagged_on("0.9.0");
-        listing.autumn_web = ">=0.8, <0.10".to_owned();
+        let mut listing = flagged_on("0.99.0");
+        listing.autumn_web = ">=0.98, <0.100".to_owned();
         let err = gate_listing(&listing, Some(RELEASE)).unwrap_err();
-        assert!(err.contains(">=0.8, <0.10"), "{err}");
+        assert!(err.contains(">=0.98, <0.100"), "{err}");
         assert!(!err.contains("re-verification"), "{err}");
     }
 
@@ -2714,7 +2714,7 @@ mod tests {
     /// app's `autumn-web` — for first-party *and* community crates.
     #[test]
     fn rows_cover_first_party_and_community() {
-        let rows = list_rows(Some("0.7.0"), &bundled(), &community());
+        let rows = list_rows(Some(RELEASE), &bundled(), &community());
         assert!(
             rows.iter()
                 .filter(|r| r.origin == Origin::FirstParty)
@@ -2732,7 +2732,7 @@ mod tests {
 
     #[test]
     fn first_party_rows_carry_a_summary_and_a_version() {
-        for row in list_rows(Some("0.7.0"), &bundled(), &[])
+        for row in list_rows(Some(RELEASE), &bundled(), &[])
             .iter()
             .filter(|r| r.origin == Origin::FirstParty)
         {
@@ -2773,7 +2773,7 @@ mod tests {
     /// API, so it is reported as unknown rather than guessed.
     #[test]
     fn community_rows_have_unknown_compatibility() {
-        let rows = list_rows(Some("0.7.0"), &bundled(), &community());
+        let rows = list_rows(Some(RELEASE), &bundled(), &community());
         let feed = rows
             .iter()
             .find(|r| r.crate_name == "autumn-plugin-live-feed")
@@ -2784,15 +2784,15 @@ mod tests {
     #[test]
     fn the_table_shows_name_version_and_description() {
         let out = render_list(
-            &list_rows(Some("0.7.0"), &bundled(), &community()),
-            Some("0.7.0"),
+            &list_rows(Some(RELEASE), &bundled(), &community()),
+            Some(RELEASE),
             None,
         );
         assert!(out.contains("autumn-admin-plugin"), "{out}");
         assert!(out.contains("autumn-plugin-live-feed"), "{out}");
         assert!(out.contains("Live feeds for autumn-web"), "{out}");
         assert!(out.contains("0.3.1"), "{out}");
-        assert!(out.contains("0.7.0"), "{out}");
+        assert!(out.contains(RELEASE), "{out}");
     }
 
     #[test]
@@ -2803,14 +2803,17 @@ mod tests {
             None,
         );
         // Naming the series that would work is the actionable half.
-        assert!(out.contains("needs autumn-web 0.7"), "{out}");
+        assert!(
+            out.contains(&format!("needs autumn-web {}", series())),
+            "{out}"
+        );
     }
 
     #[test]
     fn a_note_is_rendered_when_crates_io_could_not_be_reached() {
         let out = render_list(
-            &list_rows(Some("0.7.0"), &bundled(), &[]),
-            Some("0.7.0"),
+            &list_rows(Some(RELEASE), &bundled(), &[]),
+            Some(RELEASE),
             Some("offline"),
         );
         assert!(out.contains("offline"), "{out}");
@@ -2819,11 +2822,11 @@ mod tests {
     #[test]
     fn json_output_is_machine_readable() {
         let json = render_list_json(
-            &list_rows(Some("0.7.0"), &bundled(), &community()),
-            Some("0.7.0"),
+            &list_rows(Some(RELEASE), &bundled(), &community()),
+            Some(RELEASE),
         );
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(value["autumn_web"], "0.7.0");
+        assert_eq!(value["autumn_web"], RELEASE);
         let plugins = value["plugins"].as_array().expect("plugins array");
         let admin = plugins
             .iter()

@@ -565,7 +565,7 @@ point: the manifest format is
 expected to keep growing, and after this release a new field is additive rather
 than breaking. Only code that reads or writes `dist/manifest.json` itself is
 affected; ordinary `#[static_get]` applications are not. See
-[`docs/migrations/next.md`](docs/migrations/next.md).
+[`docs/migrations/0.8.0.md`](docs/migrations/0.8.0.md#ssg-manifestentry--staticmanifest-are-non_exhaustive-and-generated-pages-carry-their-declared-content-type).
 
 The JSON format itself is compatible in both directions. `content_type` is
 `#[serde(default, skip_serializing_if = "Option::is_none")]`, so a new runtime

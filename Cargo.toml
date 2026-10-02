@@ -28,7 +28,7 @@ autumn-web = { path = "autumn" }
 [workspace.package]
 edition = "2024"
 rust-version = "1.88.0"
-version = "0.7.0"
+version = "0.8.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/autumn-foundation/autumn"
 
@@ -195,3 +195,20 @@ disallowed_methods = "allow"
 # Revisit deliberately if the extractor hot path ever shows up in a profile —
 # it is a real (if small) win, just not one to take blind.
 unused_async_trait_impl = "allow"
+# rustc 1.99 lints `redundant_field_names` through macro expansions and pins the
+# span on the user's field, so every `#[derive(diesel::QueryableByName)]` struct
+# is flagged for the `field: field` initializer that diesel's derive emits —
+# 207 sites across the workspace, none of them hand-written code. The source
+# cannot be changed to satisfy it (the initializer is not ours), and a per-struct
+# `#[allow]` on ~100 raw-SQL row types would be noise. Hand-written
+# `Foo { a: a }` is a style nit the formatter-adjacent review already catches.
+#
+# Revisit when diesel_derives stops emitting the redundant spelling.
+redundant_field_names = "allow"
+# rustc 1.99 added `clippy::assert_is_empty` (nursery), which rewrites
+# `assert!(v.is_empty())` to `assert_eq!(v, [] as [T; 0])` and
+# `assert!(!v.is_empty())` to `assert_ne!`. All 232 sites are in test code. The
+# suggested spelling is harder to read, needs `Debug + PartialEq` on every
+# element type, and for the non-collection receivers (`str`, `Option`, custom
+# `is_empty`) has no sensible rewrite at all. `is_empty()` is the idiom.
+assert_is_empty = "allow"
