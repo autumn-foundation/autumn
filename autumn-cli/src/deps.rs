@@ -476,7 +476,7 @@ fn waived_id(fields: &serde_json::Value) -> Option<String> {
             label.get("message").and_then(serde_json::Value::as_str)
                 == Some("advisory ignored here")
         })
-        .and_then(&span_of)
+        .and_then(span_of)
         .or_else(|| {
             labels
                 .iter()

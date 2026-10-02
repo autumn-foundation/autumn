@@ -592,6 +592,10 @@ impl InFlightPermit {
 }
 
 impl Drop for InFlightPermit {
+    #[allow(
+        deprecated,
+        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+    )]
     fn drop(&mut self) {
         let _ = self
             .counter

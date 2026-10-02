@@ -36,3 +36,6 @@ unsafe_code = "forbid"
 # manifest, so grandfather the lint the same way the other examples do.
 [lints.clippy]
 disallowed_methods = "allow"
+# `#[derive(diesel::QueryableByName)]` emits `field: field`; rustc 1.99 flags it on
+# the user's field. Grandfathered workspace-wide in the root `Cargo.toml`.
+redundant_field_names = "allow"

@@ -602,6 +602,10 @@ fn send_farewell_signed(
 /// evicts it. `frames_dropped` cannot see it (the transport never got the
 /// frame) and `frames_rejected` is inbound-only, so it gets a series of its
 /// own plus a line naming the serialized size against the cap.
+#[allow(
+    deprecated,
+    reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+)]
 fn note_unsendable(inner: &ClusterInner, serialized_bytes: Option<usize>) {
     inner
         .metrics
