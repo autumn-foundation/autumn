@@ -676,6 +676,64 @@ fn changelog_notes_are_written_as_fragments() {
     );
 }
 
+/// The Release body is the `CHANGELOG.md` section for the tag, not a second
+/// changelog generated from commit titles. Two generators disagreed: the
+/// curated notes landed in the crates and the release page showed raw commits.
+#[test]
+fn publish_gate_release_notes_come_from_the_changelog_section() {
+    let root = workspace_root();
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/publish-gate.yml"))
+        .expect("read publish-gate.yml");
+    assert!(
+        !workflow.contains("git-cliff") && !workflow.contains("cliff.toml"),
+        "publish-gate must not generate release notes with git-cliff"
+    );
+    assert!(
+        workflow.contains("scripts/extract-release-notes.sh"),
+        "publish-gate must build RELEASE_NOTES.md from the CHANGELOG.md section"
+    );
+    assert!(
+        !root.join("cliff.toml").exists(),
+        "cliff.toml is unused once release notes come from CHANGELOG.md"
+    );
+}
+
+#[test]
+fn extract_release_notes_prints_the_section_and_rejects_a_missing_one() {
+    let root = workspace_root();
+    let script = root.join("scripts/extract-release-notes.sh");
+    let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).expect("read CHANGELOG.md");
+    let version = changelog
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("## [")?
+                .split_once(']')
+                .map(|(v, _)| v.to_owned())
+        })
+        .find(|v| v != "Unreleased")
+        .expect("a released version in CHANGELOG.md");
+
+    let found = std::process::Command::new("bash")
+        .arg(&script)
+        .arg(format!("v{version}"))
+        .output()
+        .expect("run extract-release-notes.sh");
+    assert!(found.status.success(), "{version}: {found:?}");
+    let body = String::from_utf8_lossy(&found.stdout);
+    assert!(!body.trim().is_empty(), "{version}: empty body");
+    assert!(
+        !body.contains(&format!("## [{version}]")),
+        "{version}: the heading must be stripped"
+    );
+
+    let missing = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("999.0.0")
+        .output()
+        .expect("run extract-release-notes.sh");
+    assert!(!missing.status.success(), "a missing section must fail");
+}
+
 #[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();
