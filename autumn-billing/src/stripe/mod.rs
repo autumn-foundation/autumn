@@ -120,7 +120,9 @@ impl BillingProvider for StripeProvider {
                     crate::config::STRIPE_WEBHOOK_SECRET_ENV
                 ))
             })?;
-        Ok(WebhookEndpointConfig::stripe(name, path, secret.expose()))
+        let mut endpoint = WebhookEndpointConfig::stripe(name, path, secret.expose());
+        endpoint.max_body_bytes = crate::config::WEBHOOK_MAX_BODY_BYTES;
+        Ok(endpoint)
     }
 
     fn create_customer(&self, request: CustomerRequest) -> ProviderFuture<'_, ProviderId> {

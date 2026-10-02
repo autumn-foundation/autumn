@@ -111,6 +111,7 @@ pub struct FakeProvider {
     cancel_outcomes: Mutex<VecDeque<Result<(), BillingError>>>,
     parser: FakeParser,
     next_customer: Mutex<u32>,
+    webhook_body_limit: usize,
 }
 
 impl FakeProvider {
@@ -127,6 +128,20 @@ impl FakeProvider {
             cancel_outcomes: Mutex::new(VecDeque::new()),
             parser,
             next_customer: Mutex::new(0),
+            webhook_body_limit: 4 * 1024 * 1024,
+        })
+    }
+
+    /// Fake whose expected webhook endpoint allows `limit` body bytes, like a
+    /// provider with smaller events than Stripe's.
+    pub fn with_webhook_body_limit(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            retry_outcomes: Mutex::new(VecDeque::new()),
+            cancel_outcomes: Mutex::new(VecDeque::new()),
+            parser: FakeParser::Stripe,
+            next_customer: Mutex::new(0),
+            webhook_body_limit: limit,
         })
     }
 
@@ -176,11 +191,9 @@ impl BillingProvider for FakeProvider {
         name: &str,
         path: &str,
     ) -> Result<WebhookEndpointConfig, BillingError> {
-        Ok(WebhookEndpointConfig::stripe(
-            name,
-            path,
-            TEST_WEBHOOK_SECRET,
-        ))
+        let mut endpoint = WebhookEndpointConfig::stripe(name, path, TEST_WEBHOOK_SECRET);
+        endpoint.max_body_bytes = self.webhook_body_limit;
+        Ok(endpoint)
     }
 
     fn create_customer(&self, request: CustomerRequest) -> ProviderFuture<'_, ProviderId> {

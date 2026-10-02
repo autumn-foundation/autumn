@@ -696,6 +696,28 @@ async fn boot_accepts_a_declared_endpoint_with_a_larger_body_limit() {
     );
 }
 
+#[tokio::test]
+async fn boot_honors_a_provider_that_expects_a_smaller_body_limit() {
+    let billing = support::config();
+    let mut autumn = support::autumn_config(&billing);
+    autumn
+        .security
+        .webhooks
+        .endpoints
+        .first_mut()
+        .expect("declared endpoint")
+        .max_body_bytes = WEBHOOK_DEFAULT_BODY_LIMIT;
+    // The minimum is the provider's call, not Stripe's: a provider whose
+    // expected endpoint allows 1 MiB must not be forced to buffer 4 MiB.
+    let _harness = support::harness_with(
+        billing,
+        autumn,
+        MemoryBillingStore::shared(),
+        FakeProvider::with_webhook_body_limit(WEBHOOK_DEFAULT_BODY_LIMIT),
+        pinned,
+    );
+}
+
 /// Every `toml` code fence in `text` that declares the billing webhook endpoint,
 /// parsed as the entry an app would paste into `autumn.toml`. `//!` doc-comment
 /// markers are stripped first, so the crate's rustdoc quick start is read the
