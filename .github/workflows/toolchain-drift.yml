@@ -62,7 +62,10 @@ jobs:
 
       - name: Clippy (workspace, all targets)
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # `-j 2` is ci.yml's cap for this exact command: at the default four
+        # workers it is OOM-killed on ubuntu-latest while checking autumn-web,
+        # which would read here as Rust-stable fallout when it is the runner.
+        run: cargo clippy -j 2 --workspace --all-targets -- -D warnings
 
       - name: Clippy (request-path gated features, all targets)
         if: ${{ !cancelled() }}

@@ -132,12 +132,28 @@ bump_tree() {
   old="$(tr -d '[:space:]' < .github/RUST_TOOLCHAIN)"
   [[ "$old" != "$new" ]] || die "the pin is already $new"
   old_re="${old//./\\.}"
+  # Rewrite via temp files, not `sed -i`: BSD/macOS sed takes the word after -i
+  # as a backup suffix, so `sed -i -E` would swallow -E and match nothing. Stage
+  # every rewrite first and touch nothing unless at least one workflow changes,
+  # so a failed bump leaves the tree as it found it.
+  local staged=() out pair
   for wf in .github/workflows/*.yml; do
+    out="$(mktemp "${TMPDIR:-/tmp}/toolchain-pin.XXXXXX")"
     # Only the two constructs the checker recognises, never prose in a comment.
-    sed -i -E \
+    sed -E \
       -e "s#^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*dtolnay/rust-toolchain@)${old_re}[[:space:]]*\$#\1${new}#" \
       -e "s#(matrix\\.toolchain == 'stable' && ')${old_re}(')#\1${new}\2#" \
-      "$wf"
+      "$wf" > "$out"
+    if cmp -s "$wf" "$out"; then
+      rm -f "$out"
+    else
+      staged+=("$wf|$out")
+    fi
+  done
+  ((${#staged[@]} > 0)) || die "no workflow references the pin $old; nothing to bump"
+  for pair in "${staged[@]}"; do
+    cat "${pair#*|}" > "${pair%%|*}"
+    rm -f "${pair#*|}"
   done
   printf '%s\n' "$new" > .github/RUST_TOOLCHAIN
   echo "Moved the pin $old -> $new"
@@ -147,7 +163,7 @@ bump_tree() {
 # --- self-test: build tiny trees and check the gate fails where it should. ---
 self_test() {
   local tmp
-  tmp="$(mktemp -d)"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/toolchain-pin-test.XXXXXX")"
   # Expanded now: `tmp` is local, and the trap fires after this function returns.
   trap "rm -rf '$tmp'" EXIT
 
@@ -222,6 +238,14 @@ self_test() {
   if ( "$0" --bump "$tmp/bump" 1.100.0 > /dev/null 2>&1 ); then
     die "self-test: --bump to the current pin should fail"
   fi
+
+  # A bump that finds nothing to rewrite must not move RUST_TOOLCHAIN on its own.
+  mk "$tmp/orphan" 1.99.0 '- uses: dtolnay/rust-toolchain@nightly'
+  if ( "$0" --bump "$tmp/orphan" 1.100.0 > /dev/null 2>&1 ); then
+    die "self-test: --bump with no references should fail"
+  fi
+  [[ "$(tr -d '[:space:]' < "$tmp/orphan/.github/RUST_TOOLCHAIN")" == "1.99.0" ]] \
+    || die "self-test: a failed --bump moved RUST_TOOLCHAIN"
 
   echo "check-toolchain-pin self-test OK"
 }
