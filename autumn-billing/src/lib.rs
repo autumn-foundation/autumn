@@ -22,7 +22,8 @@
 //! ```
 //!
 //! Declare the webhook receiver in `autumn.toml` so `SignedWebhook` verifies
-//! it and CSRF exempts it:
+//! it and CSRF exempts it. `max_body_bytes` is required: the webhook default is
+//! 1 MiB, a large provider event can exceed it, and boot fails below 4 MiB:
 //!
 //! ```toml
 //! [[security.webhooks.endpoints]]
@@ -30,6 +31,7 @@
 //! path = "/billing/webhook"
 //! provider = "stripe"
 //! secret_env = "STRIPE_WEBHOOK_SECRET"
+//! max_body_bytes = 4194304
 //! ```
 //!
 //! Gate a route:
@@ -403,6 +405,19 @@ fn verify_webhook_endpoint(
         .iter()
         .find(|endpoint| endpoint.path == path);
     match declared {
+        Some(endpoint)
+            if endpoint.provider == expected.provider
+                && endpoint.max_body_bytes < expected.max_body_bytes =>
+        {
+            Err(AutumnError::internal_server_error_msg(format!(
+                "autumn-billing: the signed webhook endpoint at {path} allows request bodies of \
+                 {} bytes, but billing events can be larger (invoices with many lines) and an \
+                 oversized body is rejected before it is reconciled, so the provider retries it \
+                 forever. Set max_body_bytes = {} on the [[security.webhooks.endpoints]] entry \
+                 in autumn.toml.",
+                endpoint.max_body_bytes, expected.max_body_bytes
+            )))
+        }
         Some(endpoint) if endpoint.provider == expected.provider => Ok(()),
         Some(endpoint) => Err(AutumnError::internal_server_error_msg(format!(
             "autumn-billing: the signed webhook endpoint at {path} declares provider = \"{}\", \
@@ -417,9 +432,11 @@ fn verify_webhook_endpoint(
              name = \"{}\"\n\
              path = \"{path}\"\n\
              provider = \"{preset}\"\n\
-             secret_env = \"{}_WEBHOOK_SECRET\"",
+             secret_env = \"{}_WEBHOOK_SECRET\"\n\
+             max_body_bytes = {}",
             config.endpoint_name,
-            provider.name().to_uppercase()
+            provider.name().to_uppercase(),
+            expected.max_body_bytes
         ))),
     }
 }

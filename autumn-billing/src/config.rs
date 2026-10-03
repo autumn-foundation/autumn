@@ -223,6 +223,16 @@ impl Default for BillingConfig {
     }
 }
 
+/// The least `max_body_bytes` the billing webhook endpoint may declare.
+///
+/// Provider events that carry many invoice lines outgrow the webhook default
+/// (1 MiB). An oversized body is rejected as a 400 before reconciliation, which
+/// the provider then retries unchanged, so the event is never applied. The boot
+/// check ([`crate::verify_webhook_endpoint`]) enforces this for the entry an
+/// app declares in `autumn.toml`; [`BillingConfig::webhook_endpoint`] builds
+/// the entry with it for tests.
+pub(crate) const WEBHOOK_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 impl BillingConfig {
     /// Defaults plus secrets from the process environment.
     #[must_use]
@@ -365,8 +375,7 @@ impl BillingConfig {
             self.webhook_path(),
             secret.expose(),
         );
-        // Invoices with many lines exceed the 1 MiB default.
-        endpoint.max_body_bytes = 4 * 1024 * 1024;
+        endpoint.max_body_bytes = WEBHOOK_MAX_BODY_BYTES;
         Ok(endpoint)
     }
 

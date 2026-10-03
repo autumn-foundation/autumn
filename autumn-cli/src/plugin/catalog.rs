@@ -122,7 +122,7 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "billing_customers",
         ],
         config_keys: &[
-            "[[security.webhooks.endpoints]]\nname = \"billing\"\npath = \"/billing/webhook\"\nprovider = \"stripe\"\nsecret_env = \"STRIPE_WEBHOOK_SECRET\"",
+            "[[security.webhooks.endpoints]]\nname = \"billing\"\npath = \"/billing/webhook\"\nprovider = \"stripe\"\nsecret_env = \"STRIPE_WEBHOOK_SECRET\"\nmax_body_bytes = 4194304",
             "[billing]\nsuccess_url = \"/billing/success\"\ncancel_url = \"/billing/cancel\"",
         ],
         post_install: &[
@@ -570,5 +570,28 @@ mod tests {
             "{snippet}"
         );
         assert!(community_mount_snippet("autumn-plugin-").is_none());
+    }
+
+    /// `autumn plugin add autumn-billing` prints the `autumn.toml` entry an app
+    /// pastes in, and billing's boot check rejects a webhook endpoint that allows
+    /// less than 4 MiB (the webhook default is 1 MiB, which an invoice event with
+    /// many lines can exceed). The printed entry must therefore pass that check.
+    #[test]
+    fn billing_webhook_entry_declares_the_body_limit_billing_needs() {
+        const BILLING_MIN_BODY_LIMIT: i64 = 4 * 1024 * 1024;
+        let entry = lookup("autumn-billing").expect("billing is in the catalog");
+        let snippet = entry
+            .config_keys
+            .iter()
+            .find(|keys| keys.contains("[[security.webhooks.endpoints]]"))
+            .expect("billing declares its webhook endpoint");
+        let table: toml::Table = snippet.parse().expect("the printed entry is valid TOML");
+        let limit = table["security"]["webhooks"]["endpoints"][0]["max_body_bytes"]
+            .as_integer()
+            .expect("the entry declares max_body_bytes");
+        assert!(
+            limit >= BILLING_MIN_BODY_LIMIT,
+            "the printed billing entry allows {limit} bytes, below the {BILLING_MIN_BODY_LIMIT} billing's boot check requires:\n{snippet}"
+        );
     }
 }
