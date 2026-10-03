@@ -8,14 +8,15 @@ fn main() {
     // `static/css/app.css`, nothing it tracks has changed since, and the site
     // stays unstyled until an unrelated source edit happens to trigger it.
     // See issue #2694 (this starter and `cms` drifted on this fix).
-    // Only the platform-correct path: watching both unconditionally
-    // means the OTHER platform's file is permanently absent, which
-    // Cargo always treats as changed -- making every build dirty
-    // forever, on every platform (Codex review on #3107).
-    #[cfg(target_os = "windows")]
-    println!("cargo:rerun-if-changed=target/autumn/tailwindcss.exe");
-    #[cfg(not(target_os = "windows"))]
-    println!("cargo:rerun-if-changed=target/autumn/tailwindcss");
+    // Resolved via the same OUT_DIR-ancestors logic find_tailwind_cli uses
+    // below -- a bare relative "target/autumn/tailwindcss" literal is wrong
+    // for a workspace member (Cargo runs the build script with the PACKAGE
+    // dir as CWD, not the workspace root `autumn setup` installs into), so
+    // it would never exist and leave the build dirty forever regardless of
+    // platform (Codex review on #3107, round 2).
+    if let Some(path) = expected_tailwind_install_path() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     println!("cargo:rerun-if-env-changed=PATH");
     #[cfg(target_os = "windows")]
     println!("cargo:rerun-if-env-changed=PATHEXT");
@@ -47,23 +48,30 @@ fn main() {
 fn find_tailwind_cli() -> Option<std::path::PathBuf> {
     // 1. Workspace target directory (populated by `autumn setup`). OUT_DIR is
     //    <target>/<profile>/build/<pkg>/out — walk up to <target>/autumn.
-    if let Ok(out_dir) = std::env::var("OUT_DIR") {
-        let out_path = std::path::PathBuf::from(out_dir);
-        if let Some(target_dir) = out_path.ancestors().nth(4) {
-            let bin_name = if cfg!(windows) {
-                "tailwindcss.exe"
-            } else {
-                "tailwindcss"
-            };
-            let local = target_dir.join("autumn").join(bin_name);
-            if local.exists() {
-                return Some(local);
-            }
-        }
+    if let Some(local) = expected_tailwind_install_path()
+        && local.exists()
+    {
+        return Some(local);
     }
 
     // 2. PATH
     which("tailwindcss")
+}
+
+/// Where `autumn setup` installs the Tailwind CLI:
+/// `<workspace target dir>/autumn/<bin name>`, resolved via `OUT_DIR`
+/// (always absolute and already under the real target dir Cargo picked,
+/// workspace member or not) rather than a package-relative literal.
+fn expected_tailwind_install_path() -> Option<std::path::PathBuf> {
+    let out_dir = std::env::var("OUT_DIR").ok()?;
+    let out_path = std::path::PathBuf::from(out_dir);
+    let target_dir = out_path.ancestors().nth(4)?;
+    let bin_name = if cfg!(windows) {
+        "tailwindcss.exe"
+    } else {
+        "tailwindcss"
+    };
+    Some(target_dir.join("autumn").join(bin_name))
 }
 
 fn which(binary: &str) -> Option<std::path::PathBuf> {
