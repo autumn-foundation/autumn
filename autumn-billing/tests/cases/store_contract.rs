@@ -360,6 +360,84 @@ pub async fn subscription_newer_wins_older_stale(store: &dyn BillingStore) {
     );
 }
 
+/// A write read from the provider settles a same-instant tie in either
+/// direction, keeps the stored instant, and is still refused by a terminal
+/// status and by an older instant.
+pub async fn subscription_authoritative_settles_a_same_instant_tie(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "sub-auth", None).await;
+    store
+        .upsert_subscription(sub_upsert(
+            "sub-auth",
+            &customer,
+            "k",
+            SubscriptionStatus::PastDue,
+            100,
+        ))
+        .await
+        .unwrap();
+    // Ranked, Active (3) loses to PastDue (4) at the same instant.
+    let ranked = store
+        .upsert_subscription(sub_upsert(
+            "sub-auth",
+            &customer,
+            "k",
+            SubscriptionStatus::Active,
+            100,
+        ))
+        .await
+        .unwrap();
+    assert!(!ranked.is_applied());
+    // Authoritative, it wins, and the stored instant stays the provider's.
+    let live = store
+        .upsert_subscription(
+            sub_upsert("sub-auth", &customer, "k", SubscriptionStatus::Active, 100)
+                .with_authoritative(),
+        )
+        .await
+        .unwrap();
+    assert!(live.is_applied());
+    let row = live.into_inner();
+    assert_eq!(row.status, SubscriptionStatus::Active);
+    assert_eq!(row.last_event_at, at(100));
+    // And downward: Paused (1) over Active (3).
+    let paused = store
+        .upsert_subscription(
+            sub_upsert("sub-auth", &customer, "k", SubscriptionStatus::Paused, 100)
+                .with_authoritative(),
+        )
+        .await
+        .unwrap();
+    assert!(paused.is_applied());
+    // Not back in time.
+    let older = store
+        .upsert_subscription(
+            sub_upsert("sub-auth", &customer, "k", SubscriptionStatus::Active, 99)
+                .with_authoritative(),
+        )
+        .await
+        .unwrap();
+    assert!(!older.is_applied());
+    // A terminal status is never left, authoritative or not.
+    store
+        .upsert_subscription(sub_upsert(
+            "sub-auth",
+            &customer,
+            "k",
+            SubscriptionStatus::Canceled,
+            100,
+        ))
+        .await
+        .unwrap();
+    let after_terminal = store
+        .upsert_subscription(
+            sub_upsert("sub-auth", &customer, "k", SubscriptionStatus::Active, 100)
+                .with_authoritative(),
+        )
+        .await
+        .unwrap();
+    assert!(!after_terminal.is_applied());
+}
+
 /// At the same instant the higher rank wins; a lower rank is stale.
 pub async fn subscription_same_instant_higher_rank_wins(store: &dyn BillingStore) {
     let customer = seed_customer(store, "sub-b", None).await;
@@ -1305,6 +1383,7 @@ pub async fn run_contract(store: &dyn BillingStore) {
     customer_lookups(store).await;
     subscription_newer_wins_older_stale(store).await;
     subscription_same_instant_higher_rank_wins(store).await;
+    subscription_authoritative_settles_a_same_instant_tie(store).await;
     subscription_terminal_never_left(store).await;
     subscriptions_for_customer_newest_first(store).await;
     subscription_set_status(store).await;
@@ -1349,6 +1428,7 @@ mod memory {
         customer_lookups,
         subscription_newer_wins_older_stale,
         subscription_same_instant_higher_rank_wins,
+        subscription_authoritative_settles_a_same_instant_tie,
         subscription_terminal_never_left,
         subscriptions_for_customer_newest_first,
         subscription_set_status,

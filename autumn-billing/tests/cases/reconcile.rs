@@ -257,9 +257,7 @@ async fn same_second_pause_ends_paused_in_either_delivery_order() {
 }
 
 #[tokio::test]
-async fn a_fetched_state_is_stamped_with_the_app_clock_not_a_made_up_provider_second() {
-    // A tie in the past: the lookup happens now, so the mirror carries the
-    // clock's instant rather than the tied second plus one.
+async fn a_fetched_state_keeps_the_providers_instant_instead_of_inventing_one() {
     let h = linked_harness().await;
     h.provider.script_live_subscription(
         SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
@@ -269,29 +267,28 @@ async fn a_fetched_state_is_stamped_with_the_app_clock_not_a_made_up_provider_se
         ("evt_1", SubscriptionStatus::PastDue),
         ("evt_2", SubscriptionStatus::Active),
     ] {
-        apply_event(&h.client, event(id, at(-100), sub_changed(status)))
+        apply_event(&h.client, event(id, at(100), sub_changed(status)))
             .await
             .unwrap();
     }
     let sub = subscription(&h).await;
     assert_eq!(sub.status, SubscriptionStatus::Active);
-    assert!(
-        sub.last_event_at >= at(0),
-        "stamped {:?}, expected the app clock, not {:?}",
+    assert_eq!(
         sub.last_event_at,
-        at(-99)
+        at(100),
+        "the stored instant must stay the provider's"
     );
 
-    // A provider event created after the lookup, same status, new quantity,
-    // is a real update, not a redelivery of the fetched state.
-    let mut newer = SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
-        .with_price(PRO_PRICE);
-    newer = newer.with_quantity(9);
+    // A provider event one second later, same status, new quantity, is a real
+    // update. Under an invented stamp it could be read as stale or unchanged.
+    let newer = SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
+        .with_price(PRO_PRICE)
+        .with_quantity(9);
     apply_event(
         &h.client,
         event(
             "evt_3",
-            at(3600),
+            at(101),
             BillingEventKind::SubscriptionChanged(newer),
         ),
     )

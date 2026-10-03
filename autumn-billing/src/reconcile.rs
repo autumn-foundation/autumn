@@ -204,13 +204,11 @@ impl Ctx<'_> {
     /// paused`) and leave the mirror wrong until some later event arrived, so
     /// ask the provider for the subscription's current state instead.
     ///
-    /// Returns the live snapshot and the instant to stamp it with: the app
-    /// clock, which is when the state was read and so really is later than both
-    /// events, never earlier than one second after the stored event (so the
-    /// store sees it as strictly newer even under clock skew). The stamp is not
-    /// a provider timestamp, so a provider event the lookup already reflects is
-    /// older than it and is dropped as stale rather than mistaken for a
-    /// redelivery, while one created after it applies normally. `None`
+    /// Returns the live snapshot, to be written as authoritative at the tied
+    /// instant itself. No timestamp is invented: the stored instant stays the
+    /// provider's, so an event created after the tie compares against a real
+    /// provider time, and a later event at the same second with a different
+    /// status ties again and is settled by another lookup. `None`
     /// keeps the event as it is: no tie, a terminal status on either side
     /// (those are final and the store's own rule is exact), or a provider that
     /// cannot look the subscription up.
@@ -225,7 +223,7 @@ impl Ctx<'_> {
         snapshot: &SubscriptionSnapshot,
         status: SubscriptionStatus,
         occurred_at: DateTime<Utc>,
-    ) -> Result<Option<(SubscriptionSnapshot, DateTime<Utc>)>, BillingError> {
+    ) -> Result<Option<SubscriptionSnapshot>, BillingError> {
         let Some(previous) = previous else {
             return Ok(None);
         };
@@ -241,10 +239,7 @@ impl Ctx<'_> {
             .provider()
             .fetch_subscription(&snapshot.provider_subscription_id)
             .await?;
-        let after = occurred_at
-            .checked_add_signed(chrono::Duration::seconds(1))
-            .unwrap_or(occurred_at);
-        Ok(live.map(|live| (live, self.now.max(after))))
+        Ok(live)
     }
 
     async fn subscription(
@@ -261,10 +256,10 @@ impl Ctx<'_> {
         let live = self
             .resolve_tie(previous.as_ref(), snapshot, status, occurred_at)
             .await?;
-        let (snapshot, status, occurred_at) = match &live {
-            Some((live, at)) => (live, live.status, *at),
-            None => (snapshot, status, occurred_at),
-        };
+        let authoritative = live.is_some();
+        let (snapshot, status) = live
+            .as_ref()
+            .map_or((snapshot, status), |live| (live, live.status));
         let mut upsert = SubscriptionUpsert::new(
             self.new_id(),
             customer.id.clone(),
@@ -275,6 +270,9 @@ impl Ctx<'_> {
         )
         .with_quantity(snapshot.quantity)
         .with_cancel_at_period_end(snapshot.cancel_at_period_end);
+        if authoritative {
+            upsert = upsert.with_authoritative();
+        }
         if let Some(price_id) = &snapshot.provider_price_id {
             upsert = upsert.with_price(price_id.clone());
             if let Some(plan) = self.service.catalog().by_price_id(price_id) {

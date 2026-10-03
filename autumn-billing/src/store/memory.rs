@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 
 use super::{
     BillingStore, CustomerUpsert, EventClaim, Guard, InvoiceUpsert, StoreFuture,
-    SubscriptionUpsert, Write, guard,
+    SubscriptionUpsert, Write, guard, guard_subscription,
 };
 use crate::error::BillingError;
 use crate::model::{
@@ -253,12 +253,13 @@ impl BillingStore for MemoryBillingStore {
                 .find(|s| s.provider_subscription_id == upsert.provider_subscription_id)
                 .cloned();
             if let Some(current) = existing {
-                match guard(
+                match guard_subscription(
                     current.last_event_at,
                     current.status.rank(),
                     current.status.is_terminal(),
                     upsert.occurred_at,
                     upsert.status.rank(),
+                    upsert.authoritative,
                 ) {
                     Guard::Apply => {}
                     Guard::Unchanged => return Write::Unchanged(current),
@@ -543,6 +544,7 @@ mod tests {
             current_period_end: None,
             cancel_at_period_end: false,
             occurred_at: at(occurred),
+            authoritative: false,
             now: at(1000),
         }
     }
