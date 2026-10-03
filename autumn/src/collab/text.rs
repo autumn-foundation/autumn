@@ -123,12 +123,25 @@ pub const EMPTY_DOCUMENT: &str = r#"{"elems":[]}"#;
 /// Ordering is `(counter, actor)`. The counter is a Lamport clock, so a
 /// character always sorts above the character it was typed after; RGA's
 /// integration rule depends on that.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OpId {
     /// Lamport counter, unique per actor.
     pub counter: u64,
     /// Replica that minted the id.
     pub actor: String,
+}
+
+impl std::hash::Hash for OpId {
+    /// Two `write`s (counter, actor bytes) instead of the derive's three: the
+    /// derived `str` hash appends a `0xff` terminator, one more `SipHash`
+    /// absorb per lookup, and `index` is probed on every applied operation.
+    /// The fixed-width counter leads, so no actor/counter pair can alias
+    /// another through the missing terminator; `Hash` only has to agree with
+    /// `Eq`, which it does.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.counter);
+        state.write(self.actor.as_bytes());
+    }
 }
 
 impl OpId {
@@ -888,8 +901,12 @@ impl CollabText {
         // so both variants could sit in `pending` at once, each waiting to
         // integrate and each spreading to every other replica on the next
         // snapshot.
+        //
+        // The `index` probe is made once here and handed on to `integrate`,
+        // which would otherwise repeat it for the same id.
+        let indexed = op.insert_id().map(|id| self.index.contains(id));
         if let CollabOp::Insert { id, after, ch } = &op
-            && let Some((held_after, held_ch)) = self.held_variant(id)
+            && let Some((held_after, held_ch)) = self.held_variant(id, indexed == Some(true))
             && (held_after != after || held_ch != *ch)
         {
             tracing::warn!(
@@ -900,7 +917,7 @@ impl CollabText {
             return false;
         }
         self.clock = self.clock.max(op.minted_counter());
-        if self.integrate(&op) {
+        if self.integrate(&op, indexed) {
             self.drain_pending();
             true
         } else {
@@ -955,10 +972,10 @@ impl CollabText {
     // ── integration ──────────────────────────────────────────────────────
 
     /// Apply one operation if its cause is present. `false` means "not yet".
-    fn integrate(&mut self, op: &CollabOp) -> bool {
+    fn integrate(&mut self, op: &CollabOp, indexed: Option<bool>) -> bool {
         match op {
             CollabOp::Insert { id, after, ch } => {
-                if self.index.contains(id) {
+                if indexed.unwrap_or_else(|| self.index.contains(id)) {
                     // A genuine idempotent replay: `apply` has already turned
                     // back anything reusing this id for a different character,
                     // so reaching here means the same operation twice.
@@ -1004,7 +1021,7 @@ impl CollabText {
             let mut blocked = Vec::new();
             let mut progressed = false;
             for op in std::mem::take(&mut self.pending) {
-                if self.integrate(&op) {
+                if self.integrate(&op, None) {
                     self.buffered.remove(&op);
                     progressed = true;
                 } else {
@@ -1021,8 +1038,8 @@ impl CollabText {
     /// Index of the character `id` names.
     /// The `(after, ch)` this replica already holds for `id`, integrated or
     /// buffered, or `None` when the id is new here.
-    fn held_variant(&self, id: &OpId) -> Option<(&Option<OpId>, char)> {
-        if let Some(pos) = self.position_of(id) {
+    fn held_variant(&self, id: &OpId, indexed: bool) -> Option<(&Option<OpId>, char)> {
+        if indexed && let Some(pos) = self.elems.iter().position(|e| &e.id == id) {
             let held = &self.elems[pos];
             return Some((&held.after, held.ch));
         }
