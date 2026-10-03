@@ -606,7 +606,7 @@ pub struct CustomDomain {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_token: Option<String>,
     /// When this registration's certificate orders were placed, newest last,
-    /// kept for [`PER_DOMAIN_WINDOW_SECS`]. Persisted so the issuance budget
+    /// kept for the per-domain budget window (24 hours). Persisted so the issuance budget
     /// survives a restart: the limiter itself is in memory, and a crash loop
     /// would otherwise start every window empty and spend the shared ACME
     /// account's quota again. [`IssuanceLimiter::hydrate`] reads it back.
