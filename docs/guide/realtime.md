@@ -9,7 +9,7 @@ API to Redis pub/sub with `autumn.toml`.
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.7", features = ["ws"] }
+autumn-web = { version = "0.8", features = ["ws"] }
 ```
 
 ## Publish

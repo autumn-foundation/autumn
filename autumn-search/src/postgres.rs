@@ -285,7 +285,7 @@ impl PostgresSearchStore {
     /// `documents` is a caller-supplied slice on a PUBLIC trait method, not
     /// something this type controls the shape of — [`SearchDocument::fields`]
     /// is itself a public, uncapped `Vec` a hand-built document can push
-    /// arbitrarily many (even repeated) entries onto — so four defenses
+    /// arbitrarily many (even repeated) entries onto — so five defenses
     /// apply before any SQL is built:
     ///
     /// - **duplicate `record_id`s are deduplicated** — a single statement's
@@ -305,6 +305,15 @@ impl PostgresSearchStore {
     ///       (`WHERE updated_at <= watermark`) fails against that
     ///       just-written row and silently no-ops. Deduplicate keeping the
     ///       FIRST, to match.
+    /// - **every document's embedding width is validated BEFORE
+    ///   deduplication** — a malformed duplicate that loses the
+    ///   keep-first/keep-last coin flip would otherwise be silently
+    ///   discarded, masking malformed embedder output the old per-document
+    ///   loop always rejected with `DimensionMismatch` (#2311). Only the
+    ///   pgvector-mode + physical-`embedding_vec`-column combination
+    ///   rejects; other modes keep the row loop's existing behavior
+    ///   (a stale column copy is repaired by `NULL`ing it, not by failing
+    ///   the batch).
     /// - **the batch is split into chunks sized so no single statement can
     ///   approach Postgres's 65,535 bind-parameter limit**, using each
     ///   document's ACTUAL bind count (not `definition.fields.len()`, which
@@ -347,16 +356,15 @@ impl PostgresSearchStore {
         // bind-parameter cap for the few shared params (`$1`/`$2`[/`$3`]).
         const PARAM_BUDGET: usize = 60_000;
 
-        // A SEPARATE cap from `PARAM_BUDGET`: a document with few or no
-        // weighted fields consumes very few binds, so the param budget
-        // alone could still admit thousands of rows into one statement.
-        // The watermarked shape joins rows with `UNION ALL`, and a deeply
-        // nested `SELECT ... UNION ALL ...` chain risks Postgres'
-        // `max_stack_depth` during parsing/planning — a failure mode the
-        // old per-document loop, and the unconditional `VALUES` form (a
-        // flat list, not a nested tree), do not have. Comfortably above
-        // the framework's own 500-document default batch, so it never
-        // engages for realistic use.
+        // A separate cap from `PARAM_BUDGET`: a document with few or no weighted
+        // fields consumes very few binds, so the param budget alone could still
+        // admit thousands of rows into one statement. The watermarked shape joins
+        // rows with `UNION ALL`, and a deeply nested `SELECT ... UNION ALL ...`
+        // chain risks Postgres's `max_stack_depth` during parsing and planning — a
+        // failure mode neither the old per-document loop nor the unconditional
+        // `VALUES` form, a flat list rather than a nested tree, has. Comfortably
+        // above the framework's own 500-document default batch, so it never engages
+        // for realistic use.
         const MAX_ROWS_PER_CHUNK: usize = 1_000;
 
         checked(definition)?;
@@ -380,24 +388,30 @@ impl PostgresSearchStore {
             ("", "")
         };
 
+        // Every supplied document is validated BEFORE `dedupe_by_id`
+        // selects the duplicate winner: a malformed duplicate that loses the
+        // keep-first/keep-last coin flip would otherwise be silently
+        // discarded, masking malformed embedder output that the old
+        // per-document loop always rejected (#2311). This runs over the full
+        // supplied slice, not the survivors.
+        validate_embedding_widths(documents, vector_width, self.vector_mode())?;
+
         // See the doc comment above for why the direction depends on
         // `watermark`.
         let mut kept_documents = dedupe_by_id(documents, watermark.is_some());
 
-        // Sorted by `record_id` so every writer of overlapping ids —
-        // concurrent callers, or successive backfill batches — locks
-        // conflict rows in the SAME order. The old per-document loop held
-        // at most one row lock at a time (autocommit per statement), so it
-        // could never deadlock on row-lock order; a multi-row statement can
-        // hold several at once, and two batches indexing the same ids in
-        // different orders (e.g. `[1, 2]` and `[2, 1]`) would otherwise be
-        // able to lock-and-wait on each other in a cycle. A fixed
-        // (ascending) order across every caller makes that cycle
-        // impossible. Sorting after dedup, not before, since a stable
-        // canonical order only has to hold across the SURVIVING ids, not
-        // whichever occurrence of a duplicate lost — and this changes
-        // nothing about the QUERY RESULT, since each row's own
-        // `ON CONFLICT` target is independent of row order.
+        // Sorted by `record_id` so every writer of overlapping ids — concurrent
+        // callers, or successive backfill batches — locks conflict rows in the same
+        // order. The old per-document loop held at most one row lock at a time,
+        // autocommitting per statement, so it could never deadlock on row-lock
+        // order; a multi-row statement can hold several at once, and two batches
+        // indexing the same ids in different orders, `[1, 2]` against `[2, 1]`,
+        // could lock and wait on each other in a cycle. A fixed ascending order
+        // across every caller makes that impossible. Sorting after dedup, not
+        // before, because a canonical order only has to hold across the surviving
+        // ids, not whichever occurrence of a duplicate lost — and it changes nothing
+        // about the query result, since each row's `ON CONFLICT` target is
+        // independent of row order.
         kept_documents.sort_unstable_by_key(|document| document.id());
 
         let mut cursor = 0usize;
@@ -440,16 +454,14 @@ impl PostgresSearchStore {
                     && (next_param.saturating_add(doc_param_count) > PARAM_BUDGET
                         || rows.len() >= MAX_ROWS_PER_CHUNK)
                 {
-                    // Would overflow this chunk's param budget OR row-count
-                    // cap: stop here (without consuming `document` —
-                    // `cursor` is untouched) and let the outer `while` start
-                    // a fresh chunk for it. A chunk with zero rows so far
-                    // always admits at least one document regardless of its
-                    // own size, so a single document pathological enough to
-                    // exceed the budget alone gets exactly the old
-                    // per-document loop's behavior: its own statement,
-                    // which Postgres would equally have rejected before
-                    // this change existed.
+                    // Would overflow this chunk's param budget or row-count cap:
+                    // stop here without consuming `document`, leaving `cursor`
+                    // untouched, and let the outer `while` start a fresh chunk for
+                    // it. A chunk with zero rows so far always admits at least one
+                    // document whatever its size, so a single document pathological
+                    // enough to exceed the budget alone gets exactly the old
+                    // per-document loop's behaviour: its own statement, which
+                    // Postgres would equally have rejected before this change.
                     break;
                 }
                 cursor = cursor.saturating_add(1);
@@ -480,24 +492,23 @@ impl PostgresSearchStore {
 
                 let vec_value = if let Some(width) = vector_width {
                     let literal = match document.embedding.as_deref() {
-                        // A width the column cannot hold would fail the insert,
-                        // and leaving the old value in place is exactly the
-                        // staleness this avoids — so it never reaches SQL.
+                        // A width the column cannot hold would fail the insert, and
+                        // leaving the old value in place is exactly the staleness
+                        // this avoids, so it never reaches SQL.
                         //
-                        // Whether that is an ERROR depends on which column this
-                        // process is actually reading. In pgvector mode k-NN
-                        // runs off `embedding_vec`, so writing NULL would leave
-                        // the row permanently invisible to semantic search
-                        // while every write reported success — a silent hole,
-                        // and the worst outcome available. Say so instead.
+                        // Whether that is an error depends on which column this
+                        // process actually reads. In pgvector mode k-NN runs off
+                        // `embedding_vec`, so writing NULL would leave the row
+                        // permanently invisible to semantic search while every write
+                        // reported success — a silent hole, and the worst outcome
+                        // available. Say so instead.
                         //
-                        // Returning here leaves THIS chunk's statement
-                        // unexecuted — a document earlier in the SAME chunk
-                        // never reaches SQL either, unlike the old per-document
-                        // loop where earlier rows would already be committed.
-                        // A prior CHUNK, if any, has already committed by this
-                        // point (see the doc comment above: atomic per chunk,
-                        // not across the whole call).
+                        // Returning here leaves this chunk's statement unexecuted, so
+                        // a document earlier in the same chunk never reaches SQL
+                        // either, unlike the old per-document loop where earlier rows
+                        // would already be committed. A prior chunk, if any, has
+                        // already committed: see the doc comment above — atomic per
+                        // chunk, not across the whole call.
                         Some(embedding) if embedding.len() != width => {
                             if self.vector_mode().is_some_and(VectorMode::is_pgvector) {
                                 return Err(SearchError::DimensionMismatch {
@@ -523,14 +534,11 @@ impl PostgresSearchStore {
                 };
 
                 // The weighted tsvector, built exactly as #842 does:
-                // `setweight(to_tsvector(<lang>, <value>), <weight>)` per
-                // field, concatenated.
-                //
-                // The weight letter is interpolated, so it comes from the
-                // VALIDATED definition rather than from the document: a
-                // hand-built document (or a third-party `DocumentSource`) can
-                // carry any `char`. A field the index does not declare is
-                // skipped entirely.
+                // `setweight(to_tsvector(<lang>, <value>), <weight>)` per field,
+                // concatenated. The weight letter is interpolated, so it comes from
+                // the validated definition rather than from the document: a
+                // hand-built document, or a third-party `DocumentSource`, can carry
+                // any `char`. A field the index does not declare is skipped.
                 let mut vector_sql = String::new();
                 for field in &document.document.fields {
                     let Some(weight) = definition.weight_of(field.name) else {
@@ -786,6 +794,21 @@ fn pgvector_order_by(filtered: bool) -> String {
     }
 }
 
+/// The pgvector similarity scan's `WHERE` predicate on the embedding column.
+///
+/// Beyond the NULL check, it excludes zero-norm stored vectors: pgvector's
+/// `<=>` returns NaN for them, and NaN sorts FIRST under `DESC`, so a
+/// filtered query's NaN rows would consume `LIMIT` slots ahead of valid
+/// neighbours — the Rust-side `is_finite` filter runs after `LIMIT` and
+/// cannot give those slots back (#2313). NaN is not equal to itself, so a
+/// self-equality test on the distance drops exactly the NaN rows. (The
+/// portable `autumn_search_cosine` yields 0 for zero-norm vectors rather
+/// than NaN, so the array predicate needs no such guard.)
+fn pgvector_embedding_predicate() -> String {
+    "embedding_vec IS NOT NULL AND (embedding_vec <=> $2::vector) = (embedding_vec <=> $2::vector)"
+        .to_owned()
+}
+
 /// References into `documents` keeping only ONE occurrence of each
 /// `record_id` — the FIRST if `keep_first`, else the LAST — in ascending
 /// original-index order.
@@ -816,6 +839,66 @@ fn dedupe_by_id(documents: &[IndexedDocument], keep_first: bool) -> Vec<&Indexed
         .into_iter()
         .filter_map(|index| documents.get(index))
         .collect()
+}
+
+/// Reject a batch carrying a wrong-width embedding BEFORE [`dedupe_by_id`]
+/// selects the duplicate winner.
+///
+/// The old per-document loop validated every document as it wrote it, so a
+/// malformed embedder output always surfaced as
+/// [`SearchError::DimensionMismatch`]. Deduplication runs first now, and a
+/// malformed duplicate that loses the keep-first/keep-last coin flip is
+/// silently discarded — an unconditional batch `[bad-width id=1, valid id=1]`
+/// succeeds, and a watermark-guarded batch `[valid id=1, bad-width id=1]`
+/// succeeds too. Malformed output from the app's embedder is then masked
+/// rather than reported (#2311).
+///
+/// This mirrors the per-document check the row loop in `write_documents`
+/// still applies: only the pgvector-mode + physical-`embedding_vec`-column
+/// combination rejects a width mismatch. Every other combination keeps the
+/// loop's existing behavior — notably the portable/`Array` mode, where a
+/// stale `embedding_vec` copy left by a previous width is repaired by `NULL`ing
+/// it rather than failing the batch.
+fn validate_embedding_widths(
+    documents: &[IndexedDocument],
+    vector_width: Option<usize>,
+    vector_mode: Option<VectorMode>,
+) -> SearchResult<()> {
+    let Some(width) = vector_width else {
+        // No physical column: nothing to validate against.
+        return Ok(());
+    };
+    if !vector_mode.is_some_and(VectorMode::is_pgvector) {
+        // Only pgvector-mode writers run k-NN off `embedding_vec`; other
+        // modes write the portable `embedding` array at full width and let
+        // the row loop repair a stale column copy by NULLing it.
+        return Ok(());
+    }
+    for document in documents {
+        if let Some(embedding) = document.embedding.as_deref()
+            && embedding.len() != width
+        {
+            return Err(SearchError::DimensionMismatch {
+                expected: width,
+                actual: embedding.len(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The `record_id` order `delete()` binds for its ledger `INSERT ...
+/// unnest($2)`.
+///
+/// The insert acquires its tombstone rows in array order, so the array must
+/// be ascending to match the unconditional batch's `ORDER BY record_id FOR
+/// UPDATE` tombstone clear — opposite orders on the two paths deadlock over
+/// the same tombstones (#2310). Kept as a pure helper so the ordering
+/// contract is unit-testable without a database.
+fn ascending_ids(ids: &[i64]) -> Vec<i64> {
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted
 }
 
 /// One row's already-rendered column-value expression list, in the exact
@@ -923,24 +1006,38 @@ fn upsert_sql(
         return upsert;
     }
 
-    // An UNCONDITIONAL write is the record coming back — a reindex read the row
-    // and found it present, which supersedes any earlier delete — so the
-    // tombstone is cleared or a later backfill would skip a record that exists.
+    // An unconditional write is the record coming back — a reindex read the row and found
+    // it present, which supersedes any earlier delete — so the tombstone is cleared, or a
+    // later backfill would skip a record that exists.
     //
-    // In the SAME statement, for the reason the round before learned the hard
-    // way. As two statements a delete can interleave between them: the upsert
-    // commits, the delete commits (document removed, tombstone written), and
-    // then the trailing clear erases that NEWER tombstone while the document
-    // stays absent — leaving a backfill able to see neither and resurrect the
-    // record. One statement means the two possible serializations are
-    // "upsert+clear, then delete" (document absent, tombstone present) and
-    // "delete, then upsert+clear" (document present, no tombstone). Both are
-    // consistent; the interleaving that is not, cannot happen.
+    // In the same statement, for the reason the round before learned the hard way. As two
+    // statements a delete can interleave: the upsert commits, the delete commits (document
+    // removed, tombstone written), and then the trailing clear erases that newer tombstone
+    // while the document stays absent, leaving a backfill able to see neither and resurrect
+    // the record. One statement means the two possible serializations are "upsert+clear,
+    // then delete" (document absent, tombstone present) and "delete, then upsert+clear"
+    // (document present, no tombstone). Both are consistent; the inconsistent interleaving
+    // cannot happen.
+    //
+    // `cleared` locks the ledger rows in ascending `record_id` order — via `ORDER BY`
+    // plus `FOR UPDATE` in a `SELECT`, the only thing that actually controls Postgres's
+    // row-lock acquisition order — matching `delete()`'s `INSERT ... unnest($2)` order.
+    // A bare `DELETE ... WHERE record_id = ANY($n)` locks whatever rows its scan visits,
+    // independent of the array's order, so racing an oppositely-ordered `delete()` over
+    // the same tombstones could deadlock: each statement holds one ledger row and waits
+    // for the other (#2310).
     format!(
         "WITH upserted AS ( \
            {upsert} \
+         ), \
+         cleared AS ( \
+           SELECT record_id FROM {DELETES_TABLE} \
+           WHERE index_name = $1 AND record_id = ANY(${ids_param}) \
+           ORDER BY record_id \
+           FOR UPDATE \
          ) \
-         DELETE FROM {DELETES_TABLE} WHERE index_name = $1 AND record_id = ANY(${ids_param})"
+         DELETE FROM {DELETES_TABLE} \
+         WHERE index_name = $1 AND record_id IN (SELECT record_id FROM cleared)"
     )
 }
 
@@ -1105,36 +1202,39 @@ impl SearchBackend for PostgresSearchStore {
                 return Ok(());
             }
             let mut conn = self.conn().await?;
-            // ONE statement, via a data-modifying CTE.
+            // One statement, via a data-modifying CTE.
             //
-            // Removing the document and recording the delete are two halves of
-            // a single fact, and a concurrent backfill must never observe the
-            // gap between them: after the DELETE commits but before the ledger
-            // row exists, a watermarked insert sees no document to conflict
-            // with AND no delete to be blocked by, so it re-creates the record
-            // — and writing the tombstone afterwards does not take it back
-            // out. Two autocommitted statements have exactly that window.
+            // Removing the document and recording the delete are two halves of one
+            // fact, and a concurrent backfill must never observe the gap between
+            // them: after the DELETE commits but before the ledger row exists, a
+            // watermarked insert sees no document to conflict with and no delete to
+            // be blocked by, so it re-creates the record — and writing the tombstone
+            // afterwards does not take it back out. Two autocommitted statements have
+            // exactly that window.
             //
-            // A CTE rather than an explicit transaction because a single
-            // statement is atomic under autocommit with nothing to roll back,
-            // and it keeps this off diesel-async's transaction API. Postgres
-            // runs a data-modifying CTE to completion whether or not the outer
-            // query reads it, so the DELETE needs no RETURNING.
+            // A CTE rather than an explicit transaction, because a single statement is
+            // atomic under autocommit with nothing to roll back, and it keeps this off
+            // diesel-async's transaction API. Postgres runs a data-modifying CTE to
+            // completion whether or not the outer query reads it, so the DELETE needs
+            // no RETURNING. `deleted_at` is refreshed on a replayed delete, so a retry
+            // cannot age out earlier than the delete it repeats.
             //
-            // `deleted_at` is refreshed on a replayed delete so a retry cannot
-            // age out earlier than the delete it repeats.
+            // `doomed` locks its rows in ascending `record_id` order — matching
+            // `write_documents`' and `clear`'s order — via `ORDER BY` plus `FOR
+            // UPDATE` in a `SELECT`, the only thing that actually controls Postgres's
+            // row-lock acquisition order. Binding a pre-sorted array to `record_id =
+            // ANY($2)` does not: Postgres may satisfy that predicate with a
+            // sequential, bitmap, or index scan and locks rows in whatever order the
+            // scan visits them, independent of the array's order, so a bare `DELETE
+            // ... WHERE record_id = ANY($2)` could lock out of order and deadlock
+            // against a concurrent `write_documents` batch.
             //
-            // `doomed` locks its rows in ascending `record_id` order —
-            // matching `write_documents`' and `clear`'s own order — via
-            // `ORDER BY` + `FOR UPDATE` in a `SELECT`, the only thing that
-            // actually controls Postgres' row-lock acquisition order.
-            // Binding a pre-sorted array to `record_id = ANY($2)` does NOT:
-            // Postgres is free to satisfy that predicate with a sequential,
-            // bitmap, or index scan and locks rows in whatever order that
-            // scan visits them, independent of the array's own order — a
-            // bare `DELETE ... WHERE record_id = ANY($2)` could still lock
-            // its rows out of order and lock-and-wait against a concurrent
-            // `write_documents` batch.
+            // The ledger half needs the same treatment in reverse: the `INSERT ...
+            // unnest($2)` below acquires its tombstone rows in array order, so the
+            // array is pre-sorted ascending to match the unconditional batch's
+            // `ORDER BY record_id FOR UPDATE` tombstone clear. Opposite orders on
+            // the two paths deadlock over the same tombstones (#2310).
+            let sorted_ids = ascending_ids(ids);
             bind_all(
                 diesel::sql_query(format!(
                     "WITH doomed AS ( \
@@ -1154,7 +1254,7 @@ impl SearchBackend for PostgresSearchStore {
                 .into_boxed::<autumn_web::RuntimeBackend>(),
                 [
                     Bound::Text(definition.name.to_owned()),
-                    Bound::Ids(ids.to_vec()),
+                    Bound::Ids(sorted_ids),
                 ],
             )
             .execute(&mut conn)
@@ -1168,20 +1268,18 @@ impl SearchBackend for PostgresSearchStore {
         Box::pin(async move {
             checked(definition)?;
             let mut conn = self.conn().await?;
-            // Documents and ledger in ONE statement, for the same reason
-            // `delete` uses a CTE: a purge is a deliberate reset, and a
-            // concurrent write must not be able to observe half of it. The
-            // ledger has to go too, or the rebuild that follows would silently
-            // skip everything previously deleted.
+            // Documents and ledger in one statement, for the same reason `delete` uses
+            // a CTE: a purge is a deliberate reset, and a concurrent write must not be
+            // able to observe half of it. The ledger has to go too, or the rebuild that
+            // follows would silently skip everything previously deleted.
             //
-            // `doomed` locks its rows in ascending `record_id` order (`FOR
-            // UPDATE` on a sorted `SELECT` acquires locks in the order rows
-            // are produced), matching `write_documents`' and `delete`'s own
-            // ascending order — a bare `DELETE ... WHERE index_name = $1`
-            // would instead lock whatever rows its scan happens to visit
-            // (physical heap order for a sequential scan), which a
-            // concurrent `write_documents` batch touching the SAME rows in
-            // ascending order could deadlock against.
+            // `doomed` locks its rows in ascending `record_id` order — `FOR UPDATE` on
+            // a sorted `SELECT` acquires locks in the order rows are produced —
+            // matching `write_documents`' and `delete`'s ascending order. A bare
+            // `DELETE ... WHERE index_name = $1` would instead lock whatever rows its
+            // scan visits, physical heap order for a sequential scan, which a
+            // concurrent `write_documents` batch touching the same rows in ascending
+            // order could deadlock against.
             diesel::sql_query(format!(
                 "WITH doomed AS ( \
                    SELECT record_id FROM {DOCUMENTS_TABLE} \
@@ -1312,14 +1410,12 @@ impl SearchBackend for PostgresSearchStore {
             // A filter here is an AUTHORIZATION boundary as often as not — a
             // tenant, a visibility allowlist, a `similar_to` self-exclusion.
             let filtered = query.filter != SearchFilter::default();
-            // Both modes score cosine SIMILARITY so the two orderings agree
-            // (pgvector's `<=>` is cosine distance, hence `1 - d`).
-            //
-            // Ordering differs, though, and deliberately: an ivfflat index can
-            // only serve `ORDER BY col <=> const ASC`. Ordering by the derived
-            // `1 - d` expression is opaque to the planner and forces an exact
-            // full scan, which would make the whole pgvector fast path buy
-            // nothing. So pgvector mode orders by DISTANCE ascending and
+            // Both modes score cosine similarity, so the two orderings agree —
+            // pgvector's `<=>` is cosine distance, hence `1 - d`. The ordering differs
+            // deliberately: an ivfflat index can serve only `ORDER BY col <=> const
+            // ASC`. Ordering by the derived `1 - d` expression is opaque to the planner
+            // and forces an exact full scan, which would make the whole pgvector fast
+            // path buy nothing. So pgvector mode orders by distance ascending and
             // converts to similarity only in the select list.
             let (query_vector, distance, score_expr, order_by, embedding_predicate) = if pgvector {
                 (
@@ -1327,24 +1423,22 @@ impl SearchBackend for PostgresSearchStore {
                     "(embedding_vec <=> $2::vector)".to_owned(),
                     "(1 - (embedding_vec <=> $2::vector))::double precision".to_owned(),
                     // The ordering decides whether the ivfflat index can serve
-                    // this query, and for a FILTERED query it must not.
+                    // this query, and for a filtered query it must not.
                     //
-                    // ivfflat picks its candidate lists by distance BEFORE the
+                    // ivfflat picks its candidate lists by distance before the
                     // `WHERE` clause runs, so a selective tenant or visibility
-                    // predicate can leave the probed lists holding few or none
-                    // of the rows the caller is allowed to see — returning
-                    // short, or empty, while qualifying neighbours sit in
-                    // unprobed lists. That is a wrong answer to an
-                    // authorization-scoped query, not merely an approximate
-                    // one, and it would differ from the array backend, which
-                    // the two suites assert implements the same contract.
+                    // predicate can leave the probed lists holding few or none of
+                    // the rows the caller may see, returning short or empty while
+                    // qualifying neighbours sit in unprobed lists. That is a wrong
+                    // answer to an authorization-scoped query, not merely an
+                    // approximate one, and it would differ from the array backend,
+                    // which the two suites assert implements the same contract.
                     //
-                    // Ordering by the derived similarity is opaque to the
-                    // planner, so it forces an exact scan: slower, and right.
-                    // An unfiltered query keeps the index-friendly form, which
-                    // is where the fast path actually pays.
+                    // Ordering by the derived similarity is opaque to the planner,
+                    // so it forces an exact scan: slower, and right. An unfiltered
+                    // query keeps the index-friendly form, where the fast path pays.
                     pgvector_order_by(filtered),
-                    "embedding_vec IS NOT NULL".to_owned(),
+                    pgvector_embedding_predicate(),
                 )
             } else {
                 let expr = "autumn_search_cosine(embedding, $2::double precision[])".to_owned();
@@ -1353,17 +1447,16 @@ impl SearchBackend for PostgresSearchStore {
                     String::new(),
                     expr.clone(),
                     format!("ORDER BY {expr} DESC, record_id ASC"),
-                    // `unnest(a, b)` pads the shorter array with NULLs and
-                    // silently mis-scores, so a width mismatch is excluded
-                    // rather than ranked. (pgvector's `<=>` errors instead —
-                    // documented divergence.)
+                    // `unnest(a, b)` pads the shorter array with NULLs and silently
+                    // mis-scores, so a width mismatch is excluded rather than ranked;
+                    // pgvector's `<=>` errors instead, a documented divergence.
                     //
-                    // The width is BOUND, not interpolated. It is the length of
-                    // a caller-supplied vector, so formatting it mints a
-                    // permanent prepared statement per distinct length in a
-                    // cache that never evicts — the same unbounded growth the
-                    // ids, limits, offsets and score threshold are all bound to
-                    // avoid. `array_length` returns `integer`, hence the cast.
+                    // The width is bound, not interpolated. It is the length of a
+                    // caller-supplied vector, so formatting it mints a permanent
+                    // prepared statement per distinct length in a cache that never
+                    // evicts — the same unbounded growth the ids, limits, offsets, and
+                    // score threshold are all bound to avoid. `array_length` returns
+                    // `integer`, hence the cast.
                     {
                         let slot = param;
                         param = param.saturating_add(1);
@@ -1408,8 +1501,9 @@ impl SearchBackend for PostgresSearchStore {
             Ok(rows
                 .into_iter()
                 // A zero-norm vector makes pgvector's `<=>` return NaN, which
-                // sorts FIRST under `DESC` — a garbage row would rank #1 with
-                // a displayed score of 0. Drop those rather than surface them.
+                // sorts FIRST under `DESC`. The `WHERE` predicate excludes
+                // those rows before `LIMIT` (#2313); this filter stays as
+                // defense-in-depth so a NaN score can never surface.
                 .filter(|row| row.score.is_finite())
                 .map(|row| SearchHit::new(definition.name, row.record_id, narrow_score(row.score)))
                 .collect())
@@ -1738,19 +1832,18 @@ impl PostgresSearchStore {
                 binds.push(Bound::BigInt(i64::try_from(limit).unwrap_or(i64::MAX)));
             }
         }
-        // BOTH conditions: the column has to exist, and the model's repository
-        // has to actually be `soft_delete`.
+        // Both conditions: the column has to exist, and the model's repository has to
+        // actually be `soft_delete`.
         //
-        // Column presence alone is not the question. A `deleted_at` that is
-        // audit history — a supported shape, whose finders return those rows —
-        // would otherwise be read as a tombstone here: reindex would see the
-        // row as absent and delete its document, and a purging backfill would
-        // drop it entirely. The index would hide records the app still shows.
+        // Column presence alone is not the question. A `deleted_at` that is audit
+        // history — a supported shape, whose finders return those rows — would
+        // otherwise be read as a tombstone here: reindex would see the row as absent
+        // and delete its document, and a purging backfill would drop it entirely. The
+        // index would hide records the app still shows.
         //
-        // When the repository IS `soft_delete`, the filter is required for the
-        // mirror-image reason: `after_delete_commit` removes the document, and
-        // a later backfill would put it straight back — searchable while
-        // `find` hides it.
+        // When the repository is `soft_delete`, the filter is required for the
+        // mirror-image reason: `after_delete_commit` removes the document, and a later
+        // backfill would put it straight back — searchable while `find` hides it.
         if columns.deleted_at && definition.soft_delete {
             predicates.push("deleted_at IS NULL".to_owned());
         }
@@ -1992,6 +2085,85 @@ mod tests {
         }
     }
 
+    fn doc_with_embedding(id: i64, width: usize) -> IndexedDocument {
+        doc(id).with_embedding(vec![0.0; width])
+    }
+
+    const PGVECTOR_MODE: Option<VectorMode> = Some(VectorMode::PgVector { dimensions: 4 });
+
+    fn assert_dimension_mismatch(error: &SearchError, expected: usize, actual: usize) {
+        assert!(
+            matches!(
+                error,
+                SearchError::DimensionMismatch {
+                    expected: exp,
+                    actual: act
+                } if *exp == expected && *act == actual
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn embedding_widths_are_validated_before_unconditional_dedup_can_hide_a_bad_duplicate() {
+        // #2311: the issue's exact scenario. Unconditional (`index`) dedup
+        // keeps the LAST occurrence, so the malformed first entry never
+        // reaches the row loop's width check — without pre-dedup validation
+        // this batch succeeds and the malformed embedder output is masked.
+        let documents = vec![
+            doc_with_embedding(1, 3), // bad width, loses the coin flip
+            doc_with_embedding(1, 4), // valid, survives dedup
+        ];
+        let error = validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
+            .expect_err("a wrong-width embedding must be rejected");
+        assert_dimension_mismatch(&error, 4, 3);
+    }
+
+    #[test]
+    fn embedding_widths_are_validated_before_guarded_dedup_can_hide_a_bad_duplicate() {
+        // Watermark-guarded (`index_unless_newer`) dedup keeps the FIRST
+        // occurrence, so a malformed LATER duplicate is the one that would
+        // be silently discarded.
+        let documents = vec![
+            doc_with_embedding(1, 4), // valid, survives dedup
+            doc_with_embedding(1, 3), // bad width, loses the coin flip
+        ];
+        let error = validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
+            .expect_err("a wrong-width embedding must be rejected");
+        assert_dimension_mismatch(&error, 4, 3);
+    }
+
+    #[test]
+    fn embedding_width_validation_accepts_a_clean_batch() {
+        let documents = vec![
+            doc_with_embedding(1, 4),
+            doc_with_embedding(2, 4),
+            doc(3), // no embedding at all is fine
+        ];
+        validate_embedding_widths(&documents, Some(4), PGVECTOR_MODE)
+            .expect("a clean batch must validate");
+    }
+
+    #[test]
+    fn embedding_width_validation_only_rejects_in_pgvector_mode() {
+        // The portable/`Array` mode does not reject a width mismatch: the
+        // row loop repairs a stale `embedding_vec` copy from a previous
+        // width by NULLing it, so pre-dedup validation must not change that
+        // behavior.
+        let documents = vec![doc_with_embedding(1, 3)];
+        validate_embedding_widths(&documents, Some(4), Some(VectorMode::Array))
+            .expect("non-pgvector mode must not reject a width mismatch");
+    }
+
+    #[test]
+    fn embedding_width_validation_skips_when_there_is_no_physical_column() {
+        // `None` width means the `embedding_vec` column is absent and must
+        // stay out of the write entirely — nothing to validate against.
+        let documents = vec![doc_with_embedding(1, 3)];
+        validate_embedding_widths(&documents, None, PGVECTOR_MODE)
+            .expect("no physical column means no validation");
+    }
+
     #[test]
     fn greedy_chunking_never_lets_a_statement_approach_the_bind_limit_even_with_repeated_fields() {
         // Mirrors write_documents' own greedy accounting: `SearchDocument::fields`
@@ -2117,6 +2289,26 @@ mod tests {
     }
 
     #[test]
+    fn the_pgvector_predicate_excludes_nan_scores_before_limit() {
+        // Zero-norm stored vectors make pgvector's `<=>` return NaN, which
+        // sorts FIRST under `DESC` — on a filtered query they would consume
+        // `LIMIT` slots ahead of valid neighbours, and the Rust-side
+        // `is_finite` filter runs too late to give those slots back (#2313).
+        // NaN is not equal to itself, so the predicate's self-equality test
+        // on the distance drops exactly the NaN rows, before ordering and
+        // limiting.
+        let predicate = pgvector_embedding_predicate();
+        assert!(
+            predicate.contains("embedding_vec IS NOT NULL"),
+            "{predicate}"
+        );
+        assert!(
+            predicate.contains("(embedding_vec <=> $2::vector) = (embedding_vec <=> $2::vector)"),
+            "NaN must be excluded by self-inequality: {predicate}"
+        );
+    }
+
+    #[test]
     fn an_unconditional_upsert_clears_the_tombstone_in_the_same_statement() {
         // Two statements let a delete interleave: the upsert commits, the
         // delete commits (document removed, tombstone written), and the
@@ -2140,6 +2332,19 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("record_id = ANY($9)"), "{sql}");
+
+        // The tombstone clear must lock the ledger rows in ascending
+        // `record_id` order — ORDER BY + FOR UPDATE is the only thing that
+        // controls Postgres's lock acquisition order — matching `delete()`'s
+        // `INSERT ... unnest($2)` order. A bare DELETE ... ANY($n) locks in
+        // scan order and deadlocks against an oppositely-ordered delete
+        // racing over the same tombstones (#2310).
+        let lock_block = sql
+            .find(&format!("DELETE FROM {DELETES_TABLE}"))
+            .map(|at| &sql[..at])
+            .expect("the tombstone-clear DELETE exists");
+        assert!(lock_block.contains("ORDER BY record_id"), "{sql}");
+        assert!(lock_block.contains("FOR UPDATE"), "{sql}");
 
         // A watermarked (backfill) write leaves the ledger alone — its batch is
         // older than any tombstone by construction. Clearing it there would
@@ -2168,6 +2373,18 @@ mod tests {
         assert_eq!(multi.matches("$3::timestamptz").count(), 3, "{multi}");
         assert!(multi.contains("record_id = $4"), "{multi}");
         assert!(multi.contains("record_id = $9"), "{multi}");
+    }
+
+    #[test]
+    fn delete_binds_its_ledger_ids_in_ascending_order() {
+        // `delete()`'s `INSERT ... unnest($2)` acquires tombstone rows in
+        // array order, so the bound array must be ascending to match the
+        // unconditional batch's `ORDER BY record_id FOR UPDATE` tombstone
+        // clear — opposite orders on the two paths deadlock (#2310).
+        assert_eq!(ascending_ids(&[3, 1, 2]), vec![1, 2, 3]);
+        assert_eq!(ascending_ids(&[1, 2, 3]), vec![1, 2, 3]);
+        assert_eq!(ascending_ids(&[5, 5, 1]), vec![1, 5, 5]);
+        assert_eq!(ascending_ids(&[]), Vec::<i64>::new());
     }
 
     #[test]

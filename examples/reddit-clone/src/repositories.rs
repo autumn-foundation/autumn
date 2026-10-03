@@ -13,14 +13,14 @@
 //     mutations at /api/posts.  To broadcast from HTML routes too, call
 //     state.broadcast().publish_oob(...) after each Diesel mutation.
 
-use crate::hooks::PostHooks;
+use crate::hooks::{PostHooks, SubredditHooks};
 use crate::models::{
-    NewPost, NewSubreddit, NewVote, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
-    UpdateVote, Vote,
+    NewPost, NewSubreddit, NewVote, Post, PostDraftExt, Subreddit, SubredditDraftExt, UpdatePost,
+    UpdateSubreddit, UpdateVote, Vote,
 };
 use crate::schema::{posts, subreddits, votes};
 
-#[autumn_web::repository(Subreddit, api = "/api/subreddits")]
+#[autumn_web::repository(Subreddit, hooks = SubredditHooks, api = "/api/subreddits")]
 pub trait SubredditRepository {
     /// SELECT * FROM subreddits WHERE slug = $1
     fn find_by_slug(slug: String) -> Vec<Subreddit>;
@@ -83,6 +83,20 @@ pub trait PostRepository {
 // comment votes from the top-N. Regression-guarded by
 // `leaderboard_grouped_aggregate_still_works_after_react` in
 // `tests/votable_pg_integration.rs`.
+//
+// Checked once already: in a production-shaped fixture where post-directed
+// votes were 88.1% of the table (comment votes, which this guard excludes,
+// were a small minority), `post_id IS NOT NULL` was NOT selective enough —
+// it matched nearly the whole table — for a partial covering index —
+// `(post_id) INCLUDE (value) WHERE post_id IS NOT NULL` — to ever get
+// chosen by the planner over the seq scan. That is a property of *that*
+// vote mix, not a guarantee: a deployment where comment votes are a much
+// larger share of `votes` would see a more selective guard (matching a
+// smaller fraction of the table), and the index could earn its keep there.
+// Re-measure against real data before concluding either way — don't just
+// reason from this comment. See
+// `docs/reports/2026-09-20-ledger-reddit-vote-leaderboard-covering-index-negative-result/`
+// for the methodology and the fixture's exact ratio.
 #[autumn_web::repository(Vote, table = "votes")]
 pub trait VoteRepository {
     /// SUM(value) GROUP BY post_id -> `Vec<(post_id, Option<sum>)>`.

@@ -1,0 +1,795 @@
+//! Which requests get mirrored, and why the rest do not (issue #1653).
+//!
+//! The decision is a pure function of the request and one `roll` in `[0, 1)`
+//! supplied by the caller, so it is fully testable and — when the roll comes
+//! from a [`crate::entropy::SeededEntropy`], as it does under
+//! [`#[sim_test]`](crate::sim_test) — reproducible.
+//!
+//! Six gates run before the sample rate is even consulted, cheapest first:
+//!
+//! 1. **Method.** Only [`MIRRORABLE_METHODS`] (`GET`/`HEAD`). This slice
+//!    mirrors idempotent traffic only, and the set is a constant rather than a
+//!    config key precisely so it cannot be widened by accident.
+//! 2. **Loop guard.** A request already carrying [`SHADOW_HEADER`] is itself a
+//!    mirrored request. Mirroring it again — which is what happens the moment
+//!    someone points a shadow target at the app itself, or chains two shadows —
+//!    would multiply traffic without bound.
+//! 3. **Request body.** A request that carries a body (issue #2332) is
+//!    never mirrored — whether the body is declared by the headers or
+//!    undeclared (frames with no `Content-Length`/`Transfer-Encoding`,
+//!    reachable on HTTP/2). The mirror replays method, target, and headers
+//!    but no body, so mirroring one would ask the candidate a *different*
+//!    request than the live build answered and record the manufactured
+//!    difference as a divergence. Until the mutating-traffic follow-up
+//!    brings real request-body replay, these requests sit out quietly.
+//! 4. **Conditional requests.** A `GET`/`HEAD` carrying `If-None-Match`,
+//!    `If-Modified-Since`, `If-Range` (or `If-Match`/`If-Unmodified-Since`)
+//!    is a cache revalidation, and a validator is scoped to the build that
+//!    issued it. Replaying the primary's validator to the candidate makes the
+//!    two builds answer differently for reasons that have nothing to do with a
+//!    regression — the primary returns `304` while the candidate, whose
+//!    validator differs, returns `200` — and when both *do* revalidate, the
+//!    differ compares two empty `304` bodies and records a vacuous `match`
+//!    that masks a genuine body regression. Conditional traffic is never
+//!    mirrored (issue #2335); the skip is counted separately so the report
+//!    shows how much coverage this costs on cache-heavy routes.
+//! 5. **Exempt paths.** The actuator prefix and the platform probe paths. A
+//!    load balancer's health checks are the highest-rate, least-interesting
+//!    traffic an app serves; mirroring them buys nothing and drowns the
+//!    candidate.
+//! 6. **Route allowlist.** Empty means "every eligible route".
+
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
+use axum::http::{
+    HeaderMap, Method,
+    header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+};
+
+use crate::entropy::Entropy;
+
+/// The only methods this slice mirrors.
+pub const MIRRORABLE_METHODS: [Method; 2] = [Method::GET, Method::HEAD];
+
+/// Header stamped on every mirrored request.
+///
+/// Two jobs: it is the loop guard (see the module docs), and it is the seam a
+/// candidate build uses to recognise mirrored traffic and refuse to act on it —
+/// the hook the follow-up effect-virtualization slice builds on.
+pub const SHADOW_HEADER: &str = "x-autumn-shadow";
+
+/// Value sent with [`SHADOW_HEADER`].
+pub const SHADOW_HEADER_VALUE: &str = "1";
+
+/// Label used for the route dimension when no route patterns are configured.
+const ALL_ROUTES_LABEL: &str = "*";
+
+/// Why a request was not mirrored.
+///
+/// Emitted on the mirror layer's `TRACE` stream (target `autumn::shadow`), so
+/// an operator debugging a quiet mirror can see whether it is quiet because
+/// nothing matched, because the sample rate is low, or because they pointed it
+/// at itself. Deliberately not a metric: this fires on every inbound request
+/// while mirroring is enabled, and a labelled counter increment on the
+/// not-mirrored path is a cost every request would pay to report a
+/// configuration fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Not a [`MIRRORABLE_METHODS`] method.
+    Method,
+    /// The request is itself a mirrored request.
+    LoopGuard,
+    /// The request carries a body the mirror cannot replay (issue #2332) —
+    /// declared by its headers or undeclared. Mirroring it would ask the
+    /// candidate a different request than the live build answered and record
+    /// the manufactured difference as a divergence.
+    HasRequestBody,
+    /// A conditional request (`If-None-Match`, `If-Modified-Since`,
+    /// `If-Range`, `If-Match`, `If-Unmodified-Since`): a cache revalidation
+    /// whose validator belongs to the primary's build, so mirroring it would
+    /// compare the primary's `304` against the candidate's `200` — or compare
+    /// two empty `304` bodies and report a vacuous match (issue #2335).
+    Conditional,
+    /// An actuator or probe path.
+    ExemptPath,
+    /// A route allowlist is configured and this path is not on it.
+    RouteNotOptedIn,
+    /// Eligible, but the sample rate did not select it.
+    NotSampled,
+}
+
+impl SkipReason {
+    /// Stable `snake_case` name for diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Method => "method",
+            Self::LoopGuard => "loop_guard",
+            Self::HasRequestBody => "has_request_body",
+            Self::Conditional => "conditional",
+            Self::ExemptPath => "exempt_path",
+            Self::RouteNotOptedIn => "route_not_opted_in",
+            Self::NotSampled => "not_sampled",
+        }
+    }
+}
+
+/// Whether to mirror one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorDecision {
+    /// Mirror it.
+    Mirror,
+    /// Leave it alone, for this reason.
+    Skip(SkipReason),
+}
+
+/// One entry of the configured route allowlist.
+#[derive(Clone, Debug)]
+enum RoutePattern {
+    /// `"/api/*"` — matches any path starting with `"/api/"`, and `"/api/"`.
+    Prefix { pattern: String, prefix: String },
+    /// `"/status"` — matches that path exactly.
+    Exact(String),
+}
+
+impl RoutePattern {
+    fn parse(raw: &str) -> Self {
+        raw.strip_suffix('*').map_or_else(
+            || Self::Exact(raw.to_owned()),
+            |prefix| Self::Prefix {
+                pattern: raw.to_owned(),
+                prefix: prefix.to_owned(),
+            },
+        )
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            Self::Prefix { prefix, .. } => path.starts_with(prefix.as_str()),
+            Self::Exact(exact) => path == exact,
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::Prefix { pattern, .. } => pattern,
+            Self::Exact(exact) => exact,
+        }
+    }
+}
+
+/// The mirroring admission decision, resolved once at router-assembly time.
+#[derive(Clone, Debug)]
+pub struct MirrorSelector {
+    sample_rate: f64,
+    routes: std::sync::Arc<Vec<RoutePattern>>,
+    actuator_prefix: String,
+    actuator_prefix_slash: String,
+    probe_paths: std::sync::Arc<Vec<String>>,
+}
+
+impl MirrorSelector {
+    /// Build a selector.
+    ///
+    /// `actuator_prefix` and `probe_paths` come from the same config the
+    /// load-shed layer reads, so the two agree on what platform traffic is.
+    /// `probe_paths` should also carry the actuator's mounted endpoint paths:
+    /// with `prefix = "/"` the actuator mounts at the root, where no prefix
+    /// test can distinguish it from application routes.
+    #[must_use]
+    pub fn new(
+        sample_rate: f64,
+        routes: &[String],
+        actuator_prefix: &str,
+        probe_paths: &[String],
+    ) -> Self {
+        // The actuator's OWN normalizer, not a hand-rolled trim. `[actuator]
+        // prefix` accepts noncanonical forms — `"ops/"` mounts at `/ops`, `"/"`
+        // mounts at the root — and a trim that disagreed with the mount would
+        // leave the real endpoints unexempt, so operator polling of
+        // `/metrics`, `/prometheus`, `/shadow` would be mirrored: candidate
+        // load, plus permanent false divergences from payloads that are
+        // per-replica by construction.
+        let actuator_prefix = crate::actuator::normalize_actuator_prefix(actuator_prefix);
+        Self {
+            sample_rate,
+            routes: std::sync::Arc::new(routes.iter().map(|r| RoutePattern::parse(r)).collect()),
+            actuator_prefix_slash: format!("{actuator_prefix}/"),
+            actuator_prefix,
+            probe_paths: std::sync::Arc::new(probe_paths.to_vec()),
+        }
+    }
+
+    /// Decide whether to mirror one request.
+    ///
+    /// `body_known_empty` is the request body's own end-of-stream signal
+    /// (`http_body::Body::is_end_stream`, read by the caller — the decision
+    /// point never sees the body itself): `true` means the body is
+    /// definitely empty. Together with the header check in
+    /// `request_carries_body` this catches both declared bodies and
+    /// *undeclared* ones — frames with no `Content-Length` or
+    /// `Transfer-Encoding`, reachable on HTTP/2 (issue #2332). When in doubt
+    /// the request sits out: a skipped mirror costs coverage, a mirrored
+    /// body-carrying request manufactures divergences.
+    ///
+    /// `roll` is a **thunk**, not a value: it is called only once the six
+    /// cheap gates above have passed. On an app with mirroring enabled this
+    /// runs on every inbound request, and the entropy source behind
+    /// [`roll_from`] takes a lock — so drawing eagerly would put a lock
+    /// acquisition on the path of every `POST`, every health check, and every
+    /// request to a route that is not even opted in. It must be in `[0, 1)`.
+    #[must_use]
+    pub fn decide(
+        &self,
+        method: &Method,
+        target: &str,
+        headers: &HeaderMap,
+        body_known_empty: bool,
+        roll: impl FnOnce() -> f64,
+    ) -> MirrorDecision {
+        if !MIRRORABLE_METHODS.contains(method) {
+            return MirrorDecision::Skip(SkipReason::Method);
+        }
+        if headers.contains_key(SHADOW_HEADER) {
+            return MirrorDecision::Skip(SkipReason::LoopGuard);
+        }
+        // A body-carrying GET/HEAD is never mirrored (issue #2332): declared
+        // via `request_carries_body`, or undeclared — frames with no
+        // `Content-Length`/`Transfer-Encoding` — via the body's own
+        // end-of-stream signal. Fails closed: doubt means no mirror.
+        if !body_known_empty || request_carries_body(headers) {
+            return MirrorDecision::Skip(SkipReason::HasRequestBody);
+        }
+        if is_conditional(headers) {
+            return MirrorDecision::Skip(SkipReason::Conditional);
+        }
+
+        let path = path_of(target);
+        if self.is_exempt(path) {
+            return MirrorDecision::Skip(SkipReason::ExemptPath);
+        }
+        if !self.routes.is_empty() && !self.routes.iter().any(|r| r.matches(path)) {
+            return MirrorDecision::Skip(SkipReason::RouteNotOptedIn);
+        }
+
+        // `roll < rate` — so `rate = 0.0` never fires (no roll is below zero)
+        // and `rate = 1.0` always does (every roll is below one).
+        if self.sample_rate <= 0.0 {
+            return MirrorDecision::Skip(SkipReason::NotSampled);
+        }
+        if roll() < self.sample_rate {
+            MirrorDecision::Mirror
+        } else {
+            MirrorDecision::Skip(SkipReason::NotSampled)
+        }
+    }
+
+    /// The bounded label for a path: the configured pattern it matched, or
+    /// `"*"` when no allowlist is configured.
+    ///
+    /// This is the **fallback**. The mirror layer prefers
+    /// [`axum::extract::MatchedPath`], which is a genuinely informative route
+    /// template and is available to it (`Router::layer` wraps each route's
+    /// service, so routing has already run); this covers the cases where no
+    /// route matched. Never the raw path either way — an unbounded URL space
+    /// must not become unbounded metric cardinality.
+    #[must_use]
+    pub fn route_label(&self, target: &str) -> &str {
+        let path = path_of(target);
+        self.routes
+            .iter()
+            .find(|r| r.matches(path))
+            .map_or(ALL_ROUTES_LABEL, RoutePattern::label)
+    }
+
+    /// Platform traffic that is never mirrored.
+    fn is_exempt(&self, path: &str) -> bool {
+        if !self.actuator_prefix.is_empty()
+            && (path == self.actuator_prefix || path.starts_with(&self.actuator_prefix_slash))
+        {
+            return true;
+        }
+        self.probe_paths.iter().any(|probe| probe == path)
+    }
+}
+
+/// The path portion of a request target, with any query string removed.
+fn path_of(target: &str) -> &str {
+    target.split('?').next().unwrap_or(target)
+}
+
+/// Whether the request's headers promise a body.
+///
+/// This is the header half of the #2332 body check in [`decide`]: the other
+/// half is the body's own end-of-stream signal, which catches *undeclared*
+/// bodies — frames with no `Content-Length`/`Transfer-Encoding`.
+///
+/// A `GET`/`HEAD` carrying a request body is unusual but legal: RFC 9110
+/// does not forbid it, and search APIs do use it. The mirror replays
+/// method, target, and headers but no body — it cannot carry the promise
+/// across — so mirroring such a request would ask the candidate a
+/// *different* question than the live build answered and record the
+/// manufactured difference as a divergence (issue #2332). The
+/// mutating-traffic follow-up owns real request-body replay; until then
+/// the safe stopgap the issue endorses is to sit these requests out.
+///
+/// Any `Transfer-Encoding` means a framed body follows. A non-zero
+/// `Content-Length` promises body bytes; `0` and absent mean none. An
+/// unparseable `Content-Length` fails closed to carrying: the request is
+/// malformed, and the live build may answer with a `400` the mirror could
+/// not replay.
+#[must_use]
+fn request_carries_body(headers: &HeaderMap) -> bool {
+    if headers.contains_key(TRANSFER_ENCODING) {
+        return true;
+    }
+    headers.get(CONTENT_LENGTH).is_some_and(|value| {
+        // Only `Some(0)` promises no body. A present-but-unparseable value
+        // fails closed to carrying (the doc comment's contract): the request
+        // is malformed, and the live build may answer with a `400` the
+        // mirror could not replay.
+        !matches!(
+            value
+                .to_str()
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok()),
+            Some(0)
+        )
+    })
+}
+
+/// Whether the request is a conditional one — a cache revalidation carrying a
+/// validator (`If-None-Match`, `If-Modified-Since`, `If-Range`), or a
+/// conditional write guard (`If-Match`, `If-Unmodified-Since`) which cannot
+/// appear on mirrored traffic anyway but is excluded for completeness (issue
+/// #2335).
+///
+/// Only header *presence* is tested: the value is the primary's validator and
+/// is never meaningful to the candidate.
+fn is_conditional(headers: &HeaderMap) -> bool {
+    use axum::http::header::{
+        IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
+    };
+    headers.contains_key(IF_NONE_MATCH)
+        || headers.contains_key(IF_MODIFIED_SINCE)
+        || headers.contains_key(IF_RANGE)
+        || headers.contains_key(IF_MATCH)
+        || headers.contains_key(IF_UNMODIFIED_SINCE)
+}
+
+/// Draw a sampling roll in `[0, 1)` from an entropy source.
+///
+/// Uses the top 53 bits so every draw is exactly representable as an `f64`, and
+/// draws through [`Entropy`] rather than a thread RNG so a seeded source makes
+/// the whole mirroring decision reproducible.
+#[must_use]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "the shift keeps the value in 53 bits, which an f64 represents exactly — \
+              that is the point of taking the top bits rather than the whole u64"
+)]
+pub fn roll_from(entropy: &dyn Entropy) -> f64 {
+    /// `2^-53`, the spacing of the representable values this maps onto.
+    const SCALE: f64 = 1.0 / (1u64 << 53) as f64;
+    ((entropy.next_u64() >> 11) as f64) * SCALE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, Method};
+
+    fn selector() -> MirrorSelector {
+        MirrorSelector::new(1.0, &[], "/actuator", &["/healthz".to_owned()])
+    }
+
+    #[test]
+    fn get_and_head_are_mirrored() {
+        let selector = selector();
+        for method in [Method::GET, Method::HEAD] {
+            assert_eq!(
+                selector.decide(&method, "/api/orders", &HeaderMap::new(), true, || 0.0),
+                MirrorDecision::Mirror
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_methods_are_never_mirrored() {
+        let selector = selector();
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ] {
+            assert_eq!(
+                selector.decide(&method, "/api/orders", &HeaderMap::new(), true, || 0.0),
+                MirrorDecision::Skip(SkipReason::Method),
+                "{method} must not be mirrored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mirrored_request_is_never_mirrored_again() {
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(SHADOW_HEADER, HeaderValue::from_static(SHADOW_HEADER_VALUE));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Skip(SkipReason::LoopGuard)
+        );
+    }
+
+    #[test]
+    fn a_get_with_a_nonzero_content_length_is_never_mirrored() {
+        let selector = selector();
+        for length in ["1", "42", " 17 "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static(length));
+            assert_eq!(
+                selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+                MirrorDecision::Skip(SkipReason::HasRequestBody),
+                "a GET with Content-Length {length} must not be mirrored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_head_with_a_nonzero_content_length_is_never_mirrored() {
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("9"));
+        assert_eq!(
+            selector.decide(&Method::HEAD, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Skip(SkipReason::HasRequestBody)
+        );
+    }
+
+    #[test]
+    fn conditional_requests_are_never_mirrored() {
+        use axum::http::header::{
+            HeaderName, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
+        };
+        let selector = selector();
+        let conditionals: [(&HeaderName, &str); 5] = [
+            (&IF_NONE_MATCH, "\"abc123\""),
+            (&IF_MODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT"),
+            (&IF_RANGE, "\"abc123\""),
+            (&IF_MATCH, "\"abc123\""),
+            (&IF_UNMODIFIED_SINCE, "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ];
+        for (name, value) in conditionals {
+            for method in [Method::GET, Method::HEAD] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name, HeaderValue::from_str(value).expect("header value"));
+                assert_eq!(
+                    selector.decide(&method, "/api/orders", &headers, true, || 0.0),
+                    MirrorDecision::Skip(SkipReason::Conditional),
+                    "{method} with {name} must not be mirrored"
+                );
+            }
+        }
+        // An unconditional request carrying other headers still mirrors.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Mirror
+        );
+    }
+
+    #[test]
+    fn any_transfer_encoding_marks_a_get_as_body_carrying() {
+        let selector = selector();
+        for encoding in ["chunked", "gzip, chunked"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(TRANSFER_ENCODING, HeaderValue::from_static(encoding));
+            assert_eq!(
+                selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+                MirrorDecision::Skip(SkipReason::HasRequestBody),
+                "Transfer-Encoding: {encoding} means a framed body follows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_get_with_a_zero_or_absent_content_length_is_still_mirrored() {
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Mirror,
+            "Content-Length: 0 promises no body"
+        );
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || 0.0),
+            MirrorDecision::Mirror,
+            "a GET with no framing headers is the normal mirrorable case"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_content_length_fails_closed_to_skipping() {
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("seventeen"));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Skip(SkipReason::HasRequestBody),
+            "a malformed Content-Length cannot be proven empty"
+        );
+    }
+
+    #[test]
+    fn an_undeclared_body_on_a_get_is_never_mirrored() {
+        // No `Content-Length`, no `Transfer-Encoding`: on HTTP/2 a client can
+        // legally send DATA frames on a GET stream without declaring them.
+        // The headers alone would wave this through; the body's own
+        // end-of-stream signal is what catches it (issue #2332, option 1).
+        let selector = selector();
+        let drew = std::cell::Cell::new(false);
+        assert_eq!(
+            selector.decide(
+                &Method::GET,
+                "/api/orders",
+                &HeaderMap::new(),
+                false,
+                || {
+                    drew.set(true);
+                    0.0
+                }
+            ),
+            MirrorDecision::Skip(SkipReason::HasRequestBody),
+            "an undeclared body must not be mirrored"
+        );
+        assert!(!drew.get(), "the body gate must decide before the roll");
+    }
+
+    #[test]
+    fn an_undeclared_body_beats_a_zero_content_length() {
+        // The headers say "no body" but the stream disagrees. Fail closed:
+        // the live build may be reading frames the mirror cannot replay.
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, false, || 0.0),
+            MirrorDecision::Skip(SkipReason::HasRequestBody)
+        );
+    }
+
+    #[test]
+    fn a_declared_body_skips_even_when_the_stream_reports_empty() {
+        // The two signals are ORed, not ANDed: either one alone is enough to
+        // sit the request out.
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &headers, true, || 0.0),
+            MirrorDecision::Skip(SkipReason::HasRequestBody)
+        );
+    }
+
+    #[test]
+    fn the_body_gate_runs_before_the_sampling_roll() {
+        // Like the other cheap gates, a body-carrying GET must decide without
+        // touching the entropy source.
+        let selector = selector();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        let drew = std::cell::Cell::new(false);
+        let decision = selector.decide(&Method::GET, "/api/orders", &headers, true, || {
+            drew.set(true);
+            0.0
+        });
+        assert_eq!(decision, MirrorDecision::Skip(SkipReason::HasRequestBody));
+        assert!(!drew.get(), "the body gate must decide before the roll");
+    }
+
+    #[test]
+    fn actuator_and_probe_paths_are_exempt() {
+        let selector = selector();
+        for path in ["/actuator", "/actuator/health", "/healthz"] {
+            assert_eq!(
+                selector.decide(&Method::GET, path, &HeaderMap::new(), true, || 0.0),
+                MirrorDecision::Skip(SkipReason::ExemptPath),
+                "{path} must be exempt"
+            );
+        }
+        // A route that merely *starts with the same letters* is not exempt.
+        assert_eq!(
+            selector.decide(
+                &Method::GET,
+                "/actuatorsomething",
+                &HeaderMap::new(),
+                true,
+                || 0.0
+            ),
+            MirrorDecision::Mirror
+        );
+    }
+
+    #[test]
+    fn an_empty_route_list_opts_every_route_in() {
+        let selector = selector();
+        assert_eq!(
+            selector.decide(
+                &Method::GET,
+                "/anything/at/all",
+                &HeaderMap::new(),
+                true,
+                || 0.0
+            ),
+            MirrorDecision::Mirror
+        );
+    }
+
+    #[test]
+    fn route_patterns_gate_which_paths_are_mirrored() {
+        let selector = MirrorSelector::new(
+            1.0,
+            &["/api/*".to_owned(), "/status".to_owned()],
+            "/actuator",
+            &[],
+        );
+        for path in ["/api/orders", "/api/", "/status"] {
+            assert_eq!(
+                selector.decide(&Method::GET, path, &HeaderMap::new(), true, || 0.0),
+                MirrorDecision::Mirror,
+                "{path} must match"
+            );
+        }
+        for path in ["/apiary", "/status/detail", "/"] {
+            assert_eq!(
+                selector.decide(&Method::GET, path, &HeaderMap::new(), true, || 0.0),
+                MirrorDecision::Skip(SkipReason::RouteNotOptedIn),
+                "{path} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_string_does_not_defeat_route_matching() {
+        let selector = MirrorSelector::new(1.0, &["/api/*".to_owned()], "/actuator", &[]);
+        assert_eq!(
+            selector.decide(
+                &Method::GET,
+                "/api/orders?page=2",
+                &HeaderMap::new(),
+                true,
+                || 0.0
+            ),
+            MirrorDecision::Mirror
+        );
+    }
+
+    #[test]
+    fn sample_rate_zero_mirrors_nothing() {
+        let selector = MirrorSelector::new(0.0, &[], "/actuator", &[]);
+        for roll in [0.0, 0.5, 0.999] {
+            assert_eq!(
+                selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || {
+                    roll
+                }),
+                MirrorDecision::Skip(SkipReason::NotSampled)
+            );
+        }
+    }
+
+    #[test]
+    fn sample_rate_is_a_deterministic_function_of_the_roll() {
+        let selector = MirrorSelector::new(0.25, &[], "/actuator", &[]);
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || 0.1),
+            MirrorDecision::Mirror
+        );
+        assert_eq!(
+            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || 0.9),
+            MirrorDecision::Skip(SkipReason::NotSampled)
+        );
+    }
+
+    #[test]
+    fn route_label_is_the_configured_pattern_not_the_raw_path() {
+        let selector = MirrorSelector::new(1.0, &["/api/*".to_owned()], "/actuator", &[]);
+        assert_eq!(selector.route_label("/api/orders/42"), "/api/*");
+        // With no patterns configured the label collapses to a single bucket so
+        // metric cardinality can never follow the URL space.
+        let all = MirrorSelector::new(1.0, &[], "/actuator", &[]);
+        assert_eq!(all.route_label("/api/orders/42"), "*");
+    }
+
+    #[test]
+    fn the_sampling_roll_is_only_drawn_once_the_cheap_gates_pass() {
+        let selector = MirrorSelector::new(1.0, &["/api/*".to_owned()], "/actuator", &[]);
+        let draws = std::cell::Cell::new(0_u32);
+        let roll = || {
+            draws.set(draws.get() + 1);
+            0.0
+        };
+
+        // Wrong method, conditional request, exempt path, and un-opted-in route
+        // must all decide without touching the entropy source.
+        let _ = selector.decide(&Method::POST, "/api/orders", &HeaderMap::new(), true, roll);
+        assert_eq!(draws.get(), 0);
+        let mut conditional = HeaderMap::new();
+        conditional.insert(
+            axum::http::header::IF_NONE_MATCH,
+            HeaderValue::from_static("\"x\""),
+        );
+        let _ = selector.decide(&Method::GET, "/api/orders", &conditional, true, roll);
+        assert_eq!(draws.get(), 0);
+        let _ = selector.decide(
+            &Method::GET,
+            "/actuator/health",
+            &HeaderMap::new(),
+            true,
+            roll,
+        );
+        assert_eq!(draws.get(), 0);
+        let _ = selector.decide(&Method::GET, "/elsewhere", &HeaderMap::new(), true, roll);
+        assert_eq!(draws.get(), 0);
+
+        // An eligible request does draw.
+        let _ = selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, roll);
+        assert_eq!(draws.get(), 1);
+    }
+
+    #[test]
+    fn a_zero_sample_rate_never_draws_at_all() {
+        let selector = MirrorSelector::new(0.0, &[], "/actuator", &[]);
+        let drew = std::cell::Cell::new(false);
+        let decision =
+            selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, || {
+                drew.set(true);
+                0.0
+            });
+        assert_eq!(decision, MirrorDecision::Skip(SkipReason::NotSampled));
+        assert!(!drew.get(), "a disabled sample rate must not draw entropy");
+    }
+
+    #[test]
+    fn skip_reasons_have_stable_metric_labels() {
+        assert_eq!(SkipReason::Method.as_str(), "method");
+        assert_eq!(SkipReason::LoopGuard.as_str(), "loop_guard");
+        assert_eq!(SkipReason::HasRequestBody.as_str(), "has_request_body");
+        assert_eq!(SkipReason::Conditional.as_str(), "conditional");
+        assert_eq!(SkipReason::ExemptPath.as_str(), "exempt_path");
+        assert_eq!(SkipReason::RouteNotOptedIn.as_str(), "route_not_opted_in");
+        assert_eq!(SkipReason::NotSampled.as_str(), "not_sampled");
+    }
+
+    #[test]
+    fn roll_from_entropy_stays_in_range_and_is_reproducible() {
+        let seeded = crate::entropy::SeededEntropy::new(42);
+        let first: Vec<f64> = (0..8).map(|_| roll_from(&seeded)).collect();
+        assert!(first.iter().all(|r| (0.0..1.0).contains(r)), "{first:?}");
+        let replay = crate::entropy::SeededEntropy::new(42);
+        let second: Vec<f64> = (0..8).map(|_| roll_from(&replay)).collect();
+        assert_eq!(first, second, "the same seed must reproduce the same rolls");
+    }
+}

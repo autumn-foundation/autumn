@@ -204,7 +204,7 @@ The rendered form appears on the show page.
 All of this lives behind `autumn-web`'s `markdown` feature:
 
 ```toml
-autumn-web = { version = "0.7", features = ["markdown"] }
+autumn-web = { version = "0.8", features = ["markdown"] }
 ```
 
 A `richtext` scaffold enables it on your project automatically.
@@ -229,3 +229,16 @@ escape hatch, and appended markup lands just before the submit button. So in a
 generated form a rich-text column always appears **last**, regardless of where
 it sits in the field list. The attachment and DSL-constrained columns share this
 limitation. Reorder by editing the generated `{resource}_form_for` helper.
+
+---
+
+## See also
+
+- [`examples/reddit-clone`](../../examples/reddit-clone) — post bodies are
+  user-submitted Markdown rendered through `render_user_content` at display
+  time, so the stored source stays editable and a later allowlist change
+  protects posts already written
+- [Forms, validation and normalization](./forms.md) — the changeset round-trip
+  the rich-text field sits inside
+- [Accessibility](./accessibility.md) — the typed primitives the field's label
+  and error wiring come from

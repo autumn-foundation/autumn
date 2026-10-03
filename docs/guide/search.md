@@ -13,6 +13,13 @@ crate; an app that never installs it pays nothing.
 - **Issue:** [#1191](https://github.com/autumn-foundation/autumn/issues/1191)
 - **Builds on:** [#842](https://github.com/autumn-foundation/autumn/issues/842)
   (in-core FTS), which it subsumes as one backend rather than replacing.
+- **Example:** `examples/wiki` mounts the plugin on `Page` — the same model
+  `docs/guide/full-text-search.md` already uses for the in-core primitive —
+  via `wiki::search_plugin()` (`src/lib.rs`). `PageHooks` (`src/hooks.rs`)
+  composes the reindex calls into its existing hooks rather than replacing
+  them (see "Keep the index in sync" below), and `GET /api/v1/search`
+  (`src/routes/pages.rs`) is the plugin-backed sibling of the hand-rolled
+  `/search` route, hydrated back into real `Page` rows.
 
 ---
 

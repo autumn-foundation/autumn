@@ -13,10 +13,21 @@
 //! | `route-prefix` | Plugin routes live under the declared prefix |
 //! | `route-collision` | No two routes share (method, path) |
 //! | `sensitive-surfaces` | Sensitive-named routes declared with auth info |
+//! | `plugin-contract` | The plugin declares a parseable `autumn-web` range |
+//! | `experimental-surface` | The plugin's declared use of experimental API |
+//!
+//! The last two read the contract the built binary dumps after
+//! [`PLUGIN_CONTRACT_MARKER`](autumn_web::plugin_contract::PLUGIN_CONTRACT_MARKER)
+//! (issue #1601). A binary that emits no marker — an app built before the
+//! contract existed — skips both rather than failing.
 
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+
+use autumn_web::plugin_contract::{
+    ContractVerdict, PLUGIN_CONTRACT_MARKER, PluginContract, SurfaceTier, evaluate, surface,
+};
 
 use crate::routes::{RouteInfo, compile_binary, find_binary};
 
@@ -55,6 +66,24 @@ pub struct CheckResult {
 pub struct ConformanceReport {
     pub plugin_name: String,
     pub checks: Vec<CheckResult>,
+    /// The contract the plugin declared, when the binary dumped one. The
+    /// plugin index records its range and tier from this (issue #1625).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<PluginContract>,
+    /// The `autumn-web` version the checked app built against, read from its
+    /// `Cargo.lock`. The plugin index records a report only for this release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autumn_web: Option<String>,
+    /// The `--prefix` the `route-prefix` check tested. The plugin index
+    /// records a pass for a prefixed listing only when this is its prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Root-level paths `--intentional-root` exempted from `route-prefix`
+    /// (issue #2828). A pass that leans on them is not evidence for a plugin
+    /// index listing, which cannot replay the exemption, so curation refuses
+    /// such a report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intentional_root: Vec<String>,
 }
 
 impl ConformanceReport {
@@ -151,10 +180,31 @@ pub struct PluginCheckOptions<'a> {
     pub plugin_name: &'a str,
     /// Expected URL prefix for plugin routes (e.g. `"/admin"`).
     pub expected_prefix: Option<&'a str>,
+    /// Paths intentionally served at the root level, exempt from the
+    /// route-prefix check (exact path match). The CLI-side spelling of the
+    /// library API's `ConformanceConfig::intentional_root_routes`
+    /// (issue #2828): a route the library harness can declare via
+    /// `.intentional_root_route(...)` must be declarable to
+    /// `autumn plugin-check` as well, or the CLI reports a false
+    /// `route-prefix` FAIL for the same route the crate's own test passes.
+    pub intentional_root_routes: &'a [String],
     /// Declared sensitive routes with their auth mechanisms.
     pub sensitive_routes: &'a [SensitiveRouteDecl],
     /// Output format.
     pub format: ReportFormat,
+    /// What the built binary's stderr said about its plugin contracts
+    /// (issue #1601). See [`ContractDump`].
+    pub contracts: &'a ContractDump,
+    /// Turn the `experimental-surface` report into a hard failure.
+    ///
+    /// Off by default: depending on experimental surface is an informed choice,
+    /// not a defect. A plugin whose own CI wants to forbid it passes
+    /// `--deny-experimental`.
+    pub deny_experimental: bool,
+    /// `--no-routes`: the plugin asserts it mounts no routes (a cache, a
+    /// search index). Only then may `route-attribution` skip when none are
+    /// found; without it, none found fails, as an unannotated `nest` would.
+    pub no_routes: bool,
 }
 
 /// Run `autumn plugin-check`.
@@ -163,15 +213,28 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
     compile_binary(opts.package, opts.bin);
     let binary = find_binary(opts.package, opts.bin);
 
+    // stderr is PIPED rather than inherited so the plugin-contract marker can be
+    // read off it (issue #1601). Everything the child wrote is relayed verbatim
+    // afterwards, minus the marker line itself, so the operator still sees the
+    // binary's own diagnostics.
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_ROUTES", "1")
+        .env("AUTUMN_DUMP_PLUGIN_CONTRACT", "1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
         .output()
         .unwrap_or_else(|e| {
             eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
             std::process::exit(1);
         });
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        if !line.starts_with(PLUGIN_CONTRACT_MARKER) {
+            eprintln!("{line}");
+        }
+    }
+    let contracts = parse_plugin_contracts(&stderr);
 
     if !output.status.success() {
         eprintln!(
@@ -188,7 +251,41 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
         std::process::exit(1);
     });
 
-    let report = build_report(opts, &routes);
+    let mut report = build_report(
+        &PluginCheckOptions {
+            package: opts.package,
+            bin: opts.bin,
+            plugin_name: opts.plugin_name,
+            expected_prefix: opts.expected_prefix,
+            intentional_root_routes: opts.intentional_root_routes,
+            sensitive_routes: opts.sensitive_routes,
+            format: opts.format.clone(),
+            contracts: &contracts,
+            deny_experimental: opts.deny_experimental,
+            no_routes: opts.no_routes,
+        },
+        &routes,
+    );
+    // Routes behind a raw `.merge()`/`.nest()` were never listed, so no
+    // check above saw them.
+    fail_on_omitted_routers(
+        &mut report,
+        crate::routes_audit::parse_omitted_count(&stderr),
+    );
+    // Without `-p`, the package is the member owning the binary that ran,
+    // named by `--bin` or picked implicitly by `find_binary`.
+    let package = opts.package.map(str::to_owned).or_else(|| {
+        opts.bin
+            .map(str::to_owned)
+            .or_else(|| {
+                binary
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned)
+            })
+            .and_then(|bin| package_owning_bin(&bin))
+    });
+    report.autumn_web = locked_autumn_web(std::path::Path::new("."), package.as_deref());
 
     match opts.format {
         ReportFormat::Text => print!("{}", report.to_text_report()),
@@ -213,35 +310,510 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     checks.push(CheckResult {
         name: "installability".to_owned(),
         status: CheckStatus::Pass,
-        message: format!("{} routes collected from binary", routes.len()),
+        // Deliberately source-neutral: `autumn plugin-check` collects these by
+        // running a binary, `autumn plugin inspect` reads them out of a
+        // sandboxed plugin's manifest with no binary in sight.
+        message: format!(
+            "{count} route{plural} collected",
+            count = routes.len(),
+            plural = if routes.len() == 1 { "" } else { "s" }
+        ),
         diagnostics: vec![],
     });
 
-    checks.push(check_route_attribution(opts.plugin_name, routes));
+    let declared = match opts.contracts {
+        ContractDump::Present(all) => find_declared(all, opts.plugin_name),
+        ContractDump::Absent | ContractDump::Malformed(_) => None,
+    };
+
+    // Routes are attributed to `Plugin::name()`, by default the type path.
+    // When only the contract's registered name carries routes, the route
+    // checks run under it. The report keeps `--plugin-name`, the crate the
+    // index lists.
+    let registered_as = declared.and_then(|c| c.registered_as.as_deref());
+    let route_key = route_key(opts.plugin_name, registered_as, routes);
+
+    // Only an explicit `--no-routes` lets none found skip; a plugin that
+    // mounted an unannotated router would otherwise skip every route check.
+    let registered_routeless = registered_as.filter(|_| opts.no_routes);
+    checks.push(
+        check_split_attribution(declared, opts.plugin_name, routes).unwrap_or_else(|| {
+            check_route_attribution(opts.plugin_name, route_key, routes, registered_routeless)
+        }),
+    );
 
     if let Some(prefix) = opts.expected_prefix {
-        checks.push(check_route_prefix(opts.plugin_name, prefix, routes));
+        checks.push(check_route_prefix(
+            route_key,
+            prefix,
+            opts.intentional_root_routes,
+            routes,
+        ));
     }
 
     checks.push(check_collisions(routes));
     checks.push(check_sensitive_surfaces(
-        opts.plugin_name,
+        route_key,
         routes,
         opts.sensitive_routes,
     ));
-    checks.push(check_duplicate_registration(opts.plugin_name, routes));
+    checks.push(check_duplicate_registration(route_key, routes));
+    checks.push(check_plugin_contract(
+        opts.plugin_name,
+        opts.contracts,
+        declared,
+    ));
+    checks.push(check_experimental_surface(
+        opts.contracts,
+        declared,
+        opts.deny_experimental,
+    ));
 
     ConformanceReport {
         plugin_name: opts.plugin_name.to_owned(),
         checks,
+        contract: declared.cloned(),
+        autumn_web: None,
+        prefix: opts.expected_prefix.map(str::to_owned),
+        intentional_root: opts.intentional_root_routes.to_vec(),
+    }
+}
+
+/// The `autumn-web` version the workspace's `Cargo.lock` resolved for the app
+/// in `dir`. Cargo uses the workspace root's lockfile, not a member's. With
+/// `package` (`-p`, else the manifest's own package) it follows that
+/// package's dependency edge, so another member on another `autumn-web` does
+/// not make it ambiguous. `None` when there is no lockfile, or the version
+/// cannot be told apart.
+pub fn locked_autumn_web(dir: &std::path::Path, package: Option<&str>) -> Option<String> {
+    crate::plugin::install::locked_version_for(dir, package, "autumn-web")
+}
+
+/// Fail `route-attribution` when the dump omitted raw routers: their routes
+/// were never attributed, prefix-checked or reviewed for sensitive paths.
+fn fail_on_omitted_routers(report: &mut ConformanceReport, omitted: usize) {
+    if omitted == 0 {
+        return;
+    }
+    if let Some(check) = report
+        .checks
+        .iter_mut()
+        .find(|check| check.name == "route-attribution")
+    {
+        check.status = CheckStatus::Fail;
+        check.message = format!(
+            "{omitted} raw router(s) added via .merge()/.nest() are not enumerable, so their \
+             routes were not checked. Declare them with AppBuilder::declare_plugin_routes"
+        );
+    }
+}
+
+/// The workspace package with a `bin` target named `bin`, from `cargo
+/// metadata`. `None` when none or several do.
+fn package_owning_bin(bin: &str) -> Option<String> {
+    let output = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+        .ok()?;
+    let metadata = serde_json::from_slice(&output.stdout).ok()?;
+    package_of_bin(&metadata, bin)
+}
+
+fn package_of_bin(metadata: &serde_json::Value, bin: &str) -> Option<String> {
+    let mut owners = metadata["packages"]
+        .as_array()?
+        .iter()
+        .filter(|package| {
+            package["targets"].as_array().is_some_and(|targets| {
+                targets.iter().any(|target| {
+                    target["name"] == bin
+                        && target["kind"]
+                            .as_array()
+                            .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"))
+                })
+            })
+        })
+        .filter_map(|package| package["name"].as_str());
+    let owner = owners.next()?;
+    owners.next().is_none().then(|| owner.to_owned())
+}
+
+/// What the child binary's stderr said about its plugin contracts.
+///
+/// Three outcomes, deliberately kept apart. Folding the third into the first
+/// would let `autumn plugin-check` report a green run for a plugin it never
+/// actually checked, which is the one thing an author gate must not do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractDump {
+    /// No [`PLUGIN_CONTRACT_MARKER`] line at all — an application built against
+    /// an `autumn-web` that predates the contract.
+    Absent,
+    /// The marker was there and parsed. An empty `Vec` means the app declared
+    /// no contracts, which is a real answer and not the same as `Absent`.
+    Present(Vec<PluginContract>),
+    /// The marker was there and its payload could not be read: a truncated
+    /// pipe, or a `PluginContract` shape this CLI is too old to understand.
+    Malformed(String),
+}
+
+/// Parse the plugin-contract dump ([`PLUGIN_CONTRACT_MARKER`]) out of a child
+/// binary's stderr.
+///
+/// The **last** marker line wins, matching the security-config dump: a child
+/// that re-execs would otherwise be read from its first, stale dump. The last
+/// line is selected *before* parsing, so a malformed final dump reports
+/// [`ContractDump::Malformed`] rather than silently falling back to an earlier,
+/// stale one.
+fn parse_plugin_contracts(stderr: &str) -> ContractDump {
+    let Some(payload) = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(PLUGIN_CONTRACT_MARKER))
+        .next_back()
+    else {
+        return ContractDump::Absent;
+    };
+
+    match serde_json::from_str::<Vec<PluginContract>>(payload.trim()) {
+        Ok(contracts) => ContractDump::Present(contracts),
+        Err(e) => ContractDump::Malformed(e.to_string()),
+    }
+}
+
+/// The contract the checked plugin declared, matched on either identity it has.
+///
+/// [`PluginContract::plugin`] is the plugin's *crate* name and
+/// [`PluginContract::registered_as`] is its
+/// [`Plugin::name`](autumn_web::plugin::Plugin::name) — which route attribution
+/// keys on, and which defaults to `std::any::type_name`. A plugin that declares
+/// `env!("CARGO_PKG_NAME")` without overriding `name()` therefore has two
+/// identities, and `--plugin-name` takes one string. Matching either means no
+/// plugin is unfindable for having picked the other.
+fn find_declared<'a>(
+    contracts: &'a [PluginContract],
+    plugin_name: &str,
+) -> Option<&'a PluginContract> {
+    contracts
+        .iter()
+        .find(|c| c.plugin == plugin_name || c.registered_as.as_deref() == Some(plugin_name))
+}
+
+/// Check that the plugin declares a usable `autumn-web` compatibility range.
+///
+/// A declaration is the whole point of the contract, so a plugin that ships
+/// none fails here — this is the author-facing gate, and "you have not declared
+/// what you support" is exactly what it is for. A declaration that cannot be
+/// parsed fails too: it disables the framework's runtime guard while looking
+/// like it is armed.
+fn check_plugin_contract(
+    plugin_name: &str,
+    dump: &ContractDump,
+    declared: Option<&PluginContract>,
+) -> CheckResult {
+    let name = "plugin-contract".to_owned();
+
+    let all = match dump {
+        ContractDump::Absent => {
+            return CheckResult {
+                name,
+                status: CheckStatus::Skip,
+                message: format!(
+                    "the built binary emitted no plugin-contract dump; rebuild against an \
+                     autumn-web newer than {} to have the contract checked",
+                    autumn_web::plugin_contract::AUTUMN_WEB_VERSION
+                ),
+                diagnostics: vec![],
+            };
+        }
+        ContractDump::Malformed(reason) => {
+            // NOT a skip. The binary answered and the answer was unreadable, so
+            // nothing about this plugin's contract has been verified — saying
+            // "skipped, too old" would be false and would read as green.
+            return CheckResult {
+                name,
+                status: CheckStatus::Fail,
+                message: "the built binary emitted a plugin-contract dump that could not be read"
+                    .to_owned(),
+                diagnostics: vec![
+                    reason.clone(),
+                    "the contract was NOT checked; this is not the same as a binary that \
+                     predates the dump"
+                        .to_owned(),
+                ],
+            };
+        }
+        ContractDump::Present(all) => all,
+    };
+
+    let Some(contract) = declared else {
+        let found: Vec<String> = all
+            .iter()
+            .map(|c| match &c.registered_as {
+                Some(registered) if registered != &c.plugin => {
+                    format!("{} (registered as `{registered}`)", c.plugin)
+                }
+                _ => c.plugin.clone(),
+            })
+            .collect();
+        let mut diagnostics = vec![format!(
+            "implement `Plugin::contract` on {plugin_name} and return \
+             `PluginContract::new(env!(\"CARGO_PKG_NAME\")).autumn_web(\"<range>\")`"
+        )];
+        if found.is_empty() {
+            diagnostics.push("no plugin in this app declares a contract".to_owned());
+        } else {
+            diagnostics.push(format!(
+                "contracts found in this app: {} — `--plugin-name` must match a contract's crate \
+                 name or the name the plugin registered under",
+                found.join(", ")
+            ));
+        }
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            message: format!("{plugin_name} declares no autumn-web compatibility contract"),
+            diagnostics,
+        };
+    };
+
+    let Some(requirement) = contract.autumn_web.as_deref() else {
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            message: format!("{plugin_name} returns a contract but declares no autumn-web range"),
+            diagnostics: vec![
+                "add `.autumn_web(\"<range>\")` — e.g. `\"0.7\"` for a single minor series"
+                    .to_owned(),
+            ],
+        };
+    };
+
+    // The framework already enforced the real pairing at registration (the
+    // binary would not have got this far otherwise), so what is left to catch
+    // here is a requirement no parser can evaluate — which silently disables
+    // that enforcement.
+    match evaluate(contract, autumn_web::plugin_contract::AUTUMN_WEB_VERSION) {
+        ContractVerdict::Unparseable { reason, .. } => CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            message: format!("{plugin_name} declares an autumn-web range that cannot be evaluated"),
+            diagnostics: vec![
+                reason,
+                "an unevaluable range disables the framework's startup compatibility check"
+                    .to_owned(),
+            ],
+        },
+        _ => CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: format!("{} supports autumn-web {requirement}", contract.label()),
+            diagnostics: vec![],
+        },
+    }
+}
+
+/// Report the experimental plugin surface this plugin declares (issue #1601).
+///
+/// Reports rather than gates by default — see
+/// [`autumn_web::plugin_conformance::check_experimental_surface`], whose rules
+/// this mirrors for the CLI's own report type. `deny_experimental` (the
+/// `--deny-experimental` flag) turns a clean report into a hard failure for
+/// authors who want to forbid it in their own CI.
+fn check_experimental_surface(
+    dump: &ContractDump,
+    declared: Option<&PluginContract>,
+    deny: bool,
+) -> CheckResult {
+    let name = "experimental-surface".to_owned();
+
+    // `--deny-experimental` is a "forbid it" flag, so it fails closed: when the
+    // contract could not be read there is no evidence the plugin is clean, and
+    // a silent Skip would turn the gate into a no-op exactly when it matters.
+    let unevaluated = |message: String| CheckResult {
+        name: name.clone(),
+        status: if deny {
+            CheckStatus::Fail
+        } else {
+            CheckStatus::Skip
+        },
+        message: if deny {
+            format!("{message} — cannot honour --deny-experimental without it")
+        } else {
+            message
+        },
+        diagnostics: vec![],
+    };
+
+    match dump {
+        ContractDump::Absent => {
+            return unevaluated("the built binary emitted no plugin-contract dump".to_owned());
+        }
+        ContractDump::Malformed(_) => {
+            return unevaluated(
+                "the built binary's plugin-contract dump could not be read; see the \
+                 plugin-contract check"
+                    .to_owned(),
+            );
+        }
+        ContractDump::Present(_) => {}
+    }
+
+    let Some(contract) = declared else {
+        return unevaluated(
+            "no contract declared for this plugin; see the plugin-contract check".to_owned(),
+        );
+    };
+
+    if contract.experimental_surfaces.is_empty() {
+        return CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "declares no dependency on experimental plugin surface".to_owned(),
+            diagnostics: vec![],
+        };
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut invalid = 0usize;
+    for entry in &contract.experimental_surfaces {
+        match surface(entry) {
+            None => {
+                invalid += 1;
+                diagnostics.push(format!(
+                    "{entry}: not a known plugin surface — check the spelling against \
+                     `autumn_web::plugin_contract::PLUGIN_SURFACES`"
+                ));
+            }
+            Some(s) if s.tier == SurfaceTier::Stable => {
+                invalid += 1;
+                diagnostics.push(format!(
+                    "{entry}: declared experimental, but it is a STABLE surface — drop the \
+                     declaration; it overstates this plugin's exposure"
+                ));
+            }
+            Some(s) => diagnostics.push(format!("{}: {}", s.name, s.note)),
+        }
+    }
+
+    let count = contract.experimental_surfaces.len();
+    if invalid > 0 {
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            message: format!(
+                "{invalid} of {count} declared experimental surface(s) could not be resolved \
+                 against the registry"
+            ),
+            diagnostics,
+        };
+    }
+
+    CheckResult {
+        name,
+        status: if deny {
+            CheckStatus::Fail
+        } else {
+            CheckStatus::Pass
+        },
+        message: if deny {
+            format!("{count} experimental surface(s) declared, and --deny-experimental is set")
+        } else {
+            format!("depends on {count} experimental surface(s); these may change in any release")
+        },
+        diagnostics,
     }
 }
 
 // ── Individual check helpers ───────────────────────────────────────────────
 
-fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
-    let expected = format!("plugin:{plugin_name}");
+/// The name the route checks match `plugin:<name>` against: `plugin_name`,
+/// or the contract's `registered_as` when only that name carries routes.
+fn route_key<'a>(
+    plugin_name: &'a str,
+    registered_as: Option<&'a str>,
+    routes: &[RouteInfo],
+) -> &'a str {
+    let carries = |name: &str| {
+        let source = format!("plugin:{name}");
+        routes.iter().any(|r| r.source == source)
+    };
+    match registered_as {
+        Some(registered) if !carries(plugin_name) && carries(registered) => registered,
+        _ => plugin_name,
+    }
+}
+
+/// A failed `route-attribution` when routes carry more than one of the
+/// plugin's linked names (`--plugin-name`, the contract's crate, its
+/// `registered_as`). The other checks read one name's routes, so they would
+/// miss the rest. `None` when at most one name carries routes.
+fn check_split_attribution(
+    declared: Option<&PluginContract>,
+    plugin_name: &str,
+    routes: &[RouteInfo],
+) -> Option<CheckResult> {
+    let declared = declared?;
+    let mut names = vec![plugin_name, declared.plugin.as_str()];
+    names.extend(declared.registered_as.as_deref());
+    names.sort_unstable();
+    names.dedup();
+    let carrying: Vec<&str> = names
+        .into_iter()
+        .filter(|name| {
+            let source = format!("plugin:{name}");
+            routes.iter().any(|r| r.source == source)
+        })
+        .collect();
+    (carrying.len() > 1).then(|| CheckResult {
+        name: "route-attribution".to_owned(),
+        status: CheckStatus::Fail,
+        message: format!(
+            "routes are attributed to more than one of this plugin's names: {}",
+            carrying.join(", ")
+        ),
+        diagnostics: vec![
+            "one plugin registers under one `Plugin::name()`; the checks cannot tell which \
+             routes are its own"
+                .to_owned(),
+        ],
+    })
+}
+
+/// `route_key` is the name routes are matched under (see [`route_key`]).
+/// `registered_as` is the `Plugin::name()` the contract dump gives, passed
+/// only with `--no-routes`. Then no routes (a cache, a search index) skips,
+/// and routes found contradict the assertion and fail. Without it, no routes
+/// found fails.
+fn check_route_attribution(
+    plugin_name: &str,
+    route_key: &str,
+    routes: &[RouteInfo],
+    registered_as: Option<&str>,
+) -> CheckResult {
+    let expected = format!("plugin:{route_key}");
     let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
+
+    if let Some(registered) = registered_as {
+        return if plugin_routes.is_empty() {
+            CheckResult {
+                name: "route-attribution".to_owned(),
+                status: CheckStatus::Skip,
+                message: format!(
+                    "{plugin_name} is registered as `{registered}` and contributes no routes"
+                ),
+                diagnostics: vec![],
+            }
+        } else {
+            CheckResult {
+                name: "route-attribution".to_owned(),
+                status: CheckStatus::Fail,
+                message: format!(
+                    "--no-routes was given, but {} route(s) are attributed to plugin:{route_key}",
+                    plugin_routes.len()
+                ),
+                diagnostics: vec![],
+            }
+        };
+    }
 
     if plugin_routes.is_empty() {
         return CheckResult {
@@ -255,18 +827,34 @@ fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResu
         };
     }
 
+    let via = if route_key == plugin_name {
+        String::new()
+    } else {
+        format!(" (the registered name of {plugin_name})")
+    };
     CheckResult {
         name: "route-attribution".to_owned(),
         status: CheckStatus::Pass,
         message: format!(
-            "{} route(s) correctly attributed to plugin:{plugin_name}",
+            "{} route(s) correctly attributed to plugin:{route_key}{via}",
             plugin_routes.len()
         ),
         diagnostics: vec![],
     }
 }
 
-fn check_route_prefix(plugin_name: &str, prefix: &str, routes: &[RouteInfo]) -> CheckResult {
+/// Check that all plugin routes live under `prefix`.
+///
+/// Routes listed in `intentional_root` (exact path match) are exempt — the
+/// same exemption the library API's `check_route_prefix` grants via
+/// `ConformanceConfig::intentional_root_routes` (issue #2828).
+/// Returns `Skip` when no routes are attributed to the plugin.
+fn check_route_prefix(
+    plugin_name: &str,
+    prefix: &str,
+    intentional_root: &[String],
+    routes: &[RouteInfo],
+) -> CheckResult {
     let expected = format!("plugin:{plugin_name}");
     let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
 
@@ -283,7 +871,10 @@ fn check_route_prefix(plugin_name: &str, prefix: &str, routes: &[RouteInfo]) -> 
         .iter()
         .filter(|r| {
             let p = &r.path;
-            p != prefix && !p.starts_with(&format!("{prefix}/"))
+            p != prefix
+                && !p.starts_with(&format!("{prefix}/"))
+                && !intentional_root.contains(p)
+                && !is_plugin_asset_route(r)
         })
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
@@ -299,10 +890,33 @@ fn check_route_prefix(plugin_name: &str, prefix: &str, routes: &[RouteInfo]) -> 
         CheckResult {
             name: "route-prefix".to_owned(),
             status: CheckStatus::Fail,
-            message: format!("{} route(s) not under prefix {prefix}", off_prefix.len()),
+            message: format!(
+                "{} route(s) not under prefix {prefix} and not declared as intentional root routes",
+                off_prefix.len()
+            ),
             diagnostics: off_prefix,
         }
     }
+}
+
+/// `true` for a file of the plugin's own `PluginAssets` bundle: a route under
+/// `/static/_plugins/` carrying the marker label `AppBuilder::plugin_assets`
+/// attaches.
+///
+/// The framework mounts those, not the plugin's router: they live outside the
+/// plugin's prefix by design and are public static bytes, so a file named
+/// `admin.js` is not a sensitive surface. Both conditions are required:
+/// `declare_plugin_routes` strips the marker, so a route a plugin merely
+/// declares at such a path gets no exemption.
+fn is_plugin_asset_route(route: &RouteInfo) -> bool {
+    route
+        .path
+        .strip_prefix(autumn_web::assets::PLUGIN_ASSETS_PREFIX)
+        .is_some_and(|rest| rest.starts_with('/'))
+        && route
+            .middleware
+            .iter()
+            .any(|label| label == autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER)
 }
 
 const SENSITIVE_KEYWORDS: &[&str] = &[
@@ -331,7 +945,7 @@ fn check_sensitive_surfaces(
     let expected = format!("plugin:{plugin_name}");
     let sensitive: Vec<&RouteInfo> = routes
         .iter()
-        .filter(|r| r.source == expected && is_sensitive_path(&r.path))
+        .filter(|r| r.source == expected && is_sensitive_path(&r.path) && !is_plugin_asset_route(r))
         .collect();
 
     if sensitive.is_empty() {
@@ -503,11 +1117,56 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         }
     }
 
     fn no_sensitive() -> Vec<SensitiveRouteDecl> {
         vec![]
+    }
+
+    /// A plugin's `PluginAssets` files live under `/static/_plugins/`, mounted
+    /// by the framework outside the plugin's prefix, and are public static
+    /// bytes: neither an off-prefix route nor a sensitive surface, even when a
+    /// file is named `admin.js`. Anything else outside the prefix still fails.
+    #[test]
+    fn plugin_asset_routes_are_exempt_from_prefix_and_sensitive_checks() {
+        let asset = |path: &str| {
+            let mut route = make_route("GET", path, "plugin:admin");
+            route.middleware = vec![autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER.to_owned()];
+            route
+        };
+        let routes = vec![
+            make_route("GET", "/admin", "plugin:admin"),
+            asset("/static/_plugins/autumn-admin/admin.js"),
+            asset("/static/_plugins/autumn-admin/admin.cb7ccaab.js"),
+        ];
+        let prefix = check_route_prefix("admin", "/admin", &[], &routes);
+        assert_eq!(prefix.status, CheckStatus::Pass, "{}", prefix.message);
+        let declared = vec![SensitiveRouteDecl {
+            path_pattern: "/admin".to_owned(),
+            auth_mechanism: "Role: admin required".to_owned(),
+        }];
+        let sensitive = check_sensitive_surfaces("admin", &routes, &declared);
+        assert_eq!(sensitive.status, CheckStatus::Pass, "{}", sensitive.message);
+
+        // `/static/_pluginsX/...` is not the asset prefix, even with the marker.
+        let lookalike = vec![asset("/static/_pluginsx/admin.js")];
+        let prefix = check_route_prefix("admin", "/admin", &[], &lookalike);
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+
+        // A route a plugin merely declared at an asset path, without the marker
+        // `AppBuilder::plugin_assets` attaches, is checked like any other.
+        let forged = vec![make_route(
+            "GET",
+            "/static/_plugins/x/admin",
+            "plugin:admin",
+        )];
+        let prefix = check_route_prefix("admin", "/admin", &[], &forged);
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+        let sensitive = check_sensitive_surfaces("admin", &forged, &declared);
+        assert_eq!(sensitive.status, CheckStatus::Fail, "{}", sensitive.message);
     }
 
     // ── check_route_attribution ────────────────────────────────────────────
@@ -518,14 +1177,14 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("POST", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_attribution("admin", &routes);
+        let result = check_route_attribution("admin", "admin", &routes, None);
         assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
     }
 
     #[test]
     fn attribution_no_plugin_routes_fails() {
         let routes = vec![make_route("GET", "/posts", "user")];
-        let result = check_route_attribution("admin", &routes);
+        let result = check_route_attribution("admin", "admin", &routes, None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(
             result.message.contains("plugin:admin"),
@@ -540,7 +1199,7 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("GET", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_attribution("admin", &routes);
+        let result = check_route_attribution("admin", "admin", &routes, None);
         assert!(result.message.contains('2'), "{}", result.message);
     }
 
@@ -552,7 +1211,7 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("POST", "/admin/items", "plugin:admin"),
         ];
-        let result = check_route_prefix("admin", "/admin", &routes);
+        let result = check_route_prefix("admin", "/admin", &[], &routes);
         assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
     }
 
@@ -562,7 +1221,7 @@ mod tests {
             make_route("GET", "/admin", "plugin:admin"),
             make_route("GET", "/webhook", "plugin:admin"),
         ];
-        let result = check_route_prefix("admin", "/admin", &routes);
+        let result = check_route_prefix("admin", "/admin", &[], &routes);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.diagnostics.iter().any(|d| d.contains("/webhook")));
     }
@@ -570,7 +1229,7 @@ mod tests {
     #[test]
     fn prefix_no_plugin_routes_skips() {
         let routes = vec![make_route("GET", "/posts", "user")];
-        let result = check_route_prefix("admin", "/admin", &routes);
+        let result = check_route_prefix("admin", "/admin", &[], &routes);
         assert_eq!(result.status, CheckStatus::Skip);
     }
 
@@ -771,6 +1430,10 @@ mod tests {
                     diagnostics: vec![],
                 },
             ],
+            contract: None,
+            autumn_web: None,
+            prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(report.passed());
     }
@@ -785,6 +1448,10 @@ mod tests {
                 message: "fail".to_owned(),
                 diagnostics: vec![],
             }],
+            contract: None,
+            autumn_web: None,
+            prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(!report.passed());
     }
@@ -794,6 +1461,10 @@ mod tests {
         let report = ConformanceReport {
             plugin_name: "autumn-admin-plugin".to_owned(),
             checks: vec![],
+            contract: None,
+            autumn_web: None,
+            prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(report.to_text_report().contains("autumn-admin-plugin"));
     }
@@ -803,6 +1474,10 @@ mod tests {
         let report = ConformanceReport {
             plugin_name: "test".to_owned(),
             checks: vec![],
+            contract: None,
+            autumn_web: None,
+            prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(report.to_text_report().contains("PASS"));
     }
@@ -817,6 +1492,10 @@ mod tests {
                 message: "fail".to_owned(),
                 diagnostics: vec![],
             }],
+            contract: None,
+            autumn_web: None,
+            prefix: None,
+            intentional_root: Vec::new(),
         };
         assert!(report.to_text_report().contains("FAIL"));
     }
@@ -831,6 +1510,10 @@ mod tests {
                 message: "ok".to_owned(),
                 diagnostics: vec![],
             }],
+            contract: None,
+            autumn_web: None,
+            prefix: None,
+            intentional_root: Vec::new(),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -936,8 +1619,12 @@ mod tests {
             bin: None,
             plugin_name: "test",
             expected_prefix: None,
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+            no_routes: false,
         };
         let routes = vec![make_route("GET", "/posts", "user")];
         let report = build_report(&opts, &routes);
@@ -951,8 +1638,12 @@ mod tests {
             bin: None,
             plugin_name: "test",
             expected_prefix: None,
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+            no_routes: false,
         };
         let report = build_report(&opts, &[]);
         assert!(!report.checks.iter().any(|c| c.name == "route-prefix"));
@@ -965,12 +1656,119 @@ mod tests {
             bin: None,
             plugin_name: "admin",
             expected_prefix: Some("/admin"),
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+            no_routes: false,
         };
         let routes = vec![make_route("GET", "/admin", "plugin:admin")];
         let report = build_report(&opts, &routes);
         assert!(report.checks.iter().any(|c| c.name == "route-prefix"));
+        // The report names the prefix it tested, for `plugin index record`.
+        assert_eq!(report.prefix.as_deref(), Some("/admin"));
+    }
+
+    /// A root-level route the operator declared via `--intentional-root` is
+    /// exempt from the prefix check (issue #2828): the CLI must not fail
+    /// what the library API's `.intentional_root_route(...)` lets pass.
+    #[test]
+    fn build_report_exempts_declared_intentional_root_routes() {
+        let declared = vec!["/webhook".to_owned()];
+        let opts = PluginCheckOptions {
+            package: None,
+            bin: None,
+            plugin_name: "admin",
+            expected_prefix: Some("/admin"),
+            intentional_root_routes: &declared,
+            sensitive_routes: &[],
+            format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+            no_routes: false,
+        };
+        let routes = vec![
+            make_route("GET", "/admin", "plugin:admin"),
+            make_route("POST", "/webhook", "plugin:admin"),
+        ];
+        let report = build_report(&opts, &routes);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-prefix")
+            .expect("route-prefix check ran");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.diagnostics.is_empty());
+        // The report names what it exempted, so the plugin index can tell a
+        // pass that leaned on the exemption from one that did not.
+        assert_eq!(report.intentional_root, vec!["/webhook".to_owned()]);
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["intentional_root"], serde_json::json!(["/webhook"]));
+    }
+
+    /// The exemption is an exact-path match, like the library's: declaring
+    /// `/webhook2` does not cover `/webhook`.
+    #[test]
+    fn build_report_intentional_root_exemption_is_exact() {
+        let declared = vec!["/webhook2".to_owned()];
+        let opts = PluginCheckOptions {
+            package: None,
+            bin: None,
+            plugin_name: "admin",
+            expected_prefix: Some("/admin"),
+            intentional_root_routes: &declared,
+            sensitive_routes: &[],
+            format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+            no_routes: false,
+        };
+        let routes = vec![make_route("POST", "/webhook", "plugin:admin")];
+        let report = build_report(&opts, &routes);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-prefix")
+            .expect("route-prefix check ran");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.diagnostics.iter().any(|d| d.contains("/webhook")));
+        assert!(
+            check
+                .message
+                .contains("not declared as intentional root routes"),
+            "fail message names the exemption: {check:?}"
+        );
+    }
+
+    /// Without any declaration, an off-prefix route still fails — the new
+    /// exemption must not silently widen the check.
+    #[test]
+    fn build_report_off_prefix_route_still_fails_without_declaration() {
+        let opts = PluginCheckOptions {
+            package: None,
+            bin: None,
+            plugin_name: "admin",
+            expected_prefix: Some("/admin"),
+            intentional_root_routes: &[],
+            sensitive_routes: &[],
+            format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+            no_routes: false,
+        };
+        let routes = vec![
+            make_route("GET", "/admin", "plugin:admin"),
+            make_route("POST", "/webhook", "plugin:admin"),
+        ];
+        let report = build_report(&opts, &routes);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-prefix")
+            .expect("route-prefix check ran");
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.diagnostics.iter().any(|d| d.contains("/webhook")));
     }
 
     #[test]
@@ -980,10 +1778,626 @@ mod tests {
             bin: None,
             plugin_name: "autumn-admin-plugin",
             expected_prefix: None,
+            intentional_root_routes: &[],
             sensitive_routes: &[],
             format: ReportFormat::Text,
+            contracts: &ContractDump::Absent,
+            deny_experimental: false,
+            no_routes: false,
         };
         let report = build_report(&opts, &[]);
         assert_eq!(report.plugin_name, "autumn-admin-plugin");
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    //! `autumn plugin-check`'s half of the plugin API stability contract
+    //! (issue #1601): parsing the contract dump off the child's stderr, and
+    //! the two checks built on it.
+
+    use super::*;
+    use autumn_web::plugin_contract::{PLUGIN_CONTRACT_MARKER, PluginContract};
+
+    /// The tested release is read from `Cargo.lock`, up to the workspace
+    /// root; two locked `autumn-web`s are ambiguous.
+    #[test]
+    fn locked_autumn_web_reads_the_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None), None);
+        let pkg = |v: &str| format!("[[package]]\nname = \"autumn-web\"\nversion = \"{v}\"\n\n");
+        let lock = format!(
+            "version = 4\n\n{}[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n",
+            pkg("0.7.1")
+        );
+        std::fs::write(tmp.path().join("Cargo.lock"), &lock).unwrap();
+        assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
+        // A stale member lockfile is not the one Cargo builds with.
+        std::fs::write(
+            app.join("Cargo.lock"),
+            format!("version = 4\n\n{}", pkg("0.1.0")),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!("version = 4\n\n{}{}", pkg("0.7.1"), pkg("0.6.0")),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None), None);
+        // The selected package's own edge tells two locked versions apart.
+        let host = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                    dependencies = [\"autumn-web 0.7.1\", \"serde\"]\n\n";
+        let other = "[[package]]\nname = \"other\"\nversion = \"0.1.0\"\n\
+                     dependencies = [\"autumn-web 0.6.0\"]\n\n";
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n{host}{other}{}{}",
+                pkg("0.7.1"),
+                pkg("0.6.0")
+            ),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
+        assert_eq!(
+            locked_autumn_web(tmp.path(), Some("other")).as_deref(),
+            Some("0.6.0")
+        );
+        // A bare edge names the one locked version.
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"autumn-web\"]\n\n{}",
+                pkg("0.7.1")
+            ),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None).as_deref(), Some("0.7.1"));
+        // Two edges from one package (an alias) cannot be told apart.
+        std::fs::write(
+            tmp.path().join("Cargo.lock"),
+            format!(
+                "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"autumn-web 0.7.1\", \"autumn-web 0.6.0\"]\n\n{}{}",
+                pkg("0.7.1"),
+                pkg("0.6.0")
+            ),
+        )
+        .unwrap();
+        assert_eq!(locked_autumn_web(&app, None), None);
+    }
+
+    /// An omitted raw router fails the report, even when the listed routes
+    /// pass: its routes were never checked.
+    #[test]
+    fn omitted_routers_fail_route_attribution() {
+        let mut report = ConformanceReport {
+            plugin_name: "autumn-plugin-x".to_owned(),
+            checks: vec![CheckResult {
+                name: "route-attribution".to_owned(),
+                status: CheckStatus::Pass,
+                message: String::new(),
+                diagnostics: vec![],
+            }],
+            contract: None,
+            autumn_web: None,
+            prefix: None,
+            intentional_root: Vec::new(),
+        };
+        fail_on_omitted_routers(&mut report, 0);
+        assert!(report.passed());
+        fail_on_omitted_routers(&mut report, 2);
+        assert!(!report.passed());
+        assert!(report.checks[0].message.contains("2 raw router(s)"));
+    }
+
+    /// `--bin` without `-p` names the member that owns that binary.
+    #[test]
+    fn package_of_bin_finds_the_one_owner() {
+        let metadata = serde_json::json!({"packages": [
+            {"name": "host", "targets": [{"name": "host", "kind": ["bin"]}]},
+            {"name": "lib", "targets": [{"name": "host", "kind": ["lib"]}]},
+            {"name": "other", "targets": [{"name": "tool", "kind": ["bin"]}]},
+        ]});
+        assert_eq!(package_of_bin(&metadata, "host").as_deref(), Some("host"));
+        assert_eq!(package_of_bin(&metadata, "missing"), None);
+        let twice = serde_json::json!({"packages": [
+            {"name": "a", "targets": [{"name": "x", "kind": ["bin"]}]},
+            {"name": "b", "targets": [{"name": "x", "kind": ["bin"]}]},
+        ]});
+        assert_eq!(package_of_bin(&twice, "x"), None);
+    }
+
+    fn opts(contracts: &ContractDump) -> PluginCheckOptions<'_> {
+        PluginCheckOptions {
+            package: None,
+            bin: None,
+            plugin_name: "autumn-plugin-demo",
+            expected_prefix: None,
+            intentional_root_routes: &[],
+            sensitive_routes: &[],
+            format: ReportFormat::Text,
+            contracts,
+            deny_experimental: false,
+            no_routes: false,
+        }
+    }
+
+    fn present(contracts: Vec<PluginContract>) -> ContractDump {
+        ContractDump::Present(contracts)
+    }
+
+    fn route() -> RouteInfo {
+        RouteInfo {
+            method: "GET".to_owned(),
+            path: "/demo".to_owned(),
+            handler: "demo::index".to_owned(),
+            source: "plugin:autumn-plugin-demo".to_owned(),
+            middleware: vec![],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
+        }
+    }
+
+    fn find<'a>(report: &'a ConformanceReport, name: &str) -> &'a CheckResult {
+        report
+            .checks
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no `{name}` check in report"))
+    }
+
+    // ── route-less plugins (issue #1625) ───────────────────────────────────
+
+    fn demo_contract() -> PluginContract {
+        let mut contract = PluginContract::new("autumn-plugin-demo").autumn_web("0.7");
+        contract.registered_as = Some("autumn-plugin-demo".to_owned());
+        contract
+    }
+
+    /// A cache or search plugin mounts no routes. Its contract proves it is
+    /// registered under this name, so no routes is not a wrong name.
+    #[test]
+    fn a_registered_plugin_with_no_routes_skips_route_attribution() {
+        let dump = present(vec![demo_contract()]);
+        let mut o = opts(&dump);
+        o.no_routes = true;
+        let report = build_report(&o, &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Skip);
+        assert!(report.passed(), "{}", report.to_text_report());
+    }
+
+    /// No routes skips only on an explicit `--no-routes`: an unannotated
+    /// `nest` also dumps none, and must not pass unchecked.
+    #[test]
+    fn no_routes_without_the_assertion_fails_attribution() {
+        let dump = present(vec![demo_contract()]);
+        let report = build_report(&opts(&dump), &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
+        // And the assertion is refused when routes are there.
+        let mut o = opts(&dump);
+        o.no_routes = true;
+        let report = build_report(&o, &[route()]);
+        let attribution = find(&report, "route-attribution");
+        assert_eq!(attribution.status, CheckStatus::Fail);
+        assert!(
+            attribution.message.contains("--no-routes"),
+            "{}",
+            attribution.message
+        );
+    }
+
+    /// `--plugin-name` is the crate name, but routes are attributed to
+    /// `Plugin::name()` (by default the type path). The contract links the
+    /// two, so the route checks run under the registered name, and the report
+    /// keeps the crate name the index lists.
+    /// Routes under both linked names: the checks would read one set and
+    /// miss the other, so attribution fails.
+    #[test]
+    fn routes_split_across_both_names_fail_attribution() {
+        let mut contract = demo_contract();
+        contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
+        let dump = present(vec![contract]);
+        let mut hidden = route();
+        hidden.source = "plugin:demo_crate::DemoPlugin".to_owned();
+        hidden.path = "/off-prefix".to_owned();
+        let report = build_report(&opts(&dump), &[route(), hidden]);
+        let attribution = find(&report, "route-attribution");
+        assert_eq!(attribution.status, CheckStatus::Fail);
+        assert!(
+            attribution.message.contains("demo_crate::DemoPlugin"),
+            "{}",
+            attribution.message
+        );
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn route_checks_follow_the_registered_name() {
+        let mut contract = demo_contract();
+        contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
+        let dump = present(vec![contract]);
+        let mut hidden = route();
+        hidden.source = "plugin:demo_crate::DemoPlugin".to_owned();
+        let mut o = opts(&dump);
+        o.expected_prefix = Some("/elsewhere");
+        let report = build_report(&o, &[hidden]);
+        assert_eq!(report.plugin_name, "autumn-plugin-demo");
+        let attribution = find(&report, "route-attribution");
+        assert_eq!(
+            attribution.status,
+            CheckStatus::Pass,
+            "{}",
+            attribution.message
+        );
+        assert!(
+            attribution.message.contains("demo_crate::DemoPlugin"),
+            "{}",
+            attribution.message
+        );
+        // The prefix check ran over those routes, and caught the mismatch.
+        assert_eq!(find(&report, "route-prefix").status, CheckStatus::Fail);
+    }
+
+    /// `--prefix` declares a routed plugin: no attributed routes is a
+    /// failure, never a skip, so the report checks at least one endpoint.
+    #[test]
+    fn a_registered_plugin_with_a_prefix_and_no_routes_fails() {
+        let dump = present(vec![demo_contract()]);
+        let mut o = opts(&dump);
+        o.expected_prefix = Some("/demo");
+        let report = build_report(&o, &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
+        assert!(!report.passed());
+    }
+
+    /// A contract with no registered name cannot prove the plugin has no
+    /// routes under some other name.
+    #[test]
+    fn a_contract_without_a_registered_name_does_not_skip() {
+        let mut contract = demo_contract();
+        contract.registered_as = None;
+        let report = build_report(&opts(&present(vec![contract])), &[]);
+        assert_eq!(find(&report, "route-attribution").status, CheckStatus::Fail);
+    }
+
+    /// Without a matching contract, no routes still means a wrong name.
+    #[test]
+    fn an_unregistered_name_with_no_routes_still_fails_route_attribution() {
+        for dump in [
+            ContractDump::Absent,
+            present(vec![]),
+            present(vec![PluginContract::new("someone-else").autumn_web("0.7")]),
+        ] {
+            let report = build_report(&opts(&dump), &[]);
+            assert_eq!(
+                find(&report, "route-attribution").status,
+                CheckStatus::Fail,
+                "{dump:?}"
+            );
+        }
+    }
+
+    /// The plugin index records the range and tier from the report, so the
+    /// report carries the contract it checked.
+    #[test]
+    fn the_report_carries_the_declared_contract() {
+        let dump = present(vec![demo_contract()]);
+        let report = build_report(&opts(&dump), &[route()]);
+        assert_eq!(report.contract, Some(demo_contract()));
+        let json = serde_json::to_value(&report).expect("json");
+        assert_eq!(json["contract"]["autumn_web"], "0.7");
+
+        let report = build_report(&opts(&ContractDump::Absent), &[route()]);
+        assert_eq!(report.contract, None);
+        let json = serde_json::to_value(&report).expect("json");
+        assert!(json.get("contract").is_none(), "{json}");
+    }
+
+    // ── parsing the dump ───────────────────────────────────────────────────
+
+    #[test]
+    fn contracts_are_parsed_from_the_marker_line() {
+        let stderr = format!(
+            "\u{1F342} autumn plugin-check\nsome warning\n{PLUGIN_CONTRACT_MARKER}[{{\"plugin\":\"autumn-plugin-demo\",\"autumn_web\":\"0.7\"}}]\ntrailing\n"
+        );
+        let ContractDump::Present(parsed) = parse_plugin_contracts(&stderr) else {
+            panic!("marker present");
+        };
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].plugin, "autumn-plugin-demo");
+        assert_eq!(parsed[0].autumn_web.as_deref(), Some("0.7"));
+    }
+
+    #[test]
+    fn an_absent_marker_parses_as_absent() {
+        assert_eq!(
+            parse_plugin_contracts("no marker here\n"),
+            ContractDump::Absent
+        );
+    }
+
+    #[test]
+    fn an_empty_contract_array_is_present_and_empty_not_absent() {
+        let stderr = format!("{PLUGIN_CONTRACT_MARKER}[]\n");
+        let ContractDump::Present(parsed) = parse_plugin_contracts(&stderr) else {
+            panic!("marker present");
+        };
+        assert!(parsed.is_empty(), "the app declared no contracts");
+    }
+
+    #[test]
+    fn a_malformed_marker_payload_is_distinguished_from_an_absent_one() {
+        let stderr = format!("{PLUGIN_CONTRACT_MARKER}{{not json\n");
+        assert!(
+            matches!(parse_plugin_contracts(&stderr), ContractDump::Malformed(_)),
+            "a marker the CLI cannot read is NOT the same as no marker"
+        );
+    }
+
+    #[test]
+    fn the_last_marker_line_wins() {
+        let stderr = format!(
+            "{PLUGIN_CONTRACT_MARKER}[]\n{PLUGIN_CONTRACT_MARKER}[{{\"plugin\":\"second\"}}]\n"
+        );
+        let ContractDump::Present(parsed) = parse_plugin_contracts(&stderr) else {
+            panic!("marker present");
+        };
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].plugin, "second");
+    }
+
+    // ── the `plugin-contract` check ────────────────────────────────────────
+
+    #[test]
+    fn a_binary_that_emits_no_marker_skips_the_contract_check() {
+        let report = build_report(&opts(&ContractDump::Absent), &[route()]);
+        let result = find(&report, "plugin-contract");
+        assert_eq!(result.status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn a_plugin_with_no_contract_fails_the_contract_check() {
+        let others = vec![PluginContract::new("some-other-plugin").autumn_web("0.7")];
+        let report = build_report(&opts(&present(others)), &[route()]);
+        let result = find(&report, "plugin-contract");
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "the checked plugin declares nothing: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("autumn-plugin-demo"),
+            "{}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn a_declared_range_passes_and_is_reported() {
+        let contracts = vec![
+            PluginContract::new("autumn-plugin-demo")
+                .plugin_version("1.2.3")
+                .autumn_web("0.7"),
+        ];
+        let report = build_report(&opts(&present(contracts)), &[route()]);
+        let result = find(&report, "plugin-contract");
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("0.7"), "{}", result.message);
+    }
+
+    #[test]
+    fn an_unparseable_range_fails_the_contract_check() {
+        let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("not a req")];
+        let report = build_report(&opts(&present(contracts)), &[route()]);
+        let result = find(&report, "plugin-contract");
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "an unevaluable requirement disables the runtime guard silently"
+        );
+        assert!(!report.passed());
+    }
+
+    // ── the `experimental-surface` check ───────────────────────────────────
+
+    #[test]
+    fn a_stable_only_plugin_passes_the_experimental_check() {
+        let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("0.7")];
+        let report = build_report(&opts(&present(contracts)), &[route()]);
+        let result = find(&report, "experimental-surface");
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn experimental_surface_is_reported_by_name_without_failing() {
+        let contracts = vec![
+            PluginContract::new("autumn-plugin-demo")
+                .autumn_web("0.7")
+                .uses_experimental("AppBuilder::with_edge_kv"),
+        ];
+        let report = build_report(&opts(&present(contracts)), &[route()]);
+        let result = find(&report, "experimental-surface");
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("AppBuilder::with_edge_kv")),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(report.passed());
+    }
+
+    #[test]
+    fn deny_experimental_turns_the_report_into_a_failure() {
+        let contracts = vec![
+            PluginContract::new("autumn-plugin-demo")
+                .autumn_web("0.7")
+                .uses_experimental("AppBuilder::with_edge_kv"),
+        ];
+        let dump = present(contracts);
+        let mut o = opts(&dump);
+        o.deny_experimental = true;
+        let report = build_report(&o, &[route()]);
+        let result = find(&report, "experimental-surface");
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn deny_experimental_does_not_fail_a_stable_only_plugin() {
+        let contracts = vec![PluginContract::new("autumn-plugin-demo").autumn_web("0.7")];
+        let dump = present(contracts);
+        let mut o = opts(&dump);
+        o.deny_experimental = true;
+        let report = build_report(&o, &[route()]);
+        assert_eq!(
+            find(&report, "experimental-surface").status,
+            CheckStatus::Pass
+        );
+        assert!(report.passed());
+    }
+
+    #[test]
+    fn an_unknown_experimental_surface_name_fails() {
+        let contracts = vec![
+            PluginContract::new("autumn-plugin-demo")
+                .autumn_web("0.7")
+                .uses_experimental("AppBuilder::not_a_surface"),
+        ];
+        let report = build_report(&opts(&present(contracts)), &[route()]);
+        assert_eq!(
+            find(&report, "experimental-surface").status,
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn the_experimental_check_is_skipped_when_the_binary_emits_no_marker() {
+        let report = build_report(&opts(&ContractDump::Absent), &[route()]);
+        assert_eq!(
+            find(&report, "experimental-surface").status,
+            CheckStatus::Skip
+        );
+    }
+
+    /// A malformed FINAL dump must not silently fall back to an earlier, stale
+    /// one — which is exactly what parsing before selecting would do.
+    #[test]
+    fn a_malformed_last_dump_does_not_fall_back_to_an_earlier_one() {
+        let stderr = format!(
+            "{PLUGIN_CONTRACT_MARKER}[{{\"plugin\":\"stale\"}}]\n{PLUGIN_CONTRACT_MARKER}[{{\"plugin\":\"trunc\"\n"
+        );
+        assert!(
+            matches!(parse_plugin_contracts(&stderr), ContractDump::Malformed(_)),
+            "the stale first dump must not win"
+        );
+    }
+
+    #[test]
+    fn a_malformed_dump_fails_the_contract_check_rather_than_skipping_it() {
+        let dump = ContractDump::Malformed("expected value at line 1".to_owned());
+        let report = build_report(&opts(&dump), &[route()]);
+        let result = find(&report, "plugin-contract");
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "an unreadable answer is not the same as no answer"
+        );
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn deny_experimental_fails_closed_when_the_contract_cannot_be_read() {
+        for dump in [
+            ContractDump::Absent,
+            ContractDump::Malformed("bad".to_owned()),
+            ContractDump::Present(vec![]),
+        ] {
+            let mut o = opts(&dump);
+            o.deny_experimental = true;
+            let report = build_report(&o, &[route()]);
+            assert_eq!(
+                find(&report, "experimental-surface").status,
+                CheckStatus::Fail,
+                "--deny-experimental must not silently no-op for {dump:?}"
+            );
+        }
+    }
+
+    /// A plugin that declares `env!("CARGO_PKG_NAME")` but does not override
+    /// `Plugin::name()` has two identities. `--plugin-name` takes one string,
+    /// so both have to resolve or the plugin is unfindable.
+    #[test]
+    fn a_contract_is_found_under_the_name_the_plugin_registered_under() {
+        let mut contract = PluginContract::new("autumn-plugin-demo").autumn_web("0.7");
+        contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
+        let dump = present(vec![contract]);
+
+        for name in ["autumn-plugin-demo", "demo_crate::DemoPlugin"] {
+            let mut o = opts(&dump);
+            o.plugin_name = name;
+            let report = build_report(&o, &[route()]);
+            assert_eq!(
+                find(&report, "plugin-contract").status,
+                CheckStatus::Pass,
+                "--plugin-name {name} should resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn the_not_found_diagnostic_names_both_identities() {
+        let mut contract = PluginContract::new("autumn-plugin-demo").autumn_web("0.7");
+        contract.registered_as = Some("demo_crate::DemoPlugin".to_owned());
+        let dump = present(vec![contract]);
+        let mut o = opts(&dump);
+        o.plugin_name = "something-else";
+        let report = build_report(&o, &[route()]);
+        let joined = find(&report, "plugin-contract").diagnostics.join("\n");
+        assert!(joined.contains("autumn-plugin-demo"), "{joined}");
+        assert!(joined.contains("demo_crate::DemoPlugin"), "{joined}");
+    }
+
+    /// The skip message must not name a hard-coded future release: the version
+    /// this CLI links is the only one it can honestly speak about.
+    #[test]
+    fn the_older_binary_skip_message_names_this_builds_version() {
+        let report = build_report(&opts(&ContractDump::Absent), &[route()]);
+        let message = &find(&report, "plugin-contract").message;
+        assert!(
+            message.contains(autumn_web::plugin_contract::AUTUMN_WEB_VERSION),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_text_report_renders_the_new_checks() {
+        let contracts = vec![
+            PluginContract::new("autumn-plugin-demo")
+                .autumn_web("0.7")
+                .uses_experimental("AppBuilder::with_edge_kv"),
+        ];
+        let report = build_report(&opts(&present(contracts)), &[route()]);
+        let text = report.to_text_report();
+        assert!(text.contains("plugin-contract"), "{text}");
+        assert!(text.contains("experimental-surface"), "{text}");
     }
 }

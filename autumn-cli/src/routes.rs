@@ -17,6 +17,7 @@ use crate::text_width::display_width;
 pub enum OutputFormat {
     Table,
     Json,
+    Mermaid,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -26,8 +27,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
+            "mermaid" => Ok(Self::Mermaid),
             other => Err(format!(
-                "unknown format '{other}'; expected 'table' or 'json'"
+                "unknown format '{other}'; expected 'table', 'json', or 'mermaid'"
             )),
         }
     }
@@ -46,6 +48,16 @@ pub struct RouteInfo {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sunset_opt_out: Option<bool>,
+    /// Statically derived resource character of the route (issue #1733).
+    ///
+    /// Carried so `autumn routes --format json` re-serializes the dump it read
+    /// instead of silently dropping a field `autumn calibrate` relies on —
+    /// two readers of the same dump must not disagree about its shape.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub resource_shape: String,
+    /// Pool tags the route's handler provably touches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
 }
 
 /// Options controlling `autumn routes` behaviour.
@@ -97,6 +109,7 @@ pub fn run(opts: &RoutesOptions<'_>) {
     match &opts.format {
         OutputFormat::Table => print_table(&routes),
         OutputFormat::Json => print_json(&routes),
+        OutputFormat::Mermaid => print_mermaid(&routes),
     }
 }
 
@@ -253,9 +266,95 @@ pub fn print_json(routes: &[RouteInfo]) {
     println!("{json}");
 }
 
+/// Print routes as a Mermaid flowchart.
+///
+/// An empty route table still prints a (node-less) `flowchart`, so piping the
+/// output into a renderer never receives prose instead of Mermaid.
+pub fn print_mermaid(routes: &[RouteInfo]) {
+    print!("{}", format_mermaid(routes));
+}
+
+/// Escape text for a quoted Mermaid label so route data renders literally.
+///
+/// Mermaid has no backslash escape in labels; it rewrites `#name;` entity
+/// codes into HTML entities, and with HTML labels (this formatter emits
+/// `<b>`) a raw `<`, `>` or `&` would be read as markup. So every label
+/// metacharacter becomes an entity code. `#` goes first, so a literal
+/// `#quot;` in a route cannot be mistaken for an entity code either.
+fn mermaid_label(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '#' => out.push_str("#35;"),
+            '"' => out.push_str("#quot;"),
+            '&' => out.push_str("#amp;"),
+            '<' => out.push_str("#lt;"),
+            '>' => out.push_str("#gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build the Mermaid string (extracted for testability).
+///
+/// Routes are grouped into one `subgraph` per source. A source is free text
+/// (a plugin name may hold `@`, `/` or whitespace), so it is never used as an
+/// identifier: each subgraph gets a generated id (`src1`, `src2`, …) and the
+/// source is rendered as its quoted title. Distinct sources therefore never
+/// collide, however similar their names.
+pub fn format_mermaid(routes: &[RouteInfo]) -> String {
+    use std::fmt::Write as _;
+
+    let mut by_source: std::collections::BTreeMap<&str, Vec<&RouteInfo>> =
+        std::collections::BTreeMap::new();
+    for route in routes {
+        by_source.entry(&route.source).or_default().push(route);
+    }
+
+    let mut out = String::from("flowchart LR\n");
+    let mut node_id = 0_usize;
+    for (source_id, (source, source_routes)) in by_source.into_iter().enumerate() {
+        // Writing into a `String` cannot fail.
+        let _ = writeln!(
+            out,
+            "    subgraph src{}[\"{}\"]",
+            source_id + 1,
+            mermaid_label(source)
+        );
+        for route in source_routes {
+            node_id += 1;
+            let _ = writeln!(
+                out,
+                "        route{node_id}(\"<b>{}</b> {}\")",
+                mermaid_label(&route.method),
+                mermaid_label(&route.path)
+            );
+        }
+        out.push_str("    end\n");
+    }
+    out
+}
+
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
 
 pub fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
+    find_binary_in_profile(package, bin, &CargoProfile::default())
+}
+
+/// Locate the app binary under an explicit Cargo profile.
+///
+/// A one-shot dump command runs the binary it just built, so the profile it
+/// looks in has to be the profile it compiled. `cfg!(debug_assertions)` and
+/// profile-gated `#[cfg]` code mean a debug binary can register a genuinely
+/// different set of inventory items than the release one that ships -- which
+/// is exactly what `autumn data-flow --check` must not be blind to (#1654
+/// review round 3).
+pub fn find_binary_in_profile(
+    package: Option<&str>,
+    bin: Option<&str>,
+    profile: &CargoProfile,
+) -> PathBuf {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -263,6 +362,7 @@ pub fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
 
     if !output.status.success() {
         eprintln!("\u{2717} Failed to read cargo metadata");
+        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
         std::process::exit(1);
     }
 
@@ -270,17 +370,18 @@ pub fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
         serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
     let cwd = std::env::current_dir().expect("current dir");
 
-    resolve_binary_from_metadata(&metadata, package, &cwd, bin).unwrap_or_else(|error| {
+    resolve_binary_in_profile(&metadata, package, &cwd, bin, profile).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
     })
 }
 
-fn resolve_binary_from_metadata(
+fn resolve_binary_in_profile(
     metadata: &serde_json::Value,
     package: Option<&str>,
     cwd: &Path,
     bin: Option<&str>,
+    profile: &CargoProfile,
 ) -> Result<PathBuf, String> {
     let target_dir = metadata["target_directory"]
         .as_str()
@@ -381,7 +482,9 @@ fn resolve_binary_from_metadata(
     })?;
 
     let mut path = PathBuf::from(target_dir);
-    path.push("debug");
+    // Cargo's artifact-directory rule: dev -> target/debug, release ->
+    // target/release, any other profile name -> target/<name>.
+    path.push(profile.artifact_dir());
     path.push(bin_name);
 
     if cfg!(windows) {
@@ -393,7 +496,94 @@ fn resolve_binary_from_metadata(
 
 // ── Also compile the binary before running ─────────────────────────────────
 
+/// The Cargo profile an inspected binary should be built and located under.
+///
+/// A manifest read out of a binary describes *that* binary. Build the debug
+/// profile and the manifest omits every `#[cached]` read and `#[repository]`
+/// write that is gated behind `#[cfg(not(debug_assertions))]` — so an audit
+/// can exit green while the deployed release build, which does compile them,
+/// is incoherent. These are the same flags `cargo build` takes, forwarded
+/// verbatim, so the inspected binary can be the one that ships.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CargoProfile {
+    /// `--release`, shorthand for `--profile release`.
+    pub release: bool,
+    /// An explicit `--profile <NAME>` selection. Conflicts with `release`;
+    /// Cargo rejects the combination too.
+    pub profile: Option<String>,
+}
+
+impl CargoProfile {
+    /// A profile selection from a plain `--release` flag.
+    #[must_use]
+    pub const fn from_release(release: bool) -> Self {
+        Self {
+            release,
+            profile: None,
+        }
+    }
+
+    /// Whether this selects anything other than Cargo's default dev profile.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        !self.release && self.profile.is_none()
+    }
+
+    /// The selection as the `cargo build` flags it forwards, for reporting.
+    #[must_use]
+    pub fn to_args(&self) -> Vec<String> {
+        self.profile.as_ref().map_or_else(
+            || {
+                if self.release {
+                    vec!["--release".to_string()]
+                } else {
+                    Vec::new()
+                }
+            },
+            |name| vec!["--profile".to_string(), name.clone()],
+        )
+    }
+
+    /// The `target/` subdirectory Cargo places this profile's artifacts in.
+    ///
+    /// Cargo's own `dir-name` rule: the built-in `dev` and `test` profiles
+    /// build into `target/debug`, `release` and `bench` into
+    /// `target/release`, and any other profile name into `target/<name>`.
+    #[must_use]
+    pub fn artifact_dir(&self) -> &str {
+        if self.release {
+            "release"
+        } else if let Some(name) = &self.profile {
+            match name.as_str() {
+                "dev" | "test" => "debug",
+                "release" | "bench" => "release",
+                other => other,
+            }
+        } else {
+            "debug"
+        }
+    }
+}
+
 pub fn compile_binary(package: Option<&str>, bin: Option<&str>) {
+    compile_binary_with(
+        package,
+        bin,
+        &CargoFeatures::default(),
+        &CargoProfile::default(),
+    );
+}
+
+/// Compile the app under an explicit Cargo feature selection and profile.
+///
+/// Pairs with [`find_binary_in_profile`]: a command that builds and then runs
+/// the binary must agree with itself about which profile it means.
+pub fn compile_binary_with(
+    package: Option<&str>,
+    bin: Option<&str>,
+    features: &CargoFeatures,
+    profile: &CargoProfile,
+) {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
     if let Some(pkg) = package {
@@ -402,11 +592,57 @@ pub fn compile_binary(package: Option<&str>, bin: Option<&str>) {
     if let Some(b) = bin {
         cargo.args(["--bin", b]);
     }
+    cargo.args(features.to_args());
+    cargo.args(profile.to_args());
 
     let status = cargo.status().expect("failed to run cargo build");
     if !status.success() {
         eprintln!("\u{2717} Compilation failed");
         std::process::exit(1);
+    }
+}
+
+/// The Cargo feature selection an audited build should be made under.
+///
+/// A manifest read out of a binary describes *that* binary. Build the default
+/// feature set and the manifest omits every `#[cached]` read and `#[repository]`
+/// write that is gated behind a non-default feature — so an audit can exit green
+/// while the deployed configuration, which does compile them, is incoherent.
+/// These are the same flags `cargo build` takes, forwarded verbatim, so the
+/// audited binary can be the one that ships.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CargoFeatures {
+    /// Each entry is passed as its own `--features` argument; Cargo accepts a
+    /// space- or comma-separated list inside one, so both spellings work.
+    pub features: Vec<String>,
+    /// `--all-features`.
+    pub all: bool,
+    /// `--no-default-features`.
+    pub no_default: bool,
+}
+
+impl CargoFeatures {
+    /// Whether this selects anything other than Cargo's defaults.
+    #[must_use]
+    pub const fn is_default(&self) -> bool {
+        self.features.is_empty() && !self.all && !self.no_default
+    }
+
+    /// The selection as the `cargo build` flags it forwards, for reporting.
+    #[must_use]
+    pub fn to_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.no_default {
+            args.push("--no-default-features".to_string());
+        }
+        if self.all {
+            args.push("--all-features".to_string());
+        }
+        for f in &self.features {
+            args.push("--features".to_string());
+            args.push(f.clone());
+        }
+        args
     }
 }
 
@@ -424,6 +660,8 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         }
     }
 
@@ -458,6 +696,12 @@ mod tests {
         assert_eq!(f, OutputFormat::Json);
         let f: OutputFormat = "Table".parse().unwrap();
         assert_eq!(f, OutputFormat::Table);
+    }
+
+    #[test]
+    fn parse_format_mermaid() {
+        let f: OutputFormat = "mermaid".parse().unwrap();
+        assert_eq!(f, OutputFormat::Mermaid);
     }
 
     #[test]
@@ -624,6 +868,8 @@ mod tests {
             api_version: None,
             status: None,
             sunset_opt_out: None,
+            resource_shape: String::new(),
+            pools: Vec::new(),
         };
         let table = format_table(&[route]);
         assert!(table.contains("secured"), "missing middleware label");
@@ -640,7 +886,119 @@ mod tests {
         assert_eq!(parsed.len(), routes.len());
     }
 
+    // ── format_mermaid ─────────────────────────────────────────────────────
+
+    #[test]
+    fn format_mermaid_contains_expected_nodes() {
+        let routes = sample_routes();
+        let mermaid = format_mermaid(&routes);
+        assert!(mermaid.starts_with("flowchart LR"));
+        assert!(mermaid.contains("subgraph src1[\"framework\"]"));
+        assert!(mermaid.contains("subgraph src2[\"plugin:harvest\"]"));
+        assert!(mermaid.contains("subgraph src3[\"user\"]"));
+
+        // Check for specific routes
+        assert!(mermaid.contains("\"<b>GET</b> /about\""));
+        assert!(mermaid.contains("\"<b>GET</b> /api/posts\""));
+        assert!(mermaid.contains("\"<b>GET</b> /actuator/health\""));
+        assert!(mermaid.contains("\"<b>POST</b> /posts\""));
+        assert!(mermaid.contains("\"<b>GET</b> /posts/{id}\""));
+    }
+
+    #[test]
+    fn mermaid_label_encodes_every_metacharacter() {
+        assert_eq!(
+            mermaid_label(r#"sales <beta> & "x" #quot;"#),
+            "sales #lt;beta#gt; #amp; #quot;x#quot; #35;quot;"
+        );
+        assert_eq!(mermaid_label("/posts/{id}"), "/posts/{id}");
+    }
+
+    #[test]
+    fn format_mermaid_empty_is_valid_flowchart() {
+        assert_eq!(format_mermaid(&[]), "flowchart LR\n");
+    }
+
+    #[test]
+    fn format_mermaid_quotes_unsafe_sources_and_keeps_them_distinct() {
+        let mut routes = sample_routes();
+        let base = routes[0].clone();
+        routes.push(RouteInfo {
+            source: "plugin:foo-bar".to_owned(),
+            ..base.clone()
+        });
+        routes.push(RouteInfo {
+            source: "plugin:foo_bar".to_owned(),
+            ..base.clone()
+        });
+        routes.push(RouteInfo {
+            source: "plugin:react_graphql::GraphqlPlugin@/graphql \"x\"".to_owned(),
+            ..base
+        });
+        let mermaid = format_mermaid(&routes);
+        assert!(mermaid.contains("[\"plugin:foo-bar\"]"));
+        assert!(mermaid.contains("[\"plugin:foo_bar\"]"));
+        assert!(
+            mermaid.contains("[\"plugin:react_graphql::GraphqlPlugin@/graphql #quot;x#quot;\"]")
+        );
+        let subgraphs = mermaid
+            .lines()
+            .filter(|l| l.trim_start().starts_with("subgraph "))
+            .count();
+        assert_eq!(subgraphs, 6);
+    }
+
     // ── resolve_binary_from_metadata ──────────────────────────────────────
+
+    #[test]
+    fn resolve_binary_honors_the_requested_profile() {
+        // #1654 review round 3: a command that builds and then runs the binary
+        // must look in the profile it just compiled. Resolving `target/debug`
+        // after a `--release` build ran the wrong binary (or none), so
+        // `autumn data-flow --check` could certify a manifest that omitted
+        // every `#[cfg(not(debug_assertions))]` classified column and
+        // declassification boundary in the binary that actually ships.
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "hello",
+                "manifest_path": "/projects/hello/Cargo.toml",
+                "targets": [{
+                    "name": "hello",
+                    "kind": ["bin"],
+                    "src_path": "/projects/hello/src/main.rs"
+                }]
+            }]
+        });
+        let cwd = Path::new("/projects/hello");
+
+        let debug = resolve_binary_in_profile(&metadata, None, cwd, None, &CargoProfile::default())
+            .expect("the debug binary resolves");
+        let release = resolve_binary_in_profile(
+            &metadata,
+            None,
+            cwd,
+            None,
+            &CargoProfile::from_release(true),
+        )
+        .expect("the release binary resolves");
+
+        assert!(
+            debug.starts_with("/tmp/target/debug"),
+            "debug must resolve under target/debug: {}",
+            debug.display()
+        );
+        assert!(
+            release.starts_with("/tmp/target/release"),
+            "release must resolve under target/release: {}",
+            release.display()
+        );
+        assert_eq!(
+            debug.file_name(),
+            release.file_name(),
+            "only the profile directory differs"
+        );
+    }
 
     #[test]
     fn resolve_binary_by_package_name() {
@@ -656,8 +1014,13 @@ mod tests {
                 }]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            Some("hello"),
+            Path::new("/projects"),
+            None,
+            &CargoProfile::default(),
+        );
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -680,8 +1043,13 @@ mod tests {
                 }]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/projects/hello"),
+            None,
+            &CargoProfile::default(),
+        );
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -700,8 +1068,13 @@ mod tests {
                 "targets": [{"name": "hello", "kind": ["bin"]}]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, Some("missing"), Path::new("/projects"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            Some("missing"),
+            Path::new("/projects"),
+            None,
+            &CargoProfile::default(),
+        );
         assert!(result.unwrap_err().contains("package 'missing'"));
     }
 
@@ -722,7 +1095,13 @@ mod tests {
                 }
             ]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws"),
+            None,
+            &CargoProfile::default(),
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary packages"),
@@ -752,8 +1131,14 @@ mod tests {
             ]
         });
         // Narrowing cwd to /ws/alpha means only "alpha" matches.
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/alpha"), None).unwrap();
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/alpha"),
+            None,
+            &CargoProfile::default(),
+        )
+        .unwrap();
         assert!(result.to_string_lossy().contains("alpha"));
     }
 
@@ -774,7 +1159,14 @@ mod tests {
                 }
             ]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws"), None).unwrap();
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws"),
+            None,
+            &CargoProfile::default(),
+        )
+        .unwrap();
         assert!(result.to_string_lossy().contains("myapp"));
     }
 
@@ -788,7 +1180,13 @@ mod tests {
                 "targets": [{"name": "mylib", "kind": ["lib"]}]
             }]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/mylib"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/mylib"),
+            None,
+            &CargoProfile::default(),
+        );
         assert!(result.unwrap_err().contains("no binary target"));
     }
 
@@ -803,8 +1201,13 @@ mod tests {
             }]
         });
         // Running from a subdirectory of the package root should still find it.
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello/src"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/projects/hello/src"),
+            None,
+            &CargoProfile::default(),
+        );
         assert!(
             result.unwrap().to_string_lossy().contains("hello"),
             "should resolve binary from subdirectory"
@@ -824,7 +1227,13 @@ mod tests {
                 ]
             }]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), None);
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/myapp"),
+            None,
+            &CargoProfile::default(),
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary targets"),
@@ -849,9 +1258,14 @@ mod tests {
                 ]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), Some("migrate"))
-                .unwrap();
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/myapp"),
+            Some("migrate"),
+            &CargoProfile::default(),
+        )
+        .unwrap();
         assert!(
             result.to_string_lossy().contains("migrate"),
             "should resolve to the named binary"
@@ -868,8 +1282,13 @@ mod tests {
                 "targets": [{"name": "server", "kind": ["bin"]}]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), Some("missing"));
+        let result = resolve_binary_in_profile(
+            &metadata,
+            None,
+            Path::new("/ws/myapp"),
+            Some("missing"),
+            &CargoProfile::default(),
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("no binary named 'missing'"),
@@ -879,5 +1298,146 @@ mod tests {
             err.contains("server"),
             "should list available binaries, got: {err}"
         );
+    }
+
+    // ── Cargo feature selection for audited builds (#1716) ─────────────────
+
+    #[test]
+    fn a_default_feature_selection_adds_no_cargo_flags() {
+        let f = CargoFeatures::default();
+        assert!(f.is_default());
+        assert!(f.to_args().is_empty());
+    }
+
+    /// Each flag has to reach `cargo build` in a form Cargo accepts, and each
+    /// `--features` value needs its own flag — a manifest built under the wrong
+    /// feature set is a green audit of a binary nobody deploys.
+    #[test]
+    fn a_feature_selection_forwards_every_flag_cargo_needs() {
+        let f = CargoFeatures {
+            features: vec!["db,cache-moka".to_string(), "redis".to_string()],
+            all: false,
+            no_default: true,
+        };
+        assert!(!f.is_default());
+        assert_eq!(
+            f.to_args(),
+            vec![
+                "--no-default-features",
+                "--features",
+                "db,cache-moka",
+                "--features",
+                "redis",
+            ]
+        );
+
+        let all = CargoFeatures {
+            all: true,
+            ..CargoFeatures::default()
+        };
+        assert!(!all.is_default());
+        assert_eq!(all.to_args(), vec!["--all-features"]);
+    }
+
+    // ── Cargo profile selection for audited builds (#2363) ─────────────────
+
+    fn profile_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "hello",
+                "manifest_path": "/projects/hello/Cargo.toml",
+                "targets": [{
+                    "name": "hello",
+                    "kind": ["bin"],
+                    "src_path": "/projects/hello/src/main.rs"
+                }]
+            }]
+        })
+    }
+
+    fn resolve_profile_dir(profile: &CargoProfile) -> String {
+        let metadata = profile_metadata();
+        let path =
+            resolve_binary_in_profile(&metadata, None, Path::new("/projects/hello"), None, profile)
+                .expect("the binary resolves");
+        path.parent()
+            .expect("binary has a parent dir")
+            .file_name()
+            .expect("dir has a name")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn a_default_profile_selection_adds_no_cargo_flags_and_resolves_debug() {
+        let p = CargoProfile::default();
+        assert!(p.is_default());
+        assert!(p.to_args().is_empty());
+        assert_eq!(resolve_profile_dir(&p), "debug");
+    }
+
+    /// `--release` has to reach `cargo build` *and* move the lookup into
+    /// `target/release` — forwarding the flag without teaching the resolver
+    /// is worse than not forwarding it: the CLI would compile one binary and
+    /// audit a different, stale one, silently.
+    #[test]
+    fn a_release_selection_forwards_the_flag_and_resolves_release() {
+        let p = CargoProfile::from_release(true);
+        assert!(!p.is_default());
+        assert_eq!(p.to_args(), vec!["--release"]);
+        assert_eq!(p.artifact_dir(), "release");
+        assert_eq!(resolve_profile_dir(&p), "release");
+    }
+
+    #[test]
+    fn a_named_profile_forwards_the_flag_and_resolves_the_named_dir() {
+        let p = CargoProfile {
+            release: false,
+            profile: Some("ci".to_string()),
+        };
+        assert!(!p.is_default());
+        assert_eq!(p.to_args(), vec!["--profile", "ci"]);
+        assert_eq!(p.artifact_dir(), "ci");
+        assert_eq!(resolve_profile_dir(&p), "ci");
+    }
+
+    /// Cargo's special case: `--profile dev` builds into `target/debug`, not
+    /// `target/dev`.
+    #[test]
+    fn a_dev_profile_resolves_to_the_debug_dir() {
+        let p = CargoProfile {
+            release: false,
+            profile: Some("dev".to_string()),
+        };
+        assert!(!p.is_default());
+        assert_eq!(p.to_args(), vec!["--profile", "dev"]);
+        assert_eq!(p.artifact_dir(), "debug");
+        assert_eq!(resolve_profile_dir(&p), "debug");
+    }
+
+    /// Cargo's other built-ins: `test` inherits `dev`'s directory and
+    /// `bench` inherits `release`'s, so neither has a `target/<name>`.
+    #[test]
+    fn the_test_and_bench_profiles_resolve_to_their_inherited_dirs() {
+        for (name, dir) in [("test", "debug"), ("bench", "release")] {
+            let p = CargoProfile {
+                release: false,
+                profile: Some(name.to_string()),
+            };
+            assert_eq!(p.to_args(), vec!["--profile", name]);
+            assert_eq!(p.artifact_dir(), dir, "{name}");
+            assert_eq!(resolve_profile_dir(&p), dir, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_release_profile_name_resolves_to_the_release_dir() {
+        let p = CargoProfile {
+            release: false,
+            profile: Some("release".to_string()),
+        };
+        assert_eq!(p.artifact_dir(), "release");
+        assert_eq!(resolve_profile_dir(&p), "release");
     }
 }

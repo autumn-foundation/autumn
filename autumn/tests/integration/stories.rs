@@ -244,6 +244,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "tabs",
     "toast",
     "transition-controls",
+    "translated-transition-controls",
 ];
 
 #[test]

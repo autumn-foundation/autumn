@@ -88,6 +88,26 @@ fn cached_response_into_response(cached: CachedResponse) -> Option<axum::respons
 /// - Only `GET` requests are cached.
 /// - Only `200 OK` responses are cached.
 /// - The cache key is the request URI path + query string.
+///
+/// # Only wrap responses that are the same for every visitor
+///
+/// That last rule is the whole contract: the key is the URI and *nothing
+/// else*. This layer does not read `Vary`, does not read `Cache-Control`,
+/// and does not look at cookies — so whatever the first visitor's request
+/// produced for a URI is replayed verbatim to everyone else who asks for it
+/// until the entry expires. Wrapping a handler whose body depends on who is
+/// asking — a session, a signed-in user, a
+/// [`Consent`](crate::consent::Consent) decision, a per-visitor CSRF token —
+/// leaks one visitor's page to the next.
+///
+/// Stamping `Vary: Cookie` or `Cache-Control: private, no-store` on such a
+/// response does not make it safe to wrap. Those headers instruct *HTTP*
+/// caches — the browser, a CDN, a reverse proxy — and this layer is not one
+/// of those; it sits inside the application, above the handler, and hits
+/// before any of them are consulted.
+///
+/// So either keep per-visitor routes out of this layer entirely, or give the
+/// cache a key that includes what the response varies on.
 #[derive(Clone)]
 pub struct CacheResponseLayer {
     store: Arc<dyn Cache>,

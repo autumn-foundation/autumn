@@ -1,0 +1,33 @@
+[starter]
+name = "cms"
+description = "WordPress-parity CMS: posts/pages, taxonomies, media, moderated comments, roles, themes, plugins"
+
+# No verbatim/binary assets: htmx is served by the framework at HTMX_JS_PATH,
+# and the media library's files are uploaded at runtime, so this starter ships
+# only text templates.
+verbatim = []
+
+post_scaffold_notes = """
+Created a WordPress-parity CMS in `{{project_name}}/`.
+
+Next steps:
+  cd {{project_name}}
+  docker compose up -d        # start Postgres 12+ (or point [database].url at your own)
+  autumn migrate              # create the content schema
+  autumn dev                  # run the app
+
+Then open http://localhost:3000/register. The FIRST account you create owns the
+site — it is made an Administrator, and everything after that happens in /admin.
+
+  autumn task seed-demo       # optional: a starter post, page, menu and sidebar
+
+What you get: posts, pages and custom post types; categories, tags and custom
+taxonomies; a media library; threaded comments with a moderation queue;
+revisions with restore; the five WordPress roles and their capability matrix;
+menus, widgets and switchable themes; a typed action/filter plugin API;
+shortcodes; all five permalink structures; Atom/RSS feeds; a sitemap; a REST
+API; and JSON import/export.
+
+See README.md for the full WordPress-core parity scorecard, including what is
+deliberately left out and why.
+"""

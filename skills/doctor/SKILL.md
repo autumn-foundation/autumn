@@ -72,7 +72,47 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `offsite_backup` **(trunk-dev)** | Set `backup.offsite.s3.bucket`, or set `backup.offsite.allow_shared_bucket = true` if intentionally reusing the app `[storage.s3]` bucket |
 | `edge_target` **(trunk-dev)** | Run `rustup target add wasm32-wasip1` — the project has `#[edge]` routes, so `autumn build` needs that target to compile the edge capsule (passes with "no `#[edge]` routes" when the project has none) |
 | `deploy_host` **(trunk-dev)** | Set a deploy target in `autumn.toml`: `[deploy] host = "<address>"` (one server) **or** `[deploy] hosts = ["<a>", "<b>"]` (a fleet, in rollout order) — never both. Blank or duplicate `hosts` entries are refused (issue #1621) |
+| `plugin_residue` **(trunk-dev)** | Orphaned plugin wiring (issue #1631). Warns when a plugin is declared in `[dependencies]` but never mounted (`autumn plugin add <name>` finishes the install, `autumn plugin remove <name>` takes the dependency back — for a community `autumn-plugin-*` crate, add the `.plugin(...)` call from its README, since `add` never writes one). Fails when a plugin's fully-qualified type is mounted but the crate is not declared, which does not compile. Warns when migrations a plugin declares are still recorded as applied and the plugin is gone (`autumn plugin remove <name> --drop-data` reverts them); that last finding needs a configured database and the `diesel` CLI, and is skipped otherwise |
+| `platform_support` **(trunk-dev)** | Never fails — reports this platform's Windows support tier (issue #1616). On Windows its `detail` names the Tier 1 (native) and Tier 2 (WSL2) commands and the vcpkg/`VCPKG_ROOT` prerequisite for `generate auth --passkeys` |
 | `edge_routes` **(trunk-dev)** | Fails when an `#[edge]` handler also carries `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]`/`#[intercept]`: remove one of the two — edge routes are unauthenticated read-path routes served without origin middleware. Warns when a marked handler is missing from `edge_routes![]`, or when `src/bin/edge-capsule.rs` is absent |
+| `dependencies` **(trunk-dev)** | Dependency policy findings (issue #1633). Fix or waive in `deny.toml` — a waiver is an `[advisories] ignore` entry, the same store the CI gate reads. Never fails for a missing cargo-deny or advisory database: those **pass** with a `not evaluated` detail, since warning would make `autumn doctor --strict` exit 1 on every machine without an optional tool. Warns with no verdict when `deny.toml` is not valid TOML, or declares a section in a spelling the generated CI workflow's grep cannot see |
+
+## Platform support check (unreleased — trunk-dev, issue #1616)
+
+`autumn doctor` runs a `platform_support` check first, reporting the platform's
+Windows support tier. It **always passes** — the tier is information, not a
+defect, and a warning would make `autumn doctor --strict` exit 1 on every
+Windows machine. Read its `detail` rather than its status:
+
+- On Linux/macOS: "every autumn journey runs natively on this platform".
+- On Windows: the Tier 1 (native) commands, the Tier 2 (WSL2) commands, and the
+  Windows prerequisites — notably that `autumn generate auth --passkeys` needs
+  OpenSSL via `vcpkg` with `VCPKG_ROOT` set.
+
+When a user reports that `autumn deploy up` (or `rollback`/`status`/
+`maintenance`) or a `scripts/*.sh` gate fails on Windows, that is the
+**documented Tier 2 refusal, not a bug**: those reach a host over `ssh`, stage
+secrets with Unix file modes, or are bash. Tell them to run it from a WSL2
+shell. `autumn deploy check` and `autumn deploy plan` are the exception and
+Tier 1 — they are local-only, so a Windows developer can validate a deploy
+config natively before switching to WSL2 to run it.
+
+`autumn serve --daemon` / `stop` / `status` / `restart` left that set on
+trunk-dev (issue #1639) and now run **natively** on Windows, `--bundled-pg`
+included — a refusal there is a bug, not the policy. See
+`docs/guide/platform-support.md`.
+
+## Daemon and service readiness (unreleased — trunk-dev)
+
+`autumn doctor` runs a `daemon_service` check (issue #1639). Read its `detail`:
+it says whether a daemon is running for this project and on what endpoint,
+and — on Windows — whether an OS service is registered and its Service Control
+Manager state. It **warns** (never fails, so `--strict` still passes) when the
+service journey is missing a prerequisite, which in practice means the shell is
+not elevated enough to register or remove a service.
+
+A stopped daemon and an unregistered service are both normal: plenty of projects
+never want either. Do not read the check as a defect on that basis.
 
 ## Operator alert checks (unreleased — trunk-dev)
 
@@ -161,17 +201,61 @@ configuration:
 
 See issue #1852.
 
+## mTLS client-auth check (unreleased — trunk-dev, issue #1640)
+
+On trunk-dev, `autumn doctor` adds a `tls_client_auth` check that grades the
+`[server.tls.client_auth]` trust store offline — no server boot, no network:
+
+- **Pass** — the section is absent or `mode = "off"` (the listener requests no
+  client certificate), or the bundle loads with every CA comfortably in date.
+- **Warn** — a CA in the bundle expires within 30 days; the CRL's `nextUpdate`
+  has passed (autumn keeps honouring a stale list rather than failing every
+  handshake, so this is otherwise silent); `mode = "optional"` with no route in
+  `required_paths` (client auth configured and enforcing nothing); or the CLI
+  was built without the `tls` feature.
+- **Fail** — the CA bundle or CRL is missing, unparseable, or empty, a CA in
+  the bundle has expired, or `client_auth` is present but is not a table. These are the conditions the runtime refuses to boot
+  on, so a Fail here means the app will not start.
+
 ## ACME preflight checks (unreleased — trunk-dev, issue #1608)
 
 On trunk-dev, `autumn doctor --online` (alias `--preflight`) runs active network
 probes, gated behind the CLI `acme` feature:
 
-- `acme_ports` — grades reachability of `:80` (HTTP-01) and `:443`.
+- `acme_ports` — grades reachability of `:80` (HTTP-01) and `:443`. Under
+  DNS-01 an unreachable `:80` is only a **Warn**: the CA never connects to this
+  host, so all that is lost is the HTTP→HTTPS redirect (#1620).
 - `acme_dns` — grades whether the configured `[server.tls.acme]` domains resolve
   to this host (`Matches` = pass, `PartialMatch` = warn, `ResolvesElsewhere` =
-  fail).
+  fail). A `*.` entry is probed as the base domain it covers — a wildcard has no
+  address record of its own. Under DNS-01 a name that resolves elsewhere is a
+  **Pass**: the CA reads a TXT record rather than connecting to this host, so
+  fronting the app with a load balancer or CDN is the normal shape (#1620).
+- `acme_dns_propagation` — whether public DNS can answer for
+  `_acme-challenge.<domain>` at all. **Fail** on SERVFAIL/timeout: the CA reads
+  the challenge record from public DNS, so a broken delegation defeats a
+  correctly-written record. **Warn** on records left over from an interrupted
+  run (#1620).
 
-Offline stored-cert expiry is also graded. See issue #1858.
+Two checks are graded **offline**, so they run without `--online`:
+
+- `acme_stored_cert` — the cached leaf's expiry.
+- `acme_dns_credential` — the `[server.tls.acme.dns]` provider credential is
+  readable and carries the fields that provider needs, graded with the runtime's
+  own `validate_credential` so doctor and the server cannot disagree. **Fail**
+  when missing: without it every issuance and renewal fails, and nothing about
+  the running app reveals that until the certificate is expiring (#1620).
+- `acme_tenancy_domain` — `[tenancy] base_domain`'s subdomains are actually
+  covered by `[server.tls.acme] domains`. **Fail** otherwise: every tenant host
+  would serve a certificate name mismatch (#1620).
+- `acme_ca_root` — the configured `[server.tls.acme] ca_root_path`, validated
+  through the same `CertificateDer::from_pem_file` + `RootCertStore::add` pair
+  the runtime uses. Fails on a blank, unreadable, or unusable file (that state
+  can only produce failed orders); warns when the file is a bundle — only its
+  first certificate becomes a trust anchor — or when it is set alongside a
+  publicly-trusted Let's Encrypt directory.
+
+See issues #1858 and #1620.
 
 ## Deploy preflight checks (unreleased — trunk-dev, issues #1607/#1621)
 
@@ -220,10 +304,45 @@ non-zero on drift. See `docs/guide/fleet-deploys.md`.
 
 For an app whose resolved primary database is `sqlite://…`, `autumn doctor`
 adapts Postgres-specific checks: the `pg_dump`/`pg_restore` client-tools check
-reports informationally (those tools are not required for a SQLite app;
-SQLite backup/restore is tracked in #1909) rather than warning misleadingly. A
+reports informationally: those tools are not required for a SQLite app, whose
+`autumn db backup` / `restore` work on the data file in-process. A
 `sqlite://` URL is only accepted as the lone primary in a single-role,
 single-host topology (SQLite is single-writer / no read-replica role).
+
+## Dependency policy check (unreleased — trunk-dev, issue #1633)
+
+`autumn doctor` grades the app's lockfile against its own `deny.toml`, using the
+same auditor, policy file, waiver store and check list as the CI gate the
+scaffold generates — so a local verdict predicts the CI verdict.
+
+```
+❌ dependencies — 1 finding, 1 blocking — cargo-deny 0.20.2; checks: advisories; advisory data 0 days old
+   RUSTSEC-2020-0071 vulnerability (high) time 0.1.45 — Potential segfault in the time crate
+```
+
+Reading the status:
+
+- **fail** — a finding the policy denies. Severity is consequence, not
+  taxonomy: denied findings grade high or critical (a CVSS v3 base score
+  separates the two), warned findings grade low or medium.
+- **warn** — only warn-level findings (duplicate or yanked crates), stale
+  advisory data (over 7 days), or **no verdict**: a `deny.toml` that is not
+  valid TOML, a section spelling only doctor's parse can see, or an auditor
+  error the diagnostic parse could not account for.
+- **pass** — no live findings, *or* the policy was not evaluated because
+  cargo-deny is not installed or no advisory database is present. A pass whose
+  detail reads `not evaluated` is not a clean bill of health; read the detail.
+
+Waivers go in `deny.toml` as `[advisories] ignore` entries and are read by
+doctor, `autumn dev` and CI alike — there is no second waiver format. A waived
+finding shows as waived and never fails.
+
+Neither doctor nor `autumn dev` fetches the advisory database; both run
+`cargo deny --offline`. Tell a user reporting a stale-data warning to run
+`cargo deny fetch db`. Two parity differences with CI are reported rather than
+hidden: CI pins its cargo-deny version while a local run uses whatever is
+installed (doctor names the version it used), and CI fetches the database every
+run (doctor names its data age). See `docs/guide/supply-chain.md`.
 
 ## Secrets redaction
 

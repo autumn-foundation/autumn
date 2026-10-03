@@ -6,14 +6,21 @@
 //! `script-src 'self'` Content Security Policy. No CDN, no npm, no build step
 //! required.
 //!
-//! The framework automatically mounts a route handler that serves this
-//! file with immutable caching headers. Reference it in your HTML
-//! templates:
+//! The framework serves each script at two URLs: its plain path
+//! (`/static/js/htmx.min.js`, revalidated on every use) and a content-hashed
+//! path (`/static/js/htmx.min.<hash>.js`, cached `immutable` for a year).
+//! Reference them through [`asset_url`](crate::assets::asset_url), which
+//! returns the hashed form, so a framework upgrade that changes a script
+//! also changes its URL:
 //!
-//! ```html
-//! <script src="/static/js/htmx.min.js"></script>
-//! <script src="/static/js/autumn-htmx-csrf.js"></script>
+//! ```rust,ignore
+//! html! {
+//!     script src=(asset_url("js/htmx.min.js")) {}
+//!     script src=(asset_url("js/autumn-htmx-csrf.js")) {}
+//! }
 //! ```
+//!
+//! The plain paths keep working for templates that hard-code them.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -25,7 +32,8 @@ use std::convert::Infallible;
 ///
 /// This is the raw byte content of the minified htmx library. It is
 /// served automatically by the framework at `/static/js/htmx.min.js`
-/// with `Cache-Control: public, max-age=31536000, immutable`.
+/// (revalidated) and at the content-hashed URL `asset_url("js/htmx.min.js")`
+/// returns (cached `immutable`).
 pub const HTMX_JS: &[u8] = include_bytes!("../vendor/htmx.min.js");
 
 /// Same-origin path where Autumn serves embedded htmx.
@@ -41,7 +49,8 @@ pub const HTMX_SSE_JS_PATH: &str = "/static/js/sse.js";
 ///
 /// Provides CSP-compatible event-listener wiring for built-in widgets
 /// (autocomplete selection, min-length enforcement). Served automatically
-/// at [`AUTUMN_WIDGETS_JS_PATH`] with immutable cache headers.
+/// at [`AUTUMN_WIDGETS_JS_PATH`] and at the content-hashed URL
+/// `asset_url("js/autumn-widgets.js")` returns.
 ///
 /// Reference it once in your layout template:
 ///
@@ -65,7 +74,8 @@ pub const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 
 /// Idiomorph DOM-morphing library, embedded at compile time.
 ///
-/// Serves at [`IDIOMORPH_JS_PATH`] with immutable caching headers.
+/// Serves at [`IDIOMORPH_JS_PATH`] and at the content-hashed URL
+/// `asset_url("js/idiomorph.min.js")` returns.
 /// Enables `hx-swap="morph"` on htmx requests for smooth DOM updates.
 ///
 /// Reference in your layout:
@@ -96,6 +106,51 @@ pub const HTMX_CSRF_JS: &str = r#"(function () {
   });
 })();
 "#;
+
+/// The framework's own scripts as a fingerprinted bundle mounted at
+/// `/static/`, so each keeps its historical plain path and also gets a
+/// content-hashed one. Logical paths are relative to `/static/`.
+#[cfg(feature = "htmx")]
+pub(crate) static FRAMEWORK_SCRIPTS: crate::assets::PluginAssets =
+    crate::assets::PluginAssets::framework(&[
+        ("js/htmx.min.js", HTMX_JS),
+        ("js/sse.js", HTMX_SSE_JS),
+        ("js/autumn-widgets.js", AUTUMN_WIDGETS_JS),
+        ("js/autumn-htmx-csrf.js", HTMX_CSRF_JS.as_bytes()),
+        ("js/idiomorph.min.js", IDIOMORPH_JS),
+    ]);
+
+/// `true` when the framework serves `logical_path` itself. htmx is the one
+/// exception: once an app pins its own copy with `autumn assets add htmx@…`,
+/// `ServeDir` serves that file and the built-in one steps aside.
+#[cfg(feature = "htmx")]
+fn framework_serves(logical_path: &str) -> bool {
+    logical_path != "js/htmx.min.js" || !crate::assets::htmx_is_vendored()
+}
+
+/// The framework script at `logical_path` (relative to `/static/`), when the
+/// framework is serving it.
+#[cfg(feature = "htmx")]
+pub(crate) fn framework_script(logical_path: &str) -> Option<&'static crate::assets::PluginAsset> {
+    FRAMEWORK_SCRIPTS
+        .get(logical_path)
+        .filter(|asset| framework_serves(asset.logical_path()))
+}
+
+/// Every framework script the framework is serving.
+#[cfg(feature = "htmx")]
+pub(crate) fn framework_scripts() -> impl Iterator<Item = &'static crate::assets::PluginAsset> {
+    FRAMEWORK_SCRIPTS
+        .iter()
+        .filter(|asset| framework_serves(asset.logical_path()))
+}
+
+/// `true` when `rel_path` (relative to `/static/`) is the fingerprinted path
+/// of a framework script the framework is serving.
+#[cfg(feature = "htmx")]
+pub(crate) fn is_framework_script_fingerprint(rel_path: &str) -> bool {
+    framework_scripts().any(|asset| asset.url().strip_prefix("/static/") == Some(rel_path))
+}
 
 /// htmx version string for diagnostics and cache busting.
 ///

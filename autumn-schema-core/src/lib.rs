@@ -205,6 +205,27 @@ impl ColumnType {
         .to_owned()
     }
 
+    /// [`rust_type`](Self::rust_type) for `backend` (issue #1924).
+    ///
+    /// Mirrors `dsl::FieldKind::rust_type_for`. Postgres is byte-for-byte
+    /// [`rust_type`](Self::rust_type); on `SQLite`, [`Uuid`](Self::Uuid) and
+    /// [`Decimal`](Self::Decimal) render `autumn-web`'s `TEXT`-backed newtypes,
+    /// because `uuid::Uuid` and `rust_decimal::Decimal` are foreign to
+    /// `autumn-web` and diesel blanket-implements `AsExpression` for every
+    /// `Expression`, leaving no crate that could give them a `SQLite`
+    /// conversion.
+    #[must_use]
+    pub fn rust_type_for(&self, backend: Backend) -> String {
+        match backend {
+            Backend::Postgres => self.rust_type(),
+            Backend::Sqlite => match self {
+                Self::Uuid => "autumn_web::db::sqlite_types::SqliteUuid".to_owned(),
+                Self::Decimal { .. } => "autumn_web::db::sqlite_types::SqliteDecimal".to_owned(),
+                _ => self.rust_type(),
+            },
+        }
+    }
+
     /// The diesel `table!` schema type token for `backend`.
     ///
     /// Mirrors `dsl::FieldKind::schema_type_for`. On `SQLite` the Postgres-only
@@ -328,26 +349,22 @@ impl ColumnType {
     /// `FromSql`/`ToSql` on diesel's `SQLite` backend in a generated app's feature
     /// set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`).
     ///
-    /// Mirrors `dsl::FieldKind::sqlite_has_diesel_conversion`: `false` for
-    /// [`Uuid`](Self::Uuid), [`Decimal`](Self::Decimal), and [`Enum`](Self::Enum)
-    /// (still rejected at generate time on `SQLite`, issue #1924); `true` for
-    /// every other type — including [`Timestamp`](Self::Timestamp) via the core,
-    /// ungated diesel `Timestamp` sql-type, [`TimestampTz`](Self::TimestampTz)
-    /// via diesel's `SQLite` `TimestamptzSqlite`, and [`Attachment`](Self::Attachment)
-    /// via `autumn-web`'s local `Blob` `Text`/`Sqlite` conversion (all #1924),
-    /// and [`Json`](Self::Json) via diesel's own `FromSql`/`ToSql<Json,
-    /// Sqlite> for serde_json::Value` — no `autumn-web` code needed at all
-    /// (issue #1341).
+    /// Mirrors `dsl::FieldKind::sqlite_has_diesel_conversion`: `true` for every
+    /// mapped type as of issue #1924 — [`Timestamp`](Self::Timestamp) via the
+    /// core, ungated diesel `Timestamp` sql-type, [`TimestampTz`](Self::TimestampTz)
+    /// via diesel's `SQLite` `TimestamptzSqlite`, [`Attachment`](Self::Attachment)
+    /// via `autumn-web`'s local `Blob` `Text`/`Sqlite` conversion,
+    /// [`Uuid`](Self::Uuid) and [`Decimal`](Self::Decimal) via `autumn-web`'s
+    /// `TEXT`-backed newtypes (see [`ColumnType::rust_type_for`]),
+    /// [`Enum`](Self::Enum) via the app-local `Text`/`Sqlite` impls the model
+    /// generator emits, and [`Json`](Self::Json) via diesel's own
+    /// `FromSql`/`ToSql<Json, Sqlite> for serde_json::Value` (issue #1341).
+    ///
+    /// Only [`Opaque`](Self::Opaque) is `false`: it is introspection-only and
+    /// carries a raw Postgres type name with no known diesel conversion.
     #[must_use]
     pub const fn sqlite_has_diesel_conversion(&self) -> bool {
-        !matches!(
-            self,
-            Self::Uuid
-                | Self::Decimal { .. }
-                | Self::Enum { .. }
-                // Introspection-only: an opaque type has no known diesel conversion.
-                | Self::Opaque { .. }
-        )
+        !matches!(self, Self::Opaque { .. })
     }
 
     /// Inverse of the Postgres mapping: resolve a Postgres `udt_name` (the
@@ -493,6 +510,21 @@ impl ColumnType {
         }
     }
 
+    /// The leaf segment of a Rust type path as written in a model struct field —
+    /// the same leaf [`from_rust_type`](Self::from_rust_type) matches on:
+    /// `autumn_web::i18n::Translated` → `Translated`, `String` → `String`.
+    /// Surrounding whitespace is trimmed (so the spacing `quote!` introduces —
+    /// `autumn_web :: i18n :: Translated` — resolves like the compact
+    /// spelling); interior whitespace is left alone, matching a token as
+    /// written.
+    #[must_use]
+    pub fn rust_type_leaf(rust: &str) -> &str {
+        let trimmed = rust.trim();
+        trimmed
+            .rfind("::")
+            .map_or(trimmed, |idx| trimmed[idx + 2..].trim())
+    }
+
     /// Inverse of [`ColumnType::rust_type`]: resolve a Rust type token (as it
     /// would appear in a `#[model]` struct) back to a [`ColumnType`]. Intended
     /// for the slice-2 `syn`-backed parser, so it is **tolerant of leading path
@@ -555,22 +587,39 @@ impl ColumnType {
             .next()
             .unwrap_or(normalized.as_str());
         match leaf {
-            // `Translated` is a `#[translatable]` per-locale container (issue
-            // #1384): its storage is a plain `TEXT` column holding a JSON
-            // object, so the declarative lane manages it exactly like any other
-            // text column. Without it here the parser skips the column and the
-            // diff refuses to emit `CREATE TABLE` for the whole model.
-            "String" | "Translated" => Some(Self::Text),
+            // `Translated` is deliberately NOT matched here (issue #2292):
+            // the leaf alone cannot tell the framework's `#[translatable]`
+            // per-locale container (issue #1384) apart from an application
+            // type that happens to share the name (e.g. `domain::Translated`).
+            // The declarative parser maps a `Translated`-leafed field to
+            // `Text` only when the field carries the `#[translatable]` marker
+            // (keying on [`rust_type_leaf`](Self::rust_type_leaf) at the call
+            // site); an unmarked look-alike falls through to `None` below and
+            // is skipped with a diagnostic, exactly like any other unknown
+            // type.
+            // `CollabText` is a `#[collaborative]` CRDT document (issue #1806);
+            // like the marked `Translated` its storage is a plain `TEXT` column
+            // holding JSON, so the declarative lane manages it as a text column.
+            "String" | "CollabText" => Some(Self::Text),
             "i32" => Some(Self::Int32),
             "i64" => Some(Self::Int64),
             "bool" => Some(Self::Bool),
             "f32" => Some(Self::Float32),
             "f64" => Some(Self::Float64),
-            "Uuid" => Some(Self::Uuid),
+            // `SqliteUuid`/`SqliteDecimal` are the `TEXT`-backed newtypes a
+            // SQLite app's model renders instead of the foreign `uuid::Uuid` /
+            // `rust_decimal::Decimal` (issue #1924). They are the same column,
+            // so they must resolve to the same `ColumnType` — otherwise the
+            // declarative lane skips the column and every snapshot, diff and
+            // generated `CREATE TABLE` silently omits it.
+            "Uuid" | "SqliteUuid" => Some(Self::Uuid),
             "NaiveDateTime" => Some(Self::Timestamp),
             "Vec<u8>" => Some(Self::Bytes),
             "Blob" => Some(Self::Attachment),
-            "Decimal" => Some(Self::Decimal {
+            // The declared precision and scale do not survive into the Rust
+            // type on either backend, so both resolve to the same default the
+            // DSL's bare `decimal` token uses.
+            "Decimal" | "SqliteDecimal" => Some(Self::Decimal {
                 precision: 12,
                 scale: 2,
             }),
@@ -1155,13 +1204,12 @@ mod tests {
         assert_eq!(d.sql_type(Backend::Postgres), "NUMERIC(8,4)");
     }
 
+    /// Issue #1924 gave `Uuid`, `Decimal` and `Enum` working `SQLite`
+    /// conversions, so only the introspection-only `Opaque` lacks one.
     #[test]
     fn sqlite_diesel_conversion_flags() {
         for ct in all_column_types() {
-            let expected = !matches!(
-                ct,
-                ColumnType::Uuid | ColumnType::Decimal { .. } | ColumnType::Enum { .. }
-            );
+            let expected = !matches!(ct, ColumnType::Opaque { .. });
             assert_eq!(
                 ct.sqlite_has_diesel_conversion(),
                 expected,
@@ -1349,19 +1397,61 @@ mod tests {
         assert!(!ct.sqlite_has_diesel_conversion());
     }
 
+    /// The `SQLite` newtypes must resolve to the same `ColumnType` as the types
+    /// they wrap (issue #1924). Without this the declarative lane drops every
+    /// `Uuid`/`decimal` column of a `SQLite` app from its snapshots and diffs.
+    #[test]
+    fn from_rust_type_maps_the_sqlite_newtypes_like_the_types_they_wrap() {
+        for (wrapper, plain) in [
+            ("autumn_web::db::sqlite_types::SqliteUuid", "uuid::Uuid"),
+            (
+                "autumn_web::db::sqlite_types::SqliteDecimal",
+                "rust_decimal::Decimal",
+            ),
+        ] {
+            assert_eq!(
+                ColumnType::from_rust_type(wrapper),
+                ColumnType::from_rust_type(plain),
+                "`{wrapper}` must resolve like `{plain}`"
+            );
+            assert!(ColumnType::from_rust_type(wrapper).is_some());
+        }
+    }
+
+    #[test]
+    fn rust_type_leaf_takes_the_final_path_segment() {
+        assert_eq!(ColumnType::rust_type_leaf("String"), "String");
+        assert_eq!(
+            ColumnType::rust_type_leaf("autumn_web::i18n::Translated"),
+            "Translated"
+        );
+        // The spacing `quote!` introduces in the parser.
+        assert_eq!(
+            ColumnType::rust_type_leaf("autumn_web :: i18n :: Translated"),
+            "Translated"
+        );
+        assert_eq!(ColumnType::rust_type_leaf("::Translated"), "Translated");
+        assert_eq!(ColumnType::rust_type_leaf("  Translated  "), "Translated");
+        assert_eq!(
+            ColumnType::rust_type_leaf("Option<Translated>"),
+            "Option<Translated>"
+        );
+    }
+
     #[test]
     fn from_rust_type_happy_and_path_tolerant() {
         // Bare tokens.
         assert_eq!(ColumnType::from_rust_type("String"), Some(ColumnType::Text));
-        // #1384: a translatable container is TEXT storage, path-tolerant.
-        assert_eq!(
-            ColumnType::from_rust_type("Translated"),
-            Some(ColumnType::Text)
-        );
+        // #2292: `Translated` is keyed on the `#[translatable]` marker at the
+        // parser call site, NOT on the type name — the generic mapper stays
+        // unaware of it, so an application's look-alike `Translated` type is
+        // never claimed as framework storage.
+        assert_eq!(ColumnType::from_rust_type("Translated"), None);
         assert_eq!(
             ColumnType::from_rust_type("autumn_web::i18n::Translated"),
-            Some(ColumnType::Text)
+            None
         );
+        assert_eq!(ColumnType::from_rust_type("domain::Translated"), None);
         assert_eq!(ColumnType::from_rust_type("i32"), Some(ColumnType::Int32));
         assert_eq!(ColumnType::from_rust_type("i64"), Some(ColumnType::Int64));
         assert_eq!(ColumnType::from_rust_type("bool"), Some(ColumnType::Bool));

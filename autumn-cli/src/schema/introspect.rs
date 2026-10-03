@@ -25,6 +25,14 @@
 //!   minting a fresh owned `BIGSERIAL`. A single-column UUID PK keeps its
 //!   `gen_random_uuid()` default (the model parser records the same), so the two
 //!   agree. See [`normalize_default`] / [`normalize_serial_pk_default`].
+//! - **Redundant-cast canonicalization**: `pg_get_expr` renders a stored
+//!   literal default with its cast (`'{}'::text` on a `TEXT` column) while the
+//!   model parser records the bare literal (`'{}'`), so exact IR equality
+//!   would report drift forever. A cast to the column's *own* Postgres type on
+//!   a *literal* is never load-bearing and is stripped during
+//!   [`normalize_default`], establishing one canonical form; a cast to a
+//!   different type, a cast carrying a typmod, or a cast over a non-literal
+//!   expression stays verbatim. See [`strip_redundant_default_cast`].
 //! - **Uniqueness**: a single-column unique index sets the owning column's
 //!   `unique` flag *and* is recorded as an [`Index`] (`unique = true`), mirroring
 //!   how the model parser represents a `#[unique]` field, so a round-trip diff is
@@ -492,33 +500,31 @@ fn fetch_columns(
     conn: &mut PgConnection,
     tables: &[String],
 ) -> Result<BTreeMap<String, Vec<ColumnRow>>, IntrospectError> {
-    // `numeric_precision` / `numeric_scale` / `character_maximum_length` are the
-    // `information_schema` `cardinal_number` domain, not a plain `int4`. Decoding
-    // that domain as diesel `Nullable<Integer>` on the wire is unproven (no sibling
-    // query reads them), and if it does not present as `int4` the whole column query
-    // would error and every pull would fail. Cast each to a plain `integer` in SQL so
-    // the output type is guaranteed `int4` regardless of the domain. The `AS <name>`
-    // aliases keep the result column names aligned with the `ColumnRow` field bindings.
+    // `numeric_precision`, `numeric_scale`, and `character_maximum_length` are the
+    // `information_schema` `cardinal_number` domain, not a plain `int4`. Decoding that
+    // domain as diesel `Nullable<Integer>` on the wire is unproven — no sibling query
+    // reads them — and if it does not present as `int4` the whole column query would error
+    // and every pull would fail. Cast each to a plain `integer` in SQL, so the output type
+    // is guaranteed `int4` whatever the domain. The `AS <name>` aliases keep the result
+    // column names aligned with the `ColumnRow` field bindings.
     //
-    // `owns_sequence` is an `EXISTS` over `pg_depend` that is `true` only when the
-    // column OWNS the SAME sequence its `nextval(...)` default allocates from — the
-    // conventional `SERIAL`/`BIGSERIAL` shape. It ties TWO dependencies to one
-    // sequence:
+    // `owns_sequence` is an `EXISTS` over `pg_depend` that is true only when the column
+    // owns the same sequence its `nextval(...)` default allocates from — the conventional
+    // `SERIAL`/`BIGSERIAL` shape. It ties two dependencies to one sequence:
     //   * OWNED BY (`deptype = 'a'`): a `pg_depend` row linking a sequence
-    //     (`pg_class.relkind = 'S'`, as `objid`) to this exact column
-    //     (`refobjid = <table oid>`, `refobjsubid = <column attnum>`).
-    //   * used-by-default (`deptype = 'n'`): a `pg_depend` row from the column's
-    //     default expression (`pg_attrdef`, `classid = 'pg_attrdef'::regclass`) to
-    //     that SAME sequence (`refobjid = seq.oid`).
-    // Requiring BOTH on the same sequence closes the brownfield hole where a column
-    // still owns an old sequence (`t_id_seq`, `deptype = 'a'`) but its default was
-    // repointed to a different one (`DEFAULT nextval('global_ids')`): the used-by
-    // dependency then targets `global_ids`, not the owned `t_id_seq`, so `EXISTS` is
-    // `false`, the raw `nextval('global_ids')` default is preserved verbatim (never
-    // stripped to a fresh owned `BIGSERIAL`), and the column classifies as
-    // `Some(Plain)`. A plain shared/custom-sequence PK (owns nothing) likewise has no
-    // `deptype = 'a'` row → `false` → preserved. `pg_depend`/`pg_attrdef` exist in
-    // every supported Postgres, so this never breaks older servers.
+    //     (`pg_class.relkind = 'S'`, as `objid`) to this exact column (`refobjid = <table
+    //     oid>`, `refobjsubid = <column attnum>`).
+    //   * used-by-default (`deptype = 'n'`): a `pg_depend` row from the column's default
+    //     expression (`pg_attrdef`, `classid = 'pg_attrdef'::regclass`) to that same
+    //     sequence (`refobjid = seq.oid`).
+    // Requiring both on the same sequence closes the brownfield hole where a column still
+    // owns an old sequence (`t_id_seq`, `deptype = 'a'`) but its default was repointed to
+    // another (`DEFAULT nextval('global_ids')`): the used-by dependency then targets
+    // `global_ids`, not the owned `t_id_seq`, so `EXISTS` is false, the raw
+    // `nextval('global_ids')` default is preserved verbatim rather than stripped to a
+    // fresh owned `BIGSERIAL`, and the column classifies as `Some(Plain)`. A plain shared
+    // or custom-sequence PK owns nothing and likewise has no `deptype = 'a'` row.
+    // `pg_depend` and `pg_attrdef` exist in every supported Postgres.
     let query = format!(
         "SELECT c.table_name, c.column_name, c.udt_name, c.is_nullable, c.column_default, \
          c.numeric_precision::integer AS numeric_precision, \
@@ -864,15 +870,14 @@ fn build_table(
         .collect();
 
     for row in columns {
-        // Fail-closed floor for Postgres DOMAIN columns: when the column is typed
-        // on a domain (`CREATE DOMAIN email_dom AS text CHECK (…)`),
-        // `information_schema` reports the base type in `udt_name` (`text`) while
-        // naming the domain in `domain_name`. Flattening to the base type would
-        // silently drop the domain's identity and validation on recreation, so
-        // preserve the domain verbatim as `Opaque` (schema-qualified when not in
-        // `public`). `Opaque`'s `sql_type` emits `pg_type` unchanged, so the down
-        // migration re-references the still-existing domain type. A non-domain
-        // column (`domain_name` NULL) maps exactly as before.
+        // Fail-closed floor for Postgres DOMAIN columns. When a column is typed on a
+        // domain (`CREATE DOMAIN email_dom AS text CHECK (…)`), `information_schema`
+        // reports the base type in `udt_name` (`text`) while naming the domain in
+        // `domain_name`. Flattening to the base type would silently drop the domain's
+        // identity and validation on recreation, so preserve the domain verbatim as
+        // `Opaque`, schema-qualified when not in `public`. `Opaque`'s `sql_type` emits
+        // `pg_type` unchanged, so the down migration re-references the still-existing
+        // domain type. A non-domain column, with `domain_name` NULL, maps as before.
         let ty = row.domain_name.as_ref().map_or_else(
             || {
                 ColumnType::from_pg_introspection(
@@ -1010,23 +1015,23 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
             .filter(|c| !c.is_empty())
             .map(str::to_owned)
             .collect();
-        // "Simple" == a single representable column set (not partial, not an
-        // expression, and NOT a covering `INCLUDE` index — whose key/INCLUDE
-        // columns are indistinguishable in the `indkey`-derived list). A
-        // single-column simple unique index sets the owning column's `unique`
-        // flag whether or not it backs a constraint (the flag is accurate either
-        // way and is never diffed). A covering `INCLUDE` unique index is NOT
-        // simple, so it never sets that flag (its uniqueness scope is only its
-        // key columns) and is retained verbatim via its `definition`.
-        // A PG15+ `NULLS NOT DISTINCT` unique index enforces STRICTER uniqueness
-        // than a plain (nulls-distinct) unique index, and the model DSL cannot
-        // express it. `pg_get_indexdef` (version-safe on every supported Postgres —
-        // it never emits the clause on PG13/14) renders the `NULLS NOT DISTINCT`
-        // clause into the `definition` text; detecting it there (rather than via the
-        // PG15-only `pg_index.indnullsnotdistinct` catalog column, which would break
-        // introspection on PG13/14) forces the index to be retained VERBATIM via its
-        // `definition` so the clause round-trips, instead of collapsing to an
-        // ordinary unique index that would silently drop it.
+        // "Simple" means a single representable column set: not partial, not an
+        // expression, and not a covering `INCLUDE` index, whose key and INCLUDE columns
+        // are indistinguishable in the `indkey`-derived list. A single-column simple
+        // unique index sets the owning column's `unique` flag whether or not it backs a
+        // constraint — the flag is accurate either way and is never diffed. A covering
+        // `INCLUDE` unique index is not simple, so it never sets that flag, since its
+        // uniqueness scope is only its key columns, and is retained verbatim via its
+        // `definition`.
+        //
+        // A PG15+ `NULLS NOT DISTINCT` unique index enforces stricter uniqueness than a
+        // plain nulls-distinct one, and the model DSL cannot express it.
+        // `pg_get_indexdef` — version-safe on every supported Postgres, never emitting the
+        // clause on PG13/14 — renders `NULLS NOT DISTINCT` into the `definition` text.
+        // Detecting it there, rather than via the PG15-only
+        // `pg_index.indnullsnotdistinct` catalog column that would break introspection on
+        // PG13/14, forces the index to be retained verbatim so the clause round-trips
+        // instead of collapsing to an ordinary unique index that silently drops it.
         let nulls_not_distinct = row
             .definition
             .to_ascii_uppercase()
@@ -1036,19 +1041,17 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
         if simple && row.is_unique && key_columns.len() == 1 {
             unique_columns.insert(key_columns[0].clone());
         }
-        // Retain (preserve verbatim, never drop) any index the model DSL cannot
-        // express: an expression, partial, or covering `INCLUDE` index, OR a
-        // constraint-owned index (UNIQUE/EXCLUDE) whose backing constraint
-        // Postgres won't let us drop. A plain, non-constraint index keeps
-        // `definition: None` so its JSON is unchanged and the model round-trip
-        // stays clean.
+        // Retain — preserve verbatim, never drop — any index the model DSL cannot
+        // express: an expression, partial, or covering `INCLUDE` index, or a
+        // constraint-owned index (UNIQUE/EXCLUDE) whose backing constraint Postgres will
+        // not let us drop. A plain, non-constraint index keeps `definition: None`, so its
+        // JSON is unchanged and the model round-trip stays clean.
         //
-        // For a SIMPLE index `Index.columns` stays the ordered key columns (exact
-        // round-trip parity; the `pg_depend` set equals the key columns anyway).
-        // For a DEFINITION-carrying index (expression / partial / constraint-owned),
-        // `Index.columns` is the exact `pg_depend` dependent-column set — key,
-        // expression-referenced, AND predicate columns — the set the diff engine
-        // uses for exact cascade/dependency detection (no string scan).
+        // For a simple index, `Index.columns` stays the ordered key columns — exact
+        // round-trip parity, and the `pg_depend` set equals the key columns anyway. For a
+        // definition-carrying index, `Index.columns` is the exact `pg_depend`
+        // dependent-column set: key, expression-referenced, and predicate columns, the set
+        // the diff engine uses for cascade and dependency detection without a string scan.
         let (columns, definition, key_cols) = if simple && !row.is_constraint {
             // A plain simple index's key columns ARE its `columns`, so recording
             // `key_columns` separately would be redundant JSON noise — leave it empty
@@ -1062,16 +1065,15 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
                 .map(str::to_owned)
                 .collect();
             if row.is_constraint && row.constraint_type == "x" {
-                // An EXCLUDE constraint (`pg_constraint.contype = 'x'`) is backed by
-                // an index, but the backing `CREATE INDEX` (pg_get_indexdef) alone
-                // does NOT enforce the exclusion — recreating only the plain index on
-                // rollback would silently allow overlapping rows (a data-integrity
-                // loss). Retain the REAL constraint instead: `pg_get_constraintdef`
-                // yields `EXCLUDE USING <method> (…)`, which the `ALTER TABLE … ADD
-                // CONSTRAINT <name> …` form wraps into a valid, exclusion-enforcing
-                // statement (`index_sql` emits `definition` verbatim). The table is
-                // referenced by its bare name, matching the rest of the emitter
-                // (`index_sql`'s plain branch / `CREATE TABLE`). `key_columns` is left
+                // An EXCLUDE constraint (`pg_constraint.contype = 'x'`) is backed by an
+                // index, but the backing `CREATE INDEX` from `pg_get_indexdef` does not
+                // enforce the exclusion: recreating only the plain index on rollback
+                // would silently allow overlapping rows, a data-integrity loss. Retain
+                // the real constraint instead — `pg_get_constraintdef` yields `EXCLUDE
+                // USING <method> (…)`, which the `ALTER TABLE … ADD CONSTRAINT <name> …`
+                // form wraps into a valid, exclusion-enforcing statement, since
+                // `index_sql` emits `definition` verbatim. The table is referenced by its
+                // bare name, matching the rest of the emitter. `key_columns` is left
                 // empty: an EXCLUDE index is not `unique`, so it never participates in
                 // the model `#[unique]` coverage check.
                 let definition = format!(
@@ -1107,6 +1109,131 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
     (indexes, unique_columns)
 }
 
+/// Strip a redundant `::type` cast from a literal column default when the cast
+/// names the column's own Postgres type (issue #2292).
+///
+/// `pg_get_expr` renders a stored literal default with its cast, so a
+/// `DEFAULT '{}'` on a `TEXT` column introspects as `'{}'::text` while the
+/// model parser records the bare literal `'{}'` — and exact equality in
+/// `diff_column` then reports drift forever, emitting a no-op `ALTER COLUMN`
+/// on every plan. A cast to the column's *own* type on a *literal* is never
+/// load-bearing (the literal's value is unchanged), so it is stripped here —
+/// establishing one canonical form inside [`normalize_default`] instead of
+/// spreading cast-awareness across every `Column.default` consumer (the DDL
+/// emitter, `is_convention_uuid_default`, `is_nextval_default`).
+///
+/// Only `<literal>::<type>` is touched, where the literal is a single-quoted
+/// string (with `''` escapes) or a bare numeric literal and the cast names one
+/// of the column's own Postgres type spellings. Everything else stays
+/// verbatim: a cast to a *different* type (`'{}'::integer` on a `TEXT` column),
+/// a cast carrying a typmod (`'abc'::character(3)` — the cast truncates, so it
+/// is load-bearing), and any cast over a non-literal expression
+/// (`nextval('s'::regclass)`, `now()`, …).
+fn strip_redundant_default_cast<'a>(raw: &'a str, ty: &ColumnType) -> &'a str {
+    let trimmed = raw.trim();
+    let Some((literal, cast_target)) = split_literal_cast(trimmed) else {
+        return raw;
+    };
+    if is_own_pg_type(cast_target, ty) {
+        literal
+    } else {
+        raw
+    }
+}
+
+/// Split `<literal>::<type>` into the literal and the cast target, or `None`
+/// when `raw` is not exactly one literal followed by one cast.
+fn split_literal_cast(raw: &str) -> Option<(&str, &str)> {
+    let (literal, rest) = if raw.starts_with('\'') {
+        // Quoted literal: find the closing quote, honoring `''` escapes.
+        let mut i = 1; // byte index into `raw`, past the opening quote
+        let end = loop {
+            let rel = raw[i..].find('\'')?;
+            let q = i + rel;
+            if raw[q + 1..].starts_with('\'') {
+                i = q + 2; // escaped quote — keep scanning
+            } else {
+                break q + 1; // just past the closing quote
+            }
+        };
+        raw.split_at(end)
+    } else {
+        // Bare numeric literal: optional sign, digits, optional fraction.
+        let bytes = raw.as_bytes();
+        let mut i = 0;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let int_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == int_start {
+            return None;
+        }
+        if i < bytes.len() && bytes[i] == b'.' {
+            let dot = i;
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == dot + 1 {
+                return None; // `123.` — not a literal we canonicalize
+            }
+        }
+        raw.split_at(i)
+    };
+    let target = rest.trim_start().strip_prefix("::")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some((literal, target))
+}
+
+/// Whether a `::type` cast target (as `pg_get_expr` renders it) names the
+/// column's own Postgres type. Compared case-insensitively; an optional
+/// `pg_catalog.` qualification is tolerated. A target carrying a typmod
+/// (`character(3)`) never matches — the cast can change the value.
+fn is_own_pg_type(target: &str, ty: &ColumnType) -> bool {
+    // Tolerate an optional `pg_catalog.` qualification, case-insensitively —
+    // compare everything lowercased from here on.
+    let lowered = target.to_ascii_lowercase();
+    let target = lowered
+        .strip_prefix("pg_catalog.")
+        .unwrap_or(lowered.as_str());
+    if target.contains('(') {
+        return false;
+    }
+    // The IR does not distinguish `TEXT` from the `VARCHAR` family (see
+    // `is_implicit_pg_type_cast` in `diff.rs`), so the family's spellings all
+    // count as the column's own type here.
+    let names: &[&str] = match ty {
+        ColumnType::Text | ColumnType::Enum { .. } => {
+            &["text", "character varying", "varchar", "character", "char"]
+        }
+        ColumnType::Int32 => &["integer", "int", "int4"],
+        ColumnType::Int64 => &["bigint", "int8"],
+        ColumnType::Bool => &["boolean", "bool"],
+        ColumnType::Float32 => &["real", "float4"],
+        ColumnType::Float64 => &["double precision", "float8"],
+        ColumnType::Uuid => &["uuid"],
+        ColumnType::Timestamp => &["timestamp", "timestamp without time zone"],
+        ColumnType::TimestampTz => &["timestamp with time zone", "timestamptz"],
+        ColumnType::Bytes => &["bytea"],
+        ColumnType::Attachment | ColumnType::Json => &["jsonb"],
+        ColumnType::Decimal { .. } => &["numeric", "decimal"],
+        ColumnType::Opaque { .. } => &[],
+    };
+    if names.contains(&target) {
+        return true;
+    }
+    // An opaque column's own type is whatever Postgres reported for it.
+    if let ColumnType::Opaque { pg_type } = ty {
+        return target == pg_type.to_ascii_lowercase();
+    }
+    false
+}
+
 /// Normalize a raw Postgres `column_default` string into a [`ColumnDefault`],
 /// matching what the model IR records so a round-trip diff is empty.
 ///
@@ -1121,6 +1248,13 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
 ///   column (`owns_sequence == false`) → preserved verbatim as
 ///   [`ColumnDefault::Sql`], so recreation continues to allocate from that
 ///   sequence instead of minting a fresh owned `BIGSERIAL`.
+/// - a redundant `::type` cast on a literal default (`'{}'::text` on a `TEXT`
+///   column, `123::integer` on an `INTEGER` column) → the cast is stripped when
+///   it names the column's own Postgres type, so the introspected IR agrees
+///   with the model parser's bare literal instead of drifting forever (issue
+///   #2292; see [`strip_redundant_default_cast`]). A cast to a *different*
+///   type, a cast carrying a typmod, or a cast over a non-literal expression
+///   stays verbatim.
 /// - anything else → [`ColumnDefault::Sql`] verbatim (e.g. a UUID PK's
 ///   `gen_random_uuid()`, which the model parser records identically).
 fn normalize_default(
@@ -1145,7 +1279,14 @@ fn normalize_default(
     if normalize_serial_pk_default(&lowered, ty, is_primary_key, primary_key, owns_sequence) {
         return None;
     }
-    Some(ColumnDefault::Sql(raw.to_owned()))
+    // A redundant `::type` cast on a literal default (`'{}'::text` on a TEXT
+    // column) is stripped when the cast names the column's own type, so the
+    // introspected IR agrees with the model parser's bare literal (issue
+    // #2292). Anything load-bearing stays verbatim — see
+    // [`strip_redundant_default_cast`].
+    Some(ColumnDefault::Sql(
+        strip_redundant_default_cast(raw, ty).to_owned(),
+    ))
 }
 
 /// Whether a raw (lower-cased) default is the auto-increment sequence default of
@@ -2645,6 +2786,138 @@ mod tests {
             false,
         );
         assert_eq!(ct, Some(ColumnDefault::Now));
+    }
+
+    /// #2292: `pg_get_expr` renders a stored `'{}'` default on a `TEXT` column
+    /// as `'{}'::text` while the model parser records the bare literal — the
+    /// redundant own-type cast must be stripped so the round-trip diff is
+    /// empty instead of emitting a no-op `ALTER COLUMN` forever.
+    #[test]
+    fn normalize_default_strips_redundant_own_type_cast_on_literals() {
+        let norm = |raw: &str, ty: &ColumnType| normalize_default(Some(raw), ty, false, &[], false);
+        assert_eq!(
+            norm("'{}'::text", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'{}'".to_owned()))
+        );
+        // A hand-written non-translatable text default round-trips the same
+        // way — the fix is the general one, not translatable-specific.
+        assert_eq!(
+            norm("'draft'::text", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'draft'".to_owned()))
+        );
+        // The `VARCHAR`-family spellings count as a TEXT column's own type
+        // (the IR does not distinguish TEXT from VARCHAR).
+        assert_eq!(
+            norm("'draft'::character varying", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'draft'".to_owned()))
+        );
+        // A bare numeric literal on its own integer type.
+        assert_eq!(
+            norm("42::integer", &ColumnType::Int32),
+            Some(ColumnDefault::Sql("42".to_owned()))
+        );
+        assert_eq!(
+            norm("-1.5::double precision", &ColumnType::Float64),
+            Some(ColumnDefault::Sql("-1.5".to_owned()))
+        );
+        // Case-insensitive, with a `pg_catalog.` qualification tolerated.
+        assert_eq!(
+            norm("'{}'::PG_CATALOG.TEXT", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'{}'".to_owned()))
+        );
+        // Escaped quotes inside the literal are honored, not mistaken for the
+        // closing quote.
+        assert_eq!(
+            norm("'it''s'::text", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'it''s'".to_owned()))
+        );
+    }
+
+    /// #2292: anything load-bearing stays verbatim — a cast to a *different*
+    /// type than the column's, a cast carrying a typmod (which can change the
+    /// value), or a cast over a non-literal expression.
+    #[test]
+    fn normalize_default_preserves_load_bearing_casts_verbatim() {
+        let norm = |raw: &str, ty: &ColumnType| normalize_default(Some(raw), ty, false, &[], false);
+        // A cast to a different type than the column's.
+        assert_eq!(
+            norm("'{}'::integer", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'{}'::integer".to_owned()))
+        );
+        assert_eq!(
+            norm("'{}'::text", &ColumnType::Int32),
+            Some(ColumnDefault::Sql("'{}'::text".to_owned()))
+        );
+        // A cast carrying a typmod can change the value (`character(3)`
+        // truncates) — never stripped.
+        assert_eq!(
+            norm("'abcdef'::character(3)", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'abcdef'::character(3)".to_owned()))
+        );
+        // A cast over a non-literal expression is not a literal cast at all.
+        assert_eq!(
+            norm("nextval('posts_id_seq'::regclass)", &ColumnType::Int64),
+            Some(ColumnDefault::Sql(
+                "nextval('posts_id_seq'::regclass)".to_owned()
+            ))
+        );
+        // Not a literal at all — the `Now` recovery is unaffected.
+        assert_eq!(
+            norm("now()", &ColumnType::Timestamp),
+            Some(ColumnDefault::Now)
+        );
+        // A bare literal with no cast passes through untouched.
+        assert_eq!(
+            norm("'{}'", &ColumnType::Text),
+            Some(ColumnDefault::Sql("'{}'".to_owned()))
+        );
+    }
+
+    /// #2292: the full round-trip — a `#[translatable]` column parsed from a
+    /// model, introspected back from Postgres (`pg_get_expr` renders the stored
+    /// `'{}'` default as `'{}'::text`), and diffed — must produce an empty
+    /// plan: no perpetual `SetDefault`.
+    #[test]
+    fn translatable_column_round_trips_without_set_default() {
+        use crate::schema::diff::{DiffOptions, diff_schema};
+        use crate::schema::parse::parse_model_source;
+
+        let src = r"
+            #[autumn_web::model]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[translatable]
+                pub title: autumn_web::i18n::Translated,
+            }
+        ";
+        let desired = parse_model_source(src, Backend::Postgres).expect("parse");
+
+        // Simulate the introspected baseline: the DB stores `DEFAULT '{}'`,
+        // which `pg_get_expr` renders with the cast.
+        let mut baseline = desired.tables.clone();
+        for table in &mut baseline {
+            for column in &mut table.columns {
+                if column.name == "title" {
+                    column.default =
+                        normalize_default(Some("'{}'::text"), &column.ty, false, &[], false);
+                }
+            }
+        }
+
+        let plan = diff_schema(
+            &baseline,
+            &desired,
+            DiffOptions {
+                allow_destructive: false,
+                definitions_authoritative: false,
+            },
+        );
+        assert!(
+            plan.is_empty(),
+            "translatable round-trip must be drift-free, got: {:?}",
+            plan.changes
+        );
     }
 
     #[test]

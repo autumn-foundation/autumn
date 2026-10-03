@@ -29,16 +29,10 @@ pub struct SelectSpec {
     pub values: Vec<String>,
 }
 
-/// Parse `--select` tokens of the form `field=val1,val2,...` or `field`.
-///
-/// The bare `field` form (no `=`) emits a `Select(vec![])` placeholder so the
-/// user can fill in options without editing generated internals.
-///
-/// # Errors
-/// Returns [`GenerateError::InvalidField`] if the token is blank.
-pub fn parse_select_specs(tokens: &[String]) -> Result<Vec<SelectSpec>, GenerateError> {
-    let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
+impl std::str::FromStr for SelectSpec {
+    type Err = GenerateError;
+
+    fn from_str(token: &str) -> Result<Self, Self::Err> {
         let (field, values) = match token.split_once('=') {
             Some((f, v)) => (
                 f.trim().to_owned(),
@@ -51,13 +45,23 @@ pub fn parse_select_specs(tokens: &[String]) -> Result<Vec<SelectSpec>, Generate
         };
         if field.is_empty() {
             return Err(GenerateError::InvalidField {
-                token: token.clone(),
+                token: token.to_owned(),
                 reason: "field name is empty in --select spec".into(),
             });
         }
-        out.push(SelectSpec { field, values });
+        Ok(Self { field, values })
     }
-    Ok(out)
+}
+
+/// Parse `--select` tokens of the form `field=val1,val2,...` or `field`.
+///
+/// The bare `field` form (no `=`) emits a `Select(vec![])` placeholder so the
+/// user can fill in options without editing generated internals.
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] if the token is blank.
+pub fn parse_select_specs(tokens: &[String]) -> Result<Vec<SelectSpec>, GenerateError> {
+    tokens.iter().map(|t| t.parse()).collect()
 }
 
 /// Options specific to `autumn generate admin`.
@@ -90,6 +94,11 @@ pub struct AdminOptions {
     /// per mode. Every other path routes through `serialize_as` and never needs
     /// to know (issue #1340).
     pub encrypted_deterministic: Vec<String>,
+    /// The plan is for `autumn destroy admin`, not `generate`. The
+    /// model-AST `#[translatable]` refusal (#2291) guards what a generated
+    /// admin would do at runtime, so it must not stop the removal of an admin
+    /// generated before the field became `#[translatable]`.
+    pub for_destroy: bool,
 }
 
 /// The generated statement that back-fills absent encrypted keys before the
@@ -227,7 +236,20 @@ pub fn plan_admin_with_options(
     options.encrypted_deterministic.extend(det_deterministic);
 
     let fields = parse_fields(field_tokens)?;
-    reject_translatable_fields(&fields)?;
+    // Issue #2291: the MODEL is the source of truth for whether a column is a
+    // per-locale container — `#[translatable]` is what makes `Translated`
+    // refuse the bare string the admin's text control produces. Detect it from
+    // the model AST (mirroring `detect_encrypted_fields` above) and refuse any
+    // submitted field bound to one, no matter how the DSL token is spelled.
+    //
+    // Generation only: destroying an admin generated before the field became
+    // `#[translatable]` must still be able to reach `Plan::revert`.
+    let model_translatable = if options.for_destroy {
+        Vec::new()
+    } else {
+        detect_translatable_fields(&model_source, &pascal_name)
+    };
+    reject_translatable_fields(&fields, &model_translatable)?;
     // Issue #1340: the MODEL is the only source of truth for whether a column is
     // encrypted at rest — `#[encrypted]` is what puts the `serialize_as` wrapper
     // on the insert/update path. A `{encrypted}` DSL token here declares the same
@@ -338,9 +360,17 @@ pub fn plan_admin_with_options(
 /// would fail validation on a required field, and a value that *did* decode
 /// would wipe every other language. Editing translated content needs a
 /// per-locale editor, which is translation-workflow UI and out of scope here.
-fn reject_translatable_fields(fields: &[Field]) -> Result<(), GenerateError> {
+///
+/// The refusal keys off BOTH the DSL token and the model AST (issue #2291):
+/// a submitted field whose backing model field is `#[translatable]` is
+/// refused no matter how the token is spelled — the model is the source of
+/// truth, mirroring the `#[encrypted]` handling from #1340.
+fn reject_translatable_fields(
+    fields: &[Field],
+    model_translatable: &[String],
+) -> Result<(), GenerateError> {
     let Some(field) = fields.iter().find(|f| f.is_translatable()) else {
-        return Ok(());
+        return reject_model_translatable_fields(fields, model_translatable);
     };
     Err(GenerateError::Config(format!(
         "a `{{translatable}}` field (`{}`) is not supported by `generate admin`: the generated \
@@ -349,6 +379,32 @@ fn reject_translatable_fields(fields: &[Field]) -> Result<(), GenerateError> {
          did decode would replace every other locale. Leave the column out of the admin field \
          list, or write a per-locale editor: `record.available_locales(\"{}\")` and \
          `record.set_{}(locale, value)` are generated for you.",
+        field.name, field.name, field.name
+    )))
+}
+
+/// Refuse a submitted field bound to a `#[translatable]` model field (issue
+/// #2291), even when the DSL token carries no `{translatable}` marker. Same
+/// hazard as the token-based refusal above; the only difference is where the
+/// marker was found.
+fn reject_model_translatable_fields(
+    fields: &[Field],
+    model_translatable: &[String],
+) -> Result<(), GenerateError> {
+    let Some(field) = fields
+        .iter()
+        .find(|f| model_translatable.iter().any(|t| t == &f.name))
+    else {
+        return Ok(());
+    };
+    Err(GenerateError::Config(format!(
+        "field `{}` is `#[translatable]` on the model, and `generate admin` does not support \
+         translatable columns: the generated admin binds one plain text control to the whole \
+         per-locale container, and `Translated` refuses a bare string — so create and update \
+         would fail validation, and a value that did decode would replace every other locale. \
+         Leave the column out of the admin field list, or write a per-locale editor: \
+         `record.available_locales(\"{}\")` and `record.set_{}(locale, value)` are generated \
+         for you.",
         field.name, field.name, field.name
     )))
 }
@@ -505,6 +561,43 @@ fn detect_encrypted_fields(
         }
     }
     (redacted, visible, deterministic)
+}
+
+/// Detect `#[translatable]` fields from the model AST (issue #2291).
+///
+/// Mirrors [`detect_encrypted_fields`]: the marker's last path segment is the
+/// spelling that matters, so a bare `#[translatable]` and a qualified
+/// `#[autumn_web::translatable]` both match. A field that carries the marker
+/// must be refused by `generate admin` no matter how its DSL token is spelled
+/// — see [`reject_translatable_fields`].
+fn detect_translatable_fields(model_source: &str, pascal_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(parsed) = syn::parse_file(model_source) else {
+        return out;
+    };
+    for item in parsed.items {
+        let syn::Item::Struct(item_struct) = item else {
+            continue;
+        };
+        if item_struct.ident != pascal_name {
+            continue;
+        }
+        let syn::Fields::Named(fields) = item_struct.fields else {
+            continue;
+        };
+        for field in fields.named {
+            let carries_marker = field.attrs.iter().any(|attr| {
+                attr.path()
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "translatable")
+            });
+            if carries_marker && let Some(name) = field.ident.as_ref().map(ToString::to_string) {
+                out.push(name);
+            }
+        }
+    }
+    out
 }
 
 // ── Field metadata derivation ────────────────────────────────────────────────
@@ -851,6 +944,54 @@ impl AdminModel for {pascal_name}Admin {{
             }}
             Ok(())
         }})
+    }}
+
+    fn execute_action(
+        &self,
+        pool: &Pool<AsyncPgConnection>,
+        action: &str,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'_, u64> {{
+        // `{pascal_name}Admin` never declares soft delete
+        // (`supports_soft_delete()` is the trait default, `false`), so
+        // `actions()` (autumn-admin-plugin's `traits.rs`) only ever offers
+        // `"delete"` -- the admin UI can't reach `"restore"` or `"purge"` for
+        // this model. Only `"delete"` needs the batched fast path below;
+        // `"restore"`, `"purge"`, and any other action name fall through to
+        // the shared `dispatch_restore_purge_or_unhandled` helper, which
+        // gives a direct or out-of-band call the same "does not support soft
+        // delete" (or "unhandled action") error the trait default always did.
+        if action == "delete" {{
+            let pool = pool.clone();
+            return Box::pin(async move {{
+                // One round trip for the whole selection instead of the
+                // trait default's one-`DELETE`-per-id loop (an operator
+                // selecting hundreds of rows in the admin list and clicking
+                // "Delete selected" otherwise costs hundreds of statements
+                // and pool checkouts for what is, on the wire, one
+                // predicate).
+                //
+                // The returned count is the number of rows the `DELETE`
+                // actually matched, not `ids.len()`: unlike `delete()`
+                // above, a missing id here is silently a no-op rather than
+                // an `AdminError::NotFound` that aborts the whole batch --
+                // the same "missing selection is a no-op" contract the
+                // scaffolded (`autumn generate scaffold`) bulk-delete route
+                // and this crate's own `TokenAdminModel`/
+                // `FeatureFlagAdminModel` overrides already use, and a
+                // strictly better-defined outcome than the loop this
+                // replaces, whose partial application on a missing id
+                // depended on where in the id list the miss fell.
+                let mut conn = pool.get().await.map_err(Self::pool_error)?;
+                let deleted = diesel::delete({plural}::table.filter({plural}::id.eq_any(&ids)))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(Self::pool_error)?;
+                Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+            }});
+        }}
+
+        dispatch_restore_purge_or_unhandled(self, pool, action, ids)
     }}
 }}
 "#
@@ -1500,6 +1641,120 @@ mod tests {
             .to_string();
         assert!(err.contains("translatable"), "{err}");
         assert!(err.contains("title"), "{err}");
+    }
+
+    /// #2291: the refusal keys off the model AST, not the DSL token. A model
+    /// whose `title` is `#[translatable]` must be refused even when the admin
+    /// field token carries no `{translatable}` marker — otherwise the token
+    /// is an opt-out of a guard the model demands.
+    #[test]
+    fn plan_admin_rejects_a_model_translatable_field_without_token_marker() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: autumn_web::i18n::Translated,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        let err = plan_admin(tmp.path(), "Post", &["title:String".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("translatable"), "{err}");
+        assert!(err.contains("title"), "{err}");
+        assert!(
+            err.contains("#[translatable]"),
+            "the refusal must name the model attribute, got: {err}"
+        );
+    }
+
+    /// #2291: the model-AST refusal holds for every spelling of the field
+    /// token, since the token is never the source of truth here.
+    #[test]
+    fn plan_admin_rejects_a_model_translatable_field_for_every_token_spelling() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: autumn_web::i18n::Translated,\n\
+            }\n";
+        for token in ["title:String", "title:Text", "title:String{nullable}"] {
+            let tmp = project_with_model_source("post", model_source);
+            let err = plan_admin(tmp.path(), "Post", &[token.into()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("translatable") && err.contains("title"),
+                "token `{token}` on a #[translatable] model field must be refused, got: {err}"
+            );
+        }
+    }
+
+    /// #2291: the model-AST refusal is generation-only. `destroy admin` for an
+    /// admin generated before the field became `#[translatable]` must still
+    /// plan, or its files could never be removed while the model exists.
+    #[test]
+    fn destroy_plan_ignores_a_model_translatable_field() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: autumn_web::i18n::Translated,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        let options = AdminOptions {
+            for_destroy: true,
+            ..Default::default()
+        };
+        assert!(
+            plan_admin_with_options(tmp.path(), "Post", &["title:String".into()], &options).is_ok(),
+            "destroying an admin must not be blocked by the generation-only guard"
+        );
+    }
+
+    /// #2291 regression guard: a plain model with a plain token must NOT be
+    /// refused by the new model-AST half of the gate.
+    #[test]
+    fn plan_admin_accepts_a_plain_field_on_a_plain_model() {
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub title: String,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        assert!(
+            plan_admin(tmp.path(), "Post", &["title:String".into()]).is_ok(),
+            "a non-translatable field on a non-translatable model must not be refused"
+        );
+    }
+
+    /// Unit pins for the AST detector itself: bare and qualified marker
+    /// spellings match; other structs, other attributes, and other fields do
+    /// not leak in.
+    #[test]
+    fn detect_translatable_fields_pins_marker_spellings() {
+        let source = "pub struct Post {\n\
+            \x20   pub id: i64,\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: String,\n\
+            \x20   #[autumn_web::translatable]\n\
+            \x20   pub summary: String,\n\
+            \x20   #[encrypted]\n\
+            \x20   pub secret: String,\n\
+            }\n\
+            pub struct Other {\n\
+            \x20   #[translatable]\n\
+            \x20   pub title: String,\n\
+            }\n";
+        assert_eq!(
+            detect_translatable_fields(source, "Post"),
+            vec!["title".to_owned(), "summary".to_owned()]
+        );
+        assert!(detect_translatable_fields(source, "Missing").is_empty());
+        assert!(detect_translatable_fields("not rust at all", "Post").is_empty());
     }
 
     #[test]
@@ -2471,24 +2726,10 @@ pub struct Account {
         assert!(plan_admin(tmp.path(), "Post", &["title:String".into()]).is_err());
 
         let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
-        // Without --force: content is unverifiable (the model is gone), so
-        // it's treated as diverged and left in place rather than guessed at.
-        let err = fallback_plan
-            .revert(Flags {
-                dry_run: false,
-                force: false,
-            })
-            .unwrap_err();
-        assert!(matches!(err, GenerateError::Diverged(_)));
-        assert!(tmp.path().join("src/admin/post.rs").exists());
-
-        let fallback_plan = plan_admin_destroy_fallback(tmp.path(), "Post").unwrap();
-        fallback_plan
-            .revert(Flags {
-                dry_run: false,
-                force: true,
-            })
-            .unwrap();
+        // The fallback plan cannot reproduce the content — it never read the
+        // model — but the digest `generate` recorded still proves these files
+        // are its own untouched output, so no --force is needed (issue #1835).
+        fallback_plan.revert(Flags::default()).unwrap();
         assert!(!tmp.path().join("src/admin/post.rs").exists());
         assert!(!tmp.path().join("tests/post_admin.rs").exists());
         assert!(
@@ -2497,6 +2738,54 @@ pub struct Account {
                 .contains("post"),
             "the mod declaration removal doesn't depend on the model and must succeed too"
         );
+    }
+
+    #[test]
+    fn destroy_admin_fallback_still_refuses_a_hand_edited_file() {
+        // The #1048 guard under the #1835 code path: the recorded digest makes
+        // the fallback plan usable, and an edit still has to break it.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        fs::write(tmp.path().join("src/admin/post.rs"), "// my own code\n").unwrap();
+
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap_err();
+
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+    }
+
+    #[test]
+    fn destroy_admin_fallback_without_provenance_still_needs_force() {
+        // The pre-#1835 path, still taken by a project generated before the
+        // manifest existed: content is unverifiable (the model is gone and
+        // nothing was recorded), so it is treated as diverged and left alone.
+        let tmp = project_with_model("post");
+        let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+        fs::remove_file(tmp.path().join(crate::generate::provenance::MANIFEST_PATH)).unwrap();
+
+        let err = plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags::default())
+            .unwrap_err();
+        assert!(matches!(err, GenerateError::Diverged(_)));
+        assert!(tmp.path().join("src/admin/post.rs").exists());
+
+        plan_admin_destroy_fallback(tmp.path(), "Post")
+            .unwrap()
+            .revert(Flags {
+                dry_run: false,
+                force: true,
+            })
+            .unwrap();
+        assert!(!tmp.path().join("src/admin/post.rs").exists());
+        assert!(!tmp.path().join("tests/post_admin.rs").exists());
     }
 
     #[test]

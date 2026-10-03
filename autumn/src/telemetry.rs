@@ -438,6 +438,7 @@ fn build_capture_layer(
     // Include encrypted-column names so plaintext values never reach the buffer.
     let mut filter_parameters = log.filter_parameters.clone();
     filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    filter_parameters.extend(crate::confidential::registered_confidential_column_names());
     let filter =
         crate::log::filter::ParameterFilter::new(&filter_parameters, &log.unfilter_parameters);
     let buffer = crate::log::capture::LogBuffer::new(log.capture.capacity, filter);

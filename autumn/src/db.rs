@@ -1,7 +1,9 @@
 //! Database connection pool and extractor.
 //!
-//! This module provides async Postgres connectivity via `diesel-async` with
-//! the `deadpool` connection pool. The pool is created at startup by
+//! This module provides async connectivity via `diesel-async` with the
+//! `deadpool` connection pool. The backend is whichever [`RuntimeConnection`]
+//! resolves to — Postgres by default, `SQLite` under the crate's `sqlite`
+//! feature. The pool is created at startup by
 //! [`AppBuilder::run`](crate::app::AppBuilder::run) and stored in
 //! [`crate::state::AppState`].
 //!
@@ -41,7 +43,15 @@ use diesel;
 // via `db`), so this import is used on both builds.
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::pooled_connection::deadpool::Pool;
+#[cfg(not(feature = "sqlite"))]
+use diesel_async::pooled_connection::RecyclingMethod;
+/// The deadpool connection pool Autumn's database seam produces.
+///
+/// Re-exported so a plugin implementing
+/// [`DatabasePoolProvider`] — a stable plugin surface (issue #1601) — can name
+/// the type its `create_pool` returns without taking its own `diesel-async`
+/// dependency at a matching major.
+pub use diesel_async::pooled_connection::deadpool::Pool;
 use futures::FutureExt as _;
 use std::any::Any;
 use std::future::Future;
@@ -95,6 +105,10 @@ pub type RuntimeBackend = diesel::pg::Pg;
 /// runtime query backend is `diesel::sqlite::Sqlite`.
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
+
+/// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
+#[cfg(feature = "sqlite")]
+pub mod sqlite_types;
 
 // ── After-commit callback infrastructure ─────────────────────────────────────
 
@@ -587,14 +601,15 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
-    match (
-        payload.downcast_ref::<&'static str>(),
-        payload.downcast_ref::<String>(),
-    ) {
-        (Some(message), _) => (*message).to_owned(),
-        (_, Some(message)) => message.clone(),
-        (None, None) => "non-string panic payload".to_owned(),
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_owned();
     }
+
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    "non-string panic payload".to_owned()
 }
 
 /// Register a callback to run after the current database transaction commits.
@@ -994,8 +1009,10 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
 {
+    // No state here, so the ambient clock (issue #2967): a running `Sim`
+    // controls it.
     run_instrumented_with_clock(
-        &crate::time::SystemClock,
+        &crate::time::AmbientClock,
         sql,
         route_key,
         slow_threshold,
@@ -1141,10 +1158,11 @@ fn is_query_canceled(err: &diesel::result::Error) -> bool {
 ///
 /// Returned by [`create_pool`] (and the other topology builders) when a pool
 /// cannot be constructed. Historically this was a bare alias for deadpool's
-/// `BuildError`; it now also carries the boot-time refusal emitted for a
-/// recognized-but-not-yet-wired backend (`SQLite`, issue #1614), so callers fail
-/// fast at pool construction with an actionable message instead of at the first
-/// query. The [`Build`](PoolError::Build) variant delegates its `Display` to the
+/// `BuildError`; it now also carries the boot-time refusal emitted when the
+/// configured backend is not the one this build serves — a `SQLite` target in a
+/// default build, or a Postgres target under `--features sqlite` (issue #1614)
+/// — so callers fail fast at pool construction with an actionable message
+/// instead of at the first query. The [`Build`](PoolError::Build) variant delegates its `Display` to the
 /// underlying `BuildError`, so the Postgres path's error text is unchanged.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1154,8 +1172,8 @@ pub enum PoolError {
     #[error(transparent)]
     Build(#[from] diesel_async::pooled_connection::deadpool::BuildError),
 
-    /// A database backend that Autumn recognizes but whose runtime pool is not
-    /// available in this build was configured. See
+    /// A recognized backend that this build does not serve was configured. The
+    /// message names the feature that serves it. See
     /// [`DatabaseBackend`](crate::config::DatabaseBackend).
     #[error("{0}")]
     UnsupportedBackend(String),
@@ -1268,6 +1286,109 @@ impl DatabaseTopology {
     }
 }
 
+/// Whether continuous `SQLite` replication (#1628) is active in this process.
+///
+/// Process-global on purpose. The per-connection pragma batch below is installed
+/// by a `custom_setup` callback that has no access to `AutumnConfig`, and
+/// replication is inherently a single-process, single-database concern — #1614's
+/// `SQLite` tier is single-host and single-writer, and continuous replication
+/// *depends* on exactly one component being allowed to checkpoint.
+static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The per-connection pragma batch a pooled `SQLite` connection is set up with.
+///
+/// Pure over its two inputs so the decision is unit-testable without a pool, a
+/// database, or the process-global replication latch.
+///
+/// * A **read-only** target gets the non-writing pragmas only: `journal_mode =
+///   WAL` and `synchronous` both write, and would fail connection setup with
+///   "attempt to write a readonly database", taking the whole pool 503.
+/// * When **replication is active** (#1628), `wal_autocheckpoint = 0` is added so
+///   the replicator is the only component that ever checkpoints. An
+///   auto-checkpoint rewrites the main database file, which would tear a base
+///   snapshot mid-copy, and restarts the WAL under a new salt, which would force
+///   an expensive fresh generation every 1000 pages.
+/// * The `busy_timeout` pragma is applied unconditionally, but it does **not**
+///   cover `cache=shared` table-lock conflicts: those return `SQLITE_LOCKED`
+///   without invoking the busy handler at all (the pool does not wire
+///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
+///   harmless, not harmful (issue #2881).
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
+    if read_only {
+        "PRAGMA busy_timeout = 5000; \
+         PRAGMA foreign_keys = ON;"
+    } else if replicating {
+        "PRAGMA busy_timeout = 5000; \
+         PRAGMA journal_mode = WAL; \
+         PRAGMA wal_autocheckpoint = 0; \
+         PRAGMA synchronous = NORMAL; \
+         PRAGMA foreign_keys = ON;"
+    } else {
+        "PRAGMA busy_timeout = 5000; \
+         PRAGMA journal_mode = WAL; \
+         PRAGMA synchronous = NORMAL; \
+         PRAGMA foreign_keys = ON;"
+    }
+}
+
+/// Declare that continuous replication is active in this process.
+///
+/// Once set, every `SQLite` connection this process's pools create is given
+/// `PRAGMA wal_autocheckpoint = 0`, so `SQLite` never restarts the write-ahead
+/// log on its own. That matters twice over: an auto-checkpoint rewrites the
+/// **main database file**, which would tear a base snapshot the replicator is
+/// copying, and it restarts the WAL, which would force an expensive fresh
+/// generation every 1000 pages. The replicator checkpoints deliberately
+/// instead, and only once everything in the WAL is already offsite.
+///
+/// **Latch-only, and read per connection.** It can be turned on but never off,
+/// because the pragma is installed by a `custom_setup` callback that runs each
+/// time deadpool *creates* a connection — lazily, and again after a recycle —
+/// for the whole life of the process. A second app booted in the same process
+/// (the workspace's own consolidated test binary is exactly that) must not be
+/// able to clear the flag out from under a replicating app's pool and let its
+/// connections auto-checkpoint behind the replicator's back.
+pub(crate) fn set_sqlite_replication_active() {
+    SQLITE_REPLICATION_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_sqlite_replication_active`] has been called in this process.
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+pub(crate) fn sqlite_replication_active() -> bool {
+    SQLITE_REPLICATION_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Build the manager config for a Postgres pool.
+///
+/// Uses [`RecyclingMethod::Fast`]. Every checkout already runs `SET
+/// statement_timeout`: see [`Db::checkout`] and the `#[repository]`-generated
+/// acquire path. That statement is a round trip to Postgres. It already
+/// proves the connection is alive. Deadpool's default `Verified` method
+/// sends a second, redundant `SELECT 1` to prove the same thing. `Fast`
+/// removes that extra round trip. A dead connection still fails fast — at
+/// the `SET statement_timeout` call, not at the pool's own ping. (issue
+/// #2485)
+///
+/// Also plugs in a TLS setup callback when the URL asks for TLS: diesel-async's
+/// default establish path hardcodes `NoTls`, which cannot satisfy
+/// `sslmode=require`. `sslmode` absent/`disable`/`prefer` keeps the default
+/// (`NoTls`) path, so existing configurations behave exactly as before. See
+/// [`tls`] for the full posture table.
+#[cfg(not(feature = "sqlite"))]
+fn pg_manager_config(
+    url: &str,
+) -> diesel_async::pooled_connection::ManagerConfig<AsyncPgConnection> {
+    let mut config = diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
+    config.recycling_method = RecyclingMethod::Fast;
+    let posture = tls::TlsPosture::from_database_url(url);
+    if posture != tls::TlsPosture::Off {
+        config.custom_setup = tls::setup_callback(posture);
+    }
+    config
+}
+
 fn build_pool(
     url: &str,
     pool_size: usize,
@@ -1295,28 +1416,17 @@ fn build_pool(
         return Err(PoolError::UnsupportedBackend(format!(
             "SQLite is a recognized database backend but its runtime pool is only available in \
              a build of autumn-web compiled with `--features sqlite`; this is a default \
-             (Postgres) build (target: {url:?})"
+             (Postgres) build (target: {target:?})",
+            target = crate::db_url::redact_target(url)
         )));
     }
 
     #[cfg(not(feature = "sqlite"))]
     {
         let timeout = Duration::from_secs(connect_timeout_secs);
-        // When the URL's `sslmode` asks for TLS, plug a rustls-backed connector
-        // into the pool via a custom setup callback — diesel-async's default
-        // establish path hardcodes `NoTls`, which cannot satisfy
-        // `sslmode=require` at all. `sslmode` absent/`disable`/`prefer` keeps the
-        // default (NoTls) path, so existing configurations behave exactly as
-        // before. See [`tls`] for the full posture table.
-        let manager = match tls::TlsPosture::from_database_url(url) {
-            tls::TlsPosture::Off => AsyncDieselConnectionManager::<AsyncPgConnection>::new(url),
-            posture => {
-                let mut config =
-                    diesel_async::pooled_connection::ManagerConfig::<AsyncPgConnection>::default();
-                config.custom_setup = tls::setup_callback(posture);
-                AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config)
-            }
-        };
+        let config = pg_manager_config(url);
+        let manager =
+            AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(url, config);
         Ok(Pool::builder(manager)
             .max_size(pool_size.max(1))
             .wait_timeout(Some(timeout))
@@ -1334,8 +1444,15 @@ fn build_pool(
 /// token — but **not** a `sqlite:` URL scheme. Strip the recognized `SQLite` URL
 /// spellings down to that: `sqlite::memory:`, `sqlite://:memory:`, and an empty
 /// `sqlite://` all become an in-memory database; `sqlite:///path` /
-/// `sqlite://path` / `sqlite:path` reduce to their path; a `file:` URI or a
-/// bare path passes through unchanged.
+/// `sqlite://path` / `sqlite:path` reduce to their path; a `file:` URI passes
+/// through unchanged.
+///
+/// A bare path passes through this function unchanged too, but no configured
+/// target reaches it that way: [`build_sqlite_pool`] refuses anything
+/// [`DatabaseBackend::detect`](crate::config::DatabaseBackend::detect) does not
+/// classify as `SQLite`, and a bare path is deliberately unclassified. The two
+/// scheme-less in-memory spellings (`:memory:` and the empty string) are the
+/// exception the pool admits explicitly.
 #[cfg(feature = "sqlite")]
 fn normalize_sqlite_target(url: &str) -> String {
     if url.starts_with("file:") {
@@ -1366,7 +1483,7 @@ fn normalize_sqlite_target(url: &str) -> String {
 /// so it must NOT be forced single-slot and returns `false` here.
 #[cfg(feature = "sqlite")]
 fn sqlite_target_is_memory(target: &str) -> bool {
-    if target.contains("cache=shared") {
+    if sqlite_target_is_shared_cache(target) {
         return false;
     }
     target == ":memory:"
@@ -1438,6 +1555,97 @@ fn sqlite_target_is_read_only(target: &str) -> bool {
     false
 }
 
+/// Whether a normalized `SQLite` target enables **shared-cache mode**
+/// (`cache=shared` in the URI query string).
+///
+/// Shared cache multiplexes several connections over one in-memory (or file)
+/// database inside the process, but its table-lock protocol makes concurrent
+/// deferred read→write transactions deadlock permanently: the deferred lock
+/// upgrade fails with `SQLITE_LOCKED` / `SQLITE_BUSY_SNAPSHOT`, which bypasses
+/// the busy-timeout handler, so no amount of retrying unblocks it (issue
+/// #2885). `SQLite`'s own docs call shared-cache mode "obsolete" and
+/// "discouraged", recommending WAL mode instead — and WAL does **not** fix this
+/// deadlock class (the table-lock protocol is orthogonal to the journal mode).
+///
+/// [`Db::tx_immediate`] only stops the participating writers from all reading
+/// before their upgrade attempts — the first `BEGIN IMMEDIATE` takes the write
+/// transaction up front. It is not a completion guarantee (a concurrent
+/// reader's table lock can still fail that writer's write with
+/// `SQLITE_LOCKED_SHAREDCACHE`), and it does **not** make the other writers
+/// wait: under shared cache their `BEGIN IMMEDIATE` fails immediately,
+/// since `SQLite` never invokes the busy handler for `SQLITE_LOCKED` (this pool
+/// does not wire `sqlite3_unlock_notify`). Concurrent shared-cache writers
+/// must therefore still be serialized, or retried with backoff (each attempt
+/// through `tx_immediate`) by the application; the real fix is a WAL-mode file
+/// database, where `tx_immediate` does queue on the busy timeout.
+///
+/// Autumn keeps supporting shared cache (the test suite uses it deliberately —
+/// see [`crate::test_urls`]), so this is a warning, not a refusal.
+/// [`build_sqlite_pool`] logs a loud boot warning when it sees this so the
+/// deadlock mode is never a surprise.
+///
+/// The same bypass means the unconditional `PRAGMA busy_timeout = 5000` from
+/// [`sqlite_connection_pragmas`] does **not** bound shared-cache lock waits,
+/// so the `statement_timeout` rejection message is scoped by this predicate
+/// (issue #2881).
+///
+/// Only an exact `cache=shared` query pair counts; a path or another
+/// parameter merely containing that text does not.
+#[cfg(feature = "sqlite")]
+pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
+    sqlite_uri_has_query_pair(target, "cache", "shared")
+}
+
+/// Whether `target` is a `SQLite` URI filename whose effective `key` query
+/// parameter is exactly `value`, read the way `SQLite` reads it: only a `file:`
+/// URI has query parameters (a plain path containing `?` is just a filename),
+/// the `#fragment` is ignored, names and values are percent-decoded before the
+/// case-sensitive comparison, and a repeated parameter takes its last value. `target` may be a raw configured URL
+/// (`sqlite:file:...`) or an already-normalized one.
+#[cfg(feature = "sqlite")]
+fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
+    let target = normalize_sqlite_target(target);
+    if !target.starts_with("file:") {
+        return false;
+    }
+    let without_fragment = target
+        .split_once('#')
+        .map_or(target.as_str(), |(head, _)| head);
+    let Some((_, query)) = without_fragment.split_once('?') else {
+        return false;
+    };
+    query
+        .split('&')
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+        .rfind(|(k, _)| percent_decode(k) == key.as_bytes())
+        .is_some_and(|(_, v)| percent_decode(v) == value.as_bytes())
+}
+
+/// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
+/// by two hex digits is kept literally.
+#[cfg(feature = "sqlite")]
+fn percent_decode(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            // Two hex digits always fit in a byte.
+            out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Build a deadpool pool over `SyncConnectionWrapper<SqliteConnection>` for a
 /// `SQLite` target (issue #1614, PR2).
 ///
@@ -1456,83 +1664,140 @@ fn build_sqlite_pool(
     pool_size: usize,
     connect_timeout_secs: u64,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
-    // Under the `sqlite` feature the runtime targets SQLite. A Postgres URL here
-    // is a misconfiguration — refuse with an actionable message rather than
-    // trying to open a file literally named "postgres://…".
-    if crate::config::DatabaseBackend::detect(url) == Some(crate::config::DatabaseBackend::Postgres)
-    {
-        return Err(PoolError::UnsupportedBackend(format!(
-            "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but the \
-             configured database URL is a Postgres target; configure a `sqlite:` URL instead \
-             (target: {url:?})"
-        )));
+    // Under the `sqlite` feature the runtime targets SQLite, so the URL must
+    // actually NAME a SQLite target. Everything past this point treats the
+    // string as a filename: `normalize_sqlite_target` strips the `sqlite:` /
+    // `sqlite://` schemes and passes anything else through verbatim, so an
+    // unguarded target is opened as a file whose name happens to be that
+    // string. Refuse anything `DatabaseBackend::detect` does not classify as
+    // SQLite, with a message that names the offending target and the fix.
+    //
+    // Two shapes reach this guard and both used to fail open:
+    //
+    //   * A Postgres target — a build/config mismatch, and the message says so
+    //     specifically rather than talking about schemes.
+    //   * Anything `detect` returns `None` for: another backend's URL
+    //     (`mysql://…`), a typo of the scheme (`sqllite:///app.db`), or a bare
+    //     filesystem path (`/var/lib/app.db`), which `DatabaseBackend`
+    //     deliberately does not recognize. `DatabaseConfig::validate` rejects
+    //     these too, so the ordinary `AutumnConfig::load` boot path never
+    //     reaches this arm — but `create_pool`, `create_topology` and
+    //     `create_shard_topology` are public and a programmatically-built
+    //     `DatabaseConfig` or a custom `DatabasePoolProvider` gets here without
+    //     that screen. Accepting them would split the runtime from every other
+    //     consumer of the same URL — `autumn doctor`, the generator's DDL
+    //     mapping and `autumn migrate` all classify through `detect` and would
+    //     report "no recognized backend" while this pool quietly served a
+    //     database out of a junk file.
+    //
+    // The bare in-memory spellings are the one accepted target `detect` does
+    // NOT classify (it recognizes schemes, and these carry none), so they are
+    // admitted explicitly rather than by scheme: `normalize_sqlite_target` has
+    // a dedicated branch mapping `""` and `:memory:` to `:memory:`
+    // (`rest.is_empty() || rest == ":memory:"`), `run_pending_sqlite` names
+    // `:memory:` among the spellings it accepts, and `TestApp::with_transactional_db`
+    // routes whatever URL it is handed straight through `create_pool`. They also
+    // cannot become a stray file, which is the failure this guard exists to
+    // prevent. Refusing them would be a regression, not a tightening.
+    match crate::config::DatabaseBackend::detect(url) {
+        _ if crate::db_url::is_bare_in_memory_sqlite(url) => {}
+        Some(crate::config::DatabaseBackend::Sqlite) => {}
+        Some(crate::config::DatabaseBackend::Postgres) => {
+            return Err(PoolError::UnsupportedBackend(format!(
+                "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but \
+                 the configured database URL is a Postgres target; configure a `sqlite:` URL \
+                 instead (target: {target:?})",
+                target = crate::db_url::redact_target(url)
+            )));
+        }
+        None => {
+            return Err(PoolError::UnsupportedBackend(format!(
+                "this build of autumn-web targets SQLite (compiled with `--features sqlite`) but \
+                 the configured database URL names no recognized database backend; configure a \
+                 SQLite target spelled `sqlite:<path>`, `sqlite://<path>`, or `file:<path>` — a \
+                 bare filesystem path is not accepted (target: {target:?})",
+                target = crate::db_url::redact_target(url)
+            )));
+        }
     }
 
     let timeout = Duration::from_secs(connect_timeout_secs);
     let target = normalize_sqlite_target(url);
+    // Issue #2885: shared-cache mode's table-lock protocol turns concurrent
+    // deferred read→write transactions into a *permanent* deadlock (the lock
+    // upgrade fails with SQLITE_LOCKED, bypassing the busy-timeout handler),
+    // and WAL mode does not fix it. This is a warning, not a refusal — the
+    // test suite itself uses shared-cache in-memory targets on purpose — but
+    // it must be loud: operators hitting this in production otherwise debug a
+    // hang, not a configuration choice.
+    if sqlite_target_is_shared_cache(&target) {
+        tracing::warn!(
+            target = %crate::db_url::redact_target(url),
+            "SQLite shared-cache mode (`cache=shared`) is enabled on this pool. \
+             Concurrent deferred read→write transactions can deadlock permanently \
+             under shared cache: the lock upgrade fails with SQLITE_LOCKED / \
+             SQLITE_BUSY_SNAPSHOT, which bypasses the busy-timeout handler, and \
+             WAL mode does not fix this deadlock class (issue #2885). An up-front \
+             BEGIN IMMEDIATE (Db::tx_immediate) stops writers from all reading \
+             before they upgrade, but it guarantees no winner: other writers, and \
+             a writer blocked by a concurrent reader's table lock, still get \
+             SQLITE_LOCKED without consulting the busy timeout, so they fail fast \
+             rather than queue. Prefer a WAL-mode file database; if shared \
+             cache is required, serialize writers or retry each one through \
+             Db::tx_immediate with backoff. SQLite itself discourages \
+             shared-cache mode: https://www.sqlite.org/sharedcache.html"
+        );
+    }
     let max_size = if sqlite_target_is_memory(&target) {
         1
     } else {
         pool_size.max(1)
     };
-    // SQLite starts every connection with `foreign_keys` OFF, so a bare manager
-    // would hand out pooled connections that silently ignore `REFERENCES`
-    // constraints — orphan rows and referential-integrity violations become
-    // possible for the whole app (addresses Codex P1). It also uses a default
-    // busy handler that returns `SQLITE_BUSY` *immediately* when another pooled
-    // connection holds the single writer lock, so ordinary overlapping writes on
-    // a >1 slot file pool fail as 5xx instead of waiting briefly for the lock to
-    // clear (addresses Codex P1). Install both pragmas — plus a deliberate WAL
-    // journal mode with `synchronous = NORMAL` for better write concurrency —
-    // during EVERY pooled connection's setup, mirroring how the sync store
-    // configures its own SQLite connection (see `crate::sync::store`:
-    // `busy_timeout = 5000`, `journal_mode = WAL`, `synchronous = NORMAL`,
-    // `foreign_keys = ON`). `busy_timeout` is set FIRST so everything after it
-    // (and every later query) queues on the timeout instead of failing on a
-    // held lock; `journal_mode = WAL` is a harmless no-op for a pure `:memory:`
-    // database. A `custom_setup` callback on the manager runs once per
-    // newly-created connection, which is exactly the per-connection hook we need
-    // (the same mechanism the Postgres path uses to install TLS).
+    // SQLite starts every connection with `foreign_keys` OFF, so a bare manager would
+    // hand out pooled connections that silently ignore `REFERENCES` constraints, making
+    // orphan rows and referential-integrity violations possible app-wide. It also uses a
+    // default busy handler that returns `SQLITE_BUSY` immediately when another pooled
+    // connection holds the single writer lock, so ordinary overlapping writes on a
+    // multi-slot file pool fail as 5xx instead of waiting briefly. Install both pragmas —
+    // plus a deliberate WAL journal mode with `synchronous = NORMAL` for better write
+    // concurrency — during every pooled connection's setup, mirroring how the sync store
+    // configures its own connection (`crate::sync::store`: `busy_timeout = 5000`,
+    // `journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = ON`). `busy_timeout`
+    // is set first, so the statements it covers queue on the timeout instead of failing
+    // on a held lock; `journal_mode = WAL` is a harmless no-op for a pure `:memory:`
+    // database, and `apply_sqlite_pragmas` covers the one lock it does not.
+    // A `custom_setup` callback runs once per newly-created connection, the same
+    // per-connection hook the Postgres path uses to install TLS.
     //
-    // A **read-only** URI target (`mode=ro` / `immutable`, e.g.
-    // `sqlite://file:/srv/reference.db?mode=ro`) is the exception: `journal_mode
-    // = WAL` writes to the database (it rewrites the file header and creates the
-    // `-wal`/`-shm` sidecars), so it fails with "attempt to write a readonly
-    // database" — `custom_setup` would propagate that as a connection-setup
-    // error and the pool could not service even read-only queries (`Db` routes
-    // 503). For such targets we install only the non-writing per-connection
-    // pragmas (`busy_timeout`, `foreign_keys`) and skip the write-affecting
-    // ones, so a read-only pool builds and serves reads. In-memory targets are
-    // NOT read-only and keep the full batch.
+    // A read-only URI target (`mode=ro`, `immutable`, e.g.
+    // `sqlite://file:/srv/reference.db?mode=ro`) is the exception: `journal_mode = WAL`
+    // writes to the database — it rewrites the file header and creates the `-wal`/`-shm`
+    // sidecars — so it fails with "attempt to write a readonly database", `custom_setup`
+    // propagates that as a connection-setup error, and the pool could not service even
+    // read-only queries (`Db` routes 503). Such targets get only the non-writing
+    // per-connection pragmas (`busy_timeout`, `foreign_keys`), so a read-only pool builds
+    // and serves reads. In-memory targets are not read-only and keep the full batch.
     let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
     config.custom_setup = Box::new(|url: &str| {
         use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
         async move {
             let mut conn = RuntimeConnection::establish(&url).await?;
-            let pragmas = if sqlite_target_is_read_only(&url) {
-                // Non-writing pragmas only — WAL + synchronous would write and
-                // fail on a read-only database.
-                "PRAGMA busy_timeout = 5000; \
-                 PRAGMA foreign_keys = ON;"
-            } else {
-                "PRAGMA busy_timeout = 5000; \
-                 PRAGMA journal_mode = WAL; \
-                 PRAGMA synchronous = NORMAL; \
-                 PRAGMA foreign_keys = ON;"
-            };
-            conn.batch_execute(pragmas)
+            let pragmas = sqlite_connection_pragmas(
+                sqlite_target_is_read_only(&url),
+                sqlite_replication_active(),
+            );
+            apply_sqlite_pragmas(&mut conn, pragmas)
                 .await
                 .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
-            // #1910 FTS5 capability probe. Searchable repositories emit FTS5
-            // virtual tables + `bm25()` ranking, and the `AddSearch` migration's
-            // `CREATE VIRTUAL TABLE ... USING fts5(...)` is the hard stop that
-            // fails loudly at boot if the linked SQLite lacks FTS5. Probe it here
-            // (create + drop a throwaway FTS5 table in the always-writable `temp`
-            // database — harmless on read-only main targets) so the failure is a
-            // clear, actionable diagnostic naming FTS5 and the fix, instead of a
-            // bare "no such module: fts5" surfacing from a migration. There is NO
-            // silent fallback to LIKE — full-text search requires FTS5.
+            // #1910 FTS5 capability probe. Searchable repositories emit FTS5 virtual
+            // tables and `bm25()` ranking, and the `AddSearch` migration's `CREATE
+            // VIRTUAL TABLE ... USING fts5(...)` is the hard stop that fails loudly at
+            // boot if the linked SQLite lacks FTS5. Probe it here — create and drop a
+            // throwaway FTS5 table in the always-writable `temp` database, harmless on
+            // read-only main targets — so the failure is a clear diagnostic naming FTS5
+            // and the fix, rather than a bare "no such module: fts5" from a migration.
+            // There is no silent fallback to LIKE: full-text search requires FTS5.
             if let Err(e) = conn
                 .batch_execute(
                     "CREATE VIRTUAL TABLE temp.__autumn_fts5_probe USING fts5(x); \
@@ -1568,6 +1833,52 @@ fn build_sqlite_pool(
         .build()?)
 }
 
+/// Apply the per-connection pragmas, retrying while the database is locked.
+///
+/// `PRAGMA journal_mode = WAL` takes an exclusive lock, and `SQLite` does not run
+/// the busy handler for it, so the `busy_timeout` set one statement earlier does
+/// not cover it. Connections created at the same time against a brand-new file
+/// therefore race, and every loser fails setup with "database is locked" — a 5xx
+/// on any request that needed one (#1907).
+///
+/// The journal mode is a persistent property of the file, so one winner settles
+/// it and each retry is then a no-op. The whole retry budget is well inside the
+/// pool's `create_timeout`.
+#[cfg(feature = "sqlite")]
+async fn apply_sqlite_pragmas(
+    conn: &mut RuntimeConnection,
+    pragmas: &str,
+) -> Result<(), diesel::result::Error> {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    /// Attempts in total, the first one included.
+    const ATTEMPTS: u32 = 10;
+    /// Wait between attempts. The lock is held for one statement, not a query.
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut attempt = 1;
+    loop {
+        match conn.batch_execute(pragmas).await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < ATTEMPTS && sqlite_error_is_locked(&error) => {
+                attempt += 1;
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Whether a `SQLite` error is the busy/locked one worth retrying.
+///
+/// `SQLITE_BUSY` and `SQLITE_LOCKED` both reach diesel as a message; there is no
+/// typed code to match on.
+#[cfg(feature = "sqlite")]
+fn sqlite_error_is_locked(error: &diesel::result::Error) -> bool {
+    let message = error.to_string();
+    message.contains("database is locked") || message.contains("database table is locked")
+}
+
 /// Create a connection pool from the database configuration.
 ///
 /// Returns `Ok(None)` if no primary database URL is configured
@@ -1584,7 +1895,7 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout)?;
+    reject_sqlite_statement_timeout(config.statement_timeout, url)?;
 
     let pool = build_pool(
         url,
@@ -1614,8 +1925,16 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
 /// [`DatabasePoolProvider`](crate::db::DatabasePoolProvider) — whose
 /// `create_topology`/`create_shard_topology` need not route through those
 /// factories — cannot bypass the guard. No configured timeout can reach a live
-/// `SQLite` pool. `busy_timeout` still bounds lock waits; a real per-statement
-/// timeout is tracked by #1996/#1910.
+/// `SQLite` pool. `busy_timeout` bounds lock waits only for lock modes that
+/// consult the busy handler; it does **not** bound `cache=shared` table-lock
+/// waits, which return `SQLITE_LOCKED` without invoking the busy handler at
+/// all (issue #2881). A real per-statement timeout is tracked by
+/// #1996/#1910.
+///
+/// `target` is the pool's database target (the raw configured URL is fine —
+/// [`sqlite_target_is_shared_cache`] only inspects the query string) and is
+/// used solely to scope the lock-wait claim in the error message so it does
+/// not lie for `cache=shared` targets.
 ///
 /// # Errors
 ///
@@ -1624,16 +1943,30 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
 #[cfg(feature = "sqlite")]
 pub(crate) fn reject_sqlite_statement_timeout(
     statement_timeout: Option<Duration>,
+    target: &str,
 ) -> Result<(), PoolError> {
     let Some(timeout) = statement_timeout.filter(|t| !t.is_zero()) else {
         return Ok(());
+    };
+    // `busy_timeout` bounds lock waits only for lock modes that consult the
+    // busy handler. A `cache=shared` target's shared-cache table-lock
+    // conflicts return `SQLITE_LOCKED` without invoking the busy handler at
+    // all (this pool does not wire `sqlite3_unlock_notify`), so stating the
+    // unqualified claim for those targets would be false (issue #2881).
+    let wait_clause = if sqlite_target_is_shared_cache(target) {
+        "and note that `cache=shared` table-lock conflicts return SQLITE_LOCKED \
+         immediately, without consulting the busy handler (this pool does not \
+         wire sqlite3_unlock_notify), so `busy_timeout` does NOT bound those \
+         waits (issue #2881)"
+    } else {
+        "(`busy_timeout` already bounds lock waits)"
     };
     Err(PoolError::UnsupportedBackend(format!(
         "SQLite backend cannot enforce database.statement_timeout ({}ms): diesel's \
          SqliteConnection exposes no interrupt/progress-handler hook through the async \
          connection wrapper, so a runaway query cannot be aborted. Unset \
-         database.statement_timeout for the SQLite backend (busy_timeout already bounds \
-         lock waits), or run on Postgres. Tracking issue: #1996/#1910.",
+         database.statement_timeout for the SQLite backend {wait_clause}, or run on Postgres. \
+         Tracking issue: #1996/#1910.",
         timeout.as_millis()
     )))
 }
@@ -1659,9 +1992,11 @@ fn reject_unusable_sqlite_replica(primary_url: &str, replica_url: &str) -> Resul
     let primary_target = normalize_sqlite_target(primary_url);
     if sqlite_target_is_memory(&replica_target) || replica_target != primary_target {
         return Err(PoolError::UnsupportedBackend(format!(
-            "SQLite does not support a separate read replica: replica_url {replica_url:?} \
-             is in-memory or differs from primary_url {primary_url:?}. Configure only a \
-             primary, or point the replica at the same database file as the primary."
+            "SQLite does not support a separate read replica: replica_url {replica:?} \
+             is in-memory or differs from primary_url {primary:?}. Configure only a \
+             primary, or point the replica at the same database file as the primary.",
+            replica = crate::db_url::redact_target(replica_url),
+            primary = crate::db_url::redact_target(primary_url)
         )));
     }
     Ok(())
@@ -1681,7 +2016,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout)?;
+    reject_sqlite_statement_timeout(config.statement_timeout, primary_url)?;
 
     let primary = build_pool(
         primary_url,
@@ -1725,7 +2060,7 @@ pub fn create_shard_topology(
     // Postgres-only), so the same fail-closed guard applies per shard. The shard
     // inherits the `[database]` `statement_timeout`.
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(defaults.statement_timeout)?;
+    reject_sqlite_statement_timeout(defaults.statement_timeout, &shard.primary_url)?;
 
     let primary = build_pool(
         &shard.primary_url,
@@ -2121,9 +2456,9 @@ where
 }
 
 /// Run a write read-modify-write closure inside a transaction that takes the
-/// SQLite write lock up front (`BEGIN IMMEDIATE`).
+/// `SQLite` write lock up front (`BEGIN IMMEDIATE`).
 ///
-/// On Postgres this delegates to [`scoped_transaction`] unchanged. On SQLite it
+/// On Postgres this delegates to [`scoped_transaction`] unchanged. On `SQLite` it
 /// begins the transaction with `BEGIN IMMEDIATE` before running `f`, so a
 /// concurrent writer queues on the connection's `busy_timeout` instead of
 /// failing its deferred read→write snapshot upgrade with `SQLITE_BUSY_SNAPSHOT`
@@ -2131,12 +2466,13 @@ where
 /// generated write-RMW paths (`with_lock`, `update`, `delete_by_id`,
 /// `find_or_create_by`); read-only transactions, [`Db::tx`], and [`savepoint`]
 /// deliberately stay on the deferred [`scoped_transaction`] so read-only user
-/// transactions keep their read concurrency.
+/// transactions keep their read concurrency. User code that wants this mode
+/// explicitly should call [`Db::tx_immediate`], not this function.
 ///
 /// This is a runtime support function for code generated by Autumn proc macros.
 /// It is semver-exempt; do not call it directly.
 ///
-/// # SQLite nesting parity
+/// # `SQLite` nesting parity
 ///
 /// The `BEGIN IMMEDIATE` is issued **through** diesel's `AnsiTransactionManager`
 /// (`begin_transaction_sql`) rather than as a raw statement, so the manager's
@@ -2152,10 +2488,63 @@ where
 /// # Errors
 ///
 /// Returns the error from `f`, or a `diesel::result::Error` from starting or
-/// committing the transaction. On SQLite a panic inside `f` rolls the
+/// committing the transaction. On `SQLite` a panic inside `f` rolls the
 /// transaction back (through the transaction manager) before resuming the
 /// unwind, so the pooled connection is never recycled with an open write
 /// transaction.
+/// Run `f` on `conn`, wrapped in a [`scoped_immediate_transaction`] only when
+/// `wrap` is true.
+///
+/// This exists for the counter-cache write paths (#1325). Several no-hooks
+/// mutation paths are deliberately transaction-free: they issue exactly one
+/// statement, so a `BEGIN`/`COMMIT` round trip would be pure overhead. A counter
+/// cache makes that one statement two, which must commit or roll back together
+/// — so those paths need a transaction if, and only if, the model actually
+/// declares a counter cache.
+///
+/// `#[model]` and `#[repository]` are separate proc-macro invocations, so the
+/// repository macro cannot see the model's `#[belongs_to(..., counter_cache)]`
+/// attributes; it learns about them from the `const HAS_COUNTER_CACHES` the
+/// model emits. That const is what callers pass as `wrap`.
+///
+/// Previously the macro branched on that const and emitted the **whole mutation
+/// body twice** — once inside a transaction closure, once bare — at seven sites
+/// per repository. That is free at runtime (the const folds) but not at compile
+/// time: both copies are parsed, name-resolved, type-checked and borrow-checked
+/// on every build, and it accounted for ~13.5% of every generated repository.
+/// Routing both cases through one closure here keeps the runtime behaviour
+/// exactly as it was — no transaction is opened when `wrap` is false — while the
+/// body is emitted once.
+///
+/// This is a runtime support function for code generated by Autumn proc macros.
+/// It is semver-exempt; do not call it directly.
+///
+/// # Errors
+///
+/// Returns the error from `f`, or a `diesel::result::Error` from starting or
+/// committing the transaction when one is opened.
+#[doc(hidden)]
+pub async fn maybe_immediate_transaction<'a, T, E, F>(
+    conn: &'a mut RuntimeConnection,
+    wrap: bool,
+    f: F,
+) -> Result<T, E>
+where
+    T: Send + 'a,
+    E: From<diesel::result::Error> + Send + 'a,
+    F: for<'r> FnOnce(
+            &'r mut RuntimeConnection,
+        ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+        + Send
+        + 'a,
+{
+    if wrap {
+        scoped_immediate_transaction(conn, f).await
+    } else {
+        f(conn).await
+    }
+}
+
 #[doc(hidden)]
 pub async fn scoped_immediate_transaction<'a, T, E, F>(
     conn: &'a mut RuntimeConnection,
@@ -2296,6 +2685,20 @@ where
 /// Connection type managed by the deadpool pool.
 pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>;
 
+/// Prove a pooled connection is actually alive, not merely checked out.
+///
+/// `pg_manager_config` sets `RecyclingMethod::Fast`, so `pool.get()` alone
+/// can return a stale connection without proving it is alive (issue #2485).
+/// A health/readiness probe that only checks out and drops a connection
+/// would then report a dead primary or replica as reachable. Run this on a
+/// fresh checkout so the probe itself proves liveness, not the pool.
+pub(crate) async fn probe_connection_alive(
+    conn: &mut PooledConnection,
+) -> Result<(), diesel::result::Error> {
+    use diesel_async::SimpleAsyncConnection as _;
+    conn.batch_execute("SELECT 1").await
+}
+
 struct TxDepthGuard<'a> {
     depth: &'a mut usize,
     poisoned: &'a mut bool,
@@ -2313,19 +2716,25 @@ impl Drop for TxDepthGuard<'_> {
 
 /// Async database connection extractor.
 ///
-/// Declare `db: Db` in a handler signature to get a pooled connection to
-/// Postgres. The connection is returned to the pool when `Db` is dropped
+/// Declare `db: Db` in a handler signature to get a pooled database
+/// connection. The connection is returned to the pool when `Db` is dropped
 /// at the end of the request.
 ///
 /// `Db` implements [`Deref`](std::ops::Deref) and
-/// [`DerefMut`](std::ops::DerefMut) to
-/// `diesel_async::AsyncPgConnection`, so you can use it directly with
-/// Diesel query methods.
+/// [`DerefMut`](std::ops::DerefMut) to [`RuntimeConnection`], so you can use it
+/// directly with Diesel query methods. That alias is
+/// `diesel_async::AsyncPgConnection` by default and a `SQLite` connection under
+/// the crate's `sqlite` feature — one extractor, two backends.
 ///
 /// If no database is configured (i.e., `database.primary_url` and legacy
 /// `database.url` are absent),
 /// requests that use `Db` will receive a `503 Service Unavailable`
 /// response.
+///
+/// A handler that also takes a body extractor (`Form`, `Json`, `Multipart`,
+/// ...) should take [`LazyDb`] instead. `Db` checks out a connection before
+/// axum reads the body. It holds that connection for as long as the client
+/// takes to send the body.
 ///
 /// # Examples
 ///
@@ -2334,7 +2743,7 @@ impl Drop for TxDepthGuard<'_> {
 ///
 /// #[get("/ping-db")]
 /// async fn ping_db(db: Db) -> AutumnResult<&'static str> {
-///     // `db` dereferences to AsyncPgConnection
+///     // `db` dereferences to the active RuntimeConnection
 ///     Ok("database is reachable")
 /// }
 /// ```
@@ -2394,7 +2803,12 @@ impl Db {
     ///
     /// Commits when the closure returns `Ok(_)`, rolls back when it returns
     /// `Err(_)`. For a stronger isolation level and/or automatic
-    /// serialization-failure retry, use [`Db::tx_with`].
+    /// serialization-failure retry, use [`Db::tx_with`]. For a write-heavy
+    /// closure on `SQLite` — where a deferred read→write lock upgrade can fail
+    /// with `SQLITE_BUSY_SNAPSHOT` instead of queueing — use
+    /// [`Db::tx_immediate`], which takes the write lock up front
+    /// (`BEGIN IMMEDIATE`). This method itself deliberately stays deferred so
+    /// read-only transactions keep their read concurrency.
     ///
     /// # Errors
     ///
@@ -2456,6 +2870,138 @@ impl Db {
             .scope(
                 registry.clone(),
                 scoped_transaction::<T, E, _, _>(&mut self.conn, f),
+            )
+            .await
+            .map_err(Into::into);
+
+        guard.disarmed = true;
+
+        // On commit: spawn the registered callbacks outside the transaction
+        // connection, but await them sequentially inside that task so callback
+        // dependencies observe registration order.
+        // Errors are counted and logged; they do NOT affect the committed tx.
+        // In transactional tests (outer transaction is rolled back), we suppress
+        // spawning these callbacks to prevent observing uncommitted side effects.
+        if result.is_ok() {
+            let callbacks: Vec<CommitCallback> = {
+                let mut reg = registry.lock().expect("registry lock");
+                std::mem::take(&mut *reg)
+            };
+
+            if !callbacks.is_empty() && !self.is_test_tx {
+                let _ = spawn_committed_after_commit_callbacks(callbacks);
+            }
+        }
+
+        result
+    }
+
+    /// Run an async closure inside a database transaction that takes the
+    /// `SQLite` write lock up front (`BEGIN IMMEDIATE`).
+    ///
+    /// This is the explicit, user-facing counterpart to [`Db::tx`] for
+    /// write-heavy transactions. Commits when the closure returns `Ok(_)`,
+    /// rolls back when it returns `Err(_)`. For a stronger isolation level
+    /// and/or automatic serialization-failure retry, use [`Db::tx_with`].
+    ///
+    /// # When to use this instead of [`Db::tx`]
+    ///
+    /// On Postgres this behaves exactly like [`Db::tx`]. On `SQLite` it begins
+    /// the transaction with `BEGIN IMMEDIATE`, taking the database write lock
+    /// before the closure runs. A concurrent writer then queues on the
+    /// connection's `busy_timeout` instead of failing its deferred read→write
+    /// snapshot upgrade with `SQLITE_BUSY_SNAPSHOT` (which bypasses the busy
+    /// handler — see issue #2885). Reach for this when the closure is
+    /// write-heavy: read-modify-write cycles, queue claims, session writes,
+    /// outbox/idempotency inserts.
+    ///
+    /// On a shared-cache target (`cache=shared`) it only stops the
+    /// participating writers from all reading before their read→write upgrade
+    /// attempts. It is not a completion guarantee — a concurrent reader's
+    /// table lock can still fail the write with `SQLITE_LOCKED_SHAREDCACHE` —
+    /// and it does **not** make other writers queue: their `BEGIN IMMEDIATE`
+    /// fails at once, because `SQLite` never consults the busy handler for
+    /// `SQLITE_LOCKED`. Serialize shared-cache
+    /// writers in the application or retry each through `tx_immediate` with
+    /// backoff — or move to a WAL-mode file database.
+    ///
+    /// The tradeoff is deliberate: an immediate transaction holds the write
+    /// lock for its whole lifetime, so a long-running `tx_immediate` serializes
+    /// other writers for longer than the equivalent deferred transaction
+    /// would. Keep the closure short, and keep pure reads on [`Db::tx`], which
+    /// stays deferred precisely so read-only transactions keep their read
+    /// concurrency.
+    ///
+    /// The `BEGIN IMMEDIATE` is issued through diesel's transaction manager
+    /// (see [`scoped_immediate_transaction`]), so nested [`savepoint`] calls
+    /// inside the closure become `SAVEPOINT`s — matching Postgres — rather than
+    /// failing with "cannot start a transaction within a transaction".
+    ///
+    /// The closure receives `&mut RuntimeConnection` (the bare runtime
+    /// connection), like the generated immediate-transaction paths — not the
+    /// `&mut PooledConnection` that [`Db::tx`] hands out. Repository methods
+    /// take `&mut RuntimeConnection`, so call sites read the same either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] when:
+    ///
+    /// - the underlying transaction returns an error,
+    /// - the closure returns an error that converts into `AutumnError`,
+    /// - this `Db` is already inside a transaction,
+    /// - this `Db` has been poisoned by a previously cancelled/dropped
+    ///   transaction future.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned (only
+    /// possible if a previous thread holding the lock panicked).
+    pub async fn tx_immediate<'a, T, E, F>(
+        &'a mut self,
+        f: F,
+    ) -> Result<T, crate::error::AutumnError>
+    where
+        T: Send + 'a,
+        E: From<diesel::result::Error> + Send + Sync + 'a,
+        crate::error::AutumnError: From<E>,
+        F: for<'r> FnOnce(
+                &'r mut RuntimeConnection,
+            ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+            + Send
+            + 'a,
+    {
+        if self.tx_poisoned {
+            return Err(crate::error::AutumnError::service_unavailable_msg(
+                "Database connection is in an invalid transaction state",
+            ));
+        }
+        if self.tx_depth > 0 {
+            return Err(crate::error::AutumnError::bad_request_msg(
+                NESTED_TX_MESSAGE,
+            ));
+        }
+        reject_ambient_after_commit_registry_for_tx()?;
+        self.tx_depth += 1;
+        let mut guard = TxDepthGuard {
+            depth: &mut self.tx_depth,
+            poisoned: &mut self.tx_poisoned,
+            disarmed: false,
+        };
+
+        // Each tx gets its own callback registry shared with the task-local so
+        // that code running inside the closure (jobs, mailer, hooks) can push
+        // callbacks without having access to `Db` directly. The `Arc` lets us
+        // read the registry after the `scope` future completes.
+        let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Mirrors `tx`, but the transaction begins IMMEDIATE (through the
+        // transaction manager, so the depth counter syncs and nested savepoints
+        // keep working) instead of deferred. `&mut self.conn` derefs from the
+        // pooled connection to the bare `RuntimeConnection` the helper takes.
+        let result = AFTER_COMMIT_REGISTRY
+            .scope(
+                registry.clone(),
+                scoped_immediate_transaction(&mut self.conn, f),
             )
             .await
             .map_err(Into::into);
@@ -2564,18 +3110,17 @@ impl Db {
         }
         reject_ambient_after_commit_registry_for_tx()?;
 
-        // Under the SQLite runtime there is no transaction builder that can
-        // enforce `READ ONLY` semantics — the `sqlite` arm below runs a single
-        // plain, writable transaction. Silently honoring a caller's
-        // `TxOptions::read_only()` by running a writable transaction anyway would
-        // let writes succeed and commit under a contract that promised none — a
-        // safety regression for any code relying on a read-only transaction to
-        // prevent mutation. So reject the request up front, BEFORE the closure
-        // can run, rather than pretending to honor it. (Real `query_only`
-        // enforcement is avoided deliberately: deadpool's `custom_setup` runs on
-        // CREATE only, so a leaked `PRAGMA query_only = ON` would poison a pooled
-        // connection for its lifetime.) The Postgres path enforces read-only via
-        // the transaction builder's `read_only()` and is unaffected.
+        // Under the SQLite runtime there is no transaction builder that can enforce
+        // `READ ONLY` semantics — the `sqlite` arm below runs a single plain, writable
+        // transaction. Silently honoring a caller's `TxOptions::read_only()` by running a
+        // writable transaction anyway would let writes succeed and commit under a
+        // contract that promised none, a safety regression for any code relying on a
+        // read-only transaction to prevent mutation. So reject the request up front,
+        // before the closure can run, rather than pretend to honor it. Real `query_only`
+        // enforcement is avoided deliberately: deadpool's `custom_setup` runs on create
+        // only, so a leaked `PRAGMA query_only = ON` would poison a pooled connection for
+        // its lifetime. The Postgres path enforces read-only via the transaction
+        // builder's `read_only()` and is unaffected.
         #[cfg(feature = "sqlite")]
         if opts.read_only {
             return Err(crate::error::AutumnError::bad_request_msg(
@@ -2601,20 +3146,17 @@ impl Db {
         );
 
         if self.is_test_tx {
-            // Under a transactional `TestApp` the connection is already inside
-            // the test harness's outer transaction (`begin_test_transaction`),
-            // so issuing a literal `BEGIN`/`SET TRANSACTION ISOLATION LEVEL`
-            // via `build_transaction()` here would be invalid — Postgres
-            // rejects `SET TRANSACTION ISOLATION LEVEL` inside a
-            // subtransaction, and the retry loop's per-attempt `&mut f`
-            // re-borrow doesn't type-check against the plain `transaction()`
-            // method's lifetime shape (unlike `build_transaction().run()`, its
-            // bound is not scoped to a single call). So: nest via `SAVEPOINT`
-            // instead, exactly like `Db::tx`, running the closure exactly
-            // once — the requested isolation/read-only/deferrable/retry
-            // options are inherited from (or meaningless nested inside) the
-            // outer test transaction, so there is nothing to retry against a
-            // single test-harness connection.
+            // Under a transactional `TestApp` the connection is already inside the test
+            // harness's outer transaction (`begin_test_transaction`), so issuing a
+            // literal `BEGIN`/`SET TRANSACTION ISOLATION LEVEL` via `build_transaction()`
+            // here would be invalid: Postgres rejects `SET TRANSACTION ISOLATION LEVEL`
+            // inside a subtransaction, and the retry loop's per-attempt `&mut f` re-borrow
+            // does not type-check against the plain `transaction()` method's lifetime
+            // shape, whose bound is not scoped to a single call. So nest via `SAVEPOINT`
+            // instead, exactly like `Db::tx`, running the closure once: the requested
+            // isolation, read-only, deferrable, and retry options are inherited from — or
+            // meaningless nested inside — the outer test transaction, so there is nothing
+            // to retry against a single test-harness connection.
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
             let conn: &mut RuntimeConnection = &mut self.conn;
             let result = AFTER_COMMIT_REGISTRY
@@ -2953,36 +3495,31 @@ impl Db {
                 .min(PG_TIMEOUT_MAX_MS)
         });
 
-        // Install a fresh per-request query timer, but ONLY when a query
-        // observer is active — EITHER a `REQUEST_DB_TIMINGS` scope (the
-        // `ServerTimingLayer`, enabled by `[observability] server_timing`) OR a
-        // `REQUEST_QUERY_CAPTURE` scope (the test harness capturing the SQL
-        // list, which runs with `server_timing` off). The timer feeds both
-        // lanes via `record_request_db_query`. Installed BEFORE the `SET
-        // statement_timeout` housekeeping statement below.
+        // Install a fresh per-request query timer, but only when a query observer is
+        // active: either a `REQUEST_DB_TIMINGS` scope (the `ServerTimingLayer`, enabled
+        // by `[observability] server_timing`) or a `REQUEST_QUERY_CAPTURE` scope (the
+        // test harness capturing the SQL list, which runs with `server_timing` off). The
+        // timer feeds both lanes via `record_request_db_query`, and is installed before
+        // the `SET statement_timeout` housekeeping statement below.
         //
-        // `set_instrumentation` WHOLESALE REPLACES the connection's
-        // instrumentation, so it must not run unconditionally: an application
-        // that registered a global default via
-        // `diesel::connection::set_default_instrumentation` (query logging,
-        // tracing, metrics) would have it silently clobbered on the first
-        // checkout and never restored — even when `server_timing` is disabled.
-        // Gating on `request_db_timing_active() || request_query_capture_active()`
-        // preserves the app's instrumentation whenever neither lane is scoped
-        // (no `server_timing`, no test capture — the production default), and
-        // only overwrites it for the duration a query observer is active.
+        // `set_instrumentation` wholesale replaces the connection's instrumentation, so
+        // it must not run unconditionally: an application that registered a global
+        // default via `diesel::connection::set_default_instrumentation` — query logging,
+        // tracing, metrics — would have it silently clobbered on the first checkout and
+        // never restored, even with `server_timing` disabled. Gating on
+        // `request_db_timing_active() || request_query_capture_active()` preserves the
+        // app's instrumentation whenever neither lane is scoped, the production default,
+        // and overwrites it only while a query observer is active.
         //
-        // Installing a *fresh* timer on every observed checkout also clears any
-        // stale `RequestQueryTimer` a pooled connection carried from a prior
-        // request (diesel-async's deadpool manager never resets instrumentation
-        // on recycle), so a stale timer can never record the upcoming
-        // housekeeping `SET` (or later app queries) into a *different* request's
-        // accumulator. Installing BEFORE the `SET` (which
-        // `is_uncounted_statement` classifies as housekeeping) keeps that
-        // statement out of the `Server-Timing` `db` count regardless. Any stale
-        // timer left on a connection later reused by an opted-out request is a
-        // cheap no-op: `on_start` probes both lanes before formatting or
-        // recording anything, so it never allocates off-scope.
+        // Installing a fresh timer on every observed checkout also clears any stale
+        // `RequestQueryTimer` a pooled connection carried from a prior request —
+        // diesel-async's deadpool manager never resets instrumentation on recycle — so a
+        // stale timer can never record the upcoming housekeeping `SET`, or later app
+        // queries, into another request's accumulator. Installing before the `SET`, which
+        // `is_uncounted_statement` classifies as housekeeping, keeps that statement out
+        // of the `Server-Timing` `db` count regardless. A stale timer left on a
+        // connection later reused by an opted-out request is a cheap no-op: `on_start`
+        // probes both lanes before formatting or recording anything.
         #[cfg(feature = "db")]
         {
             use diesel_async::AsyncConnection as _;
@@ -3113,33 +3650,72 @@ impl RequestDbContext {
     }
 }
 
-/// A database checkout that has been *prepared* but not *taken*.
+/// A database checkout that is *prepared* but not yet *taken*.
 ///
-/// [`Db`] is a `FromRequestParts` extractor, so axum runs it before the final
-/// `FromRequest` extractor reads the request body. A handler taking both
-/// therefore holds a pooled connection for as long as the client takes to send
-/// its body — and the client controls that. A handful of slow-body requests can
-/// pin `pool_size` connections and starve unrelated database work, with no
-/// request timeout configured by default to stop them.
+/// `Db` is a `FromRequestParts` extractor. Axum runs it before the
+/// `FromRequest` body extractor (`Form`, `Json`, `Multipart`, ...). A handler
+/// that takes `Db` before a body extractor holds a pooled connection for as
+/// long as the client takes to send its body. The client controls that
+/// delay. A few slow uploads can pin every connection in `pool_size` and
+/// stop all other database work.
 ///
-/// This captures what the checkout needs from the request parts — statement
-/// timeout, route key, metrics, interceptors, clock — and takes the connection
-/// only when [`DeferredDb::checkout`] is awaited, which the handler does after
-/// the body is in hand.
+/// `LazyDb` fixes this. Use it instead of `Db` in a handler that also takes a
+/// body extractor, in the same argument position:
 ///
-/// `pub(crate)` deliberately: the general answer is a lazy `Db` for every
-/// handler (#2264), and shipping a second public extractor would make that
-/// harder to land rather than easier.
-pub(crate) struct DeferredDb {
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[post("/comments")]
+/// async fn post_comment(
+///     lazy_db: LazyDb,
+///     axum::extract::Form(form): axum::extract::Form<CommentForm>,
+/// ) -> AutumnResult<&'static str> {
+///     let mut db = lazy_db.checkout().await?;
+///     save_comment(&mut db, &form.body).await?;
+///     Ok("posted")
+/// }
+///
+/// # #[derive(serde::Deserialize)]
+/// # struct CommentForm { body: String }
+/// # async fn save_comment(_db: &mut Db, _body: &str) -> AutumnResult<()> { Ok(()) }
+/// ```
+///
+/// Axum still runs `LazyDb::from_request_parts` before the body is read. But
+/// extraction only records what a checkout will need: the pool handle,
+/// statement timeout, route key, metrics, interceptors, clock. No connection
+/// is taken until the handler calls [`LazyDb::checkout`], after the body
+/// extractor has already run.
+///
+/// That guarantee assumes the body extractor actually reads the body during
+/// extraction — true for `Form` and `Json`, which buffer the whole body
+/// before the handler runs. It is **not** true for [`Multipart`]: extracting
+/// it does not read anything, and each field only streams in as the handler
+/// calls [`Multipart::next_field`] and reads from the returned field. Calling
+/// `checkout()` before that loop, the way the example above calls it right
+/// after a `Form` extractor, checks out a connection and then holds it for
+/// the loop's whole duration — exactly the pinning `LazyDb` exists to avoid.
+/// Call `checkout()` only after every field this handler needs has been
+/// fully read (buffered to memory or staged to disk), not before the loop
+/// that reads them.
+///
+/// [`Multipart`]: crate::extract::Multipart
+/// [`Multipart::next_field`]: crate::extract::Multipart::next_field
+pub struct LazyDb {
     pool: Pool<RuntimeConnection>,
     ctx: RequestDbContext,
     #[cfg(all(feature = "reporting", not(feature = "sqlite")))]
     capture_gap: Option<std::sync::Arc<str>>,
 }
 
-impl DeferredDb {
-    /// Take the connection. Called once the request body has been read.
-    pub(crate) async fn checkout(self) -> Result<Db, AutumnError> {
+impl LazyDb {
+    /// Take the connection. Call this once the request body has been read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] when the pool cannot hand out a connection —
+    /// the same failure [`Db`]'s own extractor would return, just reported
+    /// here instead of at extraction time.
+    pub async fn checkout(self) -> Result<Db, AutumnError> {
         let result = Db::checkout(DbCheckoutParams {
             pool: &self.pool,
             pool_name: "primary",
@@ -3163,7 +3739,7 @@ impl DeferredDb {
     }
 }
 
-impl<S> FromRequestParts<S> for DeferredDb
+impl<S> FromRequestParts<S> for LazyDb
 where
     S: DbState + Send + Sync,
 {
@@ -3238,15 +3814,15 @@ impl Drop for Db {
             // Record DB query metric
             let metric_key = format!("{route_key} SELECT");
             metrics.record_db_query(&metric_key, elapsed_ms);
-            // NOTE: deliberately *not* recorded into the Server-Timing
-            // per-request accumulator. `elapsed` here is the whole
-            // connection checkout-to-release window (see `start_time` /
-            // the `span` doc above), not a single query's wall time. Every
-            // request that extracts `Db` would otherwise add its entire
-            // connection-hold time as one bogus "query", inflating both
-            // `db;dur` and the `desc="N queries"` count (and double-counting
-            // against real queries recorded by `run_instrumented`). The
-            // accumulator must reflect only genuine instrumented queries.
+            // Deliberately not recorded into the Server-Timing per-request
+            // accumulator. `elapsed` here is the whole connection
+            // checkout-to-release window (see `start_time` and the `span` doc
+            // above), not a single query's wall time. Every request that extracts
+            // `Db` would otherwise add its entire connection-hold time as one
+            // bogus "query", inflating both `db;dur` and the `desc="N queries"`
+            // count, and double-counting against real queries recorded by
+            // `run_instrumented`. The accumulator must reflect genuine
+            // instrumented queries only.
 
             // Log slow query if it exceeds the threshold
             if elapsed >= self.slow_query_threshold {
@@ -3333,15 +3909,15 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
                 return Ok(None);
             };
 
-            // A custom provider that overrides only `create_pool` still gets its
-            // replica built by this default here, so the SQLite-replica rule must
-            // be enforced on this path too -- otherwise a provider configuring a
-            // distinct/in-memory `database.replica_url` would boot two unrelated
-            // SQLite databases and route reads to an empty/stale replica. Reuse
-            // the same helper `create_topology`/`create_shard_topology` use so the
-            // rejection rule cannot drift (addresses Codex P2). The primary URL is
-            // whatever `effective_primary_url` resolves; a provider returning a
-            // pool for a `None` primary URL has no URL to compare, so skip then.
+            // A custom provider that overrides only `create_pool` still gets its replica
+            // built by this default, so the SQLite-replica rule must be enforced here
+            // too. Otherwise a provider configuring a distinct or in-memory
+            // `database.replica_url` would boot two unrelated SQLite databases and route
+            // reads to an empty or stale replica. Reuse the same helper
+            // `create_topology`/`create_shard_topology` use, so the rejection rule cannot
+            // drift. The primary URL is whatever `effective_primary_url` resolves; a
+            // provider returning a pool for a `None` primary URL has no URL to compare,
+            // so skip then.
             #[cfg(feature = "sqlite")]
             if let (Some(primary_url), Some(replica_url)) = (
                 config.effective_primary_url(),
@@ -3413,6 +3989,30 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
+        // Continuous replication (#1628) needs the replicator to be the only
+        // component that ever checkpoints.
+        let plain = super::sqlite_connection_pragmas(false, false);
+        let replicating = super::sqlite_connection_pragmas(false, true);
+        assert!(!plain.contains("wal_autocheckpoint"));
+        assert!(replicating.contains("PRAGMA wal_autocheckpoint = 0"));
+        for pragmas in [plain, replicating] {
+            assert!(pragmas.contains("journal_mode = WAL"));
+            assert!(pragmas.contains("foreign_keys = ON"));
+            assert!(pragmas.contains("busy_timeout = 5000"));
+        }
+
+        // A read-only target still gets no writing pragmas — including under
+        // replication, which cannot apply to a database nothing writes to.
+        for replicating in [false, true] {
+            let read_only = super::sqlite_connection_pragmas(true, replicating);
+            assert!(!read_only.contains("journal_mode"));
+            assert!(!read_only.contains("wal_autocheckpoint"));
+            assert!(read_only.contains("foreign_keys = ON"));
+        }
+    }
+
     use super::*;
     use crate::config::DatabaseConfig;
     use std::sync::Arc;
@@ -4092,12 +4692,54 @@ mod tests {
         assert_eq!(via_provider.is_none(), via_function.is_none());
     }
 
+    // ── Backend-neutral test targets ─────────────────────────────
+    //
+    // The pool/topology mechanics below — max_size, the connect-timeout →
+    // wait/create mapping, replica retention, the read-pool fallback — are
+    // backend-independent, so they must hold on whichever backend
+    // `RuntimeConnection` resolves to. `crate::test_urls::primary` spells the
+    // target per backend; before it, an inline `postgres://…` made every one
+    // of them panic in `build_sqlite_pool` under `--features sqlite`, unseen
+    // because no CI lane ran the lib tests there.
+    use crate::test_urls::primary as test_primary_url;
+
+    /// A replica target to pair with `primary`.
+    ///
+    /// Postgres-only, and deliberately so: `database_backend_consistency`
+    /// refuses any `replica_url` alongside a `SQLite` primary, so every caller is
+    /// `#[cfg(not(feature = "sqlite"))]` and there is no `SQLite` spelling to
+    /// give. The `SQLite` side of the replica contract lives in the
+    /// `create_topology_*_sqlite_replica` tests.
+    #[cfg(not(feature = "sqlite"))]
+    fn test_replica_url(_primary: &str, name: &str) -> String {
+        format!("postgres://localhost/{name}")
+    }
+
     // ── Pool creation tests ──────────────────────────────────────
+
+    // `#[repository]`-generated code and `Db::checkout` already run `SET
+    // statement_timeout` on every acquire (a round trip to Postgres). That
+    // round trip already proves the connection is alive, so the pool must
+    // not pay for a second one via deadpool's default `Verified` recycling
+    // (issue #2485).
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn pg_manager_config_uses_fast_recycling_without_tls() {
+        let config = pg_manager_config("postgres://user:pass@localhost/app");
+        assert!(matches!(config.recycling_method, RecyclingMethod::Fast));
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn pg_manager_config_uses_fast_recycling_with_tls() {
+        let config = pg_manager_config("postgres://user:pass@localhost/app?sslmode=require");
+        assert!(matches!(config.recycling_method, RecyclingMethod::Fast));
+    }
 
     #[tokio::test]
     async fn default_pool_provider_respects_url_config() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             ..Default::default()
         };
         let provider = DieselDeadpoolPoolProvider::new();
@@ -4121,7 +4763,7 @@ mod tests {
     #[test]
     fn create_pool_with_url_returns_some() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             ..Default::default()
         };
         let pool = create_pool(&config).expect("should build pool from valid config");
@@ -4195,6 +4837,110 @@ mod tests {
             panic!("a Postgres url must refuse under the sqlite feature");
         };
         assert!(matches!(err, PoolError::UnsupportedBackend(_)), "{err:?}");
+    }
+
+    // The end-to-end contract the helper exists for: no refusal this module
+    // produces may carry a password into the boot log.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn pool_refusals_never_echo_a_password() {
+        for url in [
+            "postgres://user:hunter2@localhost/app",
+            "mysql://user:hunter2@localhost/app",
+            // The secret in the query string rather than the userinfo.
+            "mysql://localhost/app?password=hunter2",
+            "postgres://localhost/app?sslpassword=hunter2",
+            // The libpq keyword/value form: no URL shape at all.
+            "host=db user=app password=hunter2",
+            // ...and the same, malformed, so neither parser accepts it.
+            "host=db user=app password='hunter2",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.into()),
+                ..Default::default()
+            };
+            let Err(err) = create_pool(&config) else {
+                panic!("a non-sqlite target must refuse: {url}");
+            };
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("hunter2"),
+                "refusal leaked the password: {msg}"
+            );
+            assert!(msg.contains("****"), "refusal must show it masked: {msg}");
+        }
+    }
+
+    // A target that names NEITHER backend must refuse too, not be opened as a
+    // file whose name happens to be that string. `normalize_sqlite_target`
+    // strips only the `sqlite:`/`sqlite://` schemes and passes anything else
+    // through verbatim, so before this guard a `mysql:app.db` URL — or a typo
+    // like `sqllite:///app.db` — became a SQLite *filename*. Worse, every other
+    // consumer of the URL (`autumn doctor`, the generator's DDL mapping,
+    // `autumn migrate`) classifies it through `DatabaseBackend::detect`, which
+    // returns `None` for these shapes: the tooling would report "no recognized
+    // backend" while the runtime quietly served a database out of a junk file.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_pool_with_unrecognized_url_refuses_under_sqlite_feature() {
+        for url in [
+            "mysql://localhost/app",
+            "mysql:app.db",
+            // A near-miss typo of the sqlite scheme.
+            "sqllite:///var/lib/app.db",
+            // A bare filesystem path: deliberately NOT a recognized target (see
+            // `DatabaseBackend`), so it must not silently become one here.
+            "/var/lib/app.db",
+        ] {
+            let config = DatabaseConfig {
+                url: Some(url.into()),
+                ..Default::default()
+            };
+            let Err(err) = create_pool(&config) else {
+                panic!("an unrecognized url must refuse under the sqlite feature: {url}");
+            };
+            assert!(
+                matches!(err, PoolError::UnsupportedBackend(_)),
+                "expected UnsupportedBackend for {url}, got: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("sqlite:") && msg.contains(url),
+                "message must name the offending target and the accepted scheme, got: {msg}"
+            );
+        }
+    }
+
+    // …but the two scheme-less spellings `normalize_sqlite_target` explicitly
+    // maps to `:memory:` are NOT "unrecognized": `DatabaseBackend::detect`
+    // classifies by scheme and these carry none, yet the pool has always taken
+    // them, `run_pending_sqlite` lists `:memory:` among its accepted spellings,
+    // and `TestApp::with_transactional_db` hands its URL straight to
+    // `create_pool`. Refusing them would be a regression, so the guard admits
+    // them explicitly. Neither can become a stray file.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_pool_still_accepts_bare_in_memory_spellings() {
+        for url in [":memory:", ""] {
+            let config = DatabaseConfig {
+                url: Some(url.into()),
+                ..Default::default()
+            };
+            let pool = create_pool(&config)
+                .unwrap_or_else(|e| panic!("bare in-memory target {url:?} must build: {e}"));
+            assert!(
+                pool.is_some(),
+                "bare in-memory target {url:?} must yield a pool"
+            );
+            // Private in-memory: every connection is its own database, so the
+            // pool must stay single-slot (same rule `build_sqlite_pool` applies
+            // to the scheme-spelled forms).
+            assert_eq!(
+                pool.expect("pool").status().max_size,
+                1,
+                "bare in-memory target {url:?} must be single-slot"
+            );
+        }
     }
 
     // A SQLite runtime has no primary/replica replication in this pool
@@ -4445,6 +5191,109 @@ mod tests {
         assert!(!sqlite_target_is_memory("/var/lib/app.db"));
     }
 
+    // `sqlite_target_is_shared_cache` is the predicate that scopes the
+    // `statement_timeout` rejection message (issue #2881): it must catch every
+    // `cache=shared` spelling, including a shared-cache file target, and must
+    // not fire for private in-memory or plain file targets.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_target_is_shared_cache_covers_query_spellings() {
+        // Shared-cache in-memory spellings.
+        assert!(sqlite_target_is_shared_cache("file::memory:?cache=shared"));
+        assert!(sqlite_target_is_shared_cache(
+            "file:app?mode=memory&cache=shared"
+        ));
+        // Shared-cache also applies to file-backed targets.
+        assert!(sqlite_target_is_shared_cache(
+            "file:/srv/ref.db?cache=shared&mode=ro"
+        ));
+        // Private in-memory targets are NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache(":memory:"));
+        assert!(!sqlite_target_is_shared_cache("file::memory:"));
+        assert!(!sqlite_target_is_shared_cache("file::memory:?foo=bar"));
+        assert!(!sqlite_target_is_shared_cache("file:app?mode=memory"));
+        // Plain file targets are NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache("file:/srv/ref.db"));
+        assert!(!sqlite_target_is_shared_cache("/var/lib/app.db"));
+        // Text that merely contains `cache=shared` outside an exact query
+        // pair is NOT shared-cache.
+        assert!(!sqlite_target_is_shared_cache("/srv/cache=shared.db"));
+        assert!(!sqlite_target_is_shared_cache("/var/lib/cache=shared.db"));
+        assert!(!sqlite_target_is_shared_cache(
+            "file:/srv/app.db?note=cache=shared"
+        ));
+        assert!(!sqlite_target_is_shared_cache("file:app?cache=sharedly"));
+        // A URI fragment is not part of the query (SQLite ignores it).
+        assert!(sqlite_target_is_shared_cache(
+            "file:mem?mode=memory&cache=shared#tag"
+        ));
+        // Percent-encoded names and values decode as SQLite decodes them.
+        assert!(sqlite_target_is_shared_cache("file:app.db?%63ache=shared"));
+        assert!(sqlite_target_is_shared_cache("file:app.db?cache=%73hared"));
+        // A raw configured URL is normalized first.
+        assert!(sqlite_target_is_shared_cache(
+            "sqlite:file:app?mode=memory&cache=shared"
+        ));
+        // Only a `file:` URI has query parameters; elsewhere `?` is part of
+        // an ordinary filename.
+        assert!(!sqlite_target_is_shared_cache("app.db?cache=shared"));
+        assert!(!sqlite_target_is_shared_cache("sqlite:app.db?cache=shared"));
+        // A repeated parameter takes its last value.
+        assert!(!sqlite_target_is_shared_cache(
+            "file:app.db?cache=shared&cache=private"
+        ));
+        assert!(sqlite_target_is_shared_cache(
+            "file:app.db?cache=private&cache=shared"
+        ));
+    }
+
+    // The `statement_timeout` rejection must not claim `busy_timeout` bounds
+    // lock waits for `cache=shared` targets (issue #2881): shared-cache
+    // table-lock conflicts return `SQLITE_LOCKED` without invoking the busy
+    // handler at all, so the claim is false there and the message says so.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_statement_timeout_scopes_lock_wait_claim() {
+        let timeout = Some(std::time::Duration::from_millis(100));
+
+        let shared = reject_sqlite_statement_timeout(timeout, "file:app?mode=memory&cache=shared");
+        let message = match shared {
+            Err(PoolError::UnsupportedBackend(message)) => message,
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        };
+        assert!(
+            message.contains("does NOT bound"),
+            "shared-cache message must disclaim the busy_timeout bound, got: {message}"
+        );
+        assert!(
+            message.contains("SQLITE_LOCKED"),
+            "shared-cache message must name the failure mode, got: {message}"
+        );
+        assert!(
+            message.contains("#2881"),
+            "shared-cache message must point at the issue, got: {message}"
+        );
+        assert!(
+            !message.contains("already bounds lock waits"),
+            "shared-cache message must not make the unqualified claim, got: {message}"
+        );
+
+        let plain = reject_sqlite_statement_timeout(timeout, "file:/srv/app.db");
+        let message = match plain {
+            Err(PoolError::UnsupportedBackend(message)) => message,
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        };
+        assert!(
+            message.contains("(`busy_timeout` already bounds lock waits)"),
+            "non-shared-cache message keeps the original claim, got: {message}"
+        );
+
+        // No configured timeout asks for no guarantee and boots cleanly on
+        // either target shape.
+        assert!(reject_sqlite_statement_timeout(None, "file:app?mode=memory&cache=shared").is_ok());
+        assert!(reject_sqlite_statement_timeout(None, "file:/srv/app.db").is_ok());
+    }
+
     // `sqlite_target_is_any_in_memory` is the broader predicate the
     // startup-migration reject uses: it classifies EVERY in-memory spelling —
     // private AND shared-cache — as in-memory, because none of them survive the
@@ -4588,6 +5437,41 @@ mod tests {
         );
     }
 
+    // The runtime landed (#1905); the tree described it as pending for another
+    // release. Each phrase below is one a reader takes as the current contract,
+    // and each was false under `--features sqlite`. This is a ratchet, not a
+    // style rule: a "planned"/"not yet wired" claim about a SUBSYSTEM (sessions
+    // #1908, jobs #1907, backup #1909) is still accurate and is not matched.
+    #[test]
+    fn no_source_doc_still_calls_the_sqlite_runtime_unwired() {
+        let sources = [
+            ("autumn/src/db.rs", include_str!("db.rs")),
+            ("autumn/src/config.rs", include_str!("config.rs")),
+            ("autumn/Cargo.toml", include_str!("../Cargo.toml")),
+            (
+                "docs/guide/sqlite-in-production.md",
+                include_str!("../../docs/guide/sqlite-in-production.md"),
+            ),
+        ];
+        // Split, because this file is one of the files scanned: a phrase
+        // written whole here would be a finding against itself.
+        let stale = [
+            ["until the pool", "rework lands"].join(" "),
+            ["the runtime pool", "is not yet wired"].join(" "),
+            ["recognized-but", "not-yet-wired"].join("-"),
+            ["PR1 is", "a no-op refactor"].join(" "),
+            ["Update (this", "release)"].join(" "),
+        ];
+        for (name, text) in sources {
+            for phrase in &stale {
+                assert!(
+                    !text.contains(phrase.as_str()),
+                    "{name} still says {phrase:?}: the SQLite runtime is wired"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     fn normalize_sqlite_target_strips_schemes() {
@@ -4608,7 +5492,7 @@ mod tests {
     #[test]
     fn pool_respects_max_size() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             pool_size: 5,
             ..Default::default()
         };
@@ -4621,7 +5505,7 @@ mod tests {
     #[test]
     fn pool_clamps_size_to_one_if_zero() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             pool_size: 0,
             ..Default::default()
         };
@@ -4637,11 +5521,20 @@ mod tests {
 
     // ── Db extractor tests ───────────────────────────────────────
 
+    // Postgres-only: `database_backend_consistency` refuses ANY `replica_url`
+    // alongside a SQLite primary ("read replicas require the postgres
+    // backend"), so a two-pool topology is unreachable under the backend flip.
+    // Running this under `sqlite` would only assert pool mechanics for a
+    // configuration no validated deployment can have; the SQLite side of the
+    // replica contract is asserted by `create_topology_rejects_*_sqlite_replica`
+    // and `create_topology_allows_same_file_sqlite_replica` instead.
+    #[cfg(not(feature = "sqlite"))]
     #[test]
     fn database_topology_builds_primary_and_replica_pools() {
+        let primary = test_primary_url("primary");
         let config = DatabaseConfig {
-            primary_url: Some("postgres://localhost/primary".into()),
-            replica_url: Some("postgres://localhost/replica".into()),
+            primary_url: Some(primary.clone()),
+            replica_url: Some(test_replica_url(&primary, "replica")),
             primary_pool_size: Some(6),
             replica_pool_size: Some(2),
             ..Default::default()
@@ -4662,7 +5555,7 @@ mod tests {
     #[test]
     fn database_topology_single_url_builds_only_primary_pool() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/single".into()),
+            url: Some(test_primary_url("single")),
             pool_size: 5,
             ..Default::default()
         };
@@ -4679,7 +5572,7 @@ mod tests {
     #[test]
     fn config_runtime_drift_pool_applies_connect_timeout_to_wait_and_create() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(test_primary_url("test")),
             connect_timeout_secs: 7,
             ..Default::default()
         };
@@ -4715,7 +5608,7 @@ mod tests {
     #[test]
     fn database_topology_read_pool_falls_back_to_primary() {
         let config = DatabaseConfig {
-            url: Some("postgres://localhost/read-fallback".into()),
+            url: Some(test_primary_url("read-fallback")),
             pool_size: 3,
             ..Default::default()
         };
@@ -4749,10 +5642,49 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    /// #2264: `Db` is a `FromRequestParts` extractor. Axum runs it before a
+    /// body extractor (`Form`, `Json`, ...) reads the request body. A handler
+    /// that takes both holds a pooled connection for as long as the client
+    /// takes to send its body.
+    ///
+    /// `LazyDb` must not touch the pool during extraction. It defers the
+    /// checkout to `LazyDb::checkout`, called once the body is already read.
+    /// The pool here can never complete a checkout (`test_urls::unreachable`).
+    /// So `Db` extraction fails right away, while `LazyDb` extraction still
+    /// succeeds. Only its later `checkout()` call sees the same failure.
+    #[tokio::test]
+    async fn lazy_db_extraction_does_not_check_out_a_connection() {
+        use axum::http::Request;
+
+        let config = DatabaseConfig {
+            url: Some(crate::test_urls::unreachable("lazy-db-no-checkout")),
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+        let pool = create_pool(&config).unwrap().unwrap();
+        let state = TestReadState { primary: pool };
+
+        let (mut parts, ()) = Request::builder().body(()).unwrap().into_parts();
+        assert!(
+            Db::from_request_parts(&mut parts, &state).await.is_err(),
+            "sanity check: the eager extractor must fail against a pool \
+             that can never complete a checkout"
+        );
+
+        let (mut parts, ()) = Request::builder().body(()).unwrap().into_parts();
+        let lazy = LazyDb::from_request_parts(&mut parts, &state)
+            .await
+            .expect("LazyDb must extract without touching the pool");
+        assert!(
+            lazy.checkout().await.is_err(),
+            "the checkout failure is deferred, not avoided"
+        );
+    }
+
     #[tokio::test]
     async fn database_topology_primary_only_has_no_replica() {
         let config = DatabaseConfig {
-            primary_url: Some("postgres://user:pass@localhost/db".to_string()),
+            primary_url: Some(test_primary_url("db")),
             ..DatabaseConfig::default()
         };
         let topology = create_topology(&config).unwrap().unwrap();
@@ -4766,11 +5698,20 @@ mod tests {
         );
     }
 
+    // Postgres-only: `database_backend_consistency` refuses ANY `replica_url`
+    // alongside a SQLite primary ("read replicas require the postgres
+    // backend"), so a two-pool topology is unreachable under the backend flip.
+    // Running this under `sqlite` would only assert pool mechanics for a
+    // configuration no validated deployment can have; the SQLite side of the
+    // replica contract is asserted by `create_topology_rejects_*_sqlite_replica`
+    // and `create_topology_allows_same_file_sqlite_replica` instead.
+    #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     async fn database_topology_from_pools_retains_replica() {
+        let primary = test_primary_url("primary");
         let config = DatabaseConfig {
-            primary_url: Some("postgres://user:pass@localhost/db".to_string()),
-            replica_url: Some("postgres://user:pass@localhost/db_replica".to_string()),
+            primary_url: Some(primary.clone()),
+            replica_url: Some(test_replica_url(&primary, "db_replica")),
             ..DatabaseConfig::default()
         };
         let topology = create_topology(&config).unwrap().unwrap();
@@ -5978,15 +6919,14 @@ pub(crate) fn establish_migration_connection(
         return diesel::PgConnection::establish(database_url).map(MigrationConnection::Native);
     }
     let posture = tls::TlsPosture::from_database_url(database_url);
-    // Build a dedicated runtime and connect ON THE CALLING THREAD directly
-    // (no further nested thread-spawn needed here): per this function's own
-    // contract above, every caller already guarantees the calling thread has
-    // never entered any runtime, so entering this freshly built one is
-    // always safe. It drives the connection's background I/O task for as
-    // long as `conn` is used, so it is kept alongside `conn` in
-    // [`MigrationConnection::Rustls`] — dropping it is likewise safe here,
-    // since by the time it drops (after every query `$body` makes has
-    // completed) this thread is not mid-`block_on` on anything.
+    // Build a dedicated runtime and connect on the calling thread directly, with no
+    // further nested thread-spawn: per this function's own contract above, every caller
+    // guarantees the calling thread has never entered any runtime, so entering this
+    // freshly built one is always safe. It drives the connection's background I/O task
+    // for as long as `conn` is used, so it is kept alongside `conn` in
+    // [`MigrationConnection::Rustls`]. Dropping it is likewise safe here: by the time it
+    // drops, after every query `$body` makes has completed, this thread is not
+    // mid-`block_on` on anything.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -6020,9 +6960,10 @@ pub(crate) fn establish_migration_connection(
 /// *immediately* with `SQLITE_BUSY`, and `auto_migrate_sqlite` exits the process.
 /// With the timeout, migration statements WAIT up to 5s for the lock to clear
 /// instead of aborting; diesel migrations are idempotent, so a migrator that
-/// waits and then finds migrations already applied is fine. Only `busy_timeout`
-/// is set here — NOT `foreign_keys`/`journal_mode`, because `foreign_keys = ON`
-/// can break table-recreating migrations.
+/// waits and then finds migrations already applied is fine.
+///
+/// Only `busy_timeout` is set here — NOT `foreign_keys`/`journal_mode`, because
+/// `foreign_keys = ON` can break table-recreating migrations.
 ///
 /// # Errors
 ///
@@ -6077,22 +7018,19 @@ mod migration_connection_tests {
         }
     }
 
-    // Regression: TLS-enabled migrations panicked with "Cannot start
-    // a runtime from within a runtime" when called directly from an app's
-    // own async `on_startup` hook rather than from `spawn_blocking` --
-    // because the rustls arm's connect used to `block_on` on the CALLING
-    // thread, which IS one of the ambient runtime's own worker threads while
-    // an `.on_startup(|state| async move { ... })` body executes. TLS off
-    // (dev) never took this arm, so the bug only ever surfaced with
-    // `sslmode=require`/`verify-full` (prod).
+    // Regression: TLS-enabled migrations panicked with "Cannot start a runtime from
+    // within a runtime" when called directly from an app's own async `on_startup` hook
+    // rather than from `spawn_blocking`. The rustls arm's connect used to `block_on` on
+    // the calling thread, which is one of the ambient runtime's worker threads while an
+    // `.on_startup(|state| async move { ... })` body executes. TLS off (dev) never took
+    // that arm, so the bug surfaced only with `sslmode=require`/`verify-full`.
     //
-    // Exercises `crate::migrate::pending_migrations` -- the actual public
-    // entry point apps call -- rather than `establish_migration_connection`
-    // directly: that bare function is only safe when the whole connect +
-    // query sequence runs on a thread that never entered a runtime, a
-    // guarantee `with_migration_connection!` (which `pending_migrations`
-    // uses internally) provides by construction. Calling it directly, as
-    // this test used to, no longer represents how any real caller uses it.
+    // This exercises `crate::migrate::pending_migrations`, the public entry point apps
+    // call, rather than `establish_migration_connection` directly: that bare function is
+    // safe only when the whole connect-and-query sequence runs on a thread that never
+    // entered a runtime, a guarantee `with_migration_connection!` provides by
+    // construction. Calling it directly, as this test used to, no longer represents how
+    // any real caller uses it.
     #[tokio::test(flavor = "multi_thread")]
     async fn migration_functions_do_not_panic_from_an_async_caller() {
         const MIGRATIONS: crate::migrate::EmbeddedMigrations =
@@ -6110,17 +7048,15 @@ mod migration_connection_tests {
         );
     }
 
-    // Regression guard: `#[tokio::test]`'s default flavor is `current_thread`
-    // -- exactly one thread drives this runtime's I/O and timers, and that
-    // thread is the one about to call a migration function directly
-    // (mirroring an app's own `.on_startup` hook body, not `spawn_blocking`).
-    // If `with_migration_connection!` ever went back to running the connect
-    // (or the query) on the CALLING thread instead of a freshly spawned
-    // `thread::scope` thread, this would DEADLOCK rather than fail fast:
-    // there would be nothing left free to drive the connect's I/O. A
-    // watchdog thread bounds that -- there is no clean way to cancel a
-    // genuinely stuck OS thread, so a real regression here hard-exits the
-    // process instead of hanging the suite.
+    // Regression guard: `#[tokio::test]`'s default flavor is `current_thread`, so exactly
+    // one thread drives this runtime's I/O and timers, and that thread is the one about
+    // to call a migration function directly — mirroring an app's own `.on_startup` hook
+    // body, not `spawn_blocking`. If `with_migration_connection!` ever went back to
+    // running the connect, or the query, on the calling thread instead of a freshly
+    // spawned `thread::scope` thread, this would deadlock rather than fail fast: nothing
+    // would be left free to drive the connect's I/O. A watchdog thread bounds that —
+    // there is no clean way to cancel a genuinely stuck OS thread, so a real regression
+    // hard-exits the process instead of hanging the suite.
     #[tokio::test]
     async fn migration_functions_do_not_hang_on_a_current_thread_runtime() {
         const MIGRATIONS: crate::migrate::EmbeddedMigrations =

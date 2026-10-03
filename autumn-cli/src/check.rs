@@ -191,6 +191,23 @@ fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
     let body_start = html.find("<body").unwrap_or(0);
     let body_content = &html[body_start..];
 
+    // A skip link exists to let keyboard users jump past content that
+    // precedes the page's main landmark (nav, header, banners, ...). When
+    // the landmark is itself the first thing in `<body>` there is nothing to
+    // bypass, so requiring a skip link would flag pages it cannot help
+    // (e.g. a single-section page whose only link sits in its footer, after
+    // the landmark). Only applied when a main landmark was actually found —
+    // its absence is `landmark-one-main`'s concern, not this rule's.
+    // `find_main_landmark` accepts the same two shapes that rule does
+    // (`<main>` or `role="main"`), so a page using the ARIA form alone isn't
+    // treated as having no landmark and pushed through the stricter path.
+    let body_tag_end = body_content.find('>').map_or(0, |p| p + 1);
+    if let Some(main_pos) = find_main_landmark(body_content)
+        && !body_content[body_tag_end..main_pos].contains('<')
+    {
+        return;
+    }
+
     // The skip link must be the FIRST focusable link in the document; a skip
     // link that comes after navigation links doesn't help keyboard users.
     // Verify by finding the first <a > and checking it is the skip link.
@@ -519,6 +536,51 @@ fn strip_html_comments(html: &str) -> String {
 
     result.push_str(rest);
     result
+}
+
+/// Byte offset of the first opening tag exactly named `name` (via
+/// [`opening_tag_matches`]), or `None` if there is none. Unlike a bare
+/// `html.find("<name")`, this does not mistake a custom element sharing the
+/// prefix (e.g. `<main-nav>` when searching for `main`) for the real tag.
+fn find_opening_tag(html: &str, name: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    while let Some(rel_pos) = html[offset..].find('<') {
+        let tag_start = offset + rel_pos;
+        let rest = &html[tag_start..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        if opening_tag_matches(tag, name) {
+            return Some(tag_start);
+        }
+        offset = tag_start + tag_end.saturating_add(1);
+    }
+    None
+}
+
+/// Byte offset of the page's first accepted main-landmark element: a
+/// `<main>` tag or any element carrying `role="main"`, whichever comes
+/// first — the same two shapes [`check_landmark_main`] accepts as
+/// equivalent. `None` if neither is present.
+fn find_main_landmark(html: &str) -> Option<usize> {
+    let main_tag = find_opening_tag(html, "main");
+    let mut role_main = None;
+    let mut offset = 0usize;
+    while let Some(rel_pos) = html[offset..].find('<') {
+        let tag_start = offset + rel_pos;
+        let rest = &html[tag_start..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        if attr_value(tag, "role").as_deref() == Some("main") {
+            role_main = Some(tag_start);
+            break;
+        }
+        offset = tag_start + tag_end.saturating_add(1);
+    }
+    match (main_tag, role_main) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(pos), None) | (None, Some(pos)) => Some(pos),
+        (None, None) => None,
+    }
 }
 
 fn count_opening_tags(html: &str, name: &str) -> usize {
@@ -919,6 +981,61 @@ mod tests {
         let html = r#"<html lang="en"><body><nav>stuff</nav><main></main></body></html>"#;
         assert!(
             violation_ids(html).contains(&"bypass"),
+            "{:?}",
+            violation_ids(html)
+        );
+    }
+
+    #[test]
+    fn main_first_in_body_no_skip_link_needed_passes() {
+        // <main> is the very first thing in <body> — no nav/header precedes
+        // it, so there is nothing for a skip link to bypass. The page's only
+        // link sits in its footer, after <main>. Flagging this would ask for
+        // a skip link that fixes nothing (issue found via examples/todo-app).
+        let html = r#"<html lang="en"><body><main><h1>Hi</h1></main><footer><a href="/">Home</a></footer></body></html>"#;
+        assert!(
+            !violation_ids(html).contains(&"bypass"),
+            "{:?}",
+            violation_ids(html)
+        );
+    }
+
+    #[test]
+    fn bare_links_before_main_without_nav_tag_still_requires_skip_link() {
+        // Content before <main> still needs a skip link even when it isn't
+        // wrapped in a literal <nav> element (mirrors
+        // skip_link_after_nav_link_fails, without the skip link at all).
+        let html = r#"<html lang="en"><body><a href="/home">Home</a><main><h1>Hi</h1></main></body></html>"#;
+        assert!(
+            violation_ids(html).contains(&"bypass"),
+            "{:?}",
+            violation_ids(html)
+        );
+    }
+
+    #[test]
+    fn custom_element_sharing_main_prefix_is_not_mistaken_for_landmark() {
+        // A bare substring search for "<main" would match "<main-nav>" (a
+        // custom element), treat it as the landmark, and see nothing before
+        // it — wrongly exempting a page whose real navigation-bearing
+        // <main-nav> precedes the actual <main> landmark and has no skip
+        // link.
+        let html = r#"<html lang="en"><body><main-nav><a href="/home">Home</a></main-nav><main><h1>Hi</h1></main></body></html>"#;
+        assert!(
+            violation_ids(html).contains(&"bypass"),
+            "{:?}",
+            violation_ids(html)
+        );
+    }
+
+    #[test]
+    fn role_main_first_in_body_no_skip_link_needed_passes() {
+        // `role="main"` is an equally valid landmark (check_landmark_main
+        // already accepts it); a page using only that form, with nothing
+        // before it, has just as little to bypass as a literal <main> first.
+        let html = r#"<html lang="en"><body><div role="main"><h1>Hi</h1></div><footer><a href="/">Home</a></footer></body></html>"#;
+        assert!(
+            !violation_ids(html).contains(&"bypass"),
             "{:?}",
             violation_ids(html)
         );

@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "autumn-edge", "examples/hello", "examples/edge-greeting", "examples/flock", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "benchmarks/runtime/gate", "example-e2e"]
+members = ["autumn", "autumn-macros", "autumn-macros-model", "autumn-macros-repository", "autumn-macros-support", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "autumn-edge", "autumn-plugin-reference", "autumn-billing", "examples/hello", "examples/edge-greeting", "examples/hot-upgrade", "examples/flock", "examples/todo-app", "examples/collab-notes", "examples/blog", "examples/cms", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "examples/react-graphql", "examples/mesh-catalog", "examples/mesh-storefront", "benchmarks/runtime/gate", "example-e2e"]
 # The cargo-fuzz crate builds only under nightly with sanitizers and pulls
 # `autumn` in as a path dependency. Excluding it keeps `cargo build/test
 # --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
@@ -28,13 +28,20 @@ autumn-web = { path = "autumn" }
 [workspace.package]
 edition = "2024"
 rust-version = "1.88.0"
-version = "0.7.0"
+version = "0.8.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/autumn-foundation/autumn"
 
 [workspace.dependencies]
 # Runtime
-axum = { version = "0.8", features = ["macros", "ws"] }
+# `http2` is load-bearing for issue #2321: `autumn/src/tls.rs` advertises
+# `h2` in the rustls ALPN list, and `axum::serve` runs every connection
+# through `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled
+# out unless hyper-util's `http2` feature is on (enabled here via
+# `axum/http2`). Without it, a client that negotiates `h2` gets
+# "HTTP/2 is not supported" and the connection dies instead of serving.
+# Pinned by `serve_stack_speaks_http2` in `autumn/src/tls.rs`.
+axum = { version = "0.8", features = ["macros", "ws", "http2"] }
 # Multipart boundary parsing for the submit-token replay guard. `multer` is the
 # exact parser axum's `Multipart` extractor uses downstream (via `mime`), so the
 # guard and the extractor can never disagree about the boundary. Already in the
@@ -42,6 +49,10 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 # the version already resolved in Cargo.lock.
 multer = "3.1"
 tokio-util = "0.7"
+# Cargo-semantics version-requirement matching for the plugin API stability
+# contract (issue #1601): a plugin declares the `autumn-web` range it supports
+# and the framework evaluates it at registration. No transitive dependencies.
+semver = "1"
 # Automatic ACME (Let's Encrypt) certificate provisioning (issue #1608, the
 # `acme` feature on autumn-web). `default-features = false` + `ring` is load
 # bearing: the DEFAULT features of both crates pull `aws-lc-rs` into the
@@ -57,6 +68,13 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 socket2 = { version = "0.6", features = ["all"] }
 diesel = { version = "2", features = ["sqlite", "postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
+# Keep the bundled libpq source at or above 0.3.13. `pq-src` 0.3.12 (libpq
+# 18.6) called `timingsafe_bcmp`, which glibc does not have, so every binary
+# that linked it failed with an undefined symbol; 0.3.13 compiles libpq's own
+# `src/port/timingsafe_bcmp.c`, so the floor excludes only the broken release.
+# `pq-sys` (below `autumn-web`'s `db` feature) accepts `>=0.2, <0.4`, so the
+# pin changes no other crate.
+pq-src = { version = ">=0.3.13, <0.4", default-features = false }
 # `async-connection-wrapper` provides the sync diesel API (incl. running
 # diesel_migrations) over an async connection — used to run startup
 # migrations and wait checks through the rustls TLS connector, since the
@@ -64,6 +82,11 @@ pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 diesel-async = { version = "0.9", features = ["deadpool", "postgres", "async-connection-wrapper"] }
 diesel_migrations = "2"
 http = "1"
+# Direct edge for the `serve_stack_speaks_http2` regression test in
+# `autumn/src/tls.rs` (dev-dependency of the `autumn` crate only): it must NOT
+# enable `http2` itself, so that dropping `axum/http2` above breaks the test
+# compile. Pinned to the version already resolved in Cargo.lock.
+hyper-util = { version = "0.1.20", default-features = false, features = ["server", "tokio", "http1"] }
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -90,7 +113,7 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["card", "derive"] }
 bcrypt = "0.19"
 futures = "0.3"
 indexmap = "2"
@@ -118,9 +141,13 @@ printpdf = { version = "0.12", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 # Proc macro
-syn = { version = "2", features = ["full"] }
+syn = { version = "3", features = ["full", "visit", "visit-mut"] }
 quote = "1"
 proc-macro2 = "1"
+# Resolves a dependency's actual (possibly `package = "..."`-renamed) crate
+# name from the invoking crate's Cargo.toml — used by autumn-macros to emit
+# `::autumn_web` paths that still resolve after a downstream rename (#1828).
+proc-macro-crate = "3.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -168,3 +195,20 @@ disallowed_methods = "allow"
 # Revisit deliberately if the extractor hot path ever shows up in a profile —
 # it is a real (if small) win, just not one to take blind.
 unused_async_trait_impl = "allow"
+# rustc 1.99 lints `redundant_field_names` through macro expansions and pins the
+# span on the user's field, so every `#[derive(diesel::QueryableByName)]` struct
+# is flagged for the `field: field` initializer that diesel's derive emits —
+# 207 sites across the workspace, none of them hand-written code. The source
+# cannot be changed to satisfy it (the initializer is not ours), and a per-struct
+# `#[allow]` on ~100 raw-SQL row types would be noise. Hand-written
+# `Foo { a: a }` is a style nit the formatter-adjacent review already catches.
+#
+# Revisit when diesel_derives stops emitting the redundant spelling.
+redundant_field_names = "allow"
+# rustc 1.99 added `clippy::assert_is_empty` (nursery), which rewrites
+# `assert!(v.is_empty())` to `assert_eq!(v, [] as [T; 0])` and
+# `assert!(!v.is_empty())` to `assert_ne!`. All 232 sites are in test code. The
+# suggested spelling is harder to read, needs `Debug + PartialEq` on every
+# element type, and for the non-collection receivers (`str`, `Option`, custom
+# `is_empty`) has no sensible rewrite at all. `is_empty()` is the idiom.
+assert_is_empty = "allow"

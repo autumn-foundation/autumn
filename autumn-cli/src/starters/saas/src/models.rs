@@ -37,14 +37,18 @@ pub struct NewUser {
 // is omitted from the generated `NewProject` insert struct.
 
 /// A project belonging to a single tenant.
+///
+/// Keep the fields in the column order of `schema::projects`. The generated
+/// reads decode each row by position, so a different order puts the tenant id
+/// into `name` (issue #2854).
 #[autumn_web::model(table = "projects")]
 pub struct Project {
     #[id]
     pub id: i64,
-    #[validate(length(min = 1, max = 200))]
-    pub name: String,
     #[default]
     pub tenant_id: String,
+    #[validate(length(min = 1, max = 200))]
+    pub name: String,
     #[default]
     pub created_at: chrono::NaiveDateTime,
 }

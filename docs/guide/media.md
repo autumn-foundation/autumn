@@ -25,8 +25,8 @@ For a runnable end-to-end demo, see [`examples/media-room`](../../examples/media
 
 ```toml
 [dependencies]
-autumn-web = "0.7"
-autumn-media-plugin = "0.7"
+autumn-web = "0.8"
+autumn-media-plugin = "0.8"
 ```
 
 ## Mounting the plugin
@@ -116,7 +116,7 @@ endpoint_url      = "https://t3.storage.dev"
 region            = "auto"
 access_key_id     = "${MEDIA_S3_KEY}"
 secret_access_key = "${MEDIA_S3_SECRET}"
-public_base_url   = "https://cdn.example.com/media"
+public_base_url   = "https://cdn.example.com/media"  # required unless endpoint_url is Tigris
 key_prefix        = "media"
 force_path_style  = false
 
@@ -140,8 +140,9 @@ when no `[media]` table is present:
 - `MediaConfig::from_arroyo_env()` — the migration shim (see below).
 
 Call `media.validate()?` before mounting to fail fast on cross-field problems
-(an out-of-range room cap, `backend = "s3"` without a `bucket`, or exactly one
-of the S3 access-key/secret-key pair). The pure, testable cores
+(an out-of-range room cap, `backend = "s3"` without a `bucket`, exactly one
+of the S3 access-key/secret-key pair, or a generic — non-Tigris — S3 backend
+without a `public_base_url`). The pure, testable cores
 (`from_toml_str_with_env`, `from_autumn_dir_with_env`, `from_arroyo_env_pairs`)
 take an explicit env map so config resolution can be unit-tested without
 touching process-global state.
@@ -166,7 +167,7 @@ that cap is out of scope.
 
 ### The room signaling routes
 
-When `with_rooms()` is enabled, the plugin nests four HTTP routes under the API
+When `with_rooms()` is enabled, the plugin nests five HTTP routes under the API
 prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 
 | Method | Path | Purpose |
@@ -174,14 +175,18 @@ prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 | `POST` | `/api/media/rooms` | Create a room; returns a token-free `RoomSnapshot`. |
 | `POST` | `/api/media/rooms/{room_id}/join` | Join a room; returns a `JoinResponse` (session token + mesh transport targets). |
 | `POST` | `/api/media/rooms/{room_id}/leave` | Leave a room (verifies the session token). |
+| `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness and renew the advisory token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | The **member-gated** roster (`Authorization: Bearer <session token>`). |
 
-> **Security:** these routes ship **no built-in authentication or rate
-> limiting** on create/join — they **must** be mounted behind your
-> application's own auth / rate-limit middleware. The plugin does not gate who
-> may create or join a room. An `InMemoryRoomStore` caps the registry at 10,000
+> **Security:** create and join are `#[secured]`: they require an
+> authenticated session (the app's `auth.session_key` in the session), and an
+> anonymous request gets `401 Unauthorized`. Call them from a signed-in browser
+> session, or send the session cookie with API clients. Leave, heartbeat and the
+> roster are authorized by the per-room session token `join` returns. The
+> plugin ships **no rate limiting** — mount the routes behind your own
+> rate-limit middleware. An `InMemoryRoomStore` caps the registry at 10,000
 > rooms as a defense-in-depth backstop, and a background reaper reclaims idle
-> rooms, but neither substitutes for your auth layer.
+> rooms.
 
 A `join` response gives the joiner its own `publish` target (the WHIP URL for
 its `MediaMTX` path) plus one `subscribe` target (a WHEP URL) per existing peer.
@@ -220,8 +225,9 @@ async fn create_room(State(state): State<AppState>) -> AutumnResult<Json<serde_j
 ```
 
 `RoomService` exposes `create()`, `join(room_id, display_name)`,
-`leave(room_id, participant_id, token)`, and `roster(room_id, auth_token)` — the
-same operations the built-in routes call. It is cheap to `Clone` (the store is
+`leave(room_id, participant_id, token)`,
+`heartbeat(room_id, participant_id, token)`, and `roster(room_id, auth_token)` —
+the same operations the built-in routes call. It is cheap to `Clone` (the store is
 an `Arc`).
 
 ### Room store backends
@@ -248,6 +254,26 @@ a background reaper (`spawn_room_reaper_loop`) reclaims stale participants and
 idle rooms by `last_seen_at` / `created_at`. The `DbRoomStore` reaper is a
 last-write-wins sweep, so concurrent reapers across processes converge with no
 corruption.
+
+Two client signals refresh `last_seen_at`: an explicit heartbeat, and — as a
+side effect — a member-gated roster poll. Do either on any interval well under
+the idle TTL (default 15 minutes, `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS`) and the
+seat is held. Send a heartbeat as:
+
+<!-- config-key-allow: AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS — read directly by the reaper as an env-overridable constant, not a `[media]` config key; promoting it is a documented follow-up on `spawn_room_reaper_loop` -->
+
+```http
+POST /api/media/rooms/{room_id}/heartbeat
+{ "participant_id": "...", "session_token": "..." }
+```
+
+It answers `{"alive": true, "token_expires_at": "..."}` with the expiry renewed
+to `now + room_token_ttl_seconds`; the token **value** never rotates, so an
+in-flight roster poll keeps working. Like the roster, it is fail-closed: an
+unknown room, unknown participant and wrong token are one indistinguishable
+`404`. Liveness is client-driven, not media-derived — a participant that neither
+heartbeats nor polls for a full idle TTL loses its signaling record (its live
+`MediaMTX` path is untouched, so it can simply re-join).
 
 ## Broadcast, transport, and encoding
 

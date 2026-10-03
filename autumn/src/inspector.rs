@@ -16,9 +16,16 @@
 //! profile), the `InspectorLayer` is never mounted and the path is
 //! completely absent.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -455,12 +462,17 @@ where
         let query_list = RequestQueryList::new();
         req.extensions_mut().insert(query_list.clone());
 
-        let start = Instant::now();
+        let start = crate::time::ambient_instant();
         let fut = self.inner.call(req);
 
         Box::pin(async move {
             let mut response = fut.await?;
-            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let elapsed_ms = u64::try_from(
+                crate::time::ambient_instant()
+                    .saturating_duration_since(start)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
 
             let status = response.status().as_u16();
             let content_type = response
@@ -476,9 +488,7 @@ where
 
             let queries = query_list.snapshot();
             let n_plus_one = detect_n_plus_one(&queries, threshold);
-            let recorded_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
+            let recorded_at = crate::time::clock_unix_secs(&crate::time::AmbientClock);
 
             let record = RequestRecord {
                 id: 0, // assigned by InspectorBuffer::push
@@ -529,16 +539,29 @@ fn extract_session_id(headers: &axum::http::HeaderMap, cookie_name: &str) -> Opt
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
+/// Every path [`inspector_router`] mounts, given the configured base `path`.
+///
+/// The router mounts two routes, not one — the index and a detail template —
+/// so anything needing to know what the inspector claims (the router's
+/// collision preflight, for one) derives both from here rather than assuming
+/// the configured path is the whole story. Issue #2355: an inspector
+/// configured outside `/_autumn` left `{path}/requests/{id}` unclaimed, and a
+/// plugin declaring that shape panicked at startup.
+#[must_use]
+pub fn inspector_endpoint_paths(path: &str) -> [String; 2] {
+    [path.to_owned(), format!("{path}/requests/{{id}}")]
+}
+
 /// Build the router for the inspector UI.
 ///
-/// Mounts:
+/// Mounts, per [`inspector_endpoint_paths`]:
 /// * `GET {path}` — request list (newest-first)
 /// * `GET {path}/requests/{id}` — request detail
 pub fn inspector_router<S>(buffer: InspectorBuffer, path: &str) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let detail_path = format!("{path}/requests/{{id}}");
+    let [_, detail_path] = inspector_endpoint_paths(path);
     let buf_index = buffer.clone();
     let buf_detail = buffer;
     let path_for_index = path.to_owned();

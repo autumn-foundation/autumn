@@ -23,13 +23,35 @@ use crate::{
 // primary, NOT a replica. A request-scoped constructor would let the same query
 // route to a replica for free.
 
+// ── Backend portability (issue #2108) ────────────────────────────────────────
+//
+// `changed_at` is a `timestamptz` column. The table and the model declare the
+// portable `Timestamp` type with a `NaiveDateTime` field. Do not write
+// `Timestamptz` here. Diesel implements `HasSqlType<Timestamptz>` for `Pg`
+// only, so the generated DSL stops compiling under `autumn-web/sqlite`.
+//
+// This does not change what Postgres returns. Postgres sends `timestamp` and
+// `timestamptz` in the same binary form: microseconds from 2000-01-01 UTC. A
+// `Timestamp` read of a `timestamptz` column gives the UTC wall clock. The
+// session time zone has no effect. `and_utc()` adds the offset again at the
+// JSON boundary. `tests/experiment_admin_db.rs` asserts this on a non-UTC
+// session.
+//
+// The write direction is safe too. `#[default]` keeps `changed_at` out of
+// `NewExperimentChange` and `UpdateExperimentChange`, so the generated CRUD
+// cannot write it, and every writer in the workspace is raw SQL that names
+// `(experiment, mutation, actor)` only. One vector remains: a hand-written
+// `insert_into(...).values(&ExperimentChange)` binds `changed_at` as
+// `timestamp`, and Postgres then coerces it with the SESSION time zone.
+// diesel-async sets every new connection to UTC (`set_config_options` in
+// `diesel_async::pg`), so this is correct unless the app overrides that.
 diesel::table! {
     autumn_experiment_changes (id) {
         id -> diesel::sql_types::Int8,
         experiment -> diesel::sql_types::Text,
         mutation -> diesel::sql_types::Text,
         actor -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
-        changed_at -> diesel::sql_types::Timestamptz,
+        changed_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -42,7 +64,7 @@ pub struct ExperimentChange {
     pub mutation: String,
     pub actor: Option<String>,
     #[default]
-    pub changed_at: chrono::DateTime<chrono::Utc>,
+    pub changed_at: chrono::NaiveDateTime,
 }
 
 #[autumn_web::repository(ExperimentChange, table = "autumn_experiment_changes")]
@@ -54,6 +76,14 @@ pub trait ExperimentChangeRepository {
 }
 
 /// Admin panel model for A/B experiments.
+///
+/// # Postgres only
+///
+/// This model reads and writes `autumn_experiments`. That table is Postgres-only.
+/// Its SQL uses `ILIKE`, `::type` casts and writable CTEs, which `SQLite` does
+/// not have. On `SQLite` every method refuses with an error that names this
+/// model. The plugin core is backend-agnostic: register your own
+/// [`AdminModel`](crate::AdminModel)s there instead. See the crate README.
 ///
 /// Register this model with the admin plugin to get an experiment management UI
 /// at `/admin/experiments/`:
@@ -155,22 +185,14 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
 
             let per_page = params.per_page;
-            let offset = if per_page == 0 {
-                0
-            } else {
-                params.page.saturating_sub(1) * per_page
-            };
-            let limit = if per_page == 0 {
-                i64::MAX
-            } else {
-                i64::try_from(per_page).unwrap_or(i64::MAX)
-            };
+            let (offset, limit) = params.sql_offset_limit();
             let search_pattern = format!("%{}%", params.search.as_deref().unwrap_or(""));
 
             let total: i64 = diesel::sql_query(
@@ -192,7 +214,7 @@ impl AdminModel for ExperimentAdminModel {
             )
             .bind::<diesel::sql_types::Text, _>(&search_pattern)
             .bind::<diesel::sql_types::BigInt, _>(limit)
-            .bind::<diesel::sql_types::BigInt, _>(i64::try_from(offset).unwrap_or(0))
+            .bind::<diesel::sql_types::BigInt, _>(offset)
             .load::<ExperimentRow>(&mut conn)
             .await
             .map(|rows| rows.into_iter().map(ExperimentRow::into_json).collect())
@@ -217,6 +239,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -245,6 +268,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -341,6 +365,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -470,6 +495,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -502,6 +528,121 @@ impl AdminModel for ExperimentAdminModel {
         })
     }
 
+    fn execute_action(
+        &self,
+        pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+        action: &str,
+        ids: Vec<i64>,
+    ) -> AdminFuture<'_, u64> {
+        // `ExperimentAdminModel` never declares soft delete
+        // (`supports_soft_delete()` is the trait default, `false`), so
+        // `actions()` (traits.rs) only ever offers `"delete"` — the admin UI
+        // can't reach `"restore"` or `"purge"` for this model. Those two
+        // branches below, and the unhandled-action branch, are unchanged
+        // copies of the trait default's per-id loop: kept only so a direct
+        // or out-of-band `execute_action` call gets the exact same "does not
+        // support soft delete" (or "unhandled action") error it always did,
+        // not because they need batching — `self.restore`/`self.purge` are
+        // the trait's default methods, which return `Err` on the very first
+        // id regardless of loop shape, so there is no N+1 to eliminate there.
+        if action == "delete" {
+            let pool = pool.clone();
+            return Box::pin(async move {
+                // The batched form binds a Postgres array. SQLite has no array
+                // bind type. `backend_select!` keeps one arm and drops the
+                // other, so the array never reaches the SQLite type-checker
+                // (issue #2108).
+                //
+                // The SQLite arm keeps the crate compiling, and refuses.
+                // ExperimentAdminModel is Postgres-only, so there is no
+                // correct SQLite statement to fall back to.
+                ::autumn_web::backend_select! {
+                    pg => {{
+                        use diesel_async::RunQueryDsl;
+
+                        // Batch every id into ONE round trip instead of the trait
+                        // default's one-CTE-per-id loop (an operator selecting
+                        // hundreds of concluded/archived experiments in the admin
+                        // list and clicking "Delete selected" otherwise costs one
+                        // statement, and one connection checkout, per experiment).
+                        // Same CTE shape as the single-row `delete()`: the cascading
+                        // assignment/override deletes and the audit INSERT's
+                        // `SELECT name, 'deleted', NULL FROM deleted` already fan out
+                        // to one row per id the `DELETE ... RETURNING name` actually
+                        // removed, so widening the predicate to `id = ANY($1)` is
+                        // enough — an id that doesn't exist contributes no row to
+                        // `deleted` and so no cascading delete or audit row either,
+                        // exactly like the loop it replaces.
+                        //
+                        // The returned count matches the *ids submitted*, not rows
+                        // actually deleted, exactly like the loop this replaces
+                        // (which incremented its counter once per id regardless of
+                        // whether that id matched a row).
+                        let mut conn = pool
+                            .get()
+                            .await
+                            .map_err(|e| AdminError::Database(e.to_string()))?;
+                        diesel::sql_query(
+                            "WITH deleted AS ( \
+                                 DELETE FROM autumn_experiments WHERE id = ANY($1) RETURNING name \
+                             ), \
+                             _del_assignments AS ( \
+                                 DELETE FROM autumn_experiment_assignments \
+                                 WHERE experiment IN (SELECT name FROM deleted) \
+                             ), \
+                             _del_overrides AS ( \
+                                 DELETE FROM autumn_experiment_overrides \
+                                 WHERE experiment IN (SELECT name FROM deleted) \
+                             ), \
+                             _audit AS ( \
+                                 INSERT INTO autumn_experiment_changes (experiment, mutation, actor) \
+                                 SELECT name, 'deleted', NULL FROM deleted \
+                             ) \
+                             SELECT COUNT(*) AS count FROM deleted",
+                        )
+                        .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(&ids)
+                        .get_result::<CountRow>(&mut conn)
+                        .await
+                        .map_err(|e| AdminError::Database(e.to_string()))?;
+                        Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+                    }},
+                    sqlite => {{
+                        let _ = (&pool, &ids);
+                        crate::traits::require_postgres("ExperimentAdminModel").map(|()| 0)
+                    }},
+                }
+            });
+        }
+
+        let action = action.to_owned();
+        let pool = pool.clone();
+        Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
+            match action.as_str() {
+                "restore" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.restore(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                "purge" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.purge(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                other => Err(AdminError::Other(format!(
+                    "unhandled bulk action '{other}'; \
+                     override AdminModel::execute_action to support it"
+                ))),
+            }
+        })
+    }
+
     fn get_history<'a>(
         &'a self,
         pool: &'a diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
@@ -514,6 +655,7 @@ impl AdminModel for ExperimentAdminModel {
 
         let pool = pool.clone();
         Box::pin(async move {
+            crate::traits::require_postgres("ExperimentAdminModel")?;
             let mut conn = pool
                 .get()
                 .await
@@ -558,7 +700,7 @@ impl AdminModel for ExperimentAdminModel {
                 op: r.op,
                 request_id: None,
                 changes: vec![],
-                recorded_at: r.changed_at,
+                recorded_at: r.changed_at.and_utc(),
             })
             .collect();
 
@@ -701,8 +843,8 @@ struct ExperimentRow {
     variants: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     winner: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    updated_at: chrono::NaiveDateTime,
 }
 
 impl ExperimentRow {
@@ -714,7 +856,7 @@ impl ExperimentRow {
             "state": self.state,
             "variants": self.variants.map(decode_variants),
             "winner": self.winner,
-            "updated_at": self.updated_at.to_rfc3339(),
+            "updated_at": self.updated_at.and_utc().to_rfc3339(),
         })
     }
 }
@@ -750,8 +892,8 @@ struct ExperimentDetailRow {
     winner: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     exclusion_group: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    updated_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    updated_at: chrono::NaiveDateTime,
 }
 
 impl ExperimentDetailRow {
@@ -764,7 +906,7 @@ impl ExperimentDetailRow {
             "variants": self.variants.map(decode_variants),
             "winner": self.winner,
             "exclusion_group": self.exclusion_group,
-            "updated_at": self.updated_at.to_rfc3339(),
+            "updated_at": self.updated_at.and_utc().to_rfc3339(),
         })
     }
 }
@@ -777,8 +919,8 @@ struct HistoryRow {
     op: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     actor: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    changed_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    changed_at: chrono::NaiveDateTime,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

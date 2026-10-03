@@ -195,6 +195,16 @@ transaction, can opt into the same maintenance instead of hand-rolling `count +
 1`:
 
 ```rust,ignore
+// Before the write: on a table with a leg onto itself this takes the lock
+// every generated mutation takes before its first row lock; elsewhere it
+// issues nothing. A raw insert that skipped it could hold its new row while
+// a generated mutation holds the lock and waits for that row.
+autumn_web::repository::counter_cache_serialize_self_referential(
+    conn,
+    Comment::counter_caches(),
+)
+.await?;
+
 let comment_id: i64 = diesel::insert_into(comments::table)
     .values(/* … */)
     .returning(comments::id)
@@ -246,9 +256,9 @@ is raw SQL) but not readable from Rust.
   compile time: the association's foreign key names a column on the join table,
   not on the child, so the increment would read a column that does not exist. Map
   the join table as its own model and put `counter_cache` on its `belongs_to`.
-- **Flat counts.** There is no conditional/filtered counter (Rails'
-  `counter_cache` has none either). Count only `published` children by giving
-  them their own model or maintaining that column yourself.
+- **Flat counts.** `counter_cache` itself counts every live child, with no
+  predicate and no weight. To count only `published` children, or to sum a
+  field over them, declare a [`#[derivation]`](derivations.md) instead.
 - **One column per (parent table, column).** Two counter-cached legs resolving
   onto the same parent column are a compile error — they would both move it and
   double-count. Two legs to *different* parent tables may share a column name.
@@ -345,8 +355,47 @@ collapsing a mixed-tenant batch behind one arbitrary witness would either sweep
 cross-tenant children into the increment or drop legitimate ones. Tenant-scoped
 associations therefore trade the folding optimization for exactness.
 
+## Parent primary key
+
+Every counter-cache `UPDATE` addresses the parent row through `parent_pk` —
+`WHERE posts.<parent_pk> = ...` — and the default is `id`. When the parent's
+`#[id]` field is not named `id` (or is renamed with
+`#[diesel(column_name)]`), the default addresses a column that does not exist
+and the maintenance fails at runtime, on every insert and delete.
+
+Name the key explicitly:
+
+```rust,ignore
+#[belongs_to(Post, counter_cache, parent_pk = "post_uuid")]
+```
+
+It is explicit rather than inferred because `#[model]` on the child cannot
+see the parent's fields — the same visibility limit that makes
+`counter_cache_tenant` explicit. Without the key the SQL is byte-identical to
+before. `#[derivation]` takes the same `parent_pk = "<column>"` key with the
+same default.
+
+The key also drives the `belongs_to` preload: the loader filters on and
+selects `parent_pk` instead of `<parent>::id`. Note that a `#[model]` parent
+still needs an `id` column today (#3033), so for a counter cache the override
+currently serves counting through an alternate unique key; derivations onto a
+parent that is not a `#[model]` are unaffected by that limit.
+
+## Filtered and weighted counts
+
+`counter_cache` counts every live child. For a count restricted by a predicate,
+or a weighted `sum(field)` over the qualifying rows, declare a
+[`#[derivation]`](derivations.md) on the child instead:
+`#[derivation(Post, column = "published_comment_count", filter = published)]`.
+It is maintained by the same mutation paths and the same transaction contract
+described above, and it adds a content-addressed definition hash, a resumable
+backfill and `/actuator/derivations` for state and drift. See
+[Maintained Derived Read Models](derivations.md).
+
 ## See also
 
+- [Maintained Derived Read Models](derivations.md) — `#[derivation]`, the
+  filtered and weighted superset of this attribute.
 - [`#[votable]`](votable.md) — the aggregate-column sibling, for signed
   vote scores and unary like counts over a reaction edge table.
 - [Repositories](repositories.md) — `dependent`, `soft_delete`, hooks.

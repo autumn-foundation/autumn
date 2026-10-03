@@ -276,13 +276,139 @@ async fn signup_rejects_weak_password() {
         resp.text()
     );
 
-    // No account was created, so logging in with those credentials fails.
+    // No account was created, so logging in with those credentials fails —
+    // the login form re-renders inline with the generic message at HTTP 200,
+    // the same convention as the signup failure above (Wayfinder: error-path
+    // inventory), rather than a full navigation to a generic error page.
     let login = client
         .post("/login")
         .form("email=weak@acme.test&password=password")
         .send()
         .await;
-    login.assert_status(401);
+    login.assert_ok();
+    assert!(
+        login.text().contains("Invalid email or password"),
+        "expected the login form to redisplay inline with the auth error, got: {}",
+        login.text()
+    );
+}
+
+/// Every recoverable signup/login failure mode redisplays the form inline
+/// (HTTP 200, same page, error adjacent to the fields) with the entered email
+/// preserved, instead of navigating the user to a generic error page and
+/// losing what they typed (Wayfinder: error-path inventory).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn signup_and_login_failures_redisplay_the_form_with_email_preserved() {
+    let client = db_client().await;
+
+    // Malformed email at signup.
+    let resp = client
+        .post("/signup")
+        .form("email=not-an-email&password=Tr0ubad0ur-Xy7-correct-horse")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Enter a valid email address"));
+    assert!(
+        resp.text().contains(r#"value="not-an-email""#),
+        "expected the entered email to be preserved in the re-rendered form, got: {}",
+        resp.text()
+    );
+
+    // Over-long password at signup.
+    let long_password = "x".repeat(129);
+    let resp = client
+        .post("/signup")
+        .form(&format!("email=long@acme.test&password={long_password}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("at most 128 characters"));
+    assert!(resp.text().contains(r#"value="long@acme.test""#));
+
+    // Weak password at signup (the one branch that already redisplayed
+    // before this PR, but — per Codex review — was never itself asserted to
+    // preserve the entered email; `signup_rejects_weak_password` above only
+    // checks the policy message).
+    let resp = client
+        .post("/signup")
+        .form("email=weak2@acme.test&password=password")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("too common"));
+    assert!(resp.text().contains(r#"value="weak2@acme.test""#));
+
+    // Duplicate email at signup: the first signup succeeds, the second is
+    // redisplayed inline rather than dropped onto a generic error page.
+    let _ = signup(&client, "dupe@acme.test").await;
+    let resp = client
+        .post("/signup")
+        .form("email=dupe@acme.test&password=Tr0ubad0ur-Xy7-correct-horse-2")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Could not create account"));
+    assert!(resp.text().contains(r#"value="dupe@acme.test""#));
+
+    // Invalid credentials at login preserve the entered (nonexistent) email.
+    let resp = client
+        .post("/login")
+        .form("email=nobody@acme.test&password=wrong-password-entirely")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Invalid email or password"));
+    assert!(resp.text().contains(r#"value="nobody@acme.test""#));
+
+    // Over-long input at login (Codex review finding: the pre-existing
+    // "invalid credentials" case above exercises the same `login_page` call
+    // but not this distinct length-guard branch). Reuses the over-long
+    // password minted for the signup case above.
+    let resp = client
+        .post("/login")
+        .form(&format!("email=toolong@acme.test&password={long_password}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(resp.text().contains("Invalid email or password"));
+    assert!(resp.text().contains(r#"value="toolong@acme.test""#));
+}
+
+/// A "Remember me" opt-in must survive a rejected login (Codex review
+/// finding): if the user ticks the box, mistypes the password, and corrects
+/// it on the redisplayed form without re-checking a box they already
+/// checked, the eventual successful login must still honor their original
+/// choice — so the checkbox itself must come back checked.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn login_failure_preserves_the_remember_me_choice() {
+    let client = db_client().await;
+
+    let checked = client
+        .post("/login")
+        .form("email=nobody@acme.test&password=wrong-password&remember=on")
+        .send()
+        .await;
+    checked.assert_ok();
+    assert!(
+        checked.text().contains("checked"),
+        "expected the Remember-me checkbox to stay checked after a rejected login, got: {}",
+        checked.text()
+    );
+
+    let unchecked = client
+        .post("/login")
+        .form("email=nobody@acme.test&password=wrong-password")
+        .send()
+        .await;
+    unchecked.assert_ok();
+    assert!(
+        !unchecked.text().contains("checked"),
+        "an unticked box must not come back checked, got: {}",
+        unchecked.text()
+    );
 }
 
 #[tokio::test]
@@ -321,6 +447,169 @@ async fn tenants_are_isolated() {
     assert!(
         !globex_view.text().contains("Alpha"),
         "tenant isolation breached: Globex can see Acme's project"
+    );
+}
+
+/// An out-of-range project name (empty, or over 200 characters, checked after
+/// trimming) used to bounce `POST /dashboard/projects` to the framework's
+/// generic error page, dropping the user off the project list and discarding
+/// what they had typed. It now redisplays the dashboard inline (HTTP 200)
+/// with exactly what the user submitted still in the field — not the trimmed
+/// value the length check itself uses, which would silently blank out a
+/// whitespace-only submission (Codex review finding on this PR) — the error
+/// adjacent to the form, and the existing project list intact (Wayfinder:
+/// error-path inventory — 0/1 failure modes cleared the bar before this fix,
+/// 1/1 after).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_project_failure_redisplays_the_dashboard_with_name_preserved() {
+    let client = db_client().await;
+    let cookie = signup(&client, "founder@acme.test").await;
+
+    // A prior project, so the redisplay-on-failure assertion below also
+    // proves the list survived the rejected submission rather than being
+    // dropped along with the form.
+    client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form("name=Existing")
+        .send()
+        .await
+        .assert_status(303);
+
+    // Empty name (after trimming whitespace).
+    let resp = client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form("name=%20%20%20")
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(
+        resp.text()
+            .contains("Project name must be between 1 and 200 characters"),
+        "expected the length-validation error in the re-rendered dashboard, got: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains("Existing"),
+        "expected the existing project list to survive the rejected submission, got: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains(r#"value="   ""#),
+        "expected the raw (untrimmed) whitespace-only submission to be preserved verbatim \
+         in the re-rendered field rather than silently blanked by the length check's own \
+         trimming, got: {}",
+        resp.text()
+    );
+
+    // Over-long name.
+    let long_name = "x".repeat(201);
+    let resp = client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form(&format!("name={long_name}"))
+        .send()
+        .await;
+    resp.assert_ok();
+    assert!(
+        resp.text()
+            .contains("Project name must be between 1 and 200 characters")
+    );
+    assert!(
+        resp.text().contains(&format!(r#"value="{long_name}""#)),
+        "expected the rejected name to be preserved in the re-rendered field, got: {}",
+        resp.text()
+    );
+
+    // No project was created by either rejected submission.
+    let dashboard = client
+        .get("/dashboard")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    dashboard.assert_ok();
+    assert!(
+        dashboard.text().contains("1 total"),
+        "a rejected submission must not create a project, got: {}",
+        dashboard.text()
+    );
+}
+
+/// Scrape the `_submit_token` hidden field out of a rendered form.
+fn extract_submit_token(html: &str) -> String {
+    let marker = r#"name="_submit_token" value=""#;
+    let start = html
+        .find(marker)
+        .expect("expected a `_submit_token` hidden field in the rendered form (issue #2921)");
+    let rest = &html[start + marker.len()..];
+    let end = rest
+        .find('"')
+        .expect("unterminated `_submit_token` value in the rendered form");
+    rest[..end].to_owned()
+}
+
+/// Issue #2921: the dashboard's "Create Project" form used to carry no
+/// `_submit_token` hidden field (unlike signup/login in the same app), so two
+/// back-to-back `POST /dashboard/projects` — a double-click or a browser's
+/// silent retry of a slow POST — each ran the handler and created duplicate
+/// rows. The form now embeds a one-time token exactly like the signup form, so
+/// the second submission replays the first response instead of inserting a
+/// second project.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_project_double_submit_creates_exactly_one_project() {
+    let client = db_client().await;
+    let cookie = signup(&client, "founder@acme.test").await;
+
+    // The rendered dashboard must embed a fresh one-time token in the
+    // create-project form.
+    let dashboard = client
+        .get("/dashboard")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    dashboard.assert_ok();
+    let token = extract_submit_token(&dashboard.text());
+
+    let body = |token: &str| format!("name=DoubleClickTest&_submit_token={token}");
+    let first = client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form(&body(&token))
+        .send()
+        .await;
+    first.assert_status(303);
+
+    // The identical retry carries the now-spent token: the handler must not
+    // run again, and the recorded response is replayed instead.
+    let second = client
+        .post("/dashboard/projects")
+        .header("cookie", &cookie)
+        .form(&body(&token))
+        .send()
+        .await;
+    second.assert_status(303);
+    assert_eq!(
+        second.header("x-submit-token-replayed"),
+        Some("true"),
+        "the double-clicked submission must be short-circuited as a replay, \
+         not re-run the handler"
+    );
+
+    // Exactly one project landed.
+    let dashboard = client
+        .get("/dashboard")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    dashboard.assert_ok();
+    assert!(
+        dashboard.text().contains("1 total"),
+        "a double-clicked create-project submission must create exactly one \
+         project, got: {}",
+        dashboard.text()
     );
 }
 

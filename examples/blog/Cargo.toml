@@ -23,6 +23,12 @@ tokio = { version = "1", features = ["full"] }
 autumn-web = { path = "../../autumn", features = ["test-support"] }
 serde_json = "1"
 example-e2e = { path = "../../example-e2e" }
+# Own container (not TestDb) for the Ledger CSV-import profiling harness in
+# src/admin.rs: it needs `shared_preload_libraries=pg_stat_statements` set at
+# postmaster start, which TestDb's plain `Postgres::default()` container
+# doesn't set.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 
 [features]
 # Enable the headless-browser system smoke. Requires Chromium on the host.
@@ -45,3 +51,6 @@ unsafe_code = "forbid"
 # covers every target — lib, bins, tests, benches — not just one root.
 [lints.clippy]
 disallowed_methods = "allow"
+# `#[derive(diesel::QueryableByName)]` emits `field: field`; rustc 1.99 flags it on
+# the user's field. Grandfathered workspace-wide in the root `Cargo.toml`.
+redundant_field_names = "allow"

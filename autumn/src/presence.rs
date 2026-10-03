@@ -29,6 +29,14 @@
 //!
 //! [`Channels`]: crate::channels::Channels
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,7 +87,7 @@ impl PresenceInner {
             .push(ConnectionPresence {
                 connection_id,
                 meta,
-                last_heartbeat: Instant::now(),
+                last_heartbeat: crate::time::ambient_instant(),
             });
     }
 
@@ -122,7 +130,7 @@ impl PresenceInner {
         {
             for c in conns.iter_mut() {
                 if c.connection_id == connection_id {
-                    c.last_heartbeat = Instant::now();
+                    c.last_heartbeat = crate::time::ambient_instant();
                 }
             }
         }
@@ -130,7 +138,7 @@ impl PresenceInner {
 
     fn sweep_expired(&mut self) -> Vec<(String, String)> {
         let ttl = self.ttl;
-        let now = Instant::now();
+        let now = crate::time::ambient_instant();
         let mut removed = Vec::new();
 
         self.entries.retain(|topic, by_key| {
@@ -239,6 +247,11 @@ impl Presence {
     /// # Panics
     ///
     /// Panics if the internal presence store mutex is poisoned.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held across the publish on purpose: the event must be \
+                  broadcast in the same order the state changed (issue #1936)"
+    )]
     pub fn track(
         &self,
         topic: impl Into<String>,
@@ -250,16 +263,22 @@ impl Presence {
         let meta = meta.into();
         let connection_id = next_connection_id();
 
-        {
-            let mut inner = self.inner.lock().expect("presence lock poisoned");
-            inner.add(&topic, &key, connection_id, meta.clone());
-        }
-
         let event = PresenceEvent::Join {
             key: key.clone(),
-            meta,
+            meta: meta.clone(),
         };
-        self.publish_event(&topic, &event);
+
+        let json = serde_json::to_string(&event).unwrap_or_default();
+        let publish_channel = format!("presence:{topic}");
+
+        {
+            let mut inner = self.inner.lock().expect("presence lock poisoned");
+            inner.add(&topic, &key, connection_id, meta);
+
+            if let Err(e) = self.channels.publish(&publish_channel, json) {
+                tracing::warn!(topic = %topic, error = ?e, "presence: failed to publish event");
+            }
+        }
 
         PresenceHandle {
             topic,
@@ -302,20 +321,23 @@ impl Presence {
     /// # Panics
     ///
     /// Panics if the internal presence store mutex is poisoned.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held across the publish on purpose: the event must be \
+                  broadcast in the same order the state changed (issue #1936)"
+    )]
     pub fn sweep_expired(&self) {
-        let removed = {
-            let mut inner = self.inner.lock().expect("presence lock poisoned");
-            inner.sweep_expired()
-        };
-        for (topic, key) in removed {
-            self.publish_event(&topic, &PresenceEvent::Leave { key });
-        }
-    }
+        let mut inner = self.inner.lock().expect("presence lock poisoned");
+        let removed = inner.sweep_expired();
 
-    fn publish_event(&self, topic: &str, event: &PresenceEvent) {
-        let json = serde_json::to_string(event).unwrap_or_default();
-        if let Err(e) = self.channels.publish(&format!("presence:{topic}"), json) {
-            tracing::warn!(topic, error = ?e, "presence: failed to publish event");
+        // Publish events while still holding the lock to preserve exact ordering
+        // relative to other track/drop events.
+        for (topic, key) in removed {
+            let event = PresenceEvent::Leave { key };
+            let json = serde_json::to_string(&event).unwrap_or_default();
+            if let Err(e) = self.channels.publish(&format!("presence:{topic}"), json) {
+                tracing::warn!(topic = %topic, error = ?e, "presence: failed to publish sweep event");
+            }
         }
     }
 }
@@ -359,11 +381,14 @@ impl PresenceHandle {
 }
 
 impl Drop for PresenceHandle {
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held across the publish on purpose: the event must be \
+                  broadcast in the same order the state changed (issue #1936)"
+    )]
     fn drop(&mut self) {
-        let key_fully_removed = {
-            let mut inner = self.inner.lock().expect("presence lock poisoned");
-            inner.remove(&self.topic, &self.key, self.connection_id)
-        };
+        let mut inner = self.inner.lock().expect("presence lock poisoned");
+        let key_fully_removed = inner.remove(&self.topic, &self.key, self.connection_id);
 
         // Only broadcast Leave when this was the last connection for the key.
         // If the same user still has other tabs open their key remains present,

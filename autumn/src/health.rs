@@ -146,7 +146,7 @@ mod tests {
     #[tokio::test]
     async fn health_with_pool_returns_pool_status() -> Result<(), Box<dyn std::error::Error>> {
         let config = crate::config::DatabaseConfig {
-            url: Some("postgres://localhost/test".into()),
+            url: Some(crate::test_urls::primary("test")),
             pool_size: 5,
             ..Default::default()
         };

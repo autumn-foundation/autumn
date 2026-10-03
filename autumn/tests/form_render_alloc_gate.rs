@@ -128,21 +128,56 @@ fn scaffolded_form_render_allocations_on_a_12_field_workload() {
     // the allocation until `has_errors` is confirmed true). After: **104
     // blocks** / 22,479 bytes per render, 20,800 / 4,495,800 total (-16.1%
     // blocks; bytes barely move — each wasted allocation is a handful of
-    // bytes against a ~22KB/render budget dominated by larger buffers). Ceiling
-    // sits at the current measurement plus a little headroom for
-    // feature-set/toolchain variance, same convention as
+    // bytes against a ~22KB/render budget dominated by larger buffers).
+    //
+    // Bolt follow-up (looking at `maud::escape::escape_to_string`, a naive
+    // per-byte scan/match/push loop that was 26% of a release-profile
+    // instruction count on this exact workload — see
+    // `benches/form_render.rs`): the six helpers now pre-escape field
+    // values/labels/errors themselves (`autumn_web::form::fast_escape`,
+    // bulk `push_str` per clean run, zero-allocation `Cow::Borrowed` when
+    // nothing needs escaping — every value in this fixture takes that path)
+    // and hand the result to `maud::PreEscaped` instead of letting `html!`
+    // re-scan it byte by byte. Block count is untouched — **104** per render,
+    // 20,800 total, identical to the pre-Bolt-follow-up baseline above, since
+    // escaping never allocates for this fixture's clean values. Bytes rose to
+    // **23,023** per render / **4,604,600** total (+2.4%): `maud_macros`
+    // sizes its output buffer from the *source token length* of the `html!`
+    // block (`input.to_string().len()`), not from runtime content, and the
+    // longer `PreEscaped`-wrapped interpolations read as "expect more
+    // output" and over-reserve a bit of initial capacity that a shorter
+    // `(field)` interpolation didn't. That reservation is never grown again
+    // (block count proves it), so it's unused slack, not extra allocator
+    // work. Ceiling sits at the current measurement plus a little headroom
+    // for feature-set/toolchain variance, same convention as
     // `config_alloc_gate`/`password_policy_alloc_gate`; a failure a hair over
     // the line means re-measure and re-derive, not nudge upwards.
+    //
+    // Bolt follow-up (looking at `alloc::fmt::format::format_inner`, 2.45% of
+    // a release-profile instruction count on this exact workload — see
+    // `benches/form_render.rs`): all six helpers built their `-field`/
+    // `-error` id suffix with `format!("{field_html}-error")` /
+    // `format!("{field_html}-field")`, which drives an unsized `String::new()`
+    // through the `Arguments`/`fmt::Write` machinery instead of sizing the
+    // output up front. Replaced with `autumn_web::form`'s new private
+    // `concat_suffix` (`String::with_capacity(base.len() + suffix.len())`
+    // plus two `push_str` calls) at all 6 call sites. Blocks dropped to **90**
+    // per render, 18,000 total (-13.5%): `format!`'s own internal growth
+    // apparently cost more than one allocation per call for some of these
+    // short strings, not just the final `String`. Bytes dropped slightly to
+    // **22,828** per render / **4,565,600** total (-0.85%) — exact-capacity
+    // sizing trims the same over-reservation slack the pre-escaping follow-up
+    // above added, though not by much against this workload's larger buffers.
     assert!(
-        info.count_total <= 21_500,
+        info.count_total <= 18_700,
         "scaffolded form render allocated {} blocks over {RENDERS} renders, over the \
-         21,500-block ceiling (20,800 measured; 24,800 was the pre-fix baseline)",
+         18,700-block ceiling (18,000 measured; 20,800 was the pre-fix baseline)",
         info.count_total,
     );
     assert!(
-        info.bytes_total <= 4_550_000,
+        info.bytes_total <= 4_660_000,
         "scaffolded form render allocated {} bytes over {RENDERS} renders, over the \
-         4,550,000-byte ceiling (4,495,800 measured; 4,498,200 was the pre-fix baseline)",
+         4,660,000-byte ceiling (4,565,600 measured; 4,604,600 was the pre-fix baseline)",
         info.bytes_total,
     );
 }
