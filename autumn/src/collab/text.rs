@@ -132,14 +132,18 @@ pub struct OpId {
 }
 
 impl std::hash::Hash for OpId {
-    /// Two `write`s (counter, actor bytes) instead of the derive's three: the
-    /// derived `str` hash appends a `0xff` terminator, one more `SipHash`
-    /// absorb per lookup, and `index` is probed on every applied operation.
-    /// The fixed-width counter leads, so no actor/counter pair can alias
-    /// another through the missing terminator; `Hash` only has to agree with
-    /// `Eq`, which it does.
+    /// Two `write`s instead of the derive's three. The derived `str` hash
+    /// appends a `0xff` terminator, one more `SipHash` absorb per lookup, and
+    /// `index` is probed on every applied operation. The counter and the
+    /// actor's length go out together as one fixed-width 16-byte write, so
+    /// the byte stream stays prefix-free (`("ab", "c")` and `("a", "bc")`
+    /// cannot alias when an `OpId` sits inside a compound key). `Hash` only
+    /// has to agree with `Eq`, which it does.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(self.counter);
+        let mut head = [0u8; 16];
+        head[..8].copy_from_slice(&self.counter.to_le_bytes());
+        head[8..].copy_from_slice(&(self.actor.len() as u64).to_le_bytes());
+        state.write(&head);
         state.write(self.actor.as_bytes());
     }
 }
