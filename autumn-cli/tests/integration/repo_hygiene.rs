@@ -701,7 +701,6 @@ fn publish_gate_release_notes_come_from_the_changelog_section() {
 #[test]
 fn extract_release_notes_prints_the_section_and_rejects_a_missing_one() {
     let root = workspace_root();
-    let script = root.join("scripts/extract-release-notes.sh");
     let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).expect("read CHANGELOG.md");
     let version = changelog
         .lines()
@@ -713,9 +712,11 @@ fn extract_release_notes_prints_the_section_and_rejects_a_missing_one() {
         .find(|v| v != "Unreleased")
         .expect("a released version in CHANGELOG.md");
 
-    let found = std::process::Command::new("bash")
-        .arg(&script)
+    // `bash_command` finds Git Bash on Windows; a bare `bash` there is WSL's.
+    let found = bash_command()
+        .arg("scripts/extract-release-notes.sh")
         .arg(format!("v{version}"))
+        .current_dir(&root)
         .output()
         .expect("run extract-release-notes.sh");
     assert!(found.status.success(), "{version}: {found:?}");
@@ -726,9 +727,10 @@ fn extract_release_notes_prints_the_section_and_rejects_a_missing_one() {
         "{version}: the heading must be stripped"
     );
 
-    let missing = std::process::Command::new("bash")
-        .arg(&script)
+    let missing = bash_command()
+        .arg("scripts/extract-release-notes.sh")
         .arg("999.0.0")
+        .current_dir(&root)
         .output()
         .expect("run extract-release-notes.sh");
     assert!(!missing.status.success(), "a missing section must fail");
