@@ -408,6 +408,18 @@ pub async fn subscription_authoritative_settles_a_same_instant_tie(store: &dyn B
         .await
         .unwrap();
     assert!(paused.is_applied());
+    // The same status with other fields still applies: the lookup is the
+    // truth, not a redelivery of what is stored.
+    let resized = store
+        .upsert_subscription(
+            sub_upsert("sub-auth", &customer, "k", SubscriptionStatus::Paused, 100)
+                .with_quantity(7)
+                .with_authoritative(),
+        )
+        .await
+        .unwrap();
+    assert!(resized.is_applied());
+    assert_eq!(resized.into_inner().quantity, 7);
     // Not back in time.
     let older = store
         .upsert_subscription(

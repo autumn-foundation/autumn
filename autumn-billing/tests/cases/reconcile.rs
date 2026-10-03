@@ -298,6 +298,34 @@ async fn a_fetched_state_keeps_the_providers_instant_instead_of_inventing_one() 
 }
 
 #[tokio::test]
+async fn a_lookup_with_the_stored_status_still_refreshes_the_other_fields() {
+    // Stored Active at quantity 1; a tied PastDue event triggers a lookup that
+    // says Active at quantity 2. The status matches the row, but the quantity
+    // is the provider's truth and must reach the mirror.
+    let h = linked_harness().await;
+    h.provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
+            .with_price(PRO_PRICE)
+            .with_quantity(2),
+    );
+    apply_event(
+        &h.client,
+        event("evt_1", at(100), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_2", at(100), sub_changed(SubscriptionStatus::PastDue)),
+    )
+    .await
+    .unwrap();
+    let sub = subscription(&h).await;
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.quantity, 2);
+}
+
+#[tokio::test]
 async fn a_tie_with_a_terminal_status_never_asks_the_provider() {
     let h = linked_harness().await;
     h.provider

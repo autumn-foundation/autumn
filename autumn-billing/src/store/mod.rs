@@ -125,9 +125,11 @@ pub(crate) fn guard(
 /// [`guard`] for a subscription write that may carry the provider's own
 /// current state (see [`SubscriptionUpsert::authoritative`]).
 ///
-/// An authoritative write replaces the stored status at the SAME instant, which
+/// An authoritative write replaces the stored row at the SAME instant, which
 /// is how two events that tie to the second are settled by the provider's
-/// answer rather than by ranking them. It never leaves a terminal status and
+/// answer rather than by ranking them. That includes an equal status: the
+/// lookup may differ in quantity, price, period end or cancellation, and those
+/// fields must not be discarded as a redelivery. It never leaves a terminal status and
 /// never goes back in time, and it does not move the stored instant, so no
 /// timestamp is invented and a provider event created after the tie still
 /// compares against a real provider time.
@@ -140,11 +142,7 @@ pub(crate) fn guard_subscription(
     incoming_rank: u8,
     authoritative: bool,
 ) -> Guard {
-    if authoritative
-        && !existing_terminal
-        && incoming_at == existing_at
-        && incoming_rank != existing_rank
-    {
+    if authoritative && !existing_terminal && incoming_at == existing_at {
         return Guard::Apply;
     }
     guard(
