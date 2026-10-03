@@ -152,4 +152,16 @@ impl BillingProvider for StripeProvider {
     fn cancel_subscription<'a>(&'a self, subscription: &'a ProviderId) -> ProviderFuture<'a, ()> {
         Box::pin(self.cancel(subscription))
     }
+
+    fn fetch_subscription<'a>(
+        &'a self,
+        subscription: &'a ProviderId,
+    ) -> ProviderFuture<'a, Option<crate::event::SubscriptionSnapshot>> {
+        Box::pin(async move {
+            self.subscription(subscription)
+                .await?
+                .map(events::parse_subscription_object)
+                .transpose()
+        })
+    }
 }

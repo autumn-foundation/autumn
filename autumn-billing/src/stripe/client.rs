@@ -321,6 +321,24 @@ impl StripeProvider {
         }
     }
 
+    /// `GET /v1/subscriptions/{id}`: the subscription as the provider holds it
+    /// now. `None` when the provider has no such subscription (404).
+    pub(super) async fn subscription(
+        &self,
+        subscription: &ProviderId,
+    ) -> Result<Option<Value>, BillingError> {
+        let path = format!("/v1/subscriptions/{subscription}");
+        let request = self.client.get(&path);
+        let reply = self.send(request, "GET", &path).await?;
+        if reply.is_success() {
+            return Ok(Some(reply.body));
+        }
+        if reply.status == 404 {
+            return Ok(None);
+        }
+        Err(self.http_error("GET", &path, &reply))
+    }
+
     pub(super) async fn cancel(&self, subscription: &ProviderId) -> Result<(), BillingError> {
         let path = format!("/v1/subscriptions/{subscription}");
         let request = self.client.delete(&path);

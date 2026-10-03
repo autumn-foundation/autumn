@@ -69,6 +69,15 @@ pub fn cert_id_for(hostname: &str) -> CertId {
     CertId::from_domains(&[hostname.to_owned()])
 }
 
+/// `base_unix` plus the monotonic time since `started`.
+///
+/// Used instead of a fresh wall-clock read so a caller-injected `now_unix`
+/// (tests, simulation) stays the single source of time while a long pass still
+/// advances past the instant it began.
+fn elapsed_since(base_unix: i64, started: tokio::time::Instant) -> i64 {
+    base_unix.saturating_add(i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX))
+}
+
 // ── The ACME issuer ──────────────────────────────────────────────────────
 
 /// Orders one certificate per tenant hostname over HTTP-01.
@@ -564,6 +573,7 @@ impl CustomDomainTask {
         // Warm the cache before the first tick so a restart serves stored
         // certificates on the first handshake instead of after an order.
         self.warm_all().await;
+        self.hydrate_limiter(crate::custom_domain::now_unix());
         loop {
             // The tick is inside the `select!`: a pass over a thousand domains
             // is long, and shutdown must not wait for it.
@@ -580,6 +590,14 @@ impl CustomDomainTask {
 
     /// One pass over every registered domain.
     pub async fn tick(&self, now_unix: i64) {
+        // `now_unix` is when the pass began. A pass over many domains, each a
+        // CA round trip, runs for minutes, so an order late in it must not be
+        // stamped with the start time: its budget entry would age early and a
+        // failure's `next_attempt_unix` could already be in the past, sending
+        // the next tick straight back to the CA. Elapsed monotonic time keeps
+        // the stamps honest and the caller's clock injectable.
+        let started = tokio::time::Instant::now();
+        let at = move || elapsed_since(now_unix, started);
         // Each check can wait out a DNS timeout, so checks run
         // `VERIFY_CONCURRENCY` at a time instead of adding up. Each write goes
         // through the registry's per-hostname gate.
@@ -594,7 +612,7 @@ impl CustomDomainTask {
                 &domain.hostname,
                 &domain.tenant,
                 domain.verification_token.as_deref(),
-                now_unix,
+                at(),
             )
             .await;
         }
@@ -613,7 +631,7 @@ impl CustomDomainTask {
                 &domain.hostname,
                 &domain.tenant,
                 domain.verification_token.as_deref(),
-                now_unix,
+                at(),
             )
             .await;
         }
@@ -634,7 +652,7 @@ impl CustomDomainTask {
                     &domain.hostname,
                     &domain.tenant,
                     domain.verification_token.as_deref(),
-                    now_unix,
+                    at(),
                 )
                 .await;
             }
@@ -848,12 +866,7 @@ impl CustomDomainTask {
         // The budget is checked BEFORE any network call, so a spent budget
         // costs the CA nothing. The failure backoff is already applied by
         // `is_due` on the record, so the budget is the only thing left to ask.
-        let decision = self.limiter.check(hostname, now_unix);
-        if !decision.is_allowed() {
-            if let Some(reason) = decision.reason() {
-                self.record_failure(hostname, tenant, token, now_unix, reason, false)
-                    .await;
-            }
+        if !self.within_budget(hostname, tenant, token, now_unix).await {
             return;
         }
 
@@ -929,8 +942,14 @@ impl CustomDomainTask {
             }
         }
         self.limiter.record_attempt(hostname, now_unix);
+        self.persist_attempt(hostname, tenant, token, now_unix)
+            .await;
 
+        let order_started = tokio::time::Instant::now();
         let outcome = self.issuer.issue(hostname).await;
+        // An order can take minutes; what follows it is stamped with when it
+        // actually finished, not when it began.
+        let now_unix = elapsed_since(now_unix, order_started);
         // Always release the lease, whatever the order did.
         if let Err(e) = lease.release().await {
             tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
@@ -1064,6 +1083,104 @@ impl CustomDomainTask {
         // still true.
         self.clear_alert_if_healthy(now_unix);
         Ok(())
+    }
+
+    /// Seed the issuance budget from the attempts persisted on each domain
+    /// record, so a restart does not hand the shared ACME account a fresh
+    /// quota. Called once before the first pass of [`Self::run`]; safe to call
+    /// again.
+    pub fn hydrate_limiter(&self, now_unix: i64) {
+        self.limiter.hydrate(
+            self.registry.list().into_iter().flat_map(|d| {
+                let hostname = d.hostname;
+                d.issuance_attempts_unix
+                    .into_iter()
+                    .map(move |at| (hostname.clone(), at))
+            }),
+            now_unix,
+        );
+    }
+
+    /// Is there issuance budget for `hostname`? A refusal defers the domain
+    /// until the refusing window rolls; it is not a failure, because no order
+    /// was placed, so it never counts toward the failure backoff.
+    async fn within_budget(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+    ) -> bool {
+        let decision = self.limiter.check(hostname, now_unix);
+        if decision.is_allowed() {
+            return true;
+        }
+        if let (Some(reason), Some(wait)) = (decision.reason(), decision.retry_after_secs()) {
+            self.defer(
+                hostname,
+                tenant,
+                token,
+                now_unix.saturating_add(wait),
+                reason,
+            )
+            .await;
+        }
+        false
+    }
+
+    /// Persist that an order is about to go out, so the issuance budget
+    /// survives a restart, including a crash mid-order.
+    ///
+    /// Fails open: the in-memory limiter already counts it, and refusing to
+    /// order would turn a store hiccup into an outage for the tenant.
+    async fn persist_attempt(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+    ) {
+        if let Err(e) = self
+            .registry
+            .record_attempt_for_registration(hostname, tenant, token, now_unix)
+            .await
+        {
+            tracing::warn!(
+                hostname,
+                error = %e,
+                "could not persist a custom-domain issuance attempt; the budget will not survive \
+                 a restart"
+            );
+        }
+    }
+
+    /// Hold a domain back until `retry_at_unix` without recording a failure.
+    async fn defer(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        retry_at_unix: i64,
+        reason: String,
+    ) {
+        match self
+            .registry
+            .defer_for_registration(hostname, tenant, token, retry_at_unix, reason)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                hostname,
+                tenant,
+                "discarded a custom-domain deferral: the hostname changed hands or was \
+                 re-registered meanwhile"
+            ),
+            Err(e) => tracing::warn!(
+                hostname,
+                error = %e,
+                "could not record a custom-domain issuance deferral"
+            ),
+        }
     }
 
     /// Record a failure on one domain, alerting the operator when it is an
