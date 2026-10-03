@@ -727,6 +727,19 @@ fn extract_release_notes_prints_the_section_and_rejects_a_missing_one() {
         "{version}: the heading must be stripped"
     );
 
+    // Repository-relative links 404 from /releases/tag/, so every one must be
+    // pointed at the file as of the tag.
+    assert!(
+        !body.contains("](docs/") && !body.contains("](./"),
+        "{version}: a repository-relative link survived extraction"
+    );
+    assert!(
+        body.contains(&format!(
+            "](https://github.com/autumn-foundation/autumn/blob/v{version}/"
+        )),
+        "{version}: relative links were not rewritten to the tag"
+    );
+
     // The release action silently truncates a body at 124,999 characters, so
     // the script must stay under it, and say when it cut.
     assert!(

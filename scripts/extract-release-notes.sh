@@ -35,6 +35,28 @@ if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
   exit 1
 fi
 
+# The changelog links its guides by repository path (`docs/migrations/0.8.0.md`),
+# which resolves under /releases/tag/ on the release page and 404s. Point every
+# repository-relative link at the file as of the tag; anchors, absolute URLs
+# and `#fragment` links are left alone.
+repo_url="https://github.com/autumn-foundation/autumn/blob/v${version}"
+notes="$(printf '%s\n' "$notes" | awk -v base="$repo_url" '
+  {
+    line = $0; out = ""
+    while (match(line, /\]\([^)]*\)/)) {
+      pre = substr(line, 1, RSTART - 1)
+      target = substr(line, RSTART + 2, RLENGTH - 3)
+      line = substr(line, RSTART + RLENGTH)
+      if (target !~ /^([A-Za-z][A-Za-z0-9+.-]*:|#|\/)/) {
+        sub(/^\.\//, "", target)
+        target = base "/" target
+      }
+      out = out pre "](" target ")"
+    }
+    print out line
+  }
+')"
+
 max="${MAX_NOTES_CHARS:-120000}"
 if [ "${#notes}" -gt "$max" ]; then
   link="https://github.com/autumn-foundation/autumn/blob/v${version}/CHANGELOG.md"
