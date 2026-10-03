@@ -12,8 +12,14 @@ fn main() {
     // output, nothing it tracks has changed since, and the site stays
     // unstyled until an unrelated source edit happens to trigger it. See
     // issue #2694.
-    println!("cargo:rerun-if-changed=target/autumn/tailwindcss");
+    // Only the platform-correct path: watching both unconditionally
+    // means the OTHER platform's file is permanently absent, which
+    // Cargo always treats as changed -- making every build dirty
+    // forever, on every platform (Codex review on #3107).
+    #[cfg(target_os = "windows")]
     println!("cargo:rerun-if-changed=target/autumn/tailwindcss.exe");
+    #[cfg(not(target_os = "windows"))]
+    println!("cargo:rerun-if-changed=target/autumn/tailwindcss");
     println!("cargo:rerun-if-env-changed=PATH");
     #[cfg(target_os = "windows")]
     println!("cargo:rerun-if-env-changed=PATHEXT");

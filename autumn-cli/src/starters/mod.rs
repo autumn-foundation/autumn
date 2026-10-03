@@ -791,21 +791,33 @@ mod tests {
 
     /// Every Tailwind-using example's `build.rs` must watch the CLI's own
     /// install path (`target/autumn/tailwindcss[.exe]`) plus `PATH`
-    /// (`PATHEXT` on Windows).
+    /// (`PATHEXT` on Windows) — and must watch only the platform-correct one
+    /// of the two paths, each gated behind its own `#[cfg(target_os = ...)]`.
     ///
-    /// Without these, a build that runs before `autumn setup` has installed
-    /// the Tailwind binary finds no CLI, skips CSS generation, and then never
-    /// reruns once the binary shows up — nothing else the script watches
-    /// changed, so the compiled stylesheet stays missing/stale until an
-    /// unrelated source edit happens to retrigger it.
+    /// Without watching the install path, a build that runs before `autumn
+    /// setup` has installed the Tailwind binary finds no CLI, skips CSS
+    /// generation, and then never reruns once the binary shows up — nothing
+    /// else the script watches changed, so the compiled stylesheet stays
+    /// missing/stale until an unrelated source edit happens to retrigger it.
     ///
-    /// Issue #2694 (a duplication sweep) found this fix landed in
-    /// `autumn-cli/src/templates/build.rs.tmpl` (commit `bf0417d3`) and, five
-    /// months later, `examples/cms/build.rs` (commit `27a419e9`, by an author
-    /// who explicitly cited the earlier fix) — but was never backported to
-    /// the other eight example crates below, including `examples/saas`, the
-    /// *other* built-in starter. This test pins the fix across all of them so
-    /// a ninth copy cannot silently ship the same gap again.
+    /// Watching *both* paths unconditionally (this fix's first form, caught
+    /// by Codex review on #3107) is a different, worse bug: on any given
+    /// platform the other platform's file can never exist, and Cargo treats
+    /// a missing `rerun-if-changed` path as permanently changed — so the
+    /// build script, and the Tailwind invocation it drives, reruns on
+    /// *every* build forever, defeating incremental builds. Confirmed
+    /// against a minimal reproduction: `cargo build -vv` reports `Dirty ...:
+    /// the file \`...\` is missing` every time a watched path does not
+    /// exist, and `Fresh` once it exists and is unchanged.
+    ///
+    /// Issue #2694 (a duplication sweep) found the (then-unconditional) fix
+    /// landed in `autumn-cli/src/templates/build.rs.tmpl` (commit
+    /// `bf0417d3`) and, five months later, `examples/cms/build.rs` (commit
+    /// `27a419e9`, by an author who explicitly cited the earlier fix) — but
+    /// was never backported to the other eight example crates below,
+    /// including `examples/saas`, the *other* built-in starter. This test
+    /// pins the corrected, platform-gated fix across all nine so a tenth
+    /// copy cannot silently ship either gap again.
     #[test]
     fn example_build_scripts_watch_tailwind_install_path() {
         let examples_with_tailwind_build = [
@@ -835,6 +847,25 @@ mod tests {
                     "examples/{name}/build.rs is missing `{needle}` — see issue #2694"
                 );
             }
+            // Each of the two platform-specific paths must sit directly
+            // behind its own `#[cfg(target_os = "windows")]` gate, not be
+            // watched unconditionally (the always-dirty-forever bug above).
+            let windows_gated = "#[cfg(target_os = \"windows\")]\n    println!(\"cargo:rerun-if-changed=target/autumn/tailwindcss.exe\");";
+            let non_windows_gated = "#[cfg(not(target_os = \"windows\"))]\n    println!(\"cargo:rerun-if-changed=target/autumn/tailwindcss\");";
+            assert!(
+                contents.contains(windows_gated),
+                "examples/{name}/build.rs watches target/autumn/tailwindcss.exe \
+                 unconditionally instead of gating it behind \
+                 #[cfg(target_os = \"windows\")] — this makes the build dirty \
+                 forever on non-Windows platforms"
+            );
+            assert!(
+                contents.contains(non_windows_gated),
+                "examples/{name}/build.rs watches target/autumn/tailwindcss \
+                 unconditionally instead of gating it behind \
+                 #[cfg(not(target_os = \"windows\"))] — this makes the build \
+                 dirty forever on Windows"
+            );
         }
     }
 }
