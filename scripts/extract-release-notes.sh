@@ -7,6 +7,11 @@
 #
 # Exits non-zero when the section is missing or empty, so a release cannot be
 # published with a blank body.
+#
+# A GitHub Release body is capped (the release action truncates at 124,999
+# characters, silently). A section longer than MAX_NOTES_CHARS is cut at a line
+# boundary and ends with a link to the complete section in CHANGELOG.md at the
+# tag, so the page says it is partial instead of stopping mid-bullet.
 
 set -euo pipefail
 
@@ -28,6 +33,30 @@ notes="$(awk -v ver="$version" '
 if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
   echo "error: CHANGELOG.md has no entries under ## [$version]" >&2
   exit 1
+fi
+
+max="${MAX_NOTES_CHARS:-120000}"
+if [ "${#notes}" -gt "$max" ]; then
+  link="https://github.com/autumn-foundation/autumn/blob/v${version}/CHANGELOG.md"
+  notes="$(printf '%s\n' "$notes" | awk -v max="$max" '
+    # Keep reading after the cut: exiting early would SIGPIPE the printf and
+    # fail the pipeline under `set -o pipefail`.
+    stop { next }
+    used + length($0) + 1 > max { stop = 1; next }
+    { print; used += length($0) + 1 }
+  ')"
+  # Drop a trailing partial bullet group back to the last blank line so the cut
+  # does not land inside a sentence.
+  notes="$(printf '%s\n' "$notes" | awk '{ lines[NR] = $0 } END {
+    last = NR; while (last > 0 && lines[last] != "") last--
+    if (last == 0) last = NR
+    for (i = 1; i <= last; i++) print lines[i]
+  }')"
+  notes="${notes}
+
+---
+
+_These notes are cut to fit GitHub's release length limit. The complete notes for ${version} are in [CHANGELOG.md](${link})._"
 fi
 
 printf '%s\n' "$notes"
