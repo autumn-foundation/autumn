@@ -605,6 +605,13 @@ pub struct CustomDomain {
     /// serving and renewing. Any other one is given a token at the next load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_token: Option<String>,
+    /// When this registration's certificate orders were placed, newest last,
+    /// kept for [`PER_DOMAIN_WINDOW_SECS`]. Persisted so the issuance budget
+    /// survives a restart: the limiter itself is in memory, and a crash loop
+    /// would otherwise start every window empty and spend the shared ACME
+    /// account's quota again. [`IssuanceLimiter::hydrate`] reads it back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issuance_attempts_unix: Vec<i64>,
 }
 
 impl CustomDomain {
@@ -623,6 +630,7 @@ impl CustomDomain {
             consecutive_failures: 0,
             next_attempt_unix: None,
             verification_token: Some(token),
+            issuance_attempts_unix: Vec::new(),
         }
     }
 
@@ -1617,6 +1625,77 @@ impl CustomDomainRegistry {
         .await
     }
 
+    /// Persist that an order was placed for this registration at `now_unix`,
+    /// dropping attempts older than the per-domain window.
+    ///
+    /// Written BEFORE the order goes out, so a crash mid-order still counts it.
+    /// Returns whether it applied: a hostname that changed hands meanwhile is
+    /// not charged for the old registration's order.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_attempt_for_registration(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+    ) -> io::Result<bool> {
+        self.mutate_if(
+            hostname,
+            |d| d.tenant == tenant && d.verification_token.as_deref() == token,
+            move |d| {
+                let cutoff = now_unix.saturating_sub(PER_DOMAIN_WINDOW_SECS);
+                d.issuance_attempts_unix.retain(|at| *at > cutoff);
+                d.issuance_attempts_unix.push(now_unix);
+            },
+        )
+        .await
+    }
+
+    /// Hold this registration back until `retry_at_unix` because an issuance
+    /// BUDGET is spent, with `reason` for the status surface.
+    ///
+    /// Not a failure: no order was placed, so `consecutive_failures` is left
+    /// alone. Counting it would walk a domain to the maximum backoff just for
+    /// being examined while the deployment's hourly budget was full, and keep
+    /// it unavailable long after the budget reopened. A later deadline already
+    /// on the record is kept.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn defer_for_registration(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        retry_at_unix: i64,
+        reason: impl Into<String>,
+    ) -> io::Result<bool> {
+        let reason = reason.into();
+        self.mutate_if(
+            hostname,
+            |d| {
+                d.tenant == tenant
+                    && d.verification_token.as_deref() == token
+                    && Self::is_orderable_state(d.status)
+            },
+            move |d| {
+                if d.status == DomainStatus::Issuing {
+                    d.status = DomainStatus::Verified;
+                }
+                d.failure_reason = Some(reason.clone());
+                d.next_attempt_unix = Some(
+                    d.next_attempt_unix
+                        .map_or(retry_at_unix, |at| at.max(retry_at_unix)),
+                );
+            },
+        )
+        .await
+    }
+
     /// The failure-writing core of [`record_failure`](Self::record_failure)
     /// and its guarded variants. `guard` runs inside the write lock, against the record as
     /// it is at write time — never against a snapshot taken before an await.
@@ -1869,6 +1948,17 @@ impl IssuanceDecision {
         matches!(self, Self::Allow)
     }
 
+    /// Seconds until the refusing window rolls, if the attempt was refused.
+    #[must_use]
+    pub const fn retry_after_secs(&self) -> Option<i64> {
+        match self {
+            Self::Allow => None,
+            Self::PerDomainLimit { retry_after_secs } | Self::GlobalLimit { retry_after_secs } => {
+                Some(*retry_after_secs)
+            }
+        }
+    }
+
     /// The reason to record on the domain, if the attempt was refused.
     #[must_use]
     pub fn reason(&self) -> Option<String> {
@@ -2003,6 +2093,29 @@ impl IssuanceLimiter {
         kept.push(now_unix);
         *hits = kept;
         drop(attempts);
+    }
+
+    /// Seed the windows from attempts that were persisted before a restart.
+    ///
+    /// Each `(hostname, at_unix)` is one order already placed. Entries outside
+    /// the per-domain window at `now_unix` are ignored, and a `(hostname, at)`
+    /// already known is not counted again, so calling this twice is harmless.
+    /// A new attempt also lands in the global window, which protects the ACME
+    /// account shared by every tenant, so a restart cannot reset it either.
+    pub fn hydrate(&self, attempts: impl IntoIterator<Item = (String, i64)>, now_unix: i64) {
+        let oldest = now_unix.saturating_sub(PER_DOMAIN_WINDOW_SECS);
+        let mut state = write_lock(&self.attempts);
+        for (hostname, at) in attempts {
+            if at <= oldest {
+                continue;
+            }
+            let hits = state.per_domain.entry(hostname).or_default();
+            if !hits.contains(&at) {
+                hits.push(at);
+                state.global.push(at);
+            }
+        }
+        drop(state);
     }
 
     /// Drop a domain's attempt history — called when it is offboarded, so a
@@ -2715,6 +2828,40 @@ mod tests {
         // Offboarding clears the history.
         limiter.forget("a.test");
         assert_eq!(limiter.check("a.test", 1500), IssuanceDecision::Allow);
+    }
+
+    #[test]
+    fn hydrating_restores_both_windows_and_is_idempotent() {
+        let limiter = IssuanceLimiter::new(2, 2, 300, 3600);
+        let persisted = vec![
+            ("a.test".to_owned(), 1000),
+            ("b.test".to_owned(), 1100),
+            // Outside the per-domain window: ignored.
+            ("a.test".to_owned(), 1000 - PER_DOMAIN_WINDOW_SECS),
+        ];
+        let now = 1200;
+        limiter.hydrate(persisted.clone(), now);
+        limiter.hydrate(persisted, now);
+
+        // Two orders inside the hour: the global budget of 2 is spent.
+        assert!(matches!(
+            limiter.check("c.test", now),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+        // And it rolls with the hour, not at a made-up instant.
+        assert_eq!(
+            limiter.check("c.test", 1000 + GLOBAL_WINDOW_SECS + 1),
+            IssuanceDecision::Allow
+        );
+    }
+
+    #[test]
+    fn a_record_stored_before_attempts_were_persisted_still_loads() {
+        let old = r#"{"hostname":"a.test","tenant":"t","status":"active","failure_reason":null,
+            "registered_at_unix":1,"verified_at_unix":null,"activated_at_unix":null,
+            "cert_not_after_unix":null,"consecutive_failures":0,"next_attempt_unix":null}"#;
+        let record: CustomDomain = serde_json::from_str(old).unwrap();
+        assert!(record.issuance_attempts_unix.is_empty());
     }
 
     #[test]
