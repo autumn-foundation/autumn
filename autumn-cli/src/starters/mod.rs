@@ -790,8 +790,8 @@ mod tests {
     }
 
     /// Every Tailwind-using example's `build.rs` must watch the CLI's own
-    /// install path, resolved dynamically via `OUT_DIR`, plus `PATH`
-    /// (`PATHEXT` on Windows).
+    /// install path, resolved the same way `autumn-cli/src/templates/build.rs.tmpl`
+    /// resolves it, plus `PATH` (`PATHEXT` on Windows).
     ///
     /// Without watching the install path, a build that runs before `autumn
     /// setup` has installed the Tailwind binary finds no CLI, skips CSS
@@ -799,8 +799,10 @@ mod tests {
     /// else the script watches changed, so the compiled stylesheet stays
     /// missing/stale until an unrelated source edit happens to retrigger it.
     ///
-    /// This went through two buggy intermediate forms before landing here,
-    /// both caught by Codex review on #3107:
+    /// Getting this right took four rounds on #3107, each caught by Codex
+    /// review, each a real bug in a hand-rolled resolver that duplicated —
+    /// and under-approximated — logic the scaffold template already had
+    /// right:
     ///
     /// 1. Watching a bare `target/autumn/tailwindcss` **and**
     ///    `target/autumn/tailwindcss.exe` literal unconditionally: on any
@@ -809,7 +811,7 @@ mod tests {
     ///    changed — so the build script (and the Tailwind invocation it
     ///    drives) reran on *every* build forever, on every platform.
     ///    Confirmed against a minimal reproduction: `cargo build -vv`
-    ///    reports `Dirty ...: the file \`...\` is missing` every time a
+    ///    reports "Dirty ...: the file `...` is missing" every time a
     ///    watched path doesn't exist, `Fresh` once it exists and is
     ///    unchanged.
     /// 2. Gating that literal behind `#[cfg(target_os = "windows")]` fixed
@@ -819,20 +821,28 @@ mod tests {
     ///    workspace member. So the (now platform-correct) literal still
     ///    never matched the real file, leaving every build dirty forever
     ///    regardless of platform.
+    /// 3. Resolving via `OUT_DIR`'s ancestors fixed that, but two more gaps
+    ///    remained: `OUT_DIR` nests one level deeper under `cargo build
+    ///    --target <triple>` (so a fixed `ancestors().nth(4)` picks the
+    ///    triple directory instead of the real target root), and the watch
+    ///    target was always the *expected* local install path even when
+    ///    `find_tailwind_cli` actually resolved the binary from `PATH` —
+    ///    leaving the expected-but-wrong local path watched forever.
     ///
-    /// The fix watches the path `expected_tailwind_install_path()` computes
-    /// from `OUT_DIR` — the same resolution `find_tailwind_cli()` already
-    /// used to *locate* the binary, now reused to *watch* it too, so the two
-    /// can't disagree about where it lives.
+    /// Each of these is exactly what `autumn-cli/src/templates/build.rs.tmpl`
+    /// already solved: `candidate_target_dirs()` tries `CARGO_TARGET_DIR`
+    /// directly, then `OUT_DIR`'s ancestors at *both* offset 4 and 5, and
+    /// `main` watches whichever path `find_tailwind_cli()` actually resolved
+    /// (falling back to the first candidate only when nothing was found
+    /// yet). This test pins that exact, already-proven design — ported
+    /// verbatim rather than re-derived — across all nine example crates.
     ///
     /// Issue #2694 (a duplication sweep) found the (then-literal,
     /// unconditional) fix landed in `autumn-cli/src/templates/build.rs.tmpl`
     /// (commit `bf0417d3`) and, five months later, `examples/cms/build.rs`
     /// (commit `27a419e9`, by an author who explicitly cited the earlier
     /// fix) — but was never backported to the other eight example crates
-    /// below, including `examples/saas`, the *other* built-in starter. This
-    /// test pins the corrected, dynamically-resolved fix across all nine so
-    /// a tenth copy cannot silently ship any of these three gaps again.
+    /// below, including `examples/saas`, the *other* built-in starter.
     #[test]
     fn example_build_scripts_watch_tailwind_install_path() {
         let examples_with_tailwind_build = [
@@ -851,39 +861,38 @@ mod tests {
             let build_rs = examples_root.join(name).join("build.rs");
             let contents = fs::read_to_string(&build_rs)
                 .unwrap_or_else(|e| panic!("reading {}: {e}", build_rs.display()));
-            assert!(
-                contents.contains(
-                    "fn expected_tailwind_install_path() -> Option<std::path::PathBuf> {"
-                ),
-                "examples/{name}/build.rs has no expected_tailwind_install_path \
-                 resolver — see issue #2694"
-            );
-            assert!(
-                contents.contains("println!(\"cargo:rerun-if-changed={}\", path.display());"),
-                "examples/{name}/build.rs does not watch \
-                 expected_tailwind_install_path()'s resolved path — see issue #2694"
-            );
             for needle in [
+                "fn candidate_target_dirs() -> Vec<std::path::PathBuf> {",
+                "fn expected_tailwind_path() -> Option<std::path::PathBuf> {",
+                "std::env::var(\"CARGO_TARGET_DIR\")",
+                "out_dir.ancestors().nth(4)",
+                "out_dir.ancestors().nth(5)",
+                "match &tailwind {",
+                "println!(\"cargo:rerun-if-changed={}\", path.display())",
+                "println!(\"cargo:rerun-if-changed={}\", expected.display())",
                 "cargo:rerun-if-env-changed=PATH\"",
                 "cargo:rerun-if-env-changed=PATHEXT\"",
             ] {
                 assert!(
                     contents.contains(needle),
-                    "examples/{name}/build.rs is missing `{needle}` — see issue #2694"
+                    "examples/{name}/build.rs is missing `{needle}` — it should \
+                     mirror autumn-cli/src/templates/build.rs.tmpl's Tailwind \
+                     install-path resolution (see issue #2694)"
                 );
             }
-            // A bare, unresolved literal watch target (the two buggy
-            // intermediate forms above) must not reappear.
+            // None of the three earlier buggy forms (a bare unresolved
+            // literal, or a fixed `ancestors().nth(4)` with no `nth(5)`
+            // target-triple fallback) may reappear.
             for stale_needle in [
                 "cargo:rerun-if-changed=target/autumn/tailwindcss\"",
                 "cargo:rerun-if-changed=target/autumn/tailwindcss.exe\"",
+                "fn expected_tailwind_install_path(",
             ] {
                 assert!(
                     !contents.contains(stale_needle),
-                    "examples/{name}/build.rs watches a bare, package-relative \
-                     `{stale_needle}` literal instead of the OUT_DIR-resolved \
-                     path — this never matches the real install location for a \
-                     workspace member and leaves the build dirty forever"
+                    "examples/{name}/build.rs contains `{stale_needle}`, a \
+                     previously-fixed buggy resolver form (see issue #2694 and \
+                     PR #3107)"
                 );
             }
         }
