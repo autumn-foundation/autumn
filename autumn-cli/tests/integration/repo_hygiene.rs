@@ -676,6 +676,105 @@ fn changelog_notes_are_written_as_fragments() {
     );
 }
 
+/// The Release body is the `CHANGELOG.md` section for the tag, not a second
+/// changelog generated from commit titles. Two generators disagreed: the
+/// curated notes landed in the crates and the release page showed raw commits.
+#[test]
+fn publish_gate_release_notes_come_from_the_changelog_section() {
+    let root = workspace_root();
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/publish-gate.yml"))
+        .expect("read publish-gate.yml");
+    assert!(
+        !workflow.contains("git-cliff") && !workflow.contains("cliff.toml"),
+        "publish-gate must not generate release notes with git-cliff"
+    );
+    assert!(
+        workflow.contains("scripts/extract-release-notes.sh"),
+        "publish-gate must build RELEASE_NOTES.md from the CHANGELOG.md section"
+    );
+    assert!(
+        !root.join("cliff.toml").exists(),
+        "cliff.toml is unused once release notes come from CHANGELOG.md"
+    );
+}
+
+#[test]
+fn extract_release_notes_prints_the_section_and_rejects_a_missing_one() {
+    let root = workspace_root();
+    let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).expect("read CHANGELOG.md");
+    let version = changelog
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("## [")?
+                .split_once(']')
+                .map(|(v, _)| v.to_owned())
+        })
+        .find(|v| v != "Unreleased")
+        .expect("a released version in CHANGELOG.md");
+
+    // `bash_command` finds Git Bash on Windows; a bare `bash` there is WSL's.
+    let found = bash_command()
+        .arg("scripts/extract-release-notes.sh")
+        .arg(format!("v{version}"))
+        .current_dir(&root)
+        .output()
+        .expect("run extract-release-notes.sh");
+    assert!(found.status.success(), "{version}: {found:?}");
+    let body = String::from_utf8_lossy(&found.stdout);
+    assert!(!body.trim().is_empty(), "{version}: empty body");
+    assert!(
+        !body.contains(&format!("## [{version}]")),
+        "{version}: the heading must be stripped"
+    );
+
+    // Repository-relative links 404 from /releases/tag/, so every one must be
+    // pointed at the file as of the tag.
+    assert!(
+        !body.contains("](docs/") && !body.contains("](./"),
+        "{version}: a repository-relative link survived extraction"
+    );
+    assert!(
+        body.contains(&format!(
+            "](https://github.com/autumn-foundation/autumn/blob/v{version}/"
+        )),
+        "{version}: relative links were not rewritten to the tag"
+    );
+
+    // The release action silently truncates a body at 124,999 characters, so
+    // the script must stay under it, and say when it cut.
+    assert!(
+        body.chars().count() <= 124_999,
+        "{version}: {} characters is past the release body limit",
+        body.chars().count()
+    );
+    let capped = bash_command()
+        .arg("scripts/extract-release-notes.sh")
+        .arg(&version)
+        .env("MAX_NOTES_CHARS", "500")
+        .current_dir(&root)
+        .output()
+        .expect("run extract-release-notes.sh with a cap");
+    assert!(capped.status.success(), "{capped:?}");
+    let capped_body = String::from_utf8_lossy(&capped.stdout);
+    assert!(
+        capped_body.chars().count() < 1_000,
+        "a capped section must be short, got {} characters",
+        capped_body.chars().count()
+    );
+    assert!(
+        capped_body.contains("cut to fit") && capped_body.contains("CHANGELOG.md"),
+        "a cut section must say so and link the full notes: {capped_body}"
+    );
+
+    let missing = bash_command()
+        .arg("scripts/extract-release-notes.sh")
+        .arg("999.0.0")
+        .current_dir(&root)
+        .output()
+        .expect("run extract-release-notes.sh");
+    assert!(!missing.status.success(), "a missing section must fail");
+}
+
 #[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();
