@@ -7,7 +7,7 @@ use autumn_web::webhook::WebhookEndpointConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::error::BillingError;
-use crate::event::BillingEvent;
+use crate::event::{BillingEvent, SubscriptionSnapshot};
 use crate::model::ProviderId;
 
 /// Boxed future returned by provider calls.
@@ -198,6 +198,27 @@ pub trait BillingProvider: Send + Sync + 'static {
 
     /// Cancel a subscription now.
     fn cancel_subscription<'a>(&'a self, subscription: &'a ProviderId) -> ProviderFuture<'a, ()>;
+
+    /// Fetch a subscription's current state from the provider. Optional.
+    ///
+    /// The reconciler calls this when two events for one subscription carry the
+    /// same timestamp but different statuses. A provider's event timestamps are
+    /// coarse (Stripe's are whole seconds) and event ids are not ordered, so the
+    /// two events cannot be put in order; the provider's own current state is
+    /// the only answer that does not depend on delivery order. `Ok(None)` means
+    /// the provider has no such subscription or cannot look it up, and the
+    /// reconciler falls back to ranking the two events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BillingError`] when the lookup fails; the webhook is then
+    /// retried, by which time the events are no longer in the same second.
+    fn fetch_subscription<'a>(
+        &'a self,
+        _subscription: &'a ProviderId,
+    ) -> ProviderFuture<'a, Option<SubscriptionSnapshot>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Report a usage quantity for a metered subscription. Optional.
     fn report_usage<'a>(
