@@ -6,6 +6,17 @@ fn main() {
     println!("cargo:rerun-if-changed=tailwind.config.js");
     println!("cargo:rerun-if-changed=static/css/autumn.css");
     println!("cargo:rerun-if-env-changed=AUTUMN_REQUIRE_TAILWIND");
+    // The CLI's own install path, so the first build after `autumn setup`
+    // actually reruns. Without these the script can be skipped indefinitely
+    // after a first build that found no Tailwind — it produced no CSS
+    // output, nothing it tracks has changed since, and the site stays
+    // unstyled until an unrelated source edit happens to trigger it. See
+    // issue #2694.
+    println!("cargo:rerun-if-changed=target/autumn/tailwindcss");
+    println!("cargo:rerun-if-changed=target/autumn/tailwindcss.exe");
+    println!("cargo:rerun-if-env-changed=PATH");
+    #[cfg(target_os = "windows")]
+    println!("cargo:rerun-if-env-changed=PATHEXT");
 
     let Some(tailwind) = find_tailwind_cli() else {
         handle_tailwind_unavailable("Tailwind CSS CLI not found");

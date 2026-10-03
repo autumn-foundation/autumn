@@ -788,4 +788,53 @@ mod tests {
     fn embedded_cms_matches_example_cms() {
         assert_starter_matches_example(&builtin::CMS, "cms");
     }
+
+    /// Every Tailwind-using example's `build.rs` must watch the CLI's own
+    /// install path (`target/autumn/tailwindcss[.exe]`) plus `PATH`
+    /// (`PATHEXT` on Windows).
+    ///
+    /// Without these, a build that runs before `autumn setup` has installed
+    /// the Tailwind binary finds no CLI, skips CSS generation, and then never
+    /// reruns once the binary shows up — nothing else the script watches
+    /// changed, so the compiled stylesheet stays missing/stale until an
+    /// unrelated source edit happens to retrigger it.
+    ///
+    /// Issue #2694 (a duplication sweep) found this fix landed in
+    /// `autumn-cli/src/templates/build.rs.tmpl` (commit `bf0417d3`) and, five
+    /// months later, `examples/cms/build.rs` (commit `27a419e9`, by an author
+    /// who explicitly cited the earlier fix) — but was never backported to
+    /// the other eight example crates below, including `examples/saas`, the
+    /// *other* built-in starter. This test pins the fix across all of them so
+    /// a ninth copy cannot silently ship the same gap again.
+    #[test]
+    fn example_build_scripts_watch_tailwind_install_path() {
+        let examples_with_tailwind_build = [
+            "blog",
+            "bookmarks",
+            "bookmarks-distributed",
+            "cms",
+            "reddit-clone",
+            "saas",
+            "teams",
+            "todo-app",
+            "wiki",
+        ];
+        let examples_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        for name in examples_with_tailwind_build {
+            let build_rs = examples_root.join(name).join("build.rs");
+            let contents = fs::read_to_string(&build_rs)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", build_rs.display()));
+            for needle in [
+                "cargo:rerun-if-changed=target/autumn/tailwindcss\"",
+                "cargo:rerun-if-changed=target/autumn/tailwindcss.exe\"",
+                "cargo:rerun-if-env-changed=PATH\"",
+                "cargo:rerun-if-env-changed=PATHEXT\"",
+            ] {
+                assert!(
+                    contents.contains(needle),
+                    "examples/{name}/build.rs is missing `{needle}` — see issue #2694"
+                );
+            }
+        }
+    }
 }
