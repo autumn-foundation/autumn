@@ -204,8 +204,13 @@ impl Ctx<'_> {
     /// paused`) and leave the mirror wrong until some later event arrived, so
     /// ask the provider for the subscription's current state instead.
     ///
-    /// Returns the live snapshot and the instant to stamp it with, one second
-    /// after the stored event so the store sees it as strictly newer. `None`
+    /// Returns the live snapshot and the instant to stamp it with: the app
+    /// clock, which is when the state was read and so really is later than both
+    /// events, never earlier than one second after the stored event (so the
+    /// store sees it as strictly newer even under clock skew). The stamp is not
+    /// a provider timestamp, so a provider event the lookup already reflects is
+    /// older than it and is dropped as stale rather than mistaken for a
+    /// redelivery, while one created after it applies normally. `None`
     /// keeps the event as it is: no tie, a terminal status on either side
     /// (those are final and the store's own rule is exact), or a provider that
     /// cannot look the subscription up.
@@ -239,7 +244,7 @@ impl Ctx<'_> {
         let after = occurred_at
             .checked_add_signed(chrono::Duration::seconds(1))
             .unwrap_or(occurred_at);
-        Ok(live.map(|live| (live, after)))
+        Ok(live.map(|live| (live, self.now.max(after))))
     }
 
     async fn subscription(

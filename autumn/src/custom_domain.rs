@@ -2098,22 +2098,28 @@ impl IssuanceLimiter {
     /// Seed the windows from attempts that were persisted before a restart.
     ///
     /// Each `(hostname, at_unix)` is one order already placed. Entries outside
-    /// the per-domain window at `now_unix` are ignored, and a `(hostname, at)`
-    /// already known is not counted again, so calling this twice is harmless.
-    /// A new attempt also lands in the global window, which protects the ACME
-    /// account shared by every tenant, so a restart cannot reset it either.
+    /// the per-domain window at `now_unix` are ignored. Attempts are a
+    /// multiset: two orders in the same second are two attempts, and a crash
+    /// loop produces exactly that. Hydrating raises each `(hostname, at)` count
+    /// to the persisted one and never past it, so calling this twice is
+    /// harmless. A new attempt also lands in the global window, which protects
+    /// the ACME account shared by every tenant, so a restart cannot reset it
+    /// either.
     pub fn hydrate(&self, attempts: impl IntoIterator<Item = (String, i64)>, now_unix: i64) {
         let oldest = now_unix.saturating_sub(PER_DOMAIN_WINDOW_SECS);
-        let mut state = write_lock(&self.attempts);
+        let mut persisted: HashMap<(String, i64), usize> = HashMap::new();
         for (hostname, at) in attempts {
-            if at <= oldest {
-                continue;
+            if at > oldest {
+                *persisted.entry((hostname, at)).or_default() += 1;
             }
+        }
+        let mut state = write_lock(&self.attempts);
+        for ((hostname, at), want) in persisted {
             let hits = state.per_domain.entry(hostname).or_default();
-            if !hits.contains(&at) {
-                hits.push(at);
-                state.global.push(at);
-            }
+            let have = hits.iter().filter(|known| **known == at).count();
+            let missing = want.saturating_sub(have);
+            hits.extend(std::iter::repeat_n(at, missing));
+            state.global.extend(std::iter::repeat_n(at, missing));
         }
         drop(state);
     }
@@ -2853,6 +2859,21 @@ mod tests {
             limiter.check("c.test", 1000 + GLOBAL_WINDOW_SECS + 1),
             IssuanceDecision::Allow
         );
+    }
+
+    #[test]
+    fn hydrating_counts_two_attempts_in_the_same_second_twice() {
+        // A crash loop places orders in the same Unix second; collapsing them
+        // would hand the budget back on the next restart.
+        let limiter = IssuanceLimiter::new(5, 2, 300, 3600);
+        let now = 2000;
+        let twice = vec![("a.test".to_owned(), 1500), ("a.test".to_owned(), 1500)];
+        limiter.hydrate(twice.clone(), now);
+        limiter.hydrate(twice, now);
+        assert!(matches!(
+            limiter.check("b.test", now),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
     }
 
     #[test]

@@ -257,6 +257,50 @@ async fn same_second_pause_ends_paused_in_either_delivery_order() {
 }
 
 #[tokio::test]
+async fn a_fetched_state_is_stamped_with_the_app_clock_not_a_made_up_provider_second() {
+    // A tie in the past: the lookup happens now, so the mirror carries the
+    // clock's instant rather than the tied second plus one.
+    let h = linked_harness().await;
+    h.provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
+            .with_price(PRO_PRICE),
+    );
+    for (id, status) in [
+        ("evt_1", SubscriptionStatus::PastDue),
+        ("evt_2", SubscriptionStatus::Active),
+    ] {
+        apply_event(&h.client, event(id, at(-100), sub_changed(status)))
+            .await
+            .unwrap();
+    }
+    let sub = subscription(&h).await;
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert!(
+        sub.last_event_at >= at(0),
+        "stamped {:?}, expected the app clock, not {:?}",
+        sub.last_event_at,
+        at(-99)
+    );
+
+    // A provider event created after the lookup, same status, new quantity,
+    // is a real update, not a redelivery of the fetched state.
+    let mut newer = SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
+        .with_price(PRO_PRICE);
+    newer = newer.with_quantity(9);
+    apply_event(
+        &h.client,
+        event(
+            "evt_3",
+            at(3600),
+            BillingEventKind::SubscriptionChanged(newer),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(subscription(&h).await.quantity, 9);
+}
+
+#[tokio::test]
 async fn a_tie_with_a_terminal_status_never_asks_the_provider() {
     let h = linked_harness().await;
     h.provider
