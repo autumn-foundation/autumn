@@ -172,6 +172,7 @@ pub fn route_macro(
     // handler itself and the edge companion stay unconditional so one source
     // file serves both the origin binary and the capsule. For every other
     // route both values are empty and the expansion is unchanged.
+    let native_needs_identity = edge.is_some_and(|marking| marking.needs_identity);
     let (native_cfg, edge_companion) = emit_edge_items(edge, fn_name, &handler_name, vis, &path);
 
     // ── OpenAPI metadata ────────────────────────────────────────
@@ -208,6 +209,17 @@ pub fn route_macro(
                 ::autumn_edge::strip_request_credentials,
             ))
         };
+        if native_needs_identity {
+            // Capsule dispatch rejects a missing identity capability before
+            // invoking the handler. Apply the equivalent gate to the native
+            // mount so edge fallthrough and direct origin requests cannot
+            // bypass a declaration-only identity requirement.
+            handler_expr = quote! {
+                #handler_expr.layer(::autumn_edge::reexports::axum::middleware::from_fn(
+                    ::autumn_edge::require_edge_identity,
+                ))
+            };
+        }
     }
     let route_idempotency = if intercepted_route {
         quote! { ::autumn_web::RouteIdempotency::Direct }
@@ -2246,6 +2258,26 @@ mod tests {
             "needs(identity) must declare the Identity capability on the edge route: {generated}"
         );
         assert!(!generated.contains("compile_error"), "{generated}");
+        assert!(
+            generated.contains("require_edge_identity"),
+            "needs(identity) must gate the native origin mount too: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_plain_edge_does_not_add_native_identity_gate() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/public" },
+            quote! {
+                #[edge]
+                async fn public() -> &'static str { "public" }
+            },
+        )
+        .to_string();
+
+        assert!(!generated.contains("require_edge_identity"), "{generated}");
     }
 
     #[test]
