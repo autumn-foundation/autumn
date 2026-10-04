@@ -775,6 +775,29 @@ fn extract_release_notes_prints_the_section_and_rejects_a_missing_one() {
     assert!(!missing.status.success(), "a missing section must fail");
 }
 
+/// Every container test starts its own Postgres at the same moment, and on a
+/// cold runner they all pulled `postgres:11-alpine` in parallel, so one pull died
+/// mid-stream and failed an unrelated test before its body ran. Both CI jobs that
+/// run container tests must pull the images once, with retries, first.
+#[test]
+fn container_test_jobs_pre_pull_their_images() {
+    let root = workspace_root();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+    let calls = ci
+        .lines()
+        .filter(|l| l.contains("scripts/ci-prepull-images.sh") && l.contains("postgres:11-alpine"))
+        .count();
+    assert!(
+        calls >= 2,
+        "ci.yml must pre-pull postgres:11-alpine in both the `Test (Docker)` job and the \
+         `db-ignored` coverage lane, found {calls} call(s)"
+    );
+    assert!(
+        root.join("scripts/ci-prepull-images.sh").is_file(),
+        "scripts/ci-prepull-images.sh is missing"
+    );
+}
+
 #[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();
