@@ -48,7 +48,7 @@ jobs:
       # `[workspace.lints.clippy]` allow with a comment for it (see
       # `unused_async_trait_impl` in the root Cargo.toml). Do not add a
       # toolchain pin instead.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.7.8
@@ -770,7 +770,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Compile the pinned reference plugin against this framework
         # `autumn-plugin-reference` calls every surface declared
@@ -809,7 +809,7 @@ jobs:
           # would silently lose the cross-branch half of the protection on
           # every PR in this repo's own CI.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Migration version collision gate
         # Diesel records applied migrations BY VERSION (the leading
@@ -833,7 +833,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
       # install-action skips its verified download when the pinned version is
       # already there — the auditor this gate trusts must come from the pin,
@@ -930,7 +930,7 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
         with:
@@ -1050,7 +1050,7 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
         with:
@@ -1155,7 +1155,7 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
         with:
@@ -1480,7 +1480,7 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
       - name: Install Postgres client tools (Linux)
@@ -1511,6 +1511,13 @@ jobs:
         # and exit non-zero without it on PATH. Same install command as
         # generator-conformance.yml's `scaffold-postgres` job.
         run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
+      - name: Pre-pull the testcontainer images
+        if: runner.os == 'Linux'
+        # The module default `postgres:11-alpine` is what 100+ tests start, all at
+        # once. A cold runner pulled it in parallel and one pull died mid-stream
+        # (`bytes remaining on stream`), failing `db_hooks_lifecycle` before its
+        # body ran. Pull once, with retries, so every test starts from a cache.
+        run: ./scripts/ci-prepull-images.sh postgres:11-alpine postgres:16-alpine
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
         # 45 -> 75 (#1945): 46 more container-spinning `cli_tests` Docker
@@ -1972,7 +1979,7 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         with:
           # One cache per lane: each builds a different feature set, so sharing
@@ -2095,6 +2102,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin --features autumn-web/sqlite \
             --test custom_admin_model -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Pre-pull the testcontainer images
+        if: matrix.lane == 'db-ignored'
+        # Same reason as the `test-docker` job: pull once, with retries, before
+        # the parallel container tests start.
+        run: ./scripts/ci-prepull-images.sh postgres:11-alpine postgres:16-alpine
       - name: Generate coverage (Docker/testcontainer --ignored legs)
         if: matrix.lane == 'db-ignored'
         run: |
@@ -2153,6 +2165,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Check MSRV alignment
         run: ./scripts/check-msrv.sh
+      - name: Check the CI toolchain is pinned, and pinned consistently
+        # CI no longer floats on `stable` (#2252, #3082): the pin lives in
+        # .github/RUST_TOOLCHAIN and `toolchain-drift.yml` is the only workflow
+        # that tracks `stable`. Lives in this job, not a new one, so no new
+        # required-check name appears.
+        run: |
+          ./scripts/check-toolchain-pin.sh --self-test
+          ./scripts/check-toolchain-pin.sh
       - name: Check MSRV compiles
         run: cargo check --workspace
 
@@ -2181,7 +2201,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2.7.8
@@ -2347,7 +2367,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Run the sim-sweep seed sweep
         run: cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
@@ -2369,7 +2389,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Run loom model checks
         run: cargo test -p autumn-web --release --test loom_models
@@ -2397,7 +2417,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2.7.8

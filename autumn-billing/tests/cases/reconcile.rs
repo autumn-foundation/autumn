@@ -208,6 +208,186 @@ async fn out_of_order_deleted_then_updated_stays_canceled() {
     assert_eq!(h.store.applied_event_count().await.unwrap(), 2);
 }
 
+/// Two events for one subscription inside the same second cannot be ordered
+/// from their timestamps, and ranking them dropped real reversals. The
+/// provider's current state decides, whichever event arrives first.
+async fn same_second_pair(
+    first: SubscriptionStatus,
+    second: SubscriptionStatus,
+    live: SubscriptionStatus,
+) -> Harness {
+    let h = linked_harness().await;
+    h.provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", live).with_price(PRO_PRICE),
+    );
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(first)))
+        .await
+        .unwrap();
+    apply_event(&h.client, event("evt_2", at(100), sub_changed(second)))
+        .await
+        .unwrap();
+    h
+}
+
+#[tokio::test]
+async fn same_second_recovery_ends_active_in_either_delivery_order() {
+    use SubscriptionStatus::{Active, PastDue};
+    // past_due then active (the order they happened), and the reverse.
+    for (first, second) in [(PastDue, Active), (Active, PastDue)] {
+        let h = same_second_pair(first, second, Active).await;
+        assert_eq!(
+            subscription(&h).await.status,
+            Active,
+            "{first:?} then {second:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_second_pause_ends_paused_in_either_delivery_order() {
+    use SubscriptionStatus::{Active, Paused};
+    for (first, second) in [(Active, Paused), (Paused, Active)] {
+        let h = same_second_pair(first, second, Paused).await;
+        assert_eq!(
+            subscription(&h).await.status,
+            Paused,
+            "{first:?} then {second:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_fetched_state_keeps_the_providers_instant_instead_of_inventing_one() {
+    let h = linked_harness().await;
+    h.provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
+            .with_price(PRO_PRICE),
+    );
+    for (id, status) in [
+        ("evt_1", SubscriptionStatus::PastDue),
+        ("evt_2", SubscriptionStatus::Active),
+    ] {
+        apply_event(&h.client, event(id, at(100), sub_changed(status)))
+            .await
+            .unwrap();
+    }
+    let sub = subscription(&h).await;
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(
+        sub.last_event_at,
+        at(100),
+        "the stored instant must stay the provider's"
+    );
+
+    // A provider event one second later, same status, new quantity, is a real
+    // update. Under an invented stamp it could be read as stale or unchanged.
+    let newer = SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
+        .with_price(PRO_PRICE)
+        .with_quantity(9);
+    apply_event(
+        &h.client,
+        event(
+            "evt_3",
+            at(101),
+            BillingEventKind::SubscriptionChanged(newer),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(subscription(&h).await.quantity, 9);
+}
+
+#[tokio::test]
+async fn a_lookup_with_the_stored_status_still_refreshes_the_other_fields() {
+    // Stored Active at quantity 1; a tied PastDue event triggers a lookup that
+    // says Active at quantity 2. The status matches the row, but the quantity
+    // is the provider's truth and must reach the mirror.
+    let h = linked_harness().await;
+    h.provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
+            .with_price(PRO_PRICE)
+            .with_quantity(2),
+    );
+    apply_event(
+        &h.client,
+        event("evt_1", at(100), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_2", at(100), sub_changed(SubscriptionStatus::PastDue)),
+    )
+    .await
+    .unwrap();
+    let sub = subscription(&h).await;
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.quantity, 2);
+}
+
+#[tokio::test]
+async fn a_tie_with_a_terminal_status_never_asks_the_provider() {
+    let h = linked_harness().await;
+    h.provider
+        .script_live_subscription(SubscriptionSnapshot::new(
+            "sub_1",
+            "cus_1",
+            SubscriptionStatus::Active,
+        ));
+    apply_event(&h.client, event("evt_del", at(100), sub_deleted()))
+        .await
+        .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_upd", at(100), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(subscription(&h).await.status, SubscriptionStatus::Canceled);
+    assert_eq!(h.provider.fetch_calls(), 0);
+}
+
+#[tokio::test]
+async fn a_redelivered_event_does_not_ask_the_provider() {
+    let h = linked_harness().await;
+    h.provider
+        .script_live_subscription(SubscriptionSnapshot::new(
+            "sub_1",
+            "cus_1",
+            SubscriptionStatus::Active,
+        ));
+    for id in ["evt_1", "evt_2"] {
+        apply_event(
+            &h.client,
+            event(id, at(100), sub_changed(SubscriptionStatus::Active)),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(h.provider.fetch_calls(), 0, "same status is not a tie");
+}
+
+#[tokio::test]
+async fn a_provider_that_cannot_look_up_falls_back_to_ranking_the_events() {
+    // No scripted live state: `fetch_subscription` answers `None`.
+    let h = linked_harness().await;
+    apply_event(
+        &h.client,
+        event("evt_1", at(100), sub_changed(SubscriptionStatus::Active)),
+    )
+    .await
+    .unwrap();
+    apply_event(
+        &h.client,
+        event("evt_2", at(100), sub_changed(SubscriptionStatus::PastDue)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(h.provider.fetch_calls(), 1);
+    // Active (3) < PastDue (4): the previous rule still decides without a lookup.
+    assert_eq!(subscription(&h).await.status, SubscriptionStatus::PastDue);
+}
+
 #[tokio::test]
 async fn same_second_deleted_and_updated_stays_canceled() {
     // deleted first, then updated

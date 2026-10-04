@@ -71,7 +71,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.sha }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
       - name: Run tests, do not stop at the first failure

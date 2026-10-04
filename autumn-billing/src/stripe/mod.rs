@@ -120,7 +120,9 @@ impl BillingProvider for StripeProvider {
                     crate::config::STRIPE_WEBHOOK_SECRET_ENV
                 ))
             })?;
-        Ok(WebhookEndpointConfig::stripe(name, path, secret.expose()))
+        let mut endpoint = WebhookEndpointConfig::stripe(name, path, secret.expose());
+        endpoint.max_body_bytes = crate::config::WEBHOOK_MAX_BODY_BYTES;
+        Ok(endpoint)
     }
 
     fn create_customer(&self, request: CustomerRequest) -> ProviderFuture<'_, ProviderId> {
@@ -149,5 +151,17 @@ impl BillingProvider for StripeProvider {
 
     fn cancel_subscription<'a>(&'a self, subscription: &'a ProviderId) -> ProviderFuture<'a, ()> {
         Box::pin(self.cancel(subscription))
+    }
+
+    fn fetch_subscription<'a>(
+        &'a self,
+        subscription: &'a ProviderId,
+    ) -> ProviderFuture<'a, Option<crate::event::SubscriptionSnapshot>> {
+        Box::pin(async move {
+            self.subscription(subscription)
+                .await?
+                .map(events::parse_subscription_object)
+                .transpose()
+        })
     }
 }

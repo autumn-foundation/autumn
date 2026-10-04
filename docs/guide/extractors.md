@@ -60,6 +60,7 @@ how to decode structured query strings, and how to write your own.
 | `Tenant` | the resolved tenant for row-level multi-tenancy |
 | `State<AppState>` | your application state |
 | `Db`, `ShardedDb` | a pooled database connection |
+| `LazyDb` | a database checkout deferred until the handler asks for it |
 | `Flash` | the flash-message store |
 | `Flags`, `Experiments` | feature-flag and A/B assignments |
 | `Events`, `Notifications` | the event bus and the notification store |
@@ -136,6 +137,29 @@ Holding two pooled connections in one handler is invisible in development and
 fatal under load: with the default ten-connection pool, ten concurrent requests
 each holding one and waiting for a second can never make progress. Drop the
 first before acquiring the second.
+
+The same eagerness bites when `Db` sits in front of a body extractor. Head
+extractors all run before the body is read, so `Db` takes its connection and
+then holds it while the client sends the body — at whatever pace the client
+chooses. A handful of slow uploads can pin every connection in the pool and
+stall every other request. Take `LazyDb` in that position instead: extracting
+it records what a checkout needs (pool, statement timeout, route key, metrics)
+but takes no connection until the handler calls `checkout()`, after the body
+extractor has finished:
+
+```rust,ignore
+#[post("/comments")]
+async fn post_comment(lazy_db: LazyDb, Form(form): Form<CommentForm>) -> AutumnResult<&'static str> {
+    let mut db = lazy_db.checkout().await?;   // the body is already read
+    save_comment(&mut db, &form.body).await?;
+    Ok("posted")
+}
+```
+
+That holds for `Form`, `Json` and the other extractors that buffer the whole
+body. `Multipart` does not: its fields stream in as the handler reads them, so
+call `checkout()` only after the last field you need has been read, not before
+the `next_field` loop.
 
 ---
 

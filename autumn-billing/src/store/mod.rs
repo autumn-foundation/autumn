@@ -122,6 +122,38 @@ pub(crate) fn guard(
     }
 }
 
+/// [`guard`] for a subscription write that may carry the provider's own
+/// current state (see [`SubscriptionUpsert::authoritative`]).
+///
+/// An authoritative write replaces the stored row at the SAME instant, which
+/// is how two events that tie to the second are settled by the provider's
+/// answer rather than by ranking them. That includes an equal status: the
+/// lookup may differ in quantity, price, period end or cancellation, and those
+/// fields must not be discarded as a redelivery. It never leaves a terminal status and
+/// never goes back in time, and it does not move the stored instant, so no
+/// timestamp is invented and a provider event created after the tie still
+/// compares against a real provider time.
+#[must_use]
+pub(crate) fn guard_subscription(
+    existing_at: DateTime<Utc>,
+    existing_rank: u8,
+    existing_terminal: bool,
+    incoming_at: DateTime<Utc>,
+    incoming_rank: u8,
+    authoritative: bool,
+) -> Guard {
+    if authoritative && !existing_terminal && incoming_at == existing_at {
+        return Guard::Apply;
+    }
+    guard(
+        existing_at,
+        existing_rank,
+        existing_terminal,
+        incoming_at,
+        incoming_rank,
+    )
+}
+
 /// Customer upsert keyed by `provider_customer_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -198,6 +230,10 @@ pub struct SubscriptionUpsert {
     pub cancel_at_period_end: bool,
     /// Provider event time (ordering key).
     pub occurred_at: DateTime<Utc>,
+    /// The state was read from the provider (not decoded from one event), so
+    /// it settles a same-instant tie instead of being ranked against it. See
+    /// [`SubscriptionUpsert::with_authoritative`].
+    pub authoritative: bool,
     /// App clock.
     pub now: DateTime<Utc>,
 }
@@ -224,8 +260,18 @@ impl SubscriptionUpsert {
             current_period_end: None,
             cancel_at_period_end: false,
             occurred_at,
+            authoritative: false,
             now,
         }
+    }
+
+    /// Mark this as the provider's current state, read by a lookup. At the
+    /// same `occurred_at` as the stored row it replaces a different, non-terminal
+    /// status instead of being ranked against it.
+    #[must_use]
+    pub const fn with_authoritative(mut self) -> Self {
+        self.authoritative = true;
+        self
     }
 
     /// Set the provider price id.

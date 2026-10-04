@@ -32,7 +32,9 @@ use crate::error::BillingError;
 use crate::event::{
     BillingEvent, BillingEventKind, CheckoutSnapshot, InvoiceSnapshot, SubscriptionSnapshot,
 };
-use crate::model::{Customer, DunningAttempt, DunningState, Invoice, SubscriptionStatus};
+use crate::model::{
+    Customer, DunningAttempt, DunningState, Invoice, Subscription, SubscriptionStatus,
+};
 use crate::notify;
 use crate::store::{
     CustomerUpsert, EventClaim, InvoiceUpsert, SubscriptionUpsert, Write as StoreWrite,
@@ -195,6 +197,51 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// Two events for one subscription at the same instant with different
+    /// statuses cannot be put in order: the provider's timestamps are coarse
+    /// (Stripe's are whole seconds) and its event ids are not ordered. Ranking
+    /// them would drop a legitimate reversal (`past_due -> active`, `active ->
+    /// paused`) and leave the mirror wrong until some later event arrived, so
+    /// ask the provider for the subscription's current state instead.
+    ///
+    /// Returns the live snapshot, to be written as authoritative at the tied
+    /// instant itself. No timestamp is invented: the stored instant stays the
+    /// provider's, so an event created after the tie compares against a real
+    /// provider time, and a later event at the same second with a different
+    /// status ties again and is settled by another lookup. `None`
+    /// keeps the event as it is: no tie, a terminal status on either side
+    /// (those are final and the store's own rule is exact), or a provider that
+    /// cannot look the subscription up.
+    ///
+    /// # Errors
+    ///
+    /// A failed lookup is returned, so the webhook is retried rather than
+    /// guessed at.
+    async fn resolve_tie(
+        &self,
+        previous: Option<&Subscription>,
+        snapshot: &SubscriptionSnapshot,
+        status: SubscriptionStatus,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Option<SubscriptionSnapshot>, BillingError> {
+        let Some(previous) = previous else {
+            return Ok(None);
+        };
+        if previous.last_event_at != occurred_at
+            || previous.status == status
+            || previous.status.is_terminal()
+            || status.is_terminal()
+        {
+            return Ok(None);
+        }
+        let live = self
+            .service
+            .provider()
+            .fetch_subscription(&snapshot.provider_subscription_id)
+            .await?;
+        Ok(live)
+    }
+
     async fn subscription(
         &self,
         snapshot: &SubscriptionSnapshot,
@@ -206,6 +253,13 @@ impl Ctx<'_> {
         let previous = store
             .subscription_by_provider_id(&snapshot.provider_subscription_id)
             .await?;
+        let live = self
+            .resolve_tie(previous.as_ref(), snapshot, status, occurred_at)
+            .await?;
+        let authoritative = live.is_some();
+        let (snapshot, status) = live
+            .as_ref()
+            .map_or((snapshot, status), |live| (live, live.status));
         let mut upsert = SubscriptionUpsert::new(
             self.new_id(),
             customer.id.clone(),
@@ -216,6 +270,9 @@ impl Ctx<'_> {
         )
         .with_quantity(snapshot.quantity)
         .with_cancel_at_period_end(snapshot.cancel_at_period_end);
+        if authoritative {
+            upsert = upsert.with_authoritative();
+        }
         if let Some(price_id) = &snapshot.provider_price_id {
             upsert = upsert.with_price(price_id.clone());
             if let Some(plan) = self.service.catalog().by_price_id(price_id) {

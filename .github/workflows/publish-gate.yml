@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Run the posture gate over the example apps
         run: ./scripts/check-posture-gate.sh
@@ -117,7 +117,7 @@ jobs:
                       /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
         continue-on-error: true
 
@@ -188,7 +188,7 @@ jobs:
     needs: metadata
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Verify every publishable crate can be packaged
         run: ./scripts/check-publish-dry-run.sh
@@ -202,7 +202,7 @@ jobs:
     needs: metadata
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rust-docs
       - uses: Swatinem/rust-cache@v2
@@ -287,7 +287,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
       # install-action skips its verified download when the pinned version is
       # already there — the auditor this gate trusts must come from the pin,
@@ -334,7 +334,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Generate and verify the workspace SBOM
         env:
@@ -393,7 +393,7 @@ jobs:
     needs: [package, docs]
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Create smoke project
@@ -459,19 +459,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Install git-cliff
-        # Pin @v2 and pass the tool explicitly. The bare @git-cliff tag form can
-        # resolve with an empty tool input and install nothing (broke the Fuzz
-        # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.20
-        with:
-          tool: git-cliff
       - name: Generate release notes artifact
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           # CHANGELOG.md must be updated before tagging so the packaged crates
-          # include the release notes. Do not commit from this detached tag
-          # checkout; that races with trunk and can block the GitHub Release.
-          git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
+          # include the release notes. The Release body is that same section,
+          # so the page and the crates agree. Do not commit from this detached
+          # tag checkout; that races with trunk and can block the GitHub Release.
+          ./scripts/extract-release-notes.sh "${RELEASE_TAG}" > RELEASE_NOTES.md
       # The SBOM the `sbom` job already generated AND verified — downloaded
       # rather than regenerated so the asset attached to the release is
       # exactly the artifact that passed the gate.
@@ -484,7 +480,7 @@ jobs:
       # could have been truncated, replaced, or built from a different tree.
       # `--verify` regenerates from THIS checkout and diffs component by
       # component; `--expect-version` pins it to the tag being released.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Re-verify the downloaded SBOM against the tagged source
         env:

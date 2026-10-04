@@ -20,14 +20,11 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
 use crate::registry::{AdminRegistry, JOBS_NAV_SLUG, RUNTIME_CONFIG_NAV_SLUG};
-use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{
     AdminAction, AdminField, AdminFieldKind, AdminHistoryPage, AdminImportReport, CsvImportMode,
     ListResult, SortDirection, record_id,
 };
 
-const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
-const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 const TOKENS_CSS: &str = include_str!("tokens.css");
 
 // ── CSS ─────────────────────────────────────────────────────────────
@@ -621,21 +618,23 @@ pub fn admin_layout(
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 // CSRF token for HTMX requests (hx-delete, hx-post). The
-                // companion script at HTMX_CSRF_JS_PATH reads this meta tag
+                // companion `js/autumn-htmx-csrf.js` script reads this meta tag
                 // and attaches the configured header to outgoing htmx requests.
                 // The admin JS multipart handler uses data-header to send the
                 // right header name when security.csrf.token_header is customised.
                 meta name="csrf-token" content=(csrf_token) data-header=(csrf_token_header);
                 title { (title) " — Autumn Admin" }
-                script src=(HTMX_JS_PATH) {}
-                script src=(HTMX_CSRF_JS_PATH) {}
+                // `asset_url` hands out the content-hashed URLs of the
+                // framework's scripts (or an app's pinned htmx, when vendored).
+                script src=(autumn_web::assets::asset_url("js/htmx.min.js")) {}
+                script src=(autumn_web::assets::asset_url("js/autumn-htmx-csrf.js")) {}
                 // Reveals/wires up nav_bar's hamburger toggle and any future
                 // dropdown menu; the sidebar itself stays fully visible/hidden
                 // via the .admin-sidebar media-query rule below, not the
                 // toggle, so its own toggle button is kept CSS-hidden always.
-                script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
+                script src=(autumn_web::assets::asset_url("js/autumn-widgets.js")) defer {}
                 // External so it runs under the default CSP `script-src 'self'`.
-                script src={ (prefix) (&**ADMIN_JS_PATH) } {}
+                (crate::routes::ASSETS.script_tag("admin.js"))
                 style {
                     (PreEscaped(TOKENS_CSS))
                     (PreEscaped(FLASH_CSS))
@@ -3272,8 +3271,13 @@ mod tests {
             html.contains(r#"<meta name="csrf-token" content="tok-123""#),
             "CSRF meta tag missing: {html}"
         );
+        // Loaded through its content-hashed URL (`autumn-htmx-csrf.<hash>.js`).
+        let csrf_src = format!(
+            r#"src="{}""#,
+            autumn_web::assets::asset_url("js/autumn-htmx-csrf.js")
+        );
         assert!(
-            html.contains("/static/js/autumn-htmx-csrf.js"),
+            html.contains(&csrf_src),
             "HTMX CSRF helper script not loaded: {html}"
         );
     }
@@ -3816,8 +3820,8 @@ mod tests {
     fn layout_loads_external_admin_js_not_inline() {
         // The layout must NOT ship an inline <script>{js}</script> block —
         // that would be blocked by the default CSP (`script-src 'self'`).
-        // Instead it must load the plugin-owned asset at a fingerprinted
-        // `/{prefix}/static/admin.<hash>.js` URL.
+        // Instead it must load the plugin-owned asset at its fingerprinted
+        // `/static/_plugins/autumn-admin/admin.<hash>.js` URL.
         let r = dummy_registry();
         let html = dashboard_page(
             &r,
@@ -3831,18 +3835,31 @@ mod tests {
             None,
         )
         .into_string();
-        let expected = format!(r#"src="/admin{}""#, &**ADMIN_JS_PATH);
+        let asset = crate::routes::ASSETS
+            .get("admin.js")
+            .expect("admin.js is in the bundle");
+        let expected = format!(r#"src="{}""#, asset.url());
         assert!(
             html.contains(&expected),
             "admin.js must be referenced as an external script at {expected}: {html}"
         );
-        // The URL must be content-fingerprinted so immutable caching is safe.
+        // The URL must be content-fingerprinted so immutable caching is safe,
+        // and carry SRI so a stale or tampered copy is refused.
         assert!(
-            html.contains("/admin/static/admin.") && html.contains(".js\""),
-            "admin.js URL should be fingerprinted (admin.<hash>.js): {html}"
+            asset
+                .url()
+                .starts_with("/static/_plugins/autumn-admin/admin.")
+                && asset.url().rsplit('.').next() == Some("js")
+                && asset.url() != asset.plain_url(),
+            "admin.js URL should be fingerprinted (admin.<hash>.js): {}",
+            asset.url()
         );
         assert!(
-            !html.contains(r#"src="/admin/static/admin.js""#),
+            html.contains(&format!(r#"integrity="{}""#, asset.integrity())),
+            "admin.js tag should carry its SRI hash: {html}"
+        );
+        assert!(
+            !html.contains(r#"src="/static/_plugins/autumn-admin/admin.js""#),
             "unfingerprinted URL would invalidate immutable caching: {html}"
         );
         // No inline onclick on the select-all checkbox either — it's
@@ -5249,10 +5266,11 @@ mod tests {
         // autumn-widgets.js to reveal/wire them up; without it the toggle
         // stays permanently hidden and dead.
         let html = render_layout(None);
-        assert!(
-            html.contains(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH),
-            "{html}"
+        let widgets_src = format!(
+            r#"src="{}""#,
+            autumn_web::assets::asset_url("js/autumn-widgets.js")
         );
+        assert!(html.contains(&widgets_src), "{html}");
     }
 
     #[test]

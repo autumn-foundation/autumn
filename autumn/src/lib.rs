@@ -302,6 +302,47 @@ macro_rules! embed_static {
     }};
 }
 
+/// Embed a plugin crate's asset directory as a fingerprinted
+/// [`PluginAssets`](crate::assets::PluginAssets) bundle.
+///
+/// The first argument is the bundle's namespace, which becomes the URL
+/// segment under `/static/_plugins/`. The second is the directory, resolved
+/// like `include_dir!` (so `$CARGO_MANIFEST_DIR` means the **calling**
+/// crate); it defaults to `"$CARGO_MANIFEST_DIR/assets"`.
+///
+/// ```rust,ignore
+/// use autumn_web::assets::PluginAssets;
+///
+/// pub static ASSETS: PluginAssets = autumn_web::plugin_assets!("motion");
+/// // or a custom directory:
+/// pub static ASSETS: PluginAssets =
+///     autumn_web::plugin_assets!("motion", "$CARGO_MANIFEST_DIR/vendor");
+/// ```
+///
+/// Install the bundle with
+/// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets).
+/// Without the `embed-assets` feature, list the files with
+/// [`PluginAssets::from_files`](crate::assets::PluginAssets::from_files)
+/// instead.
+#[cfg(feature = "embed-assets")]
+#[macro_export]
+macro_rules! plugin_assets {
+    ($namespace:literal) => {
+        $crate::plugin_assets!($namespace, "$CARGO_MANIFEST_DIR/assets")
+    };
+    // `$dir` is a `tt`, not a `literal`: a captured `literal` fragment is
+    // forwarded as an opaque group, and `include_dir!`'s parser only accepts a
+    // bare string token.
+    ($namespace:literal, $dir:tt) => {{
+        // `include_dir!` emits `include_dir::…` paths resolved at the call
+        // site; see `embed_static!`.
+        #[allow(unused_imports)]
+        use $crate::include_dir;
+        static DIR: $crate::include_dir::Dir<'static> = $crate::include_dir::include_dir!($dir);
+        $crate::assets::PluginAssets::from_dir($namespace, &DIR)
+    }};
+}
+
 /// Embed the app's i18n locale bundles (the `i18n/` directory, or a custom
 /// directory) into the binary at compile time.
 ///

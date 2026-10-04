@@ -160,6 +160,20 @@ pub(super) fn parse(raw: &[u8]) -> Result<BillingEvent, BillingError> {
     Ok(BillingEvent::new(envelope.id, occurred_at, kind))
 }
 
+/// Decode a subscription object fetched from `GET /v1/subscriptions/{id}`.
+///
+/// Same shape as the `data.object` of a subscription event, so it goes through
+/// the same decoder.
+pub(super) fn parse_subscription_object(
+    object: Value,
+) -> Result<SubscriptionSnapshot, BillingError> {
+    let context = Context {
+        event_id: "lookup",
+        event_type: "subscription",
+    };
+    subscription(context.decode(object)?, context)
+}
+
 /// Event id and type, for error messages. Never the body.
 #[derive(Clone, Copy)]
 struct Context<'a> {

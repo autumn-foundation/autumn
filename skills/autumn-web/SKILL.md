@@ -310,6 +310,7 @@ error. See `docs/guide/getting-started.md` "Tuning the Tokio runtime".
 | `.migrations(MIGRATIONS)` | Register embedded Diesel migrations |
 | `.plugin_migrations(name, MIGRATIONS)` | Register a plugin's embedded Diesel migrations (named; version collisions with other sources auto-resolve) |
 | `.plugin(plugin)` / `.plugins((...))` | Install first- or third-party plugins |
+| `.plugin_assets(&ASSETS)` | Serve a plugin crate's JS/CSS/fonts (`PluginAssets`, from `plugin_assets!("ns")` or `PluginAssets::from_files`) at content-hashed `immutable` URLs under `/static/_plugins/<ns>/`, with SRI; call it from `Plugin::build`. Never hand-roll a fixed-URL asset route in a plugin (see `docs/guide/plugin-assets.md`) |
 | `.openapi(config)` | Configure OpenAPI generation |
 | `.policy::<R, _>(policy)` / `.scope::<R, _>(scope)` | Register repository API authorization |
 | `.scoped(prefix, layer, routes)` | Mount a scoped route group |

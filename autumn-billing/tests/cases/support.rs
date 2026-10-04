@@ -93,6 +93,7 @@ pub enum FakeCall {
         idempotency_key: String,
     },
     CancelSubscription(ProviderId),
+    FetchSubscription(ProviderId),
 }
 
 /// How the fake decodes webhook bodies.
@@ -111,6 +112,8 @@ pub struct FakeProvider {
     cancel_outcomes: Mutex<VecDeque<Result<(), BillingError>>>,
     parser: FakeParser,
     next_customer: Mutex<u32>,
+    webhook_body_limit: usize,
+    live_subscription: Mutex<Option<autumn_billing::event::SubscriptionSnapshot>>,
 }
 
 impl FakeProvider {
@@ -127,12 +130,42 @@ impl FakeProvider {
             cancel_outcomes: Mutex::new(VecDeque::new()),
             parser,
             next_customer: Mutex::new(0),
+            webhook_body_limit: 4 * 1024 * 1024,
+            live_subscription: Mutex::new(None),
+        })
+    }
+
+    /// Fake whose expected webhook endpoint allows `limit` body bytes, like a
+    /// provider with smaller events than Stripe's.
+    pub fn with_webhook_body_limit(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            retry_outcomes: Mutex::new(VecDeque::new()),
+            cancel_outcomes: Mutex::new(VecDeque::new()),
+            parser: FakeParser::Stripe,
+            next_customer: Mutex::new(0),
+            webhook_body_limit: limit,
+            live_subscription: Mutex::new(None),
         })
     }
 
     /// Queue the outcome of the next `retry_invoice_payment` call.
     pub fn script_retry(&self, outcome: Result<PaymentAttemptOutcome, BillingError>) {
         self.retry_outcomes.lock().unwrap().push_back(outcome);
+    }
+
+    /// The subscription state `fetch_subscription` reports, as the provider
+    /// would hold it now. Unset, the fake cannot look subscriptions up.
+    pub fn script_live_subscription(&self, snapshot: autumn_billing::event::SubscriptionSnapshot) {
+        *self.live_subscription.lock().unwrap() = Some(snapshot);
+    }
+
+    /// Number of `fetch_subscription` calls.
+    pub fn fetch_calls(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| matches!(c, FakeCall::FetchSubscription(_)))
+            .count()
     }
 
     /// Queue the outcome of the next `cancel_subscription` call.
@@ -176,11 +209,9 @@ impl BillingProvider for FakeProvider {
         name: &str,
         path: &str,
     ) -> Result<WebhookEndpointConfig, BillingError> {
-        Ok(WebhookEndpointConfig::stripe(
-            name,
-            path,
-            TEST_WEBHOOK_SECRET,
-        ))
+        let mut endpoint = WebhookEndpointConfig::stripe(name, path, TEST_WEBHOOK_SECRET);
+        endpoint.max_body_bytes = self.webhook_body_limit;
+        Ok(endpoint)
     }
 
     fn create_customer(&self, request: CustomerRequest) -> ProviderFuture<'_, ProviderId> {
@@ -243,6 +274,15 @@ impl BillingProvider for FakeProvider {
                 })
             });
         Box::pin(async move { outcome })
+    }
+
+    fn fetch_subscription<'a>(
+        &'a self,
+        subscription: &'a ProviderId,
+    ) -> ProviderFuture<'a, Option<autumn_billing::event::SubscriptionSnapshot>> {
+        self.record(FakeCall::FetchSubscription(subscription.clone()));
+        let live = self.live_subscription.lock().unwrap().clone();
+        Box::pin(async move { Ok(live) })
     }
 
     fn cancel_subscription<'a>(&'a self, subscription: &'a ProviderId) -> ProviderFuture<'a, ()> {

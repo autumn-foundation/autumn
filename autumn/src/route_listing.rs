@@ -768,23 +768,19 @@ pub(crate) fn append_framework_routes(
     }
 
     #[cfg(feature = "htmx")]
-    {
+    for asset in crate::htmx::framework_scripts() {
+        let handler = match asset.plain_url() {
+            crate::htmx::HTMX_JS_PATH => "htmx",
+            crate::htmx::HTMX_CSRF_JS_PATH => "htmx_csrf",
+            crate::htmx::IDIOMORPH_JS_PATH => "idiomorph",
+            crate::htmx::HTMX_SSE_JS_PATH => "htmx_sse",
+            _ => "autumn_widgets",
+        };
         infos.push(RouteInfo::framework_get(
-            crate::htmx::HTMX_JS_PATH.to_owned(),
-            "htmx",
+            asset.plain_url().to_owned(),
+            handler,
         ));
-        infos.push(RouteInfo::framework_get(
-            crate::htmx::HTMX_CSRF_JS_PATH.to_owned(),
-            "htmx_csrf",
-        ));
-        infos.push(RouteInfo::framework_get(
-            crate::htmx::IDIOMORPH_JS_PATH.to_owned(),
-            "idiomorph",
-        ));
-        infos.push(RouteInfo::framework_get(
-            crate::htmx::HTMX_SSE_JS_PATH.to_owned(),
-            "htmx_sse",
-        ));
+        infos.push(RouteInfo::framework_get(asset.url().to_owned(), handler));
     }
 
     #[cfg(feature = "mail")]

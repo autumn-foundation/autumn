@@ -257,7 +257,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: ${{ matrix.toolchain == 'stable' && '1.99.0' || matrix.toolchain }}
 
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -1034,7 +1034,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: ${{ matrix.toolchain == 'stable' && '1.99.0' || matrix.toolchain }}
 
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -1110,7 +1110,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: ${{ matrix.toolchain == 'stable' && '1.99.0' || matrix.toolchain }}
 
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -1254,8 +1254,7 @@ jobs:
                       /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h
 
-      - uses: dtolnay/rust-toolchain@stable
-
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 

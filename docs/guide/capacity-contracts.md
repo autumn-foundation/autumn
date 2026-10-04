@@ -63,7 +63,7 @@ unscaled.
 version = 1
 
 [provenance]
-autumn_version = "0.7.0"
+autumn_version = "0.8.0"
 calibrated_at = "2026-09-01T12:04:11Z"
 git_commit = "9f2c1ab"
 git_dirty = false

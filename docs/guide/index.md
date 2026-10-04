@@ -223,6 +223,7 @@ Looking for the API reference instead? That is
 - [Extensibility](extensibility.md) — the extension points, and which one fits your case
 - [Replacing Autumn Subsystems](custom-subsystems.md) — swapping a built-in implementation for your own
 - [Sandboxed Plugins](sandboxed-plugins.md) — running an unaudited third-party plugin under a capability sandbox
+- [Plugin Assets](plugin-assets.md) — shipping JS, CSS and fonts from a plugin crate with content-hashed URLs and SRI
 
 ## Releasing and upgrading
 

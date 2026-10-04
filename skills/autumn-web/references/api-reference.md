@@ -1242,7 +1242,10 @@ double-submits and replays.
   feature enabled).
   **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
   `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
-- Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
+- Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`. `asset_url` also
+  returns content-hashed URLs for files compiled into a crate:
+  `asset_url("js/htmx.min.js")` (the framework's own scripts) and
+  `asset_url("_plugins/<ns>/<file>")` (an installed `PluginAssets` bundle).
 - Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
 - Extractors: `Db`, `LazyDb`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
@@ -1275,6 +1278,7 @@ double-submits and replays.
 | `layer(...)`, `has_layer<T>()`, `get_layer_types()` | Tower middleware |
 | `merge(router)`, `nest(path, router)` | Raw Axum composition |
 | `declare_plugin_routes(...)` | Plugin route declarations |
+| `plugin_assets(&'static PluginAssets)` | Serve a plugin's compiled-in assets under `/static/_plugins/<ns>/`: hashed URL `immutable`, plain URL `must-revalidate`, ETag/304/Range, routes declared public. Build the bundle with `plugin_assets!("ns")` (embeds `assets/`, `embed-assets`) or `PluginAssets::from_files(ns, &[(path, bytes)])`; emit tags with `ASSETS.script_tag(path)` / `deferred_script_tag` / `stylesheet_tag` (hashed URL + `integrity`). A second, different bundle with the same namespace panics. Guide: `docs/guide/plugin-assets.md` |
 | `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks |
 | `with_extension(value)`, `update_extension(...)`, `extension<T>()` | Typed state extensions |
 | `i18n(bundle)`, `i18n_auto()` | I18n bundle setup |

@@ -486,6 +486,163 @@ async fn a_spent_issuance_budget_defers_the_order_without_contacting_the_ca() {
     );
 }
 
+#[tokio::test]
+async fn a_budget_deferral_is_not_counted_as_an_issuance_failure() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let limiter = IssuanceLimiter::new(5, 1, 300, 86_400);
+    limiter.record_attempt("someone.else.com", NOW);
+    let h = harness_with_limiter(
+        TableVerifier::new(&[("app.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        limiter,
+    );
+    h.registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+
+    // No order went out, so there is no failure to back off from: the retry is
+    // scheduled for when the budget window rolls, not by the failure schedule.
+    let record = h.registry.get("app.clientco.com").unwrap();
+    assert_eq!(issuer.count(), 0);
+    assert_eq!(record.consecutive_failures, 0, "{record:?}");
+    assert_eq!(record.next_attempt_unix, Some(NOW + 3600), "{record:?}");
+
+    // Once the window has rolled the domain orders on the next pass.
+    h.task.tick(NOW + 3600).await;
+    assert_eq!(issuer.count(), 1);
+    assert_eq!(
+        h.registry.get("app.clientco.com").unwrap().status,
+        DomainStatus::Active
+    );
+}
+
+/// An issuer whose every order takes `secs` and then fails.
+struct SlowFailingIssuer {
+    secs: u64,
+}
+
+impl DomainIssuer for SlowFailingIssuer {
+    fn issue<'a>(&'a self, _hostname: &'a str) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
+        Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(self.secs)).await;
+            Err("the CA rejected the order".to_owned())
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slow_pass_stamps_each_order_and_backoff_with_the_time_it_actually_ran() {
+    let h = harness(
+        TableVerifier::new(&[
+            ("a.clientco.com", points_here()),
+            ("b.clientco.com", points_here()),
+        ]),
+        Arc::new(SlowFailingIssuer { secs: 1000 }),
+    );
+    for host in ["a.clientco.com", "b.clientco.com"] {
+        h.registry.register(host, "tenant-a", NOW).await.unwrap();
+    }
+
+    h.task.tick(NOW).await;
+
+    // Orders run one after another, each taking 1000s. The first starts at NOW
+    // and fails at NOW+1000; the second starts at NOW+1000 and fails at
+    // NOW+2000. Stamping both with the pass's start time would age the second
+    // order's budget entry early and put its retry (300s backoff) at NOW+300,
+    // already in the past, so the next pass would go straight back to the CA.
+    let mut attempts: Vec<i64> = ["a.clientco.com", "b.clientco.com"]
+        .iter()
+        .flat_map(|h2| h.registry.get(h2).unwrap().issuance_attempts_unix)
+        .collect();
+    attempts.sort_unstable();
+    assert_eq!(attempts, vec![NOW, NOW + 1000]);
+    let mut retries: Vec<i64> = ["a.clientco.com", "b.clientco.com"]
+        .iter()
+        .map(|h2| h.registry.get(h2).unwrap().next_attempt_unix.unwrap())
+        .collect();
+    retries.sort_unstable();
+    assert_eq!(retries, vec![NOW + 1000 + 300, NOW + 2000 + 300]);
+}
+
+#[tokio::test]
+async fn the_issuance_budget_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let backing = Arc::new(MemoryCustomDomainStore::new());
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&backing) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(8));
+    let issuer = ScriptedIssuer::new(&[]);
+    let verifier = TableVerifier::new(&[
+        ("first.clientco.com", points_here()),
+        ("second.clientco.com", points_here()),
+    ]);
+
+    // First process: one order uses the deployment's whole hourly budget.
+    let mut before = task_over(
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+        Arc::clone(&certs),
+        Arc::clone(&verifier) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    before.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
+    registry
+        .register("first.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    before.tick(NOW).await;
+    assert_eq!(issuer.count(), 1);
+    assert_eq!(
+        registry
+            .get("first.clientco.com")
+            .unwrap()
+            .issuance_attempts_unix,
+        vec![NOW],
+        "the attempt must be on the stored record"
+    );
+
+    // Restart: a new process over the same durable records and an EMPTY limiter.
+    let restarted = Arc::new(CustomDomainRegistry::new(
+        backing as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    restarted.load().await.unwrap();
+    let mut after = task_over(
+        Arc::clone(&restarted),
+        cache,
+        certs,
+        verifier as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    after.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
+    after.hydrate_limiter(NOW + 10);
+    restarted
+        .register("second.clientco.com", "tenant-b", NOW + 10)
+        .await
+        .unwrap();
+
+    after.tick(NOW + 10).await;
+
+    assert_eq!(
+        issuer.count(),
+        1,
+        "a restart must not hand the ACME account a fresh quota"
+    );
+    let second = restarted.get("second.clientco.com").unwrap();
+    assert_eq!(second.consecutive_failures, 0, "{second:?}");
+    assert!(
+        second.failure_reason.as_deref().unwrap().contains("budget"),
+        "{second:?}"
+    );
+}
+
 // ── AC5: renewal ─────────────────────────────────────────────────────────
 
 #[tokio::test]

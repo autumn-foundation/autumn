@@ -55,7 +55,8 @@ twice is a no-op: the framework installs each plugin once.
 
 Declare the receiver in `autumn.toml`. `SignedWebhook` verifies the
 signature and CSRF exempts the path. Boot fails when the entry is missing,
-or when its `provider` preset is not the one the billing provider needs.
+when its `provider` preset is not the one the billing provider needs, or when
+it allows less than 4 MiB of request body.
 
 ```toml
 [[security.webhooks.endpoints]]
@@ -63,7 +64,13 @@ name = "billing"
 path = "/billing/webhook"
 provider = "stripe"
 secret_env = "STRIPE_WEBHOOK_SECRET"
+max_body_bytes = 4194304
 ```
+
+`max_body_bytes` is not optional here: the webhook default is 1 MiB, and a
+provider event that carries many invoice lines can be larger. An oversized body
+is rejected before it is reconciled and the provider retries it unchanged, so
+the event is never applied. A larger limit is yours to choose.
 
 ## Configuration
 

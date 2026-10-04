@@ -46,6 +46,25 @@ ignore = [
     # wasm output is rebuilt — that rebuild is the natural point to check
     # whether bincode-referencing symbols actually survive into the binary.
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (governance, not a CVE); arrives via yew's own prokio/gloo-worker plumbing, not island-flock's source; reachability in the shipped wasm undetermined (not confirmed dead-code-eliminated); no safe upgrade; review-by 2026-10-01" },
+    # RUSTSEC-2026-0319 — anymap2 is unmaintained (`anymap3` is the suggested
+    # replacement; no CVE, no known exploit). It is newly published and turned
+    # the advisory gate red workspace-wide on 2026-10-02 (#3094).
+    # It arrives through the same chain as RUSTSEC-2025-0141's `bincode`:
+    # `cargo tree -i anymap2 --target wasm32-unknown-unknown -e normal` roots
+    # at yew -> prokio -> gloo 0.8.1 -> gloo-worker 0.2.1. Mind the flags: the
+    # edge exists only for the wasm target, so a plain host `cargo tree -i
+    # anymap2` prints nothing. It is a NORMAL edge, not a proc-macro dependency
+    # like RUSTSEC-2024-0370's, so it IS part of the graph compiled for the
+    # wasm output. REACHABILITY UNDETERMINED, not confirmed unreachable:
+    # whether gloo-worker's code survives into the built
+    # `autumn_island_flock_bg.wasm` was not verified (it needs a symbol
+    # inspection of the artifact), the same caveat as the bincode entry.
+    # island-flock's own source never references `anymap2` or `gloo_worker`.
+    # anymap2 itself has no fixed release; leaving the chain means upgrading
+    # yew and rebuilding the committed islands bundle, which #3095 tracks and
+    # which retires this entry along with the two above.
+    # Review-by: 2026-11-02, or when #3095 lands.
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained (anymap3 suggested, no CVE); normal wasm-target edge via yew's prokio/gloo-worker 0.2.1, not island-flock's source; reachability in the shipped wasm undetermined; anymap2 has no fix, leaving the chain needs a yew upgrade (#3095); review-by 2026-11-02" },
 ]
 
 [sources]

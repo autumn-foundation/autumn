@@ -78,8 +78,10 @@ When mounted at the default `/admin` prefix, the plugin serves:
 - `GET /admin/{slug}/{id}/edit` — edit form
 - `POST /admin/{slug}/actions` — bulk actions
 
-The plugin also serves a hashed same-origin JavaScript asset under
-`/admin/static/admin.<hash>.js` so long-lived caching stays safe across deploys.
+The plugin also serves its same-origin JavaScript through
+`AppBuilder::plugin_assets`, at a content-hashed URL under
+`/static/_plugins/autumn-admin/` (`admin.<hash>.js`), so long-lived caching
+stays safe across deploys.
 
 ## Database Backends
 

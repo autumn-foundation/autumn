@@ -1,0 +1,93 @@
+name: Toolchain drift (Rust stable)
+
+# CI is pinned to the toolchain in .github/RUST_TOOLCHAIN (#2252, #3082), so a
+# Rust release can no longer turn an unrelated PR red. This is the other half of
+# that deal: the one workflow that DOES float on `stable`, run on a schedule, so
+# the next release's fmt/clippy fallout shows up here as a dedicated, expected
+# signal, in a week we chose, instead of on whichever PR happened to be open.
+#
+# It is not a PR gate and nothing requires it. A red run means "stable has moved
+# and the repo is not clean on it yet": bump the pin deliberately (CONTRIBUTING.md,
+# "Bumping the toolchain"), fixing or grandfathering what it found.
+#
+# The only workflow scripts/check-toolchain-pin.sh lets use `@stable`.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC, off-peak and early in the week so a bump has days to land.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  drift:
+    name: fmt + clippy on current stable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.7.8
+
+      - name: Compare stable with the pin
+        id: versions
+        run: |
+          pin="$(tr -d '[:space:]' < .github/RUST_TOOLCHAIN)"
+          stable="$(rustc --version | awk '{print $2}')"
+          echo "pin=$pin" >> "$GITHUB_OUTPUT"
+          echo "stable=$stable" >> "$GITHUB_OUTPUT"
+          if [ "$pin" = "$stable" ]; then
+            echo "stable is still the pin ($pin); this run checks the pin on a cold cache."
+          else
+            echo "::notice::stable is $stable, the pin is $pin"
+          fi
+          rustc --version --verbose
+          cargo clippy --version
+
+      # Each lane runs even if an earlier one failed, so one run reports
+      # everything stable breaks rather than just the first thing.
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (workspace, all targets)
+        if: ${{ !cancelled() }}
+        # `-j 2` is ci.yml's cap for this exact command: at the default four
+        # workers it is OOM-killed on ubuntu-latest while checking autumn-web,
+        # which would read here as Rust-stable fallout when it is the runner.
+        run: cargo clippy -j 2 --workspace --all-targets -- -D warnings
+
+      - name: Clippy (request-path gated features, all targets)
+        if: ${{ !cancelled() }}
+        # Read from the script the `lint` job's list is kept in sync with, so this
+        # lane cannot drift from it. The default-feature lane above never compiles
+        # these modules, which is how 1.99 hid two `fetch_update` calls (#3082).
+        run: |
+          features="$(sed -n 's/^GATED_REQUEST_PATH_FEATURES="\(.*\)"$/\1/p' scripts/pre-push-check.sh)"
+          test -n "$features" || { echo "::error::could not read GATED_REQUEST_PATH_FEATURES from scripts/pre-push-check.sh"; exit 1; }
+          cargo clippy -p autumn-web --features "$features" --all-targets -- -D warnings
+
+      - name: What to do
+        if: ${{ failure() }}
+        run: |
+          {
+            echo "### Rust stable ${{ steps.versions.outputs.stable }} breaks fmt or clippy"
+            echo
+            echo "CI is pinned to ${{ steps.versions.outputs.pin }}, so nothing else is red. To move to stable:"
+            echo
+            echo "1. Fix what this run found. Prefer a code fix; a lint that fires on a dependency's macro output can be grandfathered in \`[workspace.lints.clippy]\` with a reason."
+            echo "2. Run \`./scripts/check-toolchain-pin.sh --bump ${{ steps.versions.outputs.stable }}\`; it moves \`.github/RUST_TOOLCHAIN\` and every workflow pin together."
+            echo "3. Re-bless the trybuild goldens under the new compiler (\`TRYBUILD=overwrite\`), reviewing the diff."
+            echo
+            echo "See CONTRIBUTING.md, \"Bumping the toolchain\"."
+          } >> "$GITHUB_STEP_SUMMARY"

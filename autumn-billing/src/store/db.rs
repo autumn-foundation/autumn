@@ -19,7 +19,7 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 
 use super::{
     BillingStore, CustomerUpsert, EventClaim, Guard, InvoiceUpsert, StoreFuture,
-    SubscriptionUpsert, Write, guard,
+    SubscriptionUpsert, Write, guard, guard_subscription,
 };
 use crate::error::BillingError;
 use crate::model::{
@@ -767,12 +767,13 @@ impl BillingStore for DbBillingStore {
                         };
                         let current_status = SubscriptionStatus::parse(&current.status)
                             .ok_or_else(|| bad_stored("subscription status", &current.status))?;
-                        match guard(
+                        match guard_subscription(
                             to_utc(current.last_event_at),
                             current_status.rank(),
                             current_status.is_terminal(),
                             upsert.occurred_at,
                             upsert.status.rank(),
+                            upsert.authoritative,
                         ) {
                             Guard::Apply => {}
                             Guard::Unchanged => return Ok(Write::Unchanged(current)),

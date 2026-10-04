@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "dimensions": {
     "routes": {
       "provenance": "provable",
@@ -350,9 +350,53 @@
           "provenance": "provable"
         },
         {
+          "path": "/static/js/autumn-htmx-csrf.ba2cd05f.js",
+          "method": "GET",
+          "name": "htmx_csrf",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
           "path": "/static/js/autumn-htmx-csrf.js",
           "method": "GET",
           "name": "htmx_csrf",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/autumn-widgets.3dc97cf9.js",
+          "method": "GET",
+          "name": "autumn_widgets",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/autumn-widgets.js",
+          "method": "GET",
+          "name": "autumn_widgets",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/htmx.min.e209dda5.js",
+          "method": "GET",
+          "name": "htmx",
           "classification": "framework",
           "roles": [],
           "scopes": [],
@@ -372,9 +416,31 @@
           "provenance": "provable"
         },
         {
+          "path": "/static/js/idiomorph.min.2d1bbb2d.js",
+          "method": "GET",
+          "name": "idiomorph",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
           "path": "/static/js/idiomorph.min.js",
           "method": "GET",
           "name": "idiomorph",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/sse.83eca6fa.js",
+          "method": "GET",
+          "name": "htmx_sse",
           "classification": "framework",
           "roles": [],
           "scopes": [],
@@ -471,6 +537,224 @@
       "source": "macro:#[authorize]",
       "runtime_caveat": "the route→action→resource binding is proven from macro-expanded code; which impl Policy<Resource> serves it is resolved from the PolicyRegistry at boot (AppBuilder::policy::<R, _>(...)). A missing registration is not visible at build time — see the policy_registration entry in `excluded`.",
       "entries": []
+    },
+    "mtls": {
+      "provenance": "declared",
+      "source": "config:server.tls.client_auth",
+      "mode": "off",
+      "required_paths": [],
+      "entries": [
+        {
+          "path": "/",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/_autumn/inspect",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/_autumn/inspect/requests/{id}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/_autumn/jobs/{token}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/a11y",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/circuitbreakers",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/configprops",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/derivations",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/env",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/graph",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/health",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/info",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/jobs",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/logfile",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/loggers",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/loggers/{name}",
+          "method": "PUT",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/metrics",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/prometheus",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/shadow",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/tasks",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/ui",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/ui/metrics",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/ui/tasks",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/webhooks/dlq",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/webhooks/replay",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/health",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/hello",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/hello/{name}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/live",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/ready",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/startup",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-htmx-csrf.ba2cd05f.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-htmx-csrf.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-widgets.3dc97cf9.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-widgets.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/htmx.min.e209dda5.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/htmx.min.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/idiomorph.min.2d1bbb2d.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/idiomorph.min.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/sse.83eca6fa.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/sse.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/{*path}",
+          "method": "GET",
+          "mtls_required": false
+        }
+      ]
     }
   },
   "excluded": [
