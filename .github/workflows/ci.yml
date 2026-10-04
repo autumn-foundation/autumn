@@ -1511,6 +1511,13 @@ jobs:
         # and exit non-zero without it on PATH. Same install command as
         # generator-conformance.yml's `scaffold-postgres` job.
         run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
+      - name: Pre-pull the testcontainer images
+        if: runner.os == 'Linux'
+        # The module default `postgres:11-alpine` is what 100+ tests start, all at
+        # once. A cold runner pulled it in parallel and one pull died mid-stream
+        # (`bytes remaining on stream`), failing `db_hooks_lifecycle` before its
+        # body ran. Pull once, with retries, so every test starts from a cache.
+        run: ./scripts/ci-prepull-images.sh postgres:11-alpine postgres:16-alpine
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
         # 45 -> 75 (#1945): 46 more container-spinning `cli_tests` Docker
@@ -2095,6 +2102,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin --features autumn-web/sqlite \
             --test custom_admin_model -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Pre-pull the testcontainer images
+        if: matrix.lane == 'db-ignored'
+        # Same reason as the `test-docker` job: pull once, with retries, before
+        # the parallel container tests start.
+        run: ./scripts/ci-prepull-images.sh postgres:11-alpine postgres:16-alpine
       - name: Generate coverage (Docker/testcontainer --ignored legs)
         if: matrix.lane == 'db-ignored'
         run: |
