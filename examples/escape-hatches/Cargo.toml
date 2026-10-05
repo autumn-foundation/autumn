@@ -1,0 +1,71 @@
+[package]
+name = "escape-hatches"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# `src/lib.rs` builds the app. Tests build the same app from it.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "escape-hatches"
+path = "src/main.rs"
+
+[dependencies]
+autumn-web = { path = "../../autumn" }
+axum = { workspace = true }
+diesel = { version = "2", features = ["postgres"] }
+diesel-async = { version = "0.9", features = ["postgres", "deadpool"] }
+diesel_migrations = "2"
+maud = { version = "0.27", features = ["axum"] }
+# Migrations run on a libpq connection. Bundle libpq so no system install is needed.
+pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["fs", "set-header"] }
+tracing = "0.1"
+
+[dev-dependencies]
+autumn-web = { path = "../../autumn", features = ["test-support"] }
+example-e2e = { path = "../../example-e2e" }
+futures = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tempfile = "3"
+
+[features]
+# Headless-browser smoke. Needs Chromium on the host.
+#   cargo test -p escape-hatches --features system-tests --test smoke -- --include-ignored
+system-tests = ["autumn-web/system-tests"]
+
+# Docker tests share tables. Run them with `--test-threads=1`.
+[[test]]
+name = "hatches"
+path = "tests/hatches.rs"
+
+# The report gate is process-global. It needs its own test binary.
+[[test]]
+name = "report_gate"
+path = "tests/report_gate.rs"
+
+# Boots the real binary. Proves wiring that `TestApp` cannot reach.
+[[test]]
+name = "boot"
+path = "tests/boot.rs"
+
+[[test]]
+name = "smoke"
+path = "tests/system/smoke.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Determinism seam gate (autumn #1797): this package is outside the gate's
+# manifest, so it grandfathers `clippy::disallowed_methods` the same way the
+# other examples do.
+[lints.clippy]
+disallowed_methods = "allow"
+# `#[derive(diesel::QueryableByName)]` emits `field: field`; rustc 1.99 flags it.
+redundant_field_names = "allow"

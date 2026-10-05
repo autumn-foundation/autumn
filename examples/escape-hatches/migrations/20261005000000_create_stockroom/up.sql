@@ -1,0 +1,26 @@
+-- Products. The CHECK is the last line of defense: no write can make stock negative.
+CREATE TABLE products (
+    id          BIGSERIAL PRIMARY KEY,
+    sku         TEXT   NOT NULL UNIQUE,
+    name        TEXT   NOT NULL,
+    category    TEXT   NOT NULL,
+    stock       INT    NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    price_cents BIGINT NOT NULL CHECK (price_cents >= 0)
+);
+
+CREATE INDEX idx_products_category ON products (category);
+
+-- One row per checkout. A unique `order_ref` makes a retried checkout safe.
+CREATE TABLE orders (
+    id         BIGSERIAL PRIMARY KEY,
+    order_ref  TEXT   NOT NULL UNIQUE
+);
+
+CREATE TABLE order_lines (
+    id         BIGSERIAL PRIMARY KEY,
+    order_id   BIGINT NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
+    product_id BIGINT NOT NULL REFERENCES products (id),
+    quantity   INT    NOT NULL CHECK (quantity > 0)
+);
+
+CREATE INDEX idx_order_lines_order_id ON order_lines (order_id);

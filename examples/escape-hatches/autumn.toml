@@ -1,0 +1,11 @@
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[database]
+url = "postgres://autumn:autumn@localhost:5432/stockroom"
+statement_timeout = "5s"
+
+[log]
+level = "info"
+format = "Pretty"
