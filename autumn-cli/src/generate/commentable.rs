@@ -278,6 +278,51 @@ fn conflicting_table_error(missing: &[&str], columns_unknown: bool) -> GenerateE
     GenerateError::Config(message)
 }
 
+/// The first model file under `src/models` (or `src/models.rs`) that still
+/// uses the `comments` table, as a generated model does with
+/// `use crate::schema::comments;` (#2283).
+///
+/// The shared table needs `commentable_type`, `commentable_id` and
+/// `author_id` on each insert. A plain `Comment` model sets none of them.
+fn model_using_comments_table(project_root: &Path) -> Option<std::path::PathBuf> {
+    let src = project_root.join("src");
+    let mut files = vec![src.join("models.rs")];
+    let mut dirs = vec![src.join("models")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let needle = format!("schema::{COMMENTS_TABLE}");
+    files.into_iter().find(|file| {
+        std::fs::read_to_string(file).is_ok_and(|source| {
+            source
+                .match_indices(&needle)
+                .any(|(at, _)| !source[at + needle.len()..].starts_with(is_ident_char))
+        })
+    })
+}
+
+/// The refusal for a model that still uses the `comments` table (#2283).
+fn stale_model_error(project_root: &Path, model: &Path) -> GenerateError {
+    let model = model.strip_prefix(project_root).unwrap_or(model);
+    GenerateError::Config(format!(
+        "cannot add the shared `{COMMENTS_TABLE}` table: {} still uses the \
+         `{COMMENTS_TABLE}` table. Its inserts do not set the shared columns, so each \
+         insert would fail. The generator wrote no files. Remove that model, or point it \
+         at another table. Then run the command again.",
+        model.display().to_string().replace('\\', "/")
+    ))
+}
+
 /// A table reference parsed from DDL: `[schema.]name`, each half optionally
 /// double-quoted.
 ///
@@ -1266,13 +1311,21 @@ pub fn push_commentable_migration(
     // the generate run being undone, so the table always reads as present and
     // the revert would never take it back out.
     if !for_revert {
-        match comments_table(project_root) {
-            CommentsTable::Shared => return Ok(false),
-            CommentsTable::Conflicting {
-                missing,
-                columns_unknown,
-            } => return Err(conflicting_table_error(&missing, columns_unknown)),
-            CommentsTable::Absent => {}
+        let table = comments_table(project_root);
+        if let CommentsTable::Conflicting {
+            missing,
+            columns_unknown,
+        } = &table
+        {
+            return Err(conflicting_table_error(missing, *columns_unknown));
+        }
+        // Absent or shared: the table is fine, but a model still bound to it
+        // would insert rows without the shared columns.
+        if let Some(model) = model_using_comments_table(project_root) {
+            return Err(stale_model_error(project_root, &model));
+        }
+        if table == CommentsTable::Shared {
+            return Ok(false);
         }
     }
     // …but only take out a migration this generator actually WROTE. A project
@@ -3352,5 +3405,58 @@ mod tests {
         ]);
         let plain = tmp.path().join("migrations").join("0001_create_comments");
         assert!(comments_migration_still_needed(tmp.path(), &plain, &[]));
+    }
+
+    /// After the rename, the `Comment` model still uses `comments`, now the
+    /// shared table. Its inserts lack the shared columns, so generation must
+    /// refuse until that model is removed or retargeted.
+    #[test]
+    fn a_model_still_on_the_comments_table_blocks_the_shared_migration() {
+        let tmp = project_with_a_plain_comments_table();
+        let rename = tmp.path().join("migrations").join("0002_rename");
+        std::fs::create_dir_all(&rename).expect("mkdir");
+        std::fs::write(
+            rename.join("up.sql"),
+            "ALTER TABLE comments RENAME TO notes;\n",
+        )
+        .expect("write");
+        let models = tmp.path().join("src").join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+        std::fs::write(
+            models.join("comment.rs"),
+            "use crate::schema::comments;\n\n#[autumn_web::model]\npub struct Comment {}\n",
+        )
+        .expect("write");
+
+        let mut plan = Plan::new(tmp.path());
+        let message = push_commentable_migration(
+            &mut plan,
+            tmp.path(),
+            "20260101000000",
+            DatabaseBackend::Postgres,
+            false,
+        )
+        .expect_err("the `Comment` model still writes to `comments`")
+        .to_string();
+        assert!(message.contains("comment.rs"), "{message}");
+        assert!(plan.actions.is_empty());
+
+        // Retargeted at the renamed table, the model is no longer in the way.
+        std::fs::write(
+            models.join("comment.rs"),
+            "use crate::schema::notes;\n\n#[autumn_web::model]\npub struct Comment {}\n",
+        )
+        .expect("write");
+        let mut plan = Plan::new(tmp.path());
+        assert!(
+            push_commentable_migration(
+                &mut plan,
+                tmp.path(),
+                "20260101000000",
+                DatabaseBackend::Postgres,
+                false,
+            )
+            .expect("no model uses `comments` now")
+        );
     }
 }

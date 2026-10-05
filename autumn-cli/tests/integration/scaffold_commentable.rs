@@ -457,7 +457,7 @@ fn a_scaffolded_comment_resource_blocks_the_shared_table() {
     assert!(!project.join("src/models/post.rs").exists());
 
     // The remedy: rename the plain table away. The generator then adds the
-    // shared table beside it.
+    // shared table beside it, but only once no model still uses `comments`.
     let rename = project.join("migrations/99990101000000_rename_comments");
     fs::create_dir_all(&rename).expect("mkdir");
     fs::write(
@@ -465,6 +465,14 @@ fn a_scaffolded_comment_resource_blocks_the_shared_table() {
         "ALTER TABLE comments RENAME TO notes;\n",
     )
     .expect("write");
+    let (ok, output) = run_autumn(&project, &post_scaffold);
+    assert!(!ok, "the `Comment` model still uses `comments`:\n{output}");
+    assert!(output.contains("src/models/comment.rs"), "{output}");
+
+    // Retarget the model at the renamed table.
+    let model = project.join("src/models/comment.rs");
+    let source = fs::read_to_string(&model).expect("model");
+    fs::write(&model, source.replace("schema::comments", "schema::notes")).expect("write");
     let (ok, output) = run_autumn(&project, &post_scaffold);
     assert!(ok, "the remedy must unblock generation:\n{output}");
     assert_eq!(

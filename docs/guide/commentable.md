@@ -93,7 +93,8 @@ the generator refuses `comments:commentable`, writes no files, and names the
 missing columns. To continue:
 
 1. Write a migration that renames or drops the existing `comments` table.
-2. Update or remove the model that uses it.
+2. Update or remove the model that uses it. The generator refuses while a
+   model file still uses `schema::comments`.
 3. Run the command again.
 
 Do not add the missing columns to the `Comment` table instead. Its model still
