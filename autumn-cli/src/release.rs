@@ -7053,7 +7053,8 @@ previous_secrets = []
             .into_iter()
             .map(|(name, _)| {
                 let content = fs::read_to_string(dir.join(name))
-                    .unwrap_or_else(|err| panic!("read generated {name}: {err}"));
+                    .unwrap_or_else(|err| panic!("read generated {name}: {err}"))
+                    .replace("\r\n", "\n");
                 (name.to_owned(), content)
             })
             .collect()
@@ -7091,7 +7092,44 @@ previous_secrets = []
                      got: {block}"
                 );
             }
+            // No restart probe may use /ready or /startup: a drain or a slow
+            // dependency would then restart the instance.
+            for (name, content) in &files {
+                for marker in ["liveness_probe {", "[checks."] {
+                    for (at, _) in content.match_indices(marker) {
+                        let block = probe_block(&content[at..], marker).unwrap_or_default();
+                        assert!(
+                            !block.contains("/ready") && !block.contains("/startup"),
+                            "{target:?}: a liveness probe in {name} must use /live, got: {block}"
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    #[test]
+    fn all_targets_lists_every_cli_target() {
+        // The parse error names every CLI target. Each one must be in
+        // ALL_TARGETS, so a new target cannot skip the probe tests.
+        let err = "not-a-target".parse::<Target>().unwrap_err();
+        let names: Vec<&str> = err.split('\'').skip(3).step_by(2).collect();
+        assert!(names.len() >= 6, "cannot read target names from: {err}");
+        for name in &names {
+            let target: Target = name
+                .parse()
+                .unwrap_or_else(|e| panic!("`{name}` from the error must parse: {e}"));
+            assert!(
+                ALL_TARGETS.contains(&target),
+                "ALL_TARGETS must contain {target:?}"
+            );
+        }
+        // `Target::Default` has no CLI name, so count it separately.
+        assert_eq!(
+            ALL_TARGETS.len(),
+            names.len() + 1,
+            "ALL_TARGETS must hold each target once"
+        );
     }
 
     #[test]
@@ -7111,9 +7149,10 @@ previous_secrets = []
                 if name == "autumn.production.toml.example" {
                     continue;
                 }
-                let stripped = content.replace("/actuator/health", "");
+                // This also rejects `/actuator/health`, which fails when a
+                // dependency is down, as `/health` does.
                 assert!(
-                    !stripped.contains("/health"),
+                    !content.contains("/health"),
                     "{target:?}: {name} must not use the /health alias for a probe:\n{content}"
                 );
             }

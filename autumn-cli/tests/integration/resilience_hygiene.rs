@@ -106,7 +106,11 @@ fn pg_worker_idle_sleep_ms(job_rs: &str) -> u64 {
 fn postgres_job_runtime_is_not_described_as_listen_notify() {
     // The Postgres workers poll. Nothing in the job runtime uses
     // LISTEN/NOTIFY, so a line that names it may only deny it.
-    for file in ["autumn/src/job.rs", "autumn/src/job/sqlite.rs"] {
+    for file in [
+        "autumn/src/job.rs",
+        "autumn/src/job/sqlite.rs",
+        "autumn/src/sim/substrate.rs",
+    ] {
         let source = read(file);
         for (index, line) in source.lines().enumerate() {
             assert!(
@@ -157,17 +161,23 @@ fn app_runner_cutover_health_check_uses_ready() {
 #[test]
 fn healthcheck_url_overrides_use_live() {
     // The image HEALTHCHECK is a liveness probe. An override must keep the
-    // same path and change only the scheme.
+    // same path and change only the scheme. Each file shows one or more
+    // overrides, so a reworded example cannot make this check empty.
     for file in [
         "docs/guide/tls.md",
-        "docs/guide/deployment.md",
         "scripts/check-release-image-boot.sh",
+        "skills/autumn-web/references/api-reference.md",
     ] {
         let content = read(file);
-        for line in content
+        let overrides: Vec<&str> = content
             .lines()
             .filter(|line| line.contains("AUTUMN_HEALTHCHECK_URL="))
-        {
+            .collect();
+        assert!(
+            !overrides.is_empty(),
+            "{file} must show an AUTUMN_HEALTHCHECK_URL override"
+        );
+        for line in overrides {
             assert!(
                 line.contains("/live") && !line.contains("/health"),
                 "{file}: an AUTUMN_HEALTHCHECK_URL override must point at /live: {line}"
@@ -187,7 +197,8 @@ fn verus_specs() -> Vec<String> {
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()))
         .map(|entry| entry.expect("dir entry").file_name())
         .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".rs"))
+        // Case-sensitive, as the script's `*.rs` glob is.
+        .filter(|name| Path::new(name).extension().is_some_and(|ext| ext == "rs"))
         .collect();
     specs.sort();
     assert!(
@@ -216,12 +227,14 @@ fn verus_workflow_runs_the_verification_script() {
             "{VERUS_WORKFLOW} must run when `{path}` changes:\n{workflow}"
         );
     }
-    // Non-blocking at first: no required check depends on it.
+    // Non-blocking at first: no CI job depends on it.
     let ci = read(".github/workflows/ci.yml");
-    assert!(
-        !ci.contains("verus"),
-        "ci.yml must not depend on the Verus job while it is non-blocking"
-    );
+    for line in ci.lines().filter(|line| line.contains("needs:")) {
+        assert!(
+            !line.to_ascii_lowercase().contains("verus"),
+            "ci.yml must not depend on the Verus job while it is non-blocking: {line}"
+        );
+    }
 }
 
 #[test]
@@ -269,8 +282,10 @@ fn run_verus_script_with_stub(stub_exit: i32) -> (bool, Vec<String>, String) {
 #[cfg(unix)]
 #[test]
 fn verus_script_checks_every_spec() {
-    let (ok, calls, stderr) = run_verus_script_with_stub(0);
+    let (ok, mut calls, stderr) = run_verus_script_with_stub(0);
     assert!(ok, "the script must pass when every proof passes: {stderr}");
+    // The shell glob order can differ from a byte sort, so compare sorted.
+    calls.sort();
     let expected: Vec<String> = verus_specs()
         .into_iter()
         .map(|spec| format!("verification/{spec}"))
