@@ -492,6 +492,13 @@ impl ConnTimers {
                 .header_read_timeout
                 .or(self.keep_alive_timeout)
                 .map(|timeout| (since + timeout, Expiry::Head)),
+            // An open HTTP/2 header block suspends the idle timer: the new
+            // request gets the full header timeout.
+            Phase::Idle { .. }
+                if state.header_block_since.is_some() && self.header_read_timeout.is_some() =>
+            {
+                None
+            }
             Phase::Idle { since } => self
                 .keep_alive_timeout
                 .map(|timeout| (since + timeout, Expiry::Idle)),
@@ -722,6 +729,31 @@ mod tests {
             state.header_block_since.is_none(),
             "a full block stays closed"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_open_header_block_suspends_the_idle_deadline() {
+        let timers = ConnTimers::new(&HttpLimits {
+            header_read_timeout: Some(Duration::from_secs(10)),
+            keep_alive_timeout: Some(Duration::from_secs(75)),
+            ..HttpLimits::default()
+        });
+        timers.on_read(H2_PREFACE);
+        timers.request_started();
+        timers.request_finished();
+        tokio::time::advance(Duration::from_secs(74)).await;
+
+        // A request starts 1 s before the idle deadline: it gets the full
+        // header timeout, not the 1 s that is left of the idle period.
+        let full = frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, &[0x82, 0x86, 0x84]);
+        timers.on_read(&full[..9]);
+        let (deadline, expiry) = timers.deadline_and_expiry().expect("a deadline");
+        assert_eq!(expiry, Expiry::Head);
+        assert_eq!(deadline, Instant::now() + Duration::from_secs(10));
+
+        timers.on_read(&full[9..]);
+        let (_, expiry) = timers.deadline_and_expiry().expect("idle again");
+        assert_eq!(expiry, Expiry::Idle);
     }
 
     #[tokio::test]
