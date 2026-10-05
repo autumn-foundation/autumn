@@ -2294,37 +2294,14 @@ impl Analyzer {
             // `left.get_mut(0).unwrap()`, `left.as_mut()`: a part of the
             // receiver.
             Expr::MethodCall(mc) => {
-                let method = mc.method.to_string();
-                if matches!(method.as_str(), "unwrap" | "expect") {
-                    self.referents_of(&mc.receiver)
-                } else if method == "as_mut"
-                    || method.ends_with("_mut")
-                    || BORROW_MUT_METHODS.contains(&method.as_str())
-                {
-                    // `groups.entry(k).or_default()`: through the chain.
-                    if matches!(peel_parens(&mc.receiver), Expr::MethodCall(_)) {
-                        return self.referents_of(&mc.receiver);
-                    }
-                    place_root(&mc.receiver)
-                        .map(|root| {
-                            let through = self.env.binding(&root).referents;
-                            if through.is_empty() {
-                                vec![root]
-                            } else {
-                                through
-                            }
-                        })
-                        .unwrap_or_default()
-                } else if matches!(
-                    peel_parens(&mc.receiver),
-                    Expr::MethodCall(_) | Expr::Path(_)
-                ) {
-                    // `slots.iter_mut().next()`, `it.next()`: a method on a
-                    // borrow may give a borrow into it.
-                    self.referents_of(&mc.receiver)
-                } else {
-                    Vec::new()
-                }
+                // `picker.pick(&mut left)`: like a call, the result may borrow
+                // any place a `&mut` argument points to.
+                let mut all: Vec<String> =
+                    mc.args.iter().flat_map(|a| self.referents_of(a)).collect();
+                all.extend(self.receiver_referents(mc));
+                all.sort();
+                all.dedup();
+                all
             }
             // `if flag { &mut left } else { &mut right }`: every tail, and
             // every `break` value of a loop or labeled block.
@@ -2338,6 +2315,41 @@ impl Analyzer {
                 all
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// What the result of `mc` may borrow through its receiver.
+    fn receiver_referents(&self, mc: &ExprMethodCall) -> Vec<String> {
+        let method = mc.method.to_string();
+        if matches!(method.as_str(), "unwrap" | "expect") {
+            self.referents_of(&mc.receiver)
+        } else if method == "as_mut"
+            || method.ends_with("_mut")
+            || BORROW_MUT_METHODS.contains(&method.as_str())
+        {
+            // `groups.entry(k).or_default()`: through the chain.
+            if matches!(peel_parens(&mc.receiver), Expr::MethodCall(_)) {
+                return self.referents_of(&mc.receiver);
+            }
+            place_root(&mc.receiver)
+                .map(|root| {
+                    let through = self.env.binding(&root).referents;
+                    if through.is_empty() {
+                        vec![root]
+                    } else {
+                        through
+                    }
+                })
+                .unwrap_or_default()
+        } else if matches!(
+            peel_parens(&mc.receiver),
+            Expr::MethodCall(_) | Expr::Path(_)
+        ) {
+            // `slots.iter_mut().next()`, `it.next()`: a method on a borrow
+            // may give a borrow into it.
+            self.referents_of(&mc.receiver)
+        } else {
+            Vec::new()
         }
     }
 
@@ -2905,8 +2917,9 @@ impl Analyzer {
             Expr::Closure(_) => Flow::cost(self.closure_arg(expr, Kind::Plain, false)),
 
             Expr::ForLoop(f) => {
-                let element = self.value_of(&f.expr).element();
+                // The iterable runs first: what its value holds is known after.
                 let iter = self.expr(&f.expr);
+                let element = self.value_of(&f.expr).element();
                 let shape = LoopShape {
                     // An iterable that never falls through leaves before the body.
                     bound: if iter.fall.is_none() {
@@ -3436,13 +3449,18 @@ impl Analyzer {
         };
         methods.reverse();
 
+        let mut cost = self.cost_of(root);
+
+        // Arguments run regardless of what the chain does with them.
+        for method in &methods {
+            cost = cost.then(self.method_args(method));
+        }
+        // A store reads its arguments after they ran:
+        // `dest.push({ source.push(repo); source.pop().unwrap() })`.
         for method in &methods {
             let args: Vec<&Expr> = method.args.iter().collect();
             self.store_into(&method.receiver, &method.method.to_string(), &args);
         }
-
-        let mut cost = self.cost_of(root);
-
         // Where the handle enters the chain: the root itself, or the first
         // method that yields one (`app.db()…`, `slot.unwrap()…`). Methods
         // before it are ordinary; methods after it act on a handle.
@@ -3455,10 +3473,6 @@ impl Analyzer {
                 .map(|i| i + 1)
         };
 
-        // Arguments run regardless of what the chain does with them.
-        for method in &methods {
-            cost = cost.then(self.method_args(method));
-        }
         if matches!(cost, Cost::Unbounded(_)) {
             return cost;
         }
@@ -3705,8 +3719,20 @@ impl Analyzer {
             .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n))
             && call.args.first().is_some_and(|a| self.is_connection(a));
 
+        let mut cost = self.cost_of(&call.func);
+        let last = call.args.len().saturating_sub(1);
+        for (i, arg) in call.args.iter().enumerate() {
+            let next = if runs_once {
+                self.connection_params = true;
+                self.callback_arg(arg, Kind::Handle, i == last)
+            } else {
+                self.cost_of(arg)
+            };
+            cost = cost.then(next);
+        }
         // `fill(&mut repos, &repo)` or `fill(slot, &repo)`: a `&mut`
-        // argument may receive a handle from another argument.
+        // argument may receive a handle from another argument. The arguments
+        // ran first, so what they hold is known.
         for (i, arg) in call.args.iter().enumerate() {
             let place = match arg {
                 Expr::Reference(r) if r.mutability.is_some() => &*r.expr,
@@ -3721,17 +3747,6 @@ impl Analyzer {
                 .map(|(_, a)| a)
                 .collect();
             self.store_into(place, "", &others);
-        }
-        let mut cost = self.cost_of(&call.func);
-        let last = call.args.len().saturating_sub(1);
-        for (i, arg) in call.args.iter().enumerate() {
-            let next = if runs_once {
-                self.connection_params = true;
-                self.callback_arg(arg, Kind::Handle, i == last)
-            } else {
-                self.cost_of(arg)
-            };
-            cost = cost.then(next);
         }
         // The connection is the callback's, not an escape into opaque code.
         // An unreadable argument already explains itself.
@@ -12081,6 +12096,40 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut n = 0; Ctx { n, .. } = Ctx { repo: Some(repo), n: 1 }; render(n); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn evaluation_order_and_method_argument_borrows() {
+        check_handlers(&[
+            (
+                "guard: a for element is read after its iterable runs",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut rows = Vec::new(); for row in { rows.push(repo); rows } { row.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a method result borrows its mut arguments",
+                "async fn h(repo: PgPostRepository, picker: Picker) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); \
+                 { let target: &mut Vec<PgPostRepository> = picker.pick(&mut left); target.push(repo); } \
+                 render(left); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a store reads its argument after the argument runs",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Vec::new(); let mut dest = Vec::new(); \
+                 dest.push({ source.push(repo); source.pop().unwrap() }); render(dest); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a call stores into a mut argument after the arguments run",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Vec::new(); let mut dest = Vec::new(); \
+                 fill(&mut dest, { source.push(repo); source.pop().unwrap() }); render(dest); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
