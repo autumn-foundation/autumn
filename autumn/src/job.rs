@@ -958,12 +958,17 @@ impl LeaseHeartbeat {
             async move {
                 // The claim was written just before the heartbeat started.
                 let mut last_renewed = tokio::time::Instant::now();
+                let mut next_attempt =
+                    crate::time_math::saturating_tokio_deadline(last_renewed, interval);
                 loop {
                     tokio::select! {
                         () = stop.cancelled() => return,
-                        () = tokio::time::sleep(interval) => {}
+                        () = tokio::time::sleep_until(next_attempt) => {}
                     }
                     let started = tokio::time::Instant::now();
+                    // Attempts start one interval apart. A slow renewal does
+                    // not push the next one toward the give-up time.
+                    next_attempt = crate::time_math::saturating_tokio_deadline(started, interval);
                     // The give-up time also bounds a renewal that stalls.
                     let give_up_at =
                         crate::time_math::saturating_tokio_deadline(last_renewed, give_up_after);
@@ -23933,6 +23938,26 @@ mod lease_tests {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "the heartbeat ends");
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_keeps_a_lease_whose_renewals_are_slow_but_succeed() {
+        // Each renewal takes 90ms of the 100ms interval. Attempts must start
+        // one interval apart, not one interval after the last one finished,
+        // or the give-up time (two thirds of 300ms from the last renewal's
+        // start) passes while the next renewal is in flight.
+        let heartbeat = LeaseHeartbeat::spawn(300, || async {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            LeaseRenewal::Renewed
+        });
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !lost.is_cancelled(),
+            "slow renewals that all succeed must not stop the job"
+        );
         heartbeat.stop().await;
     }
 
