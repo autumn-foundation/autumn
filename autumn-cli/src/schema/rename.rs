@@ -42,6 +42,14 @@ pub fn rename_changes(baseline: &[Table], desired: &ParsedSchema) -> Vec<SchemaC
 
     let tables = table_renames(baseline, desired, &managed, &mut out);
     for (from, to) in &tables {
+        // Tables and indexes share one namespace.
+        if work.iter().any(|t| t.indexes.iter().any(|i| i.name == *to)) {
+            out.push(SchemaChange::RenameConflict {
+                table: to.clone(),
+                reason: format!("an index named `{to}` already exists"),
+            });
+            continue;
+        }
         push_applied(
             &mut work,
             &mut out,
@@ -193,6 +201,14 @@ fn index_renames(
             let owner = work
                 .iter()
                 .find(|t| t.indexes.iter().any(|i| i.name == new_name));
+            // Tables and indexes share one namespace.
+            if work.iter().any(|t| t.name == new_name) {
+                out.push(SchemaChange::RenameConflict {
+                    table: name.to_owned(),
+                    reason: format!("a table named `{new_name}` already exists"),
+                });
+                continue;
+            }
             match owner {
                 Some(t) if t.name == name => {}
                 Some(t) => out.push(SchemaChange::RenameConflict {
@@ -440,6 +456,7 @@ fn rename_index_target(def: &str, from: &str, to: &str) -> String {
         .map_or(("", target), |(s, n)| (s, n));
     let quoted = name.len() > 1
         && ((name.starts_with('"') && name.ends_with('"'))
+            || (name.starts_with('`') && name.ends_with('`'))
             || (name.starts_with('[') && name.ends_with(']')));
     let bare = if quoted {
         &name[1..name.len() - 1]
@@ -486,7 +503,7 @@ pub fn quoted_len(rest: &str, close: char) -> usize {
 /// Replace each whole-word identifier `from` with `to` in a SQL fragment.
 ///
 /// - An unquoted match ignores case, as SQL does.
-/// - A quoted identifier (`"from"` or `[from]`) matches too.
+/// - A quoted identifier (`"from"`, `` `from` `` or `[from]`) matches too.
 /// - String literals (`'...'`) do not change.
 /// - A function name (a word before `(`), a typed-literal type (a word before
 ///   `'`) or a cast type (the name after `::`, maybe schema-qualified) does not
@@ -500,7 +517,7 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
     let (mut expect_name, mut in_name) = (false, false);
     while let Some(c) = rest.chars().next() {
         let close = match c {
-            '\'' | '"' => Some(c),
+            '\'' | '"' | '`' => Some(c),
             '[' => Some(']'),
             _ => None,
         };
@@ -521,7 +538,7 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
         let is_call = next.starts_with('(') || next.starts_with('\'');
         let in_cast = expect_name && (close.is_some() || is_word(c));
         let quoted_match = !in_cast
-            && matches!(close, Some('"' | ']'))
+            && matches!(close, Some('"' | '`' | ']'))
             && token.len() > 1
             && &token[1..token.len() - 1] == from;
         if close.is_none() && token.eq_ignore_ascii_case(from) && !is_call && !in_cast {
@@ -1192,6 +1209,60 @@ mod tests {
         let err = guard_plan(&diff_schema(&base, &want, OPTS), ALLOW).unwrap_err();
         assert!(matches!(err, DiffError::RenameConflict { .. }), "{err}");
         assert!(err.to_string().contains("idx_users_mail_unique"), "{err}");
+    }
+
+    #[test]
+    fn rename_targets_are_checked_against_tables_and_indexes() {
+        // An index rename whose new name is a table.
+        let users = with_unique_email(
+            table("users", Backend::Postgres, &[("email", ColumnType::Text)]),
+            "email",
+        );
+        let clash = table("idx_users_mail_unique", Backend::Postgres, &[]);
+        let base = vec![users, clash.clone()];
+        let want = desired(
+            vec![
+                with_unique_email(
+                    table("users", Backend::Postgres, &[("mail", ColumnType::Text)]),
+                    "mail",
+                ),
+                clash,
+            ],
+            vec![col_hint("users", "mail", "email")],
+        );
+        let err = guard_plan(&diff_schema(&base, &want, OPTS), ALLOW).unwrap_err();
+        assert!(matches!(err, DiffError::RenameConflict { .. }), "{err}");
+
+        // A table rename whose new name is an index.
+        let mut posts = table("posts", Backend::Postgres, &[]);
+        posts
+            .indexes
+            .push(Index::new("articles", vec!["id".to_owned()], false));
+        let old = table("old_articles", Backend::Postgres, &[]);
+        let base = vec![posts.clone(), old];
+        let want = desired(
+            vec![posts, table("articles", Backend::Postgres, &[])],
+            vec![table_hint("articles", "old_articles")],
+        );
+        let err = guard_plan(&diff_schema(&base, &want, OPTS), ALLOW).unwrap_err();
+        assert!(matches!(err, DiffError::RenameConflict { .. }), "{err}");
+        assert!(err.to_string().contains("articles"), "{err}");
+    }
+
+    #[test]
+    fn backtick_quoted_targets_and_columns_are_rewritten() {
+        assert_eq!(
+            rename_index_target(
+                "CREATE INDEX i ON `articles` (`title`)",
+                "articles",
+                "posts"
+            ),
+            "CREATE INDEX i ON `posts` (`title`)"
+        );
+        assert_eq!(
+            rename_index_column("CREATE INDEX i ON `posts` (`title`)", "title", "headline"),
+            "CREATE INDEX i ON `posts` (`headline`)"
+        );
     }
 
     #[test]
