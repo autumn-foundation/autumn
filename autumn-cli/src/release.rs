@@ -3185,6 +3185,7 @@ case "$1 $2" in
     ;;
   "containerapp revision") tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
   "containerapp secret") echo '[{"name":"api-key","value":"user-value"}]' ;;
+  "containerapp replica") echo "${STUB_REPLICAS:-0}" ;;
   "rest --method") echo "$body" >> "$STUB_LOG.bodies" ;;
   "containerapp ingress") ;;
   *) echo "unexpected az call: $*" >&2; exit 2 ;;
@@ -3199,6 +3200,7 @@ esac
         old_image: &str,
         revision_state: &str,
         redis: bool,
+        placeholder_replicas: u32,
     ) -> Option<(std::process::ExitStatus, String, String)> {
         use std::os::unix::fs::PermissionsExt;
         if std::process::Command::new("jq")
@@ -3232,6 +3234,7 @@ esac
             .env("STUB_LOG", &log)
             .env("STUB_OLD_IMAGE", old_image)
             .env("STUB_REVISION_STATE", revision_state)
+            .env("STUB_REPLICAS", placeholder_replicas.to_string())
             .env("AZURE_APP_NAME", "app")
             .env("AZURE_RESOURCE_GROUP", "rg")
             .env("AZURE_MIGRATE_JOB_NAME", "job")
@@ -3254,10 +3257,14 @@ esac
             "mcr.microsoft.com/k8se/quickstart:latest",
             "Provisioned",
             true,
+            0,
         ) else {
             return;
         };
         assert!(status.success(), "the cutover must succeed: {calls}");
+        let replicas_at = calls
+            .find("az containerapp replica list")
+            .unwrap_or_else(|| panic!("the first cutover must check the placeholder: {calls}"));
         assert_eq!(
             calls.matches("az rest --method patch").count(),
             1,
@@ -3267,7 +3274,7 @@ esac
         let ingress_at = calls
             .find("az containerapp ingress enable")
             .unwrap_or_else(|| panic!("the cutover must open ingress: {calls}"));
-        assert!(patch_at < ingress_at, "{calls}");
+        assert!(replicas_at < patch_at && patch_at < ingress_at, "{calls}");
         for field in [
             "\"userAssignedIdentities\"",
             "\"registries\"",
@@ -3288,9 +3295,12 @@ esac
     #[cfg(unix)]
     #[test]
     fn azure_cutover_script_rolls_back_a_failed_first_cutover() {
-        let Some((status, calls, bodies)) =
-            run_azure_cutover("mcr.microsoft.com/k8se/quickstart:latest", "Failed", false)
-        else {
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+        ) else {
             return;
         };
         assert!(
@@ -3318,7 +3328,8 @@ esac
     fn azure_cutover_script_keeps_credentials_when_a_later_deploy_fails() {
         // The old revision of a later deploy is a real release. It needs
         // its identity and secret refs.
-        let Some((status, calls, _)) = run_azure_cutover("acr.azurecr.io/app:t0", "Failed", false)
+        let Some((status, calls, _)) =
+            run_azure_cutover("acr.azurecr.io/app:t0", "Failed", false, 0)
         else {
             return;
         };
@@ -3329,6 +3340,51 @@ esac
             "{calls}"
         );
         assert!(!calls.contains("ingress enable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_the_placeholder_to_stop() {
+        // The identity is app-wide. Azure keeps the old revision active
+        // until the new one is ready. A running placeholder replica would
+        // get the identity, so the first cutover must not PATCH.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            1,
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(
+            !calls.contains("az rest --method patch"),
+            "no credentials while the placeholder runs: {calls}"
+        );
+        assert!(!calls.contains("ingress enable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_syncs_config_on_a_same_tag_redeploy() {
+        // A Redis toggle followed by a redeploy of the same tag must still
+        // send the job's secrets and env vars to the app.
+        let Some((status, calls, bodies)) =
+            run_azure_cutover("acr.azurecr.io/app:t1", "Provisioned", true, 0)
+        else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            1,
+            "{calls}"
+        );
+        assert!(bodies.contains("\"redis-url\""), "{bodies}");
+        assert!(
+            !calls.contains("az containerapp replica list"),
+            "a later deploy has no placeholder to check: {calls}"
+        );
     }
 
     #[test]
