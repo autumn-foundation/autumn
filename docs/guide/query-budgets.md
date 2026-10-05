@@ -157,9 +157,10 @@ The analysis follows the handle through every name that holds it:
     and `ctx.user` is not.
   - An index (`repos[0]`), a field (`pair.0`), a pattern (`Some(r)`,
     `for r in repos`) or `?` gives a handle.
-  - A method on the container gives a handle (`repos.remove(0)`), unless it
-    returns a number or a `bool` (`repos.len()`) or a view of the container
-    (`repos.iter()`, `repos.first()`). These methods are not queries.
+  - A known container method is not a query. It gives a handle when it
+    returns a part (`repos.remove(0)`, `maybe.unwrap()`), and a container
+    when it returns a view (`repos.iter()`, `repos.first()`). Any other
+    method on the container is reported (`repos.refresh_all()`).
   - A helper handed the container is reported.
 
 When the parts are not known, for example in a parameter or a destructured

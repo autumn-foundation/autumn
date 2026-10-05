@@ -249,14 +249,50 @@ const SMART_POINTERS: &[&str] = &["Box", "Arc", "Rc"];
 /// not a query, and its parts are handles.
 const CARRIER_TYPES: &[&str] = &["Vec", "VecDeque", "Option"];
 
-/// Methods on a carrier that return a number or a `bool`, not a part of it.
+/// Methods on a carrier that return nothing, a number or a `bool`: not a
+/// part of it.
 const SCALAR_METHODS: &[&str] = &[
-    "len", "is_empty", "is_some", "is_none", "is_ok", "is_err", "contains", "count",
+    "len",
+    "is_empty",
+    "is_some",
+    "is_none",
+    "is_ok",
+    "is_err",
+    "is_some_and",
+    "is_none_or",
+    "is_ok_and",
+    "is_err_and",
+    "contains",
+    "count",
+    "any",
+    "all",
+    "position",
+    "for_each",
+    "try_for_each",
+    "push",
+    "push_back",
+    "push_front",
+    "extend",
+    "append",
+    "clear",
+    "truncate",
+    "sort",
+    "sort_by",
+    "sort_by_key",
+    "sort_unstable",
+    "sort_unstable_by",
+    "sort_unstable_by_key",
+    "dedup",
+    "reverse",
+    "retain",
+    "swap",
+    "resize",
+    "reserve",
+    "shrink_to_fit",
 ];
 
 /// Methods on a carrier that return a carrier: a view, an iterator, or an
-/// `Option` of a part. Any other method on a carrier may return a part, so
-/// its result is a handle.
+/// `Option` of a part.
 const CARRIER_METHODS: &[&str] = &[
     "iter",
     "iter_mut",
@@ -271,10 +307,14 @@ const CARRIER_METHODS: &[&str] = &[
     "filter",
     "filter_map",
     "flat_map",
+    "and_then",
+    "or",
+    "or_else",
     "enumerate",
     "rev",
     "skip",
     "take",
+    "replace",
     "chain",
     "zip",
     "peekable",
@@ -286,6 +326,15 @@ const CARRIER_METHODS: &[&str] = &[
     "get_mut",
     "pop",
     "next",
+    "nth",
+    "find",
+    "find_map",
+    "inspect",
+    "step_by",
+    "chunks",
+    "windows",
+    "skip_while",
+    "take_while",
     "ok",
     "ok_or",
     "ok_or_else",
@@ -295,6 +344,38 @@ const CARRIER_METHODS: &[&str] = &[
     "values",
     "values_mut",
 ];
+
+/// Methods on a carrier that return a part of it, which is a handle.
+const ELEMENT_METHODS: &[&str] = &[
+    "remove",
+    "swap_remove",
+    "insert",
+    "unwrap",
+    "expect",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "unwrap_unchecked",
+    "map_or",
+    "map_or_else",
+    "fold",
+    "try_fold",
+    "reduce",
+    "max",
+    "min",
+    "max_by",
+    "min_by",
+    "max_by_key",
+    "min_by_key",
+];
+
+/// Is `method` one of the known methods on a carrier? Any other method on a
+/// carrier may run queries on its parts, so it is reported.
+fn is_container_method(method: &str) -> bool {
+    SCALAR_METHODS.contains(&method)
+        || CARRIER_METHODS.contains(&method)
+        || ELEMENT_METHODS.contains(&method)
+}
 
 /// Offered when the fix is to stop issuing a query per row.
 const BATCH_HINT: &str = "Batch the per-row lookup into one query with `preload(...)`, or opt the \
@@ -873,9 +954,15 @@ impl Analyzer {
                 }
             }
             Pat::TupleStruct(p) => {
-                // `Err(e)` binds the error, not the handle of a `Result<Db, E>`.
+                // A `Result` is a handle only when its `Ok` side is one, so
+                // `Err(e)` on it binds the error. On a carrier, such as a
+                // `Result<(), Db>`, `Err(e)` may be the handle.
                 let is_err = p.path.segments.last().is_some_and(|s| s.ident == "Err");
-                let inner = if is_err { Kind::Plain } else { kind.element() };
+                let inner = if is_err && kind.is_handle() {
+                    Kind::Plain
+                } else {
+                    kind.element()
+                };
                 for elem in &p.elems {
                     self.bind_pat(elem, inner);
                 }
@@ -1581,6 +1668,21 @@ impl Analyzer {
         if matches!(cost, Cost::Unbounded(_)) {
             return cost;
         }
+        // An unknown method on a container of handles (an extension-trait
+        // `repos.refresh_all()`) may query through each of them.
+        if let Some(unknown) = methods.iter().find(|m| {
+            self.expr_is_carrier(&m.receiver) && !is_container_method(&m.method.to_string())
+        }) {
+            return Cost::unbounded(
+                unknown.span(),
+                format!(
+                    "`{}` is called on a container of database handles, and what it does with \
+                     them is another function's business",
+                    unknown.method
+                ),
+                DECLARE_HINT,
+            );
+        }
 
         if let Some(from) = handle_from {
             let on_handle = &methods[from.min(methods.len())..];
@@ -1634,6 +1736,12 @@ impl Analyzer {
 
         // Not rooted at a handle: a diesel executor call is the round trip.
         for method in &methods {
+            // `repos.push(repo)`: a known container method stores the handle.
+            if self.expr_is_carrier(&method.receiver)
+                && is_container_method(&method.method.to_string())
+            {
+                continue;
+            }
             let is_executor = EXECUTORS.contains(&method.method.to_string().as_str());
             let takes_handle = method.args.iter().any(|a| self.expr_carries_handle(a));
             // A diesel executor is handed the connection
@@ -1924,11 +2032,9 @@ impl Analyzer {
         if HANDLE_ACCESSORS.contains(&method.as_str()) {
             return true;
         }
-        // A method on a carrier may return a part of it (`repos.remove(0)`),
-        // unless it is known to return a carrier or a scalar.
+        // A method on a carrier that returns a part: `repos.remove(0)`.
         if self.expr_is_carrier(&mc.receiver) {
-            return !CARRIER_METHODS.contains(&method.as_str())
-                && !SCALAR_METHODS.contains(&method.as_str());
+            return ELEMENT_METHODS.contains(&method.as_str());
         }
         // `.expect(...)`/`.unwrap()` stand in for `?`
         // (`ctx.conn().await.expect("connection")`, #2546 review round 5).
@@ -2014,10 +2120,10 @@ impl Analyzer {
     ///
     /// * an array, tuple, `vec!`, struct literal or constructor call
     ///   (`Some(repo)`) that holds a handle is a carrier;
-    /// * a method in `CARRIER_METHODS` on a carrier gives a carrier
-    ///   (`repos.iter()`), a method in `SCALAR_METHODS` gives a plain value
-    ///   (`repos.len()`), and any other method gives a handle
-    ///   (`repos.remove(0)`);
+    /// * on a carrier, a method in `CARRIER_METHODS` gives a carrier
+    ///   (`repos.iter()`), one in `ELEMENT_METHODS` gives a handle
+    ///   (`repos.remove(0)`), one in `SCALAR_METHODS` gives a plain value
+    ///   (`repos.len()`), and any other method is reported;
     /// * an index, a field, a pattern or `?` on a carrier gives a handle (see
     ///   [`Self::expr_is_handle`]).
     fn expr_is_carrier(&self, expr: &Expr) -> bool {
@@ -2507,8 +2613,12 @@ fn type_is_carrier(ty: &Type) -> bool {
         Type::Slice(s) => holds(&s.elem),
         Type::Tuple(t) => t.elems.iter().any(holds),
         Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
-            CARRIER_TYPES.contains(&segment.ident.to_string().as_str())
-                && generic_types(segment).any(holds)
+            let name = segment.ident.to_string();
+            if name == "Result" {
+                // `Result<(), Db>`: the handle is on the `Err` side.
+                return generic_types(segment).nth(1).is_some_and(holds);
+            }
+            CARRIER_TYPES.contains(&name.as_str()) && generic_types(segment).any(holds)
         }),
         _ => false,
     }
@@ -2547,8 +2657,10 @@ fn type_is_handle(ty: &Type) -> bool {
             // A smart pointer derefs to what it holds: `Arc<PgPostRepository>`.
             // Any other wrapper (`Extension<Db>`, `State<Db>`) counts for an
             // *exact* handle type only, so `Form<NewRepo>` is not a handle.
+            // A `Result` is a handle only through its `Ok` side.
             let smart_pointer = SMART_POINTERS.contains(&name.as_str());
-            generic_types(segment).any(|inner| {
+            let take = if name == "Result" { 1 } else { usize::MAX };
+            generic_types(segment).take(take).any(|inner| {
                 type_is_exact_handle(inner) || (smart_pointer && type_is_handle_part(inner))
             })
         }
@@ -2612,9 +2724,14 @@ fn type_is_lazy_db(ty: &Type) -> bool {
         Type::Paren(p) => type_is_lazy_db(&p.elem),
         Type::Group(g) => type_is_lazy_db(&g.elem),
         Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            let take = if segment.ident == "Result" {
+                1
+            } else {
+                usize::MAX
+            };
             segment.ident == "LazyDb"
                 || (LAZY_DB_WRAPPERS.contains(&segment.ident.to_string().as_str())
-                    && generic_types(segment).any(type_is_lazy_db))
+                    && generic_types(segment).take(take).any(type_is_lazy_db))
         }),
         _ => false,
     }
@@ -5284,6 +5401,43 @@ mod tests {
             ";
         assert_clean("1", handler);
         assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn an_err_payload_keeps_a_handle_on_the_error_side() {
+        // `Result<(), Db>` holds its handle in `Err`.
+        let handler = r"
+            async fn h(result: Result<(), Db>) -> AutumnResult<usize> {
+                if let Err(mut db) = result {
+                    let _ = posts::table.load(&mut *db).await?;
+                }
+                Ok(0)
+            }
+            ";
+        assert_clean("1", handler);
+        assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn an_unknown_method_on_a_container_of_handles_is_reported() {
+        // An extension-trait method may run a query per element.
+        let handler = r"
+            async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
+                repos.refresh_all().await?;
+                Ok(0)
+            }
+            ";
+        assert_error_contains("50", handler, &["refresh_all"]);
+        // Known container methods stay free.
+        let known = r"
+            async fn h(mut repos: Vec<PgPostRepository>, extra: PgPostRepository) -> AutumnResult<usize> {
+                repos.push(extra);
+                repos.sort_by_key(|r| r.id);
+                repos.iter().for_each(|r| drop(r));
+                Ok(repos.len())
+            }
+            ";
+        assert_clean("0", known);
     }
 
     #[test]

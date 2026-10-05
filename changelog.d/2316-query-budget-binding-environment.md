@@ -20,7 +20,8 @@
 - **query budgets:** a handle kept in a container is tracked. An index, a
   field, a pattern, `?` or an element method (`remove`, `unwrap`) on
   `[repo]`, `vec![repo]`, `Some(repo)` or a `Vec<PgPostRepository>`
-  parameter gives a handle (#2316).
+  parameter gives a handle. An unknown method on such a container is
+  reported (#2316).
 - **query budgets:** a parameter of type `Arc<PgPostRepository>`, `Box<…>`,
   `Rc<…>`, `dyn PostRepository` or `impl PostRepository` is a handle. A
   handle assigned into a field (`deps.0 = repo`) is tracked. Before, a query
