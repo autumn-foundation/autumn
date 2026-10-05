@@ -2596,7 +2596,13 @@ impl Analyzer {
                     ends: false,
                 };
                 self.loop_flow(&shape, |s| {
-                    let cond = s.cost_of(&w.cond);
+                    // A condition that never falls through (`while { return
+                    // …; }`) leaves before the body.
+                    let cond = s.expr(&w.cond);
+                    if cond.fall.is_none() {
+                        s.unreachable(|s| s.block(&w.body));
+                        return cond;
+                    }
                     s.exit_loop(None);
                     let stop = Flow {
                         fall: None,
@@ -2609,7 +2615,7 @@ impl Analyzer {
                         )],
                         ret: None,
                     };
-                    Flow::cost(cond).then(stop.or_worst(s.block(&w.body)))
+                    cond.then(stop.or_worst(s.block(&w.body)))
                 })
             }
             // A `loop` ends only by an exit.
@@ -2760,6 +2766,8 @@ impl Analyzer {
     fn match_expr(&mut self, m: &syn::ExprMatch) -> Flow {
         let scrutinee = self.expr(&m.expr);
         let mut entry = self.env.clone();
+        // The guards tried so far: an arm's body runs after every guard
+        // before it, and its own.
         let mut guards = Cost::ZERO;
         let mut bodies = Flow::NEVER;
         let mut joined: Option<Env> = None;
@@ -2778,6 +2786,7 @@ impl Analyzer {
                 )
             });
             guards = guards.then(guard);
+            let body = Flow::cost(guards.clone()).then(body);
             // A failing guard falls through to the next arm with its bindings.
             let mut after_guard = after_guard;
             after_guard.scopes.truncate(depth);
@@ -2795,7 +2804,7 @@ impl Analyzer {
             }
         }
         self.env = joined.unwrap_or(entry);
-        scrutinee.then(Flow::cost(guards)).then(bodies)
+        scrutinee.then(bodies)
     }
 
     fn each<'a>(&mut self, exprs: impl Iterator<Item = &'a Expr>) -> Flow {
@@ -3709,7 +3718,7 @@ impl Analyzer {
         let Expr::Closure(closure) = f else {
             return Kind::Plain;
         };
-        self.closure_value(closure, param, false)
+        self.closure_value(closure, &[], param, false)
     }
 
     /// A copy of the analysis that reads a body. Its own record of closed
@@ -3804,26 +3813,28 @@ impl Analyzer {
         }
     }
 
-    /// What an immediately invoked closure gives. Each parameter may hold
-    /// what any argument holds.
+    /// What an immediately invoked closure gives. Each parameter holds what
+    /// its argument holds.
     fn invoked(&self, call: &ExprCall, awaited: bool) -> Option<Kind> {
         let closure = immediately_invoked_closure(&call.func)?;
-        let param = call
-            .args
-            .iter()
-            .map(|a| self.value_of(a))
-            .max()
-            .unwrap_or(Kind::Plain);
-        Some(self.closure_value(closure, param, awaited))
+        let params: Vec<Kind> = call.args.iter().map(|a| self.value_of(a)).collect();
+        Some(self.closure_value(closure, &params, Kind::Plain, awaited))
     }
 
-    /// What `closure` returns when its parameters hold `param`. When it is
-    /// `awaited`, a body of `async { … }` gives what its block gives.
-    fn closure_value(&self, closure: &syn::ExprClosure, param: Kind, awaited: bool) -> Kind {
+    /// What `closure` returns when parameter `i` holds `params[i]`, or
+    /// `rest` past the end. When it is `awaited`, a body of `async { … }`
+    /// gives what its block gives.
+    fn closure_value(
+        &self,
+        closure: &syn::ExprClosure,
+        params: &[Kind],
+        rest: Kind,
+        awaited: bool,
+    ) -> Kind {
         let mut probe = self.probe();
         probe.env.push();
-        for input in &closure.inputs {
-            probe.bind_pat(input, param);
+        for (i, input) in closure.inputs.iter().enumerate() {
+            probe.bind_pat(input, params.get(i).copied().unwrap_or(rest));
         }
         let tail = match &*closure.body {
             Expr::Block(b) => probe.block_value(&b.block),
@@ -9851,6 +9862,48 @@ mod tests {
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
                  let ids = result.map(|_| 1); let _ = ids.map(|n| render(n)); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn while_conditions_guards_and_closure_parameters() {
+        check_handlers(&[
+            (
+                "a while condition that returns never runs the body",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 while { return Ok(repo.a().await?); } { let _ = repo.b().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a while condition that falls through runs the body",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 while flag { let _ = repo.b().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "each match body pays only the guards tried before it",
+                "async fn h(repo: PgPostRepository, x: i64) -> AutumnResult<usize> { \
+                 let _ = match x { _ if repo.a().await? => repo.b().await?, _ if repo.c().await? => plain(), _ => plain() }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: a later arm pays every guard before it",
+                "async fn h(repo: PgPostRepository, x: i64) -> AutumnResult<usize> { \
+                 let _ = match x { _ if repo.a().await? => plain(), _ if repo.c().await? => plain(), _ => repo.b().await? }; Ok(0) }",
+                Expect::Exact(3),
+            ),
+            (
+                "a called closure binds each parameter to its own argument",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let n = (|_repo, n| n)(repo, 1); render(n); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a called closure gives the handle argument back",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let r = (|r, _n| r)(repo, 1); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
