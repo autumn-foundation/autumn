@@ -1578,6 +1578,11 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         {
             state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
         }
+        if status.mode == Some(HostMode::Redeploy)
+            && matches!(status.installed_proxy_port, exec::InstalledProxyPort::Unreadable)
+        {
+            state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_UNREADABLE));
+        }
         // Review round 1: the maintenance column is only as good as the CLI's
         // knowledge of WHICH file the running unit polls. Both failure shapes are
         // named here rather than buried in the column, because both need an
