@@ -402,8 +402,9 @@ across a web/worker split.
 
 Three differences from Postgres, all by design:
 
-- **Workers poll.** SQLite has no `LISTEN`/`NOTIFY`. An enqueue in the same
-  process wakes a worker directly; work another process enqueued is seen within
+- **Workers poll, with an in-process wake.** An enqueue in the same process
+  wakes a worker at once. The Postgres backend has no such wake. Work that
+  another process enqueued is seen within
   `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
   to cut idle wakeups.
 - **The queue is host-local, and must be a file.** Two processes on one host

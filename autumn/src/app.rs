@@ -5064,7 +5064,7 @@ impl AppBuilder {
         // it on the process role exactly like the `#[job]` runtime above: a `web`
         // replica must not claim or execute hook rows, while `worker` and
         // `combined` replicas keep running it. The worker drains rows through a
-        // Postgres queue (LISTEN/NOTIFY plus row-locked claiming). Under the
+        // Postgres queue (in-process kick, polling and row-locked claiming). Under the
         // `sqlite` feature the runtime pool is a SQLite pool the Postgres worker
         // cannot drive, so the worker is not spawned.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
