@@ -3244,7 +3244,9 @@ case "$1 $2" in
       registries=""
       [ -n "$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_NO_REGISTRY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
       secrets=""
-      [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}"
+      sid="$id"
+      [ -n "$STUB_APP_STALE_SECRET_IDENTITY" ] && sid=/old-id
+      [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$sid\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$sid\"}"
       app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
       # A GET shows the app state with each PATCH merged in. Like ARM after
       # a 202, the first STUB_PATCH_PENDING reads after a PATCH still show
@@ -3262,11 +3264,20 @@ case "$1 $2" in
       fi
       cat "$state"
     else
-      tsv Succeeded "${STUB_LATEST:-app--new}"
+      # Each PATCH with a template makes a new revision.
+      n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
+      latest="app--old"
+      [ "${n:-0}" -gt 0 ] && latest="app--new$n"
+      tsv Succeeded "${STUB_LATEST:-$latest}"
     fi
     ;;
   "containerapp revision")
-    if [ "$query" = properties.active ]; then echo false; else tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1; fi
+    case "$query" in
+      properties.active) echo false ;;
+      # The placeholder image always provisions.
+      properties.provisioningState) echo Provisioned ;;
+      *) tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
+    esac
     ;;
   "containerapp secret")
     if [ -n "$STUB_APP_REDIS" ]; then
@@ -3366,6 +3377,7 @@ esac
             .env_remove("STUB_APP_REDIS")
             .env_remove("STUB_APP_NO_REGISTRY")
             .env_remove("STUB_APP_OWN_IDENTITY")
+            .env_remove("STUB_APP_STALE_SECRET_IDENTITY")
             .env_remove("STUB_PATCH_PENDING");
         if !args.is_empty() {
             command.env_remove("IMAGE_TAG");
@@ -3452,9 +3464,11 @@ esac
             !status.success(),
             "a failed revision must fail the cutover: {calls}"
         );
+        // The cutover, then the rollback: a template without the secret
+        // refs, then the credential removal.
         assert_eq!(
             calls.matches("az rest --method patch").count(),
-            2,
+            3,
             "{calls}"
         );
         assert!(
@@ -3606,9 +3620,19 @@ esac
             return;
         };
         assert!(status.success(), "{calls}");
-        assert_eq!(
-            calls.matches("az rest --method patch").count(),
-            1,
+        // The active revision refers to the secrets. Azure's order: deploy
+        // a revision without the refs, wait until the old one is inactive,
+        // then delete the secrets.
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(patches[0].contains("\"template\""), "{}", patches[0]);
+        assert!(!patches[0].contains("\"secrets\""), "{}", patches[0]);
+        assert!(!patches[1].contains("\"template\""), "{}", patches[1]);
+        let inactive_at = calls
+            .find("--revision app--old --query properties.active")
+            .unwrap_or_else(|| panic!("the old revision must stop first: {calls}"));
+        assert!(
+            inactive_at < calls.rfind("az rest --method patch").unwrap(),
             "{calls}"
         );
         assert!(!calls.contains("ingress enable"), "{calls}");
@@ -3703,6 +3727,31 @@ esac
                 ("STUB_APP_ENV_FULL", "1"),
                 ("STUB_APP_LEGACY", "1"),
                 ("STUB_APP_NO_REGISTRY", "1"),
+                ("STUB_PATCH_PENDING", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(full_reads_after_patch(&calls[..restart_at]) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_checks_the_secret_identity_before_a_restart() {
+        // The stale GET has the right secret names and Key Vault URLs, but
+        // an old identity. Key Vault refs need the right identity.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_STALE_SECRET_IDENTITY", "1"),
                 ("STUB_PATCH_PENDING", "2"),
             ],
         ) else {
