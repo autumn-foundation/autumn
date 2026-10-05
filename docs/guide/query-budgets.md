@@ -402,7 +402,7 @@ The analysis tracks a handle from where the signature names it (the `Db` /
 repository extractor), through fields and conventionally-named accessors
 (`self.repo`, `state.db`, `app.pool()`), through every binding and container
 (see [How a handle is tracked](#how-a-handle-is-tracked)), and into transaction
-callbacks. Two things sit outside it, by construction:
+callbacks. These things sit outside it, by construction:
 
 - **A handle obtained some other way** — for example a repository pulled off an
   application-state extractor by an application-specific method
@@ -421,6 +421,13 @@ callbacks. Two things sit outside it, by construction:
   with an argument count that the standard method does not take
   (`repos.push()`), and reports it. Do not give a trait on a container of
   handles a standard method name.
+- **An application item that takes a standard name.** The macro trusts a
+  standard name that is bare or under a `std` path: the type `Vec`, `vec!`,
+  `format!`, `drop`. It does not trust one under another path
+  (`custom::Vec`, `custom::vec!`), or one that the handler body defines or
+  imports (`macro_rules! vec`, `fn drop`). It cannot see a module-level `use`
+  or `macro_rules!` that replaces a bare standard name. Do not give an item of
+  yours a standard name.
 
 ### `proven_max` is not `query_count()`
 

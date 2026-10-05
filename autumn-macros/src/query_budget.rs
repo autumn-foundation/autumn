@@ -1001,12 +1001,15 @@ fn type_shape(ty: &Type) -> Option<Shape> {
         Type::Tuple(_) => Some(Shape::Tuple),
         Type::Path(path) => {
             let segment = path.path.segments.last()?;
+            let std = path.qself.is_none() && std_prefix(&path.path);
             match segment.ident.to_string().as_str() {
+                // A connection: not the name suffix, which a user type may have.
+                name if HANDLE_TYPES.contains(&name) && name != "LazyDb" => Some(Shape::Db),
+                // `custom::Vec<T>` is a user type with its own methods.
+                _ if !std => None,
                 name if SMART_POINTERS.contains(&name) => {
                     generic_types(segment).next().and_then(type_shape)
                 }
-                // A connection: not the name suffix, which a user type may have.
-                name if HANDLE_TYPES.contains(&name) && name != "LazyDb" => Some(Shape::Db),
                 // `Option<&T>`.
                 "Option" if matches!(generic_types(segment).next(), Some(Type::Reference(_))) => {
                     Some(Shape::OptRef)
@@ -1845,6 +1848,9 @@ struct Analyzer {
     /// The next closure body's parameters are connections: it is a
     /// transaction callback.
     connection_params: bool,
+    /// Names the handler body defines or imports (`macro_rules! vec`, `fn
+    /// drop`, `use x::format`). A std name among them is not trusted.
+    shadowed: Rc<Vec<String>>,
 }
 
 impl Analyzer {
@@ -1857,6 +1863,7 @@ impl Analyzer {
             errors: Vec::new(),
             returned: Kind::Plain,
             connection_params: false,
+            shadowed: Rc::new(local_names(&input_fn.block)),
         };
         for arg in &input_fn.sig.inputs {
             if let syn::FnArg::Typed(typed) = arg {
@@ -2186,7 +2193,7 @@ impl Analyzer {
                 !(is_handle_constructor(call)
                     || is_container_constructor(call)
                     || is_smart_pointer_new(call)
-                    || call_path_name(call).is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str())))
+                    || self.is_std_free_fn(call))
             }
             // A path that diverges gives no value.
             Expr::Async(_)
@@ -2397,7 +2404,9 @@ impl Analyzer {
                     || self.shape_of(e).is_some())
                     && c.args.iter().all(known))
             }
-            Expr::Macro(m) => vec_elems(&m.mac).is_none_or(|elems| !elems.iter().all(known)),
+            Expr::Macro(m) => self
+                .std_vec(&m.mac)
+                .is_none_or(|elems| !elems.iter().all(known)),
             Expr::Tuple(t) => !t.elems.iter().all(known),
             Expr::Array(a) => !a.elems.iter().all(known),
             Expr::Struct(st) => st.rest.is_some() || !st.fields.iter().all(|f| known(&f.expr)),
@@ -3591,7 +3600,7 @@ impl Analyzer {
             return cost;
         }
         // An awaited `drop` is a user `async fn` of that name.
-        if !awaited && name.as_deref().is_some_and(|n| SAFE_FREE_FNS.contains(&n)) {
+        if !awaited && self.is_std_free_fn(call) {
             return cost;
         }
         // `Some(repo)`, `Ok(db)`, `Arc::new(repo)`, `PgPostRepository(pool)`:
@@ -3627,7 +3636,7 @@ impl Analyzer {
     /// handle, the queries it may hide are reported rather than assumed absent.
     fn mac(&mut self, mac: &syn::Macro) -> Cost {
         // `vec![a, b]` and `vec![a; n]` are read like an array.
-        if let Some(elems) = vec_elems(mac) {
+        if let Some(elems) = self.std_vec(mac) {
             let mut cost = Cost::ZERO;
             for elem in &elems {
                 cost = cost.then(self.cost_of(elem));
@@ -3652,7 +3661,10 @@ impl Analyzer {
         // however it names the handle: it does not await, and a sync helper it
         // hands the handle to cannot run an async query. Anything else that
         // names a handle is reported (#1667 review, round two).
-        if INERT_MACROS.contains(&name.as_str()) {
+        // A name the handler body defines, or a `vec!` that is not std, is
+        // the user's macro.
+        let users = self.is_shadowed(&name) || (name == "vec" && !std_prefix(&mac.path));
+        if INERT_MACROS.contains(&name.as_str()) && !users {
             return Cost::ZERO;
         }
         Self::opaque_macro(mac, &name)
@@ -3679,7 +3691,7 @@ impl Analyzer {
         // Std `drop` gives `()`. A value from a `drop` that took a handle is
         // a user function's, and may hold it (`let pending = drop(repo);`).
         if let Expr::Call(c) = peel_parens(expr)
-            && call_path_name(c).is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()))
+            && self.is_std_free_fn(c)
             && c.args.iter().any(|a| self.expr_carries_handle(a))
         {
             return Kind::Holder;
@@ -3771,7 +3783,7 @@ impl Analyzer {
             }
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => Some(Shape::Bool),
             Expr::Lit(l) if matches!(l.lit, syn::Lit::Bool(_)) => Some(Shape::Bool),
-            Expr::Macro(m) => vec_elems(&m.mac).map(|_| Shape::Vec),
+            Expr::Macro(m) => self.std_vec(&m.mac).map(|_| Shape::Vec),
             Expr::Call(c) if is_smart_pointer_new(c) => {
                 c.args.first().and_then(|a| self.shape_of(a))
             }
@@ -3781,9 +3793,10 @@ impl Analyzer {
                 }
                 Some("Some") => Some(Shape::Opt),
                 Some("Ok" | "Err") => Some(Shape::Res),
-                // `Vec::new()`, `HashMap::with_capacity(n)`.
+                // `Vec::new()`, `HashMap::with_capacity(n)`. Not
+                // `custom::Vec::new()`.
                 Some("new" | "with_capacity" | "default") => match &*c.func {
-                    Expr::Path(p) => p
+                    Expr::Path(p) if std_owner(&p.path) => p
                         .path
                         .segments
                         .iter()
@@ -4002,7 +4015,9 @@ impl Analyzer {
                     // `make()`, where `make` is a closure that holds a handle.
                     || path_ident(&c.func).is_some_and(|name| self.env.get(&name) != Kind::Plain)
             }
-            Expr::Macro(m) => vec_elems(&m.mac).is_some_and(|elems| elems.iter().any(container)),
+            Expr::Macro(m) => self
+                .std_vec(&m.mac)
+                .is_some_and(|elems| elems.iter().any(container)),
             Expr::If(i) => {
                 block_tail(&i.then_branch).is_some_and(|e| self.expr_is_nested(e))
                     || i.else_branch
@@ -4061,6 +4076,30 @@ impl Analyzer {
 
     /// A copy of the analysis that reads a body. Its own record of closed
     /// scopes keeps the body's handle parameters out of the real one.
+    /// Is `name` defined or imported by the handler body?
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.shadowed.iter().any(|n| n == name)
+    }
+
+    /// The elements of a std `vec!`: bare or under a std path, and not
+    /// defined by the handler body.
+    fn std_vec(&self, mac: &syn::Macro) -> Option<Vec<Expr>> {
+        (std_prefix(&mac.path) && !self.is_shadowed("vec"))
+            .then(|| vec_elems(mac))
+            .flatten()
+    }
+
+    /// Is `call` the std `drop` (`drop`, `std::mem::drop`), not one the
+    /// handler body defines?
+    fn is_std_free_fn(&self, call: &ExprCall) -> bool {
+        let Expr::Path(path) = &*call.func else {
+            return false;
+        };
+        call_path_name(call)
+            .is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()) && !self.is_shadowed(&n))
+            && std_prefix(&path.path)
+    }
+
     fn probe(&self) -> Self {
         let mut env = self.env.clone();
         env.closed = Rc::default();
@@ -4071,6 +4110,7 @@ impl Analyzer {
             errors: Vec::new(),
             returned: Kind::Plain,
             connection_params: false,
+            shadowed: Rc::clone(&self.shadowed),
         }
     }
 
@@ -4676,7 +4716,9 @@ impl Analyzer {
                 (is_container_constructor(c) || is_smart_pointer_new(c)) && c.args.iter().any(holds)
             }
             Expr::Field(f) => matches!(self.part_kind(f), Some(Kind::Carrier | Kind::Holder)),
-            Expr::Macro(m) => vec_elems(&m.mac).is_some_and(|elems| elems.iter().any(holds)),
+            Expr::Macro(m) => self
+                .std_vec(&m.mac)
+                .is_some_and(|elems| elems.iter().any(holds)),
             Expr::MethodCall(mc) => {
                 ((CARRIER_METHODS.contains(&mc.method.to_string().as_str())
                     || self.gives_option_of_part(mc))
@@ -5491,6 +5533,87 @@ fn pattern_variant(pat: &Pat) -> Option<(String, String)> {
     (!unit && !owner.is_empty()).then(|| (owner.join("::"), name))
 }
 
+/// Module names on a path to a std item: `std::collections::HashMap`,
+/// `std::mem::drop`, `alloc::vec!`.
+const STD_PATH: &[&str] = &[
+    "std",
+    "core",
+    "alloc",
+    "collections",
+    "vec",
+    "vec_deque",
+    "hash_map",
+    "hash_set",
+    "btree_map",
+    "btree_set",
+    "binary_heap",
+    "linked_list",
+    "option",
+    "result",
+    "sync",
+    "rc",
+    "boxed",
+    "mem",
+    "indexmap",
+    "map",
+    "set",
+];
+
+/// Is every segment of `path` before the last a std module? A bare name
+/// is std unless the handler body defines it.
+fn std_prefix(path: &syn::Path) -> bool {
+    let n = path.segments.len().saturating_sub(1);
+    path.segments
+        .iter()
+        .take(n)
+        .all(|s| STD_PATH.contains(&s.ident.to_string().as_str()))
+}
+
+/// Is every segment of `path` before its last two a std module? The
+/// owner of `std::collections::HashMap::new` is std; that of
+/// `custom::Vec::new` is not.
+fn std_owner(path: &syn::Path) -> bool {
+    let n = path.segments.len().saturating_sub(2);
+    path.segments
+        .iter()
+        .take(n)
+        .all(|s| STD_PATH.contains(&s.ident.to_string().as_str()))
+}
+
+/// The names that items in `block` define or import: `macro_rules! vec`,
+/// `fn drop`, `struct Vec`, `use x::format as fmt` (`fmt`).
+fn local_names(block: &Block) -> Vec<String> {
+    struct Names(Vec<String>);
+    impl<'a> Visit<'a> for Names {
+        fn visit_item_macro(&mut self, m: &'a syn::ItemMacro) {
+            if let Some(ident) = &m.ident {
+                self.0.push(ident.to_string());
+            }
+        }
+        fn visit_item_fn(&mut self, f: &'a ItemFn) {
+            self.0.push(f.sig.ident.to_string());
+        }
+        fn visit_item_struct(&mut self, s: &'a syn::ItemStruct) {
+            self.0.push(s.ident.to_string());
+        }
+        fn visit_item_enum(&mut self, e: &'a syn::ItemEnum) {
+            self.0.push(e.ident.to_string());
+        }
+        fn visit_item_type(&mut self, t: &'a syn::ItemType) {
+            self.0.push(t.ident.to_string());
+        }
+        fn visit_use_name(&mut self, u: &'a syn::UseName) {
+            self.0.push(u.ident.to_string());
+        }
+        fn visit_use_rename(&mut self, u: &'a syn::UseRename) {
+            self.0.push(u.rename.to_string());
+        }
+    }
+    let mut names = Names(Vec::new());
+    names.visit_block(block);
+    names.0
+}
+
 /// The names a pattern binds by `ref mut`.
 fn ref_mut_names(pat: &Pat) -> Vec<String> {
     struct Names(Vec<String>);
@@ -5558,6 +5681,10 @@ fn constructor_type(e: &Expr) -> Option<Type> {
         ("Ok" | "Err", true, [t, e]) => Some(syn::parse_quote!(Result<#t, #e>)),
         ("new" | "with_capacity" | "default" | "from" | "from_iter", true, [_, ..]) => {
             let owner = owner?;
+            // `custom::Vec::<T>::new()` is a user type.
+            if !std_owner(path) {
+                return None;
+            }
             let collection = &owner.ident;
             CARRIER_TYPES
                 .contains(&collection.to_string().as_str())
@@ -11259,6 +11386,72 @@ mod tests {
                  let mut left = vec![make()]; { let target = left.get_mut(0).unwrap(); *target = repo; } \
                  let _ = left[0].find_all().await?; Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn only_std_names_are_trusted() {
+        check_handlers(&[
+            (
+                "guard: a user type named Vec gets no std methods",
+                "async fn h(repos: custom::Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 repos.push(repo).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a std path to Vec keeps its methods",
+                "async fn h(mut repos: std::vec::Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 repos.push(repo); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a user constructor path named Vec is not std",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = custom::Vec::<PgPostRepository>::new(); repos.push(repo).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a local macro named vec is opaque",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 macro_rules! vec { ($r:expr) => { $r.find_all().await? }; } let _ = vec![repo]; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a qualified user vec macro is opaque",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let _ = custom::vec![repo]; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a std path to vec stays a vector",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let repos = std::vec![repo]; let _ = repos; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a local macro named format is opaque",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 macro_rules! format { ($r:expr) => { $r.find_all().await? }; } let _ = format!(repo); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a user function named drop is opaque",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 custom::drop(repo); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a local function named drop is opaque",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 fn drop(r: PgPostRepository) { let _ = r; } drop(repo); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "std::mem::drop stays free",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 std::mem::drop(repo); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
