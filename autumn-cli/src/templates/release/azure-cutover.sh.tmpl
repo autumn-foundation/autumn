@@ -179,10 +179,10 @@ patch_app() {
 # Azure deletes a secret only when no active revision refers to it. So if
 # the current template refers to one, stage 1 deploys the snapshot
 # containers without the four env vars, and waits until that revision is
-# provisioned and the old one is inactive. Stage 2 then removes the
+# provisioned and no other revision is active. Stage 2 then removes the
 # identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local live status state latest revision active body containers
+  local live status state latest revision active others body containers
   live=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -234,18 +234,21 @@ remove_credentials() {
       esac
     done
     [ "$state" = Provisioned ] || return 1
-    active=true
+    # Wait until no other revision is active. The latest revision before
+    # stage 1 can be a failed one while an older placeholder is the active
+    # one, so the script checks every active revision.
+    others=unknown
     for _ in $(seq 1 30); do
-      active=$(az containerapp revision show \
+      active=$(az containerapp revision list \
         --name "$AZURE_APP_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
-        --revision "$latest" \
-        --query properties.active \
+        --query "[?properties.active].[name, properties.template.containers[0].image]" \
         --output tsv) || return 1
-      [ "$active" = false ] && break
+      others=$(cut -f1 <<< "$active" | grep -vxF -- "$revision" || true)
+      [ -z "$others" ] && break
       sleep 10
     done
-    [ "$active" = false ] || return 1
+    [ -z "$others" ] || return 1
   fi
   body=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
     --arg id "$JOB_IDENTITY" "$SECRET_REF"'

@@ -3657,12 +3657,11 @@ esac
         assert!(patches[0].contains("\"template\""), "{}", patches[0]);
         assert!(!patches[0].contains("\"secrets\""), "{}", patches[0]);
         assert!(!patches[1].contains("\"template\""), "{}", patches[1]);
-        let inactive_at = calls
-            .find("--revision app--old --query properties.active")
-            .unwrap_or_else(|| panic!("the old revision must stop first: {calls}"));
+        let first_patch = calls.find("az rest --method patch").unwrap();
+        let second_patch = calls.rfind("az rest --method patch").unwrap();
         assert!(
-            inactive_at < calls.rfind("az rest --method patch").unwrap(),
-            "{calls}"
+            calls[first_patch..second_patch].contains("az containerapp revision list"),
+            "the old revision must stop first: {calls}"
         );
         assert!(!calls.contains("ingress enable"), "{calls}");
         assert!(bodies.contains("\"type\":\"None\""), "{bodies}");
