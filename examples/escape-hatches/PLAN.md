@@ -114,7 +114,7 @@ list because each changes a default for a real reason.
 | `with_*_interceptor` (job, mail, DB, HTTP) | No jobs, mail, or outbound HTTP. | `docs/guide/middleware.md` |
 | `static_gate` | No static page cache. | `docs/guide/middleware.md` |
 | `.merge(Router)` | `autumn routes audit` cannot list a merged router, so the audit fails. `nest` + `declare_plugin_routes` passes. A test uses `merge` to show that raw routes get the app state and middleware. | `docs/guide/getting-started.md` |
-| `on_startup` + raw SQL seed | No seed data. | `examples/react-graphql` |
+| `on_startup` + raw SQL seed | No seed data. (`app()` uses `on_startup` only to log a warning, because logging starts in `run`.) | `examples/react-graphql` |
 | `state_initializer` + extensions | No shared service. | `examples/media-room` |
 | Custom `FromRequestParts` | Built-in extractors are enough. | `docs/guide/extractors.md` |
 | `#[autumn_web::main(configure = ..)]` | Default runtime is enough. | `docs/guide/getting-started.md` |
