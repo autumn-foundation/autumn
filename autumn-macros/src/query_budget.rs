@@ -2039,9 +2039,16 @@ impl Analyzer {
             future: self.is_known_future(init),
             output: match peel_parens(init) {
                 Expr::Async(a) => Some(self.async_output(&a.block)),
+                // `(|| async { &repo })()`: what its `async` block gives.
+                Expr::Call(call)
+                    if immediately_invoked_closure(&call.func)
+                        .is_some_and(|c| matches!(peel_parens(&c.body), Expr::Async(_))) =>
+                {
+                    self.invoked(call, true)
+                }
                 other => path_ident(other).and_then(|name| self.env.binding(&name).output),
             },
-            inner: path_ident(peel_parens(init)).and_then(|name| self.env.binding(&name).inner),
+            inner: wrapper_root(init).and_then(|name| self.env.binding(&name).inner),
         }
     }
 
@@ -3341,7 +3348,7 @@ impl Analyzer {
 
     /// The shape of a part of the named wrapper `e`, when it is known.
     fn inner_shape(&self, e: &Expr) -> Option<Shape> {
-        self.env.binding(&path_ident(peel_parens(e))?).inner
+        self.env.binding(&wrapper_root(e)?).inner
     }
 
     /// Is `method` a known method of the standard container `receiver`? Not
@@ -3921,14 +3928,7 @@ impl Analyzer {
     /// What side `side` (`Ok` or `Err`) of a named `Result` with known sides
     /// holds: `result`, `result.as_ref()`, `result.as_mut()`.
     fn side_kind(&self, e: &Expr, side: &str) -> Option<Kind> {
-        match peel_refs(e) {
-            Expr::MethodCall(mc)
-                if matches!(mc.method.to_string().as_str(), "as_ref" | "as_mut") =>
-            {
-                self.side_kind(&mc.receiver, side)
-            }
-            other => self.env.part(&path_ident(other)?, side),
-        }
+        self.env.part(&wrapper_root(e)?, side)
     }
 
     /// Is `e` a database connection: a handle with the `Db` shape? A
@@ -4596,6 +4596,17 @@ fn call_path_name(call: &ExprCall) -> Option<String> {
     match &*call.func {
         Expr::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
         _ => None,
+    }
+}
+
+/// The name under a wrapper value: `result`, `&result`, `result.as_ref()`,
+/// `maybe.as_mut()`.
+fn wrapper_root(e: &Expr) -> Option<String> {
+    match peel_refs(e) {
+        Expr::MethodCall(mc) if matches!(mc.method.to_string().as_str(), "as_ref" | "as_mut") => {
+            wrapper_root(&mc.receiver)
+        }
+        other => path_ident(other),
     }
 }
 
@@ -9288,6 +9299,30 @@ mod tests {
                 "a typed local Option of Db records its inner shape",
                 "async fn h(x: i64) -> AutumnResult<usize> { \
                  let maybe: Option<Db> = make(x); let db = maybe.unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
+                Expect::Exact(2),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn stored_closure_futures_and_wrapper_adapters_keep_metadata() {
+        check_handlers(&[
+            (
+                "a stored closure call that gives an async block keeps its output",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = (|| async { &repo })(); let r = pending.await; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a Db unwrapped after as_ref is a connection",
+                "async fn h(maybe: Option<Db>) -> AutumnResult<usize> { \
+                 let db = maybe.as_ref().unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "a Db unwrapped through a reference alias is a connection",
+                "async fn h(maybe: Option<Db>) -> AutumnResult<usize> { \
+                 let alias = &maybe; let db = alias.as_ref().unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
                 Expect::Exact(2),
             ),
         ]);
