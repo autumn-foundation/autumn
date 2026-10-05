@@ -43,11 +43,21 @@ impl RedisPinger {
     }
 
     /// Send `PING`, or wait for the `PING` that already runs for this URL.
+    ///
+    /// The time limit applies inside the shared `PING`, not only to the wait
+    /// of one caller. A `PING` that is late is a failure for every caller:
+    /// a later caller cannot join it and get a late success.
     async fn ping(self: &Arc<Self>, budget: Duration) -> Result<(), String> {
         let pinger = Arc::clone(self);
         self.running
             .get_or_refresh(
-                move || async move { pinger.ping_once(budget).await },
+                move || async move {
+                    tokio::time::timeout(budget, pinger.ping_once(budget))
+                        .await
+                        .unwrap_or_else(|_elapsed| {
+                            Err(format!("PING timed out after {} ms", budget.as_millis()))
+                        })
+                },
                 || Err("PING check stopped unexpectedly".to_owned()),
             )
             .await
@@ -751,6 +761,32 @@ mod tests {
         for result in redis_results {
             assert_eq!(result.output.status, HealthStatus::Up, "{result:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn shared_ping_enforces_the_limit_itself() {
+        // The kept connection hangs, so a new one opens at half the limit
+        // and answers at about 250 ms of a 200 ms limit. Every caller of the
+        // shared PING, not only the first, must get the time-out.
+        let redis = FakeRedis::start(Duration::ZERO).await;
+        let pinger = Arc::new(RedisPinger::new(&redis.url()).expect("valid url"));
+        let budget = Duration::from_millis(200);
+        pinger
+            .ping(budget)
+            .await
+            .expect("first PING opens the connection");
+        redis.mute_open_connections();
+        redis.set_delay(Duration::from_millis(150));
+
+        let started = std::time::Instant::now();
+        let result = pinger.ping(budget).await;
+
+        assert!(result.is_err(), "a late PONG must not count: {result:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(240),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
