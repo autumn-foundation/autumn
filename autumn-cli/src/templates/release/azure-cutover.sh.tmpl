@@ -184,6 +184,11 @@ JOB_UIDS=$(jq -c --arg id "$JOB_IDENTITY" '[$id] + [.[] | select(.keyVaultUrl) |
     | select(ascii_downcase != "system")]
   | map(select(. != "")) | unique_by(ascii_downcase)' "$JOB_SECRETS")
 NEED_SYSTEM=$(jq -c 'any(.[]; .keyVaultUrl and ((.identity // "") | ascii_downcase) == "system")' "$JOB_SECRETS")
+# When the cutover turns the system identity on for a job secret, it tags
+# the app with autumn-system-identity=cutover. Credential removal turns the
+# system identity off only with that tag: an app's own system identity
+# stays.
+DROP_SYSTEM=false
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
 JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$JOB")
@@ -234,7 +239,7 @@ REMOVED="$MANAGED_DEF"'
      | select(.value != null) | .key | ascii_downcase] as $ids
   | .properties.provisioningState == "Succeeded"
     and ($ids | all(IN($lids[]) | not))
-    and (($sys | not) or (.identity.type // "None" | test("SystemAssigned") | not))
+    and (($dropsys | not) or (.identity.type // "None" | test("SystemAssigned") | not))
     and all(.properties.configuration.registries // [] | .[];
             (.identity // "" | ascii_downcase) | IN($lids[]) | not)
     and all(.properties.configuration.secrets // [] | .[];
@@ -259,7 +264,7 @@ app_shows() {
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --output json) || return 1
   jq -e --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" \
-    --argjson uids "$JOB_UIDS" --argjson sys "$NEED_SYSTEM" \
+    --argjson uids "$JOB_UIDS" --argjson sys "$NEED_SYSTEM" --argjson dropsys "$DROP_SYSTEM" \
     --argjson want "$JOB_SECRET_REFS" "$1" <<< "$now" > /dev/null
 }
 
@@ -494,12 +499,13 @@ remove_credentials() {
     # one, so the script checks every active revision.
     sole_active "$revision" || return 1
   fi
-  body=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
-    --argjson uids "$JOB_UIDS" --argjson sys "$NEED_SYSTEM" "$SECRET_REF$MANAGED_DEF"'
+  DROP_SYSTEM=$(jq -c '(.tags["autumn-system-identity"] // "") == "cutover"' <<< "$live")
+  body=$(jq -cn --argjson app "$APP" --argjson live "$live" --slurpfile app_secrets "$APP_SECRETS" \
+    --argjson uids "$JOB_UIDS" --argjson dropsys "$DROP_SYSTEM" "$SECRET_REF$MANAGED_DEF"'
     ($uids | map(ascii_downcase)) as $lids
-    | ($app.identity.type // "None") as $type
-    # The cutover turned the system identity on for a job secret; it goes.
-    | (($type | test("SystemAssigned")) and ($sys | not)) as $keep_system
+    | ($live.identity.type // "None") as $type
+    # Only a system identity that the cutover turned on (its tag) goes.
+    | (($type | test("SystemAssigned")) and ($dropsys | not)) as $keep_system
     | ($app.identity.userAssignedIdentities // {}) as $ids
     | ($ids | with_entries(select(.key | ascii_downcase | IN($lids[]) | not)) | map_values({})) as $own
     # The snapshot can predate the cutover, so it can lack a job identity.
@@ -508,8 +514,9 @@ remove_credentials() {
     | ($uids | map(. as $u
         | ($ids | with_entries(select(.key | ascii_downcase == ($u | ascii_downcase))) | map_values(null))
         | if . == {} then {($u): null} else . end) | add // {}) as $drop
-    | {location: $app.location,
-       identity: (if $own != {}
+    | {location: $app.location}
+    + (if $dropsys then {tags: {"autumn-system-identity": null}} else {} end)
+    + {identity: (if $own != {}
                   then {type: (if $keep_system then "SystemAssigned,UserAssigned" else "UserAssigned" end),
                         userAssignedIdentities: ($drop + $own)}
                   elif $keep_system then {type: "SystemAssigned", userAssignedIdentities: null}
@@ -680,7 +687,8 @@ if jq -en --argjson app "$APP" --argjson containers "$CONTAINERS" \
     --revision "$OLD_REVISION" \
     --query properties.provisioningState \
     --output tsv) || fail "cannot read revision $OLD_REVISION"
-  if [ "$LATEST_STATE" = Failed ]; then
+  # A failed or canceled revision never provisions.
+  if [ "$LATEST_STATE" = Failed ] || [ "$LATEST_STATE" = Canceled ]; then
     CONTAINERS=$(jq -c --arg now "$(date +%s)" \
       "$APP_C"' .[app_i].env += [{name: "AUTUMN_FORCE_REVISION", value: $now}]' <<< "$CONTAINERS")
   else
@@ -701,8 +709,10 @@ PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slu
   | ($app_secrets[0]
      | map(select(.name as $n | $job_names | index($n) | not) | secret_ref)
      + $job_secrets) as $secrets
-  | {location: $app.location,
-     identity: {
+  | {location: $app.location}
+  + (if $sys and ($app.identity.type // "None" | test("SystemAssigned") | not)
+     then {tags: {"autumn-system-identity": "cutover"}} else {} end)
+  + {identity: {
        type: (if ($app.identity.type // "None" | test("SystemAssigned")) or $sys
               then "SystemAssigned,UserAssigned" else "UserAssigned" end),
        userAssignedIdentities: ($uids | map({(.): {}}) | add)},
