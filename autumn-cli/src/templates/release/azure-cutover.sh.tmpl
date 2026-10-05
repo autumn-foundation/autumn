@@ -182,19 +182,32 @@ patch_app() {
 # provisioned and no other revision is active. Stage 2 then removes the
 # identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local live status state latest revision active others body containers
+  local live status state latest revision active others body containers source first
   live=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --output json) || return 1
+  # Stage 1 starts from the active revision's containers. After a canceled
+  # first cutover, the app template has the real image, which cannot start
+  # without its secrets; the active revision still runs the placeholder.
+  source=$(jq -c '.properties.template.containers' <<< "$APP")
+  read -r first _ <<< "$ACTIVE_REVISIONS"
+  if [ -n "${first:-}" ]; then
+    source=$(az containerapp revision show \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --revision "$first" \
+      --query properties.template.containers \
+      --output json) || return 1
+  fi
   # The stage 1 containers: no env var that refers to a managed secret (in
   # any container), and not the four env vars that this script sets.
-  containers=$(jq -c '.properties.template.containers
-    | map(if .env then .env = [.env[] | select((.secretRef // "")
+  containers=$(jq -c '
+    map(if .env then .env = [.env[] | select((.secretRef // "")
             | IN("database-url", "signing-secret", "redis-url") | not)] else . end)
     | .[0].env = [(.[0].env // [])[] | select(.name | IN(
         "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
-        "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)]' <<< "$APP")
+        "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)]' <<< "$source")
   # A scale rule or a volume can also refer to a secret. The script cannot
   # remove that ref without changing what the app does, so it stops.
   if jq -c --argjson c "$containers" '.properties.template.containers = $c' <<< "$APP" \
