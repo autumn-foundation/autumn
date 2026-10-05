@@ -227,15 +227,15 @@ const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Ext
 /// `ids.iter().map(|_| &repo)`, `flag.then(|| &repo)`.
 const WRAPPING_CALLBACKS: &[&str] = &["map", "map_err", "then", "then_some", "ok_or", "ok_or_else"];
 
+/// Iterator adapters whose items are the parts of what their callback
+/// returns: `filter_map(|_| Some(&repo))` yields handles.
+const FLATTENING_CALLBACKS: &[&str] = &["filter_map", "flat_map", "map_while", "scan"];
+
 /// Methods whose result is what their callback returns, or what their other
 /// arguments hold: `fold(init, f)`, `unwrap_or_else(f)`, `find_map(f)`.
 const DIRECT_CALLBACKS: &[&str] = &[
     "and_then",
     "or_else",
-    "filter_map",
-    "flat_map",
-    "map_while",
-    "scan",
     "find_map",
     "fold",
     "try_fold",
@@ -3270,7 +3270,8 @@ impl Analyzer {
     /// returns and its other arguments hold. Plain for any other method.
     fn callback_result(&self, mc: &ExprMethodCall) -> Kind {
         let method = mc.method.to_string();
-        let wraps = WRAPPING_CALLBACKS.contains(&method.as_str());
+        let flattens = FLATTENING_CALLBACKS.contains(&method.as_str());
+        let wraps = flattens || WRAPPING_CALLBACKS.contains(&method.as_str());
         if !wraps && !DIRECT_CALLBACKS.contains(&method.as_str()) {
             return Kind::Plain;
         }
@@ -3287,6 +3288,8 @@ impl Analyzer {
             })
             .max()
             .unwrap_or(Kind::Plain);
+        // A flattening adapter yields the parts of each output.
+        let out = if flattens { out.element() } else { out };
         match out {
             Kind::Handle | Kind::LazyDb if wraps => Kind::Carrier,
             Kind::Carrier | Kind::Holder if wraps => Kind::Nested,
@@ -3509,17 +3512,22 @@ impl Analyzer {
         }
     }
 
-    /// Does this `map` replace every part of an `Option` or an iterator with
-    /// its closure's output? Then the result holds only what the closure
-    /// returns (`Some(repo).map(|_| 1)` is plain). A `Result`'s `map` keeps
-    /// its `Err` side.
+    /// Does this `map` (or an `Option`'s `and_then`) replace every part of an
+    /// `Option` or an iterator with its closure's output? Then the result
+    /// holds only what the closure returns (`Some(repo).map(|_| 1)` is
+    /// plain). A `Result`'s `map` and `and_then` keep its `Err` side.
     fn maps_away(&self, mc: &ExprMethodCall) -> bool {
-        mc.method == "map"
-            && matches!(mc.args.last(), Some(Expr::Closure(_)))
-            && matches!(
-                self.shape_of(&mc.receiver),
-                Some(Shape::Opt | Shape::OptRef | Shape::Iter | Shape::IterRef)
-            )
+        let shape = self.shape_of(&mc.receiver);
+        matches!(mc.args.last(), Some(Expr::Closure(_)))
+            && match mc.method.to_string().as_str() {
+                "map" => matches!(
+                    shape,
+                    Some(Shape::Opt | Shape::OptRef | Shape::Iter | Shape::IterRef)
+                ),
+                // `Option::and_then` gives what its closure returns.
+                "and_then" => matches!(shape, Some(Shape::Opt | Shape::OptRef)),
+                _ => false,
+            }
     }
 
     /// Does this call give an `Option` of a part (`deque.remove(0)`)?
@@ -8085,6 +8093,62 @@ mod tests {
                 "Ok of a Result with a handle on the Ok side",
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
                  if let Ok(r) = result { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn iterator_adapters_keep_a_layer_and_and_then_replaces() {
+        check_handlers(&[
+            (
+                "filter_map gives an iterator, not a handle",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mapped = ids.iter().filter_map(|_| Some(&repo)); \
+                 mapped.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "flat_map gives an iterator, not a handle",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mapped = ids.iter().flat_map(|_| vec![&repo]); \
+                 mapped.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "filter_map over a closure that returns the handle's result",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mapped = ids.iter().filter_map(|_| repo.cached_one()); \
+                 mapped.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map_while gives an iterator, not a handle",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mapped = ids.iter().map_while(|_| Some(&repo)); \
+                 mapped.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "Option::and_then to a plain value",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let status = Some(repo).and_then(|_| Some(1)); render(status); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            // Guards: the items are still handles, and `and_then` keeps
+            // what its closure returns.
+            (
+                "a filter_map item is a handle",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 for r in ids.iter().filter_map(|_| Some(&repo)) { let _ = r.find_all().await?; } \
+                 Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "Option::and_then to the handle",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let r = Some(1).and_then(|_| Some(&repo)).unwrap(); \
+                 let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
