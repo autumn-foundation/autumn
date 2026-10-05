@@ -3359,13 +3359,24 @@ case "$1 $2" in
     fi
     case "$query" in
       # The template of the active (old) revision runs the active image.
-      properties.template.containers)
-        if [ -n "$STUB_ACTIVE_HAS_REFS" ]; then
-          jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" --argjson refs "[${refs#,}]" \
-            '.properties.template.containers | map(if .name == "app" then .image = $image | .env += $refs else . end)' <<< "$app"
+      # With STUB_ACTIVE_SCALE_REF, its scale rule still refers to a
+      # managed secret that the template no longer has.
+      properties.template|properties.template.containers)
+        has_refs=false
+        [ -n "$STUB_ACTIVE_HAS_REFS" ] && has_refs=true
+        template=$(jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" --argjson refs "[${refs#,}]" \
+          --argjson has_refs "$has_refs" --arg scale_ref "${STUB_ACTIVE_SCALE_REF:-}" '
+          .properties.template
+          | .containers |= map(if .name == "app"
+                               then .image = $image | (if $has_refs then .env += $refs else . end)
+                               else . end)
+          | if $scale_ref == "" then .
+            else .scale = {rules: [{name: "q", custom: {type: "azure-queue",
+                   auth: [{secretRef: "database-url", triggerParameter: "connection"}]}}]} end' <<< "$app")
+        if [ "$query" = properties.template ]; then
+          echo "$template"
         else
-          jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" \
-            '.properties.template.containers | map(if .name == "app" then .image = $image else . end)' <<< "$app"
+          jq -c '.containers' <<< "$template"
         fi
         ;;
       properties.active) echo false ;;
@@ -3519,6 +3530,7 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_ACTIVE_SCALE_REF")
             .env_remove("STUB_ACTIVE_BOTH")
             .env_remove("STUB_INGRESS_NONE")
             .env_remove("STUB_RESTART_FROM_ZERO")
@@ -4782,6 +4794,44 @@ esac
         assert!(status.success(), "{calls}");
         assert_eq!(bodies.lines().count(), 1, "{bodies}");
         assert!(!bodies.contains("\"template\""), "{bodies}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[..patch_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 4,
+            "stage 2 must wait until the clean revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_a_scale_rule_ref_on_the_active_revision() {
+        // The operator removed the secret ref from the scale rule. The
+        // template is clean, but the active placeholder revision still has
+        // the ref, so Azure cannot delete the secret yet. Stage 1 must wait
+        // until the clean revision is the only active one.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_SCALE_REF", "1"),
+                ("STUB_LATEST", "app--clean"),
+                ("STUB_ACTIVE_LAG", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(
+            calls.contains("--revision app--old --query properties.template --output json"),
+            "{calls}"
+        );
         let patch_at = calls.find("az rest --method patch").unwrap();
         assert!(
             calls[..patch_at]
