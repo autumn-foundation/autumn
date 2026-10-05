@@ -4910,6 +4910,10 @@ struct LocalJobCoordinationInner {
     unique_holds: HashMap<String, LocalUniqueHold>,
     running_slots: HashMap<String, u32>,
     waiting: HashMap<String, VecDeque<QueuedJob>>,
+    /// Deferrable jobs that wait for the cost signal to fall (issue #1720).
+    deferred: Vec<QueuedJob>,
+    /// `true` while one task checks `deferred`.
+    deferred_waiter: bool,
 }
 
 struct LocalUniqueHold {
@@ -5001,6 +5005,36 @@ enum LocalSlotDecision {
 }
 
 impl LocalJobCoordination {
+    /// Keep `job` until the cost signal falls. Return `true` when no task
+    /// checks the deferred jobs yet, so the caller must start one.
+    fn defer(&self, job: QueuedJob) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.deferred.push(job);
+        let running = std::mem::replace(&mut inner.deferred_waiter, true);
+        drop(inner);
+        !running
+    }
+
+    /// Take the deferred jobs that may go back on the queue. Return `false` as
+    /// the second value when no job is left; the checking task then stops.
+    fn take_deferred(&self, ready: impl Fn(&QueuedJob) -> bool) -> (Vec<QueuedJob>, bool) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (go, stay): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.deferred)
+            .into_iter()
+            .partition(|job| ready(job));
+        let more = !stay.is_empty();
+        inner.deferred = stay;
+        inner.deferred_waiter = more;
+        drop(inner);
+        (go, more)
+    }
+
     /// Coordination reading TTL expiry from `clock` (the app's injected clock).
     fn with_clock(clock: Arc<dyn crate::time::ClockSource>) -> Self {
         Self {
@@ -5664,30 +5698,25 @@ async fn execute_local_job(
 
     // Cost gate (issue #1720): a deferrable job waits while the cost signal is
     // high. It has not started, so it holds no slot and uses no attempt, and
-    // its queued gauge does not change. One task waits for it and puts it back
-    // on the queue when the signal falls. A canceled job goes back at once, so
-    // the cancel branch below settles it. A canceled job does not wait. The
-    // task stops when the runtime shuts down.
+    // its queued gauge does not change. The runtime keeps it in one deferred
+    // list, and one task checks that list every recheck interval: it puts a
+    // job back on the queue when the signal falls. A canceled job goes back at
+    // once, so the cancel branch below settles it. A canceled job does not
+    // wait. The task stops when the list is empty or the runtime shuts down.
     if !job_admin.is_canceled(&job.id)
         && let Some(signal) =
             crate::cost::deferral_signal(state, crate::cost::WorkKind::Job, &job.name)
     {
         crate::cost::note_deferral(&signal);
         tracing::info!(job = %job.name, value = signal.value(), "cost signal is high; job waits");
-        let sender = tx.clone();
-        let job_admin = job_admin.clone();
-        tokio::spawn(async move {
-            while signal.is_high() && !job_admin.is_canceled(&job.id) {
-                tokio::select! {
-                    // The runtime stopped: its queue is gone, as for any
-                    // queued local job.
-                    () = sender.closed() => return,
-                    () = tokio::time::sleep(signal.recheck()) => {}
-                }
-            }
-            tracing::info!(job = %job.name, "job goes back on the queue");
-            let _ = sender.send(job).await;
-        });
+        if coordination.defer(job) {
+            tokio::spawn(run_deferred_job_waiter(
+                Arc::clone(coordination),
+                signal,
+                job_admin.clone(),
+                tx.clone(),
+            ));
+        }
         return;
     }
 
@@ -5896,6 +5925,35 @@ async fn execute_local_job(
     // The concurrency slot frees as soon as the handler is no longer running,
     // including while a retry waits out its backoff.
     finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+}
+
+/// Check the deferred local jobs every recheck interval (issue #1720). Put a
+/// job back on the queue when the cost signal falls or an operator cancels it.
+async fn run_deferred_job_waiter(
+    coordination: Arc<LocalJobCoordination>,
+    signal: Arc<crate::cost::CostSignal>,
+    job_admin: JobAdminMemoryBackend,
+    sender: tokio::sync::mpsc::Sender<QueuedJob>,
+) {
+    loop {
+        tokio::select! {
+            // The runtime stopped: its queue is gone, as for any queued local
+            // job.
+            () = sender.closed() => return,
+            () = tokio::time::sleep(signal.recheck()) => {}
+        }
+        let low = !signal.is_high();
+        let (ready, more) = coordination.take_deferred(|job| low || job_admin.is_canceled(&job.id));
+        for job in ready {
+            tracing::info!(job = %job.name, "job goes back on the queue");
+            if sender.send(job).await.is_err() {
+                return;
+            }
+        }
+        if !more {
+            return;
+        }
+    }
 }
 
 /// Release a unique hold after a job settles. No-op for TTL-window holds
@@ -20069,6 +20127,52 @@ mod tests {
                 .delay_cancelers
                 .contains_key(&id),
             "cancel_enqueued must remove the delay canceler from the map"
+        );
+    }
+
+    fn deferred_test_job(id: &str) -> QueuedJob {
+        QueuedJob {
+            id: id.to_string(),
+            name: "deferred_test".to_string(),
+            queue: "default".to_string(),
+            payload: serde_json::json!({}),
+            attempt: 1,
+            max_attempts: 3,
+            initial_backoff_ms: 10,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        }
+    }
+
+    /// One task checks all deferred jobs, however many there are (#1720).
+    #[test]
+    fn deferred_jobs_share_one_waiter() {
+        let coordination = LocalJobCoordination::default();
+        assert!(
+            coordination.defer(deferred_test_job("a")),
+            "the first job starts the waiter"
+        );
+        assert!(
+            !coordination.defer(deferred_test_job("b")),
+            "later jobs use it"
+        );
+        assert!(!coordination.defer(deferred_test_job("c")));
+
+        let (ready, more) = coordination.take_deferred(|job| job.id == "b");
+        assert_eq!(
+            ready.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert!(more, "two jobs still wait");
+
+        let (ready, more) = coordination.take_deferred(|_| true);
+        assert_eq!(ready.len(), 2);
+        assert!(!more, "the waiter stops when no job is left");
+        assert!(
+            coordination.defer(deferred_test_job("d")),
+            "a new job starts a new waiter"
         );
     }
 
