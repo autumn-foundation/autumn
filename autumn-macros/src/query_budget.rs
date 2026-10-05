@@ -733,6 +733,11 @@ enum Kind {
     Handle,
     /// A `LazyDb`: a handle whose `checkout` is not a query.
     LazyDb,
+    /// A value that holds handles at an unknown depth: a container of
+    /// containers (`Vec<Vec<Repo>>`) or of user values (`[ctx]`). Every
+    /// method on it is reported, and its parts are `Nested` too. It is the
+    /// top of the order, so a join with anything stays this careful.
+    Nested,
 }
 
 impl Kind {
@@ -742,6 +747,7 @@ impl Kind {
             Self::Plain => Self::Plain,
             Self::Carrier | Self::Holder | Self::Handle => Self::Handle,
             Self::LazyDb => Self::LazyDb,
+            Self::Nested => Self::Nested,
         }
     }
 
@@ -1885,7 +1891,9 @@ impl Analyzer {
     fn opaque_container_method(&self, methods: &[&ExprMethodCall]) -> Option<Cost> {
         let unknown = methods.iter().find(|m| {
             self.expr_is_carrier(&m.receiver)
-                && (self.expr_is_holder(&m.receiver) || !is_container_method(&m.method.to_string()))
+                && (self.expr_is_holder(&m.receiver)
+                    || self.expr_is_nested(&m.receiver)
+                    || !is_container_method(&m.method.to_string()))
         })?;
         Some(Cost::unbounded(
             unknown.span(),
@@ -1907,7 +1915,11 @@ impl Analyzer {
         let runs_once = is_transaction || AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str());
         // A closure handed to a method on a carrier takes its elements:
         // `repos.iter().for_each(|r| …)`.
-        let param = if is_transaction || self.expr_is_carrier(&method.receiver) {
+        let param = if is_transaction {
+            Kind::Handle
+        } else if self.expr_is_nested(&method.receiver) {
+            Kind::Nested
+        } else if self.expr_is_carrier(&method.receiver) {
             Kind::Handle
         } else {
             Kind::Plain
@@ -2063,7 +2075,9 @@ impl Analyzer {
 
     /// What `expr` evaluates to.
     fn value_of(&self, expr: &Expr) -> Kind {
-        if self.expr_is_lazy_db(expr) {
+        if self.expr_is_nested(expr) {
+            Kind::Nested
+        } else if self.expr_is_lazy_db(expr) {
             Kind::LazyDb
         } else if self.expr_is_handle(expr) || self.chain_root_is_handle(expr) {
             Kind::Handle
@@ -2096,6 +2110,51 @@ impl Analyzer {
             && !HANDLE_TRANSITIONS.contains(&last.as_str())
     }
 
+    /// Does `e` hold handles at an unknown depth ([`Kind::Nested`])? A
+    /// container of containers or of user values, or any part of one.
+    fn expr_is_nested(&self, e: &Expr) -> bool {
+        let container = |e: &Expr| {
+            !self.is_counted_query_future(e)
+                && matches!(
+                    self.value_of(e),
+                    Kind::Carrier | Kind::Holder | Kind::Nested
+                )
+        };
+        match e {
+            Expr::Path(_) => path_ident(e).is_some_and(|name| self.env.get(&name) == Kind::Nested),
+            Expr::Reference(r) => self.expr_is_nested(&r.expr),
+            Expr::RawAddr(r) => self.expr_is_nested(&r.expr),
+            Expr::Paren(p) => self.expr_is_nested(&p.expr),
+            Expr::Group(g) => self.expr_is_nested(&g.expr),
+            Expr::Field(f) => self
+                .part_kind(f)
+                .map_or_else(|| self.expr_is_nested(&f.base), |k| k == Kind::Nested),
+            Expr::Index(i) => self.expr_is_nested(&i.expr),
+            Expr::Try(t) => self.expr_is_nested(&t.expr),
+            Expr::MethodCall(mc) => {
+                !SCALAR_METHODS.contains(&mc.method.to_string().as_str())
+                    && self.expr_is_nested(&mc.receiver)
+            }
+            Expr::Array(a) => a.elems.iter().any(container),
+            Expr::Tuple(t) => t.elems.iter().any(container),
+            Expr::Repeat(r) => container(&r.expr),
+            Expr::Call(c) => {
+                (is_container_constructor(c) || is_smart_pointer_new(c))
+                    && c.args.iter().any(container)
+            }
+            Expr::Macro(m) => vec_elems(&m.mac).is_some_and(|elems| elems.iter().any(container)),
+            Expr::If(i) => {
+                block_tail(&i.then_branch).is_some_and(|e| self.expr_is_nested(e))
+                    || i.else_branch
+                        .as_ref()
+                        .is_some_and(|(_, e)| self.expr_is_nested(e))
+            }
+            Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_nested(&arm.body)),
+            Expr::Block(b) => block_tail(&b.block).is_some_and(|e| self.expr_is_nested(e)),
+            _ => false,
+        }
+    }
+
     /// Is `e` a user value that holds a handle (`Ctx { repo }`)? Its methods
     /// are the user's, so none of them is a known container method.
     fn expr_is_holder(&self, e: &Expr) -> bool {
@@ -2124,6 +2183,9 @@ impl Analyzer {
     /// Does this expression *evaluate to* a database handle (as opposed to
     /// merely mentioning one)?
     fn expr_is_handle(&self, expr: &Expr) -> bool {
+        if self.expr_is_nested(expr) {
+            return false;
+        }
         match expr {
             Expr::Path(p) => p
                 .path
@@ -2286,6 +2348,9 @@ impl Analyzer {
     /// * an index, a field, a pattern or `?` on a carrier gives a handle (see
     ///   [`Self::expr_is_handle`]).
     fn expr_is_carrier(&self, expr: &Expr) -> bool {
+        if self.expr_is_nested(expr) {
+            return true;
+        }
         let holds = |e: &Expr| self.holds(e);
         match expr {
             Expr::Path(p) => p.path.get_ident().is_some_and(|i| {
@@ -2747,42 +2812,57 @@ fn tokens_mention_any(tokens: &TokenStream, tracked: &impl Fn(&str) -> bool) -> 
 
 /// What a parameter or annotated binding of type `ty` holds.
 fn type_kind(ty: &Type) -> Kind {
-    // A carrier first: `Vec<Db>` and `Vec<PgPostRepository>` agree.
-    if type_is_lazy_db(ty) {
-        Kind::LazyDb
-    } else if type_is_carrier(ty) {
-        Kind::Carrier
-    } else if type_is_handle(ty) {
-        Kind::Handle
-    } else {
-        Kind::Plain
+    // A container first: `Vec<Db>` and `Vec<PgPostRepository>` agree.
+    match type_depth(ty) {
+        _ if type_is_lazy_db(ty) => Kind::LazyDb,
+        0 if type_is_handle(ty) => Kind::Handle,
+        0 => Kind::Plain,
+        1 => Kind::Carrier,
+        _ => Kind::Nested,
     }
 }
 
-/// Does this type hold handles without being one: a collection, `Option`,
-/// tuple, array or slice of a handle type (`Vec<PgPostRepository>`)?
-fn type_is_carrier(ty: &Type) -> bool {
-    let holds = |inner: &Type| type_is_handle_part(inner) || type_is_carrier(inner);
-    match ty {
-        Type::Reference(r) => type_is_carrier(&r.elem),
-        Type::Paren(p) => type_is_carrier(&p.elem),
-        Type::Group(g) => type_is_carrier(&g.elem),
-        Type::Array(a) => holds(&a.elem),
-        Type::Slice(s) => holds(&s.elem),
-        Type::Tuple(t) => t.elems.iter().any(holds),
-        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
-            let name = segment.ident.to_string();
-            if name == "Result" {
-                // A container on the `Ok` side (`Result<Vec<Repo>, E>`), or a
-                // handle on the `Err` side (`Result<(), Db>`). A handle on the
-                // `Ok` side makes the `Result` a handle instead.
-                let mut sides = generic_types(segment);
-                return sides.next().is_some_and(type_is_carrier)
-                    || sides.next().is_some_and(holds);
+/// How deep handles sit in a container type: 1 for `Vec<PgPostRepository>`,
+/// 2 or more for `Vec<Vec<PgPostRepository>>`, 0 for no container of
+/// handles. A smart pointer adds no depth. A `Result` with a handle on its
+/// `Ok` side is a handle, not a container (see [`type_is_handle`]).
+fn type_depth(ty: &Type) -> u8 {
+    let part = |inner: &Type| {
+        if type_is_handle_part(inner) {
+            1
+        } else {
+            match type_depth(inner) {
+                0 => 0,
+                d => d.saturating_add(1),
             }
-            CARRIER_TYPES.contains(&name.as_str()) && generic_types(segment).any(holds)
+        }
+    };
+    match ty {
+        Type::Reference(r) => type_depth(&r.elem),
+        Type::Paren(p) => type_depth(&p.elem),
+        Type::Group(g) => type_depth(&g.elem),
+        Type::Array(a) => part(&a.elem),
+        Type::Slice(s) => part(&s.elem),
+        Type::Tuple(t) => t.elems.iter().map(part).max().unwrap_or(0),
+        Type::Path(path) => path.path.segments.last().map_or(0, |segment| {
+            let name = segment.ident.to_string();
+            let mut args = generic_types(segment);
+            if SMART_POINTERS.contains(&name.as_str()) {
+                return args.next().map_or(0, type_depth);
+            }
+            if name == "Result" {
+                let ok = args.next();
+                if ok.is_some_and(type_is_handle_part) {
+                    return 0;
+                }
+                return ok.map_or(0, part).max(args.next().map_or(0, part));
+            }
+            if CARRIER_TYPES.contains(&name.as_str()) {
+                return args.map(part).max().unwrap_or(0);
+            }
+            0
         }),
-        _ => false,
+        _ => 0,
     }
 }
 
@@ -5642,6 +5722,40 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_container_keeps_its_shape() {
+        // An element of `Vec<Vec<Repo>>` is a `Vec`, so a method on it may run
+        // a query per repository. The shape is not tracked past one level,
+        // so every method on a nested container is reported.
+        for body in [
+            "let repos = groups.remove(0); repos.refresh_all().await?;",
+            "groups[0].refresh_all().await?;",
+        ] {
+            let handler = format!(
+                "async fn h(mut groups: Vec<Vec<PgPostRepository>>) -> AutumnResult<usize> {{
+                    {body}
+                    Ok(0)
+                }}"
+            );
+            // `remove` or `refresh_all`: every method on it is reported.
+            assert_error_contains("50", &handler, &["is called on a container"]);
+        }
+        // An array of user structs: every method on an element is reported.
+        let holders = matrix_handler("let cs = [Ctx { repo }]; let _ = cs[0].clear();");
+        assert_error_contains("50", &holders, &["clear"]);
+    }
+
+    #[test]
+    fn a_smart_pointer_around_a_container_is_a_container() {
+        let handler = r"
+            async fn h(repos: Arc<Vec<PgPostRepository>>) -> AutumnResult<usize> {
+                for repo in repos.iter() { let _ = repo.find_all().await?; }
+                Ok(0)
+            }
+            ";
+        assert_error_contains("50", handler, &["loop"]);
+    }
+
+    #[test]
     fn a_map_of_handles_is_a_container() {
         let handler = r"
             async fn h(repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> {
@@ -5700,7 +5814,9 @@ mod tests {
                 Ok(0)
             }
             ";
-        assert_error_contains("50", handler, &["loop"]);
+        // The `Result` wraps a container, so its parts keep the nested shape
+        // and the method on each one is reported.
+        assert_error_contains("50", handler, &["find_all"]);
     }
 
     #[test]
