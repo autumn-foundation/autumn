@@ -354,6 +354,37 @@ falls back to the default order, an unrecognized `dir` falls back to `asc`, and
 unknown parameters are dropped. A malformed list URL — from a stale bookmark, a
 crawler, or a hand-edited address bar — renders the list rather than a 400.
 
+### Without a count: `list_rows`
+
+`list()` runs a `COUNT(*)` for every page. A bulk read, such as an export,
+does not use the count, and reading page after page has a second problem:
+each page is a new statement, so a write between two pages can move a row
+from one page to the next. The row then appears twice, or not at all.
+
+`list_rows(query, limit)` loads up to `limit` rows in `list()` order, with
+the same allowlist and scope, in **one** statement:
+
+```rust,ignore
+// GET /posts/export.csv?sort=title&filter[published]=true
+const MAX_ROWS: usize = 10_000;
+let mut rows = repo.list_rows(&list_query, MAX_ROWS + 1).await?;
+let truncated = rows.len() > MAX_ROWS;
+rows.truncate(MAX_ROWS);
+```
+
+- There is no `COUNT(*)` and no offset.
+- One statement reads one snapshot, so a concurrent insert or delete cannot
+  duplicate or skip a row.
+- All rows are in memory at the same time. Set `limit` to the most rows you
+  can hold. Ask for one row more than you keep to detect a larger set.
+- Use a constant for `limit`. Do not take it from the request.
+- If you set `database.statement_timeout`, the whole read must finish in
+  that time.
+
+With `#[repository(..., owner = <column>)]`, `list_scoped_rows(owner_id,
+query, limit)` does the same for one owner's rows. The scaffolded CSV export
+uses these two methods.
+
 ### Sortable table headers
 
 The `data_table` widget renders header links that toggle `sort`/`dir` and carry

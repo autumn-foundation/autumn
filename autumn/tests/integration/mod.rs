@@ -177,6 +177,8 @@ mod job_recorder_integration;
 mod job_tenant_scope;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
+#[cfg(feature = "db")]
+mod list_rows_snapshot;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
 mod live_state;
