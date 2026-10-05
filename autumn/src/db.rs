@@ -2709,16 +2709,15 @@ pub(crate) async fn probe_connection_alive(
 ///   `0`. An idle primary writes no new transactions, so the replay timestamp
 ///   alone would grow without limit. A disconnected or stalled receiver keeps
 ///   its last receive LSN, so the LSN check alone would read as fresh. A role
-///   without `pg_read_all_stats` sees `last_msg_receipt_time` as `NULL`, and
-///   only the receiver check applies.
+///   without `pg_read_all_stats` sees `last_msg_receipt_time` as `NULL`. That
+///   is not proof of freshness, so the branch below applies.
 /// - Else: time since the last replayed transaction. `NULL` when nothing has
 ///   been replayed yet, which means "unknown".
 #[cfg(not(feature = "sqlite"))]
 const REPLICA_LAG_SQL: &str = "SELECT CASE \
      WHEN NOT pg_is_in_recovery() THEN 0::BIGINT \
      WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver \
-          WHERE last_msg_receipt_time IS NULL \
-             OR last_msg_receipt_time > clock_timestamp() - INTERVAL '60 seconds') \
+          WHERE last_msg_receipt_time > clock_timestamp() - INTERVAL '60 seconds') \
           AND pg_last_wal_receive_lsn() IS NOT NULL \
           AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0::BIGINT \
      ELSE GREATEST(0, FLOOR(EXTRACT(EPOCH FROM \

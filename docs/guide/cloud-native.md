@@ -672,10 +672,10 @@ Know these limits of the query:
 - A replica that restores WAL from an archive (no WAL receiver) shows the
   time since its last replayed transaction.
 - Clock skew between the primary and the replica adds to the value.
-- The 60 s receiver check needs a role with `pg_read_all_stats` (for example
+- The receiver check needs a role with `pg_read_all_stats` (for example
   through `pg_monitor`). Without it, Postgres hides
-  `last_msg_receipt_time`, and a stalled receiver is found only when its
-  connection breaks.
+  `last_msg_receipt_time`, and the query always uses the time since the last
+  replayed transaction. On a quiet primary, reads then go to the primary.
 
 The limit applies only to `database.replica_url`. Shard replicas do not use
 it yet. Without `replica_url`, the app ignores the limit

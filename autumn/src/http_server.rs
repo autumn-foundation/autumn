@@ -317,11 +317,13 @@ enum Scan {
     },
     Http1,
     /// Between HTTP/2 frames: `have` bytes of the 9-byte frame header, then
-    /// `skip` payload bytes.
+    /// `skip` payload bytes. `ends_block` is set while the payload of the
+    /// last frame of a header block (`END_HEADERS`) is still to come.
     Frames {
         header: [u8; 9],
         have: usize,
         skip: usize,
+        ends_block: bool,
     },
 }
 
@@ -349,14 +351,24 @@ impl PhaseState {
                             header: [0; 9],
                             have: 0,
                             skip: 0,
+                            ends_block: false,
                         };
                     }
                 }
-                Scan::Frames { header, have, skip } => {
+                Scan::Frames {
+                    header,
+                    have,
+                    skip,
+                    ends_block,
+                } => {
                     if *skip > 0 {
                         let n = (*skip).min(bytes.len());
                         *skip -= n;
                         bytes = &bytes[n..];
+                        // The block ends only when its last payload byte is in.
+                        if *skip == 0 && std::mem::take(ends_block) {
+                            self.header_block_since = None;
+                        }
                         continue;
                     }
                     let n = (9 - *have).min(bytes.len());
@@ -372,9 +384,10 @@ impl PhaseState {
                         | usize::from(header[2]);
                     let (kind, flags) = (header[3], header[4]);
                     if kind == H2_FRAME_HEADERS || kind == H2_FRAME_CONTINUATION {
-                        if flags & H2_FLAG_END_HEADERS == 0 {
-                            self.header_block_since.get_or_insert_with(Instant::now);
-                        } else {
+                        self.header_block_since.get_or_insert_with(Instant::now);
+                        *ends_block = flags & H2_FLAG_END_HEADERS != 0;
+                        if *ends_block && *skip == 0 {
+                            *ends_block = false;
                             self.header_block_since = None;
                         }
                     }
@@ -707,7 +720,22 @@ mod tests {
         state.scan(&frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS | 0x1, &[0x82]));
         assert!(
             state.header_block_since.is_none(),
-            "a full block never opens"
+            "a full block stays closed"
         );
+    }
+
+    #[tokio::test]
+    async fn end_headers_closes_the_block_only_after_its_payload() {
+        let mut state = state();
+        state.scan(H2_PREFACE);
+        let full = frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, &[0x82, 0x86, 0x84]);
+        // Only the 9-byte frame header and one payload byte.
+        state.scan(&full[..10]);
+        assert!(
+            state.header_block_since.is_some(),
+            "the head is not complete until the payload is in"
+        );
+        state.scan(&full[10..]);
+        assert!(state.header_block_since.is_none());
     }
 }
