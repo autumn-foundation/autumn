@@ -2393,6 +2393,39 @@ impl Analyzer {
                 }
             }
             (Expr::Paren(p), _) => self.assign(&p.expr, value),
+            // `Ctx { repo: slot } = Ctx { repo: Some(repo) }`: field by field.
+            // Against any other value, each place takes that field of it.
+            (Expr::Struct(p), _) => {
+                let literal = match peel_parens(value) {
+                    Expr::Struct(v) if v.rest.is_none() && same_tokens(&p.path, &v.path) => Some(v),
+                    _ => None,
+                };
+                for field in &p.fields {
+                    let given = literal
+                        .and_then(|v| v.fields.iter().find(|f| f.member == field.member))
+                        .map(|f| f.expr.clone());
+                    let part = given.unwrap_or_else(|| field_of(value, field.member.clone()));
+                    self.assign(&field.expr, &part);
+                }
+            }
+            // `Wrapper(slot, _) = w`: each place takes that field.
+            (Expr::Call(p), _) => {
+                let literal = match peel_parens(value) {
+                    Expr::Call(v)
+                        if v.args.len() == p.args.len() && same_tokens(&p.func, &v.func) =>
+                    {
+                        Some(v)
+                    }
+                    _ => None,
+                };
+                for (i, place) in p.args.iter().enumerate() {
+                    let part = literal.map_or_else(
+                        || field_of(value, syn::Member::Unnamed(syn::Index::from(i))),
+                        |v| v.args[i].clone(),
+                    );
+                    self.assign(place, &part);
+                }
+            }
             // `*target = None;` through an alias of one whole place writes
             // that place. With more places, only one is written, so none
             // clears. An alias of a part (`&mut slot.0`) writes only the part.
@@ -5853,6 +5886,22 @@ fn local_names(block: &Block) -> Vec<String> {
     let mut names = Names(Vec::new());
     names.visit_block(block);
     names.0
+}
+
+/// `value.member`, built as a node so that no operator in `value` binds
+/// the member instead.
+fn field_of(value: &Expr, member: syn::Member) -> Expr {
+    Expr::Field(syn::ExprField {
+        attrs: Vec::new(),
+        base: Box::new(value.clone()),
+        dot_token: syn::token::Dot::default(),
+        member,
+    })
+}
+
+/// Do `a` and `b` have the same tokens?
+fn same_tokens(a: &impl quote::ToTokens, b: &impl quote::ToTokens) -> bool {
+    a.to_token_stream().to_string() == b.to_token_stream().to_string()
 }
 
 /// The names a pattern binds by `ref mut`.
@@ -11999,6 +12048,39 @@ mod tests {
                 "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
                  let _ = match x { a::E::V(_) if repo.a().await? => (), b::E::W(_) if repo.b().await? => (), _ => () }; Ok(0) }",
                 Expect::Exact(2),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn destructuring_assignments_bind_fields() {
+        check_handlers(&[
+            (
+                "guard: a struct destructuring assignment binds its fields",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; Ctx { repo: slot } = Ctx { repo: Some(repo) }; \
+                 let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a tuple-struct destructuring assignment binds its fields",
+                "async fn h(w: (Option<PgPostRepository>, i64)) -> AutumnResult<usize> { \
+                 let mut slot = None; Wrapper(slot, _) = w; \
+                 let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a destructuring assignment from a name binds its fields",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let ctx = Ctx { repo: Some(repo), n: 1 }; let mut slot = None; Ctx { repo: slot, .. } = ctx; \
+                 let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a plain field of a destructuring assignment stays plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut n = 0; Ctx { n, .. } = Ctx { repo: Some(repo), n: 1 }; render(n); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
