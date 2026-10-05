@@ -12,11 +12,22 @@
 //! A migration that cannot run in a transaction (for example
 //! `CREATE INDEX CONCURRENTLY`) makes the replay fail with its error.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use autumn_schema_core::{Backend, Table};
 use diesel::{Connection, QueryableByName, RunQueryDsl as _};
 use diesel_migrations::{FileBasedMigrations, MigrationHarness};
+
+/// The schema that the replayed migrations make.
+#[derive(Debug)]
+pub struct Replay {
+    /// The tables (the diff baseline).
+    pub tables: Vec<Table>,
+    /// The names of the other relations (views, sequences, ...). They share
+    /// the table namespace, so a new or renamed table cannot use them.
+    pub other_relations: BTreeSet<String>,
+}
 
 /// Replay the migrations in `migrations_dir` on the empty dev database at
 /// `url` and return its schema. The database is not changed.
@@ -27,7 +38,7 @@ use diesel_migrations::{FileBasedMigrations, MigrationHarness};
 /// database is unreachable or not empty, or when a migration fails. A message
 /// never contains the password. A connection error shows only the host and
 /// port (or the `SQLite` file path).
-pub fn replay(backend: Backend, url: &str, migrations_dir: &Path) -> Result<Vec<Table>, String> {
+pub fn replay(backend: Backend, url: &str, migrations_dir: &Path) -> Result<Replay, String> {
     let dev_backend = match autumn_web::config::DatabaseBackend::detect(url) {
         Some(autumn_web::config::DatabaseBackend::Postgres) => Backend::Postgres,
         Some(autumn_web::config::DatabaseBackend::Sqlite) => Backend::Sqlite,
@@ -209,7 +220,7 @@ const fn backend_label(backend: Backend) -> &'static str {
     }
 }
 
-fn replay_postgres(url: &str, migrations_dir: &Path) -> Result<Vec<Table>, String> {
+fn replay_postgres(url: &str, migrations_dir: &Path) -> Result<Replay, String> {
     use crate::schema::introspect;
     let mut conn = introspect::connect_postgres(url).map_err(|e| e.to_string())?;
     // Any table or view in any user schema makes the database not empty.
@@ -237,12 +248,22 @@ fn replay_postgres(url: &str, migrations_dir: &Path) -> Result<Vec<Table>, Strin
                 .map_err(|e| format!("could not read the replay transaction id: {e}"))?;
             Ok(rows.into_iter().next().map(|r| r.name).unwrap_or_default())
         },
-        |conn| introspect::introspect_postgres_conn(conn).map_err(|e| e.to_string()),
+        |conn| {
+            Ok(Replay {
+                tables: introspect::introspect_postgres_conn(conn).map_err(|e| e.to_string())?,
+                other_relations: relation_names(
+                    conn,
+                    "SELECT c.relname AS name FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm', 'S', 'f')",
+                )?,
+            })
+        },
     )
 }
 
 #[cfg(feature = "sqlite")]
-fn replay_sqlite(url: &str, migrations_dir: &Path) -> Result<Vec<Table>, String> {
+fn replay_sqlite(url: &str, migrations_dir: &Path) -> Result<Replay, String> {
     use crate::schema::introspect;
     let target = introspect::sqlite_target(url);
     // `establish` creates a missing file. Refuse instead of making a stray file.
@@ -263,13 +284,21 @@ fn replay_sqlite(url: &str, migrations_dir: &Path) -> Result<Vec<Table>, String>
         migrations_dir,
         |_| Ok(()),
         |_| Ok(String::new()),
-        |conn| introspect::introspect_sqlite_conn(conn).map_err(|e| e.to_string()),
+        |conn| {
+            Ok(Replay {
+                tables: introspect::introspect_sqlite_conn(conn).map_err(|e| e.to_string())?,
+                other_relations: relation_names(
+                    conn,
+                    "SELECT name FROM sqlite_master WHERE type = 'view'",
+                )?,
+            })
+        },
     )
 }
 
 /// The default build targets Postgres only and has no `SQLite` driver.
 #[cfg(not(feature = "sqlite"))]
-fn replay_sqlite(_url: &str, _migrations_dir: &Path) -> Result<Vec<Table>, String> {
+fn replay_sqlite(_url: &str, _migrations_dir: &Path) -> Result<Replay, String> {
     Err(
         "--dev-url with a SQLite URL needs a CLI built with `--features sqlite` \
          (this build targets Postgres only)"
@@ -281,6 +310,18 @@ fn replay_sqlite(_url: &str, _migrations_dir: &Path) -> Result<Vec<Table>, Strin
 struct NameRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
+}
+
+/// The `name` column of `query`, as a set.
+fn relation_names<C: Connection>(conn: &mut C, query: &str) -> Result<BTreeSet<String>, String>
+where
+    NameRow: QueryableByName<C::Backend>,
+    diesel::query_builder::SqlQuery: diesel::query_dsl::LoadQuery<'static, C, NameRow>,
+{
+    let rows: Vec<NameRow> = diesel::sql_query(query)
+        .load(conn)
+        .map_err(|e| format!("could not read the replayed relations: {e}"))?;
+    Ok(rows.into_iter().map(|r| r.name).collect())
 }
 
 /// Refuse a dev database that has a table: the replay must start from empty.
@@ -312,8 +353,8 @@ fn in_rolled_back_transaction<C>(
     migrations_dir: &Path,
     setup: impl FnOnce(&mut C) -> Result<(), String>,
     xact_id: impl Fn(&mut C) -> Result<String, String>,
-    read: impl FnOnce(&mut C) -> Result<Vec<Table>, String>,
-) -> Result<Vec<Table>, String>
+    read: impl FnOnce(&mut C) -> Result<Replay, String>,
+) -> Result<Replay, String>
 where
     C: Connection + MigrationHarness<C::Backend>,
     FileBasedMigrations: diesel::migration::MigrationSource<C::Backend>,
@@ -519,7 +560,9 @@ mod tests {
             std::fs::File::create(&db).expect("create dev.db");
             let url = format!("sqlite://{}", db.display());
 
-            let tables = replay(Backend::Sqlite, &url, &migrations).expect("replay");
+            let tables = replay(Backend::Sqlite, &url, &migrations)
+                .expect("replay")
+                .tables;
             let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
             assert_eq!(names, vec!["posts", "users"]);
             let posts = &tables[0];
@@ -537,6 +580,7 @@ mod tests {
             assert_eq!(
                 replay(Backend::Sqlite, &url, &migrations)
                     .expect("again")
+                    .tables
                     .len(),
                 2
             );
@@ -577,6 +621,24 @@ mod tests {
         }
 
         #[test]
+        fn replay_lists_views_as_other_relations() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let migrations = root.path().join("migrations");
+            migration(
+                &migrations,
+                "2026-01-01-000000_report",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY); CREATE VIEW report AS SELECT id FROM t;",
+            );
+            let replayed = replay(Backend::Sqlite, "sqlite::memory:", &migrations).expect("replay");
+            assert!(
+                replayed.other_relations.contains("report"),
+                "{:?}",
+                replayed.other_relations
+            );
+            assert_eq!(replayed.tables.len(), 1);
+        }
+
+        #[test]
         fn a_missing_sqlite_dev_file_is_refused_and_not_created() {
             let root = tempfile::tempdir().expect("tempdir");
             let db = root.path().join("absent.db");
@@ -594,7 +656,8 @@ mod tests {
                 "sqlite::memory:",
                 &root.path().join("migrations"),
             )
-            .expect("replay");
+            .expect("replay")
+            .tables;
             assert!(tables.is_empty());
         }
     }

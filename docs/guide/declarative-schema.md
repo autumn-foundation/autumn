@@ -164,6 +164,14 @@ override this.
 - Two hints use the same old name.
 - The parser cannot read the field (an unsupported type).
 - The hints make a chain or a swap. Do each rename in its own migration.
+- An index definition or a `CHECK` names the old column in a position the
+  engine cannot classify offline (for example an operator class with the same
+  name). Write that rename as a manual migration.
+- A new name is a table or index name that is already in use.
+
+On Postgres, a new name longer than 63 bytes is refused too. The offline
+snapshot does not know views or sequences; use `--dev-url` to check a new name
+against them.
 
 ### Shadow-database baseline: `--dev-url`
 
@@ -193,6 +201,8 @@ hand-written migration or with a `#[belongs_to]` foreign key.
   a hand-written migration made. With no snapshot, the diff never drops a
   table.
 - `--write-migration` writes the migration and the snapshot, as usual.
+- The command refuses a new or renamed table or index whose name is already a
+  view, a sequence or another relation in the migrated schema.
 - The URL backend must match the schema backend. A `sqlite:` URL needs a CLI
   built with `--features sqlite`, and the file must exist.
 - The replay applies your migrations only, not the framework migrations.

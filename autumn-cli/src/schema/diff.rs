@@ -2161,6 +2161,17 @@ fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
     if plan.backend != Backend::Postgres {
         return None;
     }
+    // A rename target comes from the models, so it has no length limit there.
+    if let Some(name) = plan.changes.iter().find_map(|c| match c {
+        SchemaChange::RenameTable { to, .. } | SchemaChange::RenameColumn { to, .. }
+            if to.len() > PG_MAX_IDENTIFIER_BYTES =>
+        {
+            Some(to.clone())
+        }
+        _ => None,
+    }) {
+        return Some(DiffError::GeneratedIdentifierTooLong { name });
+    }
     let mut by_truncated: BTreeMap<String, String> = BTreeMap::new();
     for name in generated_identifiers(plan) {
         // Over the limit: PG truncates it silently — refuse outright (this alone

@@ -269,3 +269,30 @@ async fn schema_dev_url_sees_hand_written_migrations_and_warns_on_snapshot_drift
     assert!(refusal.contains("DROP COLUMN posts.legacy"), "{refusal}");
     assert!(!refusal.contains("audit_log"), "{refusal}");
 }
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn schema_dev_url_refuses_a_new_table_named_like_a_replayed_view() {
+    let (_container, url) = start_postgres().await;
+    let root = project_with_initial_migration();
+    let dir = root.path();
+    let raw = dir.join("migrations/2099-01-01-000000_report_view");
+    std::fs::create_dir_all(&raw).expect("mkdir");
+    std::fs::write(
+        raw.join("up.sql"),
+        "CREATE VIEW reports AS SELECT id FROM posts;\n",
+    )
+    .expect("up.sql");
+    std::fs::write(raw.join("down.sql"), "DROP VIEW reports;\n").expect("down.sql");
+    let models = format!(
+        "{MODELS_V1}\n#[autumn_web::model(managed)]\npub struct Report {{\n    #[id]\n    pub id: i64,\n}}\n"
+    );
+    std::fs::write(dir.join("src/models.rs"), models).expect("models");
+
+    let (_, err, code) = run_autumn(
+        dir,
+        &["schema", "diff", "--backend", "pg", "--dev-url", &url],
+    );
+    assert_ne!(code, Some(0), "{err}");
+    assert!(err.contains("`reports` is already a view"), "{err}");
+}

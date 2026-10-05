@@ -150,6 +150,24 @@ fn column_renames(
             "column",
             out,
         );
+        // Refuse a rename that the index definitions and CHECKs cannot follow
+        // without a guess.
+        let mut kept = Vec::new();
+        for (from, to) in selected {
+            if let Some(place) = ambiguous_reference(base, &from) {
+                out.push(SchemaChange::RenameConflict {
+                    table: (*name).to_owned(),
+                    reason: format!(
+                        "{place} names `{from}` in a position the offline engine cannot \
+                         classify (an operator class or an alias?); write this rename as \
+                         a manual migration"
+                    ),
+                });
+            } else {
+                kept.push((from, to));
+            }
+        }
+        let selected = kept;
         if !selected.is_empty() {
             renames.insert((*name).to_owned(), selected);
         }
@@ -509,6 +527,76 @@ pub fn quoted_len(rest: &str, close: char) -> usize {
 ///   `'`), and the name after `::`, `COLLATE`, `AS` or `USING` (a type, a
 ///   collation or a method, maybe schema-qualified) do not change.
 fn replace_word(sql: &str, from: &str, to: &str) -> String {
+    rewrite_word(sql, from, to).0
+}
+
+/// Words after which a name is in a normal expression position.
+const SQL_KEYWORDS: &[&str] = &[
+    "ADD",
+    "ALL",
+    "ALTER",
+    "AND",
+    "ANY",
+    "ARRAY",
+    "AS",
+    "ASC",
+    "BETWEEN",
+    "BY",
+    "CASE",
+    "CHECK",
+    "COLLATE",
+    "CONSTRAINT",
+    "CREATE",
+    "DESC",
+    "DISTINCT",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXCLUDE",
+    "EXISTS",
+    "FALSE",
+    "FIRST",
+    "FROM",
+    "GLOB",
+    "ILIKE",
+    "IN",
+    "INCLUDE",
+    "INDEX",
+    "INTERVAL",
+    "IS",
+    "ISNULL",
+    "LAST",
+    "LIKE",
+    "MATCH",
+    "NOT",
+    "NOTNULL",
+    "NULL",
+    "NULLS",
+    "ON",
+    "ONLY",
+    "OR",
+    "OVERLAPS",
+    "REGEXP",
+    "ROW",
+    "SELECT",
+    "SIMILAR",
+    "SOME",
+    "TABLE",
+    "THEN",
+    "TO",
+    "TRUE",
+    "UNIQUE",
+    "USING",
+    "WHEN",
+    "WHERE",
+    "WITH",
+];
+
+/// [`replace_word`], plus whether an occurrence of `from` was in an ambiguous
+/// position: right after another identifier, as an operator class or an alias
+/// is (`(slug text_pattern_ops)`). The engine cannot tell that from a column
+/// offline, so it leaves such an occurrence as it is and reports it.
+fn rewrite_word(sql: &str, from: &str, to: &str) -> (String, bool) {
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
     let mut out = String::with_capacity(sql.len());
     let mut rest = sql;
@@ -517,6 +605,8 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
     // `expect_name`: after one of those or a `.` in that name; `in_name`: after
     // a part.
     let (mut expect_name, mut in_name) = (false, false);
+    // The previous significant token was an identifier (not a keyword).
+    let (mut prev_ident, mut ambiguous) = (false, false);
     while let Some(c) = rest.chars().next() {
         let close = match c {
             '\'' | '"' | '`' => Some(c),
@@ -543,7 +633,12 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
             && matches!(close, Some('"' | '`' | ']'))
             && token.len() > 1
             && &token[1..token.len() - 1] == from;
-        if close.is_none() && token.eq_ignore_ascii_case(from) && !is_call && !in_cast {
+        let plain_match =
+            close.is_none() && token.eq_ignore_ascii_case(from) && !is_call && !in_cast;
+        if (plain_match || quoted_match) && prev_ident {
+            ambiguous = true;
+            out.push_str(token);
+        } else if plain_match {
             out.push_str(to);
         } else if quoted_match {
             out.push_str(&token[..1]);
@@ -563,9 +658,35 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
         } else {
             (expect_name && c.is_whitespace(), false)
         };
+        if !c.is_whitespace() {
+            prev_ident = matches!(close, Some('"' | '`' | ']'))
+                || (close.is_none()
+                    && is_word(c)
+                    && !c.is_ascii_digit()
+                    && !SQL_KEYWORDS.iter().any(|k| token.eq_ignore_ascii_case(k)));
+        }
         rest = &rest[len..];
     }
-    out
+    (out, ambiguous)
+}
+
+/// The index or `CHECK` in `table` where the column `from` is in an ambiguous
+/// position (see [`rewrite_word`]), if any.
+fn ambiguous_reference(table: &Table, from: &str) -> Option<String> {
+    let index = table.indexes.iter().find(|i| {
+        i.definition
+            .as_deref()
+            .and_then(split_index_target)
+            .is_some_and(|(_, _, rest)| rewrite_word(rest, from, "_").1)
+    });
+    if let Some(index) = index {
+        return Some(format!("index `{}`", index.name));
+    }
+    table
+        .checks
+        .iter()
+        .find(|c| rewrite_word(&c.expression, from, "_").1)
+        .map(|c| format!("CHECK `{}`", c.name.as_deref().unwrap_or(&c.expression)))
 }
 
 #[cfg(test)]
@@ -1269,6 +1390,81 @@ mod tests {
             rename_index_column("CREATE INDEX i ON `posts` (`title`)", "title", "headline"),
             "CREATE INDEX i ON `posts` (`headline`)"
         );
+    }
+
+    #[test]
+    fn a_column_name_in_an_ambiguous_position_is_refused() {
+        // `text_pattern_ops` is an operator class in the column list and a column
+        // in the predicate; offline, the engine cannot tell them apart.
+        let mut t = table(
+            "posts",
+            Backend::Postgres,
+            &[
+                ("slug", ColumnType::Text),
+                ("text_pattern_ops", ColumnType::Text),
+            ],
+        );
+        let mut idx = Index::new(
+            "posts_slug_pattern",
+            vec!["slug".to_owned(), "text_pattern_ops".to_owned()],
+            false,
+        );
+        idx.definition = Some(
+            "CREATE INDEX posts_slug_pattern ON public.posts USING btree (slug text_pattern_ops) \
+             WHERE (text_pattern_ops <> ''::text)"
+                .to_owned(),
+        );
+        t.indexes.push(idx);
+        let want = desired(
+            vec![table(
+                "posts",
+                Backend::Postgres,
+                &[("slug", ColumnType::Text), ("code", ColumnType::Text)],
+            )],
+            vec![col_hint("posts", "code", "text_pattern_ops")],
+        );
+        let err = guard_plan(&diff_schema(&[t], &want, OPTS), ALLOW).unwrap_err();
+        assert!(matches!(err, DiffError::RenameConflict { .. }), "{err}");
+        assert!(err.to_string().contains("posts_slug_pattern"), "{err}");
+    }
+
+    #[test]
+    fn word_rewrite_flags_only_identifier_after_identifier() {
+        let (_, ambiguous) = rewrite_word("(slug text_pattern_ops)", "text_pattern_ops", "code");
+        assert!(ambiguous);
+        for sql in [
+            "lower(title) WHERE title IS NOT NULL AND NOT title = ''",
+            "length(title) > 0 OR title IN ('a') AND CASE WHEN title THEN 1 END = 1",
+            "(title DESC NULLS LAST) INCLUDE (title)",
+        ] {
+            let (out, ambiguous) = rewrite_word(sql, "title", "headline");
+            assert!(!ambiguous, "{sql}");
+            assert!(!out.contains("title"), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_rename_target_over_63_bytes_is_refused_on_postgres_only() {
+        let long = "c".repeat(64);
+        for backend in [Backend::Postgres, Backend::Sqlite] {
+            let base = vec![table("posts", backend, &[("title", ColumnType::Text)])];
+            let want = desired(
+                vec![table(
+                    "posts",
+                    backend,
+                    &[(long.as_str(), ColumnType::Text)],
+                )],
+                vec![col_hint("posts", &long, "title")],
+            );
+            let res = guard_plan(&diff_schema(&base, &want, OPTS), OPTS);
+            match backend {
+                Backend::Postgres => assert!(
+                    matches!(res, Err(DiffError::GeneratedIdentifierTooLong { .. })),
+                    "{res:?}"
+                ),
+                Backend::Sqlite => assert!(res.is_ok(), "{res:?}"),
+            }
+        }
     }
 
     #[test]

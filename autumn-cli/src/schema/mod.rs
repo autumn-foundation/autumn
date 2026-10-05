@@ -750,9 +750,15 @@ fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
     }
 
     // The baseline: the snapshot, or with `--dev-url` the replayed migrations.
-    let baseline_tables = match dev_url {
-        Some(url) => replay_baseline(project_root, url, backend, snapshot.as_ref(), &desired)?,
-        None => snapshot.map(|s| s.tables).unwrap_or_default(),
+    let (baseline_tables, other_relations) = match dev_url {
+        Some(url) => {
+            let replay = replay_baseline(project_root, url, backend, snapshot.as_ref(), &desired)?;
+            (replay.tables, replay.other_relations)
+        }
+        None => (
+            snapshot.map(|s| s.tables).unwrap_or_default(),
+            std::collections::BTreeSet::new(),
+        ),
     };
 
     // (e) Diff (pure) then guard (policy).
@@ -766,6 +772,9 @@ fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
         return Ok(());
     }
     diff::guard_plan(&plan, opts).map_err(|e| e.to_string())?;
+    if let Some(clash) = relation_clash(&plan, &other_relations) {
+        return Err(clash);
+    }
 
     // The SQLite table-recreate path needs each affected table's full desired (up)
     // / baseline (down) shape, which the per-change deltas don't carry; thread them
@@ -862,13 +871,42 @@ fn replay_baseline(
     backend: Backend,
     snapshot: Option<&SchemaSnapshot>,
     desired: &parse::ParsedSchema,
-) -> Result<Vec<Table>, String> {
+) -> Result<shadow::Replay, String> {
     let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"))?;
     if let Some(snapshot) = snapshot {
-        warn_snapshot_drift(&snapshot.tables, &replayed);
+        warn_snapshot_drift(&snapshot.tables, &replayed.tables);
     }
-    shadow::adopt_managed_flags(&mut replayed, snapshot.map(|s| &s.tables[..]), desired);
+    shadow::adopt_managed_flags(
+        &mut replayed.tables,
+        snapshot.map(|s| &s.tables[..]),
+        desired,
+    );
     Ok(replayed)
+}
+
+/// The refusal for a plan target (a new or renamed table or index) that is
+/// already a view, sequence or other non-table relation in the replayed
+/// schema. They share one namespace, so the migration would fail.
+fn relation_clash(
+    plan: &MigrationPlan,
+    others: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    plan.changes.iter().find_map(|c| {
+        let name = match c {
+            SchemaChange::CreateTable(t) => &t.name,
+            SchemaChange::RenameTable { to, .. } => to,
+            SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
+                &index.name
+            }
+            _ => return None,
+        };
+        others.contains(name).then(|| {
+            format!(
+                "`{name}` is already a view, sequence or other relation in the migrated \
+                 schema; choose another name"
+            )
+        })
+    })
 }
 
 /// Warn on stderr when the snapshot does not match the schema the migrations
@@ -1346,6 +1384,31 @@ mod tests {
         // And the other way: the snapshot has it, the migrations do not.
         let text = snapshot_drift(&[replayed], &[posts]).expect("drift");
         assert!(text.contains("id_positive"), "{text}");
+    }
+
+    #[test]
+    fn a_new_table_or_rename_on_a_replayed_view_name_is_refused() {
+        let others: std::collections::BTreeSet<String> =
+            ["report".to_owned(), "posts_id_seq".to_owned()].into();
+        let plan = |change| MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![change],
+        };
+        let create = plan(SchemaChange::CreateTable(autumn_schema_core::Table::new(
+            "report",
+            Backend::Postgres,
+        )));
+        assert!(relation_clash(&create, &others).is_some_and(|e| e.contains("report")));
+        let rename = plan(SchemaChange::RenameTable {
+            from: "old".to_owned(),
+            to: "posts_id_seq".to_owned(),
+        });
+        assert!(relation_clash(&rename, &others).is_some());
+        let fine = plan(SchemaChange::RenameTable {
+            from: "old".to_owned(),
+            to: "new".to_owned(),
+        });
+        assert_eq!(relation_clash(&fine, &others), None);
     }
 
     #[test]
