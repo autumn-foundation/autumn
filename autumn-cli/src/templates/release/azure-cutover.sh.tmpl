@@ -138,6 +138,15 @@ TAGGED_INGRESS=$(jq -c 'try ([.tags // {} | to_entries[]
   | if length == 0 then null
     else sort_by(.i) | map(.v) | join("") | @base64d | fromjson end) catch null' <<< "$APP")
 [ "$TAGGED_INGRESS" = null ] || SAVED_INGRESS="$TAGGED_INGRESS"
+# The first cutover also records, in its PATCH, the secret names and
+# identities that it copies (autumn-copied-* tags). A rollback after an
+# interrupted run removes them, also when the job no longer has them.
+COPIED=$(jq -c 'try ([.tags // {} | to_entries[]
+    | select((.key | startswith("autumn-copied-")) and .value != null)
+    | {i: (.key | ltrimstr("autumn-copied-") | tonumber), v: .value}]
+  | if length == 0 then {secrets: [], uids: []}
+    else sort_by(.i) | map(.v) | join("") | @base64d | fromjson end)
+  catch {secrets: [], uids: []}' <<< "$APP")
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 # The active revisions decide if a real release runs. The template image is
 # not enough: after a canceled first cutover, the template has the real
@@ -185,6 +194,10 @@ JOB_IDENTITY=$(jq -r --arg acr "$ACR_LOGIN_SERVER" \
 # another principal, without access to the vault. The cutover stops on it.
 JOB_UIDS=$(jq -c --arg id "$JOB_IDENTITY" '[$id] + [.[] | select(.keyVaultUrl) | .identity // empty]
   | map(select(. != "" and ascii_downcase != "system")) | unique_by(ascii_downcase)' "$JOB_SECRETS")
+# The identities that credential removal drops: the job's, and the ones
+# that an earlier first cutover recorded.
+REMOVE_UIDS=$(jq -c --argjson copied "$COPIED" '. + ($copied.uids // [])
+  | map(select(type == "string" and . != "" and ascii_downcase != "system")) | unique_by(ascii_downcase)' <<< "$JOB_UIDS")
 # The job can pull from the ACR with its system identity. "system" is not a
 # user-assigned identity, and the app's system identity has no AcrPull, so
 # the cutover cannot copy it. The script stops before any write.
@@ -200,13 +213,14 @@ JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' 
 # The managed secrets: every secret of the migration job (the cutover copies
 # them all to the app) and the three that main.tf makes. Credential removal
 # and rollback remove all of them.
-MANAGED_DEF="def managed: $(jq -c '. + ["database-url", "signing-secret", "redis-url"] | unique' <<< "$JOB_SECRET_NAMES");"
+MANAGED_DEF="def managed: $(jq -c --argjson copied "$COPIED" '. + ["database-url", "signing-secret", "redis-url"]
+  + ($copied.secrets // [] | map(select(type == "string"))) | unique' <<< "$JOB_SECRET_NAMES");"
 # The app's own (unmanaged) secrets and other registries that use a job
 # identity. Credential removal drops that identity, which breaks them, and
 # keeping it would keep vault access on the placeholder. So the script
 # stops before a first cutover (its rollback removes the credentials) or a
 # removal, and names them.
-SHARED_IDENTITY=$(jq -r --argjson app "$APP" --argjson uids "$JOB_UIDS" --arg acr "$ACR_LOGIN_SERVER" "$MANAGED_DEF"'
+SHARED_IDENTITY=$(jq -r --argjson app "$APP" --argjson uids "$REMOVE_UIDS" --arg acr "$ACR_LOGIN_SERVER" "$MANAGED_DEF"'
   ($uids | map(ascii_downcase)) as $lids
   | [(.[] | select(.keyVaultUrl and ((.identity // "" | ascii_downcase) | IN($lids[]))
                and (.name | IN(managed[]) | not)) | "secret " + .name),
@@ -257,7 +271,7 @@ APPLIED='
     and ($want | all(. as $s | $have | index([$s]) != null))'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
 REMOVED="$MANAGED_DEF"'
-  ($uids | map(ascii_downcase)) as $lids
+  ($ruids | map(ascii_downcase)) as $lids
   | [.identity.userAssignedIdentities // {} | to_entries[]
      | select(.value != null) | .key | ascii_downcase] as $ids
   | .properties.provisioningState == "Succeeded"
@@ -286,7 +300,7 @@ app_shows() {
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --output json) || return 1
   jq -e --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" \
-    --argjson uids "$JOB_UIDS" \
+    --argjson uids "$JOB_UIDS" --argjson ruids "$REMOVE_UIDS" \
     --argjson want "$JOB_SECRET_REFS" "$1" <<< "$now" > /dev/null
 }
 
@@ -346,25 +360,28 @@ save_ingress_tags() {
   tags_show "$tags"
 }
 
-# Removes the snapshot tags after the ingress is back.
-clear_ingress_tags() {
+# Removes the tags with the given prefixes (a JSON array): the ingress
+# snapshot after the ingress is back, and the copied record after a
+# successful cutover.
+clear_tags() {
   local tags now
   now=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --output json) || return 1
-  tags=$(jq -c "$INGRESS_TAG_NAMES"' | map({(.): null}) | add // {}' <<< "$now")
+  tags=$(jq -c --argjson prefixes "$1" '[.tags // {} | keys[] | select(. as $k | any($prefixes[]; . as $p | $k | startswith($p)))]
+    | map({(.): null}) | add // {}' <<< "$now")
   [ "$tags" = "{}" ] && return 0
   patch_app "$(jq -cn --argjson app "$APP" --argjson tags "$tags" '{location: $app.location, tags: $tags}')" \
     && tags_show "$tags" \
-    || echo "::warning::remove the autumn-ingress-* tags from $AZURE_APP_NAME" >&2
+    || echo "::warning::remove the $(jq -r 'map(. + "*") | join(", ")' <<< "$1") tags from $AZURE_APP_NAME" >&2
 }
 
 # Sends the saved ingress back, as it was, then removes the snapshot tags.
 restore_ingress() {
   [ "$SAVED_INGRESS" = null ] && return 0
   if set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")"; then
-    clear_ingress_tags
+    clear_tags '["autumn-ingress-"]'
   else
     echo "::warning::restore the ingress of $AZURE_APP_NAME manually. Its autumn-ingress-* tags hold the saved ingress (base64 JSON)." >&2
   fi
@@ -456,7 +473,7 @@ remove_credentials() {
   # the active revision does, the template is clean already (an earlier
   # run, or the operator): the script waits for the clean revision instead.
   if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null \
-    || jq -e --argjson uids "$JOB_UIDS" "$MANAGED_DEF"'
+    || jq -e --argjson uids "$REMOVE_UIDS" "$MANAGED_DEF"'
          ($uids | map(ascii_downcase)) as $lids
          | ([.. | objects | .secretRef? // empty] | any(IN(managed[])))
            or ([.scale.rules // [] | .. | objects | .identity? // empty | strings | ascii_downcase]
@@ -527,7 +544,7 @@ remove_credentials() {
     sole_active "$revision" || return 1
   fi
   body=$(jq -cn --argjson app "$APP" --argjson live "$live" --slurpfile app_secrets "$APP_SECRETS" \
-    --argjson uids "$JOB_UIDS" "$SECRET_REF$MANAGED_DEF"'
+    --argjson uids "$REMOVE_UIDS" "$SECRET_REF$MANAGED_DEF"'
     ($uids | map(ascii_downcase)) as $lids
     # The cutover never turns the system identity on, so it stays.
     | ($live.identity.type // "None" | test("SystemAssigned")) as $keep_system
@@ -551,7 +568,10 @@ remove_credentials() {
                         | select((.identity // "" | ascii_downcase) | IN($lids[]) | not)],
            secrets: ($app_secrets[0]
                      | map(select(.name | IN(managed[]) | not)
-                           | secret_ref))}}}')
+                           | secret_ref))}}}
+    # The record of what a first cutover copied goes with the credentials.
+    + ([$live.tags // {} | keys[] | select(startswith("autumn-copied-"))] as $copied
+       | if $copied == [] then {} else {tags: ($copied | map({(.): null}) | add)} end)')
   patch_app "$body" || return 1
   for _ in $(seq 1 30); do
     sleep 10
@@ -584,7 +604,21 @@ if [ "$MODE" = remove ]; then
     exit 1
   fi
   [ -z "$SHARED_IDENTITY" ] || shared_identity_stop
-  remove_credentials || { echo "::error::cannot remove the credentials from $AZURE_APP_NAME" >&2; exit 1; }
+  # The placeholder has credentials until stage 2. Ingress closes for the
+  # removal (the tags keep the snapshot) and comes back only after it.
+  if [ "$(jq -r '.properties.configuration.ingress != null' <<< "$APP")" = true ]; then
+    save_ingress_tags \
+      || { echo "::error::cannot save the ingress of $AZURE_APP_NAME in its tags" >&2; exit 1; }
+    az containerapp ingress disable \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --output none
+  fi
+  remove_credentials || {
+    echo "::error::cannot remove the credentials from $AZURE_APP_NAME. Its ingress stays disabled; the next run restores it from the app's tags." >&2
+    exit 1
+  }
+  restore_ingress
   echo "removed the credentials from the placeholder app $AZURE_APP_NAME"
   exit 0
 fi
@@ -730,10 +764,25 @@ if jq -en --argjson app "$APP" --argjson containers "$CONTAINERS" \
   fi
 fi
 
+# On a first cutover, the PATCH also records what it copies (with what an
+# earlier interrupted run recorded), so a later rollback can remove it.
+COPIED_TAGS='{}'
+if [ -z "$RELEASED" ]; then
+  COPIED_TAGS=$(jq -cn --argjson app "$APP" --argjson names "$JOB_SECRET_NAMES" \
+    --argjson uids "$REMOVE_UIDS" --argjson copied "$COPIED" '
+    [$app.tags // {} | keys[] | select(startswith("autumn-copied-"))] as $old
+    | ({secrets: ($names + ($copied.secrets // []) | unique), uids: $uids} | tojson | @base64) as $b
+    | [range(0; $b | length; 256) as $i | $b[$i:$i + 256]]
+    | if length > 40 then error("the record of copied credentials is too large for the tags") else . end
+    | (to_entries | map({key: ("autumn-copied-" + (.key | tostring)), value}) | from_entries) as $new
+    | ($old | map(select(in($new) | not) | {(.): null}) | add // {}) + $new') \
+    || { echo "::error::cannot record the copied credentials in the tags of $AZURE_APP_NAME" >&2; exit 1; }
+fi
+
 # The secrets, registries and identities that you add to the app stay.
 PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slurpfile job_secrets "$JOB_SECRETS" \
   --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" --argjson containers "$CONTAINERS" \
-  --argjson uids "$JOB_UIDS" "$SECRET_REF"'
+  --argjson uids "$JOB_UIDS" --argjson copied_tags "$COPIED_TAGS" "$SECRET_REF"'
   ($job_secrets[0] | map(secret_ref)) as $job_secrets
   | if $id == "" or ($job_secrets | length) == 0
     then error("the migration job has no identity or secrets to copy")
@@ -753,6 +802,7 @@ PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slu
                        | select(.server != $acr)] + [{server: $acr, identity: $id}]),
          secrets: $secrets},
        template: {containers: $containers}}}
+  + (if $copied_tags == {} then {} else {tags: $copied_tags} end)
 ') || fail "cannot build the cutover PATCH"
 patch_app "$PATCH" || fail "the cutover PATCH failed"
 
@@ -813,7 +863,9 @@ sole_active "$REVISION" || fail "revision $REVISION did not become the only acti
 # open now. It opens before a restart: a revision scaled to zero needs a
 # request through ingress to start a replica.
 open_ingress || fail "cannot open external ingress"
-clear_ingress_tags
+# The release runs with its credentials now: no rollback needs the
+# record of what was copied, and the ingress is back.
+clear_tags '["autumn-ingress-", "autumn-copied-"]'
 
 # No new revision: secrets are application-scope, and the running revision
 # reads them only when it starts.

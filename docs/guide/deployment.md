@@ -2182,7 +2182,15 @@ The script stops with an error if the app runs a real release, because that
 release needs its credentials. It works in two stages, because Azure deletes
 a secret only when no active revision uses it. First it deploys the
 placeholder without the secret env vars and waits until the old revision is
-inactive. Then it removes the identity, registry and secrets.
+inactive. Then it removes the identity, registry and secrets. During the
+removal, ingress is disabled (the `autumn-ingress-*` tags keep it), and it
+comes back only after the credentials are gone. If the removal fails,
+ingress stays disabled; run the command again.
+
+A first cutover records the secrets and identities that it copies in the
+app's `autumn-copied-*` tags. A rollback or `--remove-credentials` removes
+them too, also when you removed them from the job in between. A successful
+cutover removes the tags.
 
 **Secret changes reach the app without a deploy.** The app refers to the
 latest version of each Key Vault secret. Container Apps gets a new version

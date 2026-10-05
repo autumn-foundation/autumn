@@ -3214,7 +3214,8 @@ previous_secrets = []
         // The managed set: every job secret and the three generated ones.
         assert!(
             script.contains(
-                r#"'. + ["database-url", "signing-secret", "redis-url"] | unique' <<< "$JOB_SECRET_NAMES""#
+                r#"'. + ["database-url", "signing-secret", "redis-url"]
+  + ($copied.secrets // [] | map(select(type == "string"))) | unique' <<< "$JOB_SECRET_NAMES""#
             ),
             "{script}"
         );
@@ -4812,7 +4813,11 @@ esac
         // The active revision refers to the secrets. Azure's order: deploy
         // a revision without the refs, wait until the old one is inactive,
         // then delete the secrets.
-        let patches: Vec<&str> = bodies.lines().collect();
+        // The ingress restore after the removal is not a credential PATCH.
+        let patches: Vec<&str> = bodies
+            .lines()
+            .filter(|line| !line.contains("\"ingress\""))
+            .collect();
         assert_eq!(patches.len(), 2, "{bodies}");
         assert!(patches[0].contains("\"template\""), "{}", patches[0]);
         assert!(!patches[0].contains("\"secrets\""), "{}", patches[0]);
@@ -5445,8 +5450,13 @@ esac
             return;
         };
         assert!(status.success(), "{calls}");
-        assert_eq!(bodies.lines().count(), 1, "{bodies}");
-        assert!(!bodies.contains("\"template\""), "{bodies}");
+        // The ingress restore after the removal is not a credential PATCH.
+        let credential: Vec<&str> = bodies
+            .lines()
+            .filter(|line| !line.contains("\"ingress\""))
+            .collect();
+        assert_eq!(credential.len(), 1, "{bodies}");
+        assert!(!credential[0].contains("\"template\""), "{bodies}");
         let patch_at = calls.find("az rest --method patch").unwrap();
         assert!(
             calls[..patch_at]
@@ -5687,7 +5697,11 @@ esac
             return;
         };
         assert!(status.success(), "{calls}");
-        let patches: Vec<&str> = bodies.lines().collect();
+        // The ingress restore after the removal is not a credential PATCH.
+        let patches: Vec<&str> = bodies
+            .lines()
+            .filter(|line| !line.contains("\"ingress\""))
+            .collect();
         assert_eq!(patches.len(), 2, "{bodies}");
         assert!(
             patches[0].contains("AUTUMN_CREDENTIAL_CLEANUP"),
