@@ -2079,8 +2079,6 @@ impl RequestBuilder {
                             continue;
                         }
                     }
-                    gate.finish(last_retry, status.as_u16());
-
                     let body = if self.discard_response_body {
                         // Dropped unread — see `discard_response_body`.
                         Bytes::new()
@@ -2089,6 +2087,8 @@ impl RequestBuilder {
                             .await
                             .map_err(|e| ClientError::Request(e.without_url()))?
                     };
+                    // Refund only after the body arrived.
+                    gate.finish(last_retry, status.as_u16());
                     let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
@@ -2723,14 +2723,14 @@ fn retry_backoff(attempt: u32) -> Duration {
     Duration::from_millis(100 * (1_u64 << exp))
 }
 
-/// The retry budget key of `url`: its host, and its port when the URL names
-/// one. `None` for a relative URL.
+/// The retry budget key of `url`: its host and its effective port. `None` for
+/// a relative URL.
 fn url_host(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     Some(
         parsed
-            .port()
+            .port_or_known_default()
             .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")),
     )
 }
@@ -3140,8 +3140,6 @@ async fn send_one(
                     last_retry = Some(RetryKind::Transient);
                     continue;
                 }
-                gate.finish(last_retry, status.as_u16());
-
                 let body = if discard_response_body {
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
                     Bytes::new()
@@ -3150,6 +3148,8 @@ async fn send_one(
                         .await
                         .map_err(|e| ClientError::Request(e.without_url()))?
                 };
+                // Refund only after the body arrived.
+                gate.finish(last_retry, status.as_u16());
                 log_request(
                     method.as_str(),
                     &url_used,
@@ -3163,6 +3163,10 @@ async fn send_one(
                     body,
                     url: Some(url_used),
                 });
+            }
+            // The request deadline stopped the attempt.
+            Err(e) if e.is_timeout() && gate.expired() => {
+                return Err(ClientError::DeadlineExceeded);
             }
             Err(e)
                 if (e.is_connect() || e.is_timeout())
@@ -5926,6 +5930,25 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn custom_path_reports_a_deadline_timeout_as_deadline_exceeded() {
+            let (url, hits) = counting(None, &[]).await;
+            let result = with_deadline(
+                Duration::from_millis(300),
+                Client::new().get(&url).no_redirect().send(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ClientError::DeadlineExceeded)),
+                "{result:?}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "no retry after the deadline"
+            );
+        }
+
+        #[tokio::test]
         async fn ssrf_safe_path_fails_at_once_when_the_deadline_has_passed() {
             let result = Deadline::at(tokio::time::Instant::now())
                 .scope(Client::new().get_ssrf_safe("https://example.com/").send())
@@ -5939,7 +5962,8 @@ mod tests {
         #[test]
         fn budget_keys_keep_the_port() {
             assert_eq!(url_host("http://svc:8001/a").as_deref(), Some("svc:8001"));
-            assert_eq!(url_host("https://svc/a").as_deref(), Some("svc"));
+            assert_eq!(url_host("https://svc/a").as_deref(), Some("svc:443"));
+            assert_eq!(url_host("http://svc/a").as_deref(), Some("svc:80"));
             assert_eq!(url_host("/relative"), None);
         }
 
