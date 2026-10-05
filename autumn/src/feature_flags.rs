@@ -19,8 +19,8 @@
 //! svc.enable("dark_mode", None).unwrap();
 //! assert!(svc.is_enabled("dark_mode", Some("user:1")));
 //!
-//! // 3. Disable it — all replicas pick up the change within seconds when
-//! //    backed by the Postgres store with LISTEN/NOTIFY.
+//! // 3. Disable it. With the Postgres store, all replicas see the change on
+//! //    their next refresh (about one poll interval).
 //! svc.disable("dark_mode", None).unwrap();
 //! assert!(!svc.is_enabled("dark_mode", Some("user:1")));
 //! ```
@@ -56,7 +56,8 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -220,6 +221,18 @@ pub trait FlagStore: Send + Sync + 'static {
     ///
     /// Returns a [`FlagStoreError`] on backend failure.
     fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError>;
+
+    /// Load the store before the first read. This can block.
+    ///
+    /// [`AppBuilder::with_flag_store`](crate::app::AppBuilder::with_flag_store)
+    /// calls it once at startup on the blocking pool. The default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlagStoreError`] on backend failure.
+    fn preload(&self) -> Result<(), FlagStoreError> {
+        Ok(())
+    }
 }
 
 // Blanket delegation so `Box<dyn FlagStore>` can be passed to `with_flag_store`.
@@ -252,6 +265,9 @@ impl FlagStore for Box<dyn FlagStore> {
     }
     fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
         (**self).history(key, limit)
+    }
+    fn preload(&self) -> Result<(), FlagStoreError> {
+        (**self).preload()
     }
 }
 
@@ -298,6 +314,9 @@ impl<T: FlagStore + ?Sized> FlagStore for Arc<T> {
     }
     fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
         (**self).history(key, limit)
+    }
+    fn preload(&self) -> Result<(), FlagStoreError> {
+        (**self).preload()
     }
 }
 
@@ -435,69 +454,225 @@ impl FlagStore for InMemoryFlagStore {
 
 // ── Postgres FlagStore ───────────────────────────────────────────────────────
 
-/// Postgres-backed flag storage with LISTEN/NOTIFY cache invalidation.
+/// Postgres-backed flag storage.
 ///
 /// Uses the framework-owned `autumn_feature_flags` and `feature_flag_changes`
-/// tables managed by the `create_feature_flags` migration. On any write the
-/// store sends a `NOTIFY autumn_flags` notification so all replicas running
-/// the background LISTEN task pick up the change within seconds.
+/// tables managed by the `create_feature_flags` migration. Reads come from an
+/// in-memory snapshot of all flags. A refresh loads the snapshot off the
+/// request path. Replicas see a remote write on their next refresh. Each write
+/// also sends `NOTIFY autumn_flags`; Autumn does not `LISTEN` for it.
 #[cfg(feature = "db")]
 pub mod pg {
     use super::{FlagChangeRecord, FlagConfig, FlagStore, FlagStoreError};
     use diesel::prelude::*;
     use std::collections::HashMap;
-    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, PoisonError, RwLock};
     use std::time::{Duration, Instant};
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum CacheLookup {
-        Hit(Option<FlagConfig>),
-        Miss,
+    /// Columns that `FlagRow` reads.
+    const FLAG_COLUMNS: &str =
+        "key, description, enabled, rollout_pct, actor_allowlist, group_allowlist";
+
+    /// All flags, as the last refresh and local writes left them.
+    #[derive(Debug, Default)]
+    struct Snapshot {
+        flags: HashMap<String, FlagConfig>,
+        /// `true` after the first full load.
+        loaded: bool,
+        /// Start of the last refresh attempt, good or bad.
+        checked_at: Option<Instant>,
     }
 
-    #[derive(Debug, Clone)]
-    struct CachedFlag {
-        value: Option<FlagConfig>,
-        expires_at: Instant,
-    }
-
-    /// Postgres-backed [`FlagStore`] with a short-lived read-through cache.
-    ///
-    /// On each write the store sends `NOTIFY autumn_flags` so replicas
-    /// subscribed via a background LISTEN task can invalidate their caches
-    /// within seconds — achieving the sub-5-second kill-switch SLA without
-    /// requiring Redis.
+    /// State that a background refresh shares with the store.
     #[derive(Debug)]
-    pub struct PgFlagStore {
+    struct Shared {
         database_url: String,
         cache_ttl: Duration,
-        cache: RwLock<HashMap<String, CachedFlag>>,
+        snapshot: RwLock<Snapshot>,
+        /// Increments on each local write. A refresh that started before a
+        /// write does not replace the snapshot.
+        generation: AtomicU64,
+        /// `true` while a refresh runs. Only one refresh runs at a time.
+        refreshing: AtomicBool,
+        refresh_errors: AtomicU64,
+        /// `true` after a failed refresh, until a refresh succeeds.
+        failing: AtomicBool,
+        #[cfg(test)]
+        connect_threads: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    /// Holds the single refresh slot. Drop releases it, also when a spawned
+    /// refresh never runs.
+    struct RefreshSlot(Arc<Shared>);
+
+    impl Drop for RefreshSlot {
+        fn drop(&mut self) {
+            self.0.refreshing.store(false, Ordering::Release);
+        }
+    }
+
+    impl Shared {
+        fn connect(&self) -> Result<diesel::PgConnection, FlagStoreError> {
+            #[cfg(test)]
+            self.connect_threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(std::thread::current().id());
+            diesel::PgConnection::establish(&self.database_url)
+                .map_err(|e| FlagStoreError::Backend(e.to_string()))
+        }
+
+        fn is_stale(&self) -> bool {
+            let snapshot = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
+            snapshot.checked_at.is_none_or(|checked| {
+                checked
+                    .checked_add(self.cache_ttl)
+                    .is_some_and(|due| crate::time::ambient_instant() >= due)
+            })
+        }
+
+        fn read(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
+            let snapshot = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
+            match snapshot.flags.get(key) {
+                Some(flag) => Ok(Some(flag.clone())),
+                None if snapshot.loaded => Ok(None),
+                None => Err(FlagStoreError::Backend(
+                    "flag snapshot not loaded yet; call PgFlagStore::refresh at startup".to_owned(),
+                )),
+            }
+        }
+
+        /// Take the refresh slot, or `None` when a refresh already runs.
+        fn begin_refresh(self: &Arc<Self>) -> Option<RefreshSlot> {
+            self.refreshing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .ok()
+                .map(|_| RefreshSlot(Arc::clone(self)))
+        }
+
+        /// Load all flags on this thread. This blocks.
+        fn reload(&self) -> Result<(), FlagStoreError> {
+            let started = self.generation.load(Ordering::Acquire);
+            self.snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .checked_at = Some(crate::time::ambient_instant());
+            match self.connect().and_then(|mut conn| load_all(&mut conn)) {
+                Ok(flags) => {
+                    self.install(flags, started);
+                    if self.failing.swap(false, Ordering::AcqRel) {
+                        tracing::info!("feature flag refresh recovered");
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    self.refresh_errors.fetch_add(1, Ordering::Relaxed);
+                    if self.failing.swap(true, Ordering::AcqRel) {
+                        tracing::debug!(%error, "feature flag refresh failed again");
+                    } else {
+                        tracing::warn!(
+                            %error,
+                            "feature flag refresh failed; serving the last-known snapshot"
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        }
+
+        /// Replace the snapshot with `flags`, unless a local write came after
+        /// generation `started`. Return `true` when it replaced the snapshot.
+        fn install(&self, flags: Vec<FlagConfig>, started: u64) -> bool {
+            let mut snapshot = self
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if self.generation.load(Ordering::Acquire) != started {
+                // The loaded data can be older than the write. Refresh again soon.
+                snapshot.checked_at = None;
+                return false;
+            }
+            snapshot.flags = flags.into_iter().map(|f| (f.key.clone(), f)).collect();
+            snapshot.loaded = true;
+            true
+        }
+
+        /// Put a flag that this process wrote into the snapshot.
+        fn apply_local(&self, flag: FlagConfig) {
+            let mut snapshot = self
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            snapshot.flags.insert(flag.key.clone(), flag);
+        }
+    }
+
+    fn load_all(conn: &mut diesel::PgConnection) -> Result<Vec<FlagConfig>, FlagStoreError> {
+        diesel::sql_query(format!(
+            "SELECT {FLAG_COLUMNS} FROM autumn_feature_flags ORDER BY key"
+        ))
+        .load::<FlagRow>(conn)
+        .map(|rows| rows.into_iter().map(FlagRow::into_config).collect())
+        .map_err(|e| FlagStoreError::Backend(e.to_string()))
+    }
+
+    /// Postgres-backed [`FlagStore`] that serves reads from memory.
+    ///
+    /// `get` reads an in-memory snapshot of all flags. It does not connect on
+    /// the calling thread when a Tokio runtime is present. When the snapshot is
+    /// older than the cache TTL, `get` starts one refresh on the blocking pool
+    /// and returns the current value at once. With no runtime, `get` refreshes
+    /// on the calling thread.
+    ///
+    /// When a refresh fails, the store keeps the last-known snapshot, logs a
+    /// warning and counts the error ([`refresh_errors`](Self::refresh_errors)).
+    /// Before the first load, `get` returns an error.
+    ///
+    /// Load the snapshot at startup: [`AppBuilder::with_flag_store`] calls
+    /// [`FlagStore::preload`], and [`spawn_poll_listener`](Self::spawn_poll_listener)
+    /// loads at once and then on each interval.
+    ///
+    /// [`AppBuilder::with_flag_store`]: crate::app::AppBuilder::with_flag_store
+    #[derive(Debug)]
+    pub struct PgFlagStore {
+        shared: Arc<Shared>,
     }
 
     impl Clone for PgFlagStore {
+        /// Make a new store with the same URL and TTL and an empty snapshot.
         fn clone(&self) -> Self {
-            Self::with_cache_ttl(self.database_url.clone(), self.cache_ttl)
+            Self::with_cache_ttl(self.shared.database_url.clone(), self.shared.cache_ttl)
         }
     }
 
     impl PgFlagStore {
-        /// Default read-through cache lifetime.
+        /// Default snapshot lifetime before `get` starts a refresh.
         pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(1);
 
-        /// Create a store using the default 1 s read-through cache.
+        /// Create a store with the default 1 s snapshot TTL.
         #[must_use]
         pub fn new(database_url: impl Into<String>) -> Self {
             Self::with_cache_ttl(database_url, Self::DEFAULT_CACHE_TTL)
         }
 
-        /// Create a store with an explicit cache TTL. Use `Duration::ZERO` to
-        /// disable caching.
+        /// Create a store with an explicit snapshot TTL. With `Duration::ZERO`,
+        /// each `get` starts a refresh.
         #[must_use]
         pub fn with_cache_ttl(database_url: impl Into<String>, cache_ttl: Duration) -> Self {
             Self {
-                database_url: database_url.into(),
-                cache_ttl,
-                cache: RwLock::new(HashMap::new()),
+                shared: Arc::new(Shared {
+                    database_url: database_url.into(),
+                    cache_ttl,
+                    snapshot: RwLock::new(Snapshot::default()),
+                    generation: AtomicU64::new(0),
+                    refreshing: AtomicBool::new(false),
+                    refresh_errors: AtomicU64::new(0),
+                    failing: AtomicBool::new(false),
+                    #[cfg(test)]
+                    connect_threads: std::sync::Mutex::new(Vec::new()),
+                }),
             }
         }
 
@@ -514,39 +689,21 @@ pub mod pg {
             config.effective_primary_postgres_url().map(Self::new)
         }
 
-        fn connect(&self) -> Result<diesel::PgConnection, FlagStoreError> {
-            diesel::PgConnection::establish(&self.database_url)
-                .map_err(|e| FlagStoreError::Backend(e.to_string()))
+        /// Load all flags into the snapshot now. This blocks: call it at
+        /// startup or from `spawn_blocking`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`FlagStoreError::Backend`] when the load fails. The last-known
+        /// snapshot stays in use.
+        pub fn refresh(&self) -> Result<(), FlagStoreError> {
+            self.shared.reload()
         }
 
-        fn cached(&self, key: &str) -> CacheLookup {
-            let now = crate::time::ambient_instant();
-            let Ok(cache) = self.cache.read() else {
-                return CacheLookup::Miss;
-            };
-            match cache.get(key) {
-                Some(c) if c.expires_at > now => CacheLookup::Hit(c.value.clone()),
-                _ => CacheLookup::Miss,
-            }
-        }
-
-        fn store_cache(&self, key: &str, value: Option<FlagConfig>) {
-            if self.cache_ttl.is_zero() {
-                return;
-            }
-            let Some(expires_at) = crate::time::ambient_instant().checked_add(self.cache_ttl)
-            else {
-                return;
-            };
-            if let Ok(mut cache) = self.cache.write() {
-                cache.insert(key.to_owned(), CachedFlag { value, expires_at });
-            }
-        }
-
-        fn invalidate(&self, key: &str) {
-            if let Ok(mut cache) = self.cache.write() {
-                cache.remove(key);
-            }
+        /// Number of failed refreshes since the store was made.
+        #[must_use]
+        pub fn refresh_errors(&self) -> u64 {
+            self.shared.refresh_errors.load(Ordering::Relaxed)
         }
 
         fn upsert_flag(
@@ -569,86 +726,112 @@ pub mod pg {
             Ok(())
         }
 
-        /// Spawn a background thread that polls `feature_flag_changes` and
-        /// invalidates this store's cache whenever a remote replica writes a flag.
+        /// Run one flag mutation in a transaction, record it in the change log,
+        /// and put the new row into the snapshot.
         ///
-        /// Without this, the cache can only be invalidated when the TTL expires.
-        /// Call this once at startup when using `PgFlagStore` in a multi-replica
-        /// deployment:
+        /// `update` must end with `RETURNING {FLAG_COLUMNS}`.
+        fn write(
+            &self,
+            key: &str,
+            mutation: &str,
+            actor: Option<&str>,
+            update: impl FnOnce(&mut diesel::PgConnection) -> QueryResult<FlagRow>,
+        ) -> Result<(), FlagStoreError> {
+            let mut conn = self.shared.connect()?;
+            let row = conn
+                .transaction::<FlagRow, diesel::result::Error, _>(|conn| {
+                    Self::upsert_flag(conn, key)?;
+                    let row = update(conn)?;
+                    diesel::sql_query(
+                        "INSERT INTO feature_flag_changes (key, mutation, actor) \
+                         VALUES ($1, $2, $3)",
+                    )
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .bind::<diesel::sql_types::Text, _>(mutation)
+                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                        actor.map(str::to_owned),
+                    )
+                    .execute(conn)?;
+                    Self::notify(conn, key)?;
+                    Ok(row)
+                })
+                .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
+            self.shared.apply_local(row.into_config());
+            Ok(())
+        }
+
+        /// Spawn a thread that refreshes the snapshot at once and then on each
+        /// `poll_interval`.
+        ///
+        /// Replicas see remote writes on the next refresh. Call this once at
+        /// startup and share the `Arc` with the app:
         ///
         /// ```rust,ignore
         /// let store = Arc::new(PgFlagStore::new(db_url));
         /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
         /// ```
         ///
-        /// The thread runs indefinitely; the returned handle can be detached.
+        /// The thread stops after all clones of the `Arc` drop.
+        #[allow(
+            clippy::must_use_candidate,
+            reason = "the thread runs detached; callers drop the handle"
+        )]
         pub fn spawn_poll_listener(
-            store: std::sync::Arc<Self>,
-            poll_interval: std::time::Duration,
+            store: Arc<Self>,
+            poll_interval: Duration,
         ) -> std::thread::JoinHandle<()> {
+            let shared = Arc::downgrade(&store.shared);
+            drop(store);
             std::thread::spawn(move || {
-                // Timestamp-based cursor with a small lookback overlap.
-                //
-                // A sequence-ID cursor (WHERE id > last_id) is unsafe because
-                // PostgreSQL sequences allocate IDs before the transaction
-                // commits: transaction T1 (id=10) can commit after T2 (id=11),
-                // so advancing last_id to 11 would permanently miss id=10.
-                //
-                // A timestamp cursor avoids that by including a 5-second
-                // lookback on every poll (OVERLAP_SECS).  Any transaction that
-                // takes longer than 5 seconds to commit will still be missed,
-                // but such long-running writes are far outside the norm.
-                // Invalidating the same key twice is always safe (idempotent).
-                const OVERLAP_SECS: i64 = 5;
-                // Postgres stamps `changed_at` with its own real clock, so the
-                // cursor reads the real clock too.
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "cursor is compared with Postgres changed_at, a real clock"
-                )]
-                let now_secs = || {
-                    i64::try_from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    )
-                    .unwrap_or(i64::MAX)
-                };
-                // Start the cursor in the past so we don't replay the entire
-                // historical log: only changes that arrive after the listener
-                // starts need processing (the in-process cache starts empty and
-                // repopulates lazily on first access).
-                let mut last_polled_secs: i64 = now_secs() - OVERLAP_SECS;
-
-                loop {
-                    std::thread::sleep(poll_interval);
-                    // Advance the horizon before the query so concurrent writes
-                    // during the query are captured in the next poll cycle.
-                    let new_horizon = now_secs() - OVERLAP_SECS;
-                    if let Ok(mut conn) = store.connect() {
-                        let rows: Vec<ChangeKeyRow> = diesel::sql_query(
-                            "SELECT DISTINCT key FROM feature_flag_changes \
-                             WHERE changed_at > to_timestamp($1)",
-                        )
-                        .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
-                        .load::<ChangeKeyRow>(&mut conn)
-                        .unwrap_or_default();
-
-                        for row in rows {
-                            store.invalidate(&row.key);
-                        }
+                while let Some(shared) = shared.upgrade() {
+                    if let Some(slot) = shared.begin_refresh() {
+                        // `reload` logs and counts its errors.
+                        let _ = slot.0.reload();
                     }
-                    last_polled_secs = new_horizon;
+                    drop(shared);
+                    std::thread::sleep(poll_interval);
                 }
             })
         }
-    }
 
-    #[derive(diesel::QueryableByName)]
-    struct ChangeKeyRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        key: String,
+        #[cfg(test)]
+        fn install_for_test(&self, flags: Vec<FlagConfig>) {
+            assert!(self.install(flags, self.write_generation()));
+            self.shared
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .checked_at = Some(crate::time::ambient_instant());
+        }
+
+        #[cfg(test)]
+        fn connect_threads_for_test(&self) -> Vec<std::thread::ThreadId> {
+            self.shared
+                .connect_threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        #[cfg(test)]
+        fn refreshing_for_test(&self) -> bool {
+            self.shared.refreshing.load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        fn write_generation(&self) -> u64 {
+            self.shared.generation.load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        fn apply_local(&self, flag: FlagConfig) {
+            self.shared.apply_local(flag);
+        }
+
+        #[cfg(test)]
+        fn install(&self, flags: Vec<FlagConfig>, generation: u64) -> bool {
+            self.shared.install(flags, generation)
+        }
     }
 
     #[derive(diesel::QueryableByName)]
@@ -698,90 +881,58 @@ pub mod pg {
 
     impl FlagStore for PgFlagStore {
         fn get(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
-            if let CacheLookup::Hit(v) = self.cached(key) {
-                return Ok(v);
+            if self.shared.is_stale()
+                && let Some(slot) = self.shared.begin_refresh()
+            {
+                match tokio::runtime::Handle::try_current() {
+                    // On a runtime: refresh on the blocking pool, never here.
+                    Ok(_) => {
+                        drop(crate::time::spawn_blocking(move || {
+                            // `reload` logs and counts its errors.
+                            let _ = slot.0.reload();
+                        }));
+                    }
+                    // No runtime: this thread can block.
+                    Err(_) => {
+                        let _ = slot.0.reload();
+                    }
+                }
             }
-            let mut conn = self.connect()?;
-            let result = diesel::sql_query(
-                "SELECT key, description, enabled, rollout_pct, \
-                        actor_allowlist, group_allowlist \
-                 FROM autumn_feature_flags WHERE key = $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(key)
-            .get_result::<FlagRow>(&mut conn)
-            .optional()
-            .map(|r| r.map(FlagRow::into_config))
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-
-            self.store_cache(key, result.clone());
-            Ok(result)
+            self.shared.read(key)
         }
 
         fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
-            let mut conn = self.connect()?;
-            diesel::sql_query(
-                "SELECT key, description, enabled, rollout_pct, \
-                        actor_allowlist, group_allowlist \
-                 FROM autumn_feature_flags ORDER BY key",
-            )
-            .load::<FlagRow>(&mut conn)
-            .map(|rows| rows.into_iter().map(FlagRow::into_config).collect())
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))
+            let started = self.shared.generation.load(Ordering::Acquire);
+            let flags = load_all(&mut self.shared.connect()?)?;
+            self.shared.install(flags.clone(), started);
+            Ok(flags)
+        }
+
+        fn preload(&self) -> Result<(), FlagStoreError> {
+            self.refresh()
         }
 
         fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, "enabled", actor, |conn| {
+                diesel::sql_query(format!(
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, rollout_pct = 100, updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
-                .execute(conn)?;
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>("enabled")
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, "disabled", actor, |conn| {
+                diesel::sql_query(format!(
                     "UPDATE autumn_feature_flags SET enabled = false, updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
-                .execute(conn)?;
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>("disabled")
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn set_rollout(
@@ -791,33 +942,16 @@ pub mod pg {
             actor: Option<&str>,
         ) -> Result<(), FlagStoreError> {
             let pct = i16::from(pct.min(100));
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, &format!("rollout={pct}"), actor, |conn| {
+                diesel::sql_query(format!(
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, rollout_pct = $2, updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
                 .bind::<diesel::sql_types::SmallInt, _>(pct)
-                .execute(conn)?;
-                let mutation = format!("rollout={pct}");
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>(&mutation)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn allow_actor(
@@ -826,10 +960,8 @@ pub mod pg {
             actor_id: &str,
             actor: Option<&str>,
         ) -> Result<(), FlagStoreError> {
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, &format!("allowed_actor={actor_id}"), actor, |conn| {
+                diesel::sql_query(format!(
                     // Re-enabling from kill-switch via allowlist resets rollout_pct to 0
                     // so only listed actors gain access, not the previous global cohort.
                     "UPDATE autumn_feature_flags \
@@ -843,27 +975,12 @@ pub mod pg {
                              ) t \
                          )::text, \
                          updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
                 .bind::<diesel::sql_types::Text, _>(actor_id)
-                .execute(conn)?;
-                let mutation = format!("allowed_actor={actor_id}");
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>(&mutation)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn add_group(
@@ -872,10 +989,8 @@ pub mod pg {
             group: &str,
             actor: Option<&str>,
         ) -> Result<(), FlagStoreError> {
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, &format!("added_group={group}"), actor, |conn| {
+                diesel::sql_query(format!(
                     // Re-enabling from kill-switch via group allowlist resets rollout_pct.
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, \
@@ -888,27 +1003,12 @@ pub mod pg {
                              ) t \
                          )::text, \
                          updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
                 .bind::<diesel::sql_types::Text, _>(group)
-                .execute(conn)?;
-                let mutation = format!("added_group={group}");
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>(&mutation)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn history(
@@ -917,7 +1017,7 @@ pub mod pg {
             limit: usize,
         ) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-            let mut conn = self.connect()?;
+            let mut conn = self.shared.connect()?;
             diesel::sql_query(
                 "SELECT key, mutation, actor, \
                         EXTRACT(EPOCH FROM changed_at)::bigint AS timestamp_secs \
@@ -946,77 +1046,154 @@ pub mod pg {
     mod pg_tests {
         use super::*;
 
+        /// Nothing listens on port 1, so a connect fails at once.
+        const DEAD_URL: &str = "postgres://autumn@127.0.0.1:1/autumn?connect_timeout=2";
+
+        fn enabled(key: &str) -> FlagConfig {
+            let mut flag = FlagConfig::new(key);
+            flag.enabled = true;
+            flag.rollout_pct = 100;
+            flag
+        }
+
+        fn current_thread_runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+
+        /// Wait (on the runtime) until no background refresh runs.
+        async fn settle(store: &PgFlagStore) {
+            for _ in 0..1000 {
+                if !store.refreshing_for_test() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("background refresh did not finish");
+        }
+
+        #[test]
+        fn pg_get_serves_snapshot_when_refresh_fails() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            store.install_for_test(vec![enabled("beta")]);
+
+            // No runtime here, so `get` refreshes on this thread. It fails.
+            assert_eq!(store.get("beta").unwrap(), Some(enabled("beta")));
+            assert_eq!(store.get("absent").unwrap(), None);
+            assert_eq!(store.refresh_errors(), 2);
+        }
+
+        #[test]
+        fn pg_get_within_ttl_does_not_connect() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![enabled("beta")]);
+            assert_eq!(store.get("beta").unwrap(), Some(enabled("beta")));
+            assert!(store.connect_threads_for_test().is_empty());
+        }
+
+        #[test]
+        fn pg_get_on_current_thread_runtime_never_connects_on_the_worker() {
+            let store = std::sync::Arc::new(PgFlagStore::with_cache_ttl(DEAD_URL, Duration::ZERO));
+            store.install_for_test(vec![enabled("beta")]);
+            let svc = crate::feature_flags::FeatureFlagService::new(store.clone());
+
+            current_thread_runtime().block_on(async {
+                let worker = std::thread::current().id();
+                assert!(svc.is_enabled("beta", Some("user:1")));
+                settle(&store).await;
+
+                let threads = store.connect_threads_for_test();
+                assert!(!threads.is_empty(), "the stale snapshot is refreshed");
+                assert!(
+                    !threads.contains(&worker),
+                    "flag evaluation must not connect on the Tokio worker"
+                );
+            });
+            assert!(store.refresh_errors() >= 1);
+        }
+
+        #[test]
+        fn pg_cold_get_on_runtime_errors_and_loads_in_background() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            current_thread_runtime().block_on(async {
+                let worker = std::thread::current().id();
+                assert!(store.get("beta").is_err(), "no snapshot yet");
+                settle(&store).await;
+                let threads = store.connect_threads_for_test();
+                assert!(!threads.is_empty());
+                assert!(!threads.contains(&worker));
+            });
+        }
+
+        #[test]
+        fn pg_refresh_older_than_a_local_write_is_discarded() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![]);
+
+            let started = store.write_generation();
+            store.apply_local(enabled("beta"));
+            // A refresh that read the database before the write ends now.
+            assert!(!store.install(vec![FlagConfig::new("beta")], started));
+            assert_eq!(store.get("beta").unwrap(), Some(enabled("beta")));
+
+            assert!(store.install(vec![FlagConfig::new("beta")], store.write_generation()));
+            assert_eq!(store.get("beta").unwrap(), Some(FlagConfig::new("beta")));
+        }
+
+        #[test]
+        fn pg_refresh_reports_backend_error() {
+            let store = PgFlagStore::new(DEAD_URL);
+            assert!(store.refresh().is_err());
+            assert_eq!(store.refresh_errors(), 1);
+            assert!(store.preload().is_err());
+        }
+
+        #[test]
+        fn pg_poll_listener_stops_when_the_store_drops() {
+            let store = std::sync::Arc::new(PgFlagStore::new(DEAD_URL));
+            let handle = PgFlagStore::spawn_poll_listener(
+                std::sync::Arc::clone(&store),
+                Duration::from_millis(10),
+            );
+            drop(store);
+            for _ in 0..1000 {
+                if handle.is_finished() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("poll listener outlived its store");
+        }
+
         #[test]
         fn pg_store_exposes_database_url() {
             let store = PgFlagStore::new("postgres://localhost/myapp");
-            assert_eq!(store.database_url, "postgres://localhost/myapp");
+            assert_eq!(store.shared.database_url, "postgres://localhost/myapp");
         }
 
         #[test]
         fn pg_store_default_cache_ttl_is_one_second() {
             let store = PgFlagStore::new("postgres://localhost/myapp");
-            assert_eq!(store.cache_ttl, PgFlagStore::DEFAULT_CACHE_TTL);
-        }
-
-        #[test]
-        fn pg_store_cache_miss_on_empty_store() {
-            let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::ZERO);
-            assert_eq!(store.cached("my_flag"), CacheLookup::Miss);
-        }
-
-        #[test]
-        fn pg_store_cache_hit_returns_stored_value() {
-            let store =
-                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
-            store.store_cache("my_flag", Some(FlagConfig::new("my_flag")));
-            assert!(matches!(store.cached("my_flag"), CacheLookup::Hit(Some(_))));
-        }
-
-        #[test]
-        fn pg_store_cache_hit_none_for_absent_flag() {
-            let store =
-                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
-            store.store_cache("absent", None);
-            assert_eq!(store.cached("absent"), CacheLookup::Hit(None));
-        }
-
-        #[test]
-        fn pg_store_cache_expired_returns_miss() {
-            let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::ZERO);
-            store.store_cache("expired", Some(FlagConfig::new("expired")));
-            // TTL = 0 means entries expire immediately.
-            assert_eq!(store.cached("expired"), CacheLookup::Miss);
-        }
-
-        #[test]
-        fn pg_store_invalidate_removes_from_cache() {
-            let store =
-                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
-            store.store_cache("flag", Some(FlagConfig::new("flag")));
-            assert!(matches!(store.cached("flag"), CacheLookup::Hit(Some(_))));
-            store.invalidate("flag");
-            assert_eq!(store.cached("flag"), CacheLookup::Miss);
+            assert_eq!(store.shared.cache_ttl, PgFlagStore::DEFAULT_CACHE_TTL);
         }
 
         #[test]
         fn pg_store_with_cache_ttl_sets_custom_ttl() {
             let ttl = Duration::from_secs(30);
             let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", ttl);
-            assert_eq!(store.cache_ttl, ttl);
+            assert_eq!(store.shared.cache_ttl, ttl);
         }
 
         #[test]
-        fn pg_store_clone_has_independent_cache() {
-            // PgFlagStore::clone() creates a fresh instance — it does NOT share the
-            // cache HashMap.  Only Arc<PgFlagStore> shares a single cache.
-            let store =
-                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
-            store.store_cache("cached", Some(FlagConfig::new("cached")));
+        fn pg_store_clone_has_independent_snapshot() {
+            // Only `Arc<PgFlagStore>` shares one snapshot.
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![enabled("cached")]);
             let cloned = store.clone();
-            // Clone starts with an empty cache, so this is a Miss.
-            assert_eq!(cloned.cached("cached"), CacheLookup::Miss);
-            // Original still holds its value — confirming the two caches are independent.
-            assert!(matches!(store.cached("cached"), CacheLookup::Hit(Some(_))));
+            assert!(cloned.get("cached").is_err(), "a clone starts empty");
+            assert_eq!(store.get("cached").unwrap(), Some(enabled("cached")));
         }
     }
 }
@@ -1065,10 +1242,76 @@ pub fn rollout_bucket(flag_key: &str, actor_id: &str) -> u8 {
 /// ```rust,ignore
 /// state.insert_extension(FeatureFlagService::new(Arc::new(InMemoryFlagStore::new())));
 /// ```
+///
+/// # Store failures
+///
+/// When the store returns an error, the service uses the last value that it
+/// read for that flag (the last-known value). With no last-known value, it
+/// uses the declared default ([`with_default`](Self::with_default)), or
+/// `false`. Clones share the last-known values and the error count.
 #[derive(Clone)]
 pub struct FeatureFlagService {
     store: Arc<dyn FlagStore>,
     group_resolver: Option<GroupResolver>,
+    defaults: Arc<HashMap<String, bool>>,
+    health: Arc<StoreHealth>,
+}
+
+/// Last-known flag values and store error state, shared by service clones.
+#[derive(Default)]
+struct StoreHealth {
+    last_known: RwLock<HashMap<String, FlagConfig>>,
+    errors: AtomicU64,
+    /// `true` after a failed read, until a read succeeds.
+    failing: AtomicBool,
+}
+
+impl StoreHealth {
+    /// Keep the value that the store returned for `key`.
+    fn remember(&self, key: &str, flag: Option<&FlagConfig>) {
+        if self.failing.load(Ordering::Relaxed) && self.failing.swap(false, Ordering::AcqRel) {
+            tracing::info!("feature flag store recovered");
+        }
+        let known = self
+            .last_known
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if known.get(key) == flag {
+            return;
+        }
+        drop(known);
+        let mut known = self
+            .last_known
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        match flag {
+            Some(flag) => {
+                known.insert(key.to_owned(), flag.clone());
+            }
+            None => {
+                known.remove(key);
+            }
+        }
+    }
+
+    /// Count a failed read and return the last-known value for `key`.
+    fn recall(&self, key: &str, error: &FlagStoreError) -> Option<FlagConfig> {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        if self.failing.swap(true, Ordering::AcqRel) {
+            tracing::debug!(flag = key, %error, "feature flag store read failed again");
+        } else {
+            tracing::warn!(
+                flag = key,
+                %error,
+                "feature flag store read failed; serving last-known values or declared defaults"
+            );
+        }
+        self.last_known
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
 }
 
 impl std::fmt::Debug for FeatureFlagService {
@@ -1084,7 +1327,34 @@ impl FeatureFlagService {
         Self {
             store,
             group_resolver: None,
+            defaults: Arc::default(),
+            health: Arc::default(),
         }
+    }
+
+    /// Declare the value of `flag_key` when the store does not hold the flag,
+    /// or cannot read it and no last-known value exists.
+    ///
+    /// Without a declared default, that value is `false`.
+    #[must_use]
+    pub fn with_default(mut self, flag_key: impl Into<String>, default: bool) -> Self {
+        Arc::make_mut(&mut self.defaults).insert(flag_key.into(), default);
+        self
+    }
+
+    /// Number of failed store reads since the service was made.
+    #[must_use]
+    pub fn store_errors(&self) -> u64 {
+        self.health.errors.load(Ordering::Relaxed)
+    }
+
+    /// Load the store before the first read. This can block.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`FlagStoreError`] from the backing store.
+    pub fn preload(&self) -> Result<(), FlagStoreError> {
+        self.store.preload()
     }
 
     /// Attach a group resolver so named-group gates are evaluated.
@@ -1096,13 +1366,21 @@ impl FeatureFlagService {
 
     /// Return `true` if `flag_key` is enabled for `actor_id`.
     ///
-    /// Returns `false` for unknown flags (fail-closed).
+    /// An unknown flag gets its declared default, or `false`. A store error
+    /// gets the last-known value (see [Store failures](Self#store-failures)).
     #[must_use]
     pub fn is_enabled(&self, flag_key: &str, actor_id: Option<&str>) -> bool {
-        let Ok(Some(flag)) = self.store.get(flag_key) else {
-            return false;
+        let flag = match self.store.get(flag_key) {
+            Ok(flag) => {
+                self.health.remember(flag_key, flag.as_ref());
+                flag
+            }
+            Err(error) => self.health.recall(flag_key, &error),
         };
-        self.evaluate(&flag, actor_id)
+        flag.map_or_else(
+            || self.defaults.get(flag_key).copied().unwrap_or(false),
+            |flag| self.evaluate(&flag, actor_id),
+        )
     }
 
     fn evaluate(&self, flag: &FlagConfig, actor_id: Option<&str>) -> bool {
@@ -1224,6 +1502,24 @@ impl FeatureFlagService {
     ) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
         self.store.history(flag_key, limit)
     }
+}
+
+/// Start a preload of the store of `service` on the blocking pool.
+///
+/// The hook does not wait for the load, so a slow database does not delay
+/// later startup hooks. A failure logs a warning. Until the store loads, reads
+/// use declared defaults.
+///
+/// Call it on a Tokio runtime.
+pub(crate) fn preload_at_startup(
+    service: FeatureFlagService,
+) -> std::future::Ready<crate::AutumnResult<()>> {
+    drop(crate::time::spawn_blocking(move || {
+        if let Err(error) = service.preload() {
+            tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
+        }
+    }));
+    std::future::ready(Ok(()))
 }
 
 // ── AppState extractor ───────────────────────────────────────────────────────
@@ -1839,6 +2135,184 @@ mod tests {
 
         let flags = Flags::from_request_parts(&mut parts, &state).await.unwrap();
         assert_eq!(flags.actor_id.as_deref(), Some("user:123"));
+    }
+
+    // ── Store failure: last-known value and declared default (#3063) ──────
+
+    /// Wraps an in-memory store. The test can make `get` fail or hide a flag.
+    #[derive(Default)]
+    struct ScriptedStore {
+        inner: InMemoryFlagStore,
+        failing: std::sync::atomic::AtomicBool,
+        hidden: std::sync::atomic::AtomicBool,
+        preloads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedStore {
+        fn fail(&self, on: bool) {
+            self.failing.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn hide(&self, on: bool) {
+            self.hidden.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl FlagStore for ScriptedStore {
+        fn get(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(FlagStoreError::Backend("brownout".to_owned()));
+            }
+            if self.hidden.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.inner.get(key)
+        }
+        fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
+            self.inner.list()
+        }
+        fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+            self.inner.enable(key, actor)
+        }
+        fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+            self.inner.disable(key, actor)
+        }
+        fn set_rollout(
+            &self,
+            key: &str,
+            pct: u8,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.set_rollout(key, pct, actor)
+        }
+        fn allow_actor(
+            &self,
+            key: &str,
+            actor_id: &str,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.allow_actor(key, actor_id, actor)
+        }
+        fn add_group(
+            &self,
+            key: &str,
+            group: &str,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.add_group(key, group, actor)
+        }
+        fn history(
+            &self,
+            key: &str,
+            limit: usize,
+        ) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
+            self.inner.history(key, limit)
+        }
+        fn preload(&self) -> Result<(), FlagStoreError> {
+            self.preloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failing_store_serves_last_known_value() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        store.enable("beta", None).unwrap();
+        assert!(svc.is_enabled("beta", Some("user:1")));
+
+        store.fail(true);
+        assert!(
+            svc.is_enabled("beta", Some("user:1")),
+            "a store error must not turn a known flag off"
+        );
+        assert_eq!(svc.store_errors(), 1);
+    }
+
+    #[test]
+    fn failing_store_keeps_a_kill_switch_off() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone()).with_default("payments", true);
+        store.enable("payments", None).unwrap();
+        store.disable("payments", None).unwrap();
+        assert!(!svc.is_enabled("payments", None));
+
+        store.fail(true);
+        assert!(
+            !svc.is_enabled("payments", None),
+            "the last-known value wins over the declared default"
+        );
+    }
+
+    #[test]
+    fn failing_store_without_last_known_value_serves_declared_default() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone()).with_default("fail_open", true);
+        store.fail(true);
+        assert!(svc.is_enabled("fail_open", None));
+        assert!(!svc.is_enabled("no_default", None));
+        assert_eq!(svc.store_errors(), 2);
+    }
+
+    #[test]
+    fn unknown_flag_serves_declared_default() {
+        let svc = make_svc().with_default("absent", true);
+        assert!(svc.is_enabled("absent", None));
+        assert!(!svc.is_enabled("other", None));
+        assert_eq!(svc.store_errors(), 0);
+    }
+
+    #[test]
+    fn flag_removed_from_store_forgets_last_known_value() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        store.enable("gone", None).unwrap();
+        assert!(svc.is_enabled("gone", None));
+
+        store.hide(true);
+        assert!(!svc.is_enabled("gone", None));
+        store.hide(false);
+        store.fail(true);
+        assert!(
+            !svc.is_enabled("gone", None),
+            "a flag the store reported absent has no last-known value"
+        );
+    }
+
+    #[test]
+    fn service_clones_share_last_known_values() {
+        // The `Flags` extractor clones the service for each request.
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        store.enable("shared", None).unwrap();
+        assert!(svc.is_enabled("shared", None));
+
+        let per_request = svc.clone();
+        store.fail(true);
+        assert!(per_request.is_enabled("shared", None));
+        assert_eq!(svc.store_errors(), 1, "clones share the error count");
+    }
+
+    #[test]
+    fn service_preload_delegates_to_the_store() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        svc.preload().unwrap();
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The default `preload` does nothing and succeeds.
+        make_svc().preload().unwrap();
+    }
+
+    #[test]
+    fn feature_flag_guide_describes_polling_not_listen() {
+        let guide = include_str!("../../docs/guide/feature-flags.md");
+        assert!(
+            !guide.contains("All replicas listening on that channel"),
+            "Autumn does not LISTEN; replicas poll"
+        );
+        assert!(guide.contains("spawn_poll_listener"));
+        assert!(guide.contains("last-known"));
     }
 
     // ── Backend screening on the Postgres-only store ──────────────────────
