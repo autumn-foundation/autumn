@@ -1720,6 +1720,13 @@ jobs:
           # migrated table. Only its Chromium smoke runs elsewhere (the
           # publish-gate fleet e2e), so without this line the tier never runs.
           cargo test -p react-graphql --test graphql_api -- --ignored --test-threads=1
+          # examples/escape-hatches: the Postgres tier of its hatch suite
+          # (H1..H13) and the boot test, which spawns the real binary against
+          # a testcontainer to prove the wiring `TestApp` cannot reach (pool
+          # provider, error pages, exception filter). Testcontainer-managed;
+          # serial because the hatch tests share one migrated set of tables.
+          cargo test -p escape-hatches --test hatches -- --ignored --test-threads=1
+          cargo test -p escape-hatches --test boot -- --ignored
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored

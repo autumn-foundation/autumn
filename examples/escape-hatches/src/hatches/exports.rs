@@ -12,22 +12,30 @@
 //!
 //! `ServeDir` refuses paths that climb out of the folder (`..`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use autumn_web::AppState;
+use autumn_web::config::{Env as _, OsEnv};
 use autumn_web::route_listing::{RouteClassification, RouteInfo};
 use tower_http::services::ServeDir;
 
 /// Where the files are served.
 pub const PREFIX: &str = "/exports";
 
-/// The env var that names the exports folder. The default is `exports`.
+/// The env var that names the exports folder.
 pub const DIR_ENV: &str = "STOCKROOM_EXPORTS_DIR";
 
-/// The exports folder from [`DIR_ENV`], or `exports`.
+/// The exports folder: [`DIR_ENV`] if set. Otherwise `exports` in the
+/// project folder, which Autumn finds the same way it finds `static/`.
 #[must_use]
-pub fn dir_from_env() -> std::path::PathBuf {
-    std::env::var_os(DIR_ENV).map_or_else(|| "exports".into(), Into::into)
+pub fn dir_from_env() -> PathBuf {
+    if let Some(dir) = std::env::var_os(DIR_ENV) {
+        return dir.into();
+    }
+    OsEnv.var("AUTUMN_MANIFEST_DIR").map_or_else(
+        |_| PathBuf::from("exports"),
+        |dir| Path::new(&dir).join("exports"),
+    )
 }
 
 /// The router for the exports folder. Mount it with `nest(PREFIX, ..)`.

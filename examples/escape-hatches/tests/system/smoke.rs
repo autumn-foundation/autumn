@@ -35,10 +35,9 @@ async fn product_list_and_not_found_page_render() {
     page.visit("/products/ZZ-9")
         .await
         .expect("visit a missing SKU");
+    // The page's own status is 404, and Chromium logs that as a console
+    // error. So this visit checks the text only.
     page.expect_text("ZZ-9")
         .await
         .expect("the 404 page names the SKU");
-    page.expect_no_console_errors()
-        .await
-        .expect("no console errors");
 }
