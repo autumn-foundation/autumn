@@ -5,8 +5,8 @@
   group and the App Runner cutover now check `/ready`. `/health` is only an
   alias of `/ready`. The image `HEALTHCHECK` checks `/startup`: it waits for
   startup to complete, and Docker Swarm does not replace containers during a
-  database outage. Cloud Run gets a `/startup`
-  startup probe and a `/live` liveness probe. Azure Container Apps gets a
+  database outage. Cloud Run gets a `/ready` startup probe (its traffic gate)
+  and a `/live` liveness probe. Azure Container Apps gets a
   `/startup` startup probe, a `/ready` readiness probe and a `/live` liveness
   probe. Files that you generated before this change
   keep the old paths. Change them by hand.

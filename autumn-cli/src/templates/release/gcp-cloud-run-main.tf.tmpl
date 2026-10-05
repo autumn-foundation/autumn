@@ -540,16 +540,17 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       # Cloud Run sends no traffic to an instance until its startup probe
-      # passes. This template uses no readiness probe: Cloud Run stops
-      # traffic to an instance by itself before SIGTERM. A slow first boot
-      # gets 2 minutes (24 x 5s). The bootstrap "hello" image answers 200 on
-      # every path, so it passes too.
+      # passes, so the startup probe is the traffic gate and uses /ready.
+      # /ready fails until startup is complete and while a readiness
+      # dependency is down. Cloud Run stops traffic to an instance by itself
+      # before SIGTERM. A slow first boot gets 2 minutes (24 x 5s). The
+      # bootstrap "hello" image answers 200 on every path, so it passes too.
       startup_probe {
         period_seconds    = 5
         timeout_seconds   = 2
         failure_threshold = 24
         http_get {
-          path = "/startup"
+          path = "/ready"
         }
       }
 

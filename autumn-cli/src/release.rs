@@ -7036,9 +7036,9 @@ previous_secrets = []
             ],
             Target::GcpCloudRun => &[
                 DOCKER_HEALTHCHECK,
-                // Cloud Run has no readiness probe. Its startup probe uses
-                // /startup, as docs/guide/cloud-native.md recommends.
-                ("main.tf", "startup_probe {", r#"path = "/startup""#),
+                // The startup probe is Cloud Run's only traffic gate, so it
+                // uses /ready.
+                ("main.tf", "startup_probe {", r#"path = "/ready""#),
                 ("main.tf", "liveness_probe {", r#"path = "/live""#),
             ],
             Target::AzureContainerApps => &[
