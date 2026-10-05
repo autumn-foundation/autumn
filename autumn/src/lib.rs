@@ -723,6 +723,8 @@ pub mod job_tracking;
 pub mod links;
 pub mod nested_form;
 pub mod payload_version;
+#[cfg(feature = "repl")]
+pub mod repl;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;

@@ -2028,7 +2028,7 @@ mod tests {
         let app = test_router_with_error_pages(true);
 
         // Build a body larger than the 64 KB cap but send no Content-Length.
-        let large_body = "x=".to_owned() + &"a".repeat(70 * 1024);
+        let large_body = format!("x={}", "a".repeat(70 * 1024));
 
         let response = tower::ServiceExt::oneshot(
             app,
