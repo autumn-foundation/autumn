@@ -2259,13 +2259,29 @@ impl Analyzer {
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
             Expr::Cast(c) => self.referents_of(&c.expr),
+            // `pick(&mut left)`, `(|x| x)(&mut left)`, `Some(&mut left)`: the
+            // result may borrow any place a `&mut` argument points to.
+            Expr::Call(c) => {
+                let mut all: Vec<String> =
+                    c.args.iter().flat_map(|a| self.referents_of(a)).collect();
+                all.sort();
+                all.dedup();
+                all
+            }
             // `left.get_mut(0).unwrap()`, `left.as_mut()`: a part of the
             // receiver.
             Expr::MethodCall(mc) => {
                 let method = mc.method.to_string();
                 if matches!(method.as_str(), "unwrap" | "expect") {
                     self.referents_of(&mc.receiver)
-                } else if method == "as_mut" || method.ends_with("_mut") {
+                } else if method == "as_mut"
+                    || method.ends_with("_mut")
+                    || BORROW_MUT_METHODS.contains(&method.as_str())
+                {
+                    // `groups.entry(k).or_default()`: through the chain.
+                    if matches!(peel_parens(&mc.receiver), Expr::MethodCall(_)) {
+                        return self.referents_of(&mc.receiver);
+                    }
                     place_root(&mc.receiver)
                         .map(|root| {
                             let through = self.env.binding(&root).referents;
@@ -4157,6 +4173,10 @@ impl Analyzer {
         match e {
             Expr::Paren(p) => self.produced(&p.expr),
             Expr::Group(g) => self.produced(&g.expr),
+            // `result?` on a `Result` with known sides: the `Ok` side.
+            Expr::Try(t) if self.sides_of(&t.expr).is_some() => {
+                self.sides_of(&t.expr).map(|(ok, _)| ok)
+            }
             Expr::Call(call) => self.invoked(call, false),
             // `result.unwrap_err()` on a `Result` with known sides: that side.
             // `result.unwrap_or(0)`: the `Ok` side or what the fallback gives.
@@ -5568,6 +5588,19 @@ fn pattern_variant(pat: &Pat) -> Option<(String, String)> {
     }
     (!unit && !owner.is_empty()).then(|| (owner.join("::"), name))
 }
+
+/// Methods that give a `&mut` into their receiver without the `_mut`
+/// suffix: `map.entry(k).or_default()`, `slot.get_or_insert_with(f)`.
+const BORROW_MUT_METHODS: &[&str] = &[
+    "entry",
+    "or_default",
+    "or_insert",
+    "or_insert_with",
+    "or_insert_with_key",
+    "get_or_insert",
+    "get_or_insert_with",
+    "insert_entry",
+];
 
 /// Module names on a path to a std item: `std::collections::HashMap`,
 /// `std::mem::drop`, `alloc::vec!`.
@@ -11524,6 +11557,48 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = Some(repo.find_all()); let _ = slot.take().unwrap().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn question_mark_sides_and_call_borrows() {
+        check_handlers(&[
+            (
+                "? on a Result takes its Ok side",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = result?; render(n); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: ? on a Result of a handle gives the handle",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let repo = result?; let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an alias an invoked closure gives back aliases its place",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); \
+                 { let target: &mut Vec<PgPostRepository> = (|x| x)(&mut left); target.push(repo); } \
+                 let _ = left[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a function given a mut borrow may give it back",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); \
+                 { let target: &mut Vec<PgPostRepository> = pick(&mut left); target.push(repo); } \
+                 let _ = left[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an entry value aliases its map",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut groups = HashMap::new(); \
+                 { let list: &mut Vec<PgPostRepository> = groups.entry(1).or_default(); list.push(repo); } \
+                 render(groups); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
