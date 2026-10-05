@@ -2372,6 +2372,15 @@ app-code change) via `role = "web"|"worker"|"combined"` in config or the
   generated **docker-compose** output and sets the web-tier role on the `app`
   service (#1613). See `docs/guide/cloud-native.md`.
 
+### Redis dead-letter retention (#3055)
+
+The Redis backend keeps the newest `jobs.redis.dead_letter_limit` dead letters
+(default 10 000; `0` = unbounded). A trim removes the oldest entries and their
+replay metadata, logs a `warn`, and increments
+`autumn_jobs_dead_letter_trimmed_total` on `/actuator/prometheus`. Alert on
+that counter. Postgres and SQLite have no count limit: failed rows stay until
+`retention.job_history` deletes them by age. See `docs/guide/jobs.md`.
+
 ### Per-queue worker pools, pinning & `ProcessRole` on `AppState` (0.6.0)
 
 Carve the per-process worker pool up per queue and dedicate a worker tier to a
