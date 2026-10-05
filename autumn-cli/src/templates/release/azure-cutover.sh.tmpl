@@ -168,6 +168,10 @@ JOB_IDENTITY=$(jq -r --arg acr "$ACR_LOGIN_SERVER" \
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
 JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$JOB")
+# The managed secrets: every secret of the migration job (the cutover copies
+# them all to the app) and the three that main.tf makes. Credential removal
+# and rollback remove all of them.
+MANAGED_DEF="def managed: $(jq -c '. + ["database-url", "signing-secret", "redis-url"] | unique' <<< "$JOB_SECRET_NAMES");"
 JOB_SECRET_REFS=$(jq -c '[.properties.configuration.secrets // [] | .[]
   | {name, keyVaultUrl, identity: (.identity // "" | ascii_downcase)}]' <<< "$JOB")
 # Redis is off now, but the app still has the redis-url secret. The old
@@ -204,7 +208,7 @@ APPLIED='
             .server == $acr and (.identity // "" | ascii_downcase) == $lid)
     and ($want | all(. as $s | $have | index([$s]) != null))'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
-REMOVED='
+REMOVED="$MANAGED_DEF"'
   ($id | ascii_downcase) as $lid
   | [.identity.userAssignedIdentities // {} | to_entries[]
      | select(.value != null) | .key | ascii_downcase] as $ids
@@ -213,7 +217,7 @@ REMOVED='
     and all(.properties.configuration.registries // [] | .[];
             (.identity // "" | ascii_downcase) != $lid)
     and all(.properties.configuration.secrets // [] | .[];
-            .name | IN("database-url", "signing-secret", "redis-url") | not)'
+            .name | IN(managed[]) | not)'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
 INGRESS_OPEN='.properties.provisioningState == "Succeeded" and .properties.configuration.ingress.external == true'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
@@ -225,8 +229,8 @@ REDIS_GONE='
 # True when the template (any container, scale rule or volume) refers to a
 # managed secret.
 # shellcheck disable=SC2016 # a jq program, not a shell expression
-REFS_MANAGED='[.properties.template | .. | objects | .secretRef? // empty]
-  | any(IN("database-url", "signing-secret", "redis-url"))'
+REFS_MANAGED="$MANAGED_DEF"'[.properties.template | .. | objects | .secretRef? // empty]
+  | any(IN(managed[]))'
 app_shows() {
   local now
   now=$(az containerapp show \
@@ -291,9 +295,10 @@ sole_active() {
 }
 
 # Removes the job's credentials from the app: its identity, the registry
-# entry that uses that identity, the three secrets and the four env vars
-# that this script sets. Other identities, registries, secrets, env vars and
-# containers stay.
+# entry that uses that identity, the managed secrets (every job secret and
+# the three that main.tf makes), the env vars that refer to them, and the
+# four env vars that this script sets. Other identities, registries,
+# secrets, env vars and containers stay.
 #
 # Azure deletes a secret only when no active revision refers to it. So if
 # the current template refers to one, stage 1 deploys the snapshot
@@ -324,9 +329,9 @@ remove_credentials() {
   source=$(jq -c '.containers' <<< "$active")
   # The stage 1 containers: no env var that refers to a managed secret (in
   # any container), and not the four env vars that this script sets.
-  containers=$(jq -c "$APP_C"'
+  containers=$(jq -c "$APP_C$MANAGED_DEF"'
     map(if .env then .env = [.env[] | select((.secretRef // "")
-            | IN("database-url", "signing-secret", "redis-url") | not)] else . end)
+            | IN(managed[]) | not)] else . end)
     | app_i as $i
     | .[$i].env = [(.[$i].env // [])[] | select(.name | IN(
         "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
@@ -343,8 +348,8 @@ remove_credentials() {
   # the active revision does, the template is clean already (an earlier
   # run, or the operator): the script waits for the clean revision instead.
   if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null \
-    || jq -e '[.. | objects | .secretRef? // empty]
-              | any(IN("database-url", "signing-secret", "redis-url"))' <<< "$active" > /dev/null; then
+    || jq -e "$MANAGED_DEF"'[.. | objects | .secretRef? // empty]
+              | any(IN(managed[]))' <<< "$active" > /dev/null; then
     status=$(az containerapp show \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -410,7 +415,7 @@ remove_credentials() {
     sole_active "$revision" || return 1
   fi
   body=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
-    --arg id "$JOB_IDENTITY" "$SECRET_REF"'
+    --arg id "$JOB_IDENTITY" "$SECRET_REF$MANAGED_DEF"'
     ($id | ascii_downcase) as $lid
     | ($app.identity.type // "None") as $type
     | ($app.identity.userAssignedIdentities // {}) as $ids
@@ -429,7 +434,7 @@ remove_credentials() {
            registries: [($app.properties.configuration.registries // [])[]
                         | select((.identity // "" | ascii_downcase) != $lid)],
            secrets: ($app_secrets[0]
-                     | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not)
+                     | map(select(.name | IN(managed[]) | not)
                            | secret_ref))}}}')
   patch_app "$body" || return 1
   for _ in $(seq 1 30); do

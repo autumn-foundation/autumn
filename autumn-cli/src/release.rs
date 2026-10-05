@@ -3202,7 +3202,7 @@ previous_secrets = []
             "type: \"None\"",
             "if . == {} then {($id): null} else . end) as $drop",
             "select((.identity // \"\" | ascii_downcase) != $lid)",
-            r#"IN("database-url", "signing-secret", "redis-url") | not"#,
+            "IN(managed[]) | not",
             "\"AUTUMN_DATABASE__PRIMARY_URL\", \"AUTUMN_SECURITY__SIGNING_SECRET\"",
             "patch_app",
         ] {
@@ -3211,6 +3211,13 @@ previous_secrets = []
                 "remove_credentials must set `{field}`: {remove}"
             );
         }
+        // The managed set: every job secret and the three generated ones.
+        assert!(
+            script.contains(
+                r#"'. + ["database-url", "signing-secret", "redis-url"] | unique' <<< "$JOB_SECRET_NAMES""#
+            ),
+            "{script}"
+        );
         assert!(
             rollback.contains("[ -n \"$RELEASED\" ] && return"),
             "rollback must skip a later deploy, whose old revision is a real release: {rollback}"
