@@ -6430,6 +6430,8 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        // Startup hooks do not run here; load flags before rendering.
+        crate::feature_flags::preload_registered(&state).await;
         // Static generation has no job runtime, so register only sync listeners.
         // Durable listeners are dropped entirely (not just their jobs) so a
         // static route publishing such an event is a clean no-op for the durable
@@ -7797,6 +7799,8 @@ impl AppBuilder {
         #[cfg(feature = "storage")]
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
         run_state_initializers(state_initializers, &state);
+        // Startup hooks do not run here; load flags before the task.
+        crate::feature_flags::preload_registered(&state).await;
         finalize_event_bus(listeners, &mut jobs, &state);
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
@@ -16066,6 +16070,38 @@ mod tests {
             task_initializer < task_job,
             "task runner startup must install state-initialized resources before job workers start"
         );
+    }
+
+    #[test]
+    fn static_builds_and_tasks_preload_flags_before_they_run() {
+        // These modes skip startup hooks, so they preload the flag store
+        // themselves, after state initializers install it (#3063).
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let preload = "crate::feature_flags::preload_registered(&state).await;";
+        for (start, end, work) in [
+            (
+                "async fn run_build_mode(self)",
+                "async fn run_dump_routes_mode(self)",
+                "let router = crate::router::try_build_router_inner(",
+            ),
+            (
+                "async fn run_one_off_task_mode(self, requested_name: String)",
+                "async fn run_replay_mode(self, capsule_path: String)",
+                "initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs, true)",
+            ),
+        ] {
+            let from = source.find(start).expect(start);
+            let to = from + source[from..].find(end).expect(end);
+            let body = &source[from..to];
+            let init = body
+                .find("run_state_initializers(state_initializers, &state);")
+                .expect("state initializers");
+            let loaded = body
+                .find(preload)
+                .unwrap_or_else(|| panic!("{start} preloads flags"));
+            let ran = body.find(work).expect(work);
+            assert!(init < loaded && loaded < ran, "{start}: preload order");
+        }
     }
 
     #[test]

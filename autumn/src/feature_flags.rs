@@ -1739,6 +1739,25 @@ pub(crate) async fn preload_at_startup(service: FeatureFlagService) -> crate::Au
     Ok(())
 }
 
+/// Preload the store of the registered service and wait until the load ends.
+///
+/// For modes that skip startup hooks, such as a static build or a one-off
+/// task: their output must not use defaults when the store can load. A
+/// failure logs a warning. The store's own timeouts bound the wait.
+pub(crate) async fn preload_registered(state: &crate::AppState) {
+    let Some(service) = state.extension::<FeatureFlagService>() else {
+        return;
+    };
+    let service = (*service).clone();
+    match crate::time::spawn_blocking(move || service.preload()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
+        }
+        Err(error) => tracing::warn!(%error, "feature flag preload task failed"),
+    }
+}
+
 // ── AppState extractor ───────────────────────────────────────────────────────
 
 /// Request extractor that resolves the current user's flag service handle.
@@ -2550,6 +2569,16 @@ mod tests {
         let _client = crate::test::TestApp::new()
             .with_flag_store(Arc::clone(&store))
             .build();
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn preload_registered_loads_the_registered_store() {
+        let store = Arc::new(ScriptedStore::default());
+        let state = crate::AppState::for_test();
+        preload_registered(&state).await; // No service: nothing to do.
+        state.insert_extension(FeatureFlagService::new(store.clone()));
+        preload_registered(&state).await;
         assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
