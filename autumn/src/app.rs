@@ -3249,7 +3249,7 @@ impl AppBuilder {
         let name = name.into();
         // "db" is a reserved built-in component name. Allowing a custom indicator
         // under this name would produce an inconsistent response: the custom result
-        // would still gate the aggregate status while the built-in pool check owns
+        // would still gate the aggregate status while the built-in primary ping owns
         // the components.db / checks.database display. The "db:shard:" prefix is
         // reserved for the framework's per-shard indicators for the same reason.
         #[cfg(feature = "db")]
@@ -4234,6 +4234,15 @@ impl AppBuilder {
                 tracing::warn!("{e}");
             }
         }
+
+        // One `redis:<subsystem>` PING indicator per Redis-backed subsystem
+        // (#3059). Register these after the user indicators: if two names are
+        // the same, the user indicator stays.
+        #[cfg(feature = "redis")]
+        crate::redis_health::register_redis_health_indicators(
+            &config,
+            &state.health_indicator_registry,
+        );
 
         // Continuous SQLite replication (#1628). Resolved here, next to the other
         // indicator registrations, so lag and verification are baked into
@@ -6368,6 +6377,7 @@ impl AppBuilder {
         install_story_registry(&state, story_gallery);
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
+        state.apply_health_config(&config.health);
 
         // Apply deferred policy and scope registrations onto the live app state,
         // as `run()` does. Static routes can carry `#[authorize]` checks or sit
@@ -8137,6 +8147,7 @@ impl AppBuilder {
         // does not add one), and a replayed request should meet the app as a
         // warm process, not one still starting.
         state.probes = crate::probe::ProbeState::default();
+        state.apply_health_config(&config.health);
         state.insert_extension(RegisteredApiVersions(api_versions));
         #[cfg(feature = "db")]
         if let Some(interceptor) = db_interceptor {
@@ -13942,6 +13953,7 @@ fn build_state(
         entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
         app_id: AppState::next_app_id(),
     };
+    state.apply_health_config(&config.health);
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
         state

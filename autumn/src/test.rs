@@ -2307,6 +2307,16 @@ impl TestApp {
                 tracing::warn!("{e}");
             }
         }
+        // Mirror production `build_state`: the `[health]` cache TTL, ping
+        // time limit and database readiness gate.
+        state.apply_health_config(&self.config.health);
+        // Mirror production `AppBuilder` wiring: one `redis:<subsystem>`
+        // PING indicator per Redis-backed subsystem (#3059).
+        #[cfg(feature = "redis")]
+        crate::redis_health::register_redis_health_indicators(
+            &self.config,
+            &state.health_indicator_registry,
+        );
 
         // Mirror production `AppBuilder` wiring: surface each configured shard's
         // replica readiness as a `db:shard:<name>` indicator so `/ready`

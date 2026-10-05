@@ -1321,56 +1321,58 @@ pub fn build_shard_set(
 /// details.
 pub(crate) struct ShardHealthIndicator {
     shard: Shard,
+    /// Pings on dedicated connections, so a busy shard pool is not a failed
+    /// shard (#3059). No own cache: the indicator registry caches.
+    primary_ping: crate::db_ping::DbPingCheck,
+    replica_ping: crate::db_ping::DbPingCheck,
 }
 
 impl ShardHealthIndicator {
-    pub(crate) const fn new(shard: Shard) -> Self {
-        Self { shard }
+    pub(crate) fn new(shard: Shard) -> Self {
+        let primary_ping = crate::db_ping::DbPingCheck::new("primary");
+        let replica_ping = crate::db_ping::DbPingCheck::new("replica");
+        for ping in [&primary_ping, &replica_ping] {
+            ping.configure(
+                std::time::Duration::ZERO,
+                crate::health_cache::DEFAULT_PING_TIMEOUT,
+            );
+        }
+        Self {
+            shard,
+            primary_ping,
+            replica_ping,
+        }
     }
 
     async fn refresh_replica_readiness(&self) {
         let Some(replica_pool) = self.shard.replica_pool() else {
             return;
         };
-        // Connectivity goes through the deadpool pool (cheap, reused
-        // connections) and runs on every probe; the parity comparison
-        // opens fresh connections to both roles and is throttled.
-        match replica_pool.get().await {
-            Ok(mut conn) => {
-                let alive = crate::db::probe_connection_alive(&mut conn).await;
-                drop(conn);
-                match alive {
-                    Ok(()) => {
-                        self.shard.runtime().mark_replica_connection_ready();
-                        if self.shard.runtime().parity_check_due()
-                            && let Some((primary_url, replica_url)) =
-                                self.shard.runtime().migration_check()
-                        {
-                            let readiness =
-                                crate::migrate::check_replica_migration_readiness_blocking(
-                                    primary_url,
-                                    replica_url,
-                                )
-                                .await;
-                            if readiness.is_ready() {
-                                self.shard.runtime().mark_replica_migrations_ready();
-                            } else if let Some(detail) = readiness.detail() {
-                                self.shard.runtime().mark_replica_migrations_unready(detail);
-                            }
-                        }
-                    }
-                    Err(error) => self
-                        .shard
-                        .runtime()
-                        .mark_replica_connection_unready(format!(
-                            "replica connection failed: {error}"
-                        )),
-                }
+        let status = self.replica_ping.check(replica_pool).await;
+        if !status.up {
+            self.shard.runtime().mark_replica_connection_unready(
+                status
+                    .error
+                    .unwrap_or_else(|| "replica ping failed".to_owned()),
+            );
+            return;
+        }
+        self.shard.runtime().mark_replica_connection_ready();
+        // The parity comparison opens new connections to both roles, so it
+        // is throttled.
+        if self.shard.runtime().parity_check_due()
+            && let Some((primary_url, replica_url)) = self.shard.runtime().migration_check()
+        {
+            let readiness = crate::migrate::check_replica_migration_readiness_blocking(
+                primary_url,
+                replica_url,
+            )
+            .await;
+            if readiness.is_ready() {
+                self.shard.runtime().mark_replica_migrations_ready();
+            } else if let Some(detail) = readiness.detail() {
+                self.shard.runtime().mark_replica_migrations_unready(detail);
             }
-            Err(error) => self
-                .shard
-                .runtime()
-                .mark_replica_connection_unready(format!("replica connection failed: {error}")),
         }
     }
 }
@@ -1378,7 +1380,12 @@ impl ShardHealthIndicator {
 impl crate::actuator::HealthIndicator for ShardHealthIndicator {
     fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
         Box::pin(async move {
-            self.refresh_replica_readiness().await;
+            // Ping both roles at the same time: the wall time is the slower
+            // ping, not the sum.
+            let ((), primary) = tokio::join!(
+                self.refresh_replica_readiness(),
+                self.primary_ping.check(self.shard.primary_pool())
+            );
 
             let mut details = HashMap::new();
             let status = self.shard.primary_pool().status();
@@ -1414,25 +1421,10 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
             // (like the replica connectivity check above) and gate `/ready` on
             // it so load balancers stop routing to an instance that cannot
             // reach a shard primary.
-            let primary_ok = match self.shard.primary_pool().get().await {
-                Ok(mut conn) => match crate::db::probe_connection_alive(&mut conn).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        details.insert(
-                            "primary_detail".to_owned(),
-                            serde_json::json!(format!("primary connection failed: {error}")),
-                        );
-                        false
-                    }
-                },
-                Err(error) => {
-                    details.insert(
-                        "primary_detail".to_owned(),
-                        serde_json::json!(format!("primary connection failed: {error}")),
-                    );
-                    false
-                }
-            };
+            let primary_ok = primary.up;
+            if let Some(error) = primary.error {
+                details.insert("primary_detail".to_owned(), serde_json::json!(error));
+            }
             details.insert("primary_ready".to_owned(), serde_json::json!(primary_ok));
 
             // `read_pool()` is `None` exactly when the replica is unready under
@@ -1445,6 +1437,14 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
             };
             output.with_details(details)
         })
+    }
+
+    /// The ping time limit plus a margin. A late ping then reports its own
+    /// `DOWN` result, not the registry's `UNKNOWN` timeout result.
+    fn timeout_ms(&self) -> u64 {
+        let limit =
+            crate::health_cache::DEFAULT_PING_TIMEOUT + std::time::Duration::from_millis(500);
+        u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
     }
 }
 

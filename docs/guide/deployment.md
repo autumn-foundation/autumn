@@ -2734,11 +2734,12 @@ every secret in the project.
 scale.** `db-f1-micro`'s Postgres `max_connections` ceiling is small (around
 25 — run `SHOW max_connections;` against your instance to confirm), while
 each Cloud Run instance opens up to `pool_size` connections
-(`autumn.production.toml.example` defaults to 10). At the default
+(`autumn.production.toml.example` defaults to 10), plus one for the readiness
+ping. At the default
 `max_instances` of 10, scaling out under real load can exhaust that budget
 well before hitting the instance ceiling. Before relying on autoscaling in
 production, size `db_tier` so its `max_connections` comfortably exceeds
-`max_instances * pool_size` (e.g. `db-custom-2-7680` supports roughly 200),
+`max_instances * (pool_size + 1)` (e.g. `db-custom-2-7680` supports roughly 200),
 or lower `pool_size`/`max_instances` to fit the tier you're on.
 
 **Rotating `database_admin_password` replaces the sole live credential in

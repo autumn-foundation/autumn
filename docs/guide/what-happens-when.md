@@ -373,9 +373,9 @@ connection:
 }
 ```
 
-The health endpoint at `/health` will still respond (it doesn't require a DB
-connection to serve basic status). If `health.detailed` is enabled, the
-health check will report the database as unhealthy.
+`/ready` and `/health` return `503`: their ping to the primary fails. `/live`
+still returns `200`. If `health.detailed` is enabled, `/ready` and
+`/actuator/health` show the ping error.
 
 ---
 

@@ -94,6 +94,10 @@
 //! | `AUTUMN_HEALTH__STARTUP_PATH` | `health.startup_path` | `String` |
 //! | `AUTUMN_HEALTH__DETAILED` | `health.detailed` | `bool` |
 //! | `AUTUMN_HEALTH__ENABLED` | `health.enabled` | `bool` |
+//! | `AUTUMN_HEALTH__CACHE_TTL_MS` | `health.cache_ttl_ms` | `u64` |
+//! | `AUTUMN_HEALTH__PING_TIMEOUT_MS` | `health.ping_timeout_ms` | `u64` |
+//! | `AUTUMN_HEALTH__REDIS_READINESS` | `health.redis_readiness` | `bool` |
+//! | `AUTUMN_HEALTH__DB_READINESS` | `health.db_readiness` | `bool` |
 //! | `AUTUMN_CORS__ALLOWED_ORIGINS` | `cors.allowed_origins` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_METHODS` | `cors.allowed_methods` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_HEADERS` | `cors.allowed_headers` | comma-separated `String` |
@@ -5026,6 +5030,8 @@ impl AutumnConfig {
         // at apply time, so `autumn check` names the key. A cap of 0 would
         // silently drop every labeled sample the app records.
         self.metrics.validate()?;
+        // A zero ping limit fails every ping, so `/ready` is never `200`.
+        self.health.validate()?;
         // A `[replication]` block that is switched on but cannot ship (no
         // destination, both destinations, no credential indirection) must fail
         // here — so `autumn check` and `autumn doctor` see it too — rather than
@@ -5190,6 +5196,10 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__STARTUP_PATH` → `health.startup_path` (String)
     /// - `AUTUMN_HEALTH__DETAILED` → `health.detailed` (bool)
     /// - `AUTUMN_HEALTH__ENABLED` → `health.enabled` (bool)
+    /// - `AUTUMN_HEALTH__CACHE_TTL_MS` → `health.cache_ttl_ms` (u64)
+    /// - `AUTUMN_HEALTH__PING_TIMEOUT_MS` → `health.ping_timeout_ms` (u64)
+    /// - `AUTUMN_HEALTH__REDIS_READINESS` → `health.redis_readiness` (bool)
+    /// - `AUTUMN_HEALTH__DB_READINESS` → `health.db_readiness` (bool)
     ///
     /// # Jobs
     /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis` / `sqlite`)
@@ -5986,6 +5996,26 @@ impl AutumnConfig {
         );
         parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
         parse_env_bool(env, "AUTUMN_HEALTH__ENABLED", &mut self.health.enabled);
+        parse_env(
+            env,
+            "AUTUMN_HEALTH__CACHE_TTL_MS",
+            &mut self.health.cache_ttl_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_HEALTH__PING_TIMEOUT_MS",
+            &mut self.health.ping_timeout_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_HEALTH__REDIS_READINESS",
+            &mut self.health.redis_readiness,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_HEALTH__DB_READINESS",
+            &mut self.health.db_readiness,
+        );
     }
 
     fn apply_cors_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -9486,7 +9516,15 @@ impl TelemetryProtocol {
 /// assert_eq!(health.ready_path, "/ready");
 /// assert_eq!(health.startup_path, "/startup");
 /// assert!(!health.detailed);
+/// assert_eq!(health.cache_ttl_ms, 1_000);
+/// assert_eq!(health.ping_timeout_ms, 2_000);
+/// assert!(health.db_readiness);
+/// assert!(!health.redis_readiness);
 /// ```
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent on/off switches of one config section"
+)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
     /// When `true` (the default), the framework auto-mounts the built-in
@@ -9519,6 +9557,74 @@ pub struct HealthConfig {
     /// `dev` profile via smart defaults).
     #[serde(default)]
     pub detailed: bool,
+
+    /// How long one dependency check result stays valid, in milliseconds.
+    /// Applies to the database pings and to each registered health indicator.
+    /// When a result is stale, one probe refreshes it. The other probes wait
+    /// for that result. `0` turns the cache off. Default: `1000`.
+    #[serde(default = "default_health_cache_ttl_ms")]
+    pub cache_ttl_ms: u64,
+
+    /// Time limit for one built-in dependency ping (database `SELECT 1`,
+    /// Redis `PING`), in milliseconds. A ping that does not finish in time is
+    /// `DOWN`. Keep it below the probe timeout of the platform. Must not be
+    /// `0`. Default: `2000`.
+    #[serde(default = "default_health_ping_timeout_ms")]
+    pub ping_timeout_ms: u64,
+
+    /// When `true`, a failed primary database ping makes `/ready` return
+    /// `503`. When `false`, only `/actuator/health` shows it. Default: `true`.
+    #[serde(default = "default_health_db_readiness")]
+    pub db_readiness: bool,
+
+    /// When `true`, the built-in Redis indicators gate `/ready`. The default
+    /// is `false`: they show in `/actuator/health` only. All replicas share
+    /// Redis. A Redis failure that gates `/ready` removes every replica from
+    /// rotation.
+    #[serde(default)]
+    pub redis_readiness: bool,
+}
+
+impl HealthConfig {
+    /// [`Self::cache_ttl_ms`] as a [`Duration`](std::time::Duration).
+    #[must_use]
+    pub const fn cache_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.cache_ttl_ms)
+    }
+
+    /// [`Self::ping_timeout_ms`] as a [`Duration`](std::time::Duration).
+    #[must_use]
+    pub const fn ping_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.ping_timeout_ms)
+    }
+
+    /// Check the values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `ping_timeout_ms` is `0`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.ping_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "health.ping_timeout_ms must be greater than 0: a zero limit fails every \
+                 database and Redis ping, so /ready never returns 200"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn default_health_db_readiness() -> bool {
+    true
+}
+
+const fn default_health_cache_ttl_ms() -> u64 {
+    1_000
+}
+
+const fn default_health_ping_timeout_ms() -> u64 {
+    2_000
 }
 
 /// Actuator endpoint configuration.
@@ -10395,6 +10501,10 @@ impl Default for HealthConfig {
             ready_path: default_ready_path(),
             startup_path: default_startup_path(),
             detailed: false,
+            cache_ttl_ms: default_health_cache_ttl_ms(),
+            ping_timeout_ms: default_health_ping_timeout_ms(),
+            db_readiness: default_health_db_readiness(),
+            redis_readiness: false,
         }
     }
 }
@@ -18043,6 +18153,50 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.health.detailed);
+    }
+
+    #[test]
+    fn env_overrides_health_dependency_checks() {
+        let env = MockEnv::new()
+            .with("AUTUMN_HEALTH__CACHE_TTL_MS", "250")
+            .with("AUTUMN_HEALTH__PING_TIMEOUT_MS", "750")
+            .with("AUTUMN_HEALTH__DB_READINESS", "false")
+            .with("AUTUMN_HEALTH__REDIS_READINESS", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.health.cache_ttl(),
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(
+            config.health.ping_timeout(),
+            std::time::Duration::from_millis(750)
+        );
+        assert!(!config.health.db_readiness);
+        assert!(config.health.redis_readiness);
+    }
+
+    #[test]
+    fn health_dependency_checks_parse_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            "[health]\ncache_ttl_ms = 0\nping_timeout_ms = 300\ndb_readiness = false\n",
+        )
+        .expect("valid toml");
+        assert_eq!(config.health.cache_ttl_ms, 0);
+        assert_eq!(config.health.ping_timeout_ms, 300);
+        assert!(!config.health.db_readiness);
+        assert!(!config.health.redis_readiness);
+    }
+
+    #[test]
+    fn zero_ping_timeout_is_rejected() {
+        let mut config = AutumnConfig::default();
+        config.health.ping_timeout_ms = 0;
+        let error = config.validate().expect_err("zero ping timeout");
+        assert!(
+            error.to_string().contains("health.ping_timeout_ms"),
+            "{error}"
+        );
     }
 
     #[test]

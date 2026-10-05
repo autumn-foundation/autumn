@@ -152,11 +152,15 @@ failure_capture.max_body_bytes
 failure_capture.max_capsule_bytes
 failure_capture.max_capsules
 health
+health.cache_ttl_ms
+health.db_readiness
 health.detailed
 health.enabled
 health.live_path
 health.path
+health.ping_timeout_ms
 health.ready_path
+health.redis_readiness
 health.startup_path
 http
 http.client
