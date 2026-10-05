@@ -3259,6 +3259,8 @@ done
   [ -n "$STUB_INGRESS_INTERNAL" ] && external=false
   [ -n "$STUB_INGRESS_EXTERNAL" ] && external=true
   ingress="{\"external\":$external,\"targetPort\":3000,\"transport\":\"http\",\"fqdn\":\"app.example.internal\",\"customDomains\":[{\"name\":\"www.example.com\"}]}"
+  # An interrupted first cutover can leave ingress disabled.
+  [ -n "$STUB_INGRESS_NONE" ] && ingress=null
   containers="{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar"
   # An operator can put a sidecar before the app container.
   [ -n "$STUB_SIDECAR_FIRST" ] && containers="$sidecar,{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]}"
@@ -3291,6 +3293,8 @@ case "$1 $2" in
         fi
       fi
       cat "$state"
+    elif [ "$query" = properties.configuration.ingress.fqdn ]; then
+      echo app.example.internal
     else
       # STUB_STATUS_SEQ scripts the status reads, one per read, as
       # state:revision. Then the reads are as usual.
@@ -3320,6 +3324,12 @@ case "$1 $2" in
     if [ "$3" = list ]; then
       n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
       if [ "${n:-0}" -eq 0 ]; then
+        # A handoff: the placeholder and a real revision that is not ready
+        # yet are both active.
+        if [ -n "$STUB_ACTIVE_BOTH" ]; then
+          printf 'app--old\t%s\napp--half\tacr.azurecr.io/app:t1\n' "$STUB_OLD_IMAGE"
+          exit 0
+        fi
         # An interrupted run made the latest revision; the old one stays
         # active for the first STUB_ACTIVE_LAG reads.
         if [ -n "$STUB_ACTIVE_LAG" ] && [ -n "$STUB_LATEST" ]; then
@@ -3509,6 +3519,8 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_ACTIVE_BOTH")
+            .env_remove("STUB_INGRESS_NONE")
             .env_remove("STUB_RESTART_FROM_ZERO")
             .env_remove("STUB_ACTIVE_SCALE_RULE")
             .env_remove("STUB_JOB_NO_SECRETS")
@@ -3864,6 +3876,58 @@ esac
             return;
         };
         assert!(!status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_the_first_cutover_while_a_placeholder_is_active() {
+        // During a handoff, the placeholder and a real revision are both
+        // active. The app is not released yet: the first-cutover safeguards
+        // apply to the placeholder revision only.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_BOTH", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("ingress disable"), "{calls}");
+        assert!(
+            calls.contains("--revision app--old --query length(@)"),
+            "{calls}"
+        );
+        assert!(!calls.contains("--revision app--half --query"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_opens_ingress_before_it_wakes_a_restarted_revision() {
+        // A first cutover stopped after the handoff, before ingress opened.
+        // The retry restarts the revision. Without ingress, no request can
+        // start a replica, so the script opens ingress first.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_INGRESS_NONE", "1"),
+                ("STUB_RESTART_FROM_ZERO", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let open_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("the script must open ingress: {calls}"));
+        let curl_at = calls.find("curl ").expect("a wake request");
+        assert!(open_at < curl_at, "{calls}");
     }
 
     #[cfg(unix)]
