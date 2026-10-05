@@ -130,7 +130,10 @@ async fn export(billing: Billing, session: Session) -> AutumnResult<&'static str
 ```
 
 `Billing::current_user` reads the user id with the app's configured auth
-session key and answers 401 when nobody is logged in.
+session key and answers 401 when nobody is logged in. `Billing::require`
+returns the newest subscription that satisfies the rule.
+`Billing::current_subscription` picks one subscription to show and is not a
+gate.
 
 Entitled means: status `active` or `trialing` (`past_due` only with
 `allow_past_due`), the price maps to a catalog plan, and

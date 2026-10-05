@@ -556,10 +556,30 @@ async fn rule_satisfied_only_by_an_older_entitled_subscription_is_allowed() {
     let shown = billing.current_subscription("7").await.unwrap().unwrap();
     assert_eq!(shown.plan.as_ref().map(|p| p.id.as_str()), Some("team"));
 
-    assert!(billing.is_entitled("7", &PlanRule::plan("pro")).await.unwrap());
-    assert!(billing.is_entitled("7", &PlanRule::entitlement("sso")).await.unwrap());
-    assert!(!billing.is_entitled("7", &PlanRule::plan("enterprise")).await.unwrap());
-    assert!(!billing.is_entitled("7", &PlanRule::entitlement("audit")).await.unwrap());
+    assert!(
+        billing
+            .is_entitled("7", &PlanRule::plan("pro"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        billing
+            .is_entitled("7", &PlanRule::entitlement("sso"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !billing
+            .is_entitled("7", &PlanRule::plan("enterprise"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !billing
+            .is_entitled("7", &PlanRule::entitlement("audit"))
+            .await
+            .unwrap()
+    );
     let err = billing
         .require("7", &PlanRule::plan("enterprise"))
         .await
@@ -617,12 +637,27 @@ async fn require_breaks_an_event_time_tie_by_row_id() {
 #[tokio::test]
 async fn an_unentitled_row_never_satisfies_a_rule() {
     let cases: [(&str, Option<&str>, SubscriptionStatus, i64); 6] = [
-        ("canceled", Some(PRO_PRICE), SubscriptionStatus::Canceled, 24),
-        ("incomplete", Some(PRO_PRICE), SubscriptionStatus::Incomplete, 24),
+        (
+            "canceled",
+            Some(PRO_PRICE),
+            SubscriptionStatus::Canceled,
+            24,
+        ),
+        (
+            "incomplete",
+            Some(PRO_PRICE),
+            SubscriptionStatus::Incomplete,
+            24,
+        ),
         ("unpaid", Some(PRO_PRICE), SubscriptionStatus::Unpaid, 24),
         ("past-due", Some(PRO_PRICE), SubscriptionStatus::PastDue, 24),
         ("expired", Some(PRO_PRICE), SubscriptionStatus::Active, -73),
-        ("unknown-price", Some("price_unknown"), SubscriptionStatus::Active, 24),
+        (
+            "unknown-price",
+            Some("price_unknown"),
+            SubscriptionStatus::Active,
+            24,
+        ),
     ];
     for (key, price, status, period_hours) in cases {
         let h = build();
@@ -651,7 +686,10 @@ async fn an_unentitled_row_never_satisfies_a_rule() {
             .unwrap();
         let billing = Billing::from_state(h.client.state()).expect("plugin started");
         assert!(
-            !billing.is_entitled("7", &PlanRule::plan("pro")).await.unwrap(),
+            !billing
+                .is_entitled("7", &PlanRule::plan("pro"))
+                .await
+                .unwrap(),
             "{key} row granted plan pro"
         );
         let err = billing
@@ -693,9 +731,7 @@ fn oracle_plan(row: RowShape) -> Option<&'static str> {
 fn oracle_accepts(rule: &PlanRule, plan: &str) -> bool {
     match rule {
         PlanRule::Plan(id) => id.as_str() == plan,
-        PlanRule::Entitlement(name) => {
-            name == "export" || (name == "sso" && plan == "team")
-        }
+        PlanRule::Entitlement(name) => name == "export" || (name == "sso" && plan == "team"),
         PlanRule::AnyActive => true,
         other => panic!("the oracle does not model {other:?}"),
     }

@@ -150,7 +150,8 @@ async fn reports(_pro: Entitled<Pro>) -> &'static str { "ok" }
 ```
 
 `Entitled<R>` runs before the body is read. It answers `401` without a
-session user and `403` without an entitled subscription.
+session user and `403` when no entitled subscription satisfies `R`. The gate
+checks every subscription of the customer, not only the newest one.
 
 For a decision inside a handler, `Billing::current_user` reads the user id
 with the app's configured auth session key:

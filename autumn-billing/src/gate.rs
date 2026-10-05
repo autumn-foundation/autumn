@@ -22,6 +22,9 @@
 //! price maps to a catalog plan, and whose `current_period_end` plus the
 //! grace period is not in the past. Without a known period end the grace
 //! period counts from the last event applied. Every missing piece denies.
+//!
+//! The gate tests the rule against every subscription of the customer. One
+//! entitled subscription that satisfies the rule is sufficient (issue #3114).
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -189,7 +192,10 @@ impl Billing {
     /// build it explicitly with [`crate::gate::scope_identity`] if it isn't
     /// already at hand — or this always misses and denies entitlement for an
     /// otherwise-paying tenant user. [`is_entitled`](Self::is_entitled) and
-    /// [`require`](Self::require) share this contract; both call this method.
+    /// [`require`](Self::require) share this contract.
+    ///
+    /// This method picks one subscription to show. It is not a gate: the
+    /// gate tests every subscription (issue #3114).
     ///
     /// # Errors
     ///
@@ -198,49 +204,53 @@ impl Billing {
         &self,
         user_id: &str,
     ) -> Result<Option<SubscriptionView>, BillingError> {
-        let store = self.service.store();
-        let Some(customer) = store.customer_by_user(user_id).await? else {
-            return Ok(None);
-        };
-        let rows = store.subscriptions_for_customer(&customer.id).await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| self.view(row))
-            .max_by_key(|view| {
-                (
-                    view.entitled,
-                    view.subscription.status.is_live(),
-                    view.subscription.last_event_at,
-                )
-            }))
+        Ok(self.views(user_id).await?.into_iter().max_by_key(|view| {
+            (
+                view.entitled,
+                view.subscription.status.is_live(),
+                view.subscription.last_event_at,
+            )
+        }))
     }
 
-    /// `true` when `user_id` satisfies `rule`. Default deny.
+    /// `true` when one entitled subscription of `user_id` satisfies `rule`.
+    /// Default deny.
     ///
     /// # Errors
     ///
     /// Returns the store error.
     pub async fn is_entitled(&self, user_id: &str, rule: &PlanRule) -> Result<bool, BillingError> {
-        Ok(self
-            .current_subscription(user_id)
-            .await?
-            .is_some_and(|view| view.satisfies(rule)))
+        Ok(best_satisfying(self.views(user_id).await?, rule).is_some())
     }
 
-    /// The entitled subscription, or [`BillingError::Forbidden`].
+    /// The newest entitled subscription that satisfies `rule`, or
+    /// [`BillingError::Forbidden`].
+    ///
+    /// A tie on the event time goes to the lowest row id, so the result
+    /// does not depend on the store's row order.
     ///
     /// # Errors
     ///
-    /// Returns [`BillingError::Forbidden`] when the rule is not satisfied.
+    /// Returns [`BillingError::Forbidden`] when no subscription satisfies
+    /// the rule, or the store error.
     pub async fn require(
         &self,
         user_id: &str,
         rule: &PlanRule,
     ) -> Result<SubscriptionView, BillingError> {
-        match self.current_subscription(user_id).await? {
-            Some(view) if view.satisfies(rule) => Ok(view),
-            _ => Err(BillingError::Forbidden(rule.describe())),
-        }
+        best_satisfying(self.views(user_id).await?, rule)
+            .ok_or_else(|| BillingError::Forbidden(rule.describe()))
+    }
+
+    /// Every subscription of the user, joined with its plan. Empty when the
+    /// user has no customer row.
+    async fn views(&self, user_id: &str) -> Result<Vec<SubscriptionView>, BillingError> {
+        let store = self.service.store();
+        let Some(customer) = store.customer_by_user(user_id).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = store.subscriptions_for_customer(&customer.id).await?;
+        Ok(rows.into_iter().map(|row| self.view(row)).collect())
     }
 
     /// Join the plan and evaluate entitlement.
@@ -272,6 +282,23 @@ impl Billing {
         end.checked_add_signed(grace)
             .is_none_or(|deadline| deadline >= now)
     }
+}
+
+/// The view that grants `rule`: the newest that satisfies it, then the lowest
+/// row id. `None` denies. `verification/billing_gate.rs` models this choice.
+fn best_satisfying(
+    views: impl IntoIterator<Item = SubscriptionView>,
+    rule: &PlanRule,
+) -> Option<SubscriptionView> {
+    views
+        .into_iter()
+        .filter(|view| view.satisfies(rule))
+        .min_by(|a, b| {
+            b.subscription
+                .last_event_at
+                .cmp(&a.subscription.last_event_at)
+                .then_with(|| a.subscription.id.cmp(&b.subscription.id))
+        })
 }
 
 /// The catalog plan for a mirror row: by price id first, then by stored plan id.
