@@ -127,25 +127,26 @@ fn check_replayable(migrations_dir: &Path) -> Result<(), String> {
 
 /// The first transaction-control statement (`BEGIN`, `START TRANSACTION`,
 /// `COMMIT`, `END`, `ROLLBACK`, `ABORT`) in `sql`, if any. Comments, string
-/// literals, quoted names, dollar-quoted bodies and `BEGIN ATOMIC ... END`
-/// bodies do not count.
+/// literals, quoted names and dollar-quoted bodies do not count. A `BEGIN`
+/// inside a statement opens a body (`BEGIN ATOMIC`, a `SQLite` trigger) that
+/// ends at a standalone `END`; that `END` does not count either.
 fn transaction_control(sql: &str) -> Option<String> {
     let code = strip_sql_noise(sql);
-    let mut in_atomic = false;
+    let mut in_body = false;
     for statement in code.split(';') {
         let words: Vec<String> = statement
             .split_whitespace()
             .map(str::to_ascii_uppercase)
             .collect();
-        if in_atomic {
-            in_atomic = words != ["END"];
-            continue;
-        }
-        if words.windows(2).any(|w| w == ["BEGIN", "ATOMIC"]) {
-            in_atomic = true;
+        if in_body {
+            in_body = words != ["END"];
             continue;
         }
         let first = words.first().map_or("", String::as_str);
+        if first != "BEGIN" && words.iter().any(|w| w == "BEGIN") {
+            in_body = true;
+            continue;
+        }
         let hit = match first {
             "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" => true,
             "START" => words.get(1).is_some_and(|w| w == "TRANSACTION"),
@@ -400,6 +401,10 @@ mod tests {
             "DO $$ BEGIN PERFORM 1; END $$;",
             "CREATE FUNCTION f() RETURNS trigger AS $body$ BEGIN RETURN NEW; END; $body$ LANGUAGE plpgsql;",
             "CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;",
+            "CREATE TRIGGER \"t_assign\" AFTER INSERT ON \"t\" BEGIN\n  UPDATE \"t\" SET p = \
+             (SELECT CASE WHEN 1 THEN 0 ELSE 1 END) WHERE id = new.id;\nEND;",
+            "CREATE TRIGGER IF NOT EXISTS t_del AFTER DELETE ON t BEGIN DELETE FROM c \
+             WHERE p = old.id; DELETE FROM d WHERE p = old.id; END;",
             "INSERT INTO t VALUES ('BEGIN; COMMIT;'); -- COMMIT;\n/* ROLLBACK; */",
             "CREATE TABLE t (id INT, \"commit\" TEXT);",
         ] {
