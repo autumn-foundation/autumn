@@ -486,6 +486,13 @@ fn shell_release_scripts_are_lf_normalized() {
         attributes.contains("*.sh text eol=lf"),
         ".gitattributes must force LF checkout for shell scripts so release gates run under bash"
     );
+    // A `*.sh.tmpl` template does not match `*.sh`. `autumn release init`
+    // writes it out as a bash script, so a CRLF checkout on Windows would
+    // ship a script that bash cannot run (#2314).
+    assert!(
+        attributes.contains("autumn-cli/src/templates/**/*.sh.tmpl text eol=lf"),
+        ".gitattributes must force LF checkout for scaffolded shell script templates"
+    );
 
     let scripts_dir = root.join("scripts");
     for entry in std::fs::read_dir(&scripts_dir)
