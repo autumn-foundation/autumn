@@ -2203,6 +2203,15 @@ impl Analyzer {
             | Expr::Return(_)
             | Expr::Break(_)
             | Expr::Continue(_) => true,
+            // A loop or labeled block gives its `break` values too. Unlike an
+            // `if`, it cannot charge a builder on its own path, so a mix of
+            // builders and other futures is not known.
+            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+                let tails = value_tails(e);
+                let pending = tails.iter().filter(|t| self.is_pending_query(t)).count();
+                (pending == 0 || pending == tails.len())
+                    && tails.iter().all(|t| self.is_known_future(t))
+            }
             Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
                 branch_tails(e).is_some_and(|tails| tails.iter().all(|t| self.is_known_future(t)))
             }
@@ -2217,6 +2226,10 @@ impl Analyzer {
         match e {
             Expr::MethodCall(mc) => {
                 is_handle_builder(&mc.method.to_string()) && self.chain_root_is_handle(e)
+            }
+            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+                let tails = value_tails(e);
+                !tails.is_empty() && tails.iter().all(|t| self.is_pending_query(t))
             }
             Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
                 branch_tails(e).is_some_and(|tails| tails.iter().all(|t| self.is_pending_query(t)))
@@ -2435,6 +2448,11 @@ impl Analyzer {
             Expr::Tuple(t) => !t.elems.iter().all(known),
             Expr::Array(a) => !a.elems.iter().all(known),
             Expr::Struct(st) => st.rest.is_some() || !st.fields.iter().all(|f| known(&f.expr)),
+            // A labeled block's `break` values count too (`'a: { break 'a
+            // make(); }`).
+            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+                !value_tails(e).iter().all(|t| known(t))
+            }
             Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
                 branch_tails(e).is_none_or(|tails| !tails.iter().all(|t| known(t)))
             }
@@ -3941,6 +3959,39 @@ impl Analyzer {
     /// `receiver.method(arg)` may store `arg` in `receiver`. When an argument
     /// holds a handle, the name at the root of `receiver` now holds it too.
     fn store_into(&mut self, receiver: &Expr, method: &str, args: &[&Expr]) {
+        // `repos.clear()` on a name that owns its value empties it. What it
+        // held stays a floor: a later opaque store has the element type.
+        if method == "clear" && args.is_empty() && self.known_container_method(receiver, method, 0)
+        {
+            if let Some(name) = path_ident(peel_parens(receiver)) {
+                let mut binding = self.env.binding(&name);
+                if binding.referents.is_empty() && binding.kind != Kind::Plain {
+                    let floor = binding.declared.take().unwrap_or_else(|| {
+                        Box::new(Binding {
+                            kind: binding.kind,
+                            shape: binding.shape,
+                            inner: binding.inner,
+                            ..Binding::of(Kind::Plain)
+                        })
+                    });
+                    binding.kind = Kind::Plain;
+                    binding.parts = None;
+                    binding.declared = Some(floor);
+                    self.env.assign(name, binding);
+                }
+            }
+            return;
+        }
+        // An opaque value stored into a container with a floor has the
+        // element type: `repos.push(make_repo())` after `repos.clear()`.
+        if STORE_METHODS.contains(&method)
+            && args.iter().any(|a| self.is_opaque_value(a))
+            && let Some(root) = place_root(receiver)
+            && let Some(floor) = self.env.binding(&root).declared
+            && floor.kind != Kind::Plain
+        {
+            self.raise(root, floor.kind);
+        }
         // An executor uses the connection for one query and gives it back.
         // A known container method stores only if it is a store method.
         if EXECUTORS.contains(&method)
@@ -11704,6 +11755,57 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let make = || async { 1 }; let n = make().await; render(n); let _ = repo; Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn loop_builders_labeled_breaks_and_clear() {
+        check_handlers(&[
+            (
+                "a loop that breaks with a builder costs one when awaited",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = loop { break repo.scoped(); }; pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a loop that breaks with a builder and another future is not known",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let pending = loop { if flag { break repo.scoped(); } break repo.find(1); }; pending.await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a labeled break with an opaque value does not clear",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut slot = Some(repo); slot = 'pick: { if flag { break 'pick make(); } None }; \
+                 let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a labeled break with a builder is pending",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let pending = 'pick: { if flag { break 'pick repo.scoped(); } repo.scoped() }; pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "clear empties a container",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = vec![repo]; repos.clear(); render(repos); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: an opaque store after clear has the element type",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = vec![repo]; repos.clear(); repos.push(make_repo()); \
+                 let _ = repos[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: clear through an alias does not clear the owner",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut left = vec![repo]; let mut right = Vec::new(); \
+                 { let target = if flag { &mut left } else { &mut right }; target.clear(); } render(left); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
