@@ -93,9 +93,6 @@ const LOG_COLUMNS: &str = "id, subscription_id, topic, payload, request_headers,
 const RESET_FAILURES_SQL: &str = "UPDATE autumn_webhook_subscriptions \
      SET consecutive_failures = 0 WHERE id = $1";
 
-const SUCCESS_SQL: &str = "UPDATE autumn_webhook_subscriptions \
-     SET consecutive_failures = 0 WHERE id = $1 AND status = 'active'";
-
 const FAILURE_SQL: &str = "UPDATE autumn_webhook_subscriptions \
      SET consecutive_failures = consecutive_failures + 1, \
          status = CASE WHEN consecutive_failures + 1 >= $1 THEN 'failed' ELSE status END \
@@ -415,8 +412,10 @@ async fn log_with_outcome(
         async move {
             write_log_on(conn, log).await?;
             let failed_now = match outcome(log) {
+                // A 2xx on a `Failed` subscription comes from a replay. It
+                // reactivates the subscription in this transaction.
                 Outcome::Success => {
-                    diesel::sql_query(sql(SUCCESS_SQL))
+                    diesel::sql_query(sql(REACTIVATE_SQL))
                         .bind::<Text, _>(&log.subscription_id)
                         .execute(&mut *conn)
                         .await?;

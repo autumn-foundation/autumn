@@ -1332,22 +1332,47 @@ pub async fn purge(state: &AppState) -> AutumnResult<(usize, usize)> {
     let retention = duration_millis(Duration::from_millis(relay.config.retention_ms));
     let outbox_cutoff = to_millis(state.clock().now()).saturating_sub(retention);
     let inbox_cutoff = to_millis(crate::time::ambient_now()).saturating_sub(retention);
+    let pools = relay_pools(state)?;
     let (mut outbox, mut inbox) = (0, 0);
-    for pool in relay_pools(state)? {
-        let mut conn = pool.get().await.map_err(|error| {
-            AutumnError::service_unavailable_msg(format!("outbox purge: no connection: {error}"))
-        })?;
-        outbox += diesel::sql_query(sql(PURGE_OUTBOX_SQL))
-            .bind::<BigInt, _>(outbox_cutoff)
-            .execute(&mut conn)
-            .await
-            .map_err(|error| sql_error("outbox purge", &error))?;
-        inbox += diesel::sql_query(sql(PURGE_INBOX_SQL))
-            .bind::<BigInt, _>(inbox_cutoff)
-            .execute(&mut conn)
-            .await
-            .map_err(|error| sql_error("inbox purge", &error))?;
+    let mut failures = Vec::new();
+    for pool in &pools {
+        match purge_pool(pool, outbox_cutoff, inbox_cutoff).await {
+            Ok((o, i)) => {
+                outbox += o;
+                inbox += i;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "outbox purge failed on one pool; it goes on with the others");
+                failures.push(error);
+            }
+        }
     }
+    if failures.len() == pools.len()
+        && let Some(error) = failures.into_iter().next()
+    {
+        return Err(error);
+    }
+    Ok((outbox, inbox))
+}
+
+async fn purge_pool(
+    pool: &Pool<RuntimeConnection>,
+    outbox_cutoff: i64,
+    inbox_cutoff: i64,
+) -> AutumnResult<(usize, usize)> {
+    let mut conn = pool.get().await.map_err(|error| {
+        AutumnError::service_unavailable_msg(format!("outbox purge: no connection: {error}"))
+    })?;
+    let outbox = diesel::sql_query(sql(PURGE_OUTBOX_SQL))
+        .bind::<BigInt, _>(outbox_cutoff)
+        .execute(&mut conn)
+        .await
+        .map_err(|error| sql_error("outbox purge", &error))?;
+    let inbox = diesel::sql_query(sql(PURGE_INBOX_SQL))
+        .bind::<BigInt, _>(inbox_cutoff)
+        .execute(&mut conn)
+        .await
+        .map_err(|error| sql_error("inbox purge", &error))?;
     Ok((outbox, inbox))
 }
 

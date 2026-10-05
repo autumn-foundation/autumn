@@ -376,6 +376,40 @@ mod sql_webhook_store {
         assert_eq!(restarted.get_delivery_logs(10).await.unwrap().len(), 1);
     }
 
+    /// A successful replay reactivates a `Failed` subscription in the same
+    /// transaction as its log. A crash after the log cannot keep it failed.
+    #[tokio::test]
+    async fn sql_store_success_log_reactivates_a_failed_subscription() {
+        let substrate = substrate().await;
+        let store = SqlOutboundWebhookStore::new(substrate.pool());
+        store.ensure_schema().await.unwrap();
+        let mut failed = subscription("sub-1");
+        failed.status = WebhookSubscriptionStatus::Failed;
+        failed.consecutive_failures = 50;
+        store.create_subscription(failed).await.unwrap();
+        let mut disabled = subscription("sub-2");
+        disabled.status = WebhookSubscriptionStatus::Disabled;
+        store.create_subscription(disabled).await.unwrap();
+
+        store
+            .log_delivery(log("ok", Some(200), None))
+            .await
+            .unwrap();
+        let mut other = log("ok-2", Some(200), None);
+        other.subscription_id = "sub-2".to_owned();
+        store.log_delivery(other).await.unwrap();
+
+        let sub = store.get_subscription("sub-1").await.unwrap().unwrap();
+        assert_eq!(sub.status, WebhookSubscriptionStatus::Active);
+        assert_eq!(sub.consecutive_failures, 0);
+        let sub = store.get_subscription("sub-2").await.unwrap().unwrap();
+        assert_eq!(
+            sub.status,
+            WebhookSubscriptionStatus::Disabled,
+            "an operator disable stays"
+        );
+    }
+
     #[tokio::test]
     async fn sql_store_counts_failures_like_the_in_memory_store() {
         let substrate = substrate().await;

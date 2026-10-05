@@ -759,8 +759,8 @@ mod sqlite {
         assert_eq!(log.lock().unwrap().len(), 5);
     }
 
-    /// A shard that fails (here: no outbox tables) does not stop the drain of
-    /// the other pools. Only a drain where every pool fails is an error.
+    /// A shard that fails (here: no outbox tables) does not stop the drain or
+    /// the purge of the other pools. Only a drain where every pool fails is an error.
     #[tokio::test]
     async fn a_failed_shard_does_not_block_the_other_pools() {
         let broken = SqliteSubstrate::new().expect("shard substrate");
@@ -807,6 +807,7 @@ mod sqlite {
             1,
             "the app pool still drains"
         );
+        assert!(purge(&state).await.is_ok(), "the app pool still purges");
     }
 
     #[tokio::test]
