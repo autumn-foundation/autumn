@@ -204,7 +204,7 @@ pub fn comments_migration_still_needed(
     let src = project_root.join("src");
     let commentable_elsewhere = commentable_declared_below(&src.join("models"), excluding)
         || std::fs::read_to_string(src.join("models.rs"))
-            .is_ok_and(|models| models.contains("#[commentable"));
+            .is_ok_and(|models| declares_commentable_on_comments(&models));
     if !commentable_elsewhere {
         return false;
     }
@@ -304,6 +304,62 @@ fn model_using_comments_table(project_root: &Path) -> Option<std::path::PathBuf>
     files
         .into_iter()
         .find(|file| std::fs::read_to_string(file).is_ok_and(|source| maps_comments_table(&source)))
+}
+
+/// Whether `source` declares a live `#[commentable]` on the `comments` table:
+/// `table = <name>` when given, else `comments`. A commented-out attribute,
+/// or one on another table, does not count. A file that does not parse falls
+/// back to a text scan.
+fn declares_commentable_on_comments(source: &str) -> bool {
+    fn on_comments(items: &[syn::Item]) -> bool {
+        items.iter().any(|item| match item {
+            syn::Item::Struct(item) => item
+                .attrs
+                .iter()
+                .filter(|attr| {
+                    attr.path()
+                        .segments
+                        .last()
+                        .is_some_and(|segment| segment.ident == "commentable")
+                })
+                .any(|attr| commentable_table(attr) == COMMENTS_TABLE),
+            syn::Item::Mod(item) => item
+                .content
+                .as_ref()
+                .is_some_and(|(_, items)| on_comments(items)),
+            _ => false,
+        })
+    }
+    syn::parse_file(source).map_or_else(
+        |_| source.contains("#[commentable"),
+        |file| on_comments(&file.items),
+    )
+}
+
+/// The table a `#[commentable]` attribute names: `table = <ident>` or
+/// `table = "<name>"`, else `comments`.
+fn commentable_table(attr: &syn::Attribute) -> String {
+    let mut table = None;
+    if matches!(attr.meta, syn::Meta::List(_)) {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("table") {
+                let value: syn::Expr = meta.value()?.parse()?;
+                table = match value {
+                    syn::Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(name),
+                        ..
+                    }) => Some(name.value()),
+                    _ => None,
+                };
+            } else if meta.input.peek(syn::Token![=]) {
+                // Skip any other `key = value` pair.
+                let _: syn::Expr = meta.value()?.parse()?;
+            }
+            Ok(())
+        });
+    }
+    table.unwrap_or_else(|| COMMENTS_TABLE.to_owned())
 }
 
 /// Whether `source` has a `#[model]` struct on the `comments` table.
@@ -542,6 +598,18 @@ enum TableEvent {
     Rename { from: TableRef, to: TableRef },
 }
 
+impl TableEvent {
+    /// The table an `ALTER` event changes; `None` for other events.
+    const fn altered_table(&self) -> Option<&TableRef> {
+        match self {
+            Self::Add(table, _) | Self::Remove(table, _) | Self::Rename { from: table, .. } => {
+                Some(table)
+            }
+            Self::Create(..) | Self::Drop(..) => None,
+        }
+    }
+}
+
 /// Replay every migration's `up.sql` in version order: for every table, does it
 /// exist, and which discriminator columns does it currently carry.
 ///
@@ -571,48 +639,62 @@ struct Replay {
     touched_while_absent: std::collections::HashSet<TableRef>,
 }
 
+/// The table events one migration file holds, in no order. The flag is
+/// `ALTER TABLE IF EXISTS`: on no table the event does nothing.
+fn file_events(sql: &str) -> Vec<(usize, TableEvent, bool)> {
+    let mut events: Vec<(usize, TableEvent, bool)> = Vec::new();
+    for (at, table, body, if_not_exists) in create_tables(sql) {
+        let columns = REQUIRED_COLUMNS
+            .iter()
+            .copied()
+            .filter(|column| declares_column(body, column))
+            .collect();
+        events.push((at, TableEvent::Create(table, columns, if_not_exists), false));
+    }
+    for (at, dropped, if_exists) in drop_tables(sql) {
+        for table in dropped {
+            events.push((at, TableEvent::Drop(table, if_exists), false));
+        }
+    }
+    for (at, table, statement, if_exists) in alter_tables(sql) {
+        // A table rename moves the whole record; it mentions no column.
+        if let Some(to) = table_rename_target(statement) {
+            events.push((at, TableEvent::Rename { from: table, to }, if_exists));
+            continue;
+        }
+        // An ALTER naming the column may be adding it, dropping it, or
+        // renaming it away. Treating every mention as an add would let
+        // `DROP COLUMN commentable_type` read as proof the column is
+        // present.
+        for column in REQUIRED_COLUMNS.iter().copied() {
+            if !mentions_column(statement, column) {
+                continue;
+            }
+            if alter_removes_column(statement, column) {
+                events.push((at, TableEvent::Remove(table.clone(), column), if_exists));
+            } else {
+                events.push((at, TableEvent::Add(table.clone(), column), if_exists));
+            }
+        }
+    }
+    events
+}
+
 /// [`replay_migration_history`], also recording [`Replay::touched_while_absent`].
 fn replay(files: &[String]) -> Replay {
     let mut tables: HashMap<TableRef, TableState> = HashMap::new();
     let mut touched_while_absent = std::collections::HashSet::new();
     for sql in files {
-        let mut events: Vec<(usize, TableEvent)> = Vec::new();
-        for (at, table, body, if_not_exists) in create_tables(sql) {
-            let columns = REQUIRED_COLUMNS
-                .iter()
-                .copied()
-                .filter(|column| declares_column(body, column))
-                .collect();
-            events.push((at, TableEvent::Create(table, columns, if_not_exists)));
-        }
-        for (at, dropped, if_exists) in drop_tables(sql) {
-            for table in dropped {
-                events.push((at, TableEvent::Drop(table, if_exists)));
-            }
-        }
-        for (at, table, statement) in alter_tables(sql) {
-            // A table rename moves the whole record; it mentions no column.
-            if let Some(to) = table_rename_target(statement) {
-                events.push((at, TableEvent::Rename { from: table, to }));
+        let mut events = file_events(sql);
+        events.sort_by_key(|(at, _, _)| *at);
+        for (_, event, if_exists) in events {
+            if if_exists
+                && !event
+                    .altered_table()
+                    .is_some_and(|table| tables.get(table).is_some_and(|state| state.exists))
+            {
                 continue;
             }
-            // An ALTER naming the column may be adding it, dropping it, or
-            // renaming it away. Treating every mention as an add would let
-            // `DROP COLUMN commentable_type` read as proof the column is
-            // present.
-            for column in REQUIRED_COLUMNS.iter().copied() {
-                if !mentions_column(statement, column) {
-                    continue;
-                }
-                if alter_removes_column(statement, column) {
-                    events.push((at, TableEvent::Remove(table.clone(), column)));
-                } else {
-                    events.push((at, TableEvent::Add(table.clone(), column)));
-                }
-            }
-        }
-        events.sort_by_key(|(at, _)| *at);
-        for (_, event) in events {
             match event {
                 TableEvent::Create(table, columns, if_not_exists) => {
                     // `IF NOT EXISTS` on an existing table does nothing.
@@ -908,8 +990,9 @@ fn drop_tables(sql: &str) -> Vec<(usize, Vec<TableRef>, bool)> {
     found
 }
 
-/// Every `ALTER TABLE` in `sql`: (offset, table, statement text after the name).
-fn alter_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
+/// Every `ALTER TABLE` in `sql`: (offset, table, statement text after the
+/// name, `IF EXISTS`).
+fn alter_tables(sql: &str) -> Vec<(usize, TableRef, &str, bool)> {
     let mut found = Vec::new();
     let mut base = 0usize;
     while let Some(at) = sql[base..].find("alter table") {
@@ -927,7 +1010,9 @@ fn alter_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
         };
         let after = &rest[used..];
         let statement = after.split(';').next().unwrap_or(after);
-        found.push((start, table, statement));
+        // The pipeline lowercases unquoted SQL, so one spelling matches.
+        let if_exists = rest.trim_start().starts_with("if exists");
+        found.push((start, table, statement, if_exists));
     }
     found
 }
@@ -1534,7 +1619,7 @@ fn commentable_declared_below(dir: &Path, excluding: &[std::path::PathBuf]) -> b
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
             continue;
         }
-        if std::fs::read_to_string(&path).is_ok_and(|src| src.contains("#[commentable")) {
+        if std::fs::read_to_string(&path).is_ok_and(|src| declares_commentable_on_comments(&src)) {
             return true;
         }
     }
@@ -3701,5 +3786,51 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// `ALTER TABLE IF EXISTS` on no table does nothing, so it needs no
+    /// earlier `CREATE`.
+    #[test]
+    fn an_alter_if_exists_does_not_need_the_candidate() {
+        let ours = up_sql(DatabaseBackend::Postgres);
+        let tmp = project_with(&[
+            (
+                "0001_create_comments",
+                "CREATE TABLE comments (id BIGINT, body TEXT);\n",
+            ),
+            (
+                "0002_tweak",
+                "ALTER TABLE IF EXISTS comments ADD COLUMN commentable_type TEXT;\n",
+            ),
+            ("0003_drop", "DROP TABLE IF EXISTS comments;\n"),
+            ("0004_create_comments", &ours),
+        ]);
+        let plain = tmp.path().join("migrations").join("0001_create_comments");
+        assert!(!comments_migration_still_needed(tmp.path(), &plain, &[]));
+    }
+
+    /// Only a live `#[commentable]` on the `comments` table needs it. A
+    /// commented-out one, or one on another table, does not.
+    #[test]
+    fn only_a_live_commentable_on_comments_needs_the_table() {
+        let tmp = project_with(&[(
+            "0001_create_comments",
+            "CREATE TABLE comments (id BIGINT, commentable_type TEXT, commentable_id BIGINT, \
+             parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, \
+             deleted_at TIMESTAMP);\n",
+        )]);
+        let dir = tmp.path().join("migrations").join("0001_create_comments");
+        let post = tmp.path().join("src").join("models").join("post.rs");
+        assert!(comments_migration_still_needed(tmp.path(), &dir, &[]));
+
+        std::fs::write(&post, "// #[commentable]\npub struct Post {}\n").expect("write");
+        assert!(!comments_migration_still_needed(tmp.path(), &dir, &[]));
+
+        std::fs::write(
+            &post,
+            "#[commentable(table = remarks)]\npub struct Post {}\n",
+        )
+        .expect("write");
+        assert!(!comments_migration_still_needed(tmp.path(), &dir, &[]));
     }
 }
