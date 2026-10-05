@@ -237,10 +237,12 @@ const EXHAUSTED_SQL: &str = "UPDATE autumn_outbox \
      WHERE seq = $4 AND claim_token = $5";
 
 /// Give back the rows of a claim that the relay did not handle. The claim
-/// counted an attempt; this takes it back.
+/// counted an attempt; this takes it back. The caller adds the `seq IN`
+/// list of the unhandled rows, so a handled row keeps its attempt.
 const RELEASE_SQL: &str = "UPDATE autumn_outbox \
      SET claim_token = NULL, locked_until = NULL, attempts = attempts - 1 \
-     WHERE claim_token = $1 AND dispatched_at IS NULL AND dead_at IS NULL";
+     WHERE claim_token = $1 AND dispatched_at IS NULL AND dead_at IS NULL \
+       AND seq IN";
 
 const PURGE_OUTBOX_SQL: &str = "DELETE FROM autumn_outbox \
      WHERE dispatched_at IS NOT NULL AND dispatched_at < $1";
@@ -1056,7 +1058,8 @@ async fn drain_pool(
         }
         handled += done;
         if done < total {
-            release(pool, &claim_token).await;
+            let unhandled: Vec<i64> = rows[done..].iter().map(|row| row.seq).collect();
+            release(pool, &claim_token, &unhandled).await;
             break;
         }
     }
@@ -1086,11 +1089,21 @@ async fn claim(
         .map_err(|error| sql_error("outbox claim", &error))
 }
 
-/// Give back the unhandled rows of a claim, so a relay can claim them at
-/// once. On failure, they come back when the lease ends.
-async fn release(pool: &Pool<RuntimeConnection>, claim_token: &str) {
+/// Give back the unhandled rows `seqs` of a claim, so a relay can claim them
+/// at once. On failure, they come back when the lease ends.
+async fn release(pool: &Pool<RuntimeConnection>, claim_token: &str, seqs: &[i64]) {
+    if seqs.is_empty() {
+        return;
+    }
+    // `seq` values are integers from the claim, so the list is safe SQL text.
+    let list = seqs
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let statement = format!("{} ({list})", sql(RELEASE_SQL));
     let released = match pool.get().await {
-        Ok(mut conn) => diesel::sql_query(sql(RELEASE_SQL))
+        Ok(mut conn) => diesel::sql_query(statement)
             .bind::<Text, _>(claim_token)
             .execute(&mut conn)
             .await
@@ -1186,8 +1199,15 @@ async fn run_handler(
             message.topic
         )));
     };
-    let future =
-        std::panic::AssertUnwindSafe(handler(state.clone(), message.clone())).catch_unwind();
+    // A handler can panic when it makes its future, before the first poll.
+    let Ok(future) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handler(state.clone(), message.clone())
+    })) else {
+        return Err(AutumnError::internal_server_error_msg(
+            "outbox handler panicked",
+        ));
+    };
+    let future = std::panic::AssertUnwindSafe(future).catch_unwind();
     let run = CURRENT_MESSAGE_ID.scope(message.id.clone(), future);
     match tokio::time::timeout(budget, run).await {
         Ok(Ok(result)) => result,

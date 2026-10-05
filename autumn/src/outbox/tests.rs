@@ -576,15 +576,60 @@ mod sqlite {
         write(&fx, "a", "t", serde_json::json!({})).await;
         let relay = fx.state.extension::<OutboxRelay>().unwrap();
         let pool = fx.state.pool().unwrap().clone();
-        claim(&relay, &pool, &fx.state, "stopping", 10)
+        let claimed = claim(&relay, &pool, &fx.state, "stopping", 10)
             .await
             .unwrap();
-        release(&pool, "stopping").await;
+        let seqs: Vec<i64> = claimed.iter().map(|row| row.seq).collect();
+        release(&pool, "stopping", &seqs).await;
         assert_eq!(count(&fx, "attempts = 0 AND claim_token IS NULL").await, 1);
         assert_eq!(
             drain(&fx.state, 10).await.unwrap(),
             1,
             "no wait for the lease"
+        );
+    }
+
+    /// Release takes back the attempt of the listed rows only. A handled row
+    /// that still has the token (its outcome did not save) keeps it.
+    #[tokio::test]
+    async fn release_skips_rows_that_are_not_listed() {
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert("t", |_, _| async { Ok(()) });
+        let fx = fixture(OutboxConfig::default(), handlers).await;
+        write(&fx, "a", "t", serde_json::json!({})).await;
+        write(&fx, "b", "t", serde_json::json!({})).await;
+        let relay = fx.state.extension::<OutboxRelay>().unwrap();
+        let pool = fx.state.pool().unwrap().clone();
+        let mut claimed = claim(&relay, &pool, &fx.state, "tok", 10).await.unwrap();
+        claimed.sort_by_key(|row| row.seq);
+        release(&pool, "tok", &[claimed[1].seq]).await;
+        assert_eq!(count(&fx, "attempts = 1 AND claim_token = 'tok'").await, 1);
+        assert_eq!(count(&fx, "attempts = 0 AND claim_token IS NULL").await, 1);
+    }
+
+    /// A handler that panics when it makes its future (before the first
+    /// poll) is a failed attempt. The relay goes on.
+    #[tokio::test]
+    async fn handler_that_panics_before_its_future_is_a_failure() {
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert(
+            "sync-boom",
+            |_, _| -> std::future::Ready<AutumnResult<()>> {
+                panic!("handler bug before the future")
+            },
+        );
+        handlers.insert("ok", |_, _| async { Ok(()) });
+        let fx = fixture(OutboxConfig::default(), handlers).await;
+        write(&fx, "a", "sync-boom", serde_json::json!({})).await;
+        write(&fx, "b", "ok", serde_json::json!({})).await;
+        assert_eq!(drain(&fx.state, 10).await.unwrap(), 2);
+        assert_eq!(
+            count(&fx, "topic = 'sync-boom' AND last_error LIKE '%panicked%'").await,
+            1
+        );
+        assert_eq!(
+            count(&fx, "topic = 'ok' AND dispatched_at IS NOT NULL").await,
+            1
         );
     }
 
