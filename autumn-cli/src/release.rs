@@ -3264,7 +3264,7 @@ fi
   [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
   # The cutover of an older run also attached the identity of a custom job
   # secret.
-  [ -n "$STUB_APP_LEGACY" ] && [ "${STUB_JOB_CUSTOM_KV_IDENTITY:-}" = /kv-id-2 ] \
+  [ -n "$STUB_APP_LEGACY" ] && { [ "${STUB_JOB_CUSTOM_KV_IDENTITY:-}" = /kv-id-2 ] || [ -n "$STUB_APP_COPIED" ]; } \
     && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"},\"/kv-id-2\":{\"principalId\":\"q\"}}},"
   # An identity that the operator added to the placeholder.
   [ -n "$STUB_APP_OWN_IDENTITY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"/other\":{\"principalId\":\"o\"}}},"
@@ -3296,6 +3296,10 @@ fi
   [ -n "$STUB_INGRESS_PLAIN" ] && ingress='{"external":false,"targetPort":3000,"transport":"http"}'
   # The snapshot that an interrupted first cutover saved in the app's tags.
   tags='{"team":"web"}'
+  if [ -n "$STUB_APP_COPIED" ]; then
+    tags=$(jq -cn '{secrets: ["queue-key"], uids: ["/kv-id-2"]} | tojson | @base64
+      | {"autumn-copied-0": ., team: "web"}')
+  fi
   if [ -n "$STUB_SAVED_INGRESS_TAGS" ]; then
     saved_external=false
     [ "$STUB_SAVED_INGRESS_TAGS" = external ] && saved_external=true
@@ -3489,6 +3493,9 @@ case "$1 $2" in
     elif [ -n "$STUB_APP_LEGACY" ]; then
       custom=""
       [ -n "$STUB_JOB_CUSTOM_KV" ] && custom=",{\"name\":\"queue-key\",\"keyVaultUrl\":\"https://kv/secrets/queue-key\",\"identity\":\"$id\"}"
+      # An interrupted first cutover copied queue-key (on /kv-id-2); the job
+      # no longer has it.
+      [ -n "$STUB_APP_COPIED" ] && custom=",{\"name\":\"queue-key\",\"keyVaultUrl\":\"https://kv/secrets/queue-key\",\"identity\":\"/kv-id-2\"}"
       echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}$custom]"
     else
       echo '[{"name":"api-key","value":"user-value"}]'
@@ -3561,6 +3568,7 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_APP_COPIED",
         "STUB_ACTIVE_SCALE_IDENTITY",
         "STUB_APP_SCALE_IDENTITY",
         "STUB_JOB_ACR_SYSTEM",
@@ -5519,6 +5527,113 @@ esac
                 >= 4,
             "stage 2 must wait until the clean revision is the only active one: {calls}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_closes_ingress_while_it_removes_credentials() {
+        // An older placeholder with credentials can have open ingress. The
+        // removal disables ingress first (after it saves it in the tags),
+        // and sends it back only after the credentials are gone.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let save_at = calls.find("az tags-patch ").expect("save");
+        let disable_at = calls.find("ingress disable").expect("disable");
+        let first_patch = calls.find("az rest --method patch").expect("patch");
+        let restore_at = calls
+            .find("az ingress-patch external=true")
+            .expect("restore");
+        assert!(save_at < disable_at && disable_at < first_patch, "{calls}");
+        assert!(
+            calls.rfind("az rest --method patch").unwrap() < restore_at,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_ingress_closed_when_the_removal_fails() {
+        // A failed removal leaves credentials on the app, so ingress stays
+        // disabled; the tags keep the snapshot for the next run.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_INGRESS_EXTERNAL", "1"),
+                ("STUB_SCALE_SECRET_REF", "database-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_records_the_copied_credentials_for_a_rollback() {
+        // The first cutover records what it copies in tags, in the same
+        // PATCH; a successful cutover removes them again.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let cutover = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(cutover.contains("\"autumn-copied-0\":\""), "{cutover}");
+        let last = calls
+            .lines()
+            .rfind(|line| line.starts_with("az tags-patch "))
+            .unwrap_or_default();
+        assert!(last.contains("\"autumn-copied-0\":null"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_the_recorded_credentials() {
+        // An interrupted first cutover copied queue-key on /kv-id-2, and the
+        // job no longer has them. The tags still name them, so the removal
+        // takes them off too.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_APP_COPIED", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage2 = bodies
+            .lines()
+            .rfind(|line| line.contains("\"secrets\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(!stage2.contains("queue-key"), "{stage2}");
+        assert!(!stage2.contains("\"/kv-id-2\":{}"), "{stage2}");
+        assert!(stage2.contains("\"autumn-copied-0\":null"), "{stage2}");
     }
 
     #[cfg(unix)]
