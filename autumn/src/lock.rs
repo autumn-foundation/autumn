@@ -60,6 +60,14 @@
 //!   served in arrival order.
 //! - **Not a lease.** There is no heartbeat/renewal; if the holder's connection
 //!   drops, the lock releases. For long-lived leader election use the scheduler.
+//! - **Not for correctness.** Use it to prevent duplicate work, not to
+//!   protect data. A network failure, `idle_session_timeout` or a failover
+//!   can release the lock while the holder runs. The lock has no token, so a
+//!   resource cannot find the overlap. To protect data, use `LeaseLock` and
+//!   check its [`FencingToken`] at the resource (issue #3053).
+//! - **Not safe behind a transaction-mode pooler.** `PgBouncer` in
+//!   `transaction` mode and similar proxies move each transaction to a
+//!   different session. Use `LeaseLock` there.
 //! - **Not row-level.** Use `with_lock` (pessimistic) or optimistic locking for
 //!   per-row contention; this is a *named*, row-independent lock.
 //! - **`PostgreSQL` only.** Advisory-lock semantics assume `PostgreSQL`.
@@ -91,6 +99,16 @@
 use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
+
+mod fencing;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod lease;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub(crate) mod pooler;
+
+pub use fencing::{FencingToken, InvalidFencingToken};
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub use lease::{Lease, LeaseGuard, LeaseLock};
 
 /// Domain-separation prefix for application distributed-lock keys.
 ///
@@ -147,6 +165,14 @@ pub enum LockError {
         /// How long the acquire waited before giving up.
         waited: Duration,
     },
+    /// A `LeaseLock` holder lost its lease while its guarded section ran.
+    /// Autumn stopped the section. Its writes with `token` can be stale.
+    LeaseLost {
+        /// The lock name.
+        name: String,
+        /// The fencing token of the lost lease.
+        token: FencingToken,
+    },
 }
 
 impl std::fmt::Display for LockError {
@@ -161,6 +187,9 @@ impl std::fmt::Display for LockError {
                 "timed out after {:.3}s acquiring distributed lock {name:?}",
                 waited.as_secs_f64()
             ),
+            Self::LeaseLost { name, token } => {
+                write!(f, "lost the lease on lock {name:?} (fencing token {token})")
+            }
         }
     }
 }
@@ -169,8 +198,8 @@ impl std::error::Error for LockError {}
 
 // `LockError` converts into `AutumnError` through the blanket
 // `impl<E: std::error::Error> From<E>` in `crate::error`, which special-cases
-// `LockError::PoolUnavailable` / `LockError::Timeout` to a `503 Service
-// Unavailable` status (see `crate::error`).
+// `LockError::PoolUnavailable` / `LockError::Timeout` / `LockError::LeaseLost`
+// to a `503 Service Unavailable` status (see `crate::error`).
 
 /// Default poll interval used by the blocking, timed acquire
 /// ([`Lock::lock_timeout`]).
@@ -1430,6 +1459,28 @@ mod tests {
             msg.contains("1.5"),
             "message should include the wait: {msg}"
         );
+    }
+
+    #[test]
+    fn lease_lost_error_maps_to_service_unavailable() {
+        let err: crate::error::AutumnError = LockError::LeaseLost {
+            name: "report".to_string(),
+            token: FencingToken::try_from(3_i64).expect("token"),
+        }
+        .into();
+        assert_eq!(
+            err.status(),
+            crate::reexports::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn lease_lost_error_names_the_token() {
+        let err = LockError::LeaseLost {
+            name: "report".to_string(),
+            token: FencingToken::try_from(3_i64).expect("token"),
+        };
+        assert!(err.to_string().contains("fencing token 3"), "{err}");
     }
 
     #[test]

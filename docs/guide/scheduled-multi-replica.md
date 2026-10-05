@@ -160,3 +160,10 @@ This is not distributed exactly-once delivery. Under partitions, clock skew, or
 hard restarts near a boundary, design scheduled tasks to be idempotent. If the
 workflow needs durable retries, history, and stronger orchestration semantics,
 use Autumn Harvest instead of `#[scheduled]`.
+
+The Postgres coordinator uses session advisory locks, so it is not safe behind
+a transaction-mode pooler (PgBouncer, RDS Proxy). See
+[Connection poolers](distributed-locks.md#connection-poolers). When a tick
+writes data that a second run must not overwrite, take a
+[`LeaseLock`](distributed-locks.md#fencing-tokens-leaselock) inside the tick
+and check its fencing token at the resource.
