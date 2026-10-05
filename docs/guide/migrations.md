@@ -194,8 +194,9 @@ run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
 `autumn migrate` passes the timeout to its `diesel` subprocess as
 `PGOPTIONS=-c lock_timeout=<ms>`. This sets it for the whole session, so:
 
-- When a pending migration has `run_in_transaction = false`, the CLI sends no
-  timeout.
+- When a pending migration has `run_in_transaction = false`, the CLI runs the
+  pending set in batches of one kind. Transactional batches get the timeout.
+  Non-transactional batches get `lock_timeout=0`.
 - When the server refuses the option (`PgBouncer` can), the CLI runs again
   without it.
 - An `options` parameter in `DATABASE_URL` replaces `PGOPTIONS`. Then the

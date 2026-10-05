@@ -1741,28 +1741,100 @@ fn child_pgoptions(
 
 /// Run the user migrations through the `diesel` CLI, with `lock_timeout` and
 /// a jittered retry (#3057). Returns whether they applied.
+///
+/// `PGOPTIONS` sets the timeout for the whole `diesel` session. So when a
+/// non-transactional migration (`CREATE INDEX CONCURRENTLY`) is pending, the
+/// pending set runs in batches of one kind: transactional batches get the
+/// timeout, non-transactional ones get `lock_timeout=0`.
 fn run_user_migrations(
     database_url: &str,
     dir: &Path,
     lock_policy: autumn_web::migrate::MigrationLockPolicy,
 ) -> bool {
     eprintln!("  Running pending migrations...\n");
-    // `lock_timeout` makes a DDL statement that waits on a long transaction
-    // fail fast, then the jittered retry runs it again (#3057).
-    // `PGOPTIONS` sets the timeout for the whole session, so it stays off when
-    // a pending migration is non-transactional (`CREATE INDEX CONCURRENTLY`).
-    let non_transactional = pending_non_transactional(database_url, dir);
-    if non_transactional {
-        eprintln!(
-            "  A pending migration has run_in_transaction = false; running without lock_timeout."
-        );
+    let non_transactional: std::collections::HashSet<String> =
+        non_transactional_versions(dir).into_iter().collect();
+    let pending = if non_transactional.is_empty() {
+        None
+    } else {
+        pending_versions(database_url, dir)
+    };
+    let outcome = match pending {
+        Some(pending) if pending.iter().any(|v| non_transactional.contains(v)) => {
+            run_diesel_in_batches(
+                database_url,
+                dir,
+                lock_policy,
+                &migration_batches(&pending, &non_transactional),
+            )
+        }
+        // All pending migrations are transactional.
+        Some(_) => run_diesel_with_policy(database_url, dir, lock_policy, true),
+        // No non-transactional migration exists, or the pending set is
+        // unknown: then the timeout stays off when one exists.
+        None => {
+            run_diesel_with_policy(database_url, dir, lock_policy, non_transactional.is_empty())
+        }
+    };
+
+    match outcome {
+        Ok(()) => {
+            eprintln!("\n\u{2713} Migrations applied successfully.");
+            true
+        }
+        Err(MigrationError::Migration(_)) => {
+            eprintln!(
+                "\n\u{274C} Migration failed in {}. Check the error output above.",
+                dir.display()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("\u{274C} {e}");
+            false
+        }
     }
+}
+
+/// Run each batch from a temporary directory that holds only its migrations.
+fn run_diesel_in_batches(
+    database_url: &str,
+    dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+    batches: &[(bool, Vec<String>)],
+) -> Result<(), MigrationError> {
+    for (transactional, versions) in batches {
+        if !transactional {
+            eprintln!(
+                "  {} has run_in_transaction = false; running it without lock_timeout.",
+                versions.join(", ")
+            );
+        }
+        let batch_dir = tempfile::TempDir::new().map_err(|e| {
+            MigrationError::Migration(format!("could not create a migration batch directory: {e}"))
+        })?;
+        copy_migration_subset(dir, batch_dir.path(), versions).map_err(|e| {
+            MigrationError::Migration(format!("could not copy migrations for a batch: {e}"))
+        })?;
+        run_diesel_with_policy(database_url, batch_dir.path(), lock_policy, *transactional)?;
+    }
+    Ok(())
+}
+
+/// Run `diesel migration run` on `dir` with the retry loop. A transactional
+/// run gets the policy timeout in `PGOPTIONS`, any other run `lock_timeout=0`.
+fn run_diesel_with_policy(
+    database_url: &str,
+    dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+    transactional: bool,
+) -> Result<(), MigrationError> {
     let mut pgoptions = child_pgoptions(
         std::env::var("PGOPTIONS").ok().as_deref(),
         lock_policy.lock_timeout,
-        non_transactional,
+        !transactional,
     );
-    let outcome = autumn_web::migrate::retry_on_lock_timeout(
+    autumn_web::migrate::retry_on_lock_timeout(
         lock_policy,
         |delay| {
             eprintln!(
@@ -1784,25 +1856,7 @@ fn run_user_migrations(
             }
             other => other,
         },
-    );
-
-    match outcome {
-        Ok(()) => {
-            eprintln!("\n\u{2713} Migrations applied successfully.");
-            true
-        }
-        Err(MigrationError::Migration(_)) => {
-            eprintln!(
-                "\n\u{274C} Migration failed in {}. Check the error output above.",
-                dir.display()
-            );
-            false
-        }
-        Err(e) => {
-            eprintln!("\u{274C} {e}");
-            false
-        }
-    }
+    )
 }
 
 /// Versions of the migrations in `dir` with `run_in_transaction = false`.
@@ -1825,19 +1879,56 @@ fn non_transactional_versions(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Whether a pending migration in `dir` is non-transactional. Unknown counts
-/// as yes, so the timeout stays off when in doubt.
-fn pending_non_transactional(database_url: &str, dir: &Path) -> bool {
-    let non_transactional = non_transactional_versions(dir);
-    if non_transactional.is_empty() {
-        return false;
+/// The pending migration versions in `dir`, in version order. `None` when
+/// they cannot be read.
+fn pending_versions(database_url: &str, dir: &Path) -> Option<Vec<String>> {
+    let source = diesel_migrations::FileBasedMigrations::from_path(dir).ok()?;
+    let mut pending = autumn_web::migrate::pending_migrations(database_url, source).ok()?;
+    pending.sort();
+    Some(pending)
+}
+
+/// `pending` split into runs of the same kind, in order. `true` marks a run
+/// of transactional migrations, which get the `lock_timeout`.
+fn migration_batches(
+    pending: &[String],
+    non_transactional: &std::collections::HashSet<String>,
+) -> Vec<(bool, Vec<String>)> {
+    let mut batches: Vec<(bool, Vec<String>)> = Vec::new();
+    for version in pending {
+        let transactional = !non_transactional.contains(version);
+        match batches.last_mut() {
+            Some((kind, versions)) if *kind == transactional => versions.push(version.clone()),
+            _ => batches.push((transactional, vec![version.clone()])),
+        }
     }
-    let Ok(source) = diesel_migrations::FileBasedMigrations::from_path(dir) else {
-        return true;
-    };
-    autumn_web::migrate::pending_migrations(database_url, source).map_or(true, |pending| {
-        pending.iter().any(|v| non_transactional.contains(v))
-    })
+    batches
+}
+
+/// The diesel version of a migration directory name:
+/// `2026-01-02-000000_name` gives `20260102000000`.
+fn migration_dir_version(name: &str) -> String {
+    name.split('_').next().unwrap_or(name).replace('-', "")
+}
+
+/// Copy the migration directories of `versions` from `src` into `dst`.
+fn copy_migration_subset(src: &Path, dst: &Path, versions: &[String]) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir() || !versions.contains(&migration_dir_version(&name)) {
+            continue;
+        }
+        let target = dst.join(&name);
+        std::fs::create_dir_all(&target)?;
+        for file in std::fs::read_dir(entry.path())? {
+            let file = file?;
+            if file.file_type()?.is_file() {
+                std::fs::copy(file.path(), target.join(file.file_name()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether the server (or a pooler such as `PgBouncer`) refused the
@@ -4672,6 +4763,47 @@ primary_url = "postgres://prod-s0:5432/app"
         assert_eq!(
             non_transactional_versions(dir.path()),
             vec!["20260102000000".to_owned()]
+        );
+    }
+
+    #[test]
+    fn migration_batches_group_runs_of_the_same_kind() {
+        let pending = ["1", "2", "3", "4", "5"].map(str::to_owned).to_vec();
+        let non_transactional = std::iter::once("3".to_owned()).collect();
+        assert_eq!(
+            migration_batches(&pending, &non_transactional),
+            vec![
+                (true, vec!["1".to_owned(), "2".to_owned()]),
+                (false, vec!["3".to_owned()]),
+                (true, vec!["4".to_owned(), "5".to_owned()]),
+            ]
+        );
+        assert_eq!(
+            migration_batches(&pending[..2], &non_transactional),
+            vec![(true, vec!["1".to_owned(), "2".to_owned()])]
+        );
+        assert!(migration_batches(&[], &non_transactional).is_empty());
+    }
+
+    #[test]
+    fn copy_migration_subset_keeps_only_the_named_versions() {
+        let src = tempfile::TempDir::new().unwrap();
+        for name in ["2026-01-01-000000_one", "2026-01-02-000000_two"] {
+            let dir = src.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("up.sql"), name).unwrap();
+            std::fs::write(dir.join("down.sql"), "SELECT 1;").unwrap();
+        }
+        let dst = tempfile::TempDir::new().unwrap();
+        copy_migration_subset(src.path(), dst.path(), &["20260102000000".to_owned()]).unwrap();
+        let copied: Vec<String> = std::fs::read_dir(dst.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(copied, vec!["2026-01-02-000000_two".to_owned()]);
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("2026-01-02-000000_two/up.sql")).unwrap(),
+            "2026-01-02-000000_two"
         );
     }
 

@@ -2258,6 +2258,8 @@ pub fn create_shard_topology(
     // inherits the `[database]` `statement_timeout`.
     #[cfg(feature = "sqlite")]
     reject_sqlite_statement_timeout(defaults.statement_timeout, &shard.primary_url)?;
+    #[cfg(feature = "sqlite")]
+    reject_sqlite_idle_in_transaction_timeout(defaults.idle_in_transaction_timeout)?;
 
     let primary = build_pool(
         &shard.primary_url,
@@ -5469,6 +5471,27 @@ mod tests {
         assert!(sqlite_target_is_shared_cache(
             "file:app.db?cache=private&cache=shared"
         ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_refuses_sqlite_idle_timeout() {
+        let shard = crate::config::ShardConfig {
+            name: "s0".to_owned(),
+            primary_url: ":memory:".to_owned(),
+            ..Default::default()
+        };
+        let defaults = DatabaseConfig {
+            idle_in_transaction_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        match create_shard_topology(&shard, &defaults) {
+            Err(PoolError::UnsupportedBackend(message)) => {
+                assert!(message.contains("idle_in_transaction_timeout"), "{message}");
+            }
+            Err(other) => panic!("expected UnsupportedBackend, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedBackend, got a topology"),
+        }
     }
 
     #[cfg(feature = "sqlite")]
