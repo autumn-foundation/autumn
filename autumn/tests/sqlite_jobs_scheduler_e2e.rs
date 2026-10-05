@@ -2323,3 +2323,130 @@ async fn sqlite_worker_that_loses_its_claim_stops_the_handler_and_leaves_the_row
     shutdown.cancel();
     job::clear_global_job_client();
 }
+
+/// Issue #3052: a fixed-delay tick stays claimed for its whole delay, even
+/// when the delay is longer than `lease_ttl_secs`. A tick claimed with no
+/// period frees after the TTL.
+#[tokio::test]
+async fn sqlite_fixed_delay_tick_stays_claimed_for_its_delay() {
+    use chrono::TimeZone as _;
+    use scheduler::SchedulerCoordinator as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let clock = autumn_web::time::TickingClock::starting_at(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid date"),
+    );
+    let coordinator = scheduler::SqliteLeaseSchedulerCoordinator::new(
+        build_sqlite_pool(&tmp),
+        "replica-a",
+        "app:scheduler",
+        Duration::from_secs(10),
+        Arc::new(clock.clone()),
+    );
+    let fleet = TaskCoordination::Fleet;
+    let hour = Duration::from_secs(3_600);
+
+    assert!(
+        coordinator
+            .try_acquire_for_period("hourly", "hourly:1", fleet, hour)
+            .await
+            .expect("acquire")
+            .is_some()
+    );
+    assert!(
+        coordinator
+            .try_acquire("cron", "cron:1", fleet)
+            .await
+            .expect("acquire")
+            .is_some()
+    );
+    clock.advance(Duration::from_secs(60));
+
+    assert!(
+        coordinator
+            .try_acquire_for_period("hourly", "hourly:1", fleet, hour)
+            .await
+            .expect("acquire")
+            .is_none(),
+        "past the TTL but inside the delay, the tick must stay claimed"
+    );
+    assert!(
+        coordinator
+            .try_acquire("cron", "cron:1", fleet)
+            .await
+            .expect("acquire")
+            .is_some(),
+        "with no period, the row frees after the TTL"
+    );
+}
+
+/// Issue #3052: a constant key used as a mutex (ACME issuance).
+/// `release_and_free` frees it at once, and only the caller's own row.
+#[tokio::test]
+async fn sqlite_release_and_free_frees_only_its_own_row() {
+    use chrono::TimeZone as _;
+    use scheduler::SchedulerCoordinator as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let clock = autumn_web::time::TickingClock::starting_at(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid date"),
+    );
+    let pool = build_sqlite_pool(&tmp);
+    let build = |replica: &str| {
+        scheduler::SqliteLeaseSchedulerCoordinator::new(
+            pool.clone(),
+            replica,
+            "app:scheduler",
+            Duration::from_secs(10),
+            Arc::new(clock.clone()),
+        )
+    };
+    let (a, b) = (build("replica-a"), build("replica-b"));
+    let fleet = TaskCoordination::Fleet;
+
+    let lease = a
+        .try_acquire("acme", "acme:cert", fleet)
+        .await
+        .expect("acquire")
+        .expect("A leads");
+    assert!(
+        b.try_acquire("acme", "acme:cert", fleet)
+            .await
+            .expect("acquire")
+            .is_none()
+    );
+    lease.release_and_free().await.expect("free");
+    assert!(
+        b.try_acquire("acme", "acme:cert", fleet)
+            .await
+            .expect("acquire")
+            .is_some(),
+        "a freed key is free at once"
+    );
+
+    let stale = a
+        .try_acquire("acme", "acme:other", fleet)
+        .await
+        .expect("acquire")
+        .expect("A leads");
+    clock.advance(Duration::from_secs(60));
+    let _b_holds = b
+        .try_acquire("acme", "acme:other", fleet)
+        .await
+        .expect("acquire")
+        .expect("A's row expired");
+    stale.release_and_free().await.expect("free");
+    assert!(
+        a.try_acquire("acme", "acme:other", fleet)
+            .await
+            .expect("acquire")
+            .is_none(),
+        "B still holds the key"
+    );
+}

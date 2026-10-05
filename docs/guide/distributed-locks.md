@@ -7,8 +7,9 @@ critical sections without hand-rolling Postgres advisory locks or reasoning
 about connection lifetimes.
 
 It is the same advisory-lock machinery Autumn already trusts in production to
-gate its own migrations, `#[scheduled]` leader election, and ISR revalidation —
-promoted into a small, safe public API.
+gate its own migrations and ISR revalidation — promoted into a small, safe
+public API. (`#[scheduled]` uses a tick table instead; see
+[scheduled-multi-replica.md](scheduled-multi-replica.md).)
 
 ## Quick start
 
