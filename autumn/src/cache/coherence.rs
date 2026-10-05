@@ -1282,7 +1282,7 @@ pub async fn invalidate_namespace_async(namespace: &str) -> bool {
         stores
     } else {
         let owned = namespace.to_owned();
-        match tokio::task::spawn_blocking(move || fence_and_collect_stores(&owned)).await {
+        match crate::time::spawn_blocking(move || fence_and_collect_stores(&owned)).await {
             Ok(stores) => stores,
             Err(join) => match join.try_into_panic() {
                 Ok(panic) => std::panic::resume_unwind(panic),
