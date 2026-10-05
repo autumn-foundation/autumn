@@ -182,26 +182,35 @@ fn comments_table(project_root: &Path) -> CommentsTable {
     classify(&migration_up_sql(project_root))
 }
 
-/// Whether the shared table survives a `destroy` of the model whose own table
-/// is `comments` (#2283).
+/// Whether `destroy` must keep `migration_dir` (#2283).
 ///
-/// The replay leaves out every `*_create_comments` migration except the
-/// generator's byte-identical shared one, as if `destroy` removed it. The
-/// shared table must still come out whole.
+/// True when another `#[commentable]` model still needs the shared table, and
+/// the table is not whole without this migration — an adopted `comments`
+/// table starts with the `Comment` model's own `CREATE TABLE`. `excluding`
+/// lists the files the same `destroy` removes.
 #[must_use]
-pub fn shared_table_survives_comment_model_destroy(
+pub fn comments_migration_still_needed(
     project_root: &Path,
-    backend: autumn_web::config::DatabaseBackend,
+    migration_dir: &Path,
+    excluding: &[std::path::PathBuf],
 ) -> bool {
-    let ours = up_sql(backend);
-    let kept = migration_up_sql_where(project_root, |dir, sql| {
-        let named_like_ours = dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(MIGRATION_SUFFIX));
-        !named_like_ours || sql == ours
-    });
-    classify(&kept) == CommentsTable::Shared
+    let name = migration_dir.file_name();
+    if !name
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(MIGRATION_SUFFIX))
+    {
+        return false;
+    }
+    let src = project_root.join("src");
+    let commentable_elsewhere = commentable_declared_below(&src.join("models"), excluding)
+        || std::fs::read_to_string(src.join("models.rs"))
+            .is_ok_and(|models| models.contains("#[commentable"));
+    if !commentable_elsewhere {
+        return false;
+    }
+    let without = migration_up_sql_where(project_root, |dir, _| dir.file_name() != name);
+    comments_table(project_root) == CommentsTable::Shared
+        && classify(&without) != CommentsTable::Shared
 }
 
 /// Classify the `comments` table that `files`, replayed in order, leave.
@@ -1259,14 +1268,14 @@ pub fn push_commentable_migration(
 ///
 /// Recursive: model layout below `src/models/` is the app's business, not the
 /// generator's, and a missed declaration here costs a surviving model its table.
-fn commentable_declared_below(dir: &Path, destroying_path: &Path) -> bool {
+fn commentable_declared_below(dir: &Path, excluding: &[std::path::PathBuf]) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_dir() {
-            if commentable_declared_below(&path, destroying_path) {
+            if commentable_declared_below(&path, excluding) {
                 return true;
             }
             continue;
@@ -1275,7 +1284,7 @@ fn commentable_declared_below(dir: &Path, destroying_path: &Path) -> bool {
         // different model from `src/models/post.rs` and must still count as a
         // survivor when the flat one is destroyed — skipping it by shared
         // filename would delete the shared migration out from under it.
-        if path == destroying_path {
+        if excluding.contains(&path) {
             continue;
         }
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
@@ -1324,7 +1333,7 @@ pub fn another_model_is_still_commentable(project_root: &Path, destroying_model:
     // file simply fails, so a flat scan would conclude nobody else needs the
     // shared table and delete the migration out from under a model that does.
     // The cost of the mistake is a deployment with no storage for a live model.
-    if commentable_declared_below(&models_dir, &models_dir.join(&destroying_file)) {
+    if commentable_declared_below(&models_dir, &[models_dir.join(&destroying_file)]) {
         return true;
     }
 
@@ -3207,5 +3216,78 @@ mod tests {
         // On an absent table, the same statement creates it.
         std::fs::remove_dir_all(&first).expect("rm");
         assert!(conflicting_comments_table(tmp.path()));
+    }
+
+    /// Plant `migrations/<dir>/up.sql` for each pair, and a `Post` model that
+    /// is still `#[commentable]`.
+    fn project_with(migrations: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for (dir, sql) in migrations {
+            let dir = tmp.path().join("migrations").join(dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("up.sql"), sql).expect("write");
+        }
+        let models = tmp.path().join("src").join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+        std::fs::write(
+            models.join("post.rs"),
+            "#[commentable]\npub struct Post {}\n",
+        )
+        .expect("write");
+        tmp
+    }
+
+    /// A `Comment` migration that declares every shared column is the only
+    /// `CREATE TABLE comments`, so `destroy` must keep it.
+    #[test]
+    fn a_full_column_comment_migration_is_still_needed() {
+        let full = format!(
+            "CREATE TABLE comments ({});\n",
+            REQUIRED_COLUMNS
+                .iter()
+                .map(|column| format!("{column} BIGINT"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let tmp = project_with(&[("0001_create_comments", &full)]);
+        let dir = tmp.path().join("migrations").join("0001_create_comments");
+        assert!(comments_migration_still_needed(tmp.path(), &dir, &[]));
+
+        // The `Post` model is part of the same `destroy`: nothing needs it.
+        let post = tmp.path().join("src").join("models").join("post.rs");
+        assert!(!comments_migration_still_needed(tmp.path(), &dir, &[post]));
+    }
+
+    /// The generator's shared table was renamed away, then a plain table was
+    /// adopted. The live table starts with the plain migration.
+    #[test]
+    fn an_adopted_table_after_a_renamed_shared_one_is_still_needed() {
+        let ours = up_sql(DatabaseBackend::Postgres);
+        let tmp = project_with(&[
+            ("0001_create_comments", &ours),
+            (
+                "0002_retire",
+                "ALTER TABLE comments RENAME TO legacy_comments;\n",
+            ),
+            (
+                "0003_create_comments",
+                "CREATE TABLE comments (id BIGINT, body TEXT, created_at TIMESTAMP);\n",
+            ),
+            (
+                "0004_adopt",
+                "ALTER TABLE comments ADD COLUMN commentable_type TEXT, ADD COLUMN commentable_id BIGINT, \
+                 ADD COLUMN parent_id BIGINT, ADD COLUMN author_id BIGINT, ADD COLUMN deleted_at TIMESTAMP;\n",
+            ),
+        ]);
+        let plain = tmp.path().join("migrations").join("0003_create_comments");
+        assert!(comments_migration_still_needed(tmp.path(), &plain, &[]));
+    }
+
+    /// Only a `*_create_comments` migration is ever kept.
+    #[test]
+    fn another_migration_is_never_kept() {
+        let tmp = project_with(&[("0001_create_posts", "CREATE TABLE posts (id BIGINT);\n")]);
+        let dir = tmp.path().join("migrations").join("0001_create_posts");
+        assert!(!comments_migration_still_needed(tmp.path(), &dir, &[]));
     }
 }
