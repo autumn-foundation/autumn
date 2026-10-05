@@ -4375,7 +4375,7 @@ mod tests {
             let _guard = span.enter();
             runtime.block_on(async {
                 let request = Client::new().get("http://payments/echo");
-                let traceparent = serve_sim_host(echo(), &request, url.clone())
+                let traceparent = serve_sim_host(echo(), &request, url.clone(), None)
                     .await
                     .unwrap()
                     .text();
@@ -4384,7 +4384,9 @@ mod tests {
                 let request = Client::new()
                     .get("http://payments/echo")
                     .header("traceparent", "caller-value");
-                let response = serve_sim_host(echo(), &request, url.clone()).await.unwrap();
+                let response = serve_sim_host(echo(), &request, url.clone(), None)
+                    .await
+                    .unwrap();
                 assert_eq!(response.text(), "caller-value");
             });
         });
