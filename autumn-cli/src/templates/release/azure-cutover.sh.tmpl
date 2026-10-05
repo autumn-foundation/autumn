@@ -88,6 +88,11 @@ az containerapp secret list \
   --show-values \
   --output json > "$APP_SECRETS"
 APP_ID=$(jq -r '.id' <<< "$APP")
+# The ingress as it is now. The first cutover disables ingress, and the CLI
+# "ingress enable" command would build a new ingress object without custom
+# domains, IP restrictions or CORS. So the script sends this saved
+# object back. fqdn is read-only.
+SAVED_INGRESS=$(jq -c '.properties.configuration.ingress // null | if . then del(.fqdn) else . end' <<< "$APP")
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 # The active revisions decide if a real release runs. The template image is
 # not enough: after a canceled first cutover, the template has the real
@@ -155,6 +160,8 @@ REMOVED='
     and all(.properties.configuration.secrets // [] | .[];
             .name | IN("database-url", "signing-secret", "redis-url") | not)'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
+INGRESS_SET='.properties.provisioningState == "Succeeded" and .properties.configuration.ingress != null'
+# shellcheck disable=SC2016 # a jq program, not a shell expression
 REDIS_GONE='
   .properties.provisioningState == "Succeeded"
   and all(.properties.configuration.secrets // [] | .[]; .name != "redis-url")'
@@ -178,6 +185,31 @@ app_shows() {
 patch_app() {
   printf '%s' "$1" > "$BODY"
   az rest --method patch --url "$APP_ID?$API" --body "@$BODY" --output none
+}
+
+# Sends the saved ingress back with the given external value, and waits until
+# the app shows it. Without a saved ingress, it uses the port and transport
+# that main.tf sets.
+set_ingress() {
+  local body
+  body=$(jq -cn --argjson app "$APP" --argjson saved "$SAVED_INGRESS" --argjson external "$1" '
+    {location: $app.location, properties: {configuration: {ingress:
+      (($saved // {targetPort: 3000, transport: "http"}) | .external = $external)}}}')
+  patch_app "$body" || return 1
+  for _ in $(seq 1 30); do
+    sleep 10
+    app_shows "$INGRESS_SET" && return 0
+  done
+  return 1
+}
+
+# Opens external ingress. On a later deploy with open ingress, nothing
+# changes, so the script sends nothing.
+open_ingress() {
+  if [ -n "$RELEASED" ] && [ "$(jq -r '.external // false' <<< "$SAVED_INGRESS")" = true ]; then
+    return 0
+  fi
+  set_ingress true
 }
 
 # Waits until the given revision is the only active one. Provisioned is not
@@ -346,7 +378,13 @@ remove_credentials() {
 rollback() {
   [ -n "$RELEASED" ] && return
   echo "::warning::removing the credentials from the placeholder app" >&2
-  remove_credentials && return
+  if remove_credentials; then
+    # The first cutover disabled ingress. Bring the saved ingress back, as
+    # it was (closed), now that the placeholder has no credentials.
+    [ "$SAVED_INGRESS" = null ] || set_ingress false \
+      || echo "::warning::restore the ingress of $AZURE_APP_NAME manually" >&2
+    return
+  fi
   echo "::error::rollback failed: remove the identity and secrets from $AZURE_APP_NAME manually" >&2
 }
 
@@ -510,6 +548,13 @@ for _ in $(seq 1 60); do
 done
 [ -n "$READY" ] || fail "the new revision was not provisioned in time"
 
+# The revision serves only when it is the only active one; until then, the
+# old revision serves. On the first cutover the placeholder now has the
+# identity and secrets, and ingress must not wake it. On a later deploy the
+# deploy is not done while the old image serves. The script also waits on a
+# same-tag retry: an earlier run can stop before the revision took over.
+sole_active "$REVISION" || fail "revision $REVISION did not become the only active revision"
+
 # No new revision: secrets are application-scope, and the running revision
 # reads them only when it starts.
 if [ -n "$RESTART" ]; then
@@ -520,24 +565,8 @@ if [ -n "$RESTART" ]; then
     --output none || fail "cannot restart revision $REVISION"
 fi
 
-# A new revision serves only when it is the only active one; until then,
-# the old revision serves. On the first cutover the placeholder now has the
-# identity and secrets, and ingress must not wake it. On a later deploy the
-# deploy is not done while the old image serves. (A restart makes no new
-# revision.)
-if [ -z "$RESTART" ]; then
-  sole_active "$REVISION" || fail "revision $REVISION did not become the only active revision"
-fi
-
-# The new revision runs the real image. Open external ingress now. On a
-# later run, this command changes nothing.
-az containerapp ingress enable \
-  --name "$AZURE_APP_NAME" \
-  --resource-group "$AZURE_RESOURCE_GROUP" \
-  --type external \
-  --target-port 3000 \
-  --transport http \
-  --output none
+# The new revision runs the real image. Open external ingress now.
+open_ingress || fail "cannot open external ingress"
 
 # Remove the unused redis-url secret when no other revision is active. The
 # release runs already, so a failure here is only a warning.

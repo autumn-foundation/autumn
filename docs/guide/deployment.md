@@ -2053,7 +2053,10 @@ disables ingress (also the internal route) and waits until the placeholder
 runs no replica. Then nothing can start the placeholder again. Keep
 `min_replicas = 0` until then. If the first cutover fails, the script removes the credentials. The
 job also has them, but runs only after you set the real image on it. External
-ingress stays **disabled** until the new revision runs the real image (#2312).
+ingress stays **disabled** until the new revision runs the real image and is
+the only active revision (#2312). The script saves the ingress before it
+disables it, and sends it back, so custom domains, IP restrictions and CORS
+settings stay.
 Build and push your real image, run migrations, then cut the app over:
 
 ```bash

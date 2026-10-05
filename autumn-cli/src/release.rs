@@ -3143,7 +3143,7 @@ previous_secrets = []
             .rfind("\nopen_ingress")
             .expect("the script must open external ingress");
         assert!(patch_at < provisioned_at && provisioned_at < ready_at && ready_at < enable_at);
-        assert!(script.contains(".external = true"));
+        assert!(script.contains("set_ingress true"));
         assert!(
             script.contains("\"$REVISION_IMAGE\" = \"$IMAGE\""),
             "ingress must open only when the new revision runs the real image: {script}"
@@ -3490,9 +3490,10 @@ esac
         let replicas_at = calls
             .find("az containerapp replica list")
             .unwrap_or_else(|| panic!("the first cutover must check the placeholder: {calls}"));
+        // The cutover PATCH, then the saved ingress with external access.
         assert_eq!(
             calls.matches("az rest --method patch").count(),
-            1,
+            2,
             "{calls}"
         );
         let patch_at = calls.find("az rest --method patch").unwrap();
@@ -3707,8 +3708,8 @@ esac
             calls[restart_at..].contains("--revision app--old"),
             "{calls}"
         );
-        let ingress_at = calls.find("ingress-patch external=true").unwrap();
-        assert!(restart_at < ingress_at, "{calls}");
+        // The ingress is open already, so the script sends no ingress PATCH.
+        assert!(!calls.contains("az ingress-patch"), "{calls}");
     }
 
     #[cfg(unix)]
@@ -4340,11 +4341,8 @@ esac
         };
         assert!(status.success(), "{calls}");
         let patch_at = calls.find("az rest --method patch").unwrap();
-        let ingress_at = calls
-            .find("az ingress-patch external=true")
-            .unwrap_or_else(|| panic!("{calls}"));
         assert!(
-            calls[patch_at..ingress_at]
+            calls[patch_at..]
                 .matches("az containerapp revision list")
                 .count()
                 >= 3,
