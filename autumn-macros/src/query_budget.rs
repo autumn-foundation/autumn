@@ -863,7 +863,12 @@ const STORE_METHODS: &[&str] = &[
     "extend",
     "append",
     "resize",
+    "resize_with",
     "replace",
+    "get_or_insert",
+    "get_or_insert_with",
+    "or_insert",
+    "or_insert_with",
 ];
 
 /// Offered when the fix is to stop issuing a query per row.
@@ -2365,13 +2370,16 @@ impl Analyzer {
             .take_exits(shape.label, true)
             .into_iter()
             .partition(|(exit, _)| exit.breaks);
-        // Only a `break` to this loop ends a `loop`; a `continue` does not.
-        let ends = shape.ends || !breaks.is_empty();
+        let breaks_here = !breaks.is_empty();
         let outer = std::mem::take(&mut flow.exits);
         let pass = Pass {
             again: worst(flow.fall, worst_of(continues)),
             leave: worst(worst(flow.ret, worst_of(breaks)), worst_of(outer.clone())),
         };
+        // Only a `break` to this loop ends a `loop`; a `continue` does not.
+        // A loop known to run, whose every pass leaves, never ends by itself.
+        let always_leaves = shape.bound.is_some_and(|n| n > 0) && pass.again.is_none();
+        let ends = breaks_here || (shape.ends && !always_leaves);
         let total = self.bound_loop(pass, shape.bound, shape.span, before);
         Flow {
             fall: ends.then(|| total.clone()),
@@ -2848,9 +2856,13 @@ impl Analyzer {
         {
             return;
         }
+        // A callback stores what it returns: `slot.get_or_insert_with(|| …)`.
         let held = args
             .iter()
-            .map(|a| self.value_of(a))
+            .map(|a| match a {
+                Expr::Closure(_) => self.closure_output(a, Kind::Plain),
+                _ => self.value_of(a),
+            })
             .max()
             .unwrap_or(Kind::Plain);
         if held == Kind::Plain {
@@ -2923,12 +2935,10 @@ impl Analyzer {
                         || (self.expr_is_holder(&mc.receiver)
                             && !SAME_TYPE_METHODS.contains(&method.as_str())
                             && !HANDLE_ACCESSORS.contains(&method.as_str()))
-                        || (MAPPING_ADAPTERS.contains(&method.as_str())
-                            && self.expr_is_carrier(&mc.receiver)
-                            && mc
-                                .args
-                                .last()
-                                .is_some_and(|f| self.closure_gives_container(f))))
+                        || matches!(
+                            self.mapped_kind(mc),
+                            Kind::Carrier | Kind::Holder | Kind::Nested
+                        ))
             }
             Expr::Array(a) => a.elems.iter().any(container),
             Expr::Tuple(t) => t.elems.iter().any(container),
@@ -2953,12 +2963,26 @@ impl Analyzer {
         }
     }
 
-    /// Does the closure `f`, given a handle, return a container or a user
-    /// value? It is read in a copy of the bindings, with its parameters bound
-    /// to handles.
-    fn closure_gives_container(&self, f: &Expr) -> bool {
+    /// What a mapping adapter's closure returns for each part
+    /// (`ids.iter().map(|_| &repo)`). Plain for any other method.
+    fn mapped_kind(&self, mc: &ExprMethodCall) -> Kind {
+        if !MAPPING_ADAPTERS.contains(&mc.method.to_string().as_str()) {
+            return Kind::Plain;
+        }
+        let param = match self.value_of(&mc.receiver) {
+            Kind::Plain => Kind::Plain,
+            kind => kind.element(),
+        };
+        mc.args
+            .last()
+            .map_or(Kind::Plain, |f| self.closure_output(f, param))
+    }
+
+    /// What the closure `f` returns when its parameters hold `param`. It is
+    /// read in a copy of the bindings. Plain when `f` is not a closure.
+    fn closure_output(&self, f: &Expr, param: Kind) -> Kind {
         let Expr::Closure(closure) = f else {
-            return false;
+            return Kind::Plain;
         };
         // Its own record of closed scopes: its handle parameters must not
         // reach the real one.
@@ -2972,13 +2996,12 @@ impl Analyzer {
         };
         probe.env.push();
         for input in &closure.inputs {
-            probe.bind_pat(input, Kind::Handle);
+            probe.bind_pat(input, param);
         }
-        let output = match &*closure.body {
+        match &*closure.body {
             Expr::Block(b) => probe.block_value(&b.block),
             body => probe.value_of(body),
-        };
-        matches!(output, Kind::Carrier | Kind::Holder | Kind::Nested)
+        }
     }
 
     /// Run a block's statements, then give what its tail expression holds.
@@ -3248,9 +3271,11 @@ impl Analyzer {
             Expr::Field(f) => matches!(self.part_kind(f), Some(Kind::Carrier | Kind::Holder)),
             Expr::Macro(m) => vec_elems(&m.mac).is_some_and(|elems| elems.iter().any(holds)),
             Expr::MethodCall(mc) => {
-                (CARRIER_METHODS.contains(&mc.method.to_string().as_str())
+                ((CARRIER_METHODS.contains(&mc.method.to_string().as_str())
                     || self.gives_option_of_part(mc))
-                    && self.expr_is_carrier(&mc.receiver)
+                    && self.expr_is_carrier(&mc.receiver))
+                    // `ids.iter().map(|_| &repo)` gives handles.
+                    || matches!(self.mapped_kind(mc), Kind::Handle | Kind::LazyDb)
             }
             Expr::If(i) => {
                 block_tail(&i.then_branch).is_some_and(|e| self.expr_is_carrier(e))
@@ -7089,6 +7114,67 @@ mod tests {
                 Expect::Unbounded,
             ),
         ]);
+    }
+
+    #[test]
+    fn a_callback_result_keeps_its_handle() {
+        check_handlers(&[
+            (
+                "map over plain ids that builds holders",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let ctxs = ids.into_iter().map(|_| Ctx { repo: repo.clone() }) \
+                 .collect::<Vec<_>>(); ctxs[0].clear().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map over plain ids that gives handles",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let repos: Vec<_> = ids.iter().map(|_| &repo).collect(); \
+                 for r in &repos { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "get_or_insert_with stores the callback result",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; slot.get_or_insert_with(|| Ctx { repo }); \
+                 slot.unwrap().clear().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "resize_with stores the callback result",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut list = vec![]; list.resize_with(2, || &repo); render(list); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            // Guards: a plain mapping stays plain.
+            (
+                "map over plain ids that gives plain values",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let next: Vec<i64> = ids.iter().map(|id| id + 1).collect(); \
+                 let wrapped = ids.iter().map(|id| Some(*id)).collect::<Vec<_>>(); \
+                 render(wrapped); let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_bounded_loop_whose_every_pass_leaves_does_not_fall_through() {
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "every pass returns",
+                "for _ in 0..1 { let _ = repo.a().await?; return Ok(0); } let _ = repo.b().await?;",
+                Expect::Exact(1),
+            ),
+            // Guard: a pass that may go on still reaches the code after.
+            (
+                "a pass that may go on",
+                "for _ in 0..1 { let _ = repo.a().await?; if flag { return Ok(0); } } \
+                 let _ = repo.b().await?;",
+                Expect::Exact(2),
+            ),
+        ];
+        check_cases(cases);
     }
 
     #[test]

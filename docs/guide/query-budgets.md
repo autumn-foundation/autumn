@@ -172,9 +172,12 @@ The analysis follows the handle through every name that holds it:
     on the container is reported (`repos.refresh_all()`, or an
     extension-trait `repos.ok()`).
   - A method or function given a handle may store it: after
-    `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. Every
-    method on a user struct that holds a handle (`ctx.clear()` on
+    `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. A
+    callback stores what it returns (`slot.get_or_insert_with(|| &repo)`).
+    Every method on a user struct that holds a handle (`ctx.clear()` on
     `Ctx { repo }`) is reported too.
+  - A `map` closure gives what it returns, whatever it maps over:
+    `ids.iter().map(|_| &repo)` gives handles.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
     `Option<Vec<…>>`, `[ctx]`, `repos.chunks(2)`, or
     `repos.iter().map(|r| Ctx { repo: r })`) keeps that shape for all its
