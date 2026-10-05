@@ -2129,7 +2129,7 @@ impl RequestBuilder {
     /// The deadline and retry budget for one send to `host`.
     fn retry_gate(&self, host: Option<&str>) -> RetryGate {
         RetryGate::start(
-            self.retry.budgets.as_deref(),
+            self.retry.budgets.clone(),
             host,
             self.retry.send_deadline_header,
         )
@@ -2460,6 +2460,14 @@ impl RequestBuilder {
                 strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
             }
             let client = build_oneshot_client(resolve, reqwest::redirect::Policy::none(), timeout)?;
+            // Each hop uses the retry budget of its own host.
+            let hop_gate;
+            let hop_gate = if hop == 0 {
+                gate
+            } else {
+                hop_gate = gate.for_hop(&current);
+                &hop_gate
+            };
             let resp = send_one(
                 &client,
                 &method,
@@ -2470,7 +2478,7 @@ impl RequestBuilder {
                 self.discard_response_body,
                 None,
                 is_half_open,
-                gate,
+                hop_gate,
             )
             .await?;
 
@@ -2563,7 +2571,8 @@ impl RequestBuilder {
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
         for hop in 0.. {
-            let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)?;
+            let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)
+                .map_err(|error| gate.classify(error))?;
             // Resolve host → ALL validated addresses (rejects if ANY resolved IP
             // is blocked), then pin the full set so reqwest cannot re-resolve but
             // can still fall back across the validated addresses in order.
@@ -2572,12 +2581,13 @@ impl RequestBuilder {
             // timeout of its own at all.
             let addrs = tokio::time::timeout(remaining_for_lookup, resolve_and_validate(&current))
                 .await
-                .map_err(|_| ssrf_safe_deadline_error(&current))??;
+                .map_err(|_| gate.classify(ssrf_safe_deadline_error(&current)))??;
             let host = host_of(&current)?;
             // Re-measured after the lookup, so a slow DNS response shrinks
             // what's left for the connect/response phase below rather than
             // that phase getting a fresh full `timeout` regardless.
-            let remaining_for_connect = deadline_remaining_or_timeout(deadline, &current)?;
+            let remaining_for_connect = deadline_remaining_or_timeout(deadline, &current)
+                .map_err(|error| gate.classify(error))?;
             let client = build_oneshot_client(
                 Some((host, addrs)),
                 reqwest::redirect::Policy::none(),
@@ -2588,6 +2598,14 @@ impl RequestBuilder {
             if hop > 0 {
                 strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
             }
+            // Each hop uses the retry budget of its own host.
+            let hop_gate;
+            let hop_gate = if hop == 0 {
+                gate
+            } else {
+                hop_gate = gate.for_hop(&current);
+                &hop_gate
+            };
             let resp = send_one(
                 &client,
                 &method,
@@ -2598,7 +2616,7 @@ impl RequestBuilder {
                 self.discard_response_body,
                 Some(deadline),
                 is_half_open,
-                gate,
+                hop_gate,
             )
             .await?;
 
@@ -2766,6 +2784,9 @@ pub(crate) struct SharedRetryBudgets(pub(crate) Arc<RetryBudgets>);
 /// All three retry loops (plain, sim, custom) ask it the same questions.
 struct RetryGate {
     deadline: Option<Deadline>,
+    /// All budgets of the client, to pick the budget of a redirect hop.
+    budgets: Option<Arc<RetryBudgets>>,
+    /// The budget of the current host.
     budget: Option<Arc<RetryBudget>>,
     send_header: bool,
 }
@@ -2773,17 +2794,49 @@ struct RetryGate {
 impl RetryGate {
     /// Read the current deadline. Record the first attempt in the budget of
     /// `host`.
-    fn start(budgets: Option<&RetryBudgets>, host: Option<&str>, send_header: bool) -> Self {
+    fn start(budgets: Option<Arc<RetryBudgets>>, host: Option<&str>, send_header: bool) -> Self {
+        Self::with_deadline(Deadline::current(), budgets, host, send_header)
+    }
+
+    fn with_deadline(
+        deadline: Option<Deadline>,
+        budgets: Option<Arc<RetryBudgets>>,
+        host: Option<&str>,
+        send_header: bool,
+    ) -> Self {
         let budget = budgets
+            .as_deref()
             .zip(host)
             .map(|(budgets, host)| budgets.for_host(host));
         if let Some(budget) = &budget {
             budget.record_request();
         }
         Self {
-            deadline: Deadline::current(),
+            deadline,
+            budgets,
             budget,
             send_header,
+        }
+    }
+
+    /// The gate of a redirect hop to `url`: the same deadline, and the
+    /// budget of the hop's host.
+    fn for_hop(&self, url: &str) -> Self {
+        Self::with_deadline(
+            self.deadline,
+            self.budgets.clone(),
+            url_host(url).as_deref(),
+            self.send_header,
+        )
+    }
+
+    /// `error`, or [`ClientError::DeadlineExceeded`] when the request deadline
+    /// has passed and so is the cause.
+    fn classify(&self, error: ClientError) -> ClientError {
+        if self.expired() {
+            ClientError::DeadlineExceeded
+        } else {
+            error
         }
     }
 
@@ -5960,6 +6013,38 @@ mod tests {
         }
 
         #[test]
+        fn a_redirect_hop_uses_the_budget_of_its_own_host() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let origin = RetryGate::with_deadline(
+                None,
+                Some(Arc::clone(&budgets)),
+                Some("origin:443"),
+                true,
+            );
+            let hop = origin.for_hop("https://target/x");
+            assert!(Arc::ptr_eq(
+                hop.budget.as_ref().unwrap(),
+                &budgets.for_host("target:443")
+            ));
+            assert!(!Arc::ptr_eq(
+                hop.budget.as_ref().unwrap(),
+                origin.budget.as_ref().unwrap()
+            ));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_expired_deadline_reclassifies_a_hop_error() {
+            let gate = Deadline::at(tokio::time::Instant::now())
+                .scope(async { RetryGate::start(None, None, true) })
+                .await;
+            let error = gate.classify(ClientError::InvalidUrl("dns stalled".into()));
+            assert!(matches!(error, ClientError::DeadlineExceeded));
+            let open = RetryGate::start(None, None, true);
+            let error = open.classify(ClientError::InvalidUrl("dns".into()));
+            assert!(matches!(error, ClientError::InvalidUrl(_)));
+        }
+
+        #[test]
         fn budget_keys_keep_the_port() {
             assert_eq!(url_host("http://svc:8001/a").as_deref(), Some("svc:8001"));
             assert_eq!(url_host("https://svc/a").as_deref(), Some("svc:443"));
@@ -5972,6 +6057,7 @@ mod tests {
             let budget = Arc::new(RetryBudget::new(&RetryBudgetConfig::default()));
             let gate = RetryGate {
                 deadline: None,
+                budgets: None,
                 budget: Some(Arc::clone(&budget)),
                 send_header: true,
             };
