@@ -1078,7 +1078,9 @@ Two kinds of drift are reported, and they are deliberately separate:
   `live-slot` marker disagrees with the slot kamal-proxy is actually serving (the
   next redeploy would restart the *serving* slot); the `shared/proxy-options`
   marker is unreadable (the next deploy of that host will refuse); the installed
-  proxy unit binds a different public port than `[server] port` configures; no
+  proxy unit binds a different public port than `[server] port` configures; a
+  deployed host's installed proxy unit has no readable `--http-port` (the next
+  deploy of that host will refuse; the row shows `proxy ?`); no
   release is deployed on this host while the rest of the fleet is serving one;
   the host has a `current` symlink but the release behind it could not be read
   (the link is dangling, or its target is not a directory directly in

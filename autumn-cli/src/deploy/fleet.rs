@@ -1571,17 +1571,17 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         if matches!(status.proxy_options, exec::ProxyOptionsMarker::Unreadable) {
             state_drift.push((status.host.clone(), DRIFT_PROXY_OPTIONS_UNREADABLE));
         }
-        // Only a PROVEN different port is drift: `Absent` (no unit yet) and
-        // `Unreadable` are handled by the deploy path's own fail-closed guard, and
-        // reporting them here would flag every never-deployed host.
-        if matches!(status.installed_proxy_port, exec::InstalledProxyPort::Port(port) if port != status.public_port)
-        {
-            state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
-        }
-        if status.mode == Some(HostMode::Redeploy)
-            && matches!(status.installed_proxy_port, exec::InstalledProxyPort::Unreadable)
-        {
-            state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_UNREADABLE));
+        // `Absent` is never drift: no unit is the shape before the first deploy.
+        // `Unreadable` is drift only on a deployed host, because only the redeploy
+        // path reads the port and refuses (#2278).
+        match status.installed_proxy_port {
+            exec::InstalledProxyPort::Port(port) if port != status.public_port => {
+                state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
+            }
+            exec::InstalledProxyPort::Unreadable if status.mode == Some(HostMode::Redeploy) => {
+                state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_UNREADABLE));
+            }
+            _ => {}
         }
         // Review round 1: the maintenance column is only as good as the CLI's
         // knowledge of WHICH file the running unit polls. Both failure shapes are
