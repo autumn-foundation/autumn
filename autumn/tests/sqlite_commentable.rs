@@ -444,7 +444,7 @@ async fn a_hard_delete_refuses_a_cross_record_graft_on_sqlite() {
 fn a_copied_spec_resolves_to_its_registered_model() {
     let copy = *SqcAudit::commentable_spec();
     assert!(
-        !std::ptr::eq(&copy, SqcAudit::commentable_spec()),
+        !std::ptr::eq(std::ptr::from_ref(&copy), SqcAudit::commentable_spec()),
         "the copy must have its own address"
     );
     assert_eq!(
@@ -495,21 +495,21 @@ async fn a_copied_spec_keeps_the_repository_soft_delete_rule_on_sqlite() {
     let kind = SqcAudit::COMMENTABLE_TYPE;
     let mut conn = pool.get().await.expect("conn");
 
-    let comment = add_comment(&mut *conn, &spec, kind, target, author, "hi", None, None)
+    let comment = add_comment(&mut conn, &spec, kind, target, author, "hi", None, None)
         .await
         .expect("add_comment: an audit deleted_at must not hide the parent");
-    let thread = comment_thread(&mut *conn, &spec, kind, target, None)
+    let thread = comment_thread(&mut conn, &spec, kind, target, None)
         .await
         .expect("comment_thread");
     assert_eq!(thread.len(), 1);
     assert_eq!(
-        recompute_comment_count(&mut *conn, &spec, kind, target, None)
+        recompute_comment_count(&mut conn, &spec, kind, target, None)
             .await
             .expect("recompute_comment_count"),
         1
     );
     assert_eq!(
-        delete_comment(&mut *conn, &spec, kind, target, comment.id, None)
+        delete_comment(&mut conn, &spec, kind, target, comment.id, None)
             .await
             .expect("delete_comment"),
         1
@@ -531,13 +531,13 @@ async fn a_copy_of_a_shared_spec_uses_the_facts_of_every_model_on_sqlite() {
 
     let plain = *SqcTwinA::commentable_spec();
     let kind = SqcTwinA::COMMENTABLE_TYPE;
-    add_comment(&mut *conn, &plain, kind, target, author, "hi", None, None)
+    add_comment(&mut conn, &plain, kind, target, author, "hi", None, None)
         .await
         .expect("no repository soft-deletes, so the row is live");
 
     let mixed = *SqcMixedPlain::commentable_spec();
     let kind = SqcMixedPlain::COMMENTABLE_TYPE;
-    let err = add_comment(&mut *conn, &mixed, kind, target, author, "hi", None, None)
+    let err = add_comment(&mut conn, &mixed, kind, target, author, "hi", None, None)
         .await
         .expect_err("one repository soft-deletes, so the row is hidden");
     assert_eq!(err.status().as_u16(), 404, "{err}");
