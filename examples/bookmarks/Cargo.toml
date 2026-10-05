@@ -20,7 +20,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 tracing = "0.1"
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 
 [dev-dependencies]
 # Enables TestDb (shared Postgres testcontainer) for factory integration tests.
@@ -34,6 +34,14 @@ example-e2e = { path = "../../example-e2e" }
 # Enable the headless-browser system smoke. Requires Chromium on the host.
 #   cargo test -p bookmarks --features system-tests --test smoke -- --include-ignored
 system-tests = ["autumn-web/system-tests"]
+
+[[bin]]
+# Crate-unique binary name (autumn #2639): two example crates shipping a bin
+# target named `seed` collide at link time on Windows (LNK1104). The source
+# stays at the conventional `src/bin/seed.rs` so `autumn seed` keeps finding
+# it; only the target name is prefixed.
+name = "bookmarks-seed"
+path = "src/bin/seed.rs"
 
 [[test]]
 name = "smoke"
@@ -51,3 +59,6 @@ unsafe_code = "forbid"
 # covers every target — lib, bins, tests, benches — not just one root.
 [lints.clippy]
 disallowed_methods = "allow"
+# `#[derive(diesel::QueryableByName)]` emits `field: field`; rustc 1.99 flags it on
+# the user's field. Grandfathered workspace-wide in the root `Cargo.toml`.
+redundant_field_names = "allow"

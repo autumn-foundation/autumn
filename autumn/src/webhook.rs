@@ -4,6 +4,14 @@
 //! exact HTTP request bytes before handler code runs. Configure endpoints with
 //! [`WebhookEndpointConfig`] under `security.webhooks.endpoints`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -826,7 +834,7 @@ impl RedisWebhookReplayStore {
             .as_deref()
             .filter(|url| !url.trim().is_empty())
             .ok_or(WebhookConfigError::RedisReplayMissingUrl)?;
-        let client = redis::Client::open(url)
+        let client = crate::redis_tls::open_client(url)
             .map_err(|error| WebhookConfigError::RedisReplayInvalidUrl(error.to_string()))?;
         let connection = redis::aio::ConnectionManager::new_lazy_with_config(
             client,
@@ -969,7 +977,11 @@ impl FromRequest<crate::AppState> for SignedWebhook {
                     "webhook body could not be read: {err}"
                 ))
             })?;
-        let received_at = SystemTime::now();
+        // The ambient clock: real time outside a `Sim`, as the provider signs
+        // with real time, and the sim clock inside one (issue #2967). Not the
+        // app clock: a test that pins `TestApp::with_clock` still signs with
+        // real time.
+        let received_at = crate::time::ambient_system_time();
         verify_request(&registry, &endpoint, &parts.headers, body, received_at)
             .await
             .map_err(WebhookVerifyError::into_autumn_error)
@@ -1617,7 +1629,7 @@ fn validate_redis_replay_config(
 
     #[cfg(feature = "redis")]
     {
-        redis::Client::open(url)
+        crate::redis_tls::open_client(url)
             .map_err(|error| WebhookConfigError::RedisReplayInvalidUrl(error.to_string()))?;
         Ok(())
     }
@@ -1660,6 +1672,65 @@ pub(crate) fn install_registry_from_config(
     let registry = WebhookRegistry::from_config(config)?;
     state.insert_extension(registry);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_stripe_signature_valid() {
+        let header = "t=1614556800,v1=signature1,v1=signature2,v0=ignored";
+        let (timestamp, signatures) = parse_stripe_signature(header).unwrap();
+        assert_eq!(timestamp, 1_614_556_800);
+        assert_eq!(signatures, vec!["signature1", "signature2"]);
+    }
+
+    #[test]
+    fn test_parse_stripe_signature_missing_timestamp() {
+        let header = "v1=signature1";
+        let err = parse_stripe_signature(header).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedTimestamp));
+    }
+
+    #[test]
+    fn test_parse_stripe_signature_missing_signatures() {
+        let header = "t=1614556800";
+        let err = parse_stripe_signature(header).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedSignature));
+    }
+
+    #[test]
+    fn test_parse_stripe_signature_malformed_parts() {
+        let header = "t=1614556800,v1";
+        let err = parse_stripe_signature(header).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedSignature));
+    }
+
+    #[test]
+    fn test_parse_stripe_signature_malformed_timestamp() {
+        let header = "t=not_a_number,v1=signature1";
+        let err = parse_stripe_signature(header).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedTimestamp));
+    }
+
+    #[test]
+    fn test_verify_timestamp_valid() {
+        let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
+        assert!(verify_timestamp(1_614_556_800, received_at, 300).is_ok());
+        assert!(verify_timestamp(1_614_556_800 + 300, received_at, 300).is_ok());
+        assert!(verify_timestamp(1_614_556_800 - 300, received_at, 300).is_ok());
+    }
+
+    #[test]
+    fn test_verify_timestamp_stale() {
+        let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
+        let err = verify_timestamp(1_614_556_800 + 301, received_at, 300).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::StaleTimestamp));
+
+        let err2 = verify_timestamp(1_614_556_800 - 301, received_at, 300).unwrap_err();
+        assert!(matches!(err2, WebhookVerifyError::StaleTimestamp));
+    }
 }
 
 /// Direct coverage for [`WebhookReplayCleanupService`] and its future's state
@@ -1864,5 +1935,89 @@ mod replay_cleanup_service_tests {
             "a cancelled webhook delivery must release the replay keys it \
              registered, so the provider's redelivery is accepted"
         );
+    }
+}
+
+#[cfg(test)]
+mod payload_extractor_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn should_extract_slack_delivery_id_from_event_id() {
+        let payload = json!({
+            "event_id": "Ev12345",
+            "type": "event_callback"
+        });
+        assert_eq!(
+            slack_delivery_id(Some(&payload)),
+            Some("Ev12345".to_owned())
+        );
+    }
+
+    #[test]
+    fn should_extract_slack_delivery_id_from_url_verification_challenge() {
+        let payload = json!({
+            "type": "url_verification",
+            "challenge": "Ch9876"
+        });
+        assert_eq!(slack_delivery_id(Some(&payload)), Some("Ch9876".to_owned()));
+    }
+
+    #[test]
+    fn should_return_none_when_slack_payload_missing_identifiers() {
+        let payload = json!({
+            "type": "event_callback",
+            "text": "hello"
+        });
+        assert_eq!(slack_delivery_id(Some(&payload)), None);
+    }
+
+    #[test]
+    fn should_return_none_when_slack_payload_is_none() {
+        assert_eq!(slack_delivery_id(None), None);
+    }
+
+    #[test]
+    fn should_extract_json_string_field() {
+        let payload = json!({
+            "id": "123",
+            "count": 45
+        });
+        assert_eq!(
+            json_string_field(Some(&payload), "id"),
+            Some("123".to_owned())
+        );
+        assert_eq!(json_string_field(Some(&payload), "count"), None); // Not a string
+        assert_eq!(json_string_field(Some(&payload), "missing"), None);
+        assert_eq!(json_string_field(None, "id"), None);
+    }
+
+    #[test]
+    fn should_extract_nested_json_string_field() {
+        let payload = json!({
+            "event": {
+                "type": "message",
+                "count": 1
+            },
+            "other": "value"
+        });
+        assert_eq!(
+            nested_json_string_field(Some(&payload), "event", "type"),
+            Some("message".to_owned())
+        );
+        assert_eq!(
+            nested_json_string_field(Some(&payload), "event", "count"),
+            None
+        ); // Not a string
+        assert_eq!(
+            nested_json_string_field(Some(&payload), "event", "missing"),
+            None
+        );
+        assert_eq!(
+            nested_json_string_field(Some(&payload), "missing", "type"),
+            None
+        );
+        assert_eq!(nested_json_string_field(None, "event", "type"), None);
     }
 }

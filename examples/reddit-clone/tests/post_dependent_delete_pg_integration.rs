@@ -1,4 +1,4 @@
-//! PostgreSQL proof for the reddit-clone's real `Post` dependent graph.
+//! `PostgreSQL` proof for the reddit-clone's real `Post` dependent graph.
 //! The success case covers destroy-vs-bulk semantics and nullable vote targets;
 //! the failure case proves the generated cascade is one atomic transaction.
 

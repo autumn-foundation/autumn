@@ -31,11 +31,181 @@
 //! handler makes outside the cell's API are out of scope by design. This is a
 //! safe-Rust accounting cell, not a bounding allocator.
 
-use std::collections::HashMap;
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
+
+/// The safe, allocator-backed region for the allocation classes Autumn can
+/// enforce: owned byte buffers and UTF-8 strings created by this API.
+///
+/// This is deliberately not a global allocator.  Ordinary `Vec`, `String`,
+/// `Box`, third-party, and allocator-internal allocations remain outside this
+/// cooperative tracked-memory boundary.
+#[derive(Clone, Debug)]
+pub struct TenantArena {
+    cell: TenantCell,
+}
+
+impl TenantArena {
+    /// Allocate a zero-filled byte buffer owned by this tenant region.
+    ///
+    /// Reservation happens before allocation. Quota exhaustion therefore does
+    /// not allocate and does not mutate accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TenantAllocationError::Quota`] when the finite quota would be
+    /// exceeded, or [`TenantAllocationError::Allocator`] if the process
+    /// allocator rejects the reservation.
+    pub fn try_bytes(&self, len: usize) -> Result<TenantBytes, TenantAllocationError> {
+        let charge = self.cell.try_charge(len)?;
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(len)
+            .map_err(|error| TenantAllocationError::Allocator {
+                requested: len,
+                source: error,
+            })?;
+        let excess_charge = (value.capacity() > len)
+            .then(|| self.cell.try_charge(value.capacity() - len))
+            .transpose()?;
+        value.resize(len, 0);
+        Ok(TenantBytes {
+            value,
+            charge,
+            excess_charge,
+        })
+    }
+
+    /// Copy `value` into an owned UTF-8 allocation in this tenant region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TenantAllocationError::Quota`] when the finite quota would be
+    /// exceeded, or [`TenantAllocationError::Allocator`] if the process
+    /// allocator rejects the reservation.
+    pub fn try_string(&self, value: &str) -> Result<TenantString, TenantAllocationError> {
+        let charge = self.cell.try_charge(value.len())?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(value.len())
+            .map_err(|error| TenantAllocationError::Allocator {
+                requested: value.len(),
+                source: error,
+            })?;
+        let excess_charge = (owned.capacity() > value.len())
+            .then(|| self.cell.try_charge(owned.capacity() - value.len()))
+            .transpose()?;
+        owned.push_str(value);
+        Ok(TenantString {
+            value: owned,
+            charge,
+            excess_charge,
+        })
+    }
+
+    /// Tenant accounting domain backing this arena.
+    #[must_use]
+    pub fn tenant_id(&self) -> &str {
+        self.cell.tenant_id()
+    }
+}
+
+/// A byte allocation whose ownership and accounting cannot be separated.
+#[derive(Debug)]
+pub struct TenantBytes {
+    value: Vec<u8>,
+    charge: Charge,
+    excess_charge: Option<Charge>,
+}
+
+impl TenantBytes {
+    /// Borrow the allocation.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.value
+    }
+    /// Mutably borrow the fixed-size allocation.
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.value
+    }
+    /// Number of quota bytes owned by this allocation.
+    #[must_use]
+    pub fn tracked_bytes(&self) -> usize {
+        self.charge.bytes() + self.excess_charge.as_ref().map_or(0, Charge::bytes)
+    }
+}
+
+/// A UTF-8 allocation whose ownership and accounting cannot be separated.
+#[derive(Debug)]
+pub struct TenantString {
+    value: String,
+    charge: Charge,
+    excess_charge: Option<Charge>,
+}
+
+impl TenantString {
+    /// Borrow the allocation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+    /// Number of quota bytes owned by this allocation.
+    #[must_use]
+    pub fn tracked_bytes(&self) -> usize {
+        self.charge.bytes() + self.excess_charge.as_ref().map_or(0, Charge::bytes)
+    }
+}
+
+/// Failure to reserve tenant quota or obtain memory from the process allocator.
+#[derive(Debug)]
+pub enum TenantAllocationError {
+    /// The tenant's finite cooperative quota was exhausted.
+    Quota(QuotaExceeded),
+    /// The system allocator rejected a reservation after quota was reserved.
+    Allocator {
+        requested: usize,
+        source: std::collections::TryReserveError,
+    },
+}
+
+impl From<QuotaExceeded> for TenantAllocationError {
+    fn from(value: QuotaExceeded) -> Self {
+        Self::Quota(value)
+    }
+}
+
+impl fmt::Display for TenantAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Quota(error) => error.fmt(f),
+            Self::Allocator { requested, source } => write!(
+                f,
+                "allocator rejected tenant scratch reservation of {requested} bytes: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TenantAllocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Quota(error) => Some(error),
+            Self::Allocator { source, .. } => Some(source),
+        }
+    }
+}
 
 /// Fixed bytes charged per scratch entry to cover the map's per-entry overhead:
 /// the `String` and `Vec` structs stored inline in the bucket array plus an
@@ -43,6 +213,68 @@ use std::time::{Duration, Instant};
 /// scratch entries against the quota, so a tenant storing many tiny entries
 /// cannot amplify its footprint past the configured cap via map growth.
 const SCRATCH_ENTRY_OVERHEAD: usize = std::mem::size_of::<(String, Vec<u8>)>() + 16;
+
+/// Maximum lifecycle tombstones examined by one mutating registry operation.
+/// This amortizes cleanup so high-cardinality in-flight traffic cannot turn a
+/// cache miss into a scan of every live accounting domain under the write lock.
+const LIFECYCLE_SWEEP_BUDGET: usize = 16;
+
+/// Deterministic lower-bound model of the process-resident structure used by a
+/// registry.
+///
+/// This is deliberately separate from [`TenantCell::tracked_bytes`]: quota
+/// accounting describes tenant payload, while this report describes the fixed
+/// machinery required to keep otherwise-empty cells resident. The model uses
+/// Rust layout sizes, observed `String` capacities, and the registry map's
+/// current capacity. It does **not** attempt to count allocator headers,
+/// size-class rounding, or fragmentation, none of which has a stable portable
+/// representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TenantCellStructuralOverhead {
+    /// Number of cells represented by this report.
+    pub resident_cells: usize,
+    /// Registry state shared by every cell, including its synchronization
+    /// fields and the two registry-owned `Arc` allocation headers.
+    pub registry_fixed_bytes: usize,
+    /// Payloads of the `Arc<TenantCell>` allocations.
+    pub tenant_cell_bytes: usize,
+    /// Payloads of the `Arc<TenantCellInner>` allocations. This includes the
+    /// atomics, scratch-map header, mutex, and global-gauge `Arc` pointer.
+    pub tenant_cell_inner_bytes: usize,
+    /// Inline values in occupied map buckets: each resident `(String,
+    /// Arc<TenantCell>)` entry plus every `(String, Weak<_>)` lifecycle record
+    /// (resident, evicted-but-live, or awaiting the tombstone sweep).
+    pub registry_entry_bytes: usize,
+    /// Heap capacity of the tenant-id copies: each resident cell's registry
+    /// key and own id, plus every lifecycle record's key.
+    pub tenant_id_capacity_bytes: usize,
+    /// Two strong/weak counter pairs: one for each per-cell `Arc` allocation.
+    pub arc_header_bytes: usize,
+    /// Current element capacity reported by [`HashMap::capacity`]. This can
+    /// decrease as tombstones accumulate even though the allocation is retained.
+    pub registry_element_capacity: usize,
+    /// Estimated backing bucket count. `HashMap::capacity()` is an element
+    /// capacity, not a bucket count; this is the high-water mark of the current
+    /// `SwissTable` implementation's power-of-two backing bucket estimate.
+    pub registry_bucket_count: usize,
+    /// Lower bound for unoccupied backing slots plus one control byte per
+    /// bucket, across the resident map and the lifecycle map. This excludes
+    /// the implementation's trailing control group and allocation padding.
+    pub registry_bucket_bytes: usize,
+    /// Sum of all deterministic lower-bound structural components.
+    pub total_bytes: usize,
+}
+
+impl TenantCellStructuralOverhead {
+    /// Structural bytes per resident cell, excluding the one-off registry.
+    #[must_use]
+    pub const fn per_cell_bytes(self) -> usize {
+        if self.resident_cells == 0 {
+            return 0;
+        }
+        (self.total_bytes - self.registry_fixed_bytes) / self.resident_cells
+    }
+}
 
 /// Error returned when a charge would exceed a tenant's soft memory quota.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,6 +552,12 @@ impl TenantCell {
         self.inner.tracked_bytes.load(Ordering::Relaxed)
     }
 
+    /// Return the safe region used for supported tenant-owned scratch buffers.
+    #[must_use]
+    pub fn arena(&self) -> TenantArena {
+        TenantArena { cell: self.clone() }
+    }
+
     /// The fixed per-entry overhead (bytes) charged against the quota for each
     /// stored scratch entry, in addition to the key and value capacities.
     #[must_use]
@@ -480,7 +718,14 @@ pub struct TenantCellRegistry {
 }
 
 struct RegistryInner {
-    cells: RwLock<HashMap<String, Arc<TenantCell>>>,
+    state: RwLock<RegistryState>,
+    /// High-water backing-bucket estimate. Removing entries can consume
+    /// tombstones and lower `HashMap::capacity()` without shrinking its backing
+    /// allocation, so the current capacity alone is insufficient.
+    registry_bucket_high_water: AtomicUsize,
+    /// The same high-water estimate for the lifecycle map, which keeps its
+    /// backing allocation as tombstones are swept.
+    lifecycle_bucket_high_water: AtomicUsize,
     global_tracked: Arc<AtomicUsize>,
     /// Maximum number of resident cells; least-recently-used cells are evicted
     /// once the count exceeds this. `0` disables the bound (unlimited).
@@ -496,6 +741,20 @@ struct RegistryInner {
     /// the touched cell's `last_access_seq`, giving LRU eviction a unique,
     /// tie-free ordering so the just-inserted cell is never the victim.
     seq: AtomicU64,
+}
+
+/// Registry residency and tenant accounting lifetimes deliberately have
+/// different boundaries. `resident` is the bounded scratch cache; `lifecycle`
+/// retains a weak tombstone after eviction so a later request cannot create a
+/// second accounting domain while an old request still owns the first one.
+#[derive(Default)]
+struct RegistryState {
+    resident: HashMap<String, Arc<TenantCell>>,
+    lifecycle: HashMap<String, Weak<TenantCellInner>>,
+    /// Non-resident lifecycle records awaiting bounded, round-robin cleanup.
+    lifecycle_candidates: VecDeque<String>,
+    /// Deduplicates `lifecycle_candidates` across repeated evictions.
+    queued_lifecycles: HashSet<String>,
 }
 
 impl fmt::Debug for TenantCellRegistry {
@@ -529,11 +788,13 @@ impl TenantCellRegistry {
     pub fn with_limits(max_cells: usize, idle_ttl: Option<Duration>) -> Self {
         Self {
             inner: Arc::new(RegistryInner {
-                cells: RwLock::new(HashMap::new()),
+                state: RwLock::new(RegistryState::default()),
+                registry_bucket_high_water: AtomicUsize::new(0),
+                lifecycle_bucket_high_water: AtomicUsize::new(0),
                 global_tracked: Arc::new(AtomicUsize::new(0)),
                 max_cells,
                 idle_ttl,
-                base: Instant::now(),
+                base: crate::time::ambient_instant(),
                 seq: AtomicU64::new(0),
             }),
         }
@@ -541,7 +802,8 @@ impl TenantCellRegistry {
 
     /// Registry-relative "now" in milliseconds since `base`.
     fn now_millis(&self) -> u64 {
-        u64::try_from(self.inner.base.elapsed().as_millis()).unwrap_or(u64::MAX)
+        let elapsed = crate::time::ambient_instant().saturating_duration_since(self.inner.base);
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Draw the next globally-monotonic access sequence number. Each call
@@ -564,7 +826,7 @@ impl TenantCellRegistry {
     pub fn get(&self, tenant_id: &str) -> Option<Arc<TenantCell>> {
         let guard = self
             .inner
-            .cells
+            .state
             .read()
             .expect("tenant cell registry lock poisoned");
         // Refresh the access time/sequence WHILE the read guard is still held,
@@ -574,7 +836,7 @@ impl TenantCellRegistry {
         // lock wait can never stamp the cell. `touch` is relaxed atomic
         // `fetch_max` stores through the shared `&Arc<TenantCell>`, safe under
         // the read lock.
-        if let Some(cell) = guard.get(tenant_id) {
+        if let Some(cell) = guard.resident.get(tenant_id) {
             cell.touch(self.now_millis(), self.next_seq());
             return Some(Arc::clone(cell));
         }
@@ -608,10 +870,10 @@ impl TenantCellRegistry {
         {
             let guard = self
                 .inner
-                .cells
+                .state
                 .read()
                 .expect("tenant cell registry lock poisoned");
-            if let Some(cell) = guard.get(tenant_id) {
+            if let Some(cell) = guard.resident.get(tenant_id) {
                 // Capture `now` here, under the guard and immediately before the
                 // touch, so a timestamp taken before a lock wait can never stamp
                 // a fresh access time as stale.
@@ -620,20 +882,40 @@ impl TenantCellRegistry {
                 return Arc::clone(cell);
             }
         }
-        let mut cells = self
+        let mut state = self
             .inner
-            .cells
+            .state
             .write()
             .expect("tenant cell registry lock poisoned");
         // Another writer may have inserted between dropping the read lock and
         // taking the write lock.
-        if let Some(cell) = cells.get(tenant_id) {
+        if let Some(cell) = state.resident.get(tenant_id) {
             let cell = Arc::clone(cell);
             // Fresh `now` under the write guard, right before the touch.
             cell.touch(self.now_millis(), self.next_seq());
             cell.set_quota_bytes(quota_bytes);
             return cell;
         }
+        // An eviction only removes cache residency. If an in-flight request
+        // still owns the former cell, resurrect that exact cell (and therefore
+        // its quota counter and scratch map) rather than minting a second
+        // accounting domain for the tenant.
+        if let Some(inner) = state.lifecycle.get(tenant_id).and_then(Weak::upgrade) {
+            let cell = Arc::new(TenantCell { inner });
+            // Use one clock sample for both the touch and TTL enforcement. A
+            // second sample could cross a millisecond boundary and immediately
+            // evict a freshly resurrected cell when the configured TTL is zero.
+            let now = self.now_millis();
+            cell.touch(now, self.next_seq());
+            cell.set_quota_bytes(quota_bytes);
+            state
+                .resident
+                .insert(tenant_id.to_string(), Arc::clone(&cell));
+            self.record_resident_capacity(&state);
+            self.enforce_limits_locked(&mut state, now);
+            return cell;
+        }
+        state.lifecycle.remove(tenant_id);
         let cell = Arc::new(TenantCell::new(
             tenant_id.to_string(),
             quota_bytes,
@@ -647,61 +929,123 @@ impl TenantCellRegistry {
         // Stamp the new cell's access sequence BEFORE enforcing limits, so it
         // holds the greatest sequence and is never chosen as the LRU victim.
         cell.touch(now, self.next_seq());
-        cells.insert(tenant_id.to_string(), Arc::clone(&cell));
+        state
+            .lifecycle
+            .insert(tenant_id.to_string(), Arc::downgrade(&cell.inner));
+        self.inner.lifecycle_bucket_high_water.fetch_max(
+            Self::estimated_bucket_count(state.lifecycle.capacity()),
+            Ordering::Relaxed,
+        );
+        state
+            .resident
+            .insert(tenant_id.to_string(), Arc::clone(&cell));
+        self.record_resident_capacity(&state);
         // Enforce eviction limits while we already hold the write lock. The
         // just-touched new cell has the newest access time and the greatest
         // access sequence, so it is never the idle or LRU victim.
-        self.enforce_limits_locked(&mut cells, now);
-        drop(cells);
+        self.enforce_limits_locked(&mut state, now);
+        drop(state);
         cell
     }
 
-    /// Evict idle and over-capacity cells from an already write-locked map.
+    /// Evict idle and over-capacity cells and sweep expired lifecycle records
+    /// from already write-locked registry state.
     ///
-    /// Must be called while holding the `cells` write lock; it never re-locks,
+    /// Must be called while holding the `state` write lock; it never re-locks,
     /// so it is safe to invoke from inside [`get_or_create`]'s miss branch.
     /// Removal is a plain `HashMap::remove`, which drops only the registry's
     /// strong reference — any outstanding `Arc<TenantCell>` (e.g. one held by an
     /// in-flight request) stays valid and reclaims deterministically on drop.
-    fn enforce_limits_locked(&self, cells: &mut HashMap<String, Arc<TenantCell>>, now: u64) {
+    fn enforce_limits_locked(&self, state: &mut RegistryState, now: u64) {
         if let Some(ttl) = self.inner.idle_ttl {
             let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
-            cells.retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
+            let expired_ids: Vec<_> = state
+                .resident
+                .iter()
+                .filter(|(_, cell)| now.saturating_sub(cell.last_access_millis()) > ttl_millis)
+                .map(|(tenant_id, _)| tenant_id.clone())
+                .collect();
+            for tenant_id in expired_ids {
+                state.resident.remove(&tenant_id);
+                Self::enqueue_lifecycle_candidate_locked(state, tenant_id);
+            }
         }
         let max_cells = self.inner.max_cells;
         if max_cells > 0 {
-            while cells.len() > max_cells {
+            while state.resident.len() > max_cells {
                 // Evict the least-recently-used cell, chosen by the smallest
                 // access *sequence*. The sequence is globally unique and
                 // monotonic, so there are no ties (unlike millisecond
                 // timestamps) and the just-inserted cell — which drew the
                 // greatest sequence above — is never the victim.
-                let Some(victim) = cells
+                let Some(victim) = state
+                    .resident
                     .iter()
                     .min_by_key(|(_, cell)| cell.last_access_seq())
                     .map(|(key, _)| key.clone())
                 else {
                     break;
                 };
-                cells.remove(&victim);
+                state.resident.remove(&victim);
+                Self::enqueue_lifecycle_candidate_locked(state, victim);
+            }
+        }
+        Self::sweep_lifecycle_candidates_locked(state);
+    }
+
+    fn enqueue_lifecycle_candidate_locked(state: &mut RegistryState, tenant_id: String) {
+        if state.queued_lifecycles.insert(tenant_id.clone()) {
+            state.lifecycle_candidates.push_back(tenant_id);
+        }
+    }
+
+    /// Examine a fixed number of non-resident records. Live domains rotate to
+    /// the back; dead domains and records made resident again leave the queue.
+    fn sweep_lifecycle_candidates_locked(state: &mut RegistryState) {
+        for _ in 0..LIFECYCLE_SWEEP_BUDGET {
+            let Some(tenant_id) = state.lifecycle_candidates.pop_front() else {
+                break;
+            };
+            state.queued_lifecycles.remove(&tenant_id);
+            if state.resident.contains_key(&tenant_id) {
+                continue;
+            }
+            let alive = state
+                .lifecycle
+                .get(&tenant_id)
+                .is_some_and(|lifecycle| lifecycle.upgrade().is_some());
+            if alive {
+                Self::enqueue_lifecycle_candidate_locked(state, tenant_id);
+            } else {
+                state.lifecycle.remove(&tenant_id);
             }
         }
     }
 
-    /// Evict `tenant_id`'s cell, removing it from the registry and returning it.
-    /// When the returned handle (and any outstanding request references) drop,
-    /// the cell's owned memory is deterministically reclaimed.
+    /// Evict `tenant_id`'s cell from the resident cache and return it.
+    ///
+    /// Teardown is deferred while this returned handle or an outstanding
+    /// request owns the cell. A weak tenant-keyed tombstone remains during that
+    /// time, and [`get_or_create`](Self::get_or_create) resurrects the same cell
+    /// rather than creating an independent quota or scratch domain.
     ///
     /// # Panics
     ///
     /// Panics if the registry lock is poisoned.
     #[must_use = "the evicted cell is returned so it (and its memory) can be dropped"]
     pub fn evict(&self, tenant_id: &str) -> Option<Arc<TenantCell>> {
-        self.inner
-            .cells
+        let mut state = self
+            .inner
+            .state
             .write()
-            .expect("tenant cell registry lock poisoned")
-            .remove(tenant_id)
+            .expect("tenant cell registry lock poisoned");
+        let removed = state.resident.remove(tenant_id);
+        if removed.is_some() {
+            Self::enqueue_lifecycle_candidate_locked(&mut state, tenant_id.to_string());
+        }
+        Self::sweep_lifecycle_candidates_locked(&mut state);
+        drop(state);
+        removed
     }
 
     /// Evict every resident cell whose most recent access is older than `ttl`
@@ -719,17 +1063,29 @@ impl TenantCellRegistry {
     #[must_use]
     pub fn evict_idle_older_than(&self, ttl: Duration) -> usize {
         let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
-        let mut cells = self
+        let mut state = self
             .inner
-            .cells
+            .state
             .write()
             .expect("tenant cell registry lock poisoned");
         // Read the clock under the write guard, so a `now` captured before a
         // lock wait cannot age out a cell another thread just touched.
         let now = self.now_millis();
-        let before = cells.len();
-        cells.retain(|_, cell| now.saturating_sub(cell.last_access_millis()) <= ttl_millis);
-        before - cells.len()
+        let before = state.resident.len();
+        let expired_ids: Vec<_> = state
+            .resident
+            .iter()
+            .filter(|(_, cell)| now.saturating_sub(cell.last_access_millis()) > ttl_millis)
+            .map(|(tenant_id, _)| tenant_id.clone())
+            .collect();
+        for tenant_id in expired_ids {
+            state.resident.remove(&tenant_id);
+            Self::enqueue_lifecycle_candidate_locked(&mut state, tenant_id);
+        }
+        let removed = before - state.resident.len();
+        Self::sweep_lifecycle_candidates_locked(&mut state);
+        drop(state);
+        removed
     }
 
     /// The configured maximum number of resident cells (`0` = unbounded).
@@ -752,9 +1108,29 @@ impl TenantCellRegistry {
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner
-            .cells
+            .state
             .read()
             .expect("tenant cell registry lock poisoned")
+            .resident
+            .len()
+    }
+
+    /// Number of tenant accounting lifecycle records, including resident cells
+    /// and evicted domains still owned by in-flight work.
+    ///
+    /// Expired weak records are removed incrementally by future mutating registry
+    /// operations, so cleanup work per operation remains bounded under churn.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry lock is poisoned.
+    #[must_use]
+    pub fn accounting_domain_count(&self) -> usize {
+        self.inner
+            .state
+            .read()
+            .expect("tenant cell registry lock poisoned")
+            .lifecycle
             .len()
     }
 
@@ -764,10 +1140,131 @@ impl TenantCellRegistry {
         self.len() == 0
     }
 
-    /// Total bytes tracked across every resident cell.
+    /// Total bytes tracked across every live accounting domain, whether its
+    /// cell is resident or temporarily held only by in-flight work after
+    /// eviction.
     #[must_use]
     pub fn total_tracked_bytes(&self) -> usize {
         self.inner.global_tracked.load(Ordering::Relaxed)
+    }
+
+    /// Estimate a lower bound for the fixed structural footprint of the
+    /// resident registry.
+    ///
+    /// Unlike [`Self::total_tracked_bytes`], this excludes API-accounted tenant
+    /// payload. The returned values are deterministic for the current Rust
+    /// layouts, tenant-id capacities, and map capacity. The current std
+    /// `SwissTable` load-factor scheme is modeled by rounding its element
+    /// capacity up to the backing bucket count. Trailing control bytes,
+    /// allocator metadata, allocation padding, size-class rounding, and
+    /// fragmentation are intentionally excluded, so this remains a lower bound
+    /// rather than a claim about exact allocated bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry lock is poisoned.
+    #[must_use]
+    pub fn structural_overhead(&self) -> TenantCellStructuralOverhead {
+        // `ArcInner` contains one strong and one weak reference counter before
+        // its payload. Rust does not expose its private layout; two `usize`s is
+        // the stable structural model used here, not an allocator measurement.
+        const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+        type RegistryEntry = (String, Arc<TenantCell>);
+        type LifecycleEntry = (String, Weak<TenantCellInner>);
+
+        // Count every occupied lifecycle record and its owned key: resident
+        // cells', evicted-but-in-flight domains', and tombstones awaiting the
+        // bounded sweep — all are allocated structure. The cleanup queue's
+        // own copies are still excluded, keeping this a lower bound.
+        let state = self
+            .inner
+            .state
+            .read()
+            .expect("tenant cell registry lock poisoned");
+        let cells = &state.resident;
+        let resident_cells = cells.len();
+        let registry_fixed_bytes = std::mem::size_of::<RegistryInner>()
+            + std::mem::size_of::<AtomicUsize>()
+            + 2 * ARC_HEADER;
+        let tenant_cell_bytes = resident_cells * std::mem::size_of::<TenantCell>();
+        let tenant_cell_inner_bytes = resident_cells * std::mem::size_of::<TenantCellInner>();
+        let index_entries = state.lifecycle.len();
+        let index_key_capacity: usize = state.lifecycle.keys().map(String::capacity).sum();
+        let registry_entry_bytes = resident_cells * std::mem::size_of::<RegistryEntry>()
+            + index_entries * std::mem::size_of::<LifecycleEntry>();
+        let tenant_id_capacity_bytes = cells
+            .iter()
+            .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
+            .sum::<usize>()
+            + index_key_capacity;
+        // Like the resident map, sweeping tombstones can lower the lifecycle
+        // map's `capacity()` without shrinking its allocation, so read the
+        // high-water mark that inserts maintain under the write guard.
+        let lifecycle_bucket_count = self
+            .inner
+            .lifecycle_bucket_high_water
+            .load(Ordering::Relaxed);
+        let lifecycle_bucket_bytes = lifecycle_bucket_count.saturating_sub(state.lifecycle.len())
+            * std::mem::size_of::<LifecycleEntry>()
+            + lifecycle_bucket_count;
+        let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
+        let registry_element_capacity = cells.capacity();
+        // Read allocation history while the map's read guard is still held.
+        // Growth updates the watermark under the corresponding write guard, so
+        // this keeps the resident count, entries, ids, capacity, and watermark
+        // in one coherent registry snapshot. Removals can reduce effective
+        // element capacity via tombstones while retaining the allocation.
+        let registry_bucket_count = self
+            .inner
+            .registry_bucket_high_water
+            .load(Ordering::Relaxed);
+        drop(state);
+        let registry_bucket_bytes = (registry_bucket_count - resident_cells)
+            * std::mem::size_of::<RegistryEntry>()
+            + registry_bucket_count
+            + lifecycle_bucket_bytes;
+        let total_bytes = registry_fixed_bytes
+            + tenant_cell_bytes
+            + tenant_cell_inner_bytes
+            + registry_entry_bytes
+            + tenant_id_capacity_bytes
+            + arc_header_bytes
+            + registry_bucket_bytes;
+
+        TenantCellStructuralOverhead {
+            resident_cells,
+            registry_fixed_bytes,
+            tenant_cell_bytes,
+            tenant_cell_inner_bytes,
+            registry_entry_bytes,
+            tenant_id_capacity_bytes,
+            arc_header_bytes,
+            registry_element_capacity,
+            registry_bucket_count,
+            registry_bucket_bytes,
+            total_bytes,
+        }
+    }
+
+    /// Raise the resident map's backing-bucket high-water mark after an
+    /// insert. Must be called under the `state` write guard so
+    /// [`Self::structural_overhead`] reads a coherent snapshot.
+    fn record_resident_capacity(&self, state: &RegistryState) {
+        self.inner.registry_bucket_high_water.fetch_max(
+            Self::estimated_bucket_count(state.resident.capacity()),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Convert std's effective element capacity into the current `SwissTable`
+    /// backing-bucket estimate. `0` means no allocation.
+    fn estimated_bucket_count(element_capacity: usize) -> usize {
+        if element_capacity == 0 {
+            return 0;
+        }
+        element_capacity
+            .checked_next_power_of_two()
+            .unwrap_or(element_capacity)
     }
 }
 
@@ -861,4 +1358,12 @@ pub fn current_tenant_cell() -> Option<Arc<TenantCell>> {
         .try_with(|h| h.as_ref().map(TenantCellHandle::cell))
         .ok()
         .flatten()
+}
+
+/// Return the current request's supported cooperative scratch-allocation
+/// region. Unlike a bare heap allocation, values returned by this region own
+/// their quota charge for their entire lifetime.
+#[must_use]
+pub fn current_tenant_arena() -> Option<TenantArena> {
+    current_tenant_cell().map(|cell| cell.arena())
 }

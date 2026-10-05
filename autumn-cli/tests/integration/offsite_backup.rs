@@ -71,6 +71,17 @@ fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
+/// Starts a `MinIO` testcontainer from [`minio_image`], so both tests and the
+/// registry guard below share one image definition.
+async fn start_minio() -> testcontainers::ContainerAsync<testcontainers_modules::minio::MinIO> {
+    use testcontainers::runners::AsyncRunner as _;
+
+    minio_image()
+        .start()
+        .await
+        .expect("start MinIO — is Docker running?")
+}
+
 async fn create_bucket(endpoint: &str, access: &str, secret: &str, region: &str, bucket: &str) {
     let now = chrono::Utc::now();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -190,11 +201,47 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
     out
 }
 
+/// `testcontainers-modules`' `MinIO` image pins `minio/minio` on Docker Hub,
+/// which `MinIO` Inc. deleted. `quay.io/minio/minio` then stopped anonymous
+/// pulls too (2026-09-24). Chainguard's `MinIO` build is free to pull without
+/// an account and runs the same `minio` binary with the same entrypoint, so the
+/// module's command, credentials and wait strategy work unchanged.
+///
+/// Chainguard's free tier serves only `latest`, so the image is pinned by
+/// digest. Chainguard keeps old digests pullable.
+fn minio_image() -> testcontainers::ContainerRequest<testcontainers_modules::minio::MinIO> {
+    use testcontainers::ImageExt as _;
+    use testcontainers::core::IntoContainerPort as _;
+    testcontainers_modules::minio::MinIO::default()
+        .with_name("cgr.dev/chainguard/minio")
+        .with_tag("latest@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1")
+        // The image has no `EXPOSE`, so publish the API port by hand.
+        .with_mapped_port(0, 9000.tcp())
+}
+
+/// Guards the registry override without needing Docker.
+///
+/// Both tests below run only in the Docker sweep, so losing the override would
+/// surface as a red job naming a registry rather than the file that forgot.
+/// This runs in the ordinary lane instead.
+#[test]
+fn minio_image_pulls_from_the_public_registry() {
+    let descriptor = minio_image().descriptor();
+    let (name, tag) = descriptor.split_once(':').expect("name:tag");
+    assert_eq!(
+        name, "cgr.dev/chainguard/minio",
+        "Docker Hub and quay.io no longer serve minio/minio anonymously",
+    );
+    assert!(
+        tag.contains("@sha256:"),
+        "the image must be pinned by digest"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers: postgres+minio) and pg_dump/pg_restore on PATH"]
 async fn offsite_backup_upload_then_restore_round_trips() {
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -207,10 +254,7 @@ async fn offsite_backup_upload_then_restore_round_trips() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    let minio = MinIO::default()
-        .start()
-        .await
-        .expect("start MinIO — is Docker running?");
+    let minio = start_minio().await;
     let minio_host = minio.get_host().await.unwrap();
     let minio_port = minio.get_host_port_ipv4(9000).await.unwrap();
     let endpoint = format!("http://{minio_host}:{minio_port}");
@@ -317,7 +361,6 @@ async fn offsite_backup_upload_then_restore_round_trips() {
 #[allow(clippy::too_many_lines)]
 async fn offsite_backup_uploads_large_artifact_via_multipart() {
     use testcontainers::runners::AsyncRunner as _;
-    use testcontainers_modules::minio::MinIO;
     use testcontainers_modules::postgres::Postgres;
     use tokio_postgres::NoTls;
 
@@ -330,10 +373,7 @@ async fn offsite_backup_uploads_large_artifact_via_multipart() {
     let pg_port = pg.get_host_port_ipv4(5432).await.unwrap();
     let db_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/postgres");
 
-    let minio = MinIO::default()
-        .start()
-        .await
-        .expect("start MinIO — is Docker running?");
+    let minio = start_minio().await;
     let minio_host = minio.get_host().await.unwrap();
     let minio_port = minio.get_host_port_ipv4(9000).await.unwrap();
     let endpoint = format!("http://{minio_host}:{minio_port}");

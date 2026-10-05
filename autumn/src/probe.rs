@@ -446,10 +446,18 @@ async fn refresh_replica_readiness<S: ProvideProbeState + Sync>(state: &S) {
     };
 
     match replica_pool.get().await {
-        Ok(conn) => {
+        Ok(mut conn) => {
+            let alive = crate::db::probe_connection_alive(&mut conn).await;
             drop(conn);
-            state.probes().mark_replica_connection_ready();
-            refresh_replica_migration_readiness(state).await;
+            match alive {
+                Ok(()) => {
+                    state.probes().mark_replica_connection_ready();
+                    refresh_replica_migration_readiness(state).await;
+                }
+                Err(error) => state
+                    .probes()
+                    .mark_replica_connection_unready(format!("replica connection failed: {error}")),
+            }
         }
         Err(error) => state
             .probes()

@@ -100,6 +100,46 @@ The row lock is doing a second job too. It is held from the probe until commit,
 so the counter `UPDATE` that follows can key on the parent id alone: no
 concurrent writer can re-tenant or delete the row underneath it.
 
+The parent probe addresses the model's physical primary-key column: if the
+`#[id]` field is renamed in the database with `#[diesel(column_name =
+"…")]`, the generated SQL names the renamed column, not the Rust field.
+(Child-side maintenance — counter caches and derivations — cannot see the
+parent's fields, so those take an explicit `parent_pk = "…"` override
+instead; see the counter-cache and derivations guides.)
+
+Diesel's `column_name` is the *schema identifier*, which is the SQL column
+unless `schema.rs` maps it with `#[sql_name = "…"]` (Diesel emits that only for
+a column whose name is not a valid Rust identifier, e.g. `post-id`). The macro
+cannot see `schema.rs`, so a primary key mapped through `sql_name` is not
+supported here: rename the column to a valid identifier.
+
+### Hard deletes (#2265)
+
+The write-path check stops an unknown parent from getting a comment. It does
+not clean up an existing parent's comments when that parent is later
+deleted. `commentable_id` has no `ON DELETE CASCADE` to fall back on.
+
+The scaffold writes one more thing: an `AFTER DELETE` trigger on the
+parent's own table. `autumn generate scaffold post … comments:commentable`
+adds this trigger to `post`'s own migration, next to the `CREATE TABLE`:
+
+```sql
+CREATE TRIGGER posts_delete_comments
+    AFTER DELETE ON posts
+    FOR EACH ROW
+    EXECUTE FUNCTION comments_delete_for_parent('Post');
+```
+
+This runs for **every** hard delete of a `posts` row: through the
+repository, a raw `DELETE`, or an admin tool. An ordinary soft delete does
+not fire it — the row is only marked deleted, not removed. `add_comment`'s
+own check already refuses a soft-deleted parent. A later `purge`, though,
+issues a real hard `DELETE`. It fires the trigger, and the parent's
+comments go with it.
+
+A hand-written `#[commentable]` model gets no trigger for free. Write your
+own trigger. Match it to the model's `type_name` and comments table.
+
 ## The repository helpers
 
 ```rust,ignore
@@ -137,6 +177,13 @@ an N+1 walk. Order is stable: `(created_at, id)` at every level.
 carries `deleted_at`) and decrements the counter by the number of rows it
 actually moved — so a double-submit removes nothing the second time and cannot
 drive the count negative.
+
+With `soft_delete = false`, the delete removes the rows. The `parent_id`
+foreign key then cascades to every reply, on any record. If a reply in the
+subtree belongs to another record, the delete returns `422` and removes
+nothing. The framework cannot write such a reply, but imported data or raw SQL
+can. To fix it, set that reply's `parent_id` to `NULL` or to a comment on its
+own record. Then delete again.
 
 ### `comment_count` is maintained, not computed
 
@@ -289,6 +336,7 @@ name from.
 #[commentable(
     by = User,                    // the author model; also supplies `author_table`
     author_name = username,       // display-name column; omitted → `user #id`
+    author_name_field = username, // the author struct's field, if renamed from the column
     author_table = users,         // override the table derived from `by`
     author_pk = id,
     type_name = "Post",           // discriminator; defaults to the Rust type name
@@ -312,6 +360,24 @@ Two of these are worth a second look:
 - **`author_name`** is deliberately unset by default. The framework will not
   guess a column, and a scaffolded `User` carries an `email` — defaulting a
   *public* display name to it would leak addresses into every rendered thread.
+- **`author_name`** names the *column* the SQL selects, and with `by` the
+  macro checks it at compile time by reading the same-named *field* on the
+  author struct, which must be text: a `String`, `Box<str>`, an opted-in
+  newtype, or an `Option` of one. A typo is a
+  compile error, not a failed first request. When the author struct renames
+  the column (`#[diesel(column_name = screen_name)] pub username: String`),
+  the field and column are spelled differently: keep `author_name` on the
+  column and name the field with `author_name_field`:
+
+  ```rust,ignore
+  #[commentable(by = User, author_name = screen_name, author_name_field = username)]
+  ```
+
+  A keyword-named field is written raw: `author_name_field = r#type`. The
+  field may also be a text-backed domain newtype (a `Username` that Diesel
+  decodes from `Text`); opt it in with one line,
+  `impl autumn_web::commentable::CommentAuthorName for Username {}`.
+  `Option<T>` of an admitted type covers a nullable column.
 
 ## Multi-tenancy
 
@@ -321,6 +387,23 @@ through a `#[repository(…, tenant_scoped)]` repository, the parent is matched 
 is written or read. `across_tenants()` opts out; a `tenant_scoped` repository
 with no tenant context is an error. A model without the column emits no tenant
 predicate at all.
+
+**The column alone does not scope.** A `tenant_id` column with no
+`tenant_scoped` repository is treated as ordinary data: comments work with no
+tenant context, and never match on it. Scoping follows the repository's own
+opt-in, not the column's presence — a model can carry `tenant_id` for other
+reasons (denormalized reporting, a foreign import) without becoming
+tenant-scoped.
+
+## Soft-deleted parents
+
+`add_comment` and `comment_thread` refuse a soft-deleted parent with `404`
+(see "Why `commentable_id` has no foreign key" above) — but only when the
+parent's own repository opts into `#[repository(…, soft_delete)]`. A
+`deleted_at` column with no such repository is audit history, not a
+tombstone. The row stays commentable. The repository's own finders still
+return it. As with tenancy, the repository's opt-in decides — never the
+column's presence alone.
 
 ## What this deliberately does not do
 

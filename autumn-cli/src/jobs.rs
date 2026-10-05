@@ -27,21 +27,37 @@ pub struct ManifestOptions<'a> {
     pub output: &'a str,
 }
 
+/// Strip the one-shot dump modes that `AppBuilder::run` dispatches before
+/// `AUTUMN_DUMP_JOBS` from a child command's inherited environment.
+///
+/// `Command` inherits this process's environment by default, and any of these
+/// left over in the CLI's own environment would answer this command with that
+/// manifest instead of the jobs one (`AUTUMN_DUMP_CACHE_COHERENCE` in
+/// particular — issue #2370).
+fn clear_competing_dump_modes(command: &mut Command) {
+    command
+        .env_remove(crate::data_flow::DUMP_ENV)
+        .env_remove(crate::agents::DUMP_ENV)
+        .env_remove(crate::graph::DUMP_ENV)
+        .env_remove(crate::cache_audit::DUMP_ENV);
+}
+
 /// Run `autumn jobs manifest`.
 pub fn run(opts: &ManifestOptions<'_>) {
     eprintln!("\u{1F342} autumn jobs manifest\n");
     compile_binary(opts.package, opts.bin);
     let binary = find_binary(opts.package, opts.bin);
 
-    let output = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .env("AUTUMN_DUMP_JOBS", "1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
-            std::process::exit(1);
-        });
+        .stderr(std::process::Stdio::inherit());
+    clear_competing_dump_modes(&mut command);
+    let output = command.output().unwrap_or_else(|e| {
+        eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
+        std::process::exit(1);
+    });
 
     let stdout = match manifest_from_child(
         output.status.success(),
@@ -61,8 +77,8 @@ pub fn run(opts: &ManifestOptions<'_>) {
     // A clean exit is not enough: the child's stdout must be the expected TOML
     // manifest. If the app prints anything else to stdout (from a custom config
     // or telemetry initializer, say), writing it verbatim would produce a
-    // corrupt manifest that `autumn doctor` silently treats as an empty declared
-    // set — false-passing the very topology check this manifest exists to guard.
+    // corrupt manifest that `autumn doctor` rejects outright (#2419) — which
+    // fails the topology coverage check the manifest exists to guard.
     // Mirror `autumn routes`, which strict-parses the child's stdout and errors
     // on anything unexpected rather than emitting garbage.
     let manifest = match validate_manifest(&stdout) {
@@ -95,14 +111,70 @@ fn manifest_from_child(success: bool, code: Option<i32>, stdout: &[u8]) -> Resul
     }
 }
 
+/// A strict reading of a jobs manifest's `queues` array, shared by the
+/// emitter-side validator ([`validate_manifest`]) and doctor's consumer-side
+/// reader — one rule, one implementation, so the two sides cannot drift (#2419).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestQueues {
+    /// No `queues` key: the document says nothing about queues.
+    Absent,
+    /// A well-formed array of strings. Empty is a real answer — the app
+    /// stating it declares no `#[job(queue = "…")]` queues — not a failure.
+    Present(Vec<String>),
+}
+
+/// Why a jobs manifest's `queues` reading failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestQueuesError {
+    /// The document did not parse as TOML at all (carries the parse error).
+    NotToml(String),
+    /// `queues` is present but is not an array of strings (carries the reason).
+    /// This is the shape [`validate_manifest`] refuses to *write*, so readers
+    /// must refuse to *trust* it too.
+    BadQueuesArray(String),
+}
+
+/// Strictly parse the `queues` array out of a jobs-manifest TOML document,
+/// enforcing the emitter's contract: a top-level `queues` array of strings.
+///
+/// `Absent` is the document saying nothing (doctor falls through to
+/// `declared_queues`); `BadQueuesArray` is corruption the emitter would have
+/// refused to write, so the caller must fail loudly rather than silently
+/// narrowing the declared set.
+pub fn parse_manifest_queues(contents: &str) -> Result<ManifestQueues, ManifestQueuesError> {
+    let value: toml::Value = toml::from_str(contents)
+        .map_err(|e| ManifestQueuesError::NotToml(format!("did not parse as TOML: {e}")))?;
+    let Some(queues) = value.get("queues") else {
+        return Ok(ManifestQueues::Absent);
+    };
+    let Some(array) = queues.as_array() else {
+        return Err(ManifestQueuesError::BadQueuesArray(
+            "`queues` is not an array".to_string(),
+        ));
+    };
+    if !array.iter().all(toml::Value::is_str) {
+        return Err(ManifestQueuesError::BadQueuesArray(
+            "`queues` is not an array of strings".to_string(),
+        ));
+    }
+    Ok(ManifestQueues::Present(
+        array
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+    ))
+}
+
 /// Validate that `stdout` is the expected jobs manifest before it is written.
 ///
 /// A clean child exit does not guarantee the captured stdout is the manifest: any
 /// bytes the app writes to stdout during boot (from a custom config loader or
 /// telemetry initializer, or a stray `println!`) land here too, and writing them
-/// verbatim produces a corrupt file. `autumn doctor` parses only a valid TOML
-/// `queues` array and silently ignores anything else, so a corrupt manifest lets
-/// the topology coverage check false-pass without the app-declared queues.
+/// verbatim produces a corrupt file. `autumn doctor` rejects a manifest whose
+/// `queues` array is not an array of strings outright (#2419), so a corrupt
+/// manifest fails the topology coverage check rather than false-passing without
+/// the app-declared queues.
 ///
 /// Mirrors `autumn routes`, which strict-parses the child's stdout (as JSON there,
 /// TOML here) and errors rather than accepting unexpected output. Requires the
@@ -113,20 +185,16 @@ fn validate_manifest(stdout: &str) -> Result<String, String> {
     let hint = "app did not emit a valid jobs manifest on stdout; \
                 ensure nothing else writes to stdout during `autumn jobs manifest`";
 
-    let value: toml::Value = toml::from_str(stdout)
-        .map_err(|e| format!("{hint} (stdout did not parse as TOML: {e})"))?;
-    let queues = value
-        .get("queues")
-        .ok_or_else(|| format!("{hint} (no top-level `queues` array found)"))?
-        .as_array()
-        .ok_or_else(|| format!("{hint} (`queues` is not an array)"))?;
-    if !queues.iter().all(toml::Value::is_str) {
-        return Err(format!("{hint} (`queues` is not an array of strings)"));
-    }
-
     // Return the stdout unchanged so the on-disk bytes are byte-identical to what
     // the app emitted (preserving the highest-priority-first ordering).
-    Ok(stdout.to_owned())
+    match parse_manifest_queues(stdout) {
+        Ok(ManifestQueues::Present(_)) => Ok(stdout.to_owned()),
+        Ok(ManifestQueues::Absent) => Err(format!("{hint} (no top-level `queues` array found)")),
+        Err(ManifestQueuesError::NotToml(parse_error)) => {
+            Err(format!("{hint} (stdout {parse_error})"))
+        }
+        Err(ManifestQueuesError::BadQueuesArray(reason)) => Err(format!("{hint} ({reason})")),
+    }
 }
 
 /// Write `contents` to `path`, creating any missing parent directories.
@@ -152,6 +220,58 @@ fn write_manifest(path: &Path, contents: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── clear_competing_dump_modes ──────────────────────────────────────────
+
+    #[test]
+    fn clear_competing_dump_modes_removes_every_earlier_mode_var() {
+        // Each of these is dispatched before AUTUMN_DUMP_JOBS in
+        // AppBuilder::run's dispatch chain, so any one left in the CLI's own
+        // environment would hijack `autumn jobs manifest` into a different
+        // dump (AUTUMN_DUMP_CACHE_COHERENCE in particular — issue #2370).
+        let competing = [
+            crate::data_flow::DUMP_ENV,
+            crate::agents::DUMP_ENV,
+            crate::graph::DUMP_ENV,
+            crate::cache_audit::DUMP_ENV,
+        ];
+        let mut command = Command::new("true");
+        for var in competing {
+            command.env(var, "1");
+        }
+
+        clear_competing_dump_modes(&mut command);
+
+        for var in competing {
+            let value = command
+                .get_envs()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(var));
+            assert_eq!(
+                value,
+                Some((std::ffi::OsStr::new(var), None)),
+                "{var} must be explicitly removed: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inherited_cache_coherence_dump_cannot_hijack_the_jobs_manifest() {
+        // The issue's exact scenario: AUTUMN_DUMP_CACHE_COHERENCE is checked
+        // before AUTUMN_DUMP_JOBS in AppBuilder::run, so an ambient `=1` would
+        // have answered `autumn jobs manifest` with the coherence manifest
+        // instead of the TOML queues document (issue #2370).
+        let mut command = Command::new("true");
+        command.env(crate::cache_audit::DUMP_ENV, "1");
+        clear_competing_dump_modes(&mut command);
+        let survived = command
+            .get_envs()
+            .any(|(key, value)| key == crate::cache_audit::DUMP_ENV && value.is_some());
+        assert!(
+            !survived,
+            "an inherited {}=1 must never survive into the jobs-manifest child",
+            crate::cache_audit::DUMP_ENV
+        );
+    }
 
     // ── manifest_from_child ─────────────────────────────────────────────────
 
@@ -248,6 +368,56 @@ mod tests {
             err.contains("not an array of strings"),
             "expected element-type error, got: {err}"
         );
+    }
+
+    // ── parse_manifest_queues (shared with doctor, #2419) ────────────────
+
+    #[test]
+    fn parse_manifest_queues_accepts_a_well_formed_array() {
+        assert_eq!(
+            parse_manifest_queues("queues = [\"critical\", \"email\"]\n"),
+            Ok(ManifestQueues::Present(vec![
+                "critical".to_string(),
+                "email".to_string()
+            ])),
+        );
+    }
+
+    #[test]
+    fn parse_manifest_queues_empty_array_is_present_not_absent() {
+        // Empty is the app answering "no job-declared queues", a real answer
+        // rather than a missing one.
+        assert_eq!(
+            parse_manifest_queues("queues = []\n"),
+            Ok(ManifestQueues::Present(Vec::new())),
+        );
+    }
+
+    #[test]
+    fn parse_manifest_queues_absent_key_is_absent() {
+        assert_eq!(
+            parse_manifest_queues("other = 1\n"),
+            Ok(ManifestQueues::Absent),
+        );
+    }
+
+    #[test]
+    fn parse_manifest_queues_distinguishes_parse_failure_from_shape_failure() {
+        // Unparseable TOML and a present-but-malformed `queues` array are
+        // different defects: the reader falls through on the former and fails
+        // loudly on the latter.
+        assert!(matches!(
+            parse_manifest_queues("this is not toml ="),
+            Err(ManifestQueuesError::NotToml(_))
+        ));
+        assert!(matches!(
+            parse_manifest_queues("queues = [1]\n"),
+            Err(ManifestQueuesError::BadQueuesArray(_))
+        ));
+        assert!(matches!(
+            parse_manifest_queues("queues = \"critical\"\n"),
+            Err(ManifestQueuesError::BadQueuesArray(_))
+        ));
     }
 
     // ── write_manifest ──────────────────────────────────────────────────────

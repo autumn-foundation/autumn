@@ -49,6 +49,18 @@ created (`autumn destroy scaffold Post title:String`, `--dry-run` supported).
 It never touches a database — only generated files/migrations. On the
 published 0.5.0 CLI, revert by hand (git) instead.
 
+`destroy` refuses to delete a file you edited. `generate` records a digest of
+every file it owns in `.autumn/generated.toml` (commit it), and `destroy`
+deletes a file whose content matches that digest or the current templates.
+A CLI upgrade that changed a template therefore no longer forces `--force`.
+The entry records the command's arguments, a fingerprint of the
+`autumn.generate.toml` they resolve from, and the resolved database backend, so
+the digest counts only when all three match.
+Two cases still need it: a project generated before the manifest existed, and
+a file you edited and want deleted anyway. Re-running the original generator
+command with `--force` re-records the digest and is the better fix for the
+first.
+
 ## Field type reference
 
 Use the exact tokens below — the DSL parser is case-sensitive and does not
@@ -98,13 +110,29 @@ mailer --list-unsubscribe` are backend-aware too (#1927): on a SQLite app they
 scaffold SQLite-dialect migrations (`INTEGER PRIMARY KEY AUTOINCREMENT`,
 `DEFAULT CURRENT_TIMESTAMP`, `INTEGER` foreign keys) instead of being rejected,
 and the generated auth session store is typed against
-`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908). Field
-kinds with no working diesel SQLite conversion in the generated app's feature
-set — `Uuid`, `Attachment`, `Decimal`, `DateTime` (`DateTime<Utc>`), and
-`enum{…}` — are still **rejected at generate time** (with an actionable error)
-rather than emitting uncompilable code; `--searchable`, UUID primary keys, and
-`--sharded` likewise remain Postgres-only. First-class SQLite support for the
-rejected kinds is tracked in #1924.
+`::autumn_web::RuntimeConnection` so it compiles on either backend (#1908). That
+store's query functions also bind `::autumn_web::RuntimeBackend` rather than
+`diesel::pg::Pg` (#1908), so the tracked-sessions store compiles and runs on the
+SQLite connection; the scaffolded session-management and OAuth guides emit their
+operator SQL in the app's dialect too. `generate teams` is backend-aware as of
+the same issue: its organizations/memberships/invitations migration is emitted
+in the app's dialect, and its Rust templates never needed forking (the
+`#[repository]` macro binds `::autumn_web::RuntimeConnection`, and its
+`schema.rs` uses only sql-types both backends carry). Together with
+`notifications` and `pwa` these five are every generator that hand-writes
+`CREATE TABLE` DDL, and a guard applies each one's emitted migration to a real
+SQLite so a new hand-written table cannot regress that.
+**Every** field kind now has a working diesel SQLite conversion (#1924): a
+SQLite app's `Cargo.toml` gets the SQLite dependency set (diesel on `sqlite`,
+bundled `libsqlite3-sys`, `autumn-web/sqlite`, no `pq-sys`), a generated
+`enum{…}` carries `Text`/`Sqlite` impls, and `Uuid` / `decimal{p,s}` render
+`autumn_web::db::sqlite_types::{SqliteUuid, SqliteDecimal}` — `TEXT`-backed
+newtypes that are `Copy`, deref to the wrapped type, and are
+`#[serde(transparent)]` (`uuid::Uuid` and `rust_decimal::Decimal` are foreign
+types no crate but their own can convert for SQLite). `--searchable` works via
+FTS5 (#1910); UUID primary keys and `--sharded` remain Postgres-only. A
+scaffolded SQLite app's `tests/<model>.rs` still uses the Postgres-only
+`TestDb`, so `cargo test` on it does not compile yet (#1905).
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and
@@ -264,6 +292,37 @@ pass through an emitted `csv_text_cell` guard against spreadsheet formula
 injection (numeric/date/bool/enum columns are not guarded — guarding them
 would corrupt a negative number). Not emitted for `--live`, `--sharded`,
 owner-scoped `--live-validation`, or `--api` (issue #1315).
+
+**Scaffold CSV import `--import` (trunk-dev)**: the symmetric counterpart to the
+export (issue #1393). `autumn generate scaffold Post title:String --import` adds
+a `GET /<plural>/import` upload form (file input, an "Import for real" checkbox,
+the expected header row printed from the same `CsvSchema` the export writes, and
+the columns the import cannot set) and a `#[secured] POST /<plural>/import`
+handler. **A dry run is the default**: unless the submit carries the `commit`
+confirmation, the handler runs `autumn_web::data::csv::import_csv` in
+`ImportMode::DryRun` and renders the `ImportReport` — rows read, rows that
+*would* insert, and a table of row errors with **line numbers** — without
+writing. A confirmed submit runs the same parse in write mode and commits
+through the repository's `save_many_skip_invalid`, so a row the database rejects
+is isolated and reported against its own CSV line instead of aborting the batch.
+Each row is re-encoded and handed to the module's own `decode_form`, so it is
+validated by exactly the `#[validate(...)]` rules a browser submission goes
+through. The repository then re-checks the model's rules on the **normalized**
+row (#2586), so on a `#[normalize]` column the two passes can disagree: such a
+row is reported against its CSV line as a write failure rather than as a field
+error, and nothing is written for it. The planner auto-enables autumn-web's `multipart` feature (`csv` comes
+from the export). **Insert-only** — no row is matched against an existing
+record, so re-uploading an exported file duplicates it; use
+`ImportMode::Upsert { by }` by hand for update-in-place. Bounded by
+`MAX_IMPORT_BYTES` (2 MiB) *and* `MAX_IMPORT_ROWS` (10 000): a file over the row
+cap is **refused whole** with a 422 before anything is imported — never
+partially imported — so an over-cap file must be split and the parts uploaded
+separately. The count is taken by `autumn_web::data::csv::count_data_rows`
+*before* `import_csv` runs, because a malformed row never reaches the row
+handler. The upload is checked by extension **and** declared content type. Not emitted for `--live`, `--sharded`, owner-scoped
+`--live-validation`, `--api`, or a model with an at-rest `{encrypted}` column
+(the export omits that column but the form requires it) — the generator warns
+and emits nothing, naming the reason and what to drop.
 
 **Scaffold Trash view (trunk-dev)**: a `--soft-delete` standard HTML scaffold
 also ships the recover-from-trash UI — a `#[secured] GET /<plural>/trash` page

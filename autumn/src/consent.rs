@@ -1,12 +1,15 @@
 //! Cookie-consent tracking and gating (ePrivacy / GDPR Art. 7).
 //!
+//! See the [cookie-consent guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/cookie-consent.md)
+//! for the end-to-end flow, including the withdraw path.
+//!
 //! Provides the [`Consent`] extractor plus a first-party cookie codec, so an
 //! app can read a visitor's cookie-consent choice with a typed helper —
 //! `consent.allows("analytics", CURRENT_POLICY_VERSION)` — instead of hand
 //! rolling cookie parsing and a bespoke "have they agreed" check.
 //!
 //! `autumn new` scaffolds a banner (offering "Accept all" / "Reject
-//! non-essential") wired automatically into every HTML page via
+//! non-essential") wired automatically into HTML pages via
 //! [`inject_consent_banner`], plus `POST /consent/accept` and
 //! `POST /consent/reject` routes that call [`accept_all_cookie`] and
 //! [`reject_non_essential_cookie`] to record the choice.
@@ -55,6 +58,14 @@
 //! [`Consent::needs_prompt`]) when the cookie policy changes; a cookie
 //! recorded under an older version is treated as undecided, so the banner
 //! reappears and the gate closes until the visitor re-decides.
+
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::convert::Infallible;
 
@@ -349,7 +360,7 @@ pub fn reject_non_essential_cookie(policy_version: u32) -> String {
 }
 
 fn build_consent_cookie(categories: &[&str], policy_version: u32) -> String {
-    let decided_at = chrono::Utc::now().to_rfc3339();
+    let decided_at = crate::time::ambient_now().to_rfc3339();
     let value = encode_cookie_value(policy_version, &decided_at, categories);
     format!(
         "{CONSENT_COOKIE_NAME}={value}; Path=/; Max-Age={MAX_AGE_SECS}; HttpOnly; Secure; SameSite=Lax"

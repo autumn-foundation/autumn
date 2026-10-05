@@ -98,6 +98,9 @@ is_breaking_release_type() {
 # Publishable crates.
 CRATES=(
   autumn-macros
+  autumn-macros-support
+  autumn-macros-model
+  autumn-macros-repository
   autumn-web
   autumn-cli
   autumn-admin-plugin
@@ -225,7 +228,7 @@ for crate in "${CRATES[@]}"; do
     #      baseline and current builds cleanly.
     #
     # The list = the STABILITY.md stable public-API feature surface INTERSECTED
-    # with the published 0.6.0 baseline's `[features]` keys — i.e. the MAXIMAL
+    # with the published baseline's `[features]` keys — i.e. the MAXIMAL
     # baseline-safe coverage. Recomputed for the 0.7.0 release: 0.6.0 is now
     # the crates.io baseline, so `tls`, `acme`, `offline-sync` and
     # `embed-assets` — 0.6.0-only when this list was last computed, and
@@ -240,12 +243,16 @@ for crate in "${CRATES[@]}"; do
     # It cannot equal either set alone: cargo-semver-checks enables `--features`
     # symmetrically on the 0.6.0 baseline build too, so any feature the baseline
     # lacks would error there.
-    #   - EXCLUDES the 0.7.0-only features `sim-testing`, `pdf` and `edge`: all
-    #     are NEW in 0.7.0 and absent from the 0.6.0 baseline, so the symmetric
-    #     enable would fail the baseline build ("v0.6.0 does not have feature
-    #     ...") and re-break the gate. Add each once a future baseline carries
-    #     it — this is the same rule that gated `tls`/`acme`/`offline-sync`/
-    #     `embed-assets` out of the previous revision of this list.
+    #   - Recomputed for the 0.8.0 release: 0.7.0 is now the crates.io baseline,
+    #     so `sim-testing`, `pdf` and `edge` — new in 0.7.0, and excluded for
+    #     that reason while 0.6.0 was the baseline — are intersection-eligible
+    #     and have been ADDED.
+    #   - EXCLUDES the 0.8.0-only features `collab`, `sla`, `constela`,
+    #     `plugin-sandbox` and `acme-pebble`: all are NEW in 0.8.0 and absent
+    #     from the 0.7.0 baseline, so the symmetric enable would fail the
+    #     baseline build ("v0.7.0 does not have feature ...") and re-break the
+    #     gate. Add each once a future baseline carries it — the same rule that
+    #     gated `sim-testing`/`pdf`/`edge` out of the previous revision.
     #   - EXCLUDES `sqlite`, which IS baseline-present in 0.6.0, because it
     #     flips `db::RuntimeConnection` to a SQLite connection and is therefore
     #     type-incompatible with the Postgres surface this pass covers. It is
@@ -306,15 +313,20 @@ for crate in "${CRATES[@]}"; do
     # cargo-semver-checks is exactly `workspace_package_value "version"` — parsed
     # with the SAME method used for `workspace_version` above; if it cannot be
     # parsed at all, FAIL CLOSED (a release gate must be conservative).
-    SEMVER_ALLOWLIST_TARGET_VERSION="0.7.0"
+    SEMVER_ALLOWLIST_TARGET_VERSION="0.8.0"
     autumn_web_current_version="$(workspace_package_value "version")"
     [[ -n "$autumn_web_current_version" ]] || \
       die "could not determine autumn-web version for the SemVer allowlist guard"
     if [[ "$autumn_web_current_version" != "$SEMVER_ALLOWLIST_TARGET_VERSION" ]]; then
-      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.6.0-baseline ∩ 0.7.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently sim-testing/pdf/edge) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
+      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.7.0-baseline ∩ 0.8.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently collab/sla/constela/plugin-sandbox/acme-pebble) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
     fi
 
-    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme"
+    # `collab` is deliberately ABSENT: this list is the 0.7.0-baseline ∩ 0.8.0
+    # intersection and is passed to BOTH builds, so naming a feature the
+    # published baseline does not have fails that invocation outright ("does
+    # not have feature") and turns the gate into a tool error instead of a
+    # check. It joins the list when a baseline carries it (#1806).
+    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme,sim-testing,pdf,edge"
     # The SQLite backend surface: the SAME list plus `sqlite`.
     #
     # It was `sqlite` alone at first, on the theory that a minimal set is the

@@ -39,7 +39,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rand::{RngCore, SeedableRng};
+use rand::{Rng as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use uuid::Uuid;
 
@@ -155,6 +155,33 @@ pub(crate) fn derive_uuid_from(seed: u64, purpose_tag: &[u8]) -> Uuid {
     uuid_v4_from_bytes(bytes)
 }
 
+/// A shared entropy handle is itself an entropy source.
+///
+/// The [`ClockSource`](crate::time::ClockSource) sibling of this impl exists
+/// for the same reason: a capsule replay hands its already-`Arc`ed source
+/// straight to `TestApp::with_entropy`, with no forwarding newtype in between.
+impl Entropy for std::sync::Arc<dyn Entropy> {
+    fn next_u64(&self) -> u64 {
+        (**self).next_u64()
+    }
+
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        (**self).fill_bytes(dest);
+    }
+
+    // The *provided* methods are forwarded too, not left to the default. A
+    // source that overrides `uuid_v4`/`uuid_v7` would otherwise have its
+    // override silently dropped the moment it was handed through an `Arc`,
+    // which is precisely how this impl is used.
+    fn uuid_v4(&self) -> Uuid {
+        (**self).uuid_v4()
+    }
+
+    fn uuid_v7(&self, unix_millis: u64) -> Uuid {
+        (**self).uuid_v7(unix_millis)
+    }
+}
+
 // ── OS (real) entropy ─────────────────────────────────────────────────────────
 
 /// Real operating-system entropy implementation of [`Entropy`].
@@ -234,7 +261,7 @@ impl SeededEntropy {
 
 impl Entropy for SeededEntropy {
     fn next_u64(&self) -> u64 {
-        self.with_inner(RngCore::next_u64)
+        self.with_inner(rand::Rng::next_u64)
     }
 
     fn fill_bytes(&self, dest: &mut [u8]) {

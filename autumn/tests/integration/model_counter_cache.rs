@@ -1435,6 +1435,12 @@ async fn the_manual_escape_hatch_maintains_the_counter() {
     let post = seed_post(&mut conn, "manual").await;
 
     conn.transaction::<(), autumn_web::AutumnError, _>(async move |conn| {
+        // The documented order: the lock, then the raw write, then the hook.
+        autumn_web::repository::counter_cache_serialize_self_referential(
+            conn,
+            CcComment::counter_caches(),
+        )
+        .await?;
         let id = diesel::sql_query(
             "INSERT INTO cc_comments (body, post_id) VALUES ('manual', $1) RETURNING id",
         )

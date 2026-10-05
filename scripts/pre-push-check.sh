@@ -21,6 +21,12 @@
 # by ~17GB and risking ENOSPC. trybuild compiles at run time, not build time, so
 # `--no-run` never triggers it. This gate stays disk-cheap by construction.
 #
+# Why a FEATURE-GATED integration_tests leg (§5b): the `--no-run` above runs
+# with default features, and the gated clippy leg (§4) compiles `--lib` only —
+# so the `#![cfg(feature = "…")]` integration modules (issue #2395) were
+# compiled by neither. §5b compiles the consolidated binary once with the gated
+# feature set, so a break there is caught here instead of in CI's feature lanes.
+#
 # Why a SEPARATE doctest leg: `--no-run` compiles every *binary* test target but
 # does NOT build doctests — doctests are only built during the `--doc` phase. So
 # a doctest that stops compiling (e.g. #2107: an app.rs `no_run` example doctest
@@ -38,7 +44,12 @@
 # NOT run here (need Docker / a backend-flip feature / a browser — out of scope
 # for a fast, disk-cheap compile-only gate; CI runs them in dedicated jobs):
 #   - the Docker/testcontainer `#[ignore]`d sweep (ci.yml "Run Docker-dependent tests")
-#   - the `sqlite-runtime` lane (`--features sqlite`, a backend-flip feature)
+#   - the `sqlite-runtime` lane (`--features sqlite`, a backend-flip feature).
+#     Note what that costs since #1905: that lane now runs a BARE `--lib`, so a
+#     fixture that only panics under the flip (an inline `postgres://` target,
+#     say) is invisible here and surfaces on the PR. Reproduce it with
+#     `cargo test -p autumn-web --features sqlite --lib` when touching a test
+#     fixture that names a database target.
 #   - the `system-tests` (Chromium) browser suite
 #
 # Usage (runnable from anywhere in the tree):
@@ -76,6 +87,50 @@ step "./scripts/check-panic-gate.sh   (self-test + manifest gate; no toolchain)"
 step "./scripts/check-determinism-gate.sh   (self-test + seam gate; no toolchain)"
 ./scripts/check-determinism-gate.sh
 
+# ---------------------------------------------------------------------------
+# 1c. Plugin API surface gate (issue #1601)
+#
+# Mirrors ci.yml `migration-guides` job: `./scripts/check-plugin-surface.sh`.
+# Same reasoning as the two gates above — seconds, no toolchain, self-testing —
+# and it catches the two things a `cargo test -p <one-crate>` loop never will:
+# the docs table drifting from `PLUGIN_SURFACES`, and a plugin-surface change
+# landing with no "Plugin authors" section in `docs/migrations/next.md`.
+# ---------------------------------------------------------------------------
+step "./scripts/check-plugin-surface.sh   (self-test + plugin API contract; no toolchain)"
+./scripts/check-plugin-surface.sh
+
+# --- 1d. SQLite feature-unification gate (issue #1905) -----------------------
+# Mirrors ci.yml `lint` job: `./scripts/check-sqlite-unification.sh`. Same shape
+# as the gates above — seconds, no toolchain, self-testing — and it covers the
+# one invariant this script otherwise cannot: the legs below never enable
+# `sqlite`, so a dependency edge that turns the backend flip on for the whole
+# graph would compile here and break the Postgres lane in CI.
+step "./scripts/check-sqlite-unification.sh   (self-test + manifest gate; no toolchain)"
+./scripts/check-sqlite-unification.sh
+
+# --- 1e. Example binary-name collision gate (issues #2690/#2691) ---------------
+# Mirrors ci.yml `lint` job: `./scripts/check-example-bin-names.sh`. Same
+# shape as the gates above — seconds, no toolchain, self-testing — and it
+# covers the one invariant the compile legs cannot report on their own: two
+# members producing the same binary file name only breaks the Windows
+# linker (LNK1104, issue #2639), intermittently, so without a manifest gate
+# the reintroduction passes every other check. The script enumerates explicit
+# [[bin]] AND auto-discovered src/bin targets (#2690 corrected the old
+# "explicit disables autobins" assumption).
+step "./scripts/check-example-bin-names.sh   (self-test + manifest gate; no toolchain)"
+./scripts/check-example-bin-names.sh
+
+# --- 1f. Changelog fragment gate ---------------------------------------------
+# Mirrors ci.yml `migration-guides` job:
+# `./scripts/check-changelog-fragments.sh`. Same shape as the gates above —
+# seconds, no toolchain, self-testing. It is here because the thing it catches
+# is cheapest to fix before the push: a release note written into CHANGELOG.md
+# instead of its own `changelog.d/` file, which is the line every other open PR
+# also edits.
+step "./scripts/check-changelog-fragments.sh   (self-test + changelog notes; no toolchain)"
+./scripts/check-changelog-fragments.sh --self-test >/dev/null
+./scripts/check-changelog-fragments.sh
+
 # --- 2. Formatting -----------------------------------------------------------
 # Mirrors ci.yml `lint` job: `cargo fmt --all -- --check`.
 step "cargo fmt --all -- --check"
@@ -99,16 +154,26 @@ cargo clippy --workspace --all-targets -- -D warnings
 #
 # Feature list kept IDENTICAL to ci.yml's — `check-panic-gate.sh` verifies every
 # gated module's feature is covered by a CI clippy invocation, so the two lists
-# drifting apart is a gate failure, not a silent hole.
+# drifting apart is a gate failure, not a silent hole. It lives in one variable
+# so the feature-gated `integration_tests` compile leg in §5b below reuses the
+# identical set instead of carrying its own copy (issue #2395).
 #
 # `--lib` rather than CI's `--all-targets`: the gate is `cfg_attr(not(test), …)`,
 # so the lib target is where the denials actually apply, and skipping the test /
 # example / bench targets keeps this leg minutes shorter. CI still runs the
 # `--all-targets` form.
-step "cargo clippy -p autumn-web --features \"<gated request-path set>\" --lib -- -D warnings"
+GATED_REQUEST_PATH_FEATURES="ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence,sla"
+step "cargo clippy -p autumn-web --features \"$GATED_REQUEST_PATH_FEATURES\" --lib -- -D warnings"
 cargo clippy -p autumn-web \
-  --features "ws,mail,offline-sync,redis,markdown,inbound-mail,inbound-mailgun,inbound-ses,storage,tls" \
+  --features "$GATED_REQUEST_PATH_FEATURES" \
   --lib -- -D warnings
+
+step "cargo clippy -p autumn-web --features \"plugin-sandbox,test-support\" --lib -- -D warnings"
+# ci.yml runs `plugin-sandbox` as its own clippy lane rather than folding it into
+# the list above, so a `wasmi`-linking build is not forced on every gated-feature
+# run. Mirrored here for the same reason the lane above is: a gate you cannot
+# reproduce locally is one you find out about on the PR.
+cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --lib -- -D warnings
 
 # --- 5. Compile every workspace test target (compile-only) -------------------
 # Mirrors ci.yml `test` job (`cargo test --workspace`), but `--no-run` so it
@@ -117,6 +182,30 @@ cargo clippy -p autumn-web \
 # This is the line that catches cross-package compile breaks locally.
 step "cargo test --workspace --no-run   (compile-only; skips ~17GB trybuild run)"
 cargo test --workspace --no-run
+
+# --- 5b. Compile the feature-gated integration_tests binary (compile-only) ----
+# Issue #2395: the clippy leg above compiles `--lib` only, and step 5 runs with
+# default features — so the `#![cfg(feature = "…")]` integration modules
+# (acme_end_to_end, tls_serving, inbound_mail_integration, translatable, …)
+# were compiled by NEITHER leg. One `--no-run` link of the consolidated binary
+# with the gated set closes the hole for every feature in the list at once,
+# staying disk-cheap by construction (nothing runs; trybuild compiles at run
+# time, so `--no-run` never triggers it).
+#
+# The set already holds `i18n`, which also gates integration modules (CI's i18n
+# lane), and `test-support` is paired the way CI's feature lanes pair it. `sqlite` stays
+# out: the backend-flip lane is out of scope for this script (see §1d and the
+# header's NOT-run list), and `system-tests` stays out with the browser suite.
+step "cargo test -p autumn-web --features \"<gated set>,test-support\" --test integration_tests --no-run"
+cargo test -p autumn-web \
+  --features "$GATED_REQUEST_PATH_FEATURES,test-support" \
+  --test integration_tests --no-run
+
+step "cargo test -p autumn-web --features \"plugin-sandbox,test-support\" --test integration_tests --no-run"
+# plugin-sandbox keeps its own leg here for the same wasmi-link reason the
+# clippy leg above splits it out — and this is the leg that compiles the
+# sandbox's containment corpus (plugin_sandbox.rs, issue #1609).
+cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests --no-run
 
 # --- 6. Doctests (workspace, doc target only) --------------------------------
 # `--no-run` above skips doctests (they build only in the `--doc` phase), so a
@@ -131,7 +220,7 @@ cargo test --workspace --doc
 
 echo
 echo "pre-push-check: OK — workspace test targets compile clean, doctests pass."
-echo "note: step 1 (panic gate) needs no toolchain; steps 2-5 are COMPILE-ONLY;"
+echo "note: step 1 (panic gate) needs no toolchain; steps 2-5b are COMPILE-ONLY;"
 echo "      step 6 RUNS doctests (cheap: mostly"
 echo "      no_run/ignore, no DB, and --doc never triggers the ~17GB trybuild run)."
 echo "      A bare \`cargo test --workspace\` (without --no-run / --doc) additionally"

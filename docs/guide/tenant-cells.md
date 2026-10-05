@@ -1,7 +1,8 @@
 # Per-Tenant Memory Cells
 
-Row-level tenancy scopes a tenant's *rows*; per-tenant memory cells bound a
-tenant's *in-process memory*. On top of the existing tenancy story, each
+Row-level tenancy scopes a tenant's *rows*; per-tenant memory cells account for
+a tenant's supported *cooperative tracked scratch memory*. They do **not** bound
+arbitrary in-process memory. On top of the existing tenancy story, each
 resolved tenant gets a `TenantCell` — a byte-accounting boundary with a soft
 quota and an owned scratch buffer — created lazily on the first request that
 touches tenant memory. Allocations that flow through the cell are tracked
@@ -9,9 +10,8 @@ against the tenant's quota; when the cell is evicted and dropped, Rust's
 ownership rules deterministically reclaim its tracked footprint.
 
 This is orthogonal to sharding. Sharding decides *which database* a tenant's
-rows live on; cells decide *how much process memory* a single tenant may hold
-before its own requests start failing. One noisy tenant can no longer allocate
-its way into every other tenant's latency.
+rows live on; cells decide how much memory allocated through the supported
+arena API a single tenant may retain before its own requests start failing.
 
 The whole cell is pure, safe Rust: it holds under the workspace-wide
 `#![forbid(unsafe_code)]`. It is an accounting cell, not a bounding allocator —
@@ -81,8 +81,20 @@ request, and `None` otherwise (so a route that runs outside a tenant context
 degrades gracefully). Calling it is what *materializes* the cell for the
 request — routes that never call it create no cell.
 
-`try_charge(n)` reserves `n` bytes against the quota and hands back a `Charge`
-RAII guard. The bytes stay tracked for exactly as long as you hold the guard:
+Prefer `current_tenant_arena()` and its typed, fallible `try_bytes` and
+`try_string` APIs. The returned value owns both its allocation and quota charge,
+so supported request scratch state cannot separate the two:
+
+```rust
+let arena = autumn_web::tenant_cell::current_tenant_arena()
+    .ok_or_else(|| AutumnError::service_unavailable_msg("tenant arena unavailable"))?;
+let mut scratch = arena.try_bytes(512 * 1024)?;
+scratch.as_mut_slice()[0] = 1;
+```
+
+`try_charge(n)` is a lower-level compatibility API. It reserves `n` bytes
+against the quota and hands back a `Charge` RAII guard. The bytes stay tracked
+for exactly as long as you hold the guard:
 drop it (or let it fall off the end of the handler) and they are released
 immediately. If the charge would exceed the quota it returns `QuotaExceeded`,
 which converts into `AutumnError` as an HTTP **503 Service Unavailable** — so a
@@ -131,19 +143,20 @@ async fn stash() -> AutumnResult<&'static str> {
 
         // Removing frees only the key + value capacity back to the quota; the
         // fixed per-entry overhead is retained (against the entry high-water
-        // mark) until the cell is evicted.
+        // mark) until the accounting domain is no longer resident and its last
+        // request/eviction handle drops.
         let _ = cell.scratch_remove("draft");
     }
     Ok("ok")
 }
 ```
 
-## Quota isolation
+## Cooperative quota accounting (not hard isolation)
 
-A quota breach is scoped to the tenant that hit it. When a tenant is over
+A tracked quota breach is scoped to the tenant that hit it. When a tenant is over
 quota, only *its* over-budget request fails — with a 503 — and every other
-tenant has its own independent counter and is completely unaffected: a whale
-exhausting its cell degrades only its own traffic, not the process.
+tenant has its own independent counter. This is counter independence, not a
+claim that shared-process allocator pressure cannot affect other traffic.
 
 Where in the request that 503 lands depends on the API. `try_charge(n)?`
 reserves *before* you allocate: the quota is checked up front, so an over-quota
@@ -158,32 +171,93 @@ the memory it owns, not every byte a handler touches on the way there.
 ## Eviction and lifecycle
 
 Cells live in a process-wide `TenantCellRegistry` shared by every clone of the
-app state. Two properties matter operationally:
+app state. Three properties matter operationally:
 
 - **Lazy creation.** Binding a request to a tenant does not allocate a cell;
   the first call to `current_tenant_cell()` (internally a registry
   `get_or_create`) materializes it. Routes that never touch tenant memory leave
   the registry untouched.
-- **Deterministic eviction.** `TenantCellRegistry::evict(tenant_id)` removes
-  the tenant's cell from the registry and returns it; once that handle and any
-  outstanding request references drop, the cell's owned memory (scratch buffer
-  and all) is reclaimed, and its tracked bytes leave the process-wide gauge.
-  This is ordinary Rust `Drop`, not a background sweep — reclaim is immediate
-  and predictable.
+- **Residency eviction with deferred teardown.**
+  `TenantCellRegistry::evict(tenant_id)` removes the tenant's cell from the
+  resident cache and returns it. Eviction does not create permission for a
+  second accounting domain: while the returned handle, an outstanding request,
+  or a live `Charge` still owns the old domain, a subsequent `get_or_create` for
+  that tenant resurrects the same quota counter and scratch map and makes it
+  resident again. The scratch contents therefore remain visible to that
+  subsequent request, and its charges aggregate with the earlier request's
+  charges under one tenant quota.
+
+  Teardown occurs only after the domain is no longer resident and its final
+  strong owner drops. At that point the scratch buffer is reclaimed and its
+  tracked bytes leave the process-wide gauge through ordinary Rust `Drop`, not
+  a background reclamation task. If an operator needs to purge a tenant's
+  scratch state, traffic for that tenant must first quiesce; then call `evict`
+  and drop its returned handle after all outstanding request/charge handles have
+  completed. A request arriving before teardown prevents the purge by
+  resurrecting and re-residenting the existing domain.
 - **Automatic eviction.** With `max_cells` or `idle_ttl_secs` set (see
   [Configuration](#configuration)), the registry evicts on its own — LRU cells
   above the cap, and cells idle past the TTL — enforced lazily on cell insert.
-  Automatic eviction reclaims memory exactly like the manual `evict` above: it
-  drops only the registry's strong reference, so the same deterministic `Drop`
-  applies and an in-flight holder is never disturbed.
+  Automatic eviction has the same residency-versus-lifecycle semantics as
+  manual `evict`: it drops only the resident-cache reference, so an in-flight
+  holder is never disturbed and a same-tenant request arriving before teardown
+  reuses and re-residents the domain.
 
 Eviction is safe to do mid-request. Each in-flight request caches the cell it
-first materialized, so evicting a tenant while one of its requests is running
-does **not** reset that request's state or hand it a fresh empty cell: the
-running request keeps its own cached `Arc` and its stable cell to completion,
-its memory reclaiming on drop, and the eviction takes effect for subsequent
-requests. The registry also exposes `len()`, `is_empty()`, and
-`total_tracked_bytes()` for observability.
+first materialized, so eviction does **not** reset that request's state. It also
+does not hand a subsequent request a fresh empty cell while the old domain is
+alive: both requests share its scratch state and aggregate quota. `len()` and
+`is_empty()` report resident-cache membership, `accounting_domain_count()` also
+includes evicted domains retained by in-flight work (plus dead tombstones
+awaiting bounded incremental cleanup), and `total_tracked_bytes()` covers every
+live domain regardless of residency.
+
+### Resident-cell structural overhead
+
+`total_tracked_bytes()` is **API-accounted tenant payload**, not the cost of
+the accounting machinery itself. An empty cell therefore reports zero tracked
+bytes while still occupying process memory. `TenantCellRegistry::structural_overhead()`
+reports that second quantity separately. The density smoke test creates 1,000
+empty cells with fixed-width `tenant-NNNN` ids, verifies the configured
+1,000-cell resident target, prints total and per-cell structure, then evicts
+every entry.
+
+The lower-bound estimate sums the current platform's `size_of` layouts for `TenantCell` and
+`TenantCellInner` (including atomics, the scratch-map header, and mutex), both
+per-cell `Arc` counter headers, occupied registry entries plus every lifecycle
+record (resident, evicted-but-live, or awaiting the tombstone sweep), the
+tenant-id allocation capacities (each resident cell's registry key and own id,
+and every lifecycle key), and amortized spare buckets plus control bytes for
+both the registry and the lifecycle map.
+Because `HashMap::capacity()` is an **element capacity**, not a bucket count,
+the model rounds it up to the current SwissTable implementation's power-of-two
+backing bucket count. For this workload that means 1,792 elements map to 2,048
+buckets, including the load-factor-reserved slots. The registry retains that
+bucket estimate as a high-water mark for each map: removals (and lifecycle
+tombstone sweeps) can consume tombstones and lower the map's reported element
+capacity without shrinking its backing allocation, so recomputing solely from
+the current capacity would undercount churned registries.
+It also reports the one-off registry allocation separately. On 64-bit Linux,
+the 1,000-cell smoke test currently measures **336 lower-bound structural bytes
+per cell** plus a **304-byte one-off registry structure** (336,472 bytes total);
+run the
+following command to reproduce the exact number for a toolchain/platform:
+
+```sh
+cargo test -p autumn-web --test integration_tests \
+  integration::tenant_cell_unit::density_smoke_thousand_cells -- --exact --nocapture
+```
+
+This is a deterministic **structural lower bound**, not RSS. Rust does not expose
+allocator allocation headers, size-class rounding, internal fragmentation, or
+page residency portably, so those are explicitly excluded. The registry bucket
+element capacity is observed exactly; the backing bucket conversion and
+one-control-byte-per-bucket component model the current SwissTable
+implementation. Its trailing control group and allocation padding are excluded,
+as are allocator details, so the result is deliberately labeled a lower bound.
+The ordinary CI test never asserts RSS; an RSS
+sample would only be an observational, allocator- and environment-dependent
+metric.
 
 **Dynamic quota.** A cell's `quota_bytes` is stored atomically rather than
 frozen at creation. Every access refreshes a resident cell's quota from the
@@ -204,22 +278,32 @@ refresh simply re-applies the same configured value.
 - a fixed per-entry overhead, exposed as
   `TenantCell::scratch_entry_overhead()`, charged against the **high-water mark**
   of live scratch entries (not the current count), so that a tenant storing many
-  tiny entries cannot amplify its footprint past the cap via map growth. Because a
-  `HashMap` never shrinks its bucket array on removal, this overhead is *retained*
-  after a `scratch_remove` (which frees only the removed key and value capacity)
-  and is reclaimed only when the cell is dropped on eviction. So `tracked_bytes()`
-  can stay elevated after you insert then remove scratch entries, and re-inserting
-  within the prior peak adds no new overhead (churn-safe).
+  tiny entries cannot amplify its footprint past the cap via map growth. Because
+  a `HashMap` never shrinks its bucket array on removal, this overhead is
+  *retained* after a `scratch_remove` (which frees only the removed key and value
+  capacity) and is reclaimed only when the evicted accounting domain's final
+  owner drops. So `tracked_bytes()` can stay elevated after you insert then
+  remove scratch entries, and re-inserting within the prior peak adds no new
+  overhead (churn-safe).
 
-Everything tracked is deterministically reclaimed when the cell is dropped on
-eviction. What it is **not**: a measurement of the tenant's true process RSS.
+Everything tracked, including every arena allocation, is deterministically
+reclaimed when a non-resident accounting domain's final owner drops. The precise
+lifecycle and boundary are recorded in
+[ADR 0012](../adr/0012-cooperative-tenant-memory-boundary.md). What it is
+**not**: a measurement of the tenant's true process RSS.
 Allocator-internal fragmentation, size-class rounding, and any allocation a
 handler makes *outside* the cell's API (a bare `Box::new`, a `Vec` you build
 and never charge) are invisible to the counter by design. Charge through the
-cell for the memory you want bounded; the guarantee is that those tracked bytes
-are counted honestly and released deterministically.
+arena for supported scratch memory you want bounded; the guarantee is that
+those tracked bytes are counted honestly and released deterministically.
 
 ## Limitations and roadmap
+
+- **No hard memory isolation** — bare `Vec`, `String`, `Box`, collections,
+  request/response bodies, futures, stacks, database/TLS/plugin allocations,
+  allocator metadata, fragmentation, and native allocations are outside the
+  boundary. Use a process/container/VM when adversarial hard isolation is
+  required. `try_charge` is cooperative accounting, not allocation ownership.
 
 - **Config hot-reload** — resident cells already refresh their quota from
   `quota_bytes` on every access (see [Dynamic quota](#eviction-and-lifecycle)),

@@ -20,12 +20,20 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::plugin_contract::{PluginContract, SurfaceTier, surface};
 use crate::route_listing::{RouteInfo, RouteSource};
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
 /// Configuration for a conformance run against a specific plugin.
+///
+/// `#[non_exhaustive]`: build one with [`ConformanceConfig::new`] and the
+/// fluent setters rather than a struct literal. The `contract` field added in
+/// #1601 was a `SemVer` break for anyone constructing this with a literal, and
+/// the annotation lands in the same release so that break happens once — a
+/// later check that needs configuration of its own can then be additive.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConformanceConfig {
     /// The documented plugin name (e.g. `"autumn-admin-plugin"`).
     pub plugin_name: String,
@@ -39,6 +47,10 @@ pub struct ConformanceConfig {
     /// `admin`, `debug`, `credential`, `operator`, `secret`, or `metrics` must
     /// appear here with a non-empty `auth_mechanism`, or the check fails.
     pub sensitive_routes: Vec<SensitiveRoute>,
+    /// The plugin's declared compatibility contract (issue #1601), when it has
+    /// one. Drives the `experimental-surface` check; without it that check is
+    /// skipped rather than assumed clean.
+    pub contract: Option<PluginContract>,
 }
 
 impl ConformanceConfig {
@@ -49,7 +61,21 @@ impl ConformanceConfig {
             expected_prefix: None,
             intentional_root_routes: Vec::new(),
             sensitive_routes: Vec::new(),
+            contract: None,
         }
+    }
+
+    /// Attach the plugin's declared contract so the `experimental-surface`
+    /// check can run.
+    ///
+    /// This is the same value the plugin returns from
+    /// [`Plugin::contract`](crate::plugin::Plugin::contract) — pass it straight
+    /// through rather than restating it, so the harness checks what the plugin
+    /// actually declares.
+    #[must_use]
+    pub fn contract(mut self, contract: PluginContract) -> Self {
+        self.contract = Some(contract);
+        self
     }
 
     /// Declare the expected route prefix (e.g. `"/admin"`).
@@ -293,9 +319,32 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
     }
 }
 
+/// `true` for a file of the plugin's own
+/// [`PluginAssets`](crate::assets::PluginAssets) bundle: a route under
+/// `/static/_plugins/` that carries the
+/// [`PLUGIN_ASSETS_ROUTE_MARKER`](crate::assets::PLUGIN_ASSETS_ROUTE_MARKER).
+///
+/// The framework mounts those, not the plugin's router: they live outside the
+/// plugin's prefix by design, and they are public static bytes, so a name like
+/// `admin.js` is not a sensitive surface. Both conditions are required: only
+/// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets) can
+/// attach the marker (`declare_plugin_routes` strips it), so a route a plugin
+/// merely declares at such a path gets no exemption.
+fn is_plugin_asset_route(route: &RouteInfo) -> bool {
+    route
+        .path
+        .strip_prefix(crate::assets::PLUGIN_ASSETS_PREFIX)
+        .is_some_and(|rest| rest.starts_with('/'))
+        && route
+            .middleware
+            .iter()
+            .any(|label| label == crate::assets::PLUGIN_ASSETS_ROUTE_MARKER)
+}
+
 /// Check that all plugin routes live under `prefix`.
 ///
-/// Routes listed in `intentional_root` (exact path match) are exempt.
+/// Routes listed in `intentional_root` (exact path match) are exempt, and so
+/// are the plugin's own asset-bundle files under `/static/_plugins/`.
 /// Returns `Skip` when no routes are attributed to the plugin.
 #[must_use]
 pub fn check_route_prefix(
@@ -321,7 +370,11 @@ pub fn check_route_prefix(
     let under_prefix = |path: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
     let off_prefix: Vec<String> = plugin_routes
         .iter()
-        .filter(|r| !under_prefix(&r.path) && !intentional_root.contains(&r.path))
+        .filter(|r| {
+            !under_prefix(&r.path)
+                && !intentional_root.contains(&r.path)
+                && !is_plugin_asset_route(r)
+        })
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
 
@@ -450,6 +503,7 @@ pub fn check_sensitive_surfaces(
         .filter(|r| {
             matches!(&r.source, RouteSource::Plugin(n) if n == plugin_name)
                 && is_sensitive_path(&r.path)
+                && !is_plugin_asset_route(r)
         })
         .collect();
 
@@ -565,6 +619,95 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
 
 // ── Main entry point ───────────────────────────────────────────────────────
 
+/// Report which experimental plugin surfaces a plugin declares a dependency on
+/// (issue #1601).
+///
+/// This check **reports**; it does not gate. Building on experimental surface
+/// is a legitimate, informed choice — the point is that the choice is visible
+/// in the conformance report and in the release notes of whichever release
+/// changes that surface.
+///
+/// It does fail on two things, because both make the declaration meaningless:
+///
+/// - a name that is not in [`PLUGIN_SURFACES`](crate::plugin_contract::PLUGIN_SURFACES)
+///   at all (a typo, or a surface that has since been removed), and
+/// - a name that *is* in the registry but at the
+///   [`Stable`](crate::plugin_contract::SurfaceTier::Stable) tier — declaring a
+///   stable API as experimental misreports the plugin's actual exposure.
+///
+/// Without a contract on the config the check is `Skip`: an author who has not
+/// declared one has not claimed anything, and silently passing them would read
+/// as "verified stable-only".
+#[must_use]
+pub fn check_experimental_surface(contract: Option<&PluginContract>) -> CheckResult {
+    let name = "experimental-surface".to_owned();
+
+    let Some(contract) = contract else {
+        return CheckResult {
+            name,
+            status: CheckStatus::Skip,
+            message: "no plugin contract declared; implement `Plugin::contract` (and pass it to \
+                      `ConformanceConfig::contract`) to have experimental-surface use reported"
+                .to_owned(),
+            diagnostics: vec![],
+        };
+    };
+
+    if contract.experimental_surfaces.is_empty() {
+        return CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "declares no dependency on experimental plugin surface".to_owned(),
+            diagnostics: vec![],
+        };
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut invalid = 0usize;
+    for declared in &contract.experimental_surfaces {
+        match surface(declared) {
+            None => {
+                invalid += 1;
+                diagnostics.push(format!(
+                    "{declared}: not a known plugin surface — check the spelling against \
+                     `autumn_web::plugin_contract::PLUGIN_SURFACES`"
+                ));
+            }
+            Some(s) if s.tier == SurfaceTier::Stable => {
+                invalid += 1;
+                diagnostics.push(format!(
+                    "{declared}: declared experimental, but it is a STABLE surface — drop the \
+                     declaration; it overstates this plugin's exposure"
+                ));
+            }
+            Some(s) => diagnostics.push(format!("{}: {}", s.name, s.note)),
+        }
+    }
+
+    if invalid > 0 {
+        return CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            message: format!(
+                "{invalid} of {} declared experimental surface(s) could not be resolved against \
+                 the registry",
+                contract.experimental_surfaces.len()
+            ),
+            diagnostics,
+        };
+    }
+
+    CheckResult {
+        name,
+        status: CheckStatus::Pass,
+        message: format!(
+            "depends on {} experimental surface(s); these may change in any release",
+            contract.experimental_surfaces.len()
+        ),
+        diagnostics,
+    }
+}
+
 /// Run all conformance checks and return a `ConformanceReport`.
 ///
 /// Checks run:
@@ -573,6 +716,8 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
 /// 3. `route-collision` — no two routes share (method, path)
 /// 4. `sensitive-surfaces` — sensitive-named plugin routes are declared with auth
 /// 5. `duplicate-registration` — plugin routes are not registered more than once
+/// 6. `experimental-surface` — the plugin's declared use of experimental
+///    plugin-facing API (issue #1601), reported rather than gated
 #[must_use]
 pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> ConformanceReport {
     let mut checks = Vec::new();
@@ -598,6 +743,7 @@ pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> Conf
     ));
 
     checks.push(check_duplicate_registration(&config.plugin_name, routes));
+    checks.push(check_experimental_surface(config.contract.as_ref()));
 
     ConformanceReport {
         plugin_name: config.plugin_name.clone(),
@@ -897,6 +1043,49 @@ mod tests {
             "/static/app.js"
         );
         assert_eq!(normalize_path_for_collision("/"), "/");
+    }
+
+    /// A plugin's `PluginAssets` files live under `/static/_plugins/`, mounted
+    /// by the framework outside the plugin's prefix, and are public static
+    /// bytes: neither an off-prefix route nor a sensitive surface, even when a
+    /// file is named `admin.js`. Anything else outside the prefix still fails.
+    #[test]
+    fn plugin_asset_routes_are_exempt_from_prefix_and_sensitive_checks() {
+        let asset = |path: &str| {
+            let mut route = make_route("GET", path, plugin("admin"));
+            route.middleware = vec![crate::assets::PLUGIN_ASSETS_ROUTE_MARKER.to_owned()];
+            route
+        };
+        let routes = vec![
+            make_route("GET", "/admin", plugin("admin")),
+            asset("/static/_plugins/autumn-admin/admin.js"),
+            asset("/static/_plugins/autumn-admin/admin.cb7ccaab.js"),
+        ];
+        let prefix = check_route_prefix("admin", "/admin", &[], &routes);
+        assert_eq!(prefix.status, CheckStatus::Pass, "{}", prefix.message);
+        let declared = vec![SensitiveRoute {
+            path_pattern: "/admin".to_owned(),
+            auth_mechanism: "Role: admin required".to_owned(),
+        }];
+        let sensitive = check_sensitive_surfaces("admin", &routes, &declared);
+        assert_eq!(sensitive.status, CheckStatus::Pass, "{}", sensitive.message);
+
+        // `/static/_pluginsX/...` is not the asset prefix, even with the marker.
+        let lookalike = vec![asset("/static/_pluginsx/admin.js")];
+        let prefix = check_route_prefix("admin", "/admin", &[], &lookalike);
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+
+        // A route a plugin merely declared at an asset path, without the marker
+        // `AppBuilder::plugin_assets` attaches, is checked like any other.
+        let forged = vec![make_route(
+            "GET",
+            "/static/_plugins/x/admin",
+            plugin("admin"),
+        )];
+        let prefix = check_route_prefix("admin", "/admin", &[], &forged);
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+        let sensitive = check_sensitive_surfaces("admin", &forged, &declared);
+        assert_eq!(sensitive.status, CheckStatus::Fail, "{}", sensitive.message);
     }
 
     // ── check_sensitive_surfaces ───────────────────────────────────────────

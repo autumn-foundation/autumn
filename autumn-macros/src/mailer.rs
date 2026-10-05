@@ -35,12 +35,18 @@ pub fn returns_mail(method: &ImplItemFn) -> bool {
         .map(|segment| segment.ident.to_string())
         .collect::<Vec<_>>();
 
+    // A 2- or 3-segment path's leading segment is only ever literally
+    // "autumn_web" when unrenamed; compare against the actively resolved
+    // name instead so a fully qualified return type still recognizes under
+    // a rename or `crate = "..."` override (#1828). `segments` came from
+    // `Ident::to_string()`, which spells a raw identifier `r#type` (not the
+    // bare `type`) — compare against the same escaped form, not
+    // `current_target()` directly (Codex review, #2552).
+    let crate_root = autumn_macros_support::crate_path::current_target_path_segment();
     match segments.as_slice() {
         [mail] => mail == "Mail",
-        [autumn_web, mail] => autumn_web == "autumn_web" && mail == "Mail",
-        [autumn_web, module, mail] => {
-            autumn_web == "autumn_web" && module == "mail" && mail == "Mail"
-        }
+        [root, mail] => *root == crate_root && mail == "Mail",
+        [root, module, mail] => *root == crate_root && module == "mail" && mail == "Mail",
         _ => false,
     }
 }
@@ -52,7 +58,7 @@ fn parse_mail_method(method: &ImplItemFn) -> syn::Result<Option<MailMethod>> {
     let Some(receiver) = method.sig.receiver() else {
         return Ok(None);
     };
-    if receiver.reference.is_none() || receiver.mutability.is_some() {
+    if !matches!(receiver.kind, syn::ReceiverKind::Reference(_, _, None)) {
         return Err(syn::Error::new_spanned(
             receiver,
             "#[mailer] template methods must use an `&self` receiver",
@@ -188,7 +194,7 @@ pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 && method
                     .sig
                     .receiver()
-                    .is_some_and(|r| r.reference.is_some() && r.mutability.is_none())
+                    .is_some_and(|r| matches!(r.kind, syn::ReceiverKind::Reference(_, _, None)))
             {
                 let orig_block = method.block.clone();
                 method.block = syn::parse_quote!({

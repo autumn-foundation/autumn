@@ -819,3 +819,83 @@ async fn scope_reassignment_via_update_compacts_old_and_appends_to_new() {
          existing rank"
     );
 }
+
+/// Regression for issue #2240: `upsert_many` sends one
+/// `INSERT ... ON CONFLICT (id) DO UPDATE SET ...` per chunk. Before the fix,
+/// a changeset that reassigns several same-scope rows' `board_id` in one
+/// `upsert_many` call put them all in that one statement, and the `rescope`
+/// trigger's per-row `OLD.rank` read could see another row's already-shifted
+/// rank instead of its own pre-statement value -- corrupting the compact/
+/// append math. `upsert_many` must now force single-row chunks for a
+/// `position(...)` repository (mirroring the `delete_many`/`update_many`
+/// fix), so each reassignment runs as its own statement.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn upsert_many_scope_reassignment_of_multiple_rows_stays_contiguous() {
+    let db = TestDb::shared().await;
+    setup_triggered_table(db).await;
+    let repo = PgPositionTriggeredTaskRepository::with_pool_untracked(db.pool());
+    let board_a = 2006;
+    let board_b = 2007;
+
+    // Seed board A with 5 rows (ranks 0..4) and board B with 2 rows (ranks
+    // 0..1), both through the real BEFORE INSERT assign trigger.
+    let mut a_ids = Vec::new();
+    for i in 0..5 {
+        let mut conn = db.pool().get().await.expect("checkout connection");
+        let id: i64 = diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq(format!("a-{i}")),
+                position_triggered_tasks::board_id.eq(board_a),
+            ))
+            .returning(position_triggered_tasks::id)
+            .get_result(&mut conn)
+            .await
+            .expect("seed board a");
+        a_ids.push(id);
+    }
+    for i in 0..2 {
+        let mut conn = db.pool().get().await.expect("checkout connection");
+        diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq(format!("b-{i}")),
+                position_triggered_tasks::board_id.eq(board_b),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("seed board b");
+    }
+
+    // Move 3 of board A's 5 rows (ranks 1, 2, 3) to board B in a single
+    // upsert_many call -- the exact shape the fix must chunk to single rows.
+    let mut moved = Vec::new();
+    for &id in &a_ids[1..4] {
+        let mut record = repo
+            .find_by_id(id)
+            .await
+            .expect("find_by_id must not error")
+            .expect("seeded row must exist");
+        record.board_id = board_b;
+        moved.push(record);
+    }
+    repo.upsert_many(&moved)
+        .await
+        .expect("upsert_many must not error");
+
+    let mut a_ranks = triggered_ranks(&db.pool(), board_a).await;
+    a_ranks.sort_unstable();
+    assert_eq!(
+        a_ranks,
+        vec![0, 1],
+        "board A must compact to a contiguous 0..1 permutation after 3 rows left: {a_ranks:?}"
+    );
+
+    let mut b_ranks = triggered_ranks(&db.pool(), board_b).await;
+    b_ranks.sort_unstable();
+    assert_eq!(
+        b_ranks,
+        vec![0, 1, 2, 3, 4],
+        "board B must end up with an exact 0..4 permutation (no duplicates, no gaps) after \
+         gaining 3 rows in one upsert_many call: {b_ranks:?}"
+    );
+}

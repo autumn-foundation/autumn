@@ -53,14 +53,21 @@ curl -X POST http://localhost:3000/rooms -i
 curl http://localhost:3000/api/rooms
 # => [{"id":"<uuid>","max_participants":6,"created_at":"..."}]
 
-# Create a room directly through the plugin's mounted route:
-curl -X POST http://localhost:3000/api/media/rooms
-# => {"id":"<uuid>","max_participants":6,"created_at":"...","participants":[]}
+# The plugin's own create/join routes are #[secured]; anonymously they refuse:
+curl -X POST http://localhost:3000/api/media/rooms -i
+# => 401 Unauthorized
 
-# Join it (returns a session token + mesh WHIP/WHEP targets):
-curl -X POST http://localhost:3000/api/media/rooms/<id>/join \
+# Signed in (send your app's session cookie), create and join work:
+curl -X POST http://localhost:3000/api/media/rooms -b 'autumn.sid=<session>'
+# => {"id":"<uuid>","max_participants":6,"created_at":"...","participants":[]}
+curl -X POST http://localhost:3000/api/media/rooms/<id>/join -b 'autumn.sid=<session>' \
   -H 'content-type: application/json' -d '{"display_name":"Ada"}'
+# => a session token + mesh WHIP/WHEP targets
 ```
+
+This example has no login flow of its own, so its `/rooms` route creates rooms
+server-side through `RoomService`; wire it into an app with authentication to
+join through the plugin's routes.
 
 ## Available routes
 
@@ -72,6 +79,7 @@ curl -X POST http://localhost:3000/api/media/rooms/<id>/join \
 | POST | `/api/media/rooms` | (plugin) Create a room |
 | POST | `/api/media/rooms/{room_id}/join` | (plugin) Join a room |
 | POST | `/api/media/rooms/{room_id}/leave` | (plugin) Leave a room |
+| POST | `/api/media/rooms/{room_id}/heartbeat` | (plugin) Hold the seat: refresh liveness |
 | GET | `/api/media/rooms/{room_id}` | (plugin) Member-gated roster |
 
 ## System smoke test

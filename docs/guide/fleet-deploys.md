@@ -376,9 +376,10 @@ drift and `--strict` exits non-zero on it (it was previously reported without
 counting). Its row says so:
 
 ```
-⚠️  this host has a `current` symlink but the release it points at could not be
-read (a broken symlink or a missing releases dir) — repair it before the next
-deploy, which would record that unresolvable target as this host's rollback point
+⚠️  this host's `current` symlink does not point to a release in `releases/` (the
+link is broken, the releases dir is missing, or the target is not a release dir)
+— repair it before the next deploy, which would record that target as this
+host's rollback point
 ```
 
 Two more state-drift reasons come from the maintenance probe, and both name the
@@ -434,6 +435,39 @@ was never deployed at all — that one reads `?`. Mind its scope: a deploy that
 failed *before* cutover never
 rewrites it, so it is that host's own last completed action rather than a
 verdict on the last rollout, and it is reported, never counted as drift.
+
+A deployed host can answer `/ready` with a code that is not `2xx`, or give no
+answer. Its row then shows ⚠️, and a line under the table names the host. A load
+balancer that checks `/ready` stops sending traffic to that host. This is **not**
+drift, because readiness changes during a normal drain or start-up. `--strict`
+does not fail on it. To alert on readiness, use `--json`. For each host with
+`"mode": "deployed"`, read `ready`: the HTTP code, or `null` for no answer.
+
+### Alerting on a halted rollout or drift
+
+Do not wire the cron job above to a paging tool by hand. Two paths already
+send an [operator alert](operator-alerts.md) through your `[alerts]` config:
+
+- `autumn deploy up` sends one the moment a rollout halts.
+- `autumn deploy status --strict` sends one when it finds drift.
+
+Both alerts use the `scheduled_task_failure` condition. They carry only host
+names and the drift or halt reason strings. These are the same values the
+command already prints. Delivery is best-effort. A failed send never
+changes the command's exit code. A plain `deploy status` (no `--strict`)
+never sends an alert.
+
+Set a channel once under `[alerts]` and both paths use it:
+
+```toml
+[alerts]
+pagerduty_routing_key = "…"   # or slack_webhook_url / discord_webhook_url / webhook_url
+```
+
+> **Email is not a channel for these two alerts.** `[alerts] email`
+> needs a running mailer. A one-shot CLI command has none. Use PagerDuty,
+> Slack, Discord, or a signed webhook instead. Run `autumn alert test` to
+> check your channels are wired up.
 
 ### Converging a mixed fleet
 

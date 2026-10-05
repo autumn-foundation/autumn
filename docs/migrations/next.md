@@ -1,9 +1,10 @@
 # Migrating to the next Autumn release (rolling draft)
 
-> **Rolling draft.** This is the in-flight guide for the changes currently
-> under `## [Unreleased]` in [`CHANGELOG.md`](../../CHANGELOG.md). Every PR
-> that lands a breaking change appends a section here and links this file from
-> its changelog entry. At release time the file is renamed to
+> **Rolling draft.** This is the in-flight guide for the changes that are not
+> released yet. Every PR that lands a breaking change appends a section here
+> and links this file from its changelog note — which is a file under
+> [`changelog.d/`](../../changelog.d/README.md), not a line in
+> [`CHANGELOG.md`](../../CHANGELOG.md). At release time the file is renamed to
 > `docs/migrations/<version>.md`, its version placeholders are filled in, and
 > the index in [`README.md`](README.md) is updated — see
 > [`docs/release-checklist.md`](../release-checklist.md), *Migration Guide
@@ -110,6 +111,25 @@ codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ---
 
+## Plugin authors
+
+Everything here is addressed to someone maintaining an `autumn-plugin-*` /
+`autumn-*-plugin` crate, not to an application author. See
+[`docs/plugins.md`](../plugins.md#the-plugin-api-contract) for the tiers.
+
+- **Stable surface changed:** none.
+- **Experimental surface changed:** none.
+- **New stable surface:** none.
+- **Declared range to move to:** each release, bump the literal in
+  `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
+  `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
+  lockstep with the framework) and re-run
+  `autumn plugin-check --plugin-name <your-plugin>`. A range that excludes the
+  host makes `AppBuilder::plugin` panic at registration unless
+  `AUTUMN_PLUGIN_CONTRACT=warn` demotes it. The examples in the `Plugin::contract`
+  and `plugin_contract` rustdoc and the reference plugin's note name the series
+  under development; copy the shape, not the literal.
+
 ## Compiler error cheat sheet
 
 Paste the most common errors a user will hit and the fix. This is the
@@ -117,7 +137,7 @@ single most valuable section of the guide — keep it factual and short.
 
 | Error message (truncated) | Where you see it | Fix |
 |---------------------------|------------------|-----|
-| `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::bar;` |
+| `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 
 ## Configuration changes

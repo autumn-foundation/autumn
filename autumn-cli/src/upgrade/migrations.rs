@@ -21,6 +21,10 @@
 pub enum Confidence {
     /// Safe by construction — a rename or import move. Rewritten sites are
     /// reported as a count plus the diff.
+    // No shipped migration currently earns this label (issue #2234); kept for
+    // the next one that does. Tests construct it, so production code alone
+    // does not.
+    #[cfg_attr(not(test), allow(dead_code))]
     Auto,
     /// Rewritten, but each site is listed individually in the summary for a
     /// human to read before committing.
@@ -208,7 +212,11 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         id: "0.6.0-repository-with-pool-untracked",
         version: "0.6.0",
         title: "repository constructor `with_pool` is renamed to `with_pool_untracked`",
-        confidence: Confidence::Auto,
+        // `review`, not `auto` (issue #2234): the receiver check is textual,
+        // not name resolution, so it can miss a hand-written type or a
+        // foreign `#[repository]`. Every site is still rewritten; each one is
+        // also flagged for a human to read.
+        confidence: Confidence::Review,
         guide: "docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked",
         rewrite: Rewrite::CallRename {
             from: "with_pool",
@@ -282,6 +290,237 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         title: "`Query<T>` decodes structure, rejects duplicate scalar keys, and sorts pair vectors",
         confidence: Confidence::Manual,
         guide: "docs/migrations/0.7.0.md#queryt-decoding-1972",
+        rewrite: Rewrite::GuideOnly,
+    },
+    // 0.8.0 ships no codemod either: every break below (one entry per section of
+    // the guide's *Breaking changes*) needs a value, a new
+    // field, a changed impl shape, or a decision about behaviour — none is
+    // rename-level. They are registered as `GuideOnly` so `autumn upgrade` names
+    // them and links the guide section, rather than a 0.7.x app being told
+    // "nothing to change" about a release that tightened a dozen compile-time
+    // checks.
+    AppMigration {
+        id: "0.8.0-http-client-error-non-exhaustive",
+        version: "0.8.0",
+        title: "`http_client::ClientError` is `#[non_exhaustive]` and gains `SimNetwork`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#http_client-clienterror-is-non_exhaustive-and-gains-simnetwork-2967",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-consent-banner-csrf-cookie-option",
+        version: "0.8.0",
+        title: "`inject_consent_banner` takes `csrf_cookie_name: Option<&str>`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#consent-inject_consent_banner-takes-csrf_cookie_name-optionstr",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-sim-types-private",
+        version: "0.8.0",
+        title: "`sim::SimClock` and `sim::SimApp` are no longer public",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#sim-simclock-and-simapp-are-no-longer-public-2967",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-macros-split",
+        version: "0.8.0",
+        title: "`autumn-macros` no longer holds `model`, `repository` and `service`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#macros-autumn-macros-no-longer-holds-the-database-macros-2809",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-widget-classes-prefixed",
+        version: "0.8.0",
+        title: "built-in widget CSS classes are now `autumn-`-prefixed",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#widgets-widget-css-classes-are-now-autumn--prefixed-2354",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-commentable-author-name-checked",
+        version: "0.8.0",
+        title: "`#[commentable(by = ...)]` checks `author_name` against the author model",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#commentable-author_name-is-checked-against-the-author-model-2288",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-authorize-aliased-compile-error",
+        version: "0.8.0",
+        title: "aliased and ambiguous `#[authorize]` shapes are a compile error",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#authorize-aliased-authorize-and-ambiguous-attribute-shapes-are-now-a-compile-error",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-static-get-feature-flag-compile-error",
+        version: "0.8.0",
+        title: "`#[feature_flag]` on `static_get` is a compile error",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#static_get-feature_flag-is-now-a-compile-error",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-repository-owner-requires-policy",
+        version: "0.8.0",
+        title: "`owner = column` beside `api = \"...\"` requires `policy`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#repository-owner--column-next-to-api---now-requires-policy",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-lifecycle-unsound-graph",
+        version: "0.8.0",
+        title: "an unsound `#[lifecycle]` graph is a compile error",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#lifecycle-an-unsound-lifecycle-graph-is-now-a-compile-error",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-openapi-schema-skip-serializing-if",
+        version: "0.8.0",
+        title: "`#[serde(skip_serializing_if)]` on an `OpenApiSchema` type needs `#[serde(default)]`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#openapischema-serdeskip_serializing_if-now-needs-serdedefault",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-audit-event-metadata",
+        version: "0.8.0",
+        title: "`AuditEvent` gains a `metadata` field",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#audit-auditevent-gains-a-metadata-field",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-openapi-parameter-description",
+        version: "0.8.0",
+        title: "`openapi::Parameter` gains a `description` field",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#openapi-parameter-gains-a-description-field",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-autumn-billing-customer-tenant-scoped",
+        version: "0.8.0",
+        title: "`autumn-billing`'s `Customer.user_id` is tenant-scoped under tenancy",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#autumn-billing-customeruser_id-is-tenant-scoped-under-tenancy",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-tls-mtls-members",
+        version: "0.8.0",
+        title: "`TlsConfig`, `TlsError` and `SecurityDump` gain mTLS members",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#tls-tlsconfig-tlserror-and-securitydump-gain-mtls-members-1640",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-ssg-manifest-non-exhaustive",
+        version: "0.8.0",
+        title: "`ManifestEntry` / `StaticManifest` are `#[non_exhaustive]`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#ssg-manifestentry--staticmanifest-are-non_exhaustive-and-generated-pages-carry-their-declared-content-type",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-capsule-execute-replay-fixtures",
+        version: "0.8.0",
+        title: "`capsule::execute` takes `ReplayFixtures`; the capsule format is version 3",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#failure-capsules-capsuleexecute-takes-replayfixtures-and-the-capsule-format-is-version-3",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-config-replication-field",
+        version: "0.8.0",
+        title: "`AutumnConfig` gains a `replication` field",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#config-autumnconfig-gains-a-replication-field",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-config-job-sqlite-field",
+        version: "0.8.0",
+        title: "`JobConfig` gains a `sqlite` field and `SchedulerBackend` a `Sqlite` variant",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#config-jobconfig-gains-a-sqlite-field-and-schedulerbackend-gains-a-sqlite-variant",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-media-roomstore-heartbeat",
+        version: "0.8.0",
+        title: "`RoomStore` gains a required `heartbeat` method",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#media-rooms-roomstore-gains-a-required-heartbeat-method",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-media-rooms-require-session",
+        version: "0.8.0",
+        title: "media room create and join require an authenticated session",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#media-rooms-create-and-join-require-an-authenticated-session",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-admin-experiment-changed-at",
+        version: "0.8.0",
+        title: "`ExperimentChange::changed_at` is now `NaiveDateTime`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#admin-plugin-experimentchangechanged_at-is-now-naivedatetime",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-capacity-contract-metadata-fields",
+        version: "0.8.0",
+        title: "three capacity-contract metadata structs gain fields",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#capacity-contracts-three-metadata-structs-gain-fields",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-job-admin-record-blocked-field",
+        version: "0.8.0",
+        title: "`JobAdminRecord` gains a `blocked_on_concurrency` field",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#jobs-jobadminrecord-gains-a-blocked_on_concurrency-field",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-scrub-refuses-delete-trigger",
+        version: "0.8.0",
+        title: "`autumn db scrub` refuses a `DELETE` trigger or rule on a table it empties",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#scrub-a-delete-trigger-or-rule-on-a-table-autumn-db-scrub-empties-is-refused",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-acme-renewal-dns-recovery",
+        version: "0.8.0",
+        title: "`AcmeRenewalTask` gains `dns` and `recovery`; `AcmeConfig` gains `dns`",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#acme-acmerenewaltask-gains-dns-and-recovery-acmeconfig-gains-dns",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-plugin-conformance-config-non-exhaustive",
+        version: "0.8.0",
+        title: "`plugin_conformance::ConformanceConfig` is `#[non_exhaustive]`; build it with its constructors",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#plugin-conformance-conformanceconfig-is-non_exhaustive",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.8.0-validator-0-21",
+        version: "0.8.0",
+        title: "`#[derive(Validate)]` needs `validator = \"0.21\"` in the app's own manifest",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.8.0.md#dependencies-validator-moves-to-021",
         rewrite: Rewrite::GuideOnly,
     },
 ];
@@ -836,7 +1075,10 @@ mod tests {
             .iter()
             .find(|m| m.id == "0.6.0-repository-with-pool-untracked")
             .expect("the with_pool rename is the first shipped codemod (issue #1629)");
-        assert_eq!(migration.confidence, Confidence::Auto);
+        // `review`, not `auto` (issue #2234): receiver identification is
+        // textual, not name resolution, so flagging every rewrite for a human
+        // to read is the safer default until that gap closes.
+        assert_eq!(migration.confidence, Confidence::Review);
         assert_eq!(
             migration.rewrite,
             Rewrite::CallRename {

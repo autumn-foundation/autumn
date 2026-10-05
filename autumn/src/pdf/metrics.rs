@@ -336,7 +336,7 @@ mod tests {
     fn text_width_scales_with_font_size() {
         let small = text_width_pt("Total", 10.0, false);
         let large = text_width_pt("Total", 20.0, false);
-        assert!((large - small * 2.0).abs() < 0.01);
+        assert!(small.mul_add(-2.0, large).abs() < 0.01);
     }
 
     #[test]

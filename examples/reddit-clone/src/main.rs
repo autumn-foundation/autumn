@@ -33,6 +33,20 @@
 //                          (see routes/webhooks.rs, [[security.webhooks.endpoints]] in autumn.toml)
 //   Outbound HTTP       -> autumn_web::http::Client extractor for traced, retried outbound calls
 //                          (link-preview deferred: tracked in #1238 + #1239 for 0.5.0)
+//   Route-level SEO     -> seo(...) on the route attributes + the SeoMeta extractor, a
+//                          database-backed SitemapSource, /robots.txt and /sitemap.xml
+//                          (see src/seo.rs, [seo] in autumn.toml, docs/guide/seo.md)
+//   Cookie consent      -> inject_consent_banner layer + POST accept/reject/withdraw and a
+//                          GET preferences page; the "analytics" category is gated at its one
+//                          call site (see routes/consent.rs, docs/guide/cookie-consent.md)
+//   Rich text           -> user-submitted Markdown post bodies rendered through
+//                          markdown::render_user_content (see docs/guide/rich-text.md)
+//   Typed a11y forms    -> a11y::TextField / TextArea / Select / Button — an unlabeled field
+//                          does not compile (see routes/posts.rs, docs/guide/accessibility.md)
+//   Pagination          -> PageRequest + Page + pagination_nav on the community listing,
+//                          plain <a href> links that work with JS off (docs/guide/pagination.md)
+//   Forms & validation  -> ChangesetForm round-trip with inline errors and a no-JS fallback
+//                          (see routes/posts.rs, docs/guide/forms.md)
 //
 // Run with:   cargo run -p reddit-clone   (first dev boot applies reddit migrations and
 //                                          starts the job runtime + durable live-feed relay)
@@ -40,6 +54,9 @@
 // WebSocket:  ws://localhost:3000/ws/feed
 // API test:   curl http://localhost:3000/api/posts
 //             curl http://localhost:3000/api/subreddits
+// SEO test:   curl http://localhost:3000/robots.txt
+//             curl http://localhost:3000/sitemap.xml
+//             curl -s http://localhost:3000/ | grep -E '<title>|og:|canonical'
 
 use autumn_web::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus};
 use autumn_web::config::AutumnConfig;
@@ -95,11 +112,22 @@ async fn main() {
     // assignments survive restarts and you can conclude experiments from the DB.
     let experiment_svc = experiments::setup();
 
+    // Route-level SEO (docs/guide/seo.md). Two steps:
+    //
+    //   1. Record `[seo] base_url` so the handlers can build canonical URLs
+    //      without cloning the whole config on each request.
+    //   2. Register the sitemap source. This ALSO mounts /robots.txt and
+    //      /sitemap.xml — `[seo] base_url` alone is enough to mount them, and
+    //      the source only adds the dynamic URLs.
+    reddit_clone::seo::init_base_url(&app_config);
+    let sitemap_source = reddit_clone::seo::RedditSitemapSource::from_config(&app_config);
+
     let app = autumn_web::app()
         .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
         .with_flag_store(flag_store)
         .with_error_reporter(StructuredReporter)
+        .seo_source(sitemap_source)
         .state_initializer(move |state| {
             state.insert_extension(experiment_svc);
             // Audit sink: an append-only security-event log, kept separate from
@@ -125,6 +153,13 @@ async fn main() {
             routes::auth::profile,
             routes::avatars::avatar_form,
             routes::avatars::upload_avatar,
+            // Cookie consent (#1214): accept/reject/withdraw are POST routes
+            // behind CSRF; only the preferences page is a GET. See
+            // routes/consent.rs and docs/guide/cookie-consent.md.
+            routes::consent::accept,
+            routes::consent::reject,
+            routes::consent::withdraw,
+            routes::consent::manage,
             routes::subreddits::list,
             routes::subreddits::create_form,
             routes::subreddits::create,
@@ -194,6 +229,25 @@ async fn main() {
         // Gates /ready (IndicatorGroup::Readiness by default), so a degraded relay
         // will block rolling deploys until it recovers.
         .health_indicator("live_feed_relay", Arc::new(LiveFeedRelayIndicator))
+        // Cookie-consent banner (#1214). One layer shows the banner on every
+        // HTML page until the visitor decides, with no change to `layout()`'s
+        // signature and no per-handler wiring. The strictly-necessary session
+        // and CSRF cookies are never gated by it — only this app's
+        // `"analytics"` category is, at its single call site in
+        // `routes::layout::analytics_snippet`. See
+        // docs/guide/cookie-consent.md.
+        .layer(autumn_web::reexports::axum::middleware::from_fn(
+            move |req, next| async move {
+                autumn_web::consent::inject_consent_banner(
+                    req,
+                    next,
+                    routes::consent::CONSENT_POLICY_VERSION,
+                    Some(autumn_web::consent::DEFAULT_CSRF_COOKIE_NAME),
+                    autumn_web::consent::DEFAULT_CSRF_FORM_FIELD,
+                )
+                .await
+            },
+        ))
         .idempotent();
 
     #[cfg(feature = "embed-assets")]

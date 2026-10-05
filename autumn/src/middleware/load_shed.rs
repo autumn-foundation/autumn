@@ -15,6 +15,15 @@
 //! returns `None` in that case so this layer is never applied and there is
 //! no overhead.
 //!
+//! The ceiling itself no longer has to be a hand-tuned guess: with
+//! `[server] capacity_contract` pointing at a committed `capacity.lock`, it is
+//! sourced from the envelope `autumn calibrate` proved for this build on this
+//! host class, so the layer sheds at a measured edge rather than an assumed
+//! one (issue #1733, `docs/guide/capacity-contracts.md`). An explicit
+//! `max_concurrent_requests` still wins, and every contract problem degrades
+//! to *unlimited* rather than to a ceiling — see
+//! [`crate::capacity::resolve_admission_limit`].
+//!
 //! The admission gauge is a dedicated counter, independent of
 //! [`crate::middleware::MetricsCollector`]'s `requests_active` and the
 //! graceful-shutdown drain accounting, so shedding cannot double-count,

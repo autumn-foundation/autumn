@@ -414,7 +414,11 @@ impl LiveEventBusPublisher {
                         "distributed.live_feed_bus.redis_url is required when kind = redis_pubsub",
                     )
                 })?;
-                let client = redis::Client::open(redis_url)
+                // `open_client`, not `redis::Client::open`: a `rediss://` URL
+                // (Azure Redis Cache only offers TLS) panics inside rustls
+                // unless a process-level CryptoProvider is installed first.
+                // See `autumn_web::redis_tls` and issue #2172.
+                let client = autumn_web::redis_tls::open_client(redis_url)
                     .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
                 LiveEventBusPublisherInner::RedisPubSub {
                     channel: config.channel.clone(),
@@ -719,7 +723,7 @@ async fn connect_redis_live_event_listener(
         warn!("distributed.live_feed_bus.redis_url is missing; falling back to polling");
         return None;
     };
-    match redis::Client::open(redis_url) {
+    match autumn_web::redis_tls::open_client(redis_url) {
         Ok(client) => setup_redis_pubsub(client, channel).await,
         Err(error) => {
             warn!(
@@ -1245,6 +1249,63 @@ fn rebroadcast_row(state: &AppState, row: &LiveFeedEventRow) {
 
 #[cfg(test)]
 mod tests {
+    /// The live-feed bus must open its Redis clients through
+    /// `autumn_web::redis_tls::open_client`. A managed Redis (Azure Redis
+    /// Cache, ElastiCache with transit encryption) only offers `rediss://`,
+    /// and a bare `redis::Client::open` on that scheme panics inside rustls
+    /// unless a process-level `CryptoProvider` was installed first (#2172).
+    /// Examples get copied, so the wrong pattern must not survive here.
+    #[test]
+    fn redis_clients_are_opened_through_the_shared_tls_guard() {
+        // Split so the needles do not match this declaration. Deliberately
+        // unqualified: `redis` is a direct dependency of this example, so
+        // `use redis::Client;` + `Client::open(..)` is a one-line edit away
+        // and a `redis::`-qualified needle would not see it.
+        let needles = [concat!("Client::", "open("), concat!("build_with", "_tls(")];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rust_sources(&src, &mut files);
+        assert!(!files.is_empty(), "no sources under {}", src.display());
+        files.sort();
+
+        let mut offenders = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).expect("read source");
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                    continue;
+                }
+                if needles.iter().any(|needle| line.contains(needle)) {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        file.strip_prefix(&src).unwrap_or(&file).display(),
+                        index + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use `autumn_web::redis_tls::open_client` so a `rediss://` URL \
+             cannot panic inside rustls (#2172):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Recursively collect every `.rs` file under `dir`.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::Mutex;
