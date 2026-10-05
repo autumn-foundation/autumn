@@ -3603,13 +3603,25 @@ impl Analyzer {
                     Kind::Carrier | Kind::Holder | Kind::Nested => Kind::Nested,
                 })
             }
-            Expr::Await(a) => match peel_parens(&a.base) {
-                // `pending.await` on `let pending = async { &repo };`.
-                base @ Expr::Path(_) => self.env.binding(&path_ident(base)?).output,
-                Expr::Async(block) => Some(self.async_output(&block.block)),
-                Expr::Call(call) => self.invoked(call, true),
-                _ => None,
-            },
+            Expr::Await(a) => {
+                let base = peel_parens(&a.base);
+                let output = match base {
+                    // `pending.await` on `let pending = async { &repo };`.
+                    Expr::Path(_) => {
+                        path_ident(base).and_then(|name| self.env.binding(&name).output)
+                    }
+                    Expr::Async(block) => Some(self.async_output(&block.block)),
+                    Expr::Call(call) => self.invoked(call, true),
+                    _ => None,
+                };
+                // `.await` on a value that holds a handle and is not a known
+                // future (`PgPostRepository::new(&mut db).await`) gives what
+                // that value holds.
+                output.or_else(|| {
+                    Some(self.value_of(base))
+                        .filter(|kind| *kind != Kind::Plain && !self.is_known_future(base))
+                })
+            }
             _ => None,
         }
     }
@@ -3953,9 +3965,13 @@ impl Analyzer {
             // `checkout` counts only on a known `LazyDb` (PR #2762, round 3).
             Expr::MethodCall(mc) => {
                 let method = mc.method.to_string();
+                // `checkout` on any handle gives a handle: a `LazyDb` taken
+                // from a container (`[lazy].into_iter().next()`) is a plain
+                // handle here, and its connection must stay tracked.
                 HANDLE_ACCESSORS.contains(&method.as_str())
                     || (HANDLE_TRANSITIONS.contains(&method.as_str())
-                        && self.expr_is_lazy_db(&mc.receiver))
+                        && (self.expr_is_lazy_db(&mc.receiver)
+                            || self.expr_is_handle(&mc.receiver)))
             }
             _ => false,
         }
@@ -9112,6 +9128,36 @@ mod tests {
                 "async fn h(ids: Vec<i64>) -> AutumnResult<usize> { \
                  let mut all = Vec::new(); all.extend(ids); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn awaited_values_keep_their_handles() {
+        check_handlers(&[
+            (
+                "a LazyDb taken from a container still gives a tracked connection",
+                "async fn h(lazy: LazyDb) -> AutumnResult<usize> { \
+                 let lazy = [lazy].into_iter().next().unwrap(); let mut db = lazy.checkout().await?; let _ = db.find_all().await?; let _ = db.find_all().await?; Ok(0) }",
+                Expect::Exact(3),
+            ),
+            (
+                "an annotated awaited constructor gives a handle",
+                "async fn h(db: Db) -> AutumnResult<usize> { \
+                 #[query_cost(1)] let repo = PgPostRepository::new(&mut db).await; let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "an annotated awaited deferred constructor gives a handle",
+                "async fn h(db: Db) -> AutumnResult<usize> { \
+                 let pending = PgPostRepository::new(&mut db); #[query_cost(1)] let repo = pending.await; let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: a LazyDb checkout stays free",
+                "async fn h(lazy: LazyDb) -> AutumnResult<usize> { \
+                 let mut db = lazy.checkout().await?; let _ = db.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
