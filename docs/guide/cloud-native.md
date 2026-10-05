@@ -1020,7 +1020,7 @@ Notes:
   `ALTER ROLE app SET statement_timeout = '30s'`. Run migrations with a
   different role, because the migrator does not change `statement_timeout`.
   A route's `StatementTimeout` applies to the transactions of that request.
-  SQLite builds do not get these defaults.
+  SQLite builds do not get these defaults, and refuse a nonzero value.
 - **Migrations.** In each transactional migration, a DDL statement that waits
   more than `5s` for a table lock fails. The migrator retries it after a
   jittered delay. A `run_in_transaction = false` migration (for example

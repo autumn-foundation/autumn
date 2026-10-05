@@ -1684,13 +1684,14 @@ where
 }
 
 /// The `PGOPTIONS` value for the `diesel` subprocess: `existing` plus
-/// `-c lock_timeout=<ms>`. A zero `lock_timeout` passes `existing` through.
-/// `None` means the child gets no `PGOPTIONS`.
+/// `-c lock_timeout=<ms>`. A zero timeout is sent too, so an inherited role
+/// or database default is turned off.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "`None` means no PGOPTIONS for the child; callers set it after a pooler refusal"
+)]
 fn diesel_pgoptions(existing: Option<&str>, lock_timeout: std::time::Duration) -> Option<String> {
     let existing = existing.map(str::trim).filter(|e| !e.is_empty());
-    if lock_timeout.is_zero() {
-        return existing.map(str::to_owned);
-    }
     let ms = u64::try_from(lock_timeout.as_millis())
         .unwrap_or(u64::MAX)
         .min(i32::MAX.unsigned_abs().into());
@@ -1721,14 +1722,18 @@ fn strip_lock_timeout(existing: Option<&str>) -> Option<String> {
 }
 
 /// The `PGOPTIONS` the `diesel` subprocess gets. When a pending migration is
-/// non-transactional, no `lock_timeout` reaches it, inherited ones included.
+/// non-transactional, the session gets `lock_timeout=0`, and any inherited
+/// `lock_timeout` option is removed.
 fn child_pgoptions(
     inherited: Option<&str>,
     lock_timeout: std::time::Duration,
     non_transactional_pending: bool,
 ) -> Option<String> {
     if non_transactional_pending {
-        strip_lock_timeout(inherited)
+        diesel_pgoptions(
+            strip_lock_timeout(inherited).as_deref(),
+            std::time::Duration::ZERO,
+        )
     } else {
         diesel_pgoptions(inherited, lock_timeout)
     }
@@ -4691,11 +4696,14 @@ primary_url = "postgres://prod-s0:5432/app"
             diesel_pgoptions(Some("-c search_path=app"), five).as_deref(),
             Some("-c search_path=app -c lock_timeout=5000")
         );
-        // `0` passes the inherited value through unchanged.
-        assert_eq!(diesel_pgoptions(None, std::time::Duration::ZERO), None);
+        // `0` is sent too, so an inherited default is turned off.
+        assert_eq!(
+            diesel_pgoptions(None, std::time::Duration::ZERO).as_deref(),
+            Some("-c lock_timeout=0")
+        );
         assert_eq!(
             diesel_pgoptions(Some("-c search_path=app"), std::time::Duration::ZERO).as_deref(),
-            Some("-c search_path=app")
+            Some("-c search_path=app -c lock_timeout=0")
         );
     }
 
@@ -4718,7 +4726,7 @@ primary_url = "postgres://prod-s0:5432/app"
         let inherited = Some("-c search_path=app -c lock_timeout=9000");
         assert_eq!(
             child_pgoptions(inherited, five, true).as_deref(),
-            Some("-c search_path=app")
+            Some("-c search_path=app -c lock_timeout=0")
         );
         assert_eq!(
             child_pgoptions(inherited, five, false).as_deref(),

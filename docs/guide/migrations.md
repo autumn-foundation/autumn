@@ -172,11 +172,14 @@ WHERE pid IN (SELECT pid FROM pg_locks WHERE relation = 'users'::regclass);
 ```
 
 Only a lock timeout is retried. A migration with `run_in_transaction = false`
-(for example `CREATE INDEX CONCURRENTLY`) gets no `lock_timeout`. It must wait
-for older transactions, and a timeout would leave an INVALID index.
+(for example `CREATE INDEX CONCURRENTLY`) runs with `lock_timeout = 0`. It must
+wait for older transactions, and a timeout would leave an INVALID index. The
+value is always set explicitly, so a role or database default does not apply.
+`"0s"` turns such a default off too.
 
-The check reads the English Postgres message. With a different `lc_messages`,
-a lock timeout still stops the migration, but it is not retried.
+The check reads the English Postgres message. The migrator sets
+`lc_messages = 'C'` on its session. When the role may not set it, a
+non-English lock timeout still stops the migration, but it is not retried.
 
 The Rust API takes the policy explicitly:
 

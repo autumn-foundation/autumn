@@ -2068,6 +2068,8 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
 
     #[cfg(feature = "sqlite")]
     reject_sqlite_statement_timeout(config.statement_timeout, url)?;
+    #[cfg(feature = "sqlite")]
+    reject_sqlite_idle_in_transaction_timeout(config.idle_in_transaction_timeout)?;
 
     let pool = build_pool(
         url,
@@ -2143,6 +2145,27 @@ pub(crate) fn reject_sqlite_statement_timeout(
     )))
 }
 
+/// Reject a configured `database.idle_in_transaction_timeout` under the
+/// `SQLite` backend (#3057). `SQLite` has no such setting, so a nonzero value
+/// would look enforced and not be. `None` and zero are allowed.
+///
+/// # Errors
+///
+/// Returns [`PoolError::UnsupportedBackend`] for a nonzero value.
+#[cfg(feature = "sqlite")]
+pub(crate) fn reject_sqlite_idle_in_transaction_timeout(
+    timeout: Option<Duration>,
+) -> Result<(), PoolError> {
+    let Some(timeout) = timeout.filter(|t| !t.is_zero()) else {
+        return Ok(());
+    };
+    Err(PoolError::UnsupportedBackend(format!(
+        "SQLite backend cannot enforce database.idle_in_transaction_timeout ({}ms). \
+         Unset it for the SQLite backend, or run on Postgres.",
+        timeout.as_millis()
+    )))
+}
+
 /// Reject a `SQLite` `replica_url` that cannot act as a real read replica for the
 /// given `primary_url`.
 ///
@@ -2189,6 +2212,8 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
 
     #[cfg(feature = "sqlite")]
     reject_sqlite_statement_timeout(config.statement_timeout, primary_url)?;
+    #[cfg(feature = "sqlite")]
+    reject_sqlite_idle_in_transaction_timeout(config.idle_in_transaction_timeout)?;
 
     let primary = build_pool(
         primary_url,
@@ -5444,6 +5469,21 @@ mod tests {
         assert!(sqlite_target_is_shared_cache(
             "file:app.db?cache=private&cache=shared"
         ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_idle_in_transaction_timeout_refuses_a_nonzero_value() {
+        let err = reject_sqlite_idle_in_transaction_timeout(Some(Duration::from_secs(60)))
+            .expect_err("SQLite cannot enforce it");
+        match err {
+            PoolError::UnsupportedBackend(message) => {
+                assert!(message.contains("idle_in_transaction_timeout"), "{message}");
+            }
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        }
+        assert!(reject_sqlite_idle_in_transaction_timeout(None).is_ok());
+        assert!(reject_sqlite_idle_in_transaction_timeout(Some(Duration::ZERO)).is_ok());
     }
 
     // The `statement_timeout` rejection must not claim `busy_timeout` bounds

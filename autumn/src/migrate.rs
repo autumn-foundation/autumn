@@ -236,6 +236,21 @@ fn lock_timeout_statement(timeout: std::time::Duration) -> String {
     format!("SET LOCAL lock_timeout = {ms}")
 }
 
+/// The `lock_timeout` statement a migration runs first. It is always explicit,
+/// so a role or database default does not apply instead.
+///
+/// A transactional migration gets `SET LOCAL lock_timeout = <timeout>`. A
+/// non-transactional one (`CREATE INDEX CONCURRENTLY`) gets
+/// `SET lock_timeout = 0`: it must wait for older transactions, and a timeout
+/// would leave an INVALID index.
+fn migration_lock_sql(run_in_transaction: bool, timeout: std::time::Duration) -> String {
+    if run_in_transaction {
+        lock_timeout_statement(timeout)
+    } else {
+        "SET lock_timeout = 0".to_owned()
+    }
+}
+
 /// Names of the migrations that ran, kept across retries.
 type AppliedLog = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
 
@@ -265,13 +280,8 @@ impl<S: MigrationSource<Pg>> MigrationSource<Pg> for LockTimeoutSource<'_, S> {
     }
 }
 
-/// A migration that sets `SET LOCAL lock_timeout` before it runs, and logs
-/// its name when it succeeds.
-///
-/// Only a `run_in_transaction` migration gets the timeout. A
-/// non-transactional one (`CREATE INDEX CONCURRENTLY`) must wait for older
-/// transactions. A `lock_timeout` there would cancel it and leave an INVALID
-/// index.
+/// A migration that sets its `lock_timeout` ([`migration_lock_sql`]) before
+/// it runs, and logs its version when it succeeds.
 struct LockTimeoutMigration {
     inner: Box<dyn Migration<Pg>>,
     lock_timeout: std::time::Duration,
@@ -283,9 +293,10 @@ impl Migration<Pg> for LockTimeoutMigration {
         &self,
         conn: &mut dyn diesel::connection::BoxableConnection<Pg>,
     ) -> diesel::migration::Result<()> {
-        if self.inner.metadata().run_in_transaction() && !self.lock_timeout.is_zero() {
-            conn.batch_execute(&lock_timeout_statement(self.lock_timeout))?;
-        }
+        conn.batch_execute(&migration_lock_sql(
+            self.inner.metadata().run_in_transaction(),
+            self.lock_timeout,
+        ))?;
         self.inner.run(conn)?;
         self.applied
             .borrow_mut()
@@ -324,8 +335,13 @@ fn apply_pending_with_policy<C>(
     policy: MigrationLockPolicy,
 ) -> Result<Vec<String>, MigrationError>
 where
-    C: MigrationHarness<Pg> + 'static,
+    C: MigrationHarness<Pg> + diesel::connection::SimpleConnection + 'static,
 {
+    // The retry reads the English lock-timeout message. Ask for English
+    // messages; a role that may not set `lc_messages` keeps its own language.
+    if conn.batch_execute("SET lc_messages = 'C'").is_err() {
+        tracing::debug!("could not set lc_messages; a non-English lock timeout is not retried");
+    }
     let applied: AppliedLog = std::rc::Rc::default();
     retry_on_lock_timeout(
         policy,
@@ -5179,6 +5195,22 @@ mod tests {
     }
 
     #[test]
+    fn migration_lock_sql_is_always_explicit() {
+        let five = std::time::Duration::from_secs(5);
+        assert_eq!(
+            migration_lock_sql(true, five),
+            "SET LOCAL lock_timeout = 5000"
+        );
+        // `0s` turns an inherited role or database default off, too.
+        assert_eq!(
+            migration_lock_sql(true, std::time::Duration::ZERO),
+            "SET LOCAL lock_timeout = 0"
+        );
+        // A non-transactional migration must wait with no limit.
+        assert_eq!(migration_lock_sql(false, five), "SET lock_timeout = 0");
+    }
+
+    #[test]
     fn only_lock_timeouts_are_classified_as_lock_contention() {
         assert!(is_lock_timeout_error(&lock_timeout_error()));
         assert!(is_lock_timeout_error(&MigrationError::Migration(
@@ -5388,6 +5420,24 @@ mod tests {
         (container, url)
     }
 
+    /// Set a database-level default `lock_timeout`, as a DBA would.
+    #[cfg(feature = "test-support")]
+    async fn set_database_lock_timeout(url: &str, value: &'static str) {
+        use diesel::{Connection as _, connection::SimpleConnection as _};
+        let url = url.to_owned();
+        crate::time::spawn_blocking(move || {
+            let (_, name) = url.rsplit_once('/').expect("database name");
+            diesel::PgConnection::establish(&url)
+                .expect("connect")
+                .batch_execute(&format!(
+                    "ALTER DATABASE {name} SET lock_timeout = '{value}'"
+                ))
+                .expect("set database default");
+        })
+        .await
+        .expect("join");
+    }
+
     /// Hold `ACCESS SHARE` on the probe table (a long read transaction) until
     /// `release` fires. Returns once the lock is held.
     #[cfg(feature = "test-support")]
@@ -5504,6 +5554,8 @@ mod tests {
     #[ignore = "requires Docker (testcontainers)"]
     async fn non_transactional_migration_waits_without_lock_timeout() {
         let (_container, url) = lock_probe_database().await;
+        // An inherited default must not cut the wait short either.
+        set_database_lock_timeout(&url, "100ms").await;
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         // A writer's lock: CIC waits for it to end.
         let holder = hold_probe_lock_in(url.clone(), release_rx, "ROW EXCLUSIVE");
