@@ -1975,7 +1975,7 @@ This generates:
 
 | File | Purpose |
 |---|---|
-| `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, a one-shot migration job, Azure Database for PostgreSQL Flexible Server, and a Key Vault that feeds secrets into the app via a user-assigned managed identity. An optional Redis Cache is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
+| `main.tf` | Resource group, Azure Container Registry, Log Analytics workspace, Container Apps environment + the Container App itself, a one-shot migration job, Azure Database for PostgreSQL Flexible Server, a Key Vault and a user-assigned managed identity. `azure-cutover.sh` gives the app its secret refs. An optional Redis Cache is gated behind `enable_redis_cache` — **infrastructure only**, see the callout below. |
 | `variables.tf` | `app_name`, `subscription_id` (required — AzureRM v4 needs it explicitly, even under `az login`), `location`, `image_tag`, `db_sku`, `bootstrap_image`, `min_replicas`/`max_replicas` (default 0/10), `enable_redis_cache`, and `sensitive`, no-default secret variables (`database_admin_password`, `signing_secret`). |
 | `outputs.tf` | `app_fqdn`, `acr_login_server`, `resource_group_name`, `migrate_job_name`, and `app_name`. |
 | `terraform.tfvars.example` | Non-secret defaults only — secrets are documented as `TF_VAR_*` exports, never committed. |
@@ -1983,10 +1983,9 @@ This generates:
 | `azure-cutover.sh` | Sets the real image on the app. In the same write, it attaches the managed identity, registry and Key Vault secret refs from the migration job. Then it opens external ingress. The workflow and the manual walkthrough both run it. |
 
 **Redis cache is infrastructure only.** `enable_redis_cache = true`
-provisions an Azure Redis Cache. The deploy step then sets
-`AUTUMN_CACHE__BACKEND=redis` and `AUTUMN_CACHE__REDIS__URL` on the
-Container App. But Autumn's cache
-subsystem has no built-in Redis implementation — unlike sessions, channels,
+provisions an Azure Redis Cache. The cutover (`azure-cutover.sh`) then sets
+`AUTUMN_CACHE__BACKEND=redis` and `AUTUMN_CACHE__REDIS__URL` on the Container
+App. But Autumn's cache subsystem has no built-in Redis implementation — unlike sessions, channels,
 and jobs, which activate purely from config once compiled with the `redis`
 Cargo feature. Setting these env vars alone does nothing: your application
 must *also* depend on the `autumn-cache-redis` crate and register
@@ -2085,9 +2084,9 @@ docker push "$ACR/$APP_NAME:$TAG"
 # production config sets auto_migrate_in_production = false, so nothing
 # else does this for you. `az containerapp job start` only starts the
 # execution and returns immediately; it does NOT wait for it to finish, so
-# the loop below is required — proceeding straight to `az containerapp
-# update` after `job start` returns would update the app before migrations
-# have actually completed.
+# the loop below is required — proceeding straight to the cutover after
+# `job start` returns would update the app before migrations have actually
+# completed.
 #
 # `job start --image` sends an execution-TEMPLATE OVERRIDE, which Azure
 # treats as a full replacement rather than a merge: an override containing
@@ -2123,7 +2122,7 @@ done
 
 # Attach the identity, registry and secret refs, and set the real image, in
 # one write (#2314). Then open external ingress (#2312). The scaffolded
-# script reads these variables. See its header for the full procedure.
+# script reads these variables and needs `jq`. See its header for details.
 AZURE_APP_NAME="$APP_NAME" AZURE_RESOURCE_GROUP="$RG" \
 AZURE_MIGRATE_JOB_NAME="$MIGRATE_JOB" ACR_LOGIN_SERVER="$ACR" IMAGE_TAG="$TAG" \
   bash azure-cutover.sh
@@ -2134,15 +2133,17 @@ Terraform is told to ignore both resources' image afterward
 live deploy back to the bootstrap placeholder. It also ignores the app's
 identity, registry, secrets and env vars, which the cutover owns. Terraform
 sets env vars at create time only: change one later with `az containerapp
-update --set-env-vars`. The cutover keeps env vars it does not own.
+update --set-env-vars`. The cutover keeps the env vars that it does not set.
 
 **Secret changes reach the app without a deploy.** The app refers to the
 latest version of each Key Vault secret. Container Apps gets a new version
 in 30 minutes or less, and restarts the revision.
 
 **To turn Redis on or off after the first deploy,** change
-`enable_redis_cache`, run `terraform apply`, then deploy again. The cutover
-sets or removes the Redis env vars and secret ref from the migration job.
+`enable_redis_cache`, run `terraform apply`, then deploy again immediately.
+The cutover reads the migration job's secrets. If the job has `redis-url`,
+the cutover sets the Redis env vars and secret ref. If not, it removes them.
+Until you deploy again, the app refers to the old Redis secret.
 
 **Automated deploys on tag push:** `.github/workflows/azure-deploy.yml` only
 runs once you add the required repository secrets and variables it documents
@@ -2209,8 +2210,8 @@ sneak through in the meantime.
 empty, and `main.tf` sets `AUTUMN_PROFILE=prod`. The Container App's default
 ingress hostname (`<app_name>.<environment default domain>`) is derived in
 Terraform (`local.app_fqdn`) and passed in as
-`AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS` so the first `az containerapp
-update` actually serves traffic instead of crash-looping — the same value
+`AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS` so the first cutover
+(`azure-cutover.sh`) actually serves traffic instead of crash-looping — the same value
 `terraform output app_fqdn` prints, deliberately the *stable* ingress
 hostname rather than a revision-specific one (which would send a `Host`
 header the app doesn't trust, and would go stale the moment CI creates a new

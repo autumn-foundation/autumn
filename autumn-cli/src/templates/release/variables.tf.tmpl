@@ -26,11 +26,11 @@ variable "image_tag" {
 # Container Apps must pull an image to create the app's (and the migration
 # job's) first revision, but a brand-new ACR has none yet — so Terraform
 # points both at this public placeholder on the first apply, then ignores
-# further image drift (see the `lifecycle.ignore_changes` blocks in main.tf)
-# once azure-cutover.sh/the migration job start in azure-deploy.yml
-# take over managing the real image. The placeholder app gets no identity or
-# secret refs (#2314). Keep min_replicas at 0 until after the first real
-# deploy so the placeholder does not run.
+# further image drift (see the `lifecycle.ignore_changes` blocks in main.tf).
+# After the first deploy, azure-deploy.yml sets the real image on the app and
+# the job. The placeholder app gets no identity or secret refs (#2314). Keep
+# min_replicas at 0 until after the first real deploy so the placeholder does
+# not run.
 variable "bootstrap_image" {
   description = "Public placeholder image Terraform uses only to create inactive first revisions before any real image has been pushed to ACR. The placeholder app gets no production secrets. The migration job has them, but runs only after CI sets the real image. Keep min_replicas at 0 until after the first real deploy."
   type        = string

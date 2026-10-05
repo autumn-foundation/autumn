@@ -3649,8 +3649,9 @@ enum ReleaseCommands {
     /// --target fly                    : also emits fly.toml.
     /// --target docker-compose         : also emits docker-compose.yml with app + Postgres.
     /// --target azure-container-apps   : also emits main.tf, variables.tf, outputs.tf,
-    ///                                   terraform.tfvars.example, and
-    ///                                   .github/workflows/azure-deploy.yml.
+    ///                                   terraform.tfvars.example,
+    ///                                   .github/workflows/azure-deploy.yml, and
+    ///                                   azure-cutover.sh.
     /// --target aws-app-runner         : also emits main.tf, variables.tf, outputs.tf, and
     ///                                   terraform.tfvars.example (ECR + App Runner + RDS,
     ///                                   no CI workflow — fast/minimal path).

@@ -26,8 +26,8 @@
 # The app starts with no managed identity, registry or secret refs (#2314),
 # so the public placeholder never gets production credentials. The cutover
 # script (azure-cutover.sh) copies them from the migration job and sets the
-# real image in one write. The job also has them, but it runs only when CI
-# starts it, after CI sets the real image on it.
+# real image in one write. The job also has them. It runs only when you or
+# CI start it, after the real image is set on it.
 
 terraform {
   required_version = ">= 1.5"
@@ -318,10 +318,10 @@ resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
 # Optional Redis Cache, gated behind the `enable_redis_cache` flag — off by
 # default so a plain deploy incurs no extra cost.
 #
-# This block makes the infrastructure. The cutover (azure-cutover.sh) sets
+# This block creates the infrastructure. The cutover (azure-cutover.sh) sets
 # AUTUMN_CACHE__BACKEND and AUTUMN_CACHE__REDIS__URL on the Container App
-# (#2314). That alone does NOT make the app use Redis: Autumn's cache subsystem has no built-in Redis
-# implementation (unlike sessions/channels/jobs, which activate from config
+# (#2314). That alone does NOT make the app use Redis: Autumn's cache
+# subsystem has no built-in Redis implementation (unlike sessions/channels/jobs, which activate from config
 # alone once compiled with the `redis` Cargo feature). Your application must
 # ALSO depend on the separate `autumn-cache-redis` crate and register
 # `.plugin(RedisCachePlugin::new())` in main.rs — without that, these env
@@ -368,9 +368,9 @@ resource "azurerm_container_app" "this" {
 
   # External ingress stays DISABLED until the first real image is deployed
   # (#2312), so no inbound request wakes the placeholder. `min_replicas = 0`
-  # does not stop the HTTP scale rule below from starting it. The cutover
-  # (azure-deploy.yml and the deployment guide) enables external ingress
-  # with `az containerapp ingress enable` after the real image serves.
+  # does not stop the HTTP scale rule below from starting it.
+  # azure-cutover.sh enables external ingress after the new revision runs
+  # the real image.
   ingress {
     external_enabled = false
     target_port      = 3000

@@ -14,8 +14,8 @@
 #       Container Apps Job, and Azure RBAC granted on one resource does not
 #       inherit to another, even a sibling in the same environment. The
 #       same scope lets azure-cutover.sh assign the app's user-assigned
-#       identity (#2314). No
-#       client secret is needed: `permissions.id-token: write` below plus
+#       identity (#2314).
+#       No client secret is needed: `permissions.id-token: write` below plus
 #       azure/login's client-id/tenant-id/subscription-id inputs is enough
 #       for OIDC login.
 #
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     # Two overlapping runs (e.g. two rapid tag pushes, or a tag push racing
     # a manual dispatch) must not interleave: the older run's later
-    # cutover (azure-cutover.sh) could execute after the newer one and roll
+    # cutover (azure-cutover.sh) could run after the newer one and roll
     # production back, or leave stale code serving against a schema the
     # newer run just migrated. One queue per repo, `cancel-in-progress:
     # false` so a run is never killed mid-migration/mid-cutover — it waits

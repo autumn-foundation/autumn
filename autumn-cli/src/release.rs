@@ -2677,7 +2677,7 @@ previous_secrets = []
         // revision, but a brand-new ACR has none yet, so Terraform points
         // both at a public placeholder and then ignores further image
         // changes so a later `terraform apply` doesn't revert a live
-        // `az containerapp update`/job deploy back to the placeholder.
+        // cutover or job deploy back to the placeholder.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -3948,7 +3948,7 @@ esac
     fn azure_workflow_serializes_overlapping_runs() {
         // Two overlapping runs (e.g. two rapid tag pushes, or a tag push
         // racing a manual dispatch) must not interleave: the older run's
-        // later `az containerapp update` could execute after the newer one
+        // later cutover (`azure-cutover.sh`) could run after the newer one
         // and roll production back.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
