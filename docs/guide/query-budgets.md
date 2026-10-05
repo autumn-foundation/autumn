@@ -196,7 +196,8 @@ The analysis follows the handle through every name that holds it:
     callback on a `Result` parameter gets only its side: in
     `result.map_err(|e| …)`, `e` is the error, not the handle. `result.ok()`
     and `result.err()` also give only their side, and `result.map(|_| 1)`
-    keeps only the `Err` side.
+    keeps only the `Err` side. `Ok(repo)` has a plain `Err` side, and
+    `Err(repo)` has a plain `Ok` side.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
     `Option<Vec<…>>`, `[ctx]`, `repos.chunks(2)`, or
     `repos.iter().map(|r| Ctx { repo: r })`) keeps that shape for all its

@@ -4137,9 +4137,21 @@ impl Analyzer {
     /// `Result`, through `as_ref`, `as_mut`, `inspect`, `inspect_err` and
     /// `clone`, and after `map` or `map_err`.
     fn sides_of(&self, e: &Expr) -> Option<(Kind, Kind)> {
-        let Expr::MethodCall(mc) = peel_refs(e) else {
-            let name = path_ident(peel_refs(e))?;
-            return Some((self.env.part(&name, "Ok")?, self.env.part(&name, "Err")?));
+        let mc = match peel_refs(e) {
+            Expr::MethodCall(mc) => mc,
+            // `Ok::<T, E>(x)`: the other side holds nothing.
+            Expr::Call(c) if is_container_constructor(c) => {
+                let held = c.args.first().map_or(Kind::Plain, |a| self.value_of(a));
+                return match call_path_name(c).as_deref() {
+                    Some("Ok") => Some((held, Kind::Plain)),
+                    Some("Err") => Some((Kind::Plain, held)),
+                    _ => None,
+                };
+            }
+            other => {
+                let name = path_ident(other)?;
+                return Some((self.env.part(&name, "Ok")?, self.env.part(&name, "Err")?));
+            }
         };
         let method = mc.method.to_string();
         let callback = |side: Kind| match mc.args.last() {
@@ -4195,17 +4207,7 @@ impl Analyzer {
         if probe.returned != Kind::Plain {
             return None;
         }
-        match peel_parens(tail) {
-            Expr::Call(c) if is_container_constructor(c) => {
-                let held = c.args.first().map_or(Kind::Plain, |a| probe.value_of(a));
-                match call_path_name(c).as_deref() {
-                    Some("Ok") => Some((held, Kind::Plain)),
-                    Some("Err") => Some((Kind::Plain, held)),
-                    _ => None,
-                }
-            }
-            other => probe.sides_of(other),
-        }
+        probe.sides_of(peel_parens(tail))
     }
 
     /// Is `e` a database connection: a handle with the `Db` shape? A
@@ -10086,6 +10088,36 @@ mod tests {
                 "guard: and_then that returns the handle as an error",
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
                  let mapped = result.and_then(|r| Err::<i64, _>(r)); let _ = mapped.map_err(|e| render(e)); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn result_constructors_give_their_sides() {
+        check_handlers(&[
+            (
+                "an Ok constructor gives a plain error side",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let result = Ok::<PgPostRepository, Error>(repo); let _ = result.map_err(|e| render(e)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "an Err constructor gives a plain value side",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let result = Err::<i64, PgPostRepository>(repo); let _ = result.map(|n| render(n)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: an Ok constructor keeps the handle on its value side",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let result = Ok::<PgPostRepository, Error>(repo); let _ = result.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a user function named Ok is not a constructor",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let result = factory::Ok(repo); let _ = result.map_err(|e| e.run()); Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
