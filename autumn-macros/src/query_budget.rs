@@ -1864,6 +1864,9 @@ struct Analyzer {
     /// What the next closure body's parameters borrow into: the places the
     /// method's receiver borrows.
     param_referents: Vec<String>,
+    /// The same, one list per parameter: an invoked closure's parameter
+    /// borrows what its own argument borrows.
+    param_referents_each: Vec<Vec<String>>,
     /// Names the handler body defines or imports (`macro_rules! vec`, `fn
     /// drop`, `use x::format`). A std name among them is not trusted.
     shadowed: Rc<Vec<String>>,
@@ -1880,6 +1883,7 @@ impl Analyzer {
             returned: Kind::Plain,
             connection_params: false,
             param_referents: Vec::new(),
+            param_referents_each: Vec::new(),
             shadowed: Rc::new(local_names(&input_fn.block)),
         };
         for arg in &input_fn.sig.inputs {
@@ -2023,6 +2027,20 @@ impl Analyzer {
                 let mut binding = self.env.binding(&name);
                 binding.whole = true;
                 self.env.declare(name, binding);
+            }
+        }
+        // `let (left, _) = slots.split_at_mut(1);`: each name may borrow
+        // into what the value borrows.
+        let single = match pat {
+            Pat::Type(t) => matches!(&*t.pat, Pat::Ident(_)),
+            other => matches!(other, Pat::Ident(_)),
+        };
+        if !single {
+            let targets = self.referents_of(init);
+            if !targets.is_empty() {
+                for name in bound_names(pat) {
+                    self.add_referents(name, &targets);
+                }
             }
         }
         // `let Holder(ref mut bucket) = holder;`: a store into `bucket` is a
@@ -2918,6 +2936,10 @@ impl Analyzer {
                     cost = cost.then(self.cost_of(arg));
                 }
                 let params: Vec<Kind> = call.args.iter().map(|a| self.value_of(a)).collect();
+                // `(|slot| slot.push(repo))(&mut list)`: each parameter
+                // borrows what its argument borrows.
+                self.param_referents_each =
+                    call.args.iter().map(|a| self.referents_of(a)).collect();
                 Flow::cost(cost.then(self.closure_body(closure, &params, Kind::Plain)))
             }
             Expr::Call(call) => Flow::cost(self.call(call, awaited)),
@@ -3265,12 +3287,16 @@ impl Analyzer {
     fn closure_body(&mut self, closure: &syn::ExprClosure, params: &[Kind], rest: Kind) -> Cost {
         let connection = std::mem::take(&mut self.connection_params);
         let borrows = std::mem::take(&mut self.param_referents);
+        let each = std::mem::take(&mut self.param_referents_each);
         self.framed(Target::Body, None, |s| {
             s.scoped(|s| {
                 for (i, input) in closure.inputs.iter().enumerate() {
                     s.bind_pat(input, params.get(i).copied().unwrap_or(rest));
                     for name in bound_names(input) {
-                        s.add_referents(name, &borrows);
+                        s.add_referents(name.clone(), &borrows);
+                        if let Some(own) = each.get(i) {
+                            s.add_referents(name, own);
+                        }
                     }
                     // A transaction hands its callback a connection.
                     if connection && let Pat::Ident(id) = input {
@@ -3459,13 +3485,11 @@ impl Analyzer {
 
         let mut cost = self.cost_of(root);
 
-        // Arguments run regardless of what the chain does with them.
+        // Arguments run regardless of what the chain does with them. Each
+        // store reads its own arguments right after they ran, before a later
+        // method's arguments run: `dest.push({ source.push(repo); … })`.
         for method in &methods {
             cost = cost.then(self.method_args(method));
-        }
-        // A store reads its arguments after they ran:
-        // `dest.push({ source.push(repo); source.pop().unwrap() })`.
-        for method in &methods {
             let args: Vec<&Expr> = method.args.iter().collect();
             self.store_into(&method.receiver, &method.method.to_string(), &args);
         }
@@ -4325,6 +4349,7 @@ impl Analyzer {
             returned: Kind::Plain,
             connection_params: false,
             param_referents: Vec::new(),
+            param_referents_each: Vec::new(),
             shadowed: Rc::clone(&self.shadowed),
         }
     }
@@ -12177,6 +12202,33 @@ mod tests {
                 "guard: a field write through a temporary borrow reaches its owner",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut ctxs = vec![Ctx::default()]; ctxs.last_mut().unwrap().repo = Some(repo); render(ctxs); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn destructured_borrows_closure_params_and_chain_store_order() {
+        check_handlers(&[
+            (
+                "guard: a destructured borrow keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None, None]; { let (left, _) = slots.split_at_mut(1); left[0] = Some(repo); } \
+                 render(slots); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an invoked closure parameter borrows its mut argument",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut list = Vec::new(); (|slot: &mut Vec<PgPostRepository>| slot.push(repo))(&mut list); \
+                 render(list); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: each store in a chain follows its own arguments",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); let mut dest = Vec::new(); \
+                 dest.insert(0, source.take().unwrap()).clone_from(&{ source = None; 1 }); render(dest); Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
