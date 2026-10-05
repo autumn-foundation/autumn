@@ -5,17 +5,19 @@
 //!
 //! - No-database tier: layers, plugins, routers, filters, error pages.
 //! - Postgres tier (Docker): each test that reads or writes rows. These tests
-//!   share one Postgres container and its tables, so run them on one thread:
+//!   share one Postgres container and its tables. A lock in `fresh_db` runs
+//!   them one at a time:
 //!
 //! ```text
 //! cargo test -p escape-hatches --test hatches                                         # no-database tier
-//! cargo test -p escape-hatches --test hatches -- --include-ignored --test-threads=1   # both tiers
+//! cargo test -p escape-hatches --test hatches -- --include-ignored                    # both tiers
 //! ```
 
 mod support;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use autumn_web::RuntimeConnection;
 use autumn_web::config::{AutumnConfig, MockEnv};
@@ -550,7 +552,7 @@ async fn password_file_refuses_a_replica() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn hazard_repository_read_modify_write_loses_an_update() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
     let repo = PgProductRepository::with_pool_untracked(db.pool());
 
@@ -571,7 +573,7 @@ async fn hazard_repository_read_modify_write_loses_an_update() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn convention_reserve_with_lock_never_oversells() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 3, 100)]).await;
     let client = db_client(db);
 
@@ -594,12 +596,16 @@ async fn convention_reserve_with_lock_never_oversells() {
 }
 
 /// Send every call at once and collect the status codes.
+///
+/// A stuck call (for example, a pool with no free connection) fails the test
+/// after 30 seconds. It does not stop the CI job.
 async fn futures_join<F>(calls: Vec<F>) -> Vec<u16>
 where
     F: std::future::Future<Output = autumn_web::test::TestResponse>,
 {
-    futures::future::join_all(calls)
+    tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(calls))
         .await
+        .expect("the parallel calls finish in 30 seconds")
         .iter()
         .map(|response| response.status.as_u16())
         .collect()
@@ -609,7 +615,7 @@ where
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_reserves_every_line_or_none() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(
         db,
         &[
@@ -645,7 +651,7 @@ async fn checkout_reserves_every_line_or_none() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_returns_201_with_location() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
     let client = db_client(db);
 
@@ -676,7 +682,7 @@ async fn checkout_returns_201_with_location() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_with_a_used_order_ref_changes_nothing() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
     let client = db_client(db);
 
@@ -694,7 +700,7 @@ async fn checkout_with_a_used_order_ref_changes_nothing() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_refuses_bad_carts() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
     let client = db_client(db);
 
@@ -718,18 +724,52 @@ async fn checkout_refuses_bad_carts() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_merges_lines_for_the_same_sku() {
-    let db = fresh_db().await;
-    seed(db, &[product("A-1", "tools", 3, 100)]).await;
+    let (db, _tables) = fresh_db().await;
+    seed(db, &[product("A-1", "tools", 4, 100)]).await;
+    let client = db_client(db);
+    let expected = Receipt {
+        order_ref: "o-1".to_owned(),
+        lines: vec![CartLine {
+            sku: "A-1".to_owned(),
+            quantity: 4,
+        }],
+    };
+
+    let response = post_api(
+        &client,
+        "/api/checkout",
+        &cart("o-1", &[("A-1", 2), ("A-1", 2)]),
+    )
+    .await;
+    response.assert_status(201);
+    assert_eq!(response.json::<Receipt>(), expected);
+    assert_eq!(stock_of(db, "A-1").await, 0);
+    let stored: Receipt = client
+        .get("/api/orders/o-1")
+        .header("authorization", &format!("Bearer {SCANNER_TOKEN}"))
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert_eq!(stored, expected, "one line, quantity 4");
+}
+
+/// H1: the merged quantity for one SKU has the same cap as one line.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn checkout_caps_the_merged_quantity() {
+    let (db, _tables) = fresh_db().await;
+    seed(db, &[product("A-1", "tools", 20_000, 100)]).await;
     let client = db_client(db);
 
     post_api(
         &client,
         "/api/checkout",
-        &cart("o-1", &[("A-1", 2), ("A-1", 2)]),
+        &cart("o-1", &[("A-1", 6_000), ("A-1", 6_000)]),
     )
     .await
-    .assert_status(409);
-    assert_eq!(stock_of(db, "A-1").await, 3);
+    .assert_status(422);
+    assert_eq!(stock_of(db, "A-1").await, 20_000);
 }
 
 /// H1: carts that touch the same SKUs in opposite order do not deadlock and
@@ -737,7 +777,7 @@ async fn checkout_merges_lines_for_the_same_sku() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_concurrent_carts_never_oversell_or_deadlock() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(
         db,
         &[
@@ -780,7 +820,7 @@ async fn checkout_concurrent_carts_never_oversell_or_deadlock() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn restock_adds_to_a_whole_category() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(
         db,
         &[
@@ -823,7 +863,7 @@ async fn restock_adds_to_a_whole_category() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn restock_and_checkout_together_lose_nothing() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 50, 100)]).await;
     let client = db_client(db);
 
@@ -849,7 +889,7 @@ async fn restock_and_checkout_together_lose_nothing() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn report_ranks_top_three_per_category() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(
         db,
         &[
@@ -899,7 +939,7 @@ async fn report_ranks_top_three_per_category() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn pages_list_and_show_products() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 4, 250)]).await;
     let client = db_client(db);
 
@@ -956,7 +996,7 @@ async fn password_file_is_read_on_each_new_connection() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_retry_with_the_same_cart_replays_the_receipt() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
     let client = db_client(db);
     let body = cart("o-1", &[("A-1", 2)]);
@@ -977,7 +1017,7 @@ async fn checkout_retry_with_the_same_cart_replays_the_receipt() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_refuses_too_many_lines() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     let client = db_client(db);
     let skus: Vec<String> = (0..101).map(|n| format!("S-{n}")).collect();
     let lines: Vec<(&str, i32)> = skus.iter().map(|sku| (sku.as_str(), 1)).collect();
@@ -991,7 +1031,7 @@ async fn checkout_refuses_too_many_lines() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn restock_refuses_an_unknown_category() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(db, &[product("A-1", "tools", 1, 100)]).await;
     let client = db_client(db);
 
@@ -1016,7 +1056,7 @@ async fn restock_refuses_an_unknown_category() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn restock_refuses_to_pass_the_stock_limit() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(
         db,
         &[
@@ -1043,7 +1083,7 @@ async fn restock_refuses_to_pass_the_stock_limit() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn restock_and_carts_on_two_skus_never_deadlock() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(
         db,
         &[
@@ -1088,7 +1128,7 @@ async fn restock_and_carts_on_two_skus_never_deadlock() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn report_top_sets_the_count_per_category() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     seed(
         db,
         &[
@@ -1119,7 +1159,7 @@ async fn report_top_sets_the_count_per_category() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn report_refuses_a_bad_top() {
-    let db = fresh_db().await;
+    let (db, _tables) = fresh_db().await;
     let client = db_client(db);
     for query in ["?top=0", "?top=11", "?top=x"] {
         let response = client

@@ -10,8 +10,15 @@ use escape_hatches::repositories::{PgProductRepository, ProductRepository};
 /// The token that the scanner tests send.
 pub const SCANNER_TOKEN: &str = "scanner-test-token";
 
+/// One test at a time may use the shared tables.
+static TABLES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Apply the real migration, empty the tables, and return the shared database.
-pub async fn fresh_db() -> &'static TestDb {
+///
+/// Keep the guard until the test ends. It stops a parallel test from
+/// emptying the tables under this one.
+pub async fn fresh_db() -> (&'static TestDb, tokio::sync::MutexGuard<'static, ()>) {
+    let guard = TABLES.lock().await;
     let db = TestDb::shared().await;
     let url = db.url().to_owned();
     tokio::task::spawn_blocking(move || autumn_web::migrate::run_pending(&url, MIGRATIONS))
@@ -20,7 +27,7 @@ pub async fn fresh_db() -> &'static TestDb {
         .expect("apply the stockroom migration");
     db.execute_sql("TRUNCATE order_lines, orders, products RESTART IDENTITY CASCADE")
         .await;
-    db
+    (db, guard)
 }
 
 /// A product row for a test.

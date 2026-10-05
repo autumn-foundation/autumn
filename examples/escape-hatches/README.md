@@ -153,8 +153,8 @@ not need to restart the app.
 | Command | What it runs | Needs |
 |---|---|---|
 | `cargo test -p escape-hatches` | Unit tests, the no-database tier of `hatches`, and the report gate | — |
-| `cargo test -p escape-hatches --test hatches -- --include-ignored --test-threads=1` | All hatch tests, the Postgres tier too | Docker |
-| `cargo test -p escape-hatches --test boot -- --ignored` | Starts the real binary: H7, H10, H11, H12 wiring | Docker |
+| `cargo test -p escape-hatches --test hatches -- --include-ignored` | All hatch tests, the Postgres tier too | Docker |
+| `cargo test -p escape-hatches --test boot -- --ignored` | Starts the real binary: H5, H7, H8, and H10 to H13 wiring | Docker |
 | `cargo test -p escape-hatches --features system-tests --test smoke -- --include-ignored` | Chromium smoke | Docker, Chromium |
 
 Read the tests in this order:

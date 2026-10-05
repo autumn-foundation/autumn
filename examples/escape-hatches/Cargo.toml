@@ -42,7 +42,7 @@ tempfile = "3"
 #   cargo test -p escape-hatches --features system-tests --test smoke -- --include-ignored
 system-tests = ["autumn-web/system-tests"]
 
-# Docker tests share tables. Run them with `--test-threads=1`.
+# The Postgres tests share tables. A lock in `tests/support` runs them one at a time.
 [[test]]
 name = "hatches"
 path = "tests/hatches.rs"

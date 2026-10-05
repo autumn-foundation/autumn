@@ -1722,9 +1722,11 @@ jobs:
           cargo test -p react-graphql --test graphql_api -- --ignored --test-threads=1
           # examples/escape-hatches: the Docker tests in `hatches` (H1, H2, H3,
           # H12, H13) and `boot`. `boot` starts the real binary to check the
-          # pool provider, error pages and exception filter. Testcontainer-
-          # managed. Run `hatches` on one thread: its tests share tables.
-          cargo test -p escape-hatches --test hatches -- --ignored --test-threads=1
+          # wiring that `TestApp` cannot reach (pool provider, error pages,
+          # exception filter, env-driven hatches). Testcontainer-managed. The
+          # `hatches` tests share tables; a lock in their `fresh_db` helper
+          # runs them one at a time.
+          cargo test -p escape-hatches --test hatches -- --ignored
           cargo test -p escape-hatches --test boot -- --ignored
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
