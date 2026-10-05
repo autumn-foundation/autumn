@@ -29,7 +29,7 @@
   one with declared defaults.
 - **feature_flags:** `FlagStore::preload` (default: no-op) and
   `PgFlagStore::refresh`. At startup, the app runs `preload` on the blocking
-  pool and waits up to 5 s for it.
+  pool and waits up to 5 s for it. `TestApp::build` runs `preload` too.
 
 ### Changed
 

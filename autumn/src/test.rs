@@ -1236,11 +1236,20 @@ impl TestApp {
         self.with_flag_service(service)
     }
 
-    /// Mirrors [`crate::app::AppBuilder::with_flag_service`]. It does not
-    /// preload the store.
+    /// Mirrors [`crate::app::AppBuilder::with_flag_service`]. The build
+    /// preloads the store before the first request.
     #[must_use]
     pub fn with_flag_service(mut self, service: crate::feature_flags::FeatureFlagService) -> Self {
         self.state_initializers.push(Box::new(move |state| {
+            // Preload on its own thread, like the startup hooks below: the
+            // build can run on a Tokio worker.
+            let preload = service.clone();
+            let loaded = std::thread::spawn(move || preload.preload())
+                .join()
+                .expect("feature flag preload thread panicked");
+            if let Err(error) = loaded {
+                tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
+            }
             state.insert_extension(service);
         }));
         self

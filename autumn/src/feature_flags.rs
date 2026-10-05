@@ -2446,6 +2446,15 @@ mod tests {
         make_svc().preload().unwrap();
     }
 
+    #[tokio::test]
+    async fn test_app_preloads_the_flag_store_at_build() {
+        let store = Arc::new(ScriptedStore::default());
+        let _client = crate::test::TestApp::new()
+            .with_flag_store(Arc::clone(&store))
+            .build();
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn feature_flag_guide_describes_polling_not_listen() {
         let guide = include_str!("../../docs/guide/feature-flags.md");
