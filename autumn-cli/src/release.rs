@@ -3288,6 +3288,17 @@ case "$1 $2" in
       fi
       cat "$state"
     else
+      # STUB_STATUS_SEQ scripts the status reads, one per read, as
+      # state:revision. Then the reads are as usual.
+      if [ -n "$STUB_STATUS_SEQ" ]; then
+        [ -f "$STUB_LOG.seq" ] || echo "$STUB_STATUS_SEQ" > "$STUB_LOG.seq"
+        read -r next rest < "$STUB_LOG.seq" || true
+        if [ -n "$next" ]; then
+          echo "$rest" > "$STUB_LOG.seq"
+          tsv "${next%%:*}" "${next#*:}"
+          exit 0
+        fi
+      fi
       # Each PATCH with a template makes a new revision.
       n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
       latest="app--old"
@@ -3450,6 +3461,7 @@ esac
             .env("IMAGE_TAG", "t1");
         command
             .env_remove("STUB_LATEST")
+            .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_APP_ENV_FULL")
             .env_remove("STUB_APP_LEGACY")
             .env_remove("STUB_APP_REDIS")
@@ -3617,10 +3629,102 @@ esac
         };
         assert!(!status.success(), "{calls}");
         assert!(
-            !calls.contains("az rest --method patch"),
+            !calls.contains("az rest --method patch")
+                || calls.matches("az rest --method patch").count()
+                    == calls.matches("az ingress-patch").count(),
             "no credentials while the placeholder runs: {calls}"
         );
         assert!(!calls.contains("ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_ingress_when_the_placeholder_does_not_stop() {
+        // The script disabled ingress. If it stops there, the app must get
+        // its saved ingress back (custom domains too). Else a retry saves
+        // no ingress, and the settings are lost.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            1,
+            &[("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let disable_at = calls.find("ingress disable").expect("disable");
+        let restore_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("the script must restore the saved ingress: {calls}"));
+        assert!(disable_at < restore_at, "{calls}");
+        assert!(bodies.contains("www.example.com"), "{bodies}");
+        for field in ["userAssignedIdentities", "secrets", "template"] {
+            assert!(!bodies.contains(field), "no credentials: {bodies}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_out_a_stale_failed_state() {
+        // After a 202, the GET can still show the failed earlier update and
+        // the old revision. That is not this update.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_STATUS_SEQ", "Failed:app--old Canceled:app--old")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_out_a_stale_failed_state_before_a_restart() {
+        // A same-tag retry makes no new revision, so the revision name
+        // cannot tell a stale state from a new one.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_STATUS_SEQ", "Failed:app--old"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("revision restart"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_fast_when_this_update_fails() {
+        // A failed state after a new revision, or after the update was in
+        // progress, is this update. The script stops without the timeout.
+        for seq in ["Failed:app--new1", "InProgress:app--old Failed:app--old"] {
+            let Some((status, calls, _)) = run_azure_cutover(
+                "acr.azurecr.io/app:t0",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_STATUS_SEQ", seq)],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{seq}: {calls}");
+            assert_eq!(
+                calls.matches("latestRevisionName").count(),
+                seq.split(' ').count(),
+                "{seq}: {calls}"
+            );
+        }
     }
 
     #[cfg(unix)]
