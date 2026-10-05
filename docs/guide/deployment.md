@@ -2051,7 +2051,8 @@ managed identity, no registry and no secret refs. The scaffolded
 in one write. The identity applies to all revisions, so the first cutover
 disables ingress (also the internal route) and waits until the placeholder
 runs no replica. Then nothing can start the placeholder again. Keep
-`min_replicas = 0` until then. The script treats only a revision that runs
+`min_replicas = 0` until then. If a replica does not stop, the script sends
+the saved ingress back and stops. The script treats only a revision that runs
 the bootstrap image as the placeholder. If you changed `bootstrap_image`, set
 `AZURE_BOOTSTRAP_IMAGE` (a repository variable for the workflow) to that
 image. If the first cutover fails, the script removes the credentials. The

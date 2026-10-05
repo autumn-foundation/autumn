@@ -435,6 +435,15 @@ if [ -z "$RELEASED" ]; then
     # external) can start the placeholder. Then wait until no placeholder
     # replica runs. The HTTP scaler stops a replica after a 300-second cool
     # down, so the script checks 60 times, 10 seconds apart.
+    # If the script stops before the PATCH, the placeholder has no
+    # credentials yet. It gets its saved ingress back, so a retry saves it
+    # again.
+    stop_before_patch() {
+      echo "::error::$1" >&2
+      [ "$SAVED_INGRESS" = null ] || set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")" \
+        || echo "::warning::restore the ingress of $AZURE_APP_NAME manually" >&2
+      exit 1
+    }
     az containerapp ingress disable \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -447,15 +456,14 @@ if [ -z "$RELEASED" ]; then
           --resource-group "$AZURE_RESOURCE_GROUP" \
           --revision "$revision" \
           --query "length(@)" \
-          --output tsv)
+          --output tsv) || stop_before_patch "cannot list the replicas of revision $revision"
         REPLICAS=$((REPLICAS + COUNT))
       done
       [ "$REPLICAS" = "0" ] && break
       sleep 10
     done
     if [ "$REPLICAS" != "0" ]; then
-      echo "::error::the placeholder runs $REPLICAS replica(s). Set min_replicas = 0, run terraform apply, and try again." >&2
-      exit 1
+      stop_before_patch "the placeholder runs $REPLICAS replica(s). Set min_replicas = 0, run terraform apply, and try again."
     fi
 fi
 
@@ -535,7 +543,11 @@ PATCH=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets
 patch_app "$PATCH" || fail "the cutover PATCH failed"
 
 # Wait for the new revision. The script checks 60 times, 10 seconds apart.
+# After a 202, the GET can still show the state of an earlier update. So a
+# Failed or Canceled state counts only after the GET shows a new revision,
+# or after it showed another state since the PATCH.
 READY=""
+MOVED=""
 for _ in $(seq 1 60); do
   sleep 10
   # The nested list makes `--output tsv` print one tab-separated row.
@@ -546,7 +558,13 @@ for _ in $(seq 1 60); do
     --output tsv) || fail "cannot read the app state"
   read -r STATE REVISION <<< "$STATUS"
   case "$STATE" in
-    Failed|Canceled) fail "the app update ended as $STATE" ;;
+    Failed|Canceled)
+      if [ -n "$MOVED" ] || { [ -n "$OLD_REVISION" ] && [ -n "$REVISION" ] && [ "$REVISION" != "$OLD_REVISION" ]; }; then
+        fail "the app update ended as $STATE"
+      fi
+      continue
+      ;;
+    *) MOVED=1 ;;
   esac
   if [ "$STATE" != "Succeeded" ] || [ -z "$REVISION" ] || [ "$REVISION" = "$OLD_REVISION" ]; then
     continue
@@ -568,7 +586,7 @@ for _ in $(seq 1 60); do
     Failed) fail "revision $REVISION failed to provision" ;;
   esac
 done
-[ -n "$READY" ] || fail "the new revision was not provisioned in time"
+[ -n "$READY" ] || fail "the new revision was not provisioned in time (app state: $STATE)"
 
 # The revision serves only when it is the only active one; until then, the
 # old revision serves. On the first cutover the placeholder now has the
