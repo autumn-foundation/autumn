@@ -3275,10 +3275,20 @@ done
   ingress="{\"external\":$external,\"targetPort\":3000,\"transport\":\"http\",\"fqdn\":\"app.example.internal\",\"customDomains\":[{\"name\":\"www.example.com\"}]}"
   # An interrupted first cutover can leave ingress disabled.
   [ -n "$STUB_INGRESS_NONE" ] && ingress=null
+  # The snapshot that an interrupted first cutover saved in the app's tags.
+  tags='{"team":"web"}'
+  if [ -n "$STUB_SAVED_INGRESS_TAGS" ]; then
+    tags=$(jq -cn '{external: false, targetPort: 3000, transport: "http",
+                    customDomains: [{name: "www.example.com"}]}
+      | tojson | @base64 | . as $b
+      | [range(0; length; 256) as $i | $b[$i:$i + 256]]
+      | to_entries | map({key: ("autumn-ingress-" + (.key | tostring)), value})
+      | from_entries + {team: "web"}')
+  fi
   containers="{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar"
   # An operator can put a sidecar before the app container.
   [ -n "$STUB_SIDECAR_FIRST" ] && containers="$sidecar,{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]}"
-  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$scale}}}"
+  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",\"tags\":$tags,$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$scale}}}"
 case "$1 $2" in
   "containerapp job")
     secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"$id\"}"; }
@@ -3575,6 +3585,7 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_SAVED_INGRESS_TAGS")
             .env_remove("STUB_JOB_CUSTOM_KV")
             .env_remove("STUB_ACTIVE_EMPTY_FIRST")
             .env_remove("STUB_TMP_MODES")
@@ -4153,6 +4164,57 @@ esac
             stage2.contains("api-key"),
             "the app's own secret stays: {stage2}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_saves_the_ingress_in_tags_before_it_disables_it() {
+        // A runner that dies after the disable loses the shell variable.
+        // The app's tags keep the snapshot; after ingress opens, the script
+        // removes them and keeps the operator's own tags.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let first = bodies.lines().next().unwrap_or_default();
+        assert!(first.contains("\"autumn-ingress-0\""), "{bodies}");
+        let disable_at = calls.find("ingress disable").expect("disable");
+        let patch_at = calls.find("az rest --method patch").expect("patch");
+        assert!(patch_at < disable_at, "{calls}");
+        let last = bodies.lines().last().unwrap_or_default();
+        assert!(last.contains("\"autumn-ingress-0\":null"), "{bodies}");
+        assert!(!last.contains("team"), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_the_ingress_from_tags_after_an_interruption() {
+        // An earlier first cutover disabled ingress and stopped. The retry
+        // finds no ingress, but the tags hold the snapshot with the custom
+        // domain, so the script sends that back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_INGRESS_NONE", "1"), ("STUB_SAVED_INGRESS_TAGS", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let open = bodies
+            .lines()
+            .find(|line| line.contains("\"external\":true"))
+            .unwrap_or_else(|| panic!("the script must open ingress: {bodies}"));
+        assert!(open.contains("www.example.com"), "{open}");
+        let last = bodies.lines().last().unwrap_or_default();
+        assert!(last.contains("\"autumn-ingress-0\":null"), "{bodies}");
     }
 
     #[cfg(unix)]
