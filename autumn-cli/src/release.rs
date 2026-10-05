@@ -6987,4 +6987,133 @@ previous_secrets = []
             "gcp-deploy.yml must not contain unsubstituted placeholders: {content}"
         );
     }
+
+    // ── probe paths (issue #3066) ─────────────────────────────────────────────
+
+    /// Every release target. Add a new `Target` here and in
+    /// `probe_expectations`, which has no wildcard arm.
+    const ALL_TARGETS: [Target; 7] = [
+        Target::Default,
+        Target::Fly,
+        Target::DockerCompose,
+        Target::AzureContainerApps,
+        Target::AwsAppRunner,
+        Target::AwsEcs,
+        Target::GcpCloudRun,
+    ];
+
+    /// The probes each target must render, as `(file, block marker, needle)`.
+    /// `/ready` gates traffic. `/live` triggers a restart.
+    fn probe_expectations(target: Target) -> &'static [(&'static str, &'static str, &'static str)] {
+        // The Docker HEALTHCHECK is a liveness signal: an unhealthy container
+        // is restarted or replaced, so it must not fail on a dependency.
+        const DOCKER_LIVENESS: (&str, &str, &str) =
+            ("Dockerfile", "HEALTHCHECK ", "localhost:3000/live");
+        match target {
+            Target::Default | Target::DockerCompose => &[DOCKER_LIVENESS],
+            Target::Fly => &[
+                DOCKER_LIVENESS,
+                ("fly.toml", "[[http_service.checks]]", r#"path = "/ready""#),
+                ("fly.toml", "[checks.live]", r#"path = "/live""#),
+            ],
+            Target::AwsEcs => &[
+                DOCKER_LIVENESS,
+                ("main.tf", "health_check {", r#"path = "/ready""#),
+                // The bootstrap container must pass the same check.
+                ("main.tf", "command = [", "location /ready"),
+            ],
+            // The real path is set by the cutover call in
+            // docs/guide/deployment.md. The bootstrap image only serves "/".
+            Target::AwsAppRunner => &[
+                DOCKER_LIVENESS,
+                ("main.tf", "health_check_configuration {", r#"path = "/""#),
+            ],
+            Target::GcpCloudRun => &[
+                DOCKER_LIVENESS,
+                ("main.tf", "startup_probe {", r#"path = "/ready""#),
+                ("main.tf", "liveness_probe {", r#"path = "/live""#),
+            ],
+            Target::AzureContainerApps => &[
+                DOCKER_LIVENESS,
+                ("main.tf", "readiness_probe {", r#"path = "/ready""#),
+                ("main.tf", "liveness_probe {", r#"path = "/live""#),
+            ],
+        }
+    }
+
+    /// Render `target` and return each generated file as `(name, content)`.
+    fn render_target(target: Target, split_workers: bool) -> Vec<(String, String)> {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, target, split_workers).unwrap();
+        planned_files(target)
+            .into_iter()
+            .map(|(name, _)| {
+                let content = fs::read_to_string(dir.join(name))
+                    .unwrap_or_else(|err| panic!("read generated {name}: {err}"));
+                (name.to_owned(), content)
+            })
+            .collect()
+    }
+
+    /// The text from `marker` to the first `}` or blank line, with all
+    /// whitespace runs collapsed to one space.
+    fn probe_block(content: &str, marker: &str) -> Option<String> {
+        let start = content.find(marker)?;
+        let rest = &content[start..];
+        let end = [rest.find('}'), rest.find("\n\n")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        Some(rest[..end].split_whitespace().collect::<Vec<_>>().join(" "))
+    }
+
+    #[test]
+    fn release_templates_probe_ready_for_traffic_and_live_for_liveness() {
+        for target in ALL_TARGETS {
+            let files = render_target(target, false);
+            for &(file, marker, needle) in probe_expectations(target) {
+                let content = &files
+                    .iter()
+                    .find(|(name, _)| name == file)
+                    .unwrap_or_else(|| panic!("{target:?} must generate {file}"))
+                    .1;
+                let block = probe_block(content, marker).unwrap_or_else(|| {
+                    panic!("{target:?}: {file} must contain `{marker}`:\n{content}")
+                });
+                assert!(
+                    block.contains(needle),
+                    "{target:?}: the `{marker}` block in {file} must contain `{needle}`, \
+                     got: {block}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn release_templates_never_probe_the_health_alias() {
+        // `/health` is a transitional alias. Probes use `/ready` or `/live`.
+        // Only the production config may name it, to configure the alias.
+        let mut renders: Vec<_> = ALL_TARGETS
+            .into_iter()
+            .map(|target| (target, render_target(target, false)))
+            .collect();
+        renders.push((
+            Target::DockerCompose,
+            render_target(Target::DockerCompose, true),
+        ));
+        for (target, files) in renders {
+            for (name, content) in files {
+                if name == "autumn.production.toml.example" {
+                    continue;
+                }
+                let stripped = content.replace("/actuator/health", "");
+                assert!(
+                    !stripped.contains("/health"),
+                    "{target:?}: {name} must not use the /health alias for a probe:\n{content}"
+                );
+            }
+        }
+    }
 }
