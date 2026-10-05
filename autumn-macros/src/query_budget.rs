@@ -3126,8 +3126,11 @@ impl Analyzer {
             },
             Expr::MethodCall(mc) => {
                 let method = mc.method.to_string();
-                // `state.db()`, `ctx.conn().await?`: a connection accessor.
-                if DB_ACCESSORS.contains(&method.as_str()) {
+                // `state.db()`, `ctx.conn().await?`, `lazy.checkout().await?`: a
+                // connection.
+                if DB_ACCESSORS.contains(&method.as_str())
+                    || (method == "checkout" && self.expr_is_lazy_db(&mc.receiver))
+                {
                     return Some(Shape::Db);
                 }
                 if method == "collect" {
@@ -3559,15 +3562,12 @@ impl Analyzer {
             }
     }
 
-    /// Is `e` a database connection: a `LazyDb`, or a handle with the `Db`
-    /// shape? A repository is not one, so a `RunnerRepository::tx` may run
-    /// its callback many times.
+    /// Is `e` a database connection: a handle with the `Db` shape? A
+    /// repository is not one, so a `RunnerRepository::tx` may run its
+    /// callback many times. A `LazyDb` is not one either: it has only
+    /// `checkout`, so its `tx` is a user's.
     fn is_connection(&self, e: &Expr) -> bool {
-        match self.value_of(e) {
-            Kind::LazyDb => true,
-            Kind::Handle => self.shape_of(e) == Some(Shape::Db),
-            _ => false,
-        }
+        self.value_of(e) == Kind::Handle && self.shape_of(e) == Some(Shape::Db)
     }
 
     /// Does this call give an `Option` of a part (`deque.remove(0)`)?
@@ -8253,6 +8253,19 @@ mod tests {
                  db.tx(|c| async move { c.tx(|d| async move { let _ = d.find_all().await; }).await; }) \
                  .await; Ok(0) }",
                 Expect::Exact(3),
+            ),
+            (
+                "a transaction name on a LazyDb comes from a user trait",
+                "async fn h(repo: PgPostRepository, lazy: LazyDb) -> AutumnResult<usize> { \
+                 lazy.tx(|| repo.find_all()).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a transaction on a checked-out connection runs once",
+                "async fn h(lazy: LazyDb) -> AutumnResult<usize> { \
+                 let mut db = lazy.checkout().await?; \
+                 db.tx(|c| async move { let _ = c.find_all().await; }).await; Ok(0) }",
+                Expect::Exact(2),
             ),
             (
                 "a slice method reached through a Vec may be shadowed",
