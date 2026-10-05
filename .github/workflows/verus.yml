@@ -62,11 +62,13 @@ jobs:
             exit 1
           fi
           # Verus needs one exact Rust toolchain. When it is missing, Verus
-          # names it in a `rustup install <toolchain>` hint.
+          # names it in a `rustup install <toolchain>` hint. The hint can hold
+          # colour codes, so take only the MAJOR.MINOR.PATCH version from it.
           out="$("$verus_bin" --version 2>&1)" || true
-          toolchain="$(printf '%s\n' "$out" | grep -oE 'rustup (toolchain )?install [^ ]+' | awk '{print $NF}' | head -n 1)" || true
-          if [ -n "$toolchain" ]; then
-            rustup toolchain install "$toolchain" --profile minimal
+          version="$(printf '%s\n' "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-x86_64-unknown-linux-gnu' | head -n 1 | cut -d- -f1)" || true
+          if [ -n "$version" ]; then
+            echo "Verus needs Rust $version"
+            rustup toolchain install "$version" --profile minimal
           fi
           "$verus_bin" --version
           echo "VERUS_BIN=$verus_bin" >> "$GITHUB_ENV"
