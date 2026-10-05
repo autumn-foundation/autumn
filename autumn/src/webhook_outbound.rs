@@ -363,7 +363,11 @@ pub struct WebhookOutboundManager {
     handler: Arc<dyn OutboundWebhookHandler>,
     client: Client,
     initial_backoff_ms: u64,
+    max_attempts: u32,
 }
+
+/// Default number of delivery attempts for one webhook.
+pub const DEFAULT_WEBHOOK_MAX_ATTEMPTS: u32 = 5;
 
 impl WebhookOutboundManager {
     /// Create a new webhook manager with a handler.
@@ -372,7 +376,27 @@ impl WebhookOutboundManager {
             handler,
             client: Client::new(),
             initial_backoff_ms: 1000,
+            max_attempts: DEFAULT_WEBHOOK_MAX_ATTEMPTS,
         }
+    }
+
+    /// Set the number of delivery attempts per webhook. Default: 5.
+    /// A value of 0 is read as 1. The last failed attempt moves the delivery
+    /// to the DLQ.
+    ///
+    /// This does not change the `autumn_webhook_delivery` job. That job needs
+    /// 2 job attempts per delivery attempt. Use
+    /// [`OutboundWebhookPlugin::with_max_attempts`], which sets both.
+    #[must_use]
+    pub const fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = if max_attempts == 0 { 1 } else { max_attempts };
+        self
+    }
+
+    /// The number of delivery attempts per webhook.
+    #[must_use]
+    pub const fn max_attempts(&self) -> u32 {
+        self.max_attempts
     }
 
     /// Set a custom initial backoff for retries.
@@ -432,7 +456,7 @@ impl WebhookOutboundManager {
                 response_body: None,
                 elapsed_ms: 0,
                 attempt: 1,
-                max_attempts: 5,
+                max_attempts: self.max_attempts,
                 is_dlq: false,
                 last_error: None,
                 timestamp: crate::time::ambient_now(),
@@ -511,9 +535,11 @@ fn install_outbound_webhook_manager(
     state: &AppState,
     store: Arc<dyn OutboundWebhookHandler>,
     initial_backoff_ms: u64,
+    max_attempts: u32,
 ) {
     let manager = WebhookOutboundManager::new(store)
         .with_initial_backoff_ms(initial_backoff_ms)
+        .with_max_attempts(max_attempts)
         .with_client_from_state(state);
     state.insert_extension(manager);
 }
@@ -682,7 +708,7 @@ pub fn deliver_webhook_job(
                 } else {
                     let status_err = format!("server returned status: {status}");
                     log.last_error = Some(status_err.clone());
-                    if log.attempt < log.max_attempts {
+                    if attempts_remain(&manager, &log) {
                         manager.store().log_delivery(log.clone()).await?;
                     }
                     handle_delivery_failure(&manager, &sub, log, status_err).await
@@ -691,13 +717,21 @@ pub fn deliver_webhook_job(
             Err(e) => {
                 let error_str = e.to_string();
                 log.last_error = Some(error_str.clone());
-                if log.attempt < log.max_attempts {
+                if attempts_remain(&manager, &log) {
                     manager.store().log_delivery(log.clone()).await?;
                 }
                 handle_delivery_failure(&manager, &sub, log, error_str).await
             }
         }
     })
+}
+
+/// `true` when this delivery has attempts left. The limit is the smaller of
+/// the log's own limit and the manager's. A log written before a deploy that
+/// lowered the limit then still moves to the DLQ before the job engine runs
+/// out of job attempts (2 per delivery attempt).
+fn attempts_remain(manager: &WebhookOutboundManager, log: &WebhookDeliveryLog) -> bool {
+    log.attempt < log.max_attempts.min(manager.max_attempts)
 }
 
 async fn load_current_subscription(
@@ -752,7 +786,7 @@ async fn handle_delivery_failure(
     mut log: WebhookDeliveryLog,
     error_msg: String,
 ) -> AutumnResult<()> {
-    if log.attempt < log.max_attempts {
+    if attempts_remain(manager, &log) {
         // Return an error to signal the background job runner to retry this job
         Err(AutumnError::internal_server_error_msg(format!(
             "delivery attempt {} failed, scheduled retry: {error_msg}",
@@ -771,6 +805,7 @@ async fn handle_delivery_failure(
 pub struct OutboundWebhookPlugin {
     store: Arc<dyn OutboundWebhookHandler>,
     initial_backoff_ms: u64,
+    max_attempts: u32,
 }
 
 impl OutboundWebhookPlugin {
@@ -780,6 +815,7 @@ impl OutboundWebhookPlugin {
         Self {
             store,
             initial_backoff_ms: 1000,
+            max_attempts: DEFAULT_WEBHOOK_MAX_ATTEMPTS,
         }
     }
 
@@ -789,19 +825,37 @@ impl OutboundWebhookPlugin {
         self.initial_backoff_ms = ms;
         self
     }
+
+    /// Set the number of delivery attempts per webhook. Default: 5.
+    /// A value of 0 is read as 1. The last failed attempt moves the delivery
+    /// to the DLQ.
+    #[must_use]
+    pub const fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = if max_attempts == 0 { 1 } else { max_attempts };
+        self
+    }
 }
 
 impl crate::plugin::Plugin for OutboundWebhookPlugin {
     fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
         let store = self.store;
         let initial_backoff_ms = self.initial_backoff_ms;
+        let max_attempts = self.max_attempts;
 
         app.state_initializer(move |state| {
-            install_outbound_webhook_manager(state, store.clone(), initial_backoff_ms);
+            install_outbound_webhook_manager(
+                state,
+                store.clone(),
+                initial_backoff_ms,
+                max_attempts,
+            );
         })
         .jobs(vec![crate::job::JobInfo {
             name: "autumn_webhook_delivery".to_string(),
-            max_attempts: 10, // Retries are handled durably via the background job engine
+            // The job engine runs the retries. Two job attempts per delivery
+            // attempt leave room for store errors, which use a job attempt
+            // but not a delivery attempt.
+            max_attempts: max_attempts.saturating_mul(2),
             initial_backoff_ms,
             queue: "default".to_string(),
             uniqueness: None,
@@ -877,6 +931,55 @@ mod tests {
         assert_eq!(builder.state_initializers.len(), 1);
     }
 
+    /// Issue #3054: the number of delivery attempts is configurable.
+    #[tokio::test]
+    async fn max_attempts_reaches_the_delivery_log_and_the_job() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let mut builder =
+            crate::app().plugin(OutboundWebhookPlugin::new(store.clone()).with_max_attempts(3));
+        assert_eq!(
+            builder.jobs[0].max_attempts, 6,
+            "two job attempts per delivery"
+        );
+
+        let state = AppState::for_test();
+        let initializer = builder.state_initializers.remove(0);
+        initializer(&state);
+        let manager = state
+            .extension::<WebhookOutboundManager>()
+            .expect("manager installed");
+        assert_eq!(manager.max_attempts(), 3);
+
+        store
+            .create_subscription(sample_subscription(
+                "sub_n",
+                "http://mock-receiver/n",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        // No job client: the dispatch fails, but the log is written first.
+        let _ = manager
+            .dispatch(&state, "orders.created", &serde_json::json!({}))
+            .await;
+        let logs = store.get_delivery_logs().await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].max_attempts, 3);
+    }
+
+    #[test]
+    fn zero_max_attempts_reads_as_one() {
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        assert_eq!(
+            WebhookOutboundManager::new(store)
+                .with_max_attempts(0)
+                .max_attempts(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn replay_job_sends_failed_subscription_instead_of_skipping() {
         let state = AppState::for_test();
@@ -886,7 +989,7 @@ mod tests {
             .post("/webhooks/replay")
             .respond_with(200, serde_json::json!({ "received": true }));
         state.insert_extension(HttpMockRegistryExt(registry));
-        install_outbound_webhook_manager(&state, store.clone(), 1);
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
 
         let sub = sample_subscription(
             "sub_failed",
@@ -937,7 +1040,7 @@ mod tests {
             .post("/webhooks/disabled")
             .respond_with(200, serde_json::json!({ "received": true }));
         state.insert_extension(HttpMockRegistryExt(registry));
-        install_outbound_webhook_manager(&state, store.clone(), 1);
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
 
         let sub = sample_subscription(
             "sub_disabled",
@@ -1005,7 +1108,7 @@ mod tests {
         // path short-circuits before the SSRF check runs (`send_recorded`
         // checks `self.mock.is_some()` first), so this test needs the real
         // send path to observe whether the connection was actually blocked.
-        install_outbound_webhook_manager(&state, store.clone(), 1);
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
 
         let sub = sample_subscription("sub_ssrf", &target_url, WebhookSubscriptionStatus::Active);
         store.create_subscription(sub).await.unwrap();
@@ -1053,7 +1156,7 @@ mod tests {
             .post("/webhooks/stale")
             .respond_with(200, serde_json::json!({ "received": true }));
         state.insert_extension(HttpMockRegistryExt(registry));
-        install_outbound_webhook_manager(&state, store.clone(), 1);
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
 
         let stored_sub = sample_subscription(
             "sub_refresh",
@@ -1152,7 +1255,7 @@ mod tests {
         .post("/webhooks/large-error")
         .respond_with(500, serde_json::json!({ "error": large_body }));
         state.insert_extension(HttpMockRegistryExt(registry));
-        install_outbound_webhook_manager(&state, store.clone(), 1);
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
 
         let sub = sample_subscription(
             "sub_large_error",
@@ -1187,6 +1290,44 @@ mod tests {
             body.len()
         );
         assert!(body.ends_with("[truncated]"));
+    }
+
+    /// A log written with a limit of 10 moves to the DLQ at the manager's
+    /// lower limit of 2, so the job engine cannot run out first.
+    #[tokio::test]
+    async fn a_lowered_limit_moves_an_old_log_to_the_dlq() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let _mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/lowered")
+            .post("/webhooks/lowered")
+            .respond_with(500, serde_json::json!({}));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1, 2);
+
+        let sub = sample_subscription(
+            "sub_lowered",
+            "http://mock-receiver/webhooks/lowered",
+            WebhookSubscriptionStatus::Active,
+        );
+        store.create_subscription(sub.clone()).await.unwrap();
+        let mut log = sample_log("log_lowered", "sub_lowered");
+        log.attempt = 2;
+        log.max_attempts = 10;
+
+        deliver_webhook_job(
+            state,
+            serde_json::json!({ "subscription": sub, "log": log }),
+        )
+        .await
+        .expect("the last attempt settles the job");
+
+        let stored = store
+            .get_delivery_log("log_lowered")
+            .await
+            .unwrap()
+            .expect("delivery log should exist");
+        assert!(stored.is_dlq, "attempt 2 of a limit of 2 goes to the DLQ");
     }
 
     struct CountingReplacementStore {
@@ -1360,7 +1501,7 @@ mod tests {
             .post("/webhooks/success")
             .respond_with(200, serde_json::json!({ "received": true }));
         state.insert_extension(HttpMockRegistryExt(registry));
-        install_outbound_webhook_manager(&state, store.clone(), 1);
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
 
         let sub = sample_subscription(
             "sub_success",

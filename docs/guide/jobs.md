@@ -123,6 +123,7 @@ backend = "local"   # local | postgres | redis | sqlite
 workers = 2
 max_attempts = 5
 initial_backoff_ms = 250
+max_backoff_ms = 3600000   # cap on the jittered retry backoff (default: 1 h)
 
 [jobs.postgres]
 # Reuses the configured [database] pool. No extra URL needed.
@@ -364,7 +365,12 @@ as every other durable backend.
 
 ## Retry/backoff and dead letters
 
-- Jobs retry with exponential backoff (`initial_backoff_ms * 2^(attempt-1)`).
+- Jobs retry with exponential backoff and full jitter: the wait is a random
+  value in `[0, min(max_backoff_ms, initial_backoff_ms * 2^(attempt-1))]`
+  (issue #3054). Jobs that fail together do not retry together. All four
+  backends use the same rule. Under a `Sim`, the jitter replays from the seed.
+- `max_backoff_ms` caps the wait. Default: 3 600 000 (1 hour). Set it in
+  `[jobs]` or with `AUTUMN_JOBS__MAX_BACKOFF_MS`.
 - Retries stop at `max_attempts` (job-level override or config default).
 - Exhausted jobs are dead-lettered.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
