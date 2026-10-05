@@ -781,3 +781,66 @@ async fn the_probe_refuses_a_bad_configuration() {
         Err(NodeError::Config(_))
     ));
 }
+
+#[tokio::test]
+async fn an_upgrade_is_tunnelled_to_the_origin() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // An origin that accepts `upgrade: echo` and echoes the raw bytes.
+    let router = axum::Router::new().fallback(|mut request: Request<Body>| async move {
+        let Some(upgrade) = request
+            .extensions_mut()
+            .remove::<hyper::upgrade::OnUpgrade>()
+        else {
+            return Response::builder().status(400).body(Body::empty()).unwrap();
+        };
+        tokio::spawn(async move {
+            let upgraded = upgrade.await.expect("the client upgrades");
+            let mut io = hyper_util::rt::TokioIo::new(upgraded);
+            let mut buffer = [0u8; 4];
+            io.read_exact(&mut buffer).await.expect("read");
+            io.write_all(&buffer).await.expect("echo");
+        });
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("connection", "upgrade")
+            .header("upgrade", "echo")
+            .body(Body::empty())
+            .unwrap()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let edge = node(declining_guest(), &origin).await;
+
+    let address = edge.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    stream
+        .write_all(
+            format!("GET /ws HTTP/1.1\r\nhost: {address}\r\nconnection: upgrade\r\nupgrade: echo\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("write");
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).await.expect("read head");
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 101"), "{head}");
+    assert!(head.contains("upgrade: echo"), "{head}");
+
+    stream.write_all(b"ping").await.expect("write");
+    let mut echo = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echo))
+        .await
+        .expect("the tunnel answers in time")
+        .expect("read");
+    assert_eq!(&echo, b"ping");
+}

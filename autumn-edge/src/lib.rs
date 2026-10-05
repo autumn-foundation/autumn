@@ -178,9 +178,9 @@ mod manifest_guard {
     fn no_native_only_runtime_is_a_dependency() {
         for line in dependency_lines() {
             let name = line.split('=').next().unwrap_or_default().trim();
-            // The `node` feature uses tokio and reqwest. They must stay
-            // optional: a capsule never enables `node`.
-            if matches!(name, "tokio" | "reqwest") {
+            // The `node` feature uses tokio, hyper and reqwest. They must
+            // stay optional: a capsule never enables `node`.
+            if matches!(name, "tokio" | "reqwest" | "hyper" | "hyper-util") {
                 assert!(line.contains("optional = true"), "{line}");
                 continue;
             }
@@ -202,9 +202,17 @@ mod manifest_guard {
             .skip(1)
             .take_while(|line| !line.trim_start().starts_with('['))
             .filter(|line| {
-                ["dep:tokio", "dep:reqwest", "tokio/", "reqwest/", "\"node\""]
-                    .iter()
-                    .any(|needle| line.contains(needle))
+                [
+                    "dep:tokio",
+                    "dep:reqwest",
+                    "dep:hyper",
+                    "tokio/",
+                    "reqwest/",
+                    "hyper",
+                    "\"node\"",
+                ]
+                .iter()
+                .any(|needle| line.contains(needle))
             })
             .collect();
         assert_eq!(features.len(), 1, "{features:?}");

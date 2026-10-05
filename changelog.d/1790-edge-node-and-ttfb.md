@@ -5,7 +5,8 @@
   the capsule serves and sends every other request to the origin over HTTP.
   At start it copies the origin's static security, CORS and CSP headers. It
   does not follow redirects, removes hop-by-hop headers, replaces the
-  client's `x-forwarded-*` headers, and refuses a path with a dot segment.
+  client's `x-forwarded-*` headers, refuses a path with a dot segment, and
+  tunnels WebSocket upgrades to the origin.
   In Rust:
   `autumn_edge::node::EdgeNode` (feature `node`).
 - **edge:** `autumn edge ttfb` measures time to first byte at the edge node

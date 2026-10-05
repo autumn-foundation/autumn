@@ -273,6 +273,7 @@ Rules for the node:
 - It is the first proxy. It replaces the client's `x-forwarded-*` headers
   and removes `forwarded`.
 - It refuses a path with a dot segment or a `\`.
+- It tunnels an `upgrade` request (WebSocket) to the origin.
 - It streams bodies to and from the origin. It runs the capsule on a
   blocking thread, at most one for each CPU at the same time.
 - It copies the origin's static security, CORS and CSP headers at start.

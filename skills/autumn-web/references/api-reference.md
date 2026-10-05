@@ -1633,7 +1633,7 @@ An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
 | `.with_kv(kv)` / `.with_response_headers(headers)` | Provide the `kv` capability; set the origin's static security headers (and a static CSP) on edge responses |
 | `gateway::Lane` | In the response extensions: `Edge`, `Fallthrough(reason)`, `OriginOnly` |
 | `node::EdgeNode::new(gateway)` (feature `node`) | HTTP edge node; capsule on a blocking thread, at most one per CPU (`.with_max_capsules(n)`); 400 on a dot-segment path; `.with_access_log(f)` gets the lane of each request |
-| `node::HttpOrigin::new(url)` | The origin over HTTP for the gateway; no redirects, no proxy, no credentials in the URL, hop-by-hop headers removed, client `x-forwarded-*` replaced; 502 when the origin does not connect in 10 s or stops for 60 s |
+| `node::HttpOrigin::new(url)` | The origin over HTTP for the gateway; no redirects, no proxy, no credentials in the URL, hop-by-hop headers removed, client `x-forwarded-*` replaced, `upgrade` (WebSocket) tunnelled; 502 when the origin does not connect in 10 s or stops for 60 s |
 | `node::origin_static_headers(url, path)` | Security, CORS and CSP headers with the same value in two origin responses |
 | `node::serve(listener, service, shutdown)` | Serves `service` until `shutdown`; gives the peer address to `HttpOrigin` |
 | `node::ttfb::measure(&Probe)` | TTFB edge vs origin and a byte compare of each pair; `Report::passes(min_percent)` |

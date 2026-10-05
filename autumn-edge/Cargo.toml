@@ -45,6 +45,10 @@ wasmi = { version = "0.40", optional = true }
 # through axum) lets the node send a request body to the origin without a
 # buffer.
 http-body = { version = "1", optional = true }
+# The node tunnels an upgraded connection (WebSocket) to the origin. Both are
+# already in the graph through axum.
+hyper = { version = "1", optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
 tokio = { workspace = true, optional = true }
 
@@ -65,7 +69,7 @@ host = ["dep:wasmi"]
 # Native-only edge node: an HTTP server that runs a capsule and sends each
 # fallthrough to a remote origin. `autumn edge serve` uses it. NEVER enable
 # this for a `wasm32-*` target.
-node = ["host", "dep:http-body", "dep:tokio", "dep:reqwest", "axum/tokio", "axum/http1"]
+node = ["host", "dep:http-body", "dep:hyper", "dep:hyper-util", "dep:tokio", "dep:reqwest", "axum/tokio", "axum/http1"]
 
 [package.metadata.docs.rs]
 all-features = true

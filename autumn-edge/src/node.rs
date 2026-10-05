@@ -18,6 +18,8 @@
 //! - **The node is the first proxy.** It replaces the client's
 //!   `x-forwarded-*` headers and removes `forwarded`. `host` is the
 //!   origin's host.
+//! - **Upgrades tunnel.** A WebSocket (or other `upgrade`) request goes to
+//!   the origin. On a 101, the node copies bytes both ways.
 //! - **Origin bodies stream.** The node does not hold a request or origin
 //!   body in memory.
 //! - **The capsule runs on a blocking thread**, at most one for each CPU at
@@ -34,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{Body, HttpBody};
 use axum::extract::ConnectInfo;
-use http::header::{CONNECTION, CONTENT_TYPE, HOST};
+use http::header::{CONNECTION, CONTENT_TYPE, HOST, UPGRADE};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use tokio::sync::Semaphore;
 use tower::Service;
@@ -154,35 +156,84 @@ impl Service<Request<Body>> for HttpOrigin {
 }
 
 /// Send `request` to the origin and return its response, or a 502 (400 for an unsafe path).
+///
+/// An upgrade request (WebSocket) keeps `connection` and `upgrade`. When the
+/// origin answers 101, the node joins the two connections.
 async fn forward(client: &reqwest::Client, base: &str, request: Request<Body>) -> Response<Body> {
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|info| info.0.ip());
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let path = parts
         .uri
         .path_and_query()
-        .map_or("/", http::uri::PathAndQuery::as_str);
-    if !is_safe_path(path) {
+        .map_or("/", http::uri::PathAndQuery::as_str)
+        .to_owned();
+    if !is_safe_path(&path) {
         return bad_request();
+    }
+    let upgrade = upgrade_protocol(&parts.headers);
+    let client_upgrade = upgrade
+        .as_ref()
+        .and_then(|_| parts.extensions.remove::<hyper::upgrade::OnUpgrade>());
+    let mut headers = forwarded_headers(&parts.headers, peer);
+    if let (Some(protocol), Some(_)) = (&upgrade, &client_upgrade) {
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, protocol.clone());
     }
     let mut outgoing = client
         .request(parts.method, format!("{base}{path}"))
-        .headers(forwarded_headers(&parts.headers, peer));
+        .headers(headers);
     // An empty body stays empty. A stream would make a GET chunked.
     if body.size_hint().exact() != Some(0) {
         outgoing = outgoing.body(reqwest::Body::wrap(SyncBody(Mutex::new(body))));
     }
-    outgoing.send().await.map_or_else(
-        |_| bad_gateway(),
-        |answer| {
-            let answer: Response<reqwest::Body> = answer.into();
-            let (mut parts, body) = answer.into_parts();
-            remove_hop_by_hop(&mut parts.headers);
-            Response::from_parts(parts, Body::new(body))
-        },
-    )
+    let Ok(answer) = outgoing.send().await else {
+        return bad_gateway();
+    };
+    if answer.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return client_upgrade
+            .map_or_else(bad_gateway, |client_upgrade| tunnel(answer, client_upgrade));
+    }
+    let answer: Response<reqwest::Body> = answer.into();
+    let (mut parts, body) = answer.into_parts();
+    remove_hop_by_hop(&mut parts.headers);
+    Response::from_parts(parts, Body::new(body))
+}
+
+/// The `upgrade` value when `connection` names `upgrade`.
+fn upgrade_protocol(headers: &HeaderMap) -> Option<HeaderValue> {
+    let named = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    named.then(|| headers.get(UPGRADE).cloned()).flatten()
+}
+
+/// Send the origin's 101 to the client, then copy bytes both ways until one
+/// side closes.
+fn tunnel(answer: reqwest::Response, client_upgrade: hyper::upgrade::OnUpgrade) -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    let mut headers = answer.headers().clone();
+    let protocol = headers.remove(UPGRADE);
+    remove_hop_by_hop(&mut headers);
+    if let Some(protocol) = protocol {
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(UPGRADE, protocol);
+    }
+    *response.headers_mut() = headers;
+    tokio::spawn(async move {
+        let (Ok(client), Ok(mut origin)) = (client_upgrade.await, answer.upgrade().await) else {
+            return;
+        };
+        let mut client = hyper_util::rt::TokioIo::new(client);
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut origin).await;
+    });
+    response
 }
 
 /// A request body that is `Sync`, as `reqwest::Body::wrap` needs. Only the
@@ -338,6 +389,7 @@ impl<O> std::fmt::Debug for EdgeNode<O> {
         f.debug_struct("EdgeNode")
             .field("gateway", &self.gateway)
             .field("access_log", &self.access_log.is_some())
+            .field("max_capsules", &self.capsules.available_permits())
             .finish()
     }
 }

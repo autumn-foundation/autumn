@@ -556,6 +556,8 @@ Rules:
 - It does not follow redirects. It does not use `HTTP_PROXY` or
   `HTTPS_PROXY`.
 - It removes hop-by-hop headers in both directions.
+- It sends an `upgrade` request (WebSocket) to the origin. When the origin
+  answers `101`, the node copies bytes both ways until one side closes.
 - It is the first proxy. It replaces the client's forwarded headers:
   `x-forwarded-for` is the client address, `x-forwarded-host` is the request
   `host`, and `x-forwarded-proto` is `http`. It removes `forwarded`.

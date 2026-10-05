@@ -142,7 +142,7 @@ pub fn serve(options: &ServeOptions<'_>) {
                     fail(
                         EXIT_FAIL,
                         &format!(
-                            "could not read the security headers from the origin: {err}\n  \
+                            "could not read the static headers from the origin: {err}\n  \
                              Start the origin first, or pass --no-probe and set them with \
                              --response-header."
                         ),
@@ -154,22 +154,8 @@ pub fn serve(options: &ServeOptions<'_>) {
         headers.extend(configured);
         let header_count = headers.len();
 
-        let mut gateway =
-            EdgeGateway::new(Arc::new(artifact), origin).with_response_headers(headers);
-        let kv_state = if let Some(path) = options.kv {
-            let store = load_kv(Path::new(path))
-                .unwrap_or_else(|err| fail(EXIT_FAIL, &format!("--kv {path}: {err}")));
-            let count = store.len();
-            let kv = store
-                .into_iter()
-                .fold(InMemoryEdgeKv::new(), |kv, (key, value)| {
-                    kv.with(key, value)
-                });
-            gateway = gateway.with_kv(Arc::new(kv));
-            format!("{count} key(s)")
-        } else {
-            "off".to_owned()
-        };
+        let gateway = EdgeGateway::new(Arc::new(artifact), origin).with_response_headers(headers);
+        let (gateway, kv_state) = with_kv_file(gateway, options.kv);
 
         let mut edge_node = EdgeNode::new(gateway);
         if !options.quiet {
@@ -203,23 +189,48 @@ pub fn serve(options: &ServeOptions<'_>) {
             options.capsule,
             wasm.len() / 1024,
         );
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let server = node::serve(listener, edge_node, async {
-            let _ = stopped.await;
-        });
-        tokio::pin!(server);
-        let result = tokio::select! {
-            result = &mut server => result,
-            () = shutdown_signal() => {
-                let _ = stop.send(());
-                println!("Stopping: open requests have {} s to finish.", DRAIN.as_secs());
-                tokio::time::timeout(DRAIN, server).await.unwrap_or(Ok(()))
-            }
-        };
-        if let Err(err) = result {
-            fail(EXIT_FAIL, &format!("the edge node stopped: {err}"));
-        }
+        run_until_stopped(listener, edge_node).await;
     });
+}
+
+/// Give the gateway the `kv` capability from `--kv`. Returns the gateway and
+/// a short state for the banner.
+fn with_kv_file(
+    gateway: EdgeGateway<HttpOrigin>,
+    kv: Option<&str>,
+) -> (EdgeGateway<HttpOrigin>, String) {
+    let Some(path) = kv else {
+        return (gateway, "off".to_owned());
+    };
+    let store = load_kv(Path::new(path))
+        .unwrap_or_else(|err| fail(EXIT_FAIL, &format!("--kv {path}: {err}")));
+    let count = store.len();
+    let kv = store
+        .into_iter()
+        .fold(InMemoryEdgeKv::new(), |kv, (key, value)| {
+            kv.with(key, value)
+        });
+    (gateway.with_kv(Arc::new(kv)), format!("{count} key(s)"))
+}
+
+/// Serve until Ctrl-C or SIGTERM, then give open requests [`DRAIN`].
+async fn run_until_stopped(listener: tokio::net::TcpListener, edge_node: EdgeNode<HttpOrigin>) {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = node::serve(listener, edge_node, async {
+        let _ = stopped.await;
+    });
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => result,
+        () = shutdown_signal() => {
+            let _ = stop.send(());
+            println!("Stopping: open requests have {} s to finish.", DRAIN.as_secs());
+            tokio::time::timeout(DRAIN, server).await.unwrap_or(Ok(()))
+        }
+    };
+    if let Err(err) = result {
+        fail(EXIT_FAIL, &format!("the edge node stopped: {err}"));
+    }
 }
 
 /// How long open requests can run after a stop signal.

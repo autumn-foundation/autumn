@@ -1008,6 +1008,7 @@ pub enum EdgeCommands {
     ///
     ///   autumn edge serve --origin https://origin.example.com
     ///   autumn edge serve --origin http://10.0.0.5:3000 --listen 0.0.0.0:8787 --kv kv.json
+    #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
     Serve {
         /// The capsule that `autumn build` wrote.
@@ -1052,6 +1053,7 @@ pub enum EdgeCommands {
     /// # Examples
     ///
     ///   autumn edge ttfb --edge https://edge.example.com --origin https://origin.example.com --path /greet/ada
+    #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
     Ttfb {
         /// The edge node base URL.
@@ -1629,6 +1631,7 @@ enum Commands {
     ///
     ///   autumn edge serve --origin https://origin.example.com
     ///   autumn edge ttfb --edge http://127.0.0.1:8787 --origin https://origin.example.com --path /
+    #[allow(clippy::doc_markdown)]
     #[command(verbatim_doc_comment)]
     Edge {
         #[command(subcommand)]
