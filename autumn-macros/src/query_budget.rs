@@ -3124,10 +3124,12 @@ impl Analyzer {
                 (guard, after_guard, body)
             });
             let guard_falls = guard.fall.clone();
-            let prefix = tried
-                .iter()
-                .filter(|(earlier, _, _)| !patterns_disjoint(earlier, pat))
-                .fold(Cost::ZERO, |sum, (_, cost, _)| sum.then(cost.clone()));
+            let prefix = guard_prefix(
+                tried
+                    .iter()
+                    .filter(|(earlier, _, _)| !patterns_disjoint(earlier, pat))
+                    .map(|(earlier, cost, _)| (*earlier, cost)),
+            );
             let body = Flow::cost(prefix).then(guard).then(body);
             // A later arm runs after this guard falls through, or after
             // this pattern fails (and the guard does not run).
@@ -4184,6 +4186,7 @@ impl Analyzer {
                 break_results(e).into_iter().any(|v| self.expr_is_nested(v))
             }
             Expr::Block(b) => block_tail(&b.block).is_some_and(|e| self.expr_is_nested(e)),
+            Expr::Unsafe(u) => block_tail(&u.block).is_some_and(|e| self.expr_is_nested(e)),
             _ => false,
         }
     }
@@ -4507,6 +4510,10 @@ impl Analyzer {
             }
             Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
                 break_results(e).into_iter().any(|v| self.expr_is_holder(v))
+            }
+            // `{ move || repo }`, `if flag { Ctx { repo } } else { … }`.
+            Expr::If(_) | Expr::Match(_) | Expr::Block(_) | Expr::Unsafe(_) => {
+                value_tails(e).into_iter().any(|v| self.expr_is_holder(v))
             }
             // A closure that captures a handle holds it, like a user value.
             Expr::Closure(c) => self.closure_captures_handle(c),
@@ -5645,6 +5652,46 @@ impl<'a> Visit<'a> for FreeNames<'_> {
     fn visit_expr_closure(&mut self, c: &'a syn::ExprClosure) {
         let names = c.inputs.iter().flat_map(bound_names).collect();
         self.scoped(names, |s| s.visit_expr(&c.body));
+    }
+}
+
+/// The most that the guards one value can run may cost. A value runs the
+/// guard of every earlier arm whose pattern it matches. A guard with no
+/// variant key (`_`, a binding, a constant) may always run. Of the guards
+/// on one written owner (`Some(_)`, `None`), a value runs those of one
+/// variant only. Owners may name one enum, so they add up.
+fn guard_prefix<'a>(guards: impl Iterator<Item = (&'a Pat, &'a Cost)>) -> Cost {
+    let mut keyless = Cost::ZERO;
+    let mut variants: Vec<((String, String), Cost)> = Vec::new();
+    for (pat, cost) in guards {
+        match pattern_key(pat) {
+            None => keyless = keyless.then(cost.clone()),
+            Some(key) => match variants.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, sum)) => *sum = sum.clone().then(cost.clone()),
+                None => variants.push((key, cost.clone())),
+            },
+        }
+    }
+    let mut owners: Vec<(String, Cost)> = Vec::new();
+    for ((owner, _), cost) in variants {
+        match owners.iter_mut().find(|(o, _)| *o == owner) {
+            Some((_, worst)) => *worst = worst.clone().or_worst(cost),
+            None => owners.push((owner, cost)),
+        }
+    }
+    owners
+        .into_iter()
+        .fold(keyless, |sum, (_, cost)| sum.then(cost))
+}
+
+/// The `(owner, variant)` a pattern names, for grouping guards: a variant
+/// pattern, or a literal under the owner `literal`. `None` for any other
+/// pattern, which may match any value.
+fn pattern_key(pat: &Pat) -> Option<(String, String)> {
+    match pat {
+        Pat::Paren(p) => pattern_key(&p.pat),
+        Pat::Lit(l) => literal_value(&l.lit).map(|v| ("literal".to_string(), v)),
+        other => pattern_variant(other),
     }
 }
 
@@ -11904,6 +11951,54 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let pending = unsafe { repo.scoped() }; pending.await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn block_wrapped_holders_and_exclusive_guards() {
+        check_handlers(&[
+            (
+                "guard: a block-wrapped closure that captures a handle holds it",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let make = { move || repo }; let alias = make(); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an if of holders holds",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let ctx = if flag { Ctx { repo } } else { Ctx::empty() }; render(ctx); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an unsafe block of nested values is nested",
+                "async fn h(lists: Vec<Vec<PgPostRepository>>) -> AutumnResult<usize> { \
+                 let inner = unsafe { lists }; inner.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guards on exclusive variants are not summed",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let _ = match x { Some(_) if repo.a().await? => (), None if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: guards on overlapping patterns are summed",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let _ = match x { Some(_) if repo.a().await? => (), Some(_) if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: a keyless guard adds to a variant guard",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let _ = match x { y if repo.a().await? => { let _ = y; } Some(_) if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: variants of different owners add up",
+                "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
+                 let _ = match x { a::E::V(_) if repo.a().await? => (), b::E::W(_) if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
             ),
         ]);
     }
