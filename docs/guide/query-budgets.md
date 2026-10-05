@@ -117,15 +117,15 @@ Both halves are compiled in CI as trybuild fixtures — see
 |---|---|
 | Straight-line statements | **sum** |
 | `if` / `match` arms | **maximum** — only one arm runs, so the bound is the worst one |
-| `return`, `break`, `continue` | the path that leaves early does not pay for the code it skips. `if cached { return repo.find_cached().await; } repo.find_fresh().await` is **1** |
+| `return`, `break`, `continue` | the early path does not include the cost of the code it skips. `if cached { return repo.find_cached().await; } repo.find_fresh().await` is **1**. A `return` inside a loop still counts as reaching the code after the loop |
 | A loop whose body issues a query | **unbounded** (rejected under a finite budget) |
 | A loop with a literal bound (`for _ in 0..3`) | body cost **× 3** |
 | A loop whose body issues nothing | **0** — loops are free until they query |
 | A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, `limit()`, …) it carries — splitting the chain across `let` bindings does not change the count |
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
-| An associated function handed the handle (`Post::published(&mut db)`) | **reported** — declare it with `#[query_cost(N)]` |
-| `db.tx(\|conn\| …)` / `db.tx_with(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still counted |
+| An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
+| `db.tx(\|conn\| …)` / `db.tx_with(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
 | An `Option`/`Result` combinator closure (`unwrap_or_else`, `ok_or_else`, …) | counted **once** — it is not an iterator adapter |
 
@@ -137,24 +137,30 @@ caught as the same N+1.
 
 The analysis follows the handle through every name that holds it:
 
-- **Bindings.** `let`, `let … else`, assignment, `if let`, `while let`,
-  `match` arms, `for` patterns, closure parameters and transaction callback
-  parameters all bind the same way. A type on the binding counts too:
-  `let r: PgPostRepository = …` is a handle.
+- **Bindings.** The analysis reads each of these binding forms: `let`,
+  `let … else`, assignment, `if let`, `while let`, `match` arms, `for`
+  patterns, closure parameters and transaction callback parameters. A type
+  annotation also marks a handle: `let r: PgPostRepository = …`. An
+  `Arc<PgPostRepository>`, `Box<…>` or `Rc<…>` is a handle too.
 - **Scopes.** A `let` in a block ends with the block. An assignment to a name
-  declared outside the block lasts after it.
+  declared outside the block stays after the block.
 - **Branches.** After an `if`, a `match` or a loop, a name holds a handle when
-  it holds one on any path. An early exit carries its bindings to where it
-  lands.
+  it holds one on any path. The bindings at a `return`, `break` or `continue`
+  apply where that exit lands.
 - **Containers.** A value built from a handle holds it: `[repo]`,
-  `vec![repo]`, `(repo, 1)`, `Some(repo)`, `Ctx { db }`, or a parameter of
-  type `Vec<PgPostRepository>`, `Option<…>`, a tuple, array or slice. An
-  element, a field or an unwrapped value of it is a handle. A method on the
-  container itself (`repos.len()`) is not a query. A helper handed the
-  container is reported.
+  `vec![repo]`, `(repo, 1)`, `Some(repo)`, `Ctx { db }`. A parameter of type
+  `Vec`, `VecDeque`, `Option`, tuple, array or slice of a handle type also
+  holds handles (`Vec<PgPostRepository>`, `Option<Db>`).
+  - An index (`repos[0]`), a field (`pair.0`), a pattern (`Some(r)`,
+    `for r in repos`) or `?` gives a handle.
+  - A method on the container gives a handle (`repos.remove(0)`), unless it
+    returns a number or a `bool` (`repos.len()`) or a view of the container
+    (`repos.iter()`, `repos.first()`). These methods are not queries.
+  - A helper handed the container is reported.
 
 The container rule can over-count. `ctx.name.len()` on `Ctx { db, name }` is
-counted as a query. Move the value out before the struct is built.
+counted as a query. Bind `name` to its own variable before you build the
+struct.
 
 ## What the analysis refuses to guess
 
@@ -166,7 +172,8 @@ negative ships an N+1 to production.
   is another function; the macro sees only the call.
 - **An associated function handed the handle** — `Post::published(&mut db)`.
   It has the same shape as `ReportBuilder::build(&mut db)`, which can issue any
-  number of queries. Declare a finder's cost with `#[query_cost(1)]`.
+  number of queries. Put `#[query_cost(1)]` on the statement that calls a
+  one-query finder.
 - **A macro body that `await`s while naming the handle** — `html! { …
   (fetch(&mut db).await?) … }`. A macro body is token soup to `syn`. A template
   that merely *passes* the handle to a render helper is fine: only an `await`
@@ -320,7 +327,8 @@ Within an annotated function, every construct that can issue a query is either
 counted or reported — never silently skipped. Counting rests on two framework
 contracts, both of which the macro states in its diagnostics:
 
-1. One repository-chain call or one `preload` association issues one query.
+1. One repository-chain call, one diesel executor call, or one `preload`
+   association issues one query.
 2. A call site the analysis cannot read declares its own cost with
    `#[query_cost(N)]`, or is excluded with `#[query_exempt(reason = "…")]`.
 

@@ -1019,7 +1019,7 @@ impl Analyzer {
     fn block(&mut self, block: &Block) {
         // A block scopes the names its own `let`s introduce, but not an
         // assignment it makes to an outer name. Restore exactly the declared
-        // names (the lesson `query_budget` learned in review).
+        // names.
         let outer = self.handles.clone();
         let mut declared = HashSet::new();
         for stmt in &block.stmts {
@@ -4212,7 +4212,7 @@ mod tests {
 
     /// `expr_attrs`, `expr_attrs_mut`, `item_attrs_mut`,
     /// `immediately_invoked_closure`, `call_path_name`, `tokens_contain_await`,
-    /// `collect_pat_idents`, `StripAnnotations`'s `VisitMut` impl, and
+    /// `is_constructor_call`, `StripAnnotations`'s `VisitMut` impl, and
     /// `EXECUTORS` are a deliberate copy of `query_budget.rs`, modulo
     /// comments (see the comment above `expr_attrs` in this file, and its
     /// mirror in `query_budget.rs`) — everything else nearby has since

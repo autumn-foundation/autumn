@@ -1075,9 +1075,12 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   however many builder methods (`on_primary()`, `scoped()`, …) it carries.
 /// * `.preload(rows, Post::preload().author().tags())` costs **one query per
 ///   association** — the batched `WHERE ... IN (...)` loads.
-/// * Anything opaque — a helper function handed the handle, a macro body that
-///   names it, a closure that may run per element — is **reported**, never
-///   assumed query-free.
+/// * A path that leaves early (`return`, `break`, `continue`) does not include
+///   the cost of the code it skips.
+/// * Anything opaque — a helper function or associated function handed the
+///   handle (`Post::published(&mut db)`), a macro body that names it, a
+///   closure that may run per element — is **reported**, never assumed
+///   query-free.
 ///
 /// # Escape hatches
 ///

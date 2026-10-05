@@ -109,16 +109,15 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
-### Query budgets: an associated function handed the handle is opaque (#2316)
+### Query budgets: an associated function handed the handle is reported (#2316)
 
 **Why:** `Post::published(&mut db)` and `ReportBuilder::build(&mut db)` have
-the same shape. The analysis cannot tell a one-query finder from a helper
-that issues many queries. It counted both as 1 query, so a helper could hide
-an N+1. Now both are reported, like a free function handed the handle.
+the same shape, so the analysis cannot tell a one-query finder from a helper
+that loops. It counted both as 1 query, and a helper could hide an N+1.
 
-You are affected only if a `#[query_budget(N)]` handler calls `Type::f(…)`
-with the `Db` handle. The build fails with "`f` is handed the database
-handle". Declare the cost of the statement.
+This affects you only if a `#[query_budget(N)]` function gives a database or
+repository handle to `Type::f(…)`. The build fails with "`f` is handed the
+database handle". Put `#[query_cost(N)]` on the statement.
 
 **Before (`{X.Y}`):**
 
