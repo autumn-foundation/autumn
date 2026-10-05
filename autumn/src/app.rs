@@ -5819,6 +5819,11 @@ impl AppBuilder {
             // the scheduler must not regress readiness: mark_startup_complete and
             // signal_serve_ready below still run.
             if role.runs_workers() && !tasks.is_empty() {
+                if let Some(warning) =
+                    in_process_fleet_warning(&config, &tasks, &crate::config::OsEnv)
+                {
+                    tracing::warn!("{warning}");
+                }
                 let res = start_task_scheduler_with_config(
                     tasks,
                     &state,
@@ -8895,6 +8900,40 @@ pub(crate) fn start_task_scheduler_with_config(
     Ok(())
 }
 
+/// The boot warning for an `in_process` scheduler that runs fleet tasks while
+/// a hint shows more than one replica. Each replica would run each tick
+/// (issue #3052). `None` when there is nothing to warn about.
+fn in_process_fleet_warning(
+    config: &AutumnConfig,
+    tasks: &[crate::task::TaskInfo],
+    env: &dyn crate::config::Env,
+) -> Option<String> {
+    let has_fleet_task = tasks
+        .iter()
+        .any(|task| task.coordination == crate::task::TaskCoordination::Fleet);
+    if !has_fleet_task {
+        return None;
+    }
+    let replicas = env.var("AUTUMN_REPLICAS").ok();
+    let kubernetes = env.var("KUBERNETES_SERVICE_HOST").is_ok();
+    let hint = crate::scheduler::in_process_fleet_hint(
+        config.scheduler.backend,
+        &config.jobs.backend,
+        replicas.as_deref(),
+        kubernetes,
+    )?;
+    let fix = if cfg!(feature = "sqlite") {
+        "sqlite"
+    } else {
+        "postgres"
+    };
+    Some(format!(
+        "scheduler.backend = \"in_process\" runs each fleet tick on every replica \
+         ({hint}). If more than one replica runs, set scheduler.backend = \"{fix}\". \
+         See docs/guide/scheduled-multi-replica.md"
+    ))
+}
+
 #[allow(unused_variables, clippy::needless_pass_by_value)]
 fn send_ws_sys_task_msg(
     state: &AppState,
@@ -8979,6 +9018,8 @@ fn format_scheduled_task_panic(panic: &(dyn Any + Send)) -> String {
     format!("scheduled task handler panicked: {detail}")
 }
 
+/// Run one tick with `tick` as its [`crate::scheduler::current_tick`], and
+/// stop it after `lease_ttl` when one is set.
 async fn execute_task_result_with_optional_lease_ttl(
     state: &AppState,
     handler: crate::task::TaskHandler,
@@ -8986,26 +9027,28 @@ async fn execute_task_result_with_optional_lease_ttl(
     name: &str,
     schedule: &'static str,
     lease_ttl: Option<std::time::Duration>,
+    tick: crate::scheduler::ScheduledTick,
 ) -> Result<u64, (u64, String)> {
+    let run = crate::scheduler::with_tick(
+        tick,
+        execute_task_result(state, handler, start, name, schedule),
+    );
     let Some(lease_ttl) = lease_ttl else {
-        return execute_task_result(state, handler, start, name, schedule).await;
+        return run.await;
     };
 
-    tokio::time::timeout(
-        lease_ttl,
-        execute_task_result(state, handler, start, name, schedule),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        let duration_ms = task_duration_ms(state, start);
-        Err((
-            duration_ms,
-            format!(
-                "scheduled task exceeded lease TTL of {}s",
-                lease_ttl.as_secs()
-            ),
-        ))
-    })
+    tokio::time::timeout(lease_ttl, run)
+        .await
+        .unwrap_or_else(|_| {
+            let duration_ms = task_duration_ms(state, start);
+            Err((
+                duration_ms,
+                format!(
+                    "scheduled task exceeded lease TTL of {}s",
+                    lease_ttl.as_secs()
+                ),
+            ))
+        })
 }
 
 /// Handle the execution of a single fixed-delay task.
@@ -9024,8 +9067,9 @@ async fn execute_fixed_delay_task(
         delay,
         crate::time::clock_unix_duration(state.clock()),
     );
+    // Pass the delay: replica timers can reach one bucket a full delay apart.
     let lease = match coordinator
-        .try_acquire(&name, &tick_key, coordination)
+        .try_acquire_for_period(&name, &tick_key, coordination, delay)
         .await
     {
         Ok(Some(lease)) => lease,
@@ -9048,6 +9092,7 @@ async fn execute_fixed_delay_task(
 
     let start = state.monotonic();
     let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
+    let tick = crate::scheduler::ScheduledTick::new(&tick_key, &lease);
     match execute_task_result_with_optional_lease_ttl(
         &state,
         handler,
@@ -9055,6 +9100,7 @@ async fn execute_fixed_delay_task(
         &name,
         "fixed_delay",
         lease_ttl,
+        tick,
     )
     .await
     {
@@ -9092,6 +9138,16 @@ async fn execute_fixed_delay_task(
     }
 }
 
+/// One cron occurrence to run.
+#[derive(Debug, Clone, Copy)]
+struct CronTick {
+    /// The occurrence's scheduled time, in Unix seconds.
+    unix_secs: u64,
+    /// Time from this occurrence to the next. The loop still runs a late
+    /// occurrence inside this window, so the claim must hold for all of it.
+    window: std::time::Duration,
+}
+
 /// Handle the execution of a single cron task.
 #[allow(clippy::cognitive_complexity)]
 async fn execute_cron_task(
@@ -9101,11 +9157,11 @@ async fn execute_cron_task(
     coordination: crate::task::TaskCoordination,
     coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
     lease_ttl: std::time::Duration,
-    scheduled_unix_secs: u64,
+    occurrence: CronTick,
 ) {
-    let tick_key = crate::scheduler::cron_tick_key(&name, scheduled_unix_secs);
+    let tick_key = crate::scheduler::cron_tick_key(&name, occurrence.unix_secs);
     let lease = match coordinator
-        .try_acquire(&name, &tick_key, coordination)
+        .try_acquire_for_period(&name, &tick_key, coordination, occurrence.window)
         .await
     {
         Ok(Some(lease)) => lease,
@@ -9128,8 +9184,9 @@ async fn execute_cron_task(
 
     let start = state.monotonic();
     let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
+    let tick = crate::scheduler::ScheduledTick::new(&tick_key, &lease);
     match execute_task_result_with_optional_lease_ttl(
-        &state, handler, start, &name, "cron", lease_ttl,
+        &state, handler, start, &name, "cron", lease_ttl, tick,
     )
     .await
     {
@@ -9278,7 +9335,10 @@ async fn run_cron_task_loop(
                         return;
                     }
                 }
-                let scheduled_unix_secs = u64::try_from(scheduled_at.timestamp()).unwrap_or_default();
+                let occurrence = CronTick {
+                    unix_secs: u64::try_from(scheduled_at.timestamp()).unwrap_or_default(),
+                    window: cron_occurrence_window(&cron, &scheduled_at),
+                };
                 tokio::spawn(execute_cron_task(
                     name.clone(),
                     state.clone(),
@@ -9286,7 +9346,7 @@ async fn run_cron_task_loop(
                     coordination,
                     Arc::clone(&coordinator),
                     lease_ttl,
-                    scheduled_unix_secs,
+                    occurrence,
                 ));
                 cursor = scheduled_at;
             }
@@ -9331,6 +9391,19 @@ fn cron_occurrence_is_overdue<Tz: chrono::TimeZone>(
 ) -> Result<bool, croner::errors::CronError> {
     let next_after_scheduled = cron.find_next_occurrence(scheduled_at, false)?;
     Ok(&next_after_scheduled <= now)
+}
+
+/// Time from `scheduled_at` to the next occurrence: the window in which the
+/// loop still runs a late `scheduled_at` (see [`cron_occurrence_is_overdue`]).
+/// Zero when no next occurrence exists.
+fn cron_occurrence_window<Tz: chrono::TimeZone>(
+    cron: &croner::Cron,
+    scheduled_at: &chrono::DateTime<Tz>,
+) -> std::time::Duration {
+    cron.find_next_occurrence(scheduled_at, false)
+        .ok()
+        .and_then(|next| next.signed_duration_since(scheduled_at).to_std().ok())
+        .unwrap_or_default()
 }
 
 /// How long to sleep from `now` until `scheduled_at`, saturating at zero for a
@@ -19580,6 +19653,196 @@ mod tests {
         );
     }
 
+    static SEEN_TICK: std::sync::Mutex<Option<crate::scheduler::ScheduledTick>> =
+        std::sync::Mutex::new(None);
+
+    /// Grants every tick with fencing token 99.
+    struct FencingSchedulerCoordinator;
+
+    impl crate::scheduler::SchedulerCoordinator for FencingSchedulerCoordinator {
+        fn backend(&self) -> &'static str {
+            "postgres"
+        }
+
+        fn replica_id(&self) -> &'static str {
+            "replica-a"
+        }
+
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async {
+                Ok(Some(
+                    crate::scheduler::SchedulerLease::local("postgres", "replica-a")
+                        .with_fencing_token(99),
+                ))
+            })
+        }
+    }
+
+    /// Records the period that `try_acquire_for_period` gets.
+    struct PeriodRecordingCoordinator {
+        period: std::sync::Mutex<Option<std::time::Duration>>,
+    }
+
+    impl crate::scheduler::SchedulerCoordinator for PeriodRecordingCoordinator {
+        fn backend(&self) -> &'static str {
+            "postgres"
+        }
+
+        fn replica_id(&self) -> &'static str {
+            "replica-a"
+        }
+
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn try_acquire_for_period<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+            period: std::time::Duration,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            *self.period.lock().unwrap() = Some(period);
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    // Issue #3052: a fixed-delay tick stays claimed for its whole delay.
+    #[tokio::test]
+    async fn fixed_delay_task_claims_its_tick_for_the_delay() {
+        let coordinator = std::sync::Arc::new(PeriodRecordingCoordinator {
+            period: std::sync::Mutex::new(None),
+        });
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+
+        super::execute_fixed_delay_task(
+            "hourly_task".to_owned(),
+            AppState::for_test(),
+            handler,
+            std::time::Duration::from_secs(3_600),
+            crate::task::TaskCoordination::Fleet,
+            std::sync::Arc::clone(&coordinator) as _,
+            std::time::Duration::from_secs(300),
+        )
+        .await;
+
+        assert_eq!(
+            *coordinator.period.lock().unwrap(),
+            Some(std::time::Duration::from_secs(3_600))
+        );
+    }
+
+    fn fleet_task_info(coordination: crate::task::TaskCoordination) -> crate::task::TaskInfo {
+        crate::task::TaskInfo {
+            name: "nightly".to_owned(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination,
+            handler: |_| Box::pin(async { Ok(()) }),
+        }
+    }
+
+    // Issue #3052: the boot warning reads its hints through the env seam.
+    #[test]
+    fn in_process_fleet_warning_names_the_hint_and_the_fix() {
+        let config = AutumnConfig::default();
+        let tasks = [fleet_task_info(crate::task::TaskCoordination::Fleet)];
+        let env = crate::config::MockEnv::new().with("AUTUMN_REPLICAS", "3");
+
+        let warning = super::in_process_fleet_warning(&config, &tasks, &env)
+            .expect("three replicas on in_process must warn");
+        assert!(
+            warning.contains("AUTUMN_REPLICAS is more than 1"),
+            "{warning}"
+        );
+        assert!(warning.contains("scheduler.backend = \""), "{warning}");
+
+        let k8s = crate::config::MockEnv::new().with("KUBERNETES_SERVICE_HOST", "10.0.0.1");
+        assert!(super::in_process_fleet_warning(&config, &tasks, &k8s).is_some());
+    }
+
+    #[test]
+    fn in_process_fleet_warning_is_silent_without_a_hint_or_a_fleet_task() {
+        let config = AutumnConfig::default();
+        let fleet = [fleet_task_info(crate::task::TaskCoordination::Fleet)];
+        let local = [fleet_task_info(crate::task::TaskCoordination::PerReplica)];
+        let crowd = crate::config::MockEnv::new().with("AUTUMN_REPLICAS", "5");
+
+        assert!(
+            super::in_process_fleet_warning(&config, &fleet, &crate::config::MockEnv::new())
+                .is_none(),
+            "no hint"
+        );
+        assert!(
+            super::in_process_fleet_warning(&config, &local, &crowd).is_none(),
+            "per-replica tasks run on every replica by design"
+        );
+
+        let mut coordinated = AutumnConfig::default();
+        coordinated.scheduler.backend = crate::config::SchedulerBackend::Postgres;
+        assert!(super::in_process_fleet_warning(&coordinated, &fleet, &crowd).is_none());
+    }
+
+    // Issue #3052: the handler reads its tick and fencing token.
+    #[tokio::test]
+    async fn scheduled_handler_sees_its_tick_and_fencing_token() {
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "cron_fence_task",
+            "cron 0 * * * * *",
+            crate::task::TaskCoordination::Fleet,
+            "postgres",
+            "replica-a",
+        );
+        let handler: crate::task::TaskHandler = |_| {
+            Box::pin(async {
+                *SEEN_TICK.lock().unwrap() = crate::scheduler::current_tick();
+                Ok(())
+            })
+        };
+
+        super::execute_cron_task(
+            "cron_fence_task".to_owned(),
+            state,
+            handler,
+            crate::task::TaskCoordination::Fleet,
+            std::sync::Arc::new(FencingSchedulerCoordinator),
+            std::time::Duration::from_secs(5),
+            super::CronTick {
+                unix_secs: 1_700_000_000,
+                window: std::time::Duration::from_secs(60),
+            },
+        )
+        .await;
+
+        let seen = SEEN_TICK
+            .lock()
+            .unwrap()
+            .take()
+            .expect("handler saw a tick");
+        assert_eq!(seen.tick_key(), "cron_fence_task:1700000000");
+        assert_eq!(seen.fencing_token(), Some(99));
+    }
+
     #[tokio::test]
     async fn execute_cron_task_uses_scheduled_occurrence_for_tick_key() {
         let state = AppState::for_test();
@@ -19606,7 +19869,10 @@ mod tests {
             crate::task::TaskCoordination::Fleet,
             coordinator,
             std::time::Duration::from_secs(30),
-            scheduled_unix_secs,
+            super::CronTick {
+                unix_secs: scheduled_unix_secs,
+                window: std::time::Duration::from_secs(10),
+            },
         )
         .await;
 
@@ -19687,6 +19953,57 @@ mod tests {
             chrono_tz::UTC
                 .with_ymd_and_hms(2026, 5, 5, 12, 31, 0)
                 .unwrap()
+        );
+    }
+
+    // Issue #3052: a late cron occurrence still runs until the next one, so
+    // the claim must hold for that whole window.
+    #[test]
+    fn cron_occurrence_window_spans_to_the_next_occurrence() {
+        use chrono::TimeZone as _;
+
+        let daily = "0 0 3 * * *".parse::<croner::Cron>().expect("parse");
+        let at = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 3, 0, 0)
+            .unwrap();
+        assert_eq!(
+            super::cron_occurrence_window(&daily, &at),
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+        let every_ten = "*/10 * * * * *".parse::<croner::Cron>().expect("parse");
+        let at = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 3, 0, 10)
+            .unwrap();
+        assert_eq!(
+            super::cron_occurrence_window(&every_ten, &at),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_task_claims_its_tick_for_the_occurrence_window() {
+        let coordinator = std::sync::Arc::new(PeriodRecordingCoordinator {
+            period: std::sync::Mutex::new(None),
+        });
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+
+        super::execute_cron_task(
+            "daily_task".to_owned(),
+            AppState::for_test(),
+            handler,
+            crate::task::TaskCoordination::Fleet,
+            std::sync::Arc::clone(&coordinator) as _,
+            std::time::Duration::from_secs(300),
+            super::CronTick {
+                unix_secs: 1_700_000_000,
+                window: std::time::Duration::from_secs(86_400),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *coordinator.period.lock().unwrap(),
+            Some(std::time::Duration::from_secs(86_400))
         );
     }
 
