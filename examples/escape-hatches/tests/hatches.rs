@@ -14,15 +14,18 @@
 
 mod support;
 
+use std::path::Path;
 use std::sync::Arc;
 
+use autumn_web::RuntimeConnection;
 use autumn_web::config::{AutumnConfig, MockEnv};
+use autumn_web::db::Pool;
 use autumn_web::error_pages::{ErrorContext, ErrorPageRenderer};
 use autumn_web::middleware::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
 use autumn_web::plugin::Plugin;
 use autumn_web::plugin_conformance::{ConformanceConfig, run_conformance};
 use autumn_web::prelude::*;
-use autumn_web::test::{TestApp, TestClient};
+use autumn_web::test::{TestApp, TestClient, TestDb};
 use escape_hatches::hatches::error_pages::StockroomErrorPages;
 use escape_hatches::hatches::exports;
 use escape_hatches::hatches::password_file::PasswordFilePool;
@@ -38,14 +41,7 @@ use support::{SCANNER_TOKEN, fresh_db, product, seed, stock_of};
 
 /// The app as `TestApp` can build it. `app()` wires the same pieces; the
 /// `boot` test proves the parts that `TestApp` cannot reach.
-fn client(
-    pool: Option<
-        autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-            autumn_web::RuntimeConnection,
-        >,
-    >,
-    exports_dir: &std::path::Path,
-) -> TestClient {
+fn client(pool: Option<Pool<RuntimeConnection>>, exports_dir: &Path) -> TestClient {
     let app = TestApp::new()
         .routes(escape_hatches::routes())
         .scoped(
@@ -65,6 +61,24 @@ fn client(
 fn no_db_client() -> TestClient {
     let dir = tempfile::tempdir().expect("tempdir");
     client(None, dir.path())
+}
+
+/// A client on the test database. These tests do not read exports.
+fn db_client(db: &TestDb) -> TestClient {
+    let dir = tempfile::tempdir().expect("tempdir");
+    client(Some(db.pool()), dir.path())
+}
+
+/// The context that the framework gives an error page for a 404 at `path`.
+fn not_found_at(path: &str) -> ErrorContext {
+    ErrorContext {
+        status: StatusCode::NOT_FOUND,
+        message: "not found".to_owned(),
+        path: path.to_owned(),
+        request_id: None,
+        details: None,
+        is_dev: false,
+    }
 }
 
 fn cart(order_ref: &str, lines: &[(&str, i32)]) -> Value {
@@ -269,14 +283,7 @@ async fn merged_raw_router_gets_app_middleware() {
 /// H10: a 404 for an unknown SKU links to the supplier catalog.
 #[test]
 fn not_found_page_links_to_the_supplier_catalog() {
-    let ctx = ErrorContext {
-        status: StatusCode::NOT_FOUND,
-        message: "not found".to_owned(),
-        path: "/products/ZZ-9".to_owned(),
-        request_id: None,
-        details: None,
-        is_dev: false,
-    };
+    let ctx = not_found_at("/products/ZZ-9");
     let page = StockroomErrorPages.render_404(&ctx).into_string();
     assert!(page.contains("ZZ-9"), "{page}");
     assert!(page.contains(r#"href="/supplier/items/ZZ-9""#), "{page}");
@@ -286,14 +293,7 @@ fn not_found_page_links_to_the_supplier_catalog() {
 /// H10: a 404 for another path has no supplier link.
 #[test]
 fn not_found_page_for_other_paths_has_no_supplier_link() {
-    let ctx = ErrorContext {
-        status: StatusCode::NOT_FOUND,
-        message: "not found".to_owned(),
-        path: "/nowhere".to_owned(),
-        request_id: None,
-        details: None,
-        is_dev: false,
-    };
+    let ctx = not_found_at("/nowhere");
     let page = StockroomErrorPages.render_404(&ctx).into_string();
     assert!(!page.contains("/supplier/items/"), "{page}");
 }
@@ -301,14 +301,7 @@ fn not_found_page_for_other_paths_has_no_supplier_link() {
 /// H10: a SKU in the path is escaped in the page.
 #[test]
 fn not_found_page_escapes_the_sku() {
-    let ctx = ErrorContext {
-        status: StatusCode::NOT_FOUND,
-        message: "not found".to_owned(),
-        path: "/products/<script>".to_owned(),
-        request_id: None,
-        details: None,
-        is_dev: false,
-    };
+    let ctx = not_found_at("/products/<script>");
     let page = StockroomErrorPages.render_404(&ctx).into_string();
     assert!(!page.contains("<script>"), "{page}");
 }
@@ -471,10 +464,7 @@ async fn hazard_repository_read_modify_write_loses_an_update() {
 async fn convention_reserve_with_lock_never_oversells() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 3, 100)]).await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     let body = json!({ "quantity": 1 });
     let calls = (0..10)
@@ -519,10 +509,7 @@ async fn checkout_reserves_every_line_or_none() {
         ],
     )
     .await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     let response = post_api(
         &client,
@@ -551,10 +538,7 @@ async fn checkout_reserves_every_line_or_none() {
 async fn checkout_returns_201_with_location() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     let response = post_api(&client, "/api/checkout", &cart("o-7", &[("A-1", 2)])).await;
     response
@@ -585,10 +569,7 @@ async fn checkout_returns_201_with_location() {
 async fn checkout_with_a_used_order_ref_changes_nothing() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)]))
         .await
@@ -606,10 +587,7 @@ async fn checkout_with_a_used_order_ref_changes_nothing() {
 async fn checkout_refuses_bad_carts() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     post_api(&client, "/api/checkout", &cart("o-1", &[]))
         .await
@@ -633,10 +611,7 @@ async fn checkout_refuses_bad_carts() {
 async fn checkout_merges_lines_for_the_same_sku() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 3, 100)]).await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     post_api(
         &client,
@@ -662,10 +637,7 @@ async fn checkout_concurrent_carts_never_oversell_or_deadlock() {
         ],
     )
     .await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     let bodies: Vec<Value> = (0..10)
         .map(|n| {
@@ -709,10 +681,7 @@ async fn restock_adds_to_a_whole_category() {
         ],
     )
     .await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     let body: Value = post_api(
         &client,
@@ -747,10 +716,7 @@ async fn restock_adds_to_a_whole_category() {
 async fn restock_and_checkout_together_lose_nothing() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 50, 100)]).await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     let restock = json!({ "category": "tools", "add": 1 });
     let mut bodies = Vec::new();
@@ -787,10 +753,7 @@ async fn report_ranks_top_three_per_category() {
         ],
     )
     .await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     let rows: Value = client
         .get("/reports/stock-value")
@@ -829,10 +792,7 @@ async fn report_ranks_top_three_per_category() {
 async fn pages_list_and_show_products() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 4, 250)]).await;
-    let client = client(
-        Some(db.pool()),
-        tempfile::tempdir().expect("tempdir").path(),
-    );
+    let client = db_client(db);
 
     client
         .get("/")

@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::models::{Cart, CartLine, Receipt};
 use crate::repositories::{
     OrderLineRepository, OrderRepository, PgOrderLineRepository, PgOrderRepository,
-    PgProductRepository, ProductRepository,
+    PgProductRepository, product_by_sku,
 };
 use crate::schema::{order_lines, orders, products};
 
@@ -50,12 +50,7 @@ pub async fn reserve(
     Json(body): Json<Reserve>,
 ) -> AutumnResult<Json<serde_json::Value>> {
     let quantity = check_quantity(body.quantity)?;
-    let product = repo
-        .find_by_sku(sku.clone())
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AutumnError::not_found_msg(format!("no product with SKU {sku}")))?;
+    let product = product_by_sku(&repo, &sku).await?;
 
     let stock = repo
         .with_lock(product.id, move |row, conn| {

@@ -2,8 +2,7 @@
 
 use autumn_web::prelude::*;
 
-use crate::models::Product;
-use crate::repositories::{PgProductRepository, ProductRepository};
+use crate::repositories::{PgProductRepository, ProductRepository, product_by_sku};
 
 /// The page frame. The error pages (H10) use it too.
 #[must_use]
@@ -54,12 +53,7 @@ pub async fn index(repo: PgProductRepository) -> AutumnResult<Markup> {
 #[get("/products/{sku}")]
 #[public]
 pub async fn product(Path(sku): Path<String>, repo: PgProductRepository) -> AutumnResult<Markup> {
-    let product: Product = repo
-        .find_by_sku(sku.clone())
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| AutumnError::not_found_msg(format!("no product with SKU {sku}")))?;
+    let product = product_by_sku(&repo, &sku).await?;
     Ok(layout(
         &product.name,
         &html! {

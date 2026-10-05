@@ -1,4 +1,5 @@
 //! H3: a report that the repository and Diesel's DSL cannot express.
+//! H4: the report route carries `#[intercept(ReportGate)]`.
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::diesel;
@@ -23,15 +24,7 @@ pub struct StockValueRow {
     pub rank: i64,
 }
 
-/// The three most valuable products in each category.
-///
-/// "Top N per group" needs a window function (`ROW_NUMBER() OVER
-/// (PARTITION BY …)`). Repository finders and aggregates do not have one,
-/// and Diesel's query DSL does not either. So this is plain SQL through
-/// `diesel::sql_query`, with typed rows from `QueryableByName`. The SQL has
-/// no input, so it binds nothing.
-///
-/// The query reads every product. H4 (`ReportGate`) lets one run at a time.
+/// Rank products by stock value in each category, and keep the top three.
 const STOCK_VALUE_SQL: &str = "
     SELECT category, sku, name, value_cents, rank
     FROM (
@@ -46,7 +39,15 @@ const STOCK_VALUE_SQL: &str = "
     WHERE rank <= 3
     ORDER BY category, rank";
 
-/// The stock-value report as JSON.
+/// The three most valuable products in each category, as JSON.
+///
+/// "Top N per group" needs a window function (`ROW_NUMBER() OVER
+/// (PARTITION BY …)`). Repository finders and aggregates have none, and
+/// Diesel's query DSL has none. So this is plain SQL through
+/// `diesel::sql_query`, with typed rows from `QueryableByName`. The SQL has
+/// no input, so it binds nothing.
+///
+/// The query reads every product. H4 (`ReportGate`) lets one run at a time.
 #[get("/reports/stock-value")]
 #[public]
 #[intercept(ReportGate)]
