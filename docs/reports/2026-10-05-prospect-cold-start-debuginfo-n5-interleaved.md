@@ -60,7 +60,7 @@ Registered set: baseline = samples 2–6, debug=1 = samples 1–5.
   is larger than the 4% of samples 2–5 alone suggested.
 - Gate budget (p95 130000ms): baseline 1/5 registered samples exceeded it (sample 6, 155322ms,
   warm cache); debug=1 0/5, max 77.9% of budget. Secondary, not verdict-bearing. Two of the
-  seven baseline runs overall (1 and 6) exceeded the budget on this box.
+  six baseline runs overall (samples 1–6) (1 and 6) exceeded the budget on this box.
 - Worst case: each sample is already a from-scratch build.
 
 ## 🏁 Verdict
@@ -73,8 +73,10 @@ Registered set: baseline = samples 2–6, debug=1 = samples 1–5.
 2. **Lines:** the 12.75% median misses the 20% pursue line and clears the 10% kill line, so
    it is neither pursue nor kill. The line is not moved.
 
-What the data supports, with that qualification: in all 5 paired runs `debug = 1` finished
-faster than every baseline sample and its own spread was ~2%, in the same direction as the
+What the data supports, with that qualification: every `debug = 1` sample finished
+faster than every registered baseline sample (an all-to-all range separation, not a paired
+comparison: only samples 2–5 keep their original interleaved partner, D1 lost its baseline
+and B6 has no `debug = 1` partner) and its own spread was ~2%, in the same direction as the
 09-28 assay. That is consistent with a real ~12% effect, but at n=5 with a noisy baseline it is
 not a settled number, and the 12.75% median should be quoted only alongside the noise
 verdict. Whether ~14 s on a ~115 s cold start justifies a template default (and its effect on
