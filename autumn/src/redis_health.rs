@@ -3,9 +3,10 @@
 //! The framework registers one indicator for each subsystem that runs on
 //! Redis, named `redis:<subsystem>`. `RedisCachePlugin` registers
 //! `redis:cache` itself. By default they are
-//! [`IndicatorGroup::HealthOnly`]: Redis is shared by all replicas, so a
-//! Redis failure must not take every replica out of rotation at the same
-//! time. Set `health.redis_readiness = true` to make them gate `/ready`.
+//! [`IndicatorGroup::HealthOnly`](crate::actuator::IndicatorGroup::HealthOnly):
+//! Redis is shared by all replicas, so a Redis failure must not take every
+//! replica out of rotation at the same time. Set
+//! `health.redis_readiness = true` to make them gate `/ready`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
