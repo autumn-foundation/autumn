@@ -1702,6 +1702,10 @@ mod sqlite {
         /// The indexed column name, or `NULL` for an expression key.
         #[diesel(sql_type = Nullable<Text>)]
         column_name: Option<String>,
+        /// `1` when the key has a modifier the IR column list cannot hold: a
+        /// non-`BINARY` collation or `DESC` (`pragma_index_xinfo`).
+        #[diesel(sql_type = Integer)]
+        modified: i32,
     }
 
     #[derive(QueryableByName)]
@@ -1871,17 +1875,20 @@ mod sqlite {
         Ok(group_by(rows, |r| r.table_name.clone()))
     }
 
-    /// Fetch the columns of every index in one batched `pragma_index_info` join,
-    /// grouped by `(table, index)` in key order.
+    /// Fetch the key columns of every index in one batched `pragma_index_xinfo`
+    /// join, grouped by `(table, index)` in key order. `xinfo` (not `info`) also
+    /// gives each key's collation and sort order, so a key with a modifier the IR
+    /// cannot hold is flagged.
     fn fetch_index_columns(
         conn: &mut SqliteConnection,
     ) -> Result<BTreeMap<IndexKey, Vec<IndexColumnRow>>, IntrospectError> {
         let mut rows: Vec<IndexColumnRow> = sql_query(
             "SELECT m.name AS table_name, il.name AS index_name, ii.seqno AS seqno, \
-             ii.name AS column_name \
+             ii.name AS column_name, \
+             ((ii.coll IS NOT NULL AND ii.coll <> 'BINARY') OR ii.\"desc\" <> 0) AS modified \
              FROM sqlite_master m JOIN pragma_index_list(m.name) il \
-             JOIN pragma_index_info(il.name) ii \
-             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             JOIN pragma_index_xinfo(il.name) ii \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND ii.key = 1 \
              ORDER BY m.name, il.name, ii.seqno",
         )
         .load(conn)
@@ -2252,17 +2259,20 @@ mod sqlite {
                 .get(&(table_name.to_owned(), row.index_name.clone()))
                 .map_or(&[][..], Vec::as_slice);
             let has_expression = cols.iter().any(|c| c.column_name.is_none());
+            // A collated or `DESC` key cannot be rebuilt from the column list.
+            let has_modifier = cols.iter().any(|c| c.modified != 0);
             let key_columns: Vec<String> =
                 cols.iter().filter_map(|c| c.column_name.clone()).collect();
             let is_unique = row.is_unique != 0;
             let is_partial = row.partial != 0;
 
-            let simple = !is_partial && !has_expression;
+            let simple = !is_partial && !has_expression && !has_modifier;
             if simple && is_unique && key_columns.len() == 1 {
                 unique_columns.insert(key_columns[0].clone());
             }
-            // A partial or expression index is retained verbatim via its CREATE INDEX
-            // SQL (when present); a plain index is representable by its columns.
+            // A partial, expression or collated/`DESC` index is retained verbatim via
+            // its CREATE INDEX SQL (when present); a plain index is representable by
+            // its columns.
             let definition = if simple { None } else { row.index_sql.clone() };
             indexes.push(Index {
                 name: row.index_name.clone(),
@@ -2629,6 +2639,7 @@ mod sqlite {
                     index_name: "idx_authors_email_unique".to_owned(),
                     seqno: 0,
                     column_name: Some("email".to_owned()),
+                    modified: 0,
                 }],
             );
             let (indexes, unique_cols) = collapse_indexes("authors", &rows, &index_columns);
@@ -2640,6 +2651,54 @@ mod sqlite {
                 "a simple index carries no definition"
             );
             assert!(unique_cols.contains("email"));
+        }
+
+        #[test]
+        fn collapse_indexes_collated_or_desc_index_keeps_its_sql() {
+            let sql = "CREATE UNIQUE INDEX idx_users_email_unique ON users (email COLLATE NOCASE)";
+            let rows = vec![IndexRow {
+                table_name: "users".to_owned(),
+                index_name: "idx_users_email_unique".to_owned(),
+                is_unique: 1,
+                origin: "c".to_owned(),
+                partial: 0,
+                index_sql: Some(sql.to_owned()),
+            }];
+            let mut index_columns = BTreeMap::new();
+            index_columns.insert(
+                ("users".to_owned(), "idx_users_email_unique".to_owned()),
+                vec![IndexColumnRow {
+                    table_name: "users".to_owned(),
+                    index_name: "idx_users_email_unique".to_owned(),
+                    seqno: 0,
+                    column_name: Some("email".to_owned()),
+                    modified: 1,
+                }],
+            );
+            let (indexes, unique_cols) = collapse_indexes("users", &rows, &index_columns);
+            assert_eq!(indexes[0].definition.as_deref(), Some(sql));
+            assert!(!unique_cols.contains("email"), "not a plain unique column");
+        }
+
+        #[test]
+        fn introspection_keeps_a_collated_index_verbatim() {
+            use diesel::{Connection as _, RunQueryDsl as _};
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("pull.db");
+            let mut conn = SqliteConnection::establish(&db.display().to_string()).expect("open");
+            for sql in [
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL, name TEXT)",
+                "CREATE UNIQUE INDEX idx_users_email_unique ON users (email COLLATE NOCASE)",
+                "CREATE INDEX idx_users_name ON users (name DESC)",
+            ] {
+                diesel::sql_query(sql).execute(&mut conn).expect("ddl");
+            }
+            let tables = introspect(&mut conn).expect("introspect");
+            let users = tables.iter().find(|t| t.name == "users").expect("users");
+            for name in ["idx_users_email_unique", "idx_users_name"] {
+                let idx = users.indexes.iter().find(|i| i.name == name).expect(name);
+                assert!(idx.definition.is_some(), "{name} keeps its SQL: {idx:?}");
+            }
         }
 
         #[test]
@@ -2673,6 +2732,7 @@ mod sqlite {
                     index_name: "t_active_idx".to_owned(),
                     seqno: 0,
                     column_name: Some("email".to_owned()),
+                    modified: 0,
                 }],
             );
             let (indexes, _unique) = collapse_indexes("t", &rows, &index_columns);
@@ -2709,6 +2769,7 @@ mod sqlite {
                             index_name: "sqlite_autoindex_t_1".to_owned(),
                             seqno: i32::try_from(i).unwrap(),
                             column_name: Some((*c).to_owned()),
+                            modified: 0,
                         })
                         .collect(),
                 );

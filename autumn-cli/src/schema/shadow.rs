@@ -255,7 +255,7 @@ fn replay_postgres(url: &str, migrations_dir: &Path) -> Result<Replay, String> {
                     conn,
                     "SELECT c.relname AS name FROM pg_class c \
                      JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm', 'S', 'f')",
+                     WHERE n.nspname = 'public' AND c.relkind IN ('v', 'm', 'S', 'f', 'c')",
                 )?,
             })
         },

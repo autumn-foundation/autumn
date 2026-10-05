@@ -295,4 +295,21 @@ async fn schema_dev_url_refuses_a_new_table_named_like_a_replayed_view() {
     );
     assert_ne!(code, Some(0), "{err}");
     assert!(err.contains("`reports` is already a view"), "{err}");
+
+    // A standalone composite type shares the namespace too.
+    std::fs::write(
+        raw.join("up.sql"),
+        "CREATE VIEW reports AS SELECT id FROM posts;\nCREATE TYPE report_rows AS (id bigint);\n",
+    )
+    .expect("up.sql");
+    let models = format!(
+        "{MODELS_V1}\n#[autumn_web::model(managed)]\npub struct ReportRow {{\n    #[id]\n    pub id: i64,\n}}\n"
+    );
+    std::fs::write(dir.join("src/models.rs"), models).expect("models");
+    let (_, err, code) = run_autumn(
+        dir,
+        &["schema", "diff", "--backend", "pg", "--dev-url", &url],
+    );
+    assert_ne!(code, Some(0), "{err}");
+    assert!(err.contains("`report_rows` is already a view"), "{err}");
 }
