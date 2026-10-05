@@ -6,6 +6,7 @@
   timeout. If a renewal finds the claim gone, or no renewal succeeds for two
   thirds of the timeout, the worker stops the handler. It does not settle the
   job. Crash recovery does not change: the heartbeat stops with the process.
+  A visibility timeout shorter than 30ms is raised to 30ms, with a warning.
 - **jobs:** Redis claim deadlines and the stale-claim check use the Redis
   server clock (`TIME`), not the worker clock. A worker with a skewed clock
   does not see a live claim as expired.

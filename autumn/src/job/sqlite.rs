@@ -55,7 +55,7 @@ use serde_json::Value;
 
 use super::{
     DEFAULT_JOB_ADMIN_HISTORY_LIMIT, ExecutionBounds, JobExecutionOutcome, LeaseHeartbeat,
-    LeaseRenewal, QueueLimits, record_lease_lost,
+    LeaseRenewal, QueueLimits, record_lease_lost, runtime_visibility_timeout_ms,
 };
 use super::{
     EnqueueOutcome, JobAdminBackend, JobAdminBackendEntry, JobAdminFuture, JobAdminMemoryBackend,
@@ -1627,7 +1627,8 @@ pub(super) fn start_runtime(
         return Ok(());
     }
 
-    let visibility_timeout_ms = config.sqlite.visibility_timeout_ms;
+    let visibility_timeout_ms =
+        runtime_visibility_timeout_ms("sqlite", config.sqlite.visibility_timeout_ms);
     let survey_blocked = jobs_by_name
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

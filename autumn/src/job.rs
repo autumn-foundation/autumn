@@ -864,19 +864,48 @@ fn job_timeout_message(limit: std::time::Duration) -> String {
     format!("job timed out after {}ms", limit.as_millis())
 }
 
-/// Shortest gap between claim renewals, so a tiny visibility timeout does not
-/// make the heartbeat a hot loop.
+/// Shortest visibility timeout a durable backend uses. The heartbeat renews
+/// every third of it, so this keeps renewals at least 10ms apart. A shorter
+/// configured value is raised to this one.
 #[cfg(any(feature = "db", feature = "redis"))]
-const MIN_LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const MIN_VISIBILITY_TIMEOUT_MS: u64 = 30;
+
+/// The visibility timeout a durable backend uses for both stale recovery and
+/// the heartbeat: the configured value, but not less than
+/// [`MIN_VISIBILITY_TIMEOUT_MS`]. Both use the same value, so the first renewal
+/// always comes inside the lease.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn effective_visibility_timeout_ms(configured: u64) -> u64 {
+    configured.max(MIN_VISIBILITY_TIMEOUT_MS)
+}
+
+/// [`effective_visibility_timeout_ms`] for a runtime start, with a warning
+/// when the configured value was too short.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn runtime_visibility_timeout_ms(backend: &str, configured: u64) -> u64 {
+    let effective = effective_visibility_timeout_ms(configured);
+    if effective != configured {
+        tracing::warn!(
+            backend,
+            configured_ms = configured,
+            effective_ms = effective,
+            "job visibility timeout is too short; using the minimum"
+        );
+    }
+    effective
+}
 
 /// Error recorded when a worker loses its claim on a running job.
 #[cfg(any(feature = "db", feature = "redis"))]
 const LEASE_LOST_ERROR: &str = "job lease lost; another worker owns the job";
 
 /// How often a worker renews its claim: a third of the visibility timeout.
+/// Runtimes pass [`effective_visibility_timeout_ms`], so this is at least 10ms.
+/// The 1ms floor only keeps `tokio::time::interval` from panicking on zero.
 #[cfg(any(feature = "db", feature = "redis"))]
 fn lease_heartbeat_interval(visibility_timeout_ms: u64) -> std::time::Duration {
-    std::time::Duration::from_millis(visibility_timeout_ms / 3).max(MIN_LEASE_HEARTBEAT_INTERVAL)
+    std::time::Duration::from_millis(visibility_timeout_ms / 3)
+        .max(std::time::Duration::from_millis(1))
 }
 
 /// Result of one claim renewal.
@@ -9073,7 +9102,10 @@ fn start_redis_runtime(
                 unique_prefix: unique_prefix.clone(),
                 concurrency_prefix: concurrency_prefix.clone(),
                 worker_id: format!("{}:{}", std::process::id(), state.entropy().uuid_v4()),
-                visibility_timeout_ms: config.redis.visibility_timeout_ms,
+                visibility_timeout_ms: runtime_visibility_timeout_ms(
+                    "redis",
+                    config.redis.visibility_timeout_ms,
+                ),
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
                 retry_promotion_interval,
@@ -11618,7 +11650,8 @@ fn start_postgres_runtime(
         return Ok(());
     }
 
-    let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
+    let visibility_timeout_ms =
+        runtime_visibility_timeout_ms("postgres", config.postgres.visibility_timeout_ms);
     let worker_count = config.workers.max(1);
 
     // Single maintenance task shared across all workers.
@@ -23288,10 +23321,37 @@ mod lease_tests {
 
     #[cfg(any(feature = "db", feature = "redis"))]
     #[test]
-    fn heartbeat_interval_is_a_third_of_the_visibility_timeout_with_a_floor() {
+    fn heartbeat_interval_is_a_third_of_the_visibility_timeout() {
         assert_eq!(lease_heartbeat_interval(30_000), Duration::from_secs(10));
         assert_eq!(lease_heartbeat_interval(300), Duration::from_millis(100));
-        assert_eq!(lease_heartbeat_interval(0), MIN_LEASE_HEARTBEAT_INTERVAL);
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn effective_visibility_timeout_keeps_three_renewals_inside_the_lease() {
+        assert_eq!(effective_visibility_timeout_ms(30_000), 30_000);
+        assert_eq!(
+            effective_visibility_timeout_ms(MIN_VISIBILITY_TIMEOUT_MS),
+            30
+        );
+        for configured in [0, 1, 5, 29] {
+            assert_eq!(
+                effective_visibility_timeout_ms(configured),
+                MIN_VISIBILITY_TIMEOUT_MS
+            );
+        }
+        for configured in [0, 1, 5, 29, 30, 31, 100, 30_000] {
+            let lease = effective_visibility_timeout_ms(configured);
+            let interval = lease_heartbeat_interval(lease);
+            assert!(
+                interval >= Duration::from_millis(10),
+                "no hot loop at {configured}"
+            );
+            assert!(
+                interval * 3 <= Duration::from_millis(lease),
+                "first renewal inside the lease at {configured}"
+            );
+        }
     }
 
     /// A heartbeat whose renewals return `results` in order, then `Renewed`.

@@ -373,7 +373,9 @@ as every other durable backend.
 
 A durable worker (`postgres`, `redis`, `sqlite`) holds a lease on each job it
 runs. A heartbeat renews the lease every third of the visibility timeout. Thus,
-while renewals succeed, a long job does not run again on a second worker.
+while renewals succeed, a long job does not run again on a second worker. The
+minimum visibility timeout is 30ms. A worker uses 30ms if the configured value
+is shorter, and logs a warning.
 
 - **Crash.** The heartbeat stops with the process. After the visibility
   timeout, another worker recovers the job and runs it again.
