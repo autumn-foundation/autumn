@@ -160,7 +160,9 @@ REMOVED='
     and all(.properties.configuration.secrets // [] | .[];
             .name | IN("database-url", "signing-secret", "redis-url") | not)'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
-INGRESS_SET='.properties.provisioningState == "Succeeded" and .properties.configuration.ingress != null'
+INGRESS_OPEN='.properties.provisioningState == "Succeeded" and .properties.configuration.ingress.external == true'
+# shellcheck disable=SC2016 # a jq program, not a shell expression
+INGRESS_CLOSED='.properties.provisioningState == "Succeeded" and .properties.configuration.ingress.external == false'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
 REDIS_GONE='
   .properties.provisioningState == "Succeeded"
@@ -196,9 +198,11 @@ set_ingress() {
     {location: $app.location, properties: {configuration: {ingress:
       (($saved // {targetPort: 3000, transport: "http"}) | .external = $external)}}}')
   patch_app "$body" || return 1
+  local check="$INGRESS_CLOSED"
+  [ "$1" = true ] && check="$INGRESS_OPEN"
   for _ in $(seq 1 30); do
     sleep 10
-    app_shows "$INGRESS_SET" && return 0
+    app_shows "$check" && return 0
   done
   return 1
 }
@@ -409,6 +413,14 @@ fail() {
 }
 
 if [ -z "$RELEASED" ]; then
+    # Without ingress, only a scale rule that is not HTTP can start the
+    # placeholder again. Then zero replicas is no proof, so the script stops
+    # before any write.
+    if jq -e '[.properties.template.scale.rules // [] | .[] | select(.http == null)] | length > 0' \
+      <<< "$APP" > /dev/null; then
+      echo "::error::the placeholder has a scale rule that is not HTTP. It can start the placeholder after the script disables ingress. Remove the rule until the first cutover is done." >&2
+      exit 1
+    fi
     # The first cutover. Disable ingress, so no request (internal or
     # external) can start the placeholder. Then wait until no placeholder
     # replica runs. The HTTP scaler stops a replica after a 300-second cool
