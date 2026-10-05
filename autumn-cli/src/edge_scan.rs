@@ -227,6 +227,7 @@ const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("Sla", "app state"),
     ("WebPush", "app state"),
     ("Client", "app state"),
+    ("ShutdownToken", "app state"),
     ("Impersonation", "a session"),
     ("AuthorizedComment", "auth state"),
     ("SubmitToken", "a session"),
