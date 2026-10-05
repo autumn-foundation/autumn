@@ -78,6 +78,41 @@ full commit-level picture.
 
 ## Breaking changes
 
+### Commentable: the runtime helpers take `soft_delete: Option<bool>`
+
+**Why:** a model can have a `soft_delete` repository and a plain one. The
+helpers could not tell which one called them, so they returned `404` for a
+soft-deleted parent through both (#2284). The caller now tells them.
+
+This affects only direct calls to the `autumn_web::commentable` functions. The
+generated `{Model}Comments` methods (`repo.add_comment(...)` and so on) do not
+change. The generic router does not change.
+
+**Before (`0.8`):**
+
+```rust
+use autumn_web::commentable::comment_thread;
+
+let thread = comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None).await?;
+```
+
+**After (next release):**
+
+```rust
+use autumn_web::commentable::comment_thread;
+
+// `None`: the old behavior. Hide the parent if any repository soft-deletes.
+// `Some(true)` / `Some(false)`: your repository's own `soft_delete` setting.
+let thread =
+    comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None, None).await?;
+```
+
+Do the same for `add_comment`, `delete_comment` and
+`recompute_comment_count`: add `None` as the last argument.
+
+**Automation:** `manual` — it adds an argument whose value depends on the
+calling repository, which a codemod cannot see.
+
 Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
 care about.

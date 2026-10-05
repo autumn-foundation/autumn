@@ -314,6 +314,36 @@ pub struct CmtAuditSoft {
 pub trait CmtAuditSoftRepository {}
 
 diesel::table! {
+    cmt_duals (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// #2284: one model, two repositories. Only the first soft-deletes. Each
+/// repository's helpers apply that repository's own rule. The router has no
+/// repository in hand, so it keeps the conservative rule: filter if any
+/// repository soft-deletes.
+#[autumn_web::model(table = "cmt_duals")]
+#[commentable(by = CmtUser, table = cmt_comments)]
+pub struct CmtDual {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(CmtDual, table = "cmt_duals", soft_delete)]
+pub trait CmtDualRepository {}
+
+#[autumn_web::repository(CmtDual, table = "cmt_duals")]
+pub trait CmtDualAdminRepository {}
+
+diesel::table! {
     cmt_hards (id) {
         id -> Int8,
         title -> Text,
@@ -386,6 +416,9 @@ const DDL: &[&str] = &[
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0)",
     "CREATE TABLE cmt_audit_softs \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
+    "CREATE TABLE cmt_duals \
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
     "CREATE TABLE cmt_hards \
@@ -1326,6 +1359,71 @@ async fn a_soft_deleted_parent_refuses_comments_and_reports_no_thread() {
     assert_eq!(counter(&mut conn, "cmt_softs", target).await, 1);
 }
 
+/// #2284: each repository's helpers apply that repository's own soft-delete
+/// rule. Before, any `soft_delete` repository made every helper filter
+/// `deleted_at`, so the plain repository got `404` for rows its own finders
+/// return.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn each_repository_applies_its_own_soft_delete_rule() {
+    let (pool, _container) = setup_pool().await;
+    let soft = PgCmtDualRepository::with_pool_untracked(pool.clone());
+    let plain = PgCmtDualAdminRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_duals", "title", "t").await;
+    diesel::sql_query("UPDATE cmt_duals SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+
+    // The plain repository sees the row, so its helpers do too.
+    let comment = plain
+        .add_comment(target, author, "still here", None)
+        .await
+        .expect("the plain repository comments on its own row");
+    let thread = plain
+        .comment_thread(target)
+        .await
+        .expect("the plain repository reads the thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(
+        plain
+            .recompute_comment_count(target)
+            .await
+            .expect("recompute"),
+        1
+    );
+
+    // The soft-deleting repository does not see the row: every helper is 404.
+    let hidden = "the soft-deleting repository does not see the row";
+    let errors = [
+        soft.add_comment(target, author, "x", None)
+            .await
+            .expect_err(hidden),
+        soft.comment_thread(target).await.expect_err(hidden),
+        soft.delete_comment(target, comment.id)
+            .await
+            .expect_err(hidden),
+        soft.recompute_comment_count(target)
+            .await
+            .expect_err(hidden),
+    ];
+    for err in errors {
+        assert_eq!(err.status().as_u16(), 404, "{err}");
+    }
+
+    assert_eq!(
+        plain
+            .delete_comment(target, comment.id)
+            .await
+            .expect("the plain repository deletes"),
+        1
+    );
+    assert_eq!(counter(&mut conn, "cmt_duals", target).await, 0);
+}
+
 /// Issue #2263: `cmt_audit_softs.deleted_at` is audit history, not a
 /// tombstone — `CmtAuditSoftRepository` never declares `soft_delete`. A
 /// non-null value must not hide the parent, or the comment thread would
@@ -1829,6 +1927,27 @@ async fn router_reports_not_found_for_a_soft_deleted_parent() {
 
     let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
     let (status, _) = call(app, get(&format!("/comments/CmtSoft/{target}"))).await;
+    assert_eq!(status, 404);
+}
+
+/// #2284: the router has no repository in hand. For a model with a
+/// `soft_delete` repository and a plain one, it keeps the conservative rule
+/// and hides the soft-deleted parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_hides_a_soft_deleted_parent_when_any_repository_soft_deletes() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let target = seed_one_col(&mut conn, "cmt_duals", "title", "gone").await;
+    diesel::sql_query("UPDATE cmt_duals SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+    drop(conn);
+
+    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
+    let (status, _) = call(app, get(&format!("/comments/CmtDual/{target}"))).await;
     assert_eq!(status, 404);
 }
 

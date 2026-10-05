@@ -989,6 +989,17 @@ pub trait M2mConnSource: Send + Sync {
     /// Returns an error when the repository is `tenant_scoped`, is not in
     /// `across_tenants()` mode, and no tenant context was established.
     fn __autumn_m2m_tenant_scope(&self) -> crate::AutumnResult<::core::option::Option<String>>;
+
+    /// Whether this repository is `#[repository(..., soft_delete)]`, for the
+    /// `#[commentable]` helpers' parent check (#2284).
+    ///
+    /// - `Some(true)` — the helpers ignore a parent with `deleted_at` set.
+    /// - `Some(false)` — the helpers see every parent row, as the finders do.
+    /// - `None` (the default) — unknown. The helpers use the registry rule:
+    ///   filter if any repository of the model soft-deletes.
+    fn __autumn_m2m_soft_delete(&self) -> ::core::option::Option<bool> {
+        ::core::option::Option::None
+    }
 }
 
 /// Which of the three edge mutations a `#[votable]` `react()` call performed

@@ -1015,6 +1015,7 @@ pub fn emit_commentable_items(
                     body,
                     reply_to,
                     #tenant_arg,
+                    self.__autumn_m2m_soft_delete(),
                 )
                 .await
             }
@@ -1035,6 +1036,7 @@ pub fn emit_commentable_items(
                     #type_name,
                     parent_id,
                     #tenant_arg,
+                    self.__autumn_m2m_soft_delete(),
                 )
                 .await
             }
@@ -1053,6 +1055,7 @@ pub fn emit_commentable_items(
                     parent_id,
                     comment_id,
                     #tenant_arg,
+                    self.__autumn_m2m_soft_delete(),
                 )
                 .await
             }
@@ -1069,6 +1072,7 @@ pub fn emit_commentable_items(
                     #type_name,
                     parent_id,
                     #tenant_arg,
+                    self.__autumn_m2m_soft_delete(),
                 )
                 .await
             }
@@ -1600,6 +1604,32 @@ mod tests {
             "the Rust field name must not survive as the parent probe key, \
              got: {emitted}"
         );
+    }
+
+    /// #2284: each helper passes the calling repository's own soft-delete
+    /// fact, so the runtime does not guess it from every repository.
+    #[test]
+    fn every_helper_passes_the_repositorys_soft_delete_fact() {
+        let emitted = emit(&quote! { (by = User) });
+        let blanket = &emitted[emitted
+            .find("impl < __R >")
+            .unwrap_or_else(|| panic!("the blanket impl: {emitted}"))..];
+        for helper in [
+            "add_comment",
+            "comment_thread",
+            "delete_comment",
+            "recompute_comment_count",
+        ] {
+            let start = blanket
+                .find(&format!(":: autumn_web :: commentable :: {helper} ("))
+                .unwrap_or_else(|| panic!("the {helper} call: {blanket}"));
+            let call = &blanket[start..];
+            let call = &call[..call.find(". await").expect("the awaited call")];
+            assert!(
+                call.contains("self . __autumn_m2m_soft_delete ()"),
+                "{helper} must pass the repository's fact: {call}"
+            );
+        }
     }
 
     /// A model with neither a tenant nor a soft-delete column must emit no
