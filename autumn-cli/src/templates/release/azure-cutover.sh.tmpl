@@ -194,10 +194,6 @@ JOB_IDENTITY=$(jq -r --arg acr "$ACR_LOGIN_SERVER" \
 # another principal, without access to the vault. The cutover stops on it.
 JOB_UIDS=$(jq -c --arg id "$JOB_IDENTITY" '[$id] + [.[] | select(.keyVaultUrl) | .identity // empty]
   | map(select(. != "" and ascii_downcase != "system")) | unique_by(ascii_downcase)' "$JOB_SECRETS")
-# The identities that credential removal drops: the job's, and the ones
-# that an earlier first cutover recorded.
-REMOVE_UIDS=$(jq -c --argjson copied "$COPIED" '. + ($copied.uids // [])
-  | map(select(type == "string" and . != "" and ascii_downcase != "system")) | unique_by(ascii_downcase)' <<< "$JOB_UIDS")
 # The job can pull from the ACR with its system identity. "system" is not a
 # user-assigned identity, and the app's system identity has no AcrPull, so
 # the cutover cannot copy it. The script stops before any write.
@@ -215,6 +211,16 @@ JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' 
 # and rollback remove all of them.
 MANAGED_DEF="def managed: $(jq -c --argjson copied "$COPIED" '. + ["database-url", "signing-secret", "redis-url"]
   + ($copied.secrets // [] | map(select(type == "string"))) | unique' <<< "$JOB_SECRET_NAMES");"
+# The identities that credential removal drops: the job's, the ones that an
+# earlier first cutover recorded, and the ones that the app's managed
+# secrets and its ACR entry use (an older placeholder can use an identity
+# that the job no longer uses; it can still read the vault).
+REMOVE_UIDS=$(jq -c --argjson job "$JOB_UIDS" --argjson copied "$COPIED" --argjson app "$APP" \
+  --arg acr "$ACR_LOGIN_SERVER" "$MANAGED_DEF"'
+  $job + ($copied.uids // [])
+  + [.[] | select(.keyVaultUrl and (.name | IN(managed[]))) | .identity // empty]
+  + [$app.properties.configuration.registries // [] | .[] | select(.server == $acr) | .identity // empty]
+  | map(select(type == "string" and . != "" and ascii_downcase != "system")) | unique_by(ascii_downcase)' "$APP_SECRETS")
 # The app's own (unmanaged) secrets and other registries that use a job
 # identity. Credential removal drops that identity, which breaks them, and
 # keeping it would keep vault access on the placeholder. So the script
@@ -430,7 +436,7 @@ sole_active() {
 # provisioned and no other revision is active. Stage 2 then removes the
 # identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local live status state latest revision body containers source active first patch
+  local live status state latest revision body containers source active actives template first patch
   live=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -438,18 +444,26 @@ remove_credentials() {
   # Stage 1 starts from the active revision's containers. After a canceled
   # first cutover, the app template has the real image, which cannot start
   # without its secrets; the active revision still runs the placeholder.
-  # The script reads the complete template of that revision: its scale
-  # rules and volumes can also refer to a secret.
+  # The script reads the complete template of every active placeholder
+  # revision (during a handoff there can be more than one): scale rules and
+  # volumes can also refer to a secret or an identity.
   active=$(jq -c '.properties.template' <<< "$APP")
-  read -r first _ <<< "$PLACEHOLDER_REVISIONS"
-  if [ -n "${first:-}" ]; then
-    active=$(az containerapp revision show \
+  actives=$(jq -c '[.]' <<< "$active")
+  first=""
+  for revision in $PLACEHOLDER_REVISIONS; do
+    template=$(az containerapp revision show \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
-      --revision "$first" \
+      --revision "$revision" \
       --query properties.template \
       --output json) || return 1
-  fi
+    if [ -z "$first" ]; then
+      first="$revision"
+      active="$template"
+      actives="[]"
+    fi
+    actives=$(jq -c --argjson t "$template" '. + [$t]' <<< "$actives")
+  done
   source=$(jq -c '.containers' <<< "$active")
   # The stage 1 containers: no env var that refers to a managed secret (in
   # any container), and not the four env vars that this script sets.
@@ -467,17 +481,17 @@ remove_credentials() {
     echo "::error::a scale rule or volume of $AZURE_APP_NAME uses a managed secret. Remove that reference, then run the script again." >&2
     return 1
   fi
-  # Stage 1 runs when the desired template or the active revision (in a
-  # container, a scale rule or a volume) refers to a managed secret, or
-  # when a scale rule of the active revision uses a job identity. If only
-  # the active revision does, the template is clean already (an earlier
-  # run, or the operator): the script waits for the clean revision instead.
+  # Stage 1 runs when the desired template or an active placeholder
+  # revision (in a container, a scale rule or a volume) refers to a managed
+  # secret, or when a scale rule of an active revision uses a job identity.
+  # If only an active revision does, the template is clean already (an
+  # earlier run, or the operator): the script waits for the clean revision.
   if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null \
     || jq -e --argjson uids "$REMOVE_UIDS" "$MANAGED_DEF"'
          ($uids | map(ascii_downcase)) as $lids
          | ([.. | objects | .secretRef? // empty] | any(IN(managed[])))
-           or ([.scale.rules // [] | .. | objects | .identity? // empty | strings | ascii_downcase]
-               | any(IN($lids[])))' <<< "$active" > /dev/null; then
+           or ([.[] | .scale.rules // [] | .. | objects | .identity? // empty | strings | ascii_downcase]
+               | any(IN($lids[])))' <<< "$actives" > /dev/null; then
     status=$(az containerapp show \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -584,6 +598,16 @@ remove_credentials() {
 # is a real release, so the script keeps the credentials.
 rollback() {
   [ -n "$RELEASED" ] && return
+  # This run opened ingress already (a restart that then failed). The
+  # placeholder template comes back before stage 2 removes the identity,
+  # so ingress closes again first.
+  if [ -n "$OPENED" ]; then
+    az containerapp ingress disable \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --output none \
+      || echo "::warning::cannot disable the ingress of $AZURE_APP_NAME" >&2
+  fi
   echo "::warning::removing the credentials from the placeholder app" >&2
   if remove_credentials; then
     # The first cutover disabled ingress. Bring the saved ingress back, as
@@ -623,6 +647,7 @@ if [ "$MODE" = remove ]; then
   exit 0
 fi
 
+OPENED=""
 fail() {
   echo "::error::$1" >&2
   rollback
@@ -863,9 +888,7 @@ sole_active "$REVISION" || fail "revision $REVISION did not become the only acti
 # open now. It opens before a restart: a revision scaled to zero needs a
 # request through ingress to start a replica.
 open_ingress || fail "cannot open external ingress"
-# The release runs with its credentials now: no rollback needs the
-# record of what was copied, and the ingress is back.
-clear_tags '["autumn-ingress-", "autumn-copied-"]'
+OPENED=1
 
 # No new revision: secrets are application-scope, and the running revision
 # reads them only when it starts.
@@ -941,4 +964,7 @@ if [ -n "$STALE_REDIS" ]; then
     echo "::warning::remove the unused redis-url secret from $AZURE_APP_NAME when no revision uses it" >&2
   fi
 fi
+# The release runs with its credentials now: no rollback needs the record of
+# what was copied, and the ingress is back.
+clear_tags '["autumn-ingress-", "autumn-copied-"]'
 echo "cutover complete: $AZURE_APP_NAME runs $IMAGE"
