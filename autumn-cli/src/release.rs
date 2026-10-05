@@ -3148,6 +3148,180 @@ previous_secrets = []
         );
     }
 
+    /// A stub `az` for [`run_azure_cutover`]. It logs each call and each
+    /// PATCH body. Its TSV output matches knack: a list of scalars prints one
+    /// value per line, and a nested list prints one tab-separated row.
+    #[cfg(unix)]
+    const AZ_STUB: &str = r#"#!/usr/bin/env bash
+echo "az $*" >> "$STUB_LOG"
+id=/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id
+tsv() { case "$query" in "[["*) local IFS=$'\t'; echo "$*" ;; *) printf '%s\n' "$@" ;; esac; }
+prev=""; query=""; body=""
+for arg in "$@"; do
+  [ "$prev" = "--query" ] && query="$arg"
+  [ "$prev" = "--body" ] && body="$arg"
+  prev="$arg"
+done
+case "$1 $2" in
+  "containerapp job")
+    secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"$id\"}"; }
+    secrets="$(secret database-url),$(secret signing-secret)"
+    [ -n "$STUB_REDIS" ] && secrets="$secrets,$(secret redis-url)"
+    echo "{\"properties\":{\"configuration\":{\"registries\":[{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}],\"secrets\":[$secrets]}}}"
+    ;;
+  "containerapp show")
+    if [ -z "$query" ]; then
+      echo "{\"id\":\"/subscriptions/s/app\",\"properties\":{\"latestRevisionName\":\"app--old\",\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[{\"name\":\"AUTUMN_PROFILE\",\"value\":\"prod\"}]}]}}}"
+    else
+      tsv Succeeded app--new
+    fi
+    ;;
+  "containerapp revision") tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
+  "rest --method") echo "$body" >> "$STUB_LOG.bodies" ;;
+  "containerapp ingress") ;;
+  *) echo "unexpected az call: $*" >&2; exit 2 ;;
+esac
+"#;
+
+    /// Runs the generated azure-cutover.sh against [`AZ_STUB`]. Returns the
+    /// exit status, the `az` call log and the PATCH bodies. `None` when
+    /// `jq` is not installed.
+    #[cfg(unix)]
+    fn run_azure_cutover(
+        old_image: &str,
+        revision_state: &str,
+        redis: bool,
+    ) -> Option<(std::process::ExitStatus, String, String)> {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: jq is not installed");
+            return None;
+        }
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for (name, body) in [("az", AZ_STUB), ("sleep", "#!/bin/sh\nexit 0\n")] {
+            let path = bin.join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let log = tmp.path().join("az.log");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg(dir.join("azure-cutover.sh"))
+            .env("PATH", path)
+            .env("STUB_LOG", &log)
+            .env("STUB_OLD_IMAGE", old_image)
+            .env("STUB_REVISION_STATE", revision_state)
+            .env("AZURE_APP_NAME", "app")
+            .env("AZURE_RESOURCE_GROUP", "rg")
+            .env("AZURE_MIGRATE_JOB_NAME", "job")
+            .env("ACR_LOGIN_SERVER", "acr.azurecr.io")
+            .env("IMAGE_TAG", "t1");
+        if redis {
+            command.env("STUB_REDIS", "1");
+        } else {
+            command.env_remove("STUB_REDIS");
+        }
+        let status = command.output().expect("run azure-cutover.sh").status;
+        let read = |path: &std::path::Path| fs::read_to_string(path).unwrap_or_default();
+        Some((status, read(&log), read(&log.with_extension("log.bodies"))))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_sends_one_patch_then_opens_ingress() {
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            true,
+        ) else {
+            return;
+        };
+        assert!(status.success(), "the cutover must succeed: {calls}");
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            1,
+            "{calls}"
+        );
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        let ingress_at = calls
+            .find("az containerapp ingress enable")
+            .unwrap_or_else(|| panic!("the cutover must open ingress: {calls}"));
+        assert!(patch_at < ingress_at, "{calls}");
+        for field in [
+            "\"userAssignedIdentities\"",
+            "\"registries\"",
+            "\"signing-secret\"",
+            "\"redis-url\"",
+            "\"acr.azurecr.io/app:t1\"",
+            "\"AUTUMN_PROFILE\"",
+            "\"AUTUMN_CACHE__BACKEND\"",
+        ] {
+            assert!(
+                bodies.contains(field),
+                "the PATCH must carry {field}: {bodies}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rolls_back_a_failed_first_cutover() {
+        let Some((status, calls, bodies)) =
+            run_azure_cutover("mcr.microsoft.com/k8se/quickstart:latest", "Failed", false)
+        else {
+            return;
+        };
+        assert!(
+            !status.success(),
+            "a failed revision must fail the cutover: {calls}"
+        );
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            2,
+            "{calls}"
+        );
+        assert!(
+            !calls.contains("ingress enable"),
+            "ingress must stay closed: {calls}"
+        );
+        let rollback = bodies.lines().last().unwrap_or_default();
+        assert!(
+            rollback.contains("\"type\":\"None\"") && rollback.contains("\"secrets\":[]"),
+            "the rollback must remove the identity and secret refs: {rollback}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_credentials_when_a_later_deploy_fails() {
+        // The old revision of a later deploy is a real release. It needs
+        // its identity and secret refs.
+        let Some((status, calls, _)) = run_azure_cutover("acr.azurecr.io/app:t0", "Failed", false)
+        else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            1,
+            "{calls}"
+        );
+        assert!(!calls.contains("ingress enable"), "{calls}");
+    }
+
     #[test]
     fn azure_workflow_runs_the_cutover_script_after_migrations() {
         let tmp = TempDir::new().unwrap();
