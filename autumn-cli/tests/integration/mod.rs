@@ -45,6 +45,7 @@ mod scaffold_search;
 mod scaffold_sort_filter;
 mod scaffold_trash;
 mod scaffold_validation;
+mod schema_dev_url;
 mod schema_migrate;
 #[cfg(feature = "sqlite")]
 mod schema_migrate_sqlite;

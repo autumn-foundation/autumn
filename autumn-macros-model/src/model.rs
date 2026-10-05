@@ -91,7 +91,9 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
 ///   ...]`) is an error.
 /// - `#[references]` — bare; the target table is inferred from the field name.
 /// - `#[references(table = "other_table")]` — an explicit target table.
+/// - `#[renamed_from("old_name")]` — one `snake_case` old column name.
 fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
+    validate_model_renamed_from(&field.attrs)?;
     for attr in &field.attrs {
         if attr.path().is_ident("unique") {
             if !matches!(attr.meta, syn::Meta::Path(_)) {
@@ -140,6 +142,52 @@ fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate a struct-level `#[renamed_from("old_table")]` hint (#1975).
+///
+/// The hint is for the `autumn schema` toolchain only. The macro accepts it,
+/// rejects a bad shape, and strips it. Codegen does not change.
+fn validate_model_renamed_from(attrs: &[syn::Attribute]) -> syn::Result<()> {
+    let mut seen = false;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("renamed_from")) {
+        if seen {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "use only one `#[renamed_from(\"old_name\")]` on an item",
+            ));
+        }
+        seen = true;
+        validate_renamed_from_shape(attr)?;
+    }
+    Ok(())
+}
+
+/// Validate one `#[renamed_from("old_name")]`: one string literal that is a
+/// plain identifier (`[a-z_][a-z0-9_]*`, at most 63 bytes). Keep in sync with
+/// `autumn-cli/src/schema/rename.rs::is_plain_identifier`.
+fn validate_renamed_from_shape(attr: &syn::Attribute) -> syn::Result<()> {
+    let error = || {
+        syn::Error::new_spanned(
+            attr,
+            "write `#[renamed_from(\"old_name\")]` with one snake_case name: \
+             start with a lowercase letter or `_`, then use lowercase letters, \
+             digits and `_`, at most 63 bytes",
+        )
+    };
+    let syn::Meta::List(list) = &attr.meta else {
+        return Err(error());
+    };
+    let name = syn::parse2::<LitStr>(list.tokens.clone())
+        .map_err(|_| error())?
+        .value();
+    let mut chars = name.chars();
+    let plain = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && name.len() <= 63;
+    if plain { Ok(()) } else { Err(error()) }
 }
 
 /// The three declarative association kinds supported on `#[model]`.
@@ -4655,6 +4703,7 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // they never leak onto the Diesel derives; codegen is unchanged.
                 && !a.path().is_ident("unique")
                 && !a.path().is_ident("references")
+                && !a.path().is_ident("renamed_from")
                 && !a.path().is_ident("position")
                 // #1384: `#[translatable]` is a marker the model macro reads;
                 // the behaviour lives in the field's `Translated` type, so the
@@ -7867,6 +7916,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 && !is_commentable_attr(a)
                 && !is_derivation_attr(a)
                 && !a.path().is_ident("shard_key")
+                // #1975: a declarative-schema hint, not a Diesel attribute.
+                && !a.path().is_ident("renamed_from")
         })
         .collect();
 
@@ -7884,6 +7935,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if let Err(err) = validate_field_schema_markers(field) {
             return err.to_compile_error();
         }
+    }
+    if let Err(err) = validate_model_renamed_from(outer_attrs) {
+        return err.to_compile_error();
     }
 
     // Validate that the declared shard_key names an existing field (or "id").
@@ -18020,6 +18074,101 @@ mod tests {
         assert_eq!(
             with_markers, without_markers,
             "schema markers must not alter generated code"
+        );
+    }
+
+    #[test]
+    fn renamed_from_with_one_snake_case_name_passes() {
+        let field: syn::Field = syn::parse_quote! {
+            #[renamed_from("title")]
+            pub headline: String
+        };
+        validate_field_schema_markers(&field).expect("a valid hint must pass");
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[renamed_from("articles")])];
+        validate_model_renamed_from(&attrs).expect("a valid table hint must pass");
+    }
+
+    #[test]
+    fn malformed_renamed_from_is_rejected() {
+        let bad: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[renamed_from]),
+            syn::parse_quote!(#[renamed_from = "title"]),
+            syn::parse_quote!(#[renamed_from(title)]),
+            syn::parse_quote!(#[renamed_from("Title")]),
+            syn::parse_quote!(#[renamed_from("a b")]),
+            syn::parse_quote!(#[renamed_from("a", "b")]),
+            syn::parse_quote!(#[renamed_from("")]),
+            syn::parse_quote!(#[renamed_from("1a")]),
+        ];
+        let long = "a".repeat(64);
+        let bad: Vec<syn::Attribute> = bad
+            .into_iter()
+            .chain(std::iter::once(syn::parse_quote!(#[renamed_from(#long)])))
+            .collect();
+        for attr in bad {
+            let shown = quote!(#attr).to_string();
+            let field = syn::Field {
+                attrs: vec![attr.clone()],
+                ..syn::parse_quote! { pub headline: String }
+            };
+            let err = validate_field_schema_markers(&field)
+                .expect_err(&format!("`{shown}` must be rejected on a field"));
+            assert!(
+                err.to_string().contains("`#[renamed_from(\"old_name\")]`"),
+                "unexpected message for `{shown}`: {err}"
+            );
+            let err = validate_model_renamed_from(&[attr])
+                .expect_err(&format!("`{shown}` must be rejected on a model"));
+            assert!(
+                err.to_string().contains("`#[renamed_from(\"old_name\")]`"),
+                "unexpected message for `{shown}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_renamed_from_on_one_item_are_rejected() {
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[renamed_from("a")]),
+            syn::parse_quote!(#[renamed_from("b")]),
+        ];
+        assert!(validate_model_renamed_from(&attrs).is_err());
+        let field = syn::Field {
+            attrs,
+            ..syn::parse_quote! { pub headline: String }
+        };
+        assert!(validate_field_schema_markers(&field).is_err());
+    }
+
+    #[test]
+    fn renamed_from_does_not_change_codegen() {
+        let with_hints = model_macro(
+            quote! { managed },
+            quote! {
+                #[renamed_from("old_memberships")]
+                pub struct Membership {
+                    #[id]
+                    pub id: i64,
+                    #[renamed_from("account")]
+                    pub account_id: i64,
+                }
+            },
+        )
+        .to_string();
+        let without_hints = model_macro(
+            quote! { managed },
+            quote! {
+                pub struct Membership {
+                    #[id]
+                    pub id: i64,
+                    pub account_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            with_hints, without_hints,
+            "hints must not alter generated code"
         );
     }
 
