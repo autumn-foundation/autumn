@@ -1893,11 +1893,6 @@ fn resolve_migration_removal(
     {
         return MigrationOutcome::StillNeededElsewhere(real_dir);
     }
-    if !force
-        && super::commentable::comments_migration_still_needed(project_root, &real_dir, excluding)
-    {
-        return MigrationOutcome::StillNeededByCommentable(real_dir);
-    }
 
     // Deliberately NOT gated on `force`: `--force` bypasses content
     // divergence and the sibling-resource "still needed elsewhere" caution,
@@ -1910,6 +1905,18 @@ fn resolve_migration_removal(
     let (version, _) = split_migration_dir_name(real_dir_name);
     match migration_applied_status(version, migrations_root) {
         MigrationStatus::Applied | MigrationStatus::Unknown => MigrationOutcome::Applied(real_dir),
+        // After the status check: `--force` can remove only an unapplied
+        // migration, so only then is it the way out (#2283).
+        MigrationStatus::NotApplied | MigrationStatus::NotConfigured
+            if !force
+                && super::commentable::comments_migration_still_needed(
+                    project_root,
+                    &real_dir,
+                    excluding,
+                ) =>
+        {
+            MigrationOutcome::StillNeededByCommentable(real_dir)
+        }
         MigrationStatus::NotApplied | MigrationStatus::NotConfigured => {
             MigrationOutcome::Remove(real_dir)
         }
@@ -3474,6 +3481,36 @@ mod tests {
             plan.revert(Flags::default()).unwrap();
             assert!(!real_dir.exists());
         });
+    }
+
+    /// An applied migration is kept even with `--force`, so the warning must
+    /// not offer `--force` as the way out.
+    #[test]
+    fn an_applied_needed_comments_migration_gets_the_applied_warning() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                (
+                    "AUTUMN_DATABASE__URL",
+                    Some("postgres://postgres:x@127.0.0.1:1/nope"),
+                ),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let (tmp, mut plan) = fixture();
+                let real_dir = adopted_comments_fixture(&tmp, &mut plan);
+                let warnings = plan.compute_revert_plan(false).warnings;
+                assert!(
+                    warnings.iter().any(|w| w.contains("appears to be applied")),
+                    "{warnings:#?}"
+                );
+                assert!(
+                    !warnings.iter().any(|w| w.contains("pass --force")),
+                    "{warnings:#?}"
+                );
+                assert!(real_dir.exists());
+            },
+        );
     }
 
     /// The old behaviour left a separate generator-written shared migration.
