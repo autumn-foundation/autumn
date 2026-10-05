@@ -105,6 +105,7 @@ const AT_MOST_ONCE_CLOSURE_METHODS: &[&str] = &[
     "get_or_insert_with",
     "unwrap_or_default",
     "map",
+    "map_err",
     "map_or",
     "map_or_else",
     "and_then",
@@ -224,7 +225,7 @@ const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Ext
 
 /// Methods whose result is a container of what their callback returns:
 /// `ids.iter().map(|_| &repo)`, `flag.then(|| &repo)`.
-const WRAPPING_CALLBACKS: &[&str] = &["map", "then", "then_some"];
+const WRAPPING_CALLBACKS: &[&str] = &["map", "map_err", "then", "then_some"];
 
 /// Methods whose result is what their callback returns, or what their other
 /// arguments hold: `fold(init, f)`, `unwrap_or_else(f)`, `find_map(f)`.
@@ -278,6 +279,7 @@ const CALLBACK_METHODS: &[&str] = &[
     "ok_or_else",
     "get_or_insert_with",
     "or_else",
+    "map_err",
     "is_some_and",
     "is_none_or",
     "is_ok_and",
@@ -361,6 +363,8 @@ const SCALAR_METHODS: &[&str] = &[
 /// Methods on a carrier that return a carrier: a view, an iterator, or an
 /// `Option` of a part.
 const CARRIER_METHODS: &[&str] = &[
+    "err",
+    "map_err",
     "then",
     "then_some",
     "iter",
@@ -423,6 +427,8 @@ const CARRIER_METHODS: &[&str] = &[
 
 /// Methods on a carrier that return a part of it, which is a handle.
 const ELEMENT_METHODS: &[&str] = &[
+    "unwrap_err",
+    "expect_err",
     "remove",
     "swap_remove",
     "insert",
@@ -667,6 +673,10 @@ const RESULT_METHODS: &[&str] = &[
     "is_ok_and",
     "is_err_and",
     "ok",
+    "err",
+    "map_err",
+    "unwrap_err",
+    "expect_err",
     "unwrap",
     "expect",
     "unwrap_or",
@@ -851,7 +861,7 @@ impl Shape {
             "iter" | "iter_mut" | "into_iter" | "drain" | "chunks" | "windows" | "keys"
             | "values" | "values_mut" | "into_keys" | "into_values" => Some(Self::Iter),
             "first" | "last" | "get" | "get_mut" | "pop" | "pop_back" | "pop_front" | "next"
-            | "nth" | "find" | "find_map" | "ok" => Some(Self::Opt),
+            | "nth" | "find" | "find_map" | "ok" | "err" => Some(Self::Opt),
             "ok_or" | "ok_or_else" => Some(Self::Res),
             _ if self.option_of_part(method) => Some(Self::Opt),
             "to_vec" => Some(Self::Vec),
@@ -3059,6 +3069,14 @@ impl Analyzer {
                         || (method == "zip"
                             && (self.holds(&mc.receiver) || mc.args.iter().any(|a| self.holds(a))))
                         || (method == "chain" && mc.args.iter().any(|a| self.expr_is_nested(a)))
+                        // `enumerate` and a map's iterators yield tuples.
+                        || (method == "enumerate" && self.holds(&mc.receiver))
+                        || (matches!(method.as_str(), "iter" | "iter_mut" | "into_iter" | "drain")
+                            && matches!(
+                                self.shape_of(&mc.receiver),
+                                Some(Shape::Map | Shape::SortedMap)
+                            )
+                            && self.holds(&mc.receiver))
                         || (self.expr_is_holder(&mc.receiver)
                             && !SAME_TYPE_METHODS.contains(&method.as_str())
                             && !HANDLE_ACCESSORS.contains(&method.as_str()))
@@ -3206,9 +3224,13 @@ impl Analyzer {
             Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
                 break_results(e).into_iter().any(|v| self.expr_is_holder(v))
             }
-            // A closure that names a handle holds it, like a user value.
+            // A closure that captures a handle holds it, like a user value.
+            // Its own parameters are not captures (`|repo| repo.len()`).
             Expr::Closure(c) => {
-                tokens_mention_any(&c.body.to_token_stream(), &|name| self.env.is_tracked(name))
+                let params = pattern_names(c.inputs.iter());
+                tokens_mention_any(&c.body.to_token_stream(), &|name| {
+                    !params.iter().any(|p| p == name) && self.env.is_tracked(name)
+                })
             }
             Expr::Reference(r) => self.expr_is_holder(&r.expr),
             Expr::Paren(p) => self.expr_is_holder(&p.expr),
@@ -3492,7 +3514,9 @@ impl Analyzer {
     /// Does this expression *carry* a handle into a callee — directly, as a
     /// carrier, or wrapped in a context struct, tuple or slice?
     fn expr_carries_handle(&self, expr: &Expr) -> bool {
-        if self.expr_is_handle(expr) || self.expr_is_carrier(expr) {
+        // `expr_is_carrier` also covers a nested value. A holder includes a
+        // closure that captures a handle (`drive(|| &repo)`).
+        if self.expr_is_handle(expr) || self.expr_is_carrier(expr) || self.expr_is_holder(expr) {
             return true;
         }
         match expr {
@@ -3932,6 +3956,22 @@ fn call_path_name(call: &ExprCall) -> Option<String> {
         Expr::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
         _ => None,
     }
+}
+
+/// The names that the patterns `pats` bind.
+fn pattern_names<'a>(pats: impl Iterator<Item = &'a Pat>) -> Vec<String> {
+    struct Names(Vec<String>);
+    impl<'a> Visit<'a> for Names {
+        fn visit_pat_ident(&mut self, p: &'a syn::PatIdent) {
+            self.0.push(p.ident.to_string());
+            syn::visit::visit_pat_ident(self, p);
+        }
+    }
+    let mut names = Names(Vec::new());
+    for pat in pats {
+        names.visit_pat(pat);
+    }
+    names.0
 }
 
 /// Does this token stream name a tracked name (recursing into groups)?
@@ -7581,6 +7621,45 @@ mod tests {
                 "async fn h(mut slot: Option<PgPostRepository>, repo: PgPostRepository) \
                  -> AutumnResult<usize> { let r = slot.insert(repo); \
                  let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn closures_errors_and_tuple_items_keep_their_handles() {
+        check_handlers(&[
+            (
+                "a closure that captures a handle, handed to a helper",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 drive(|| &repo).await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map_err gives a handle on the error side",
+                "async fn h(repo: PgPostRepository, result: Result<i64, Error>) \
+                 -> AutumnResult<usize> { let mapped = result.map_err(|_| &repo); \
+                 let r = mapped.unwrap_err(); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "an enumerate item is a tuple",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let pair = repos.into_iter().enumerate().next().unwrap(); \
+                 pair.refresh().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a map item is a tuple",
+                "async fn h(repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let pair = repos.into_iter().next().unwrap(); pair.refresh().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            // Guard: a map's values are handles.
+            (
+                "a map value is a handle",
+                "async fn h(repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let r = repos.values().next().unwrap(); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
