@@ -289,7 +289,7 @@ fn into_http(response: EdgeResponse, head: bool) -> Option<Response<Body>> {
         }
         if name == http::header::CONTENT_LENGTH {
             let declared: usize = value.trim().parse().ok()?;
-            if !head && declared != body_len {
+            if !content_length_fits(response.status, head, declared, body_len) {
                 return None;
             }
         }
@@ -297,6 +297,19 @@ fn into_http(response: EdgeResponse, head: bool) -> Option<Response<Body>> {
             .append(name, HeaderValue::from_str(&value).ok()?);
     }
     Some(http)
+}
+
+/// Whether a declared `content-length` is valid for this answer (RFC 9110
+/// section 8.6). A `HEAD` or 304 answer may give the length of the 200
+/// representation. A 204 must not send the field. A 205 may only send 0.
+/// Any other answer must give the length of its body.
+const fn content_length_fits(status: u16, head: bool, declared: usize, body_len: usize) -> bool {
+    match status {
+        204 => false,
+        205 => declared == 0,
+        304 => true,
+        _ => head || declared == body_len,
+    }
 }
 
 fn with_lane(mut response: Response<Body>, lane: Lane) -> Response<Body> {

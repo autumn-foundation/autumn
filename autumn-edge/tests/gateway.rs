@@ -477,3 +477,28 @@ fn a_body_on_a_no_content_status_falls_through() {
         );
     }
 }
+
+/// `content-length` follows the status (RFC 9110 section 8.6): a 304 may give
+/// the length of the 200 representation, a 204 must not send it, and a 205
+/// may only send 0.
+#[test]
+fn content_length_is_checked_by_status() {
+    let run = |status: u16, length: &str| {
+        let artifact = guest(&GuestFrame::Response(EdgeResponse {
+            status,
+            headers: vec![("content-length".into(), length.into())],
+            body: Vec::new(),
+        }));
+        let seen = Seen::default();
+        let gateway = EdgeGateway::new(artifact, origin(&seen));
+        lane(&block_on(
+            gateway.handle(Request::get("/x").body(Body::empty()).unwrap()),
+        ))
+    };
+    let declined = Lane::Fallthrough(FallthroughReason::CapsuleError);
+
+    assert_eq!(run(304, "13"), Lane::Edge);
+    assert_eq!(run(204, "0"), declined);
+    assert_eq!(run(205, "0"), Lane::Edge);
+    assert_eq!(run(205, "13"), declined);
+}
