@@ -2589,6 +2589,14 @@ impl Analyzer {
                     }
                 } else if let Some(root) = place_root(place) {
                     self.raise(root, Kind::Holder);
+                } else {
+                    // `*slots.get_mut(0).unwrap() = …`,
+                    // `ctxs.last_mut().unwrap().repo = …`: a place inside a
+                    // temporary borrow. Each place it borrows holds the value
+                    // one layer down.
+                    for name in self.referents_of(place_base(place)) {
+                        self.raise_one(name, Kind::Nested);
+                    }
                 }
             }
         }
@@ -5900,6 +5908,17 @@ fn local_names(block: &Block) -> Vec<String> {
     let mut names = Names(Vec::new());
     names.visit_block(block);
     names.0
+}
+
+/// The value a place is inside: `x` for `*x`, `x.field`, `x[i]`.
+fn place_base(place: &Expr) -> &Expr {
+    match place {
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => place_base(&u.expr),
+        Expr::Field(f) => place_base(&f.base),
+        Expr::Index(i) => place_base(&i.expr),
+        Expr::Paren(p) => place_base(&p.expr),
+        other => other,
+    }
 }
 
 /// `value.member`, built as a node so that no operator in `value` binds
@@ -12134,6 +12153,30 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Vec::new(); let mut dest = Vec::new(); \
                  fill(&mut dest, { source.push(repo); source.pop().unwrap() }); render(dest); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn writes_through_temporary_borrows() {
+        check_handlers(&[
+            (
+                "guard: a write through a temporary borrow reaches its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; *slots.get_mut(0).unwrap() = Some(repo); render(slots); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a store through a temporary borrow reaches its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut lists = vec![Vec::new()]; lists.get_mut(0).unwrap().push(repo); render(lists); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a field write through a temporary borrow reaches its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut ctxs = vec![Ctx::default()]; ctxs.last_mut().unwrap().repo = Some(repo); render(ctxs); Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
