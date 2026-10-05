@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::diesel::prelude::*;
+use autumn_web::reexports::diesel::sql_types::Text;
 use autumn_web::reexports::diesel_async::RunQueryDsl;
 use autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 use axum::http::header::LOCATION;
@@ -24,6 +25,13 @@ use crate::schema::{order_lines, orders, products};
 
 /// The most units that one call can move.
 const MAX_QUANTITY: i32 = 10_000;
+
+/// The most units of one product. The schema has the same CHECK.
+pub const MAX_STOCK: i32 = 1_000_000;
+
+/// The most distinct lines in one cart. It keeps one checkout transaction,
+/// and the row locks that it holds, short.
+const MAX_LINES: usize = 100;
 
 /// The body of a reserve call.
 #[derive(Debug, Deserialize)]
@@ -86,8 +94,12 @@ pub async fn reserve(
 ///
 /// So the handler opens `Db::tx` and sends one guarded `UPDATE` per line:
 /// `SET stock = stock - n WHERE stock >= n`. Postgres does the check and the
-/// write in one step. Lines run in SKU order, so two carts lock rows in the
-/// same order and cannot deadlock.
+/// write in one step. Lines run in SKU order. `restock` locks rows in SKU
+/// order too, so no two calls wait for each other in a circle (a deadlock).
+///
+/// A retry with a used `order_ref` and the same lines gets the first receipt
+/// with `200`, and sells nothing. So a scanner that lost a response can
+/// retry. Other lines with a used `order_ref` get 409.
 ///
 /// H13: there is no `Created` helper, so the handler returns a tuple:
 /// `201`, a `Location` header, and the JSON body.
@@ -95,13 +107,13 @@ pub async fn reserve(
 pub async fn checkout(mut db: Db, Json(cart): Json<Cart>) -> AutumnResult<Response> {
     let lines = check_cart(&cart)?;
     let order_ref = cart.order_ref;
-    let receipt = db
+    let (status, receipt) = db
         .tx(|conn| {
             let order_ref = order_ref.clone();
             let lines = lines.clone();
             async move {
-                // A used `order_ref` inserts no row. The handler returns 409
-                // and writes nothing.
+                let receipt = receipt_for(&order_ref, &lines);
+                // A used `order_ref` inserts no row.
                 let order_id: Option<i64> = diesel::insert_into(orders::table)
                     .values(orders::order_ref.eq(&order_ref))
                     .on_conflict_do_nothing()
@@ -109,9 +121,9 @@ pub async fn checkout(mut db: Db, Json(cart): Json<Cart>) -> AutumnResult<Respon
                     .get_result(conn)
                     .await
                     .optional()?;
-                let order_id = order_id.ok_or_else(|| {
-                    AutumnError::conflict_msg(format!("order {order_ref} exists"))
-                })?;
+                let Some(order_id) = order_id else {
+                    return replay(conn, receipt).await;
+                };
 
                 for (sku, quantity) in &lines {
                     let product_id: Option<i64> = diesel::update(
@@ -138,24 +150,56 @@ pub async fn checkout(mut db: Db, Json(cart): Json<Cart>) -> AutumnResult<Respon
                         .execute(conn)
                         .await?;
                 }
-
-                Ok::<_, AutumnError>(Receipt {
-                    order_ref,
-                    lines: lines
-                        .iter()
-                        .map(|(sku, quantity)| CartLine {
-                            sku: sku.clone(),
-                            quantity: *quantity,
-                        })
-                        .collect(),
-                })
+                Ok::<_, AutumnError>((StatusCode::CREATED, receipt))
             }
             .scope_boxed()
         })
         .await?;
 
     let location = format!("/api/orders/{}", receipt.order_ref);
-    Ok((StatusCode::CREATED, [(LOCATION, location)], Json(receipt)).into_response())
+    Ok((status, [(LOCATION, location)], Json(receipt)).into_response())
+}
+
+/// The receipt for `lines`, in SKU order.
+fn receipt_for(order_ref: &str, lines: &BTreeMap<String, i32>) -> Receipt {
+    Receipt {
+        order_ref: order_ref.to_owned(),
+        lines: lines
+            .iter()
+            .map(|(sku, quantity)| CartLine {
+                sku: sku.clone(),
+                quantity: *quantity,
+            })
+            .collect(),
+    }
+}
+
+/// The answer to a retry with a used `order_ref`: `200` and the stored
+/// receipt if the lines are the same, else 409.
+async fn replay(
+    conn: &mut autumn_web::RuntimeConnection,
+    requested: Receipt,
+) -> AutumnResult<(StatusCode, Receipt)> {
+    let stored: Vec<(String, i32)> = order_lines::table
+        .inner_join(orders::table)
+        .filter(orders::order_ref.eq(&requested.order_ref))
+        .order(order_lines::sku.asc())
+        .select((order_lines::sku, order_lines::quantity))
+        .load(conn)
+        .await?;
+    let same = stored.len() == requested.lines.len()
+        && stored
+            .iter()
+            .zip(&requested.lines)
+            .all(|((sku, quantity), line)| *sku == line.sku && *quantity == line.quantity);
+    if same {
+        Ok((StatusCode::OK, requested))
+    } else {
+        Err(AutumnError::conflict_msg(format!(
+            "order {} exists with other lines",
+            requested.order_ref
+        )))
+    }
 }
 
 /// The error for a line that the guarded `UPDATE` did not change: the SKU is
@@ -178,23 +222,60 @@ async fn short_line_error(conn: &mut autumn_web::RuntimeConnection, sku: &str) -
 /// Why not the convention: the repository writes absolute values. A loop of
 /// `find_by_category` then `update` per row costs a round trip per product.
 /// The loop also loses a checkout that runs between its read and its write
-/// (see `hazard_repository_read_modify_write_loses_an_update`). One relative
-/// `UPDATE … SET stock = stock + n` has no read, so it cannot lose a checkout.
+/// (see `hazard_repository_read_modify_write_loses_an_update`).
+///
+/// So the handler sends one relative `UPDATE … SET stock = stock + n`. It
+/// writes no value that it read, so it cannot lose a checkout. First, in the
+/// same transaction, it locks the rows in SKU order, the order that
+/// `checkout` uses, so the two cannot deadlock. The lock also lets it refuse
+/// a restock that passes [`MAX_STOCK`] before it changes any row.
 #[post("/restock")]
 pub async fn restock(
     mut db: Db,
     Json(body): Json<Restock>,
 ) -> AutumnResult<Json<serde_json::Value>> {
     let add = check_quantity(body.add)?;
-    if body.category.trim().is_empty() {
+    let category = body.category.trim().to_owned();
+    if category.is_empty() {
         return Err(AutumnError::unprocessable_msg("category is empty"));
     }
-    let updated = diesel::update(products::table.filter(products::category.eq(&body.category)))
-        .set(products::stock.eq(products::stock + add))
-        .execute(&mut *db)
+    let updated = db
+        .tx(|conn| {
+            let category = category.clone();
+            async move {
+                let rows: Vec<(i64, String, i32)> = products::table
+                    .filter(products::category.eq(&category))
+                    // Byte order (`COLLATE "C"`), the order of the `BTreeMap`
+                    // in `checkout`. The database collation can differ.
+                    .order(diesel::dsl::sql::<Text>(r#"sku COLLATE "C""#))
+                    .select((products::id, products::sku, products::stock))
+                    .for_update()
+                    .load(conn)
+                    .await?;
+                if rows.is_empty() {
+                    return Err(AutumnError::not_found_msg(format!(
+                        "no products in category {category}"
+                    )));
+                }
+                if let Some((_, sku, _)) =
+                    rows.iter().find(|(_, _, stock)| *stock > MAX_STOCK - add)
+                {
+                    return Err(AutumnError::conflict_msg(format!(
+                        "restock would put {sku} over {MAX_STOCK} units"
+                    )));
+                }
+                let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+                let updated = diesel::update(products::table.filter(products::id.eq_any(ids)))
+                    .set(products::stock.eq(products::stock + add))
+                    .execute(conn)
+                    .await?;
+                Ok::<_, AutumnError>(updated)
+            }
+            .scope_boxed()
+        })
         .await?;
     Ok(Json(
-        serde_json::json!({ "category": body.category, "updated": updated }),
+        serde_json::json!({ "category": category, "updated": updated }),
     ))
 }
 
@@ -251,6 +332,11 @@ fn check_cart(cart: &Cart) -> AutumnResult<BTreeMap<String, i32>> {
     }
     if cart.lines.is_empty() {
         return Err(AutumnError::unprocessable_msg("cart is empty"));
+    }
+    if cart.lines.len() > MAX_LINES {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "a cart has at most {MAX_LINES} lines"
+        )));
     }
     let mut lines = BTreeMap::new();
     for line in &cart.lines {

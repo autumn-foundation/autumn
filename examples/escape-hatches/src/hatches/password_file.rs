@@ -3,8 +3,9 @@
 //!
 //! A secrets sidecar (for example, a Vault agent) writes the database
 //! password to a file and rotates it. Autumn reads `database.url` once, at
-//! boot. Autumn's connections use tokio-postgres, which reads no password
-//! file. So, after a rotation, each new connection fails until a restart.
+//! boot. Its pool connections use tokio-postgres, which reads no password
+//! file. So, after a rotation, each new pool connection fails until a
+//! restart.
 //!
 //! This provider builds the pool with a custom connect step. The step reads
 //! the file each time the pool opens a connection. A rotation takes effect
@@ -13,9 +14,17 @@
 //!
 //! With no file set, the provider uses Autumn's default pool.
 //!
-//! Trade-off: a custom connect step replaces Autumn's own, which also sets
-//! up TLS. This provider does not set up TLS, so it refuses a URL that asks
-//! for it. It never drops TLS silently.
+//! Limits:
+//!
+//! - A custom connect step replaces Autumn's own, which also sets up TLS.
+//!   This provider does not set up TLS, so it refuses a URL that asks for it.
+//!   It never drops TLS silently.
+//! - It builds only the primary pool. Autumn builds replica and shard pools
+//!   from their URLs, with no password file. So it refuses a replica or
+//!   shards.
+//! - Migrations do not use the pool. `autumn migrate` and auto-migrate
+//!   connect through libpq with `database.url`. Give them a credential of
+//!   their own, for example a libpq `PGPASSFILE`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -65,15 +74,15 @@ impl DatabasePoolProvider for PasswordFilePool {
         let Some(file) = self.file.clone() else {
             return autumn_web::db::create_pool(config);
         };
+        if config.replica_url.is_some() || !config.shards.is_empty() {
+            return Err(refuse(
+                "PasswordFilePool builds only the primary pool; remove the replica and shards",
+            ));
+        }
         let Some(url) = config.effective_primary_url() else {
             return Ok(None);
         };
-        if asks_for_tls(url) {
-            return Err(PoolError::UnsupportedBackend(
-                "PasswordFilePool does not set up TLS; remove `sslmode` or use the default pool"
-                    .to_owned(),
-            ));
-        }
+        check_url(url).map_err(|reason| refuse(&reason))?;
 
         let base_url = url.to_owned();
         let mut manager_config = ManagerConfig::<AsyncPgConnection>::default();
@@ -82,7 +91,7 @@ impl DatabasePoolProvider for PasswordFilePool {
             let base_url = base_url.clone();
             let file = file.clone();
             Box::pin(async move {
-                let password = std::fs::read_to_string(&file).map_err(|error| {
+                let password = tokio::fs::read_to_string(&file).await.map_err(|error| {
                     ConnectionError::BadConnection(format!(
                         "read password file {}: {error}",
                         file.display()
@@ -104,6 +113,27 @@ impl DatabasePoolProvider for PasswordFilePool {
             .build()?;
         Ok(Some(pool))
     }
+}
+
+fn refuse(reason: &str) -> PoolError {
+    PoolError::UnsupportedBackend(reason.to_owned())
+}
+
+/// Refuse a URL that the connect step cannot rewrite safely. The check runs
+/// at boot, so a bad URL fails there and not at the first connection.
+fn check_url(url: &str) -> Result<(), String> {
+    if asks_for_tls(url) {
+        return Err(
+            "PasswordFilePool does not set up TLS; remove `sslmode` or use the default pool"
+                .to_owned(),
+        );
+    }
+    let query = url.split_once('?').map_or("", |(_, query)| query);
+    if query.split('&').any(|pair| pair.starts_with("password=")) {
+        // A query password wins over the user part, so the file would lose.
+        return Err("database URL has a `password` query parameter".to_owned());
+    }
+    with_password(url, "").map(|_| ())
 }
 
 /// True if the URL asks for TLS (`sslmode=require`, `verify-ca`, or
@@ -185,6 +215,14 @@ mod tests {
     fn with_password_needs_a_user() {
         assert!(with_password("postgres://db/stock", "pw").is_err());
         assert!(with_password("db/stock", "pw").is_err());
+    }
+
+    #[test]
+    fn check_url_refuses_what_it_cannot_rewrite() {
+        assert!(check_url("postgres://app@db/stock").is_ok());
+        assert!(check_url("postgres://app@db/stock?password=old").is_err());
+        assert!(check_url("postgres://app@db/stock?sslmode=require").is_err());
+        assert!(check_url("host=db user=app").is_err());
     }
 
     #[test]

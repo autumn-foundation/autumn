@@ -53,7 +53,7 @@ pub fn api_routes() -> Vec<autumn_web::Route> {
 /// With no token, the guard refuses every call. It never opens the API.
 #[must_use]
 pub fn scanner_guard(token: Option<&str>) -> RequireApiToken {
-    let store = match token {
+    let store = match token.map(str::trim) {
         Some(token) if !token.is_empty() => {
             InMemoryApiTokenStore::default().with_token(token, "scanner")
         }
@@ -66,10 +66,10 @@ pub fn scanner_guard(token: Option<&str>) -> RequireApiToken {
 /// comment names it.
 #[must_use]
 pub fn app() -> AppBuilder {
-    let scanner_token = std::env::var(SCANNER_TOKEN_ENV).ok();
-    if scanner_token.is_none() {
-        tracing::warn!("{SCANNER_TOKEN_ENV} is not set; the /api routes refuse every call");
-    }
+    let scanner_token = std::env::var(SCANNER_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty());
+    let token_missing = scanner_token.is_none();
     autumn_web::app()
         .migrations(MIGRATIONS)
         .routes(routes())
@@ -92,4 +92,11 @@ pub fn app() -> AppBuilder {
         .exception_filter(RetryAfterOn503)
         // H12: the database password comes from a rotated file.
         .with_pool_provider(PasswordFilePool::from_env())
+        // Logging starts in `run`, so warn from a startup hook.
+        .on_startup(move |_| async move {
+            if token_missing {
+                tracing::warn!("{SCANNER_TOKEN_ENV} is not set; /api refuses every call");
+            }
+            Ok(())
+        })
 }

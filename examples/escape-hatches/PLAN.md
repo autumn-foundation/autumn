@@ -67,7 +67,8 @@ Question: "How do we make this example bad?" Each answer gives a rule.
 | `Deprecation`/`Sunset` layer on `/v1` | Built in: API version lifecycles. |
 | `statement_timeout` pool provider | Built in: `database.statement_timeout`. |
 | Custom rate-limit layer | Built in: `#[throttle]`. |
-| Ideas 15 to 18 | This app has no need for them. Do not add a hatch that the app does not need. Section 7 tells where each one is shown. |
+| Idea 16: store sessions in Redis | Built in: `[session] backend = "redis"`. It is configuration, not a hatch. |
+| Ideas 15, 17 and 18 | This app has no need for them. Do not add a hatch that the app does not need. Section 7 tells where each one is shown. |
 
 ## 5. Six thinking hats
 
@@ -86,29 +87,33 @@ Question: "How do we make this example bad?" Each answer gives a rule.
 |---|---|---|---|---|
 | H1 | `with_lock` per product | It locks one row. A cart needs all lines or none. | `Db::tx` with a guarded Diesel `UPDATE` per line | `checkout_*` tests |
 | H2 | Repository `update` per row | It needs one round trip per row. Its absolute values can lose a concurrent sale. | One set-based Diesel `UPDATE` | `restock_*` tests |
-| H3 | Repository finders and aggregates | They cannot express a window function. | `diesel::sql_query` + `QueryableByName` | `report_*` tests |
-| H4 | `#[throttle]`, `timeout_ms` | They limit rate and time, not concurrent runs. | `#[intercept(ReportGate)]` | `report_gate` test binary |
+| H3 | Repository finders, aggregates, and Diesel's DSL | Finders and aggregates have no window function. Diesel's DSL can compute `row_number()` in SELECT, but it cannot filter on it: that needs a subquery in FROM or a CTE. | `diesel::sql_query` + `QueryableByName` | `report_*` tests |
+| H4 | `#[throttle]`, `timeout_ms`, `server.max_concurrent_requests`, `cache::get_or_compute` | They limit rate, time, or the whole process. `get_or_compute` joins only callers of one key, and each `top` value is a key. | `#[intercept(ReportGate)]` | `report_gate` test binary |
 | H5 | Browser routes with no login | Scanners are machines with bearer tokens. | `scoped("/api", RequireApiToken, ..)` | `api_*` tests |
 | H6 | CSRF on for every POST in `prod` | Scanners send no CSRF cookie. | `security.csrf.exempt_paths` | `csrf_*` test |
-| H7 | `Cache-Control` only on `/static` | Live stock must not stay in a shared cache. | `.layer(SetResponseHeaderLayer)` | `cache_control_*` tests |
-| H8 | `static/` file serving | It serves only build assets. Runtime files need another mount. | `.nest(Router)` with `ServeDir` + `declare_plugin_routes` | `exports_*` tests |
+| H7 | `Cache-Control` only on framework assets; `etag::cache_for(..).no_store()` per handler | There is no app-wide setting. A per-handler call does not reach error pages or raw routers. | `.layer(SetResponseHeaderLayer)` | `cache_control_*` tests |
+| H8 | `static/`, and `/_blobs` with the `storage` feature | They serve build assets, or signed, expiring blob URLs. A folder that another process writes needs another mount. | `.nest(Router)` with `ServeDir` + `declare_plugin_routes` | `exports_*` tests |
 | H9 | `#[get]` handlers on `AppState` | The supplier code is plain Axum with its own state. | `Plugin` + `nest` + `declare_plugin_routes` | `supplier_*` tests |
-| H10 | Default error pages | The 404 page links only to `/`. Staff need a link to order an unknown SKU. | `.error_pages(..)` | `not_found_*` tests |
-| H11 | Default problem response | The query-timeout `503` has no `Retry-After`. | `.exception_filter(..)` | `retry_after_*` tests |
+| H10 | Default error pages | They use the framework look, with a link to `/`. Staff need the app frame, and a link to order an unknown SKU. | `.error_pages(..)` | `not_found_*` tests |
+| H11 | Default problem response | The query-timeout `503` has no `Retry-After`. The filter runs on each `AutumnError` response. | `.exception_filter(..)` | `retry_after_*` tests |
 | H12 | Default pool factory | A sidecar rotates the password in a file. | `.with_pool_provider(..)` | `password_file_*` tests |
 | H13 | `Markup` / `Json` return | There is no helper for `201 Created` with `Location`. | `impl IntoResponse` tuple | `checkout_returns_201_*` test |
+
+H6 and H13 are small: a config switch and a tuple response. They are in the
+list because each changes a default for a real reason.
 
 ## 7. Hatches not used here
 
 | Hatch | Why not here | Where it is shown |
 |---|---|---|
 | `with_config_loader` | `autumn.toml` and env vars cover this app. | `docs/guide/custom-subsystems.md` |
-| `with_session_store`, `with_cache_backend` | One process. The built-in stores are enough. | `autumn-cache-redis` |
+| `with_session_store` | The built-in stores (memory, Redis) are enough. | `docs/guide/custom-subsystems.md` |
+| `with_cache_backend` | One process. The built-in cache is enough. | `autumn-cache-redis` |
 | `with_blob_store` | No uploads. | `autumn-storage-s3` |
 | `with_telemetry_provider`, `with_channels_backend` | No need. | `docs/guide/custom-subsystems.md` |
 | `with_*_interceptor` (job, mail, DB, HTTP) | No jobs, mail, or outbound HTTP. | `docs/guide/middleware.md` |
 | `static_gate` | No static page cache. | `docs/guide/middleware.md` |
-| `.merge(Router)` | `merge` hides routes from `autumn routes audit`. `nest` + `declare_plugin_routes` does not. A test uses `merge` to show that raw routes get the app state and middleware. | `docs/guide/getting-started.md` |
+| `.merge(Router)` | `autumn routes audit` cannot list a merged router, so the audit fails. `nest` + `declare_plugin_routes` passes. A test uses `merge` to show that raw routes get the app state and middleware. | `docs/guide/getting-started.md` |
 | `on_startup` + raw SQL seed | No seed data. | `examples/react-graphql` |
 | `state_initializer` + extensions | No shared service. | `examples/media-room` |
 | Custom `FromRequestParts` | Built-in extractors are enough. | `docs/guide/extractors.md` |

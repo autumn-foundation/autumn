@@ -5,8 +5,9 @@
 //! timeout into a 503 (`autumn.query_timeout`), but it sends no
 //! `Retry-After`. Without it, clients retry at once and add load.
 //!
-//! An exception filter runs on every error response that the framework
-//! makes. This one adds the header where it is missing.
+//! An exception filter runs on each response that an `AutumnError` makes.
+//! This one adds the header where it is missing. (The report gate, H4, makes
+//! its own 503 and sets `Retry-After` itself.)
 
 use autumn_web::middleware::{AutumnErrorInfo, ExceptionFilter};
 use axum::http::{HeaderValue, StatusCode, header::RETRY_AFTER};

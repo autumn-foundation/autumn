@@ -19,16 +19,16 @@ brainstorming, and six thinking hats.
 | # | Convention first | Why it is not enough | Escape hatch | Where |
 |---|---|---|---|---|
 | — | `with_lock` per product | It is enough for one product. This is the baseline. | — | `src/api.rs` `reserve` |
-| H1 | `with_lock` | It locks one row. A cart needs all lines or none. | `Db::tx` + a guarded Diesel `UPDATE` per line | `src/api.rs` `checkout` |
-| H2 | Repository `update` per row | It writes absolute values. It can lose a concurrent sale. | One set-based Diesel `UPDATE` | `src/api.rs` `restock` |
-| H3 | Finders and aggregates | They cannot express a window function. | `diesel::sql_query` + `QueryableByName` | `src/reports.rs` |
-| H4 | `#[throttle]`, `timeout_ms` | They limit rate and time, not concurrent runs. | `#[intercept(ReportGate)]` (a custom tower layer) | `src/hatches/report_gate.rs` |
+| H1 | `with_lock` | It locks one row. A cart needs all lines or none. | `Db::tx` + a guarded Diesel `UPDATE` per line, with a safe retry | `src/api.rs` `checkout` |
+| H2 | Repository `update` per row | It writes absolute values. It can lose a concurrent sale. | One relative, set-based Diesel `UPDATE` | `src/api.rs` `restock` |
+| H3 | Finders, aggregates, Diesel's DSL | They cannot filter on a window function. | `diesel::sql_query` + `QueryableByName` | `src/reports.rs` |
+| H4 | `#[throttle]`, `timeout_ms`, `max_concurrent_requests`, `get_or_compute` | They limit rate, time, or the whole process, or join only equal keys. | `#[intercept(ReportGate)]` (a custom tower layer) | `src/hatches/report_gate.rs` |
 | H5 | Browser routes with no login | Scanners are machines with bearer tokens. | `.scoped("/api", RequireApiToken, ..)` | `src/lib.rs` |
 | H6 | CSRF on for every POST in `prod` | Scanners send no CSRF cookie. | `[security.csrf] exempt_paths` | `autumn.toml` |
-| H7 | `Cache-Control` only on `/static` | Live stock must not stay in a shared cache. | `.layer(SetResponseHeaderLayer)` | `src/hatches/cache_control.rs` |
-| H8 | `static/` file serving | It serves only build assets. Runtime files need another mount. | `.nest(..)` + `ServeDir` + `declare_plugin_routes` | `src/hatches/exports.rs` |
+| H7 | `Cache-Control` only on framework assets; `etag::cache_for` per handler | Live stock must not stay in a shared cache, on any response. | `.layer(SetResponseHeaderLayer)` | `src/hatches/cache_control.rs` |
+| H8 | `static/` and `/_blobs` | They serve build assets, or signed blob URLs. A folder that a job writes needs another mount. | `.nest(..)` + `ServeDir` + `declare_plugin_routes` | `src/hatches/exports.rs` |
 | H9 | `#[get]` handlers on `AppState` | The supplier code is plain Axum with its own state. | `Plugin` + `nest` + `declare_plugin_routes` | `src/hatches/supplier_plugin.rs`, `src/supplier.rs` |
-| H10 | Default error pages | An unknown SKU needs a link to order it. | `.error_pages(..)` | `src/hatches/error_pages.rs` |
+| H10 | Default error pages | They use the framework look. An unknown SKU needs a link to order it. | `.error_pages(..)` | `src/hatches/error_pages.rs` |
 | H11 | Default problem responses | The query-timeout 503 has no `Retry-After`. | `.exception_filter(..)` | `src/hatches/retry_after.rs` |
 | H12 | Default pool factory | A sidecar rotates the password in a file. | `.with_pool_provider(..)` | `src/hatches/password_file.rs` |
 | H13 | `Markup` / `Json` returns | There is no helper for `201 Created` with `Location`. | `impl IntoResponse` tuple | `src/api.rs` `checkout` |
@@ -77,17 +77,23 @@ curl -si http://127.0.0.1:3000/api/checkout -H "$T" -H "$J" -H "$A" \
 # => HTTP/1.1 201 Created
 #    location: /api/orders/o-100
 
+# H1: a retry of the same cart (a lost response) gets 200 and the same receipt.
+# It sells nothing.
+curl -si http://127.0.0.1:3000/api/checkout -H "$T" -H "$J" -H "$A" \
+  -d '{"order_ref":"o-100","lines":[{"sku":"HAM-1","quantity":2},{"sku":"SAW-1","quantity":1}]}' | head -1
+# => HTTP/1.1 200 OK
+
 # H1: a short line (a line with not enough stock) rolls back the whole cart.
 # HAM-1 keeps its stock.
 curl -s http://127.0.0.1:3000/api/checkout -H "$T" -H "$J" -H "$A" \
   -d '{"order_ref":"o-101","lines":[{"sku":"HAM-1","quantity":1},{"sku":"SAW-1","quantity":50}]}'
 # => {"type":"https://autumn.dev/problems/conflict",...,"detail":"not enough stock for SAW-1",...}
 
-# H2: add 10 to each tool, in one statement.
+# H2: add 10 to each tool, with one relative UPDATE.
 curl -s http://127.0.0.1:3000/api/restock -H "$T" -H "$J" -H "$A" -d '{"category":"tools","add":10}'
 # => {"category":"tools","updated":2}
 
-# H3: the top three products by stock value in each category.
+# H3: the top three products by stock value in each category. `?top=1` to `?top=10`.
 # (H4: a second call while one runs gets 503 with Retry-After: 1.)
 curl -s http://127.0.0.1:3000/reports/stock-value
 # => [{"category":"paint","sku":"PNT-RED",...,"rank":1},{"category":"tools","sku":"SAW-1",...},...]

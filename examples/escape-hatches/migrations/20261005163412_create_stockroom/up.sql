@@ -1,11 +1,12 @@
--- Products. The CHECK stops any write that makes stock negative.
+-- Products. The CHECKs stop each write that puts stock or price out of range.
+-- The limits keep `stock * price_cents` inside BIGINT.
 CREATE TABLE products (
     id          BIGSERIAL PRIMARY KEY,
     sku         TEXT   NOT NULL UNIQUE,
     name        TEXT   NOT NULL,
     category    TEXT   NOT NULL,
-    stock       INT    NOT NULL DEFAULT 0 CHECK (stock >= 0),
-    price_cents BIGINT NOT NULL CHECK (price_cents >= 0)
+    stock       INT    NOT NULL DEFAULT 0 CHECK (stock BETWEEN 0 AND 1000000),
+    price_cents BIGINT NOT NULL CHECK (price_cents BETWEEN 0 AND 100000000)
 );
 
 CREATE INDEX idx_products_category ON products (category);

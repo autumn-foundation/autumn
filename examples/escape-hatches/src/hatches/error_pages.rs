@@ -1,9 +1,12 @@
 //! H10: error pages that know the stockroom, with `.error_pages(..)`.
 //!
-//! Staff open `/products/{sku}` in a browser. If no product has that SKU, the
-//! default 404 page shows only the status and a link to `/`. To order the
-//! item, staff need the supplier catalog. This renderer adds a link to it, in
-//! the app's page frame.
+//! The default error pages use the framework's own look, with a link to `/`.
+//! This renderer puts each error page (an unknown route, a 409, a 500) in
+//! the app's page frame, with its navigation.
+//!
+//! It also helps with one case. Staff open `/products/{sku}` in a browser.
+//! If no product has that SKU, staff need the supplier catalog to order the
+//! item. So the 404 page for that path links to the SKU in the catalog.
 
 use autumn_web::error_pages::{ErrorContext, ErrorPageRenderer};
 use maud::{Markup, html};

@@ -1,12 +1,16 @@
 //! H4: one report at a time, as a per-route tower layer.
 //!
 //! The stock-value report reads every product. Ten parallel callers hold ten
-//! pool connections and slow every page. The framework has two related
-//! tools. Neither does this job:
+//! pool connections and slow every page. The framework has four related
+//! tools. None does this job:
 //!
 //! - `#[throttle]` limits each caller's request rate. It does not limit how
 //!   many reports run at once across all callers.
 //! - `timeout_ms` stops a slow request. It does not stop requests that pile up.
+//! - `server.max_concurrent_requests` limits the whole process. It also sheds
+//!   page loads and scanner calls, not only reports.
+//! - `cache::get_or_compute` runs one query for many callers of one key. Each
+//!   `top` value is a different key, so ten values still run ten scans.
 //!
 //! So `#[intercept(ReportGate)]` puts this layer on the report route only.
 //! The gate has one slot (a semaphore permit). When the slot is in use, a
