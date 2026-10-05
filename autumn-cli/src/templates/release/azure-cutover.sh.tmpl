@@ -334,10 +334,13 @@ restore_ingress() {
   fi
 }
 
-# Opens external ingress. On a later deploy with open ingress, nothing
-# changes, so the script sends nothing.
+# Opens external ingress. On a later deploy whose live ingress is open,
+# nothing changes, so the script sends nothing. The check reads the live
+# app, not the snapshot: after an interrupted first cutover, the snapshot
+# from the tags can say external while the app has no ingress.
 open_ingress() {
-  if [ -n "$RELEASED" ] && [ "$(jq -r '.external // false' <<< "$SAVED_INGRESS")" = true ]; then
+  if [ -n "$RELEASED" ] \
+    && [ "$(jq -r '.properties.configuration.ingress.external // false' <<< "$APP")" = true ]; then
     return 0
   fi
   set_ingress true
