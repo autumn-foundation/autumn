@@ -772,7 +772,7 @@ fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
         return Ok(());
     }
     diff::guard_plan(&plan, opts).map_err(|e| e.to_string())?;
-    if let Some(clash) = relation_clash(&plan, &other_relations) {
+    if let Some(clash) = relation_clash(&plan, &baseline_tables, &other_relations) {
         return Err(clash);
     }
 
@@ -884,13 +884,45 @@ fn replay_baseline(
     Ok(replayed)
 }
 
-/// The refusal for a plan target (a new or renamed table or index) that is
-/// already a view, sequence or other non-table relation in the replayed
-/// schema. They share one namespace, so the migration would fail.
+/// The refusal for a plan target (a new or renamed table or index) whose name
+/// is already taken. Tables, indexes, views, sequences and other relations
+/// share one namespace, so the migration would fail. Taken names are the
+/// baseline's tables and indexes plus `others` (the non-table relations of a
+/// `--dev-url` replay), less the names the plan frees first: the old name of a
+/// renamed table or index, and an index dropped just before its re-add.
 fn relation_clash(
     plan: &MigrationPlan,
+    baseline: &[Table],
     others: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
+    let added: std::collections::BTreeSet<&str> = plan
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::AddIndex { index, .. } => Some(index.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let freed: std::collections::BTreeSet<&str> = plan
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::RenameTable { from, .. } | SchemaChange::RenameIndex { from, .. } => {
+                Some(from.as_str())
+            }
+            SchemaChange::DropIndex { index, .. } if added.contains(index.name.as_str()) => {
+                Some(index.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let taken = |name: &str| {
+        !freed.contains(name)
+            && (others.contains(name)
+                || baseline
+                    .iter()
+                    .any(|t| t.name == name || t.indexes.iter().any(|i| i.name == name)))
+    };
     plan.changes.iter().find_map(|c| {
         let names: Vec<&String> = match c {
             // A new table brings its own indexes.
@@ -903,10 +935,10 @@ fn relation_clash(
             }
             _ => return None,
         };
-        let name = names.into_iter().find(|n| others.contains(*n))?;
+        let name = names.into_iter().find(|n| taken(n))?;
         Some(format!(
-            "`{name}` is already a view, sequence or other relation in the migrated \
-                 schema; choose another name"
+            "`{name}` is already a table, index, view, sequence or other relation in \
+             the schema; choose another name"
         ))
     })
 }
@@ -1400,24 +1432,66 @@ mod tests {
             "report",
             Backend::Postgres,
         )));
-        assert!(relation_clash(&create, &others).is_some_and(|e| e.contains("report")));
+        assert!(relation_clash(&create, &[], &others).is_some_and(|e| e.contains("report")));
         let rename = plan(SchemaChange::RenameTable {
             from: "old".to_owned(),
             to: "posts_id_seq".to_owned(),
         });
-        assert!(relation_clash(&rename, &others).is_some());
+        assert!(relation_clash(&rename, &[], &others).is_some());
         let mut with_index = autumn_schema_core::Table::new("new_table", Backend::Postgres);
         with_index.indexes.push(autumn_schema_core::Index::new(
             "report",
             vec!["id".to_owned()],
             false,
         ));
-        assert!(relation_clash(&plan(SchemaChange::CreateTable(with_index)), &others).is_some());
+        assert!(
+            relation_clash(&plan(SchemaChange::CreateTable(with_index)), &[], &others).is_some()
+        );
         let fine = plan(SchemaChange::RenameTable {
             from: "old".to_owned(),
             to: "new".to_owned(),
         });
-        assert_eq!(relation_clash(&fine, &others), None);
+        assert_eq!(relation_clash(&fine, &[], &others), None);
+    }
+
+    #[test]
+    fn a_new_index_named_like_a_baseline_index_on_another_table_is_refused() {
+        use autumn_schema_core::{Index, Table};
+        let mut audit = Table::new("audit", Backend::Postgres);
+        audit
+            .indexes
+            .push(Index::new("idx_reports_slug", vec!["x".to_owned()], false));
+        let baseline = vec![audit, Table::new("reports", Backend::Postgres)];
+        let none = std::collections::BTreeSet::new();
+        let add = |name: &str| SchemaChange::AddIndex {
+            table: "reports".to_owned(),
+            index: Index::new(name, vec!["slug".to_owned()], false),
+        };
+        let plan = |changes| MigrationPlan {
+            backend: Backend::Postgres,
+            changes,
+        };
+        let err =
+            relation_clash(&plan(vec![add("idx_reports_slug")]), &baseline, &none).expect("clash");
+        assert!(
+            err.contains("idx_reports_slug") && err.contains("already"),
+            "{err}"
+        );
+        // A table name is taken too.
+        assert!(relation_clash(&plan(vec![add("audit")]), &baseline, &none).is_some());
+        // A replaced index (dropped before its re-add) frees its name.
+        let replaced = plan(vec![
+            SchemaChange::DropIndex {
+                table: "audit".to_owned(),
+                index: Index::new("idx_reports_slug", vec!["x".to_owned()], false),
+            },
+            add("idx_reports_slug"),
+        ]);
+        assert_eq!(relation_clash(&replaced, &baseline, &none), None);
+        assert_eq!(
+            relation_clash(&plan(vec![add("idx_new")]), &baseline, &none),
+            None
+        );
     }
 
     #[test]

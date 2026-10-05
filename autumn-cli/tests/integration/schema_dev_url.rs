@@ -294,7 +294,7 @@ async fn schema_dev_url_refuses_a_new_table_named_like_a_replayed_view() {
         &["schema", "diff", "--backend", "pg", "--dev-url", &url],
     );
     assert_ne!(code, Some(0), "{err}");
-    assert!(err.contains("`reports` is already a view"), "{err}");
+    assert!(err.contains("`reports` is already a"), "{err}");
 
     // A standalone composite type shares the namespace too.
     std::fs::write(
@@ -311,5 +311,5 @@ async fn schema_dev_url_refuses_a_new_table_named_like_a_replayed_view() {
         &["schema", "diff", "--backend", "pg", "--dev-url", &url],
     );
     assert_ne!(code, Some(0), "{err}");
-    assert!(err.contains("`report_rows` is already a view"), "{err}");
+    assert!(err.contains("`report_rows` is already a"), "{err}");
 }

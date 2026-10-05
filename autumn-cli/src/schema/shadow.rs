@@ -170,8 +170,8 @@ fn transaction_control(sql: &str) -> Option<String> {
     None
 }
 
-/// `sql` with comments, `'...'` and `"..."` literals, and `$tag$...$tag$`
-/// bodies replaced by a space.
+/// `sql` with comments, `'...'`, `E'...'` and `"..."` literals, and
+/// `$tag$...$tag$` bodies replaced by a space.
 fn strip_sql_noise(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut rest = sql;
@@ -180,6 +180,12 @@ fn strip_sql_noise(sql: &str) -> String {
             rest.find('\n').unwrap_or(rest.len())
         } else if rest.starts_with("/*") {
             rest.find("*/").map_or(rest.len(), |i| i + 2)
+        } else if matches!(c, 'E' | 'e')
+            && rest[1..].starts_with('\'')
+            && !out.ends_with(|p: char| p.is_ascii_alphanumeric() || p == '_')
+        {
+            // A Postgres escape string: a backslash escapes the next character.
+            1 + escape_string_len(&rest[1..])
         } else if c == '\'' || c == '"' {
             crate::schema::rename::quoted_len(rest, c)
         } else if let Some(tag) = dollar_tag(rest) {
@@ -198,6 +204,26 @@ fn strip_sql_noise(sql: &str) -> String {
         }
     }
     out
+}
+
+/// The byte length of the escape-string body at the start of `s` (it starts at
+/// the opening `'`), through the closing quote. `\x` and `''` are escapes. An
+/// unclosed body runs to the end.
+fn escape_string_len(s: &str) -> usize {
+    let mut iter = s.char_indices().skip(1).peekable();
+    while let Some((i, c)) = iter.next() {
+        match c {
+            '\\' => {
+                iter.next();
+            }
+            '\'' if iter.peek().is_some_and(|&(_, n)| n == '\'') => {
+                iter.next();
+            }
+            '\'' => return i + 1,
+            _ => {}
+        }
+    }
+    s.len()
 }
 
 /// The dollar-quote opener (`$$` or `$tag$`) at the start of `s`, if any.
@@ -435,6 +461,7 @@ mod tests {
             "START TRANSACTION;",
             "ALTER TYPE s ADD VALUE 'x'; END;",
             "ROLLBACK",
+            "SELECT E'a\\'b'; COMMIT;",
         ] {
             assert!(transaction_control(sql).is_some(), "{sql}");
         }
@@ -448,6 +475,8 @@ mod tests {
              WHERE p = old.id; DELETE FROM d WHERE p = old.id; END;",
             "INSERT INTO t VALUES ('BEGIN; COMMIT;'); -- COMMIT;\n/* ROLLBACK; */",
             "CREATE TABLE t (id INT, \"commit\" TEXT);",
+            "SELECT E'it\\'s; COMMIT;';",
+            "SELECT e'\\\\'; SELECT 1;",
         ] {
             assert_eq!(transaction_control(sql), None, "{sql}");
         }
