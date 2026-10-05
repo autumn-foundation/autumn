@@ -279,7 +279,8 @@ fn conflicting_table_error(missing: &[&str], columns_unknown: bool) -> GenerateE
 }
 
 /// The first model file under `src/models` (or `src/models.rs`) with a
-/// `#[model]` struct on the `comments` table (#2283).
+/// `#[model]` struct on the `comments` table that lacks a shared column
+/// (#2283).
 ///
 /// The shared table needs `commentable_type`, `commentable_id` and
 /// `author_id` on each insert. A plain `Comment` model sets none of them.
@@ -320,13 +321,30 @@ fn maps_comments_table(source: &str) -> bool {
 /// [`maps_comments_table`] over `items`, inline modules included.
 fn items_map_comments_table(items: &[syn::Item]) -> bool {
     items.iter().any(|item| match item {
-        syn::Item::Struct(item) => model_table(item).is_some_and(|table| table == COMMENTS_TABLE),
+        // A model that declares every shared column writes the shared table
+        // correctly. Only one that lacks a column is stale.
+        syn::Item::Struct(item) => {
+            model_table(item).is_some_and(|table| table == COMMENTS_TABLE)
+                && !declares_every_shared_column(item)
+        }
         syn::Item::Mod(item) => item
             .content
             .as_ref()
             .is_some_and(|(_, items)| items_map_comments_table(items)),
         _ => false,
     })
+}
+
+/// Whether `item` has a field for each of [`REQUIRED_COLUMNS`].
+fn declares_every_shared_column(item: &syn::ItemStruct) -> bool {
+    let fields: Vec<String> = item
+        .fields
+        .iter()
+        .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+        .collect();
+    REQUIRED_COLUMNS
+        .iter()
+        .all(|column| fields.iter().any(|field| field == column))
 }
 
 /// The table of a `#[model]` struct, as the macro decides it. `None` when the
@@ -3670,6 +3688,18 @@ mod tests {
         assert_eq!(
             check("mod inner {\n#[autumn_web::model]\npub struct Comment { pub id: i64 }\n}\n"),
             Some(models.clone())
+        );
+        // A model with every shared column writes the shared table correctly.
+        let fields = REQUIRED_COLUMNS
+            .iter()
+            .map(|column| format!("pub {column}: i64"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            check(&format!(
+                "#[autumn_web::model]\npub struct Comment {{ {fields} }}\n"
+            )),
+            None
         );
     }
 }
