@@ -270,8 +270,9 @@ Rules for the node:
 
 - It does not follow redirects and does not use `HTTP(S)_PROXY`.
 - It removes hop-by-hop headers in both directions.
-- It is the first proxy. It replaces the client's `x-forwarded-*` headers
-  and removes `forwarded`.
+- It sets the forwarded headers before both lanes. It keeps them only from a
+  `--trusted-proxy` peer (a TLS terminator); for any other peer it is the
+  first proxy. It removes `forwarded`.
 - It refuses a path with a dot segment or a `\`.
 - It tunnels an `upgrade` request (WebSocket) to the origin.
 - It streams bodies to and from the origin. It runs the capsule on a

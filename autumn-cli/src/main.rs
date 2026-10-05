@@ -1037,6 +1037,10 @@ pub enum EdgeCommands {
         /// Also set this header on each edge response. Repeat it.
         #[arg(long = "response-header", value_name = "NAME: VALUE")]
         response_headers: Vec<String>,
+        /// Keep the `x-forwarded-*` headers from this peer (an address or a
+        /// CIDR range), for example your TLS terminator. Repeat it.
+        #[arg(long = "trusted-proxy", value_name = "IP|CIDR")]
+        trusted_proxies: Vec<String>,
         /// Do not write a line for each request.
         #[arg(long)]
         quiet: bool,
@@ -5194,6 +5198,7 @@ fn run_command(command: Commands) {
                 probe_path,
                 no_probe,
                 response_headers,
+                trusted_proxies,
                 quiet,
             } => edge::serve(&edge::ServeOptions {
                 capsule: &capsule,
@@ -5203,6 +5208,7 @@ fn run_command(command: Commands) {
                 probe_path: &probe_path,
                 no_probe,
                 response_headers: &response_headers,
+                trusted_proxies: &trusted_proxies,
                 quiet,
             }),
             EdgeCommands::Ttfb {
@@ -7503,6 +7509,8 @@ mod tests {
             "x-a: 1",
             "--response-header",
             "x-b: 2",
+            "--trusted-proxy",
+            "10.0.0.0/8",
         ])
         .unwrap();
         match cli.command {
@@ -7516,9 +7524,11 @@ mod tests {
                         probe_path,
                         no_probe,
                         response_headers,
+                        trusted_proxies,
                         quiet,
                     },
             } => {
+                assert_eq!(trusted_proxies, ["10.0.0.0/8"]);
                 assert_eq!(capsule, "target/wasm32-wasip1/release/edge-capsule.wasm");
                 assert_eq!(origin, "https://origin.example.com");
                 assert_eq!(listen, "127.0.0.1:8787");

@@ -15,9 +15,10 @@
 //! - **The node forwards requests exactly.** It does not follow redirects.
 //!   It does not use `HTTP(S)_PROXY`. It removes hop-by-hop headers in both
 //!   directions. It refuses a path with a dot segment (400).
-//! - **The node is the first proxy.** It replaces the client's
-//!   `x-forwarded-*` headers and removes `forwarded`. `host` is the
-//!   origin's host.
+//! - **Both lanes get the same forwarded headers.** [`EdgeNode`] sets them
+//!   before the capsule runs. It keeps them only from a [`TrustedProxy`];
+//!   for any other peer it is the first proxy. It removes `forwarded`.
+//!   `host` is the origin's host.
 //! - **Upgrades tunnel.** A WebSocket (or other `upgrade`) request goes to
 //!   the origin. On a 101, the node copies bytes both ways.
 //! - **Origin bodies stream.** The node does not hold a request or origin
@@ -160,10 +161,6 @@ impl Service<Request<Body>> for HttpOrigin {
 /// An upgrade request (WebSocket) keeps `connection` and `upgrade`. When the
 /// origin answers 101, the node joins the two connections.
 async fn forward(client: &reqwest::Client, base: &str, request: Request<Body>) -> Response<Body> {
-    let peer = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|info| info.0.ip());
     let (mut parts, body) = request.into_parts();
     let path = parts
         .uri
@@ -177,7 +174,7 @@ async fn forward(client: &reqwest::Client, base: &str, request: Request<Body>) -
     let client_upgrade = upgrade
         .as_ref()
         .and_then(|_| parts.extensions.remove::<hyper::upgrade::OnUpgrade>());
-    let mut headers = forwarded_headers(&parts.headers, peer);
+    let mut headers = forwarded_headers(&parts.headers);
     if let (Some(protocol), Some(_)) = (&upgrade, &client_upgrade) {
         headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         headers.insert(UPGRADE, protocol.clone());
@@ -264,31 +261,116 @@ impl HttpBody for SyncBody {
     }
 }
 
-/// The request headers the origin gets. The node is the first proxy, so it
-/// replaces the client's forwarded headers: `x-forwarded-for` is the peer,
-/// `x-forwarded-host` is the request `host`, `x-forwarded-proto` is `http`.
-/// It removes `forwarded`, `host` and the hop-by-hop headers.
-fn forwarded_headers(incoming: &HeaderMap, peer: Option<IpAddr>) -> HeaderMap {
+/// The request headers the origin gets: no hop-by-hop headers and no
+/// `host`. `x-forwarded-host` keeps the request `host` when it is not set.
+/// [`EdgeNode`] sets the other forwarded headers before both lanes.
+fn forwarded_headers(incoming: &HeaderMap) -> HeaderMap {
     let mut headers = incoming.clone();
     remove_hop_by_hop(&mut headers);
-    for name in [
-        X_FORWARDED_FOR,
-        X_FORWARDED_HOST,
-        X_FORWARDED_PROTO,
-        FORWARDED,
-    ] {
-        headers.remove(name);
-    }
-    if let Some(host) = headers.remove(HOST) {
+    if let Some(host) = headers.remove(HOST)
+        && !headers.contains_key(X_FORWARDED_HOST)
+    {
         headers.insert(X_FORWARDED_HOST, host);
     }
-    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("http"));
-    if let Some(peer) = peer
-        && let Ok(value) = HeaderValue::from_str(&peer.to_canonical().to_string())
+    headers
+}
+
+/// Set the forwarded headers for a request from `peer`.
+///
+/// From a trusted proxy, the node keeps `x-forwarded-host`, keeps an `http`
+/// or `https` `x-forwarded-proto`, and appends `peer` to `x-forwarded-for`.
+/// From any other peer, the node is the first proxy: `x-forwarded-for` is
+/// `peer`, `x-forwarded-host` is `host`, `x-forwarded-proto` is `http`. It
+/// always removes `forwarded`.
+fn set_forwarded_headers(headers: &mut HeaderMap, peer: Option<IpAddr>, trusted: bool) {
+    headers.remove(FORWARDED);
+    let chain: Vec<String> = if trusted {
+        headers
+            .get_all(X_FORWARDED_FOR)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let proto = headers
+        .get(X_FORWARDED_PROTO)
+        .filter(|value| trusted && matches!(value.as_bytes(), b"http" | b"https"))
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("http"));
+    let host = headers
+        .get(X_FORWARDED_HOST)
+        .filter(|_| trusted)
+        .or_else(|| headers.get(HOST))
+        .cloned();
+    for name in [X_FORWARDED_FOR, X_FORWARDED_HOST, X_FORWARDED_PROTO] {
+        headers.remove(name);
+    }
+    headers.insert(X_FORWARDED_PROTO, proto);
+    if let Some(host) = host {
+        headers.insert(X_FORWARDED_HOST, host);
+    }
+    let mut chain = chain;
+    if let Some(peer) = peer {
+        chain.push(peer.to_canonical().to_string());
+    }
+    if let Ok(value) = HeaderValue::from_str(&chain.join(", "))
+        && !chain.is_empty()
     {
         headers.insert(X_FORWARDED_FOR, value);
     }
-    headers
+}
+
+/// A peer whose forwarded headers the node keeps: an address or a CIDR range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedProxy {
+    network: IpAddr,
+    prefix: u32,
+}
+
+impl TrustedProxy {
+    /// Parse `10.0.0.5`, `10.0.0.0/8` or `fd00::/8`.
+    ///
+    /// # Errors
+    ///
+    /// [`NodeError::Config`] for a bad address or prefix.
+    pub fn parse(raw: &str) -> Result<Self, NodeError> {
+        let bad = || NodeError::Config(format!("`{raw}` is not an IP address or a CIDR range"));
+        let (address, prefix) = raw
+            .split_once('/')
+            .map_or((raw, None), |(a, p)| (a, Some(p)));
+        let network: IpAddr = address.trim().parse().map_err(|_| bad())?;
+        let bits = if network.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            Some(prefix) => prefix.trim().parse::<u32>().map_err(|_| bad())?,
+            None => bits,
+        };
+        if prefix > bits {
+            return Err(bad());
+        }
+        Ok(Self { network, prefix })
+    }
+
+    /// Whether `peer` is in this range.
+    #[must_use]
+    pub fn contains(&self, peer: IpAddr) -> bool {
+        match (self.network, peer.to_canonical()) {
+            (IpAddr::V4(network), IpAddr::V4(peer)) => {
+                let mask = u32::MAX
+                    .checked_shl(32u32.saturating_sub(self.prefix))
+                    .unwrap_or(0);
+                u32::from(network) & mask == u32::from(peer) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(peer)) => {
+                let mask = u128::MAX
+                    .checked_shl(128u32.saturating_sub(self.prefix))
+                    .unwrap_or(0);
+                u128::from(network) & mask == u128::from(peer) & mask
+            }
+            _ => false,
+        }
+    }
 }
 
 /// True when `path_and_query` starts with `/` and has no `.` or `..`
@@ -372,6 +454,7 @@ pub struct EdgeNode<O> {
     gateway: EdgeGateway<O>,
     access_log: Option<AccessLog>,
     capsules: Arc<Semaphore>,
+    trusted: Arc<[TrustedProxy]>,
 }
 
 impl<O: Clone> Clone for EdgeNode<O> {
@@ -380,6 +463,7 @@ impl<O: Clone> Clone for EdgeNode<O> {
             gateway: self.gateway.clone(),
             access_log: self.access_log.clone(),
             capsules: Arc::clone(&self.capsules),
+            trusted: Arc::clone(&self.trusted),
         }
     }
 }
@@ -390,6 +474,7 @@ impl<O> std::fmt::Debug for EdgeNode<O> {
             .field("gateway", &self.gateway)
             .field("access_log", &self.access_log.is_some())
             .field("max_capsules", &self.capsules.available_permits())
+            .field("trusted", &self.trusted)
             .finish()
     }
 }
@@ -403,7 +488,17 @@ impl<O> EdgeNode<O> {
             gateway,
             access_log: None,
             capsules: Arc::new(Semaphore::new(cpus)),
+            trusted: Arc::from(Vec::new()),
         }
+    }
+
+    /// Keep the forwarded headers from these peers, for example the TLS
+    /// terminator in front of the node. From any other peer, the node
+    /// replaces them.
+    #[must_use]
+    pub fn with_trusted_proxies(mut self, proxies: Vec<TrustedProxy>) -> Self {
+        self.trusted = Arc::from(proxies);
+        self
     }
 
     /// Run at most `max` capsules at the same time (at least 1).
@@ -445,7 +540,16 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Body>) -> Self::Future {
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        // Both lanes, the capsule and the origin, get the same forwarded
+        // headers.
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0.ip());
+        let trusted =
+            peer.is_some_and(|peer| self.trusted.iter().any(|proxy| proxy.contains(peer)));
+        set_forwarded_headers(request.headers_mut(), peer, trusted);
         let gateway = self.gateway.clone();
         let access_log = self.access_log.clone();
         let capsules = Arc::clone(&self.capsules);

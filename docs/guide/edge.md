@@ -543,6 +543,7 @@ For each request, the node does these steps:
 | `--probe-path` | `/` | the origin path for the header requests at start |
 | `--no-probe` | off | do not send the header requests |
 | `--response-header` | none | add `name: value` to each edge response; repeat it |
+| `--trusted-proxy` | none | an address or CIDR range whose `x-forwarded-*` headers the node keeps; repeat it |
 | `--quiet` | off | no line for each request |
 
 Rules:
@@ -558,10 +559,15 @@ Rules:
 - It removes hop-by-hop headers in both directions.
 - It sends an `upgrade` request (WebSocket) to the origin. When the origin
   answers `101`, the node copies bytes both ways until one side closes.
-- It is the first proxy. It replaces the client's forwarded headers:
-  `x-forwarded-for` is the client address, `x-forwarded-host` is the request
-  `host`, and `x-forwarded-proto` is `http`. It removes `forwarded`.
-  Configure the origin to trust the node as a proxy.
+- It sets the forwarded headers before the capsule and the origin get the
+  request, so both lanes see the same values. It removes `forwarded`.
+  - From a `--trusted-proxy` peer, it keeps `x-forwarded-host`, keeps an
+    `http` or `https` `x-forwarded-proto`, and appends the peer to
+    `x-forwarded-for`.
+  - From any other peer, it is the first proxy: `x-forwarded-for` is the
+    peer, `x-forwarded-host` is the request `host`, and
+    `x-forwarded-proto` is `http`.
+- Configure the origin to trust the node as a proxy.
 - It refuses a path with a `.` or `..` segment (also `%2e`) or a `\` with
   a `400`. An HTTP client resolves these segments, so the origin would get
   a different path.
@@ -574,7 +580,9 @@ Rules:
 - It stops on Ctrl-C or SIGTERM. Open requests then have 10 s to finish.
 
 The node serves plain HTTP. Put a TLS terminator or a load balancer in
-front of it. That server also limits slow clients and connection counts.
+front of it, and give its address with `--trusted-proxy`. Then the origin
+sees the client's scheme and address. That server also limits slow clients
+and connection counts.
 
 In Rust, the same node is `autumn_edge::node::EdgeNode` (feature `node`).
 

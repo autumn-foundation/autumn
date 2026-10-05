@@ -844,3 +844,142 @@ async fn an_upgrade_is_tunnelled_to_the_origin() {
         .expect("read");
     assert_eq!(&echo, b"ping");
 }
+
+/// The headers of each request an origin got.
+type HeaderLog = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
+/// A node in front of an in-process origin that records the headers the
+/// gateway gives it. The gateway gives the capsule the same request.
+async fn recording_node(trusted: &[&str]) -> (String, HeaderLog) {
+    use autumn_edge::node::TrustedProxy;
+
+    let seen = HeaderLog::default();
+    let sink = Arc::clone(&seen);
+    let origin = tower::service_fn(move |request: Request<Body>| {
+        let sink = Arc::clone(&sink);
+        async move {
+            sink.lock().unwrap_or_else(PoisonError::into_inner).push(
+                request
+                    .headers()
+                    .iter()
+                    .map(|(n, v)| (n.to_string(), v.to_str().unwrap_or("?").to_owned()))
+                    .collect(),
+            );
+            Ok::<_, std::convert::Infallible>(Response::new(Body::from("origin")))
+        }
+    });
+    let trusted = trusted
+        .iter()
+        .map(|raw| TrustedProxy::parse(raw).expect("valid proxy"))
+        .collect();
+    let node =
+        EdgeNode::new(EdgeGateway::new(declining_guest(), origin)).with_trusted_proxies(trusted);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let edge = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(serve(listener, node, std::future::pending()));
+    (edge, seen)
+}
+
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
+}
+
+#[tokio::test]
+async fn both_lanes_get_the_replaced_forwarded_headers() {
+    let (edge, seen) = recording_node(&[]).await;
+
+    client()
+        .get(format!("{edge}/x"))
+        .header("x-forwarded-for", "203.0.113.9")
+        .header("x-forwarded-host", "evil.example")
+        .header("x-forwarded-proto", "https")
+        .header("forwarded", "for=203.0.113.9")
+        .send()
+        .await
+        .expect("node answers");
+
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let [headers] = seen.as_slice() else {
+        panic!("the origin is asked once: {seen:?}");
+    };
+    assert_eq!(header(headers, "x-forwarded-for"), Some("127.0.0.1"));
+    assert_eq!(
+        header(headers, "x-forwarded-host"),
+        Some(edge.trim_start_matches("http://"))
+    );
+    assert_eq!(header(headers, "x-forwarded-proto"), Some("http"));
+    assert_eq!(header(headers, "forwarded"), None);
+}
+
+#[tokio::test]
+async fn a_trusted_proxy_keeps_its_forwarded_headers() {
+    let (edge, seen) = recording_node(&["127.0.0.0/8"]).await;
+
+    client()
+        .get(format!("{edge}/x"))
+        .header("x-forwarded-for", "203.0.113.9")
+        .header("x-forwarded-host", "shop.example")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .expect("node answers");
+
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let [headers] = seen.as_slice() else {
+        panic!("the origin is asked once: {seen:?}");
+    };
+    assert_eq!(
+        header(headers, "x-forwarded-for"),
+        Some("203.0.113.9, 127.0.0.1")
+    );
+    assert_eq!(header(headers, "x-forwarded-host"), Some("shop.example"));
+    assert_eq!(header(headers, "x-forwarded-proto"), Some("https"));
+}
+
+#[tokio::test]
+async fn a_trusted_proxy_cannot_set_a_bad_scheme() {
+    let (edge, seen) = recording_node(&["127.0.0.1"]).await;
+
+    client()
+        .get(format!("{edge}/x"))
+        .header("x-forwarded-proto", "javascript")
+        .send()
+        .await
+        .expect("node answers");
+
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(header(&seen[0], "x-forwarded-proto"), Some("http"));
+}
+
+#[test]
+fn a_trusted_proxy_is_an_address_or_a_cidr_range() {
+    use autumn_edge::node::TrustedProxy;
+    use std::net::IpAddr;
+
+    let ip = |raw: &str| raw.parse::<IpAddr>().unwrap();
+    let range = TrustedProxy::parse("10.0.0.0/8").unwrap();
+    assert!(range.contains(ip("10.1.2.3")));
+    assert!(!range.contains(ip("11.0.0.1")));
+    assert!(!range.contains(ip("::1")));
+    let one = TrustedProxy::parse("::1").unwrap();
+    assert!(one.contains(ip("::1")));
+    assert!(!one.contains(ip("::2")));
+    assert!(
+        TrustedProxy::parse("0.0.0.0/0")
+            .unwrap()
+            .contains(ip("8.8.8.8"))
+    );
+    assert!(
+        TrustedProxy::parse("fd00::/8")
+            .unwrap()
+            .contains(ip("fd12::1"))
+    );
+    for bad in ["", "10.0.0.0/33", "::/129", "nope", "10.0.0.0/x"] {
+        assert!(TrustedProxy::parse(bad).is_err(), "{bad}");
+    }
+}

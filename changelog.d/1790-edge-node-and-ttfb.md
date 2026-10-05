@@ -4,9 +4,10 @@
   the capsule from `autumn build` in front of a remote origin. It serves what
   the capsule serves and sends every other request to the origin over HTTP.
   At start it copies the origin's static security, CORS and CSP headers. It
-  does not follow redirects, removes hop-by-hop headers, replaces the
-  client's `x-forwarded-*` headers, refuses a path with a dot segment, and
-  tunnels WebSocket upgrades to the origin.
+  does not follow redirects, removes hop-by-hop headers, refuses a path with
+  a dot segment, and tunnels WebSocket upgrades to the origin. It replaces
+  the client's `x-forwarded-*` headers for both lanes, except from a
+  `--trusted-proxy` peer such as a TLS terminator.
   In Rust:
   `autumn_edge::node::EdgeNode` (feature `node`).
 - **edge:** `autumn edge ttfb` measures time to first byte at the edge node

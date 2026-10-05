@@ -12,7 +12,7 @@ use std::sync::Arc;
 use autumn_edge::InMemoryEdgeKv;
 use autumn_edge::gateway::{EdgeGateway, Lane, check_response_header};
 use autumn_edge::host::EdgeArtifact;
-use autumn_edge::node::{self, AccessEntry, EdgeNode, HttpOrigin, ttfb};
+use autumn_edge::node::{self, AccessEntry, EdgeNode, HttpOrigin, TrustedProxy, ttfb};
 use autumn_edge::reexports::http::{HeaderName, HeaderValue};
 
 /// Options for `autumn edge serve`.
@@ -24,6 +24,7 @@ pub struct ServeOptions<'a> {
     pub probe_path: &'a str,
     pub no_probe: bool,
     pub response_headers: &'a [String],
+    pub trusted_proxies: &'a [String],
     pub quiet: bool,
 }
 
@@ -53,6 +54,13 @@ fn parse_response_header(raw: &str) -> Result<(HeaderName, HeaderValue), String>
     let value = HeaderValue::from_str(value.trim())
         .map_err(|_| format!("the value of `{name}` is not a valid header value"))?;
     Ok((name, value))
+}
+
+/// The `--trusted-proxy` values.
+fn parse_trusted_proxies(raw: &[String]) -> Result<Vec<TrustedProxy>, String> {
+    raw.iter()
+        .map(|proxy| TrustedProxy::parse(proxy).map_err(|err| err.to_string()))
+        .collect()
 }
 
 /// A JSON object of string values, as the `kv` store.
@@ -132,6 +140,9 @@ pub fn serve(options: &ServeOptions<'_>) {
         );
     }
 
+    let trusted = parse_trusted_proxies(options.trusted_proxies)
+        .unwrap_or_else(|err| fail(EXIT_FAIL, &format!("--trusted-proxy: {err}")));
+
     let runtime = runtime();
     runtime.block_on(async {
         let mut headers = Vec::new();
@@ -157,7 +168,7 @@ pub fn serve(options: &ServeOptions<'_>) {
         let gateway = EdgeGateway::new(Arc::new(artifact), origin).with_response_headers(headers);
         let (gateway, kv_state) = with_kv_file(gateway, options.kv);
 
-        let mut edge_node = EdgeNode::new(gateway);
+        let mut edge_node = EdgeNode::new(gateway).with_trusted_proxies(trusted);
         if !options.quiet {
             edge_node = edge_node.with_access_log(|entry: &AccessEntry| {
                 println!(
@@ -343,6 +354,18 @@ mod tests {
         let err = parse_response_header("set-cookie: a=b").unwrap_err();
         assert!(err.contains("set-cookie"), "{err}");
         assert!(parse_response_header("content-length: 3").is_err());
+    }
+
+    #[test]
+    fn a_trusted_proxy_flag_is_an_address_or_a_range() {
+        assert_eq!(
+            parse_trusted_proxies(&["10.0.0.0/8".into(), "::1".into()])
+                .unwrap()
+                .len(),
+            2
+        );
+        let err = parse_trusted_proxies(&["nope".into()]).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[test]
