@@ -84,6 +84,32 @@ it is a no-op and the default in-process Moka cache stays in use.
 The URL follows the standard Redis URL format and is passed directly to the `redis` crate's
 connection manager.
 
+## Invalidation errors
+
+Invalidation retries a failed `DEL` with bounded, jittered backoff. The
+default is 3 attempts (two sleeps, about 90 ms at most). Change it with
+`RedisCache::with_invalidation_retry`:
+
+```rust,ignore
+use autumn_cache_redis::{InvalidationRetry, RedisCache};
+use std::time::Duration;
+
+let cache = RedisCache::from_config(&config.cache.redis)
+    .await?
+    .with_invalidation_retry(InvalidationRetry::new(
+        5,                          // attempts
+        Duration::from_millis(20),  // first sleep
+        Duration::from_millis(500), // sleep cap
+    ));
+```
+
+- `invalidate_async` and `invalidate_namespace_async` return the final error.
+  They are real async calls and work on any Tokio runtime.
+- The sync `invalidate` and `clear` cannot return an error. They log it with
+  `warn!` and count it in `autumn_cache_invalidation_failures_total`.
+- All sync methods, `invalidate` and `clear` included, use `block_in_place`.
+  They need a multi-thread Tokio runtime.
+
 ## Status
 
 This crate is the first-party Redis cache plugin for `autumn-web`. It targets the same
