@@ -124,21 +124,21 @@ The app finds `exports/` in the project folder, the same way it finds
 
 ### H12: the password from a file
 
-The Quick start already applied the migration. The migration cannot read the
-password file, so turn auto-migrate off.
-
 ```bash
 echo autumn > /tmp/db-password
 STOCKROOM_DB_PASSWORD_FILE=/tmp/db-password \
 AUTUMN_DATABASE__URL=postgres://autumn@localhost:5432/stockroom \
-AUTUMN_DATABASE__AUTO_MIGRATE=false \
 STOCKROOM_SCANNER_TOKEN=dev-scanner-token \
   cargo run -p escape-hatches
 ```
 
-The URL has no password. Each new connection reads the file. To rotate the
-password, write the new password to the file. New connections use it. You do
-not need to restart the app.
+The URL has no password. Each new pool connection reads the file. To rotate
+the password, write the new password to the file. New connections use it. You
+do not need to restart the app.
+
+The startup migration connects once, at boot, with the password that the file
+has then. The `autumn migrate` command does not start the app, so give it its
+own credential (for example, a libpq `PGPASSFILE`).
 
 ## Environment
 

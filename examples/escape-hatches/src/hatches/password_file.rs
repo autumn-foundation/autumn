@@ -19,19 +19,22 @@
 //! - A custom connect step replaces Autumn's own, which also sets up TLS.
 //!   This provider does not set up TLS, so it refuses a URL that asks for it.
 //!   It never drops TLS silently.
-//! - It builds only the primary pool. Autumn builds replica and shard pools
-//!   from their URLs, with no password file. So it refuses a replica or
-//!   shards.
-//! - Migrations do not use the pool. `autumn migrate` and auto-migrate
-//!   connect through libpq with `database.url`. Give them a credential of
-//!   their own, for example a libpq `PGPASSFILE`.
+//! - It builds the primary and the replica pool. Autumn builds each shard
+//!   pool from the shard's own URL, so the provider refuses shards.
+//! - Startup migrations do not use the pool. They connect once, at boot. The
+//!   provider gives them a URL with the password that the file has at boot
+//!   (`DatabaseTopology::with_migration_url`). The `autumn migrate` command
+//!   does not start the app, so give it a credential of its own, for example
+//!   a libpq `PGPASSFILE`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use autumn_web::RuntimeConnection;
 use autumn_web::config::DatabaseConfig;
-use autumn_web::db::{DatabasePoolProvider, PoolError};
+use autumn_web::db::{
+    DatabasePoolProvider, DatabaseTopology, DieselDeadpoolPoolProvider, PoolError,
+};
 use diesel::ConnectionError;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::pooled_connection::{
@@ -71,48 +74,86 @@ impl DatabasePoolProvider for PasswordFilePool {
         &self,
         config: &DatabaseConfig,
     ) -> Result<Option<Pool<RuntimeConnection>>, PoolError> {
-        let Some(file) = self.file.clone() else {
+        let Some(file) = &self.file else {
             return autumn_web::db::create_pool(config);
         };
-        if config.replica_url.is_some() || !config.shards.is_empty() {
+        let Some(url) = config.effective_primary_url() else {
+            return Ok(None);
+        };
+        build_pool(url, file, config.effective_primary_pool_size(), config).map(Some)
+    }
+
+    async fn create_topology(
+        &self,
+        config: &DatabaseConfig,
+    ) -> Result<Option<DatabaseTopology>, PoolError> {
+        let Some(file) = &self.file else {
+            return DieselDeadpoolPoolProvider.create_topology(config).await;
+        };
+        if !config.shards.is_empty() {
             return Err(refuse(
-                "PasswordFilePool builds only the primary pool; remove the replica and shards",
+                "PasswordFilePool does not build shard pools; remove the shards",
             ));
         }
         let Some(url) = config.effective_primary_url() else {
             return Ok(None);
         };
-        check_url(url).map_err(|reason| refuse(&reason))?;
-
-        let base_url = url.to_owned();
-        let mut manager_config = ManagerConfig::<AsyncPgConnection>::default();
-        manager_config.recycling_method = RecyclingMethod::Fast;
-        manager_config.custom_setup = Box::new(move |_| {
-            let base_url = base_url.clone();
-            let file = file.clone();
-            Box::pin(async move {
-                let password = tokio::fs::read_to_string(&file).await.map_err(|error| {
-                    ConnectionError::BadConnection(format!(
-                        "read password file {}: {error}",
-                        file.display()
-                    ))
-                })?;
-                let url = with_password(&base_url, password.trim_end_matches(['\r', '\n']))
-                    .map_err(ConnectionError::InvalidConnectionUrl)?;
-                AsyncPgConnection::establish(&url).await
-            })
-        });
-
-        let timeout = Duration::from_secs(config.connect_timeout_secs);
-        let manager = AsyncDieselConnectionManager::new_with_config(url, manager_config);
-        let pool = Pool::builder(manager)
-            .max_size(config.effective_primary_pool_size().max(1))
-            .wait_timeout(Some(timeout))
-            .create_timeout(Some(timeout))
-            .runtime(deadpool::Runtime::Tokio1)
-            .build()?;
-        Ok(Some(pool))
+        let primary = build_pool(url, file, config.effective_primary_pool_size(), config)?;
+        let replica = config
+            .replica_url
+            .as_deref()
+            .map(|replica| build_pool(replica, file, config.effective_replica_pool_size(), config))
+            .transpose()?;
+        let password = read_password(file).await.map_err(|error| refuse(&error))?;
+        let migration_url = with_password(url, &password).map_err(|error| refuse(&error))?;
+        Ok(Some(
+            DatabaseTopology::from_pools(primary, replica).with_migration_url(Some(migration_url)),
+        ))
     }
+}
+
+/// A pool whose connect step reads the password file each time.
+fn build_pool(
+    url: &str,
+    file: &Path,
+    size: usize,
+    config: &DatabaseConfig,
+) -> Result<Pool<RuntimeConnection>, PoolError> {
+    check_url(url).map_err(|reason| refuse(&reason))?;
+    let base_url = url.to_owned();
+    let file = file.to_path_buf();
+    let mut manager_config = ManagerConfig::<AsyncPgConnection>::default();
+    manager_config.recycling_method = RecyclingMethod::Fast;
+    manager_config.custom_setup = Box::new(move |_| {
+        let base_url = base_url.clone();
+        let file = file.clone();
+        Box::pin(async move {
+            let password = read_password(&file)
+                .await
+                .map_err(ConnectionError::BadConnection)?;
+            let url = with_password(&base_url, &password)
+                .map_err(ConnectionError::InvalidConnectionUrl)?;
+            AsyncPgConnection::establish(&url).await
+        })
+    });
+
+    let timeout = Duration::from_secs(config.connect_timeout_secs);
+    let manager = AsyncDieselConnectionManager::new_with_config(url, manager_config);
+    Ok(Pool::builder(manager)
+        .max_size(size.max(1))
+        .wait_timeout(Some(timeout))
+        .create_timeout(Some(timeout))
+        .runtime(deadpool::Runtime::Tokio1)
+        .build()?)
+}
+
+/// The password in `file`, with the line break at its end removed. An error
+/// names the file, never the password.
+async fn read_password(file: &Path) -> Result<String, String> {
+    let text = tokio::fs::read_to_string(file)
+        .await
+        .map_err(|error| format!("read password file {}: {error}", file.display()))?;
+    Ok(text.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 fn refuse(reason: &str) -> PoolError {
