@@ -2041,6 +2041,14 @@ impl Analyzer {
             }
             (Pat::Paren(p), _) => self.bind_init(&p.pat, init),
             (_, Expr::Paren(e)) => self.bind_init(pat, &e.expr),
+            // `let ref mut alias = repos;` is `let alias = &mut repos;`.
+            (Pat::Ident(p), _)
+                if p.subpat.is_none() && p.by_ref.is_some() && p.mutability.is_some() =>
+            {
+                let borrow: Expr = syn::parse_quote!(&mut #init);
+                let binding = self.binding_of(&borrow);
+                self.env.declare(p.ident.to_string(), binding);
+            }
             (Pat::Ident(p), _) if p.subpat.is_none() => {
                 let binding = self.binding_of(init);
                 self.env.declare(p.ident.to_string(), binding);
@@ -3318,11 +3326,13 @@ impl Analyzer {
         }
         // `Some(repo)`, `Ok(db)`, `Arc::new(repo)`, `PgPostRepository(pool)`:
         // these build a value that holds the handle and run no query. Any
-        // other uppercase callee may be a user type that runs queries. An
-        // awaited constructor is an `async fn`, which can run queries.
-        if is_container_constructor(call)
-            || is_smart_pointer_new(call)
-            || (is_handle_constructor(call) && !awaited)
+        // other uppercase callee may be a user type that runs queries. No
+        // std constructor gives a future, so an awaited one is a user
+        // `async fn`, which can run queries.
+        if !awaited
+            && (is_container_constructor(call)
+                || is_smart_pointer_new(call)
+                || is_handle_constructor(call))
         {
             return cost;
         }
@@ -3938,9 +3948,13 @@ impl Analyzer {
             }
         }
         let params = pattern_names(c.inputs.iter());
-        if tokens_mention_any(&c.body.to_token_stream(), &|name| {
-            !params.iter().any(|p| p == name) && self.env.is_tracked(name)
-        }) {
+        let mut free = FreeNames {
+            scopes: vec![c.inputs.iter().flat_map(bound_names).collect()],
+            tracked: &|name| self.env.is_tracked(name),
+            found: false,
+        };
+        free.visit_expr(&c.body);
+        if free.found {
             return true;
         }
         let mut accessors = Accessors {
@@ -5050,6 +5064,93 @@ fn pattern_names<'a>(pats: impl Iterator<Item = &'a Pat>) -> Vec<String> {
     for pat in pats {
         names.visit_pat(pat);
     }
+    names.0
+}
+
+/// Finds a tracked name that a closure body reads from outside: a local
+/// `let`, a match arm, a `for` pattern or a nested closure parameter
+/// shadows the outer name. An `if let` binding does not shadow, so the
+/// result can over-count. A macro is read as tokens.
+struct FreeNames<'t> {
+    scopes: Vec<Vec<String>>,
+    tracked: &'t dyn Fn(&str) -> bool,
+    found: bool,
+}
+
+impl FreeNames<'_> {
+    fn is_free(&self, name: &str) -> bool {
+        !self
+            .scopes
+            .iter()
+            .any(|scope| scope.iter().any(|n| n == name))
+            && (self.tracked)(name)
+    }
+
+    fn scoped(&mut self, names: Vec<String>, body: impl FnOnce(&mut Self)) {
+        self.scopes.push(names);
+        body(self);
+        self.scopes.pop();
+    }
+}
+
+impl<'a> Visit<'a> for FreeNames<'_> {
+    fn visit_expr_path(&mut self, p: &'a syn::ExprPath) {
+        if p.qself.is_none()
+            && let Some(name) = p.path.get_ident()
+        {
+            self.found |= self.is_free(&name.to_string());
+        }
+    }
+    fn visit_macro(&mut self, m: &'a syn::Macro) {
+        self.found |= tokens_mention_any(&m.tokens, &|name| self.is_free(name));
+    }
+    fn visit_block(&mut self, b: &'a Block) {
+        self.scoped(Vec::new(), |s| syn::visit::visit_block(s, b));
+    }
+    // The initializer reads the outer name. The pattern shadows it after.
+    fn visit_local(&mut self, l: &'a syn::Local) {
+        if let Some(init) = &l.init {
+            self.visit_expr(&init.expr);
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+        let names = bound_names(&l.pat);
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.extend(names);
+        }
+    }
+    // A guard is part of the arm pattern, and it sees the arm's names.
+    fn visit_arm(&mut self, a: &'a syn::Arm) {
+        self.scoped(bound_names(&a.pat), |s| {
+            s.visit_pat(&a.pat);
+            s.visit_expr(&a.body);
+        });
+    }
+    fn visit_expr_for_loop(&mut self, f: &'a syn::ExprForLoop) {
+        self.visit_expr(&f.expr);
+        self.scoped(bound_names(&f.pat), |s| s.visit_block(&f.body));
+    }
+    fn visit_expr_closure(&mut self, c: &'a syn::ExprClosure) {
+        let names = c.inputs.iter().flat_map(bound_names).collect();
+        self.scoped(names, |s| s.visit_expr(&c.body));
+    }
+}
+
+/// The names a pattern binds. Unlike `pattern_names`, it does not read
+/// the expressions in a pattern (a guard), so a closure parameter in a
+/// guard does not shadow an outer name.
+fn bound_names(pat: &Pat) -> Vec<String> {
+    struct Names(Vec<String>);
+    impl<'a> Visit<'a> for Names {
+        fn visit_pat_ident(&mut self, p: &'a syn::PatIdent) {
+            self.0.push(p.ident.to_string());
+            syn::visit::visit_pat_ident(self, p);
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let mut names = Names(Vec::new());
+    names.visit_pat(pat);
     names.0
 }
 
@@ -10134,6 +10235,74 @@ mod tests {
                 "async fn h((repo, n): (PgPostRepository, i64)) -> AutumnResult<usize> { \
                  let _ = n; let _ = repo.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn ref_mut_aliases_shadowed_captures_and_awaited_constructors() {
+        check_handlers(&[
+            (
+                "a ref mut binding is a mutable alias",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = Vec::new(); { let ref mut alias = repos; alias.push(repo); } \
+                 let _ = repos[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a ref mut match arm is a mutable alias",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = Vec::new(); match repos { ref mut alias => alias.push(repo) } \
+                 let _ = repos[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a closure local shadows an outer handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let callback = || { let repo = 1; repo }; render(callback); let _ = repo; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a nested closure parameter shadows an outer handle",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let callback = || ids.iter().map(|repo| repo + 1).count(); render(callback); let _ = repo; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a closure that reads the handle before it shadows it",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let callback = || { let n = repo.len(); let repo = 1; n + repo }; render(callback); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a let initializer reads the outer handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let callback = || { let repo = repo; repo }; render(callback); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a macro in a closure names the handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let callback = || vec![repo.clone()]; render(callback); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an awaited smart-pointer new is a user function",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let _ = Arc::new(&repo).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an awaited Some is a user function",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let _ = Some(&repo).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a smart-pointer new that is not awaited stays free",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let shared = Arc::new(repo); let _ = shared; Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }

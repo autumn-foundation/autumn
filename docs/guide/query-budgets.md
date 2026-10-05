@@ -223,9 +223,10 @@ negative ships an N+1 to production.
 - **An associated function handed the handle** — `Post::published(&mut db)`.
   It has the same shape as `ReportBuilder::build(&mut db)`, which can issue any
   number of queries. Put `#[query_cost(1)]` on the statement that calls a
-  one-query finder. An awaited constructor of a handle type
-  (`PgPostRepository::new(&mut db).await`) is reported too: an `async fn` can
-  run queries. This is also true when the `.await` comes later
+  one-query finder. An awaited constructor
+  (`PgPostRepository::new(&mut db).await`, `Arc::new(&repo).await`) is
+  reported too. No std constructor gives a future, so it is an `async fn`,
+  and an `async fn` can run queries. This is also true when the `.await` comes later
   (`let pending = PgPostRepository::new(&mut db); pending.await`). An
   `.await` on any value that holds a handle is reported, unless the value is
   a query or accessor on a handle, a call, or an `async` block.
