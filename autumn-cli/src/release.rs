@@ -3189,7 +3189,7 @@ previous_secrets = []
             .0;
         for field in [
             "type: \"None\"",
-            "map_values(null)) as $drop",
+            "if . == {} then {($id): null} else . end) as $drop",
             "select((.identity // \"\" | ascii_downcase) != $lid)",
             r#"IN("database-url", "signing-secret", "redis-url") | not"#,
             "\"AUTUMN_DATABASE__PRIMARY_URL\", \"AUTUMN_SECURITY__SIGNING_SECRET\"",

@@ -151,7 +151,11 @@ remove_credentials() {
     | ($app.identity.type // "None") as $type
     | ($app.identity.userAssignedIdentities // {}) as $ids
     | ($ids | with_entries(select(.key | ascii_downcase != $lid)) | map_values({})) as $own
-    | ($ids | with_entries(select(.key | ascii_downcase == $lid)) | map_values(null)) as $drop
+    # The snapshot can predate the cutover, so it can lack the job identity.
+    # Merge-patch keeps an omitted key, so the body always names it: with
+    # the app spelling if the snapshot has one, else as the job spells it.
+    | ($ids | with_entries(select(.key | ascii_downcase == $lid)) | map_values(null)
+       | if . == {} then {($id): null} else . end) as $drop
     | {location: $app.location,
        identity: (if $own != {} then {type: $type, userAssignedIdentities: ($drop + $own)}
                   elif ($type | test("SystemAssigned")) then {type: "SystemAssigned", userAssignedIdentities: null}
