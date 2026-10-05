@@ -2323,8 +2323,10 @@ impl Analyzer {
             Expr::Paren(p) => self.referents_of(&p.expr),
             Expr::Group(g) => self.referents_of(&g.expr),
             Expr::Reference(r) if r.mutability.is_some() => {
+                // `&mut *slots.get_mut(0).unwrap()`: a reborrow of a
+                // temporary borrows what the temporary borrows.
                 let Some(root) = place_root(&r.expr) else {
-                    return Vec::new();
+                    return self.referents_of(place_base(&r.expr));
                 };
                 let through = self.env.binding(&root).referents;
                 if through.is_empty() {
@@ -3019,15 +3021,19 @@ impl Analyzer {
             Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
                 let closure = immediately_invoked_closure(&call.func)
                     .expect("guarded by the match arm above");
-                let mut cost = Cost::ZERO;
-                for arg in &call.args {
-                    cost = cost.then(self.cost_of(arg));
-                }
-                let params: Vec<Kind> = call.args.iter().map(|a| self.value_of(a)).collect();
+                // Each parameter takes its argument as it was when it ran:
+                // a later argument may change what an earlier one read.
                 // `(|slot| slot.push(repo))(&mut list)`: each parameter
                 // borrows what its argument borrows.
-                self.param_referents_each =
-                    call.args.iter().map(|a| self.referents_of(a)).collect();
+                let mut cost = Cost::ZERO;
+                let mut params = Vec::new();
+                let mut borrows = Vec::new();
+                for arg in &call.args {
+                    cost = cost.then(self.cost_of(arg));
+                    params.push(self.value_of(arg));
+                    borrows.push(self.referents_of(arg));
+                }
+                self.param_referents_each = borrows;
                 Flow::cost(cost.then(self.closure_body(closure, &params, Kind::Plain)))
             }
             Expr::Call(call) => Flow::cost(self.call(call, awaited)),
@@ -3806,7 +3812,11 @@ impl Analyzer {
         // `slots.iter_mut().for_each(|t| …)`: a parameter borrows into the
         // place the receiver borrows.
         let borrows = self.referents_of(&method.receiver);
+        let mut reads = Vec::new();
         for (i, arg) in method.args.iter().enumerate() {
+            if i > 0 {
+                reads.push(self.env.clone());
+            }
             let callback = takes_callback && (every || i == last);
             let param = self.side_param(method, i).unwrap_or(param);
             self.param_referents.clone_from(&borrows);
@@ -3821,6 +3831,7 @@ impl Analyzer {
             self.param_referents.clear();
             cost = cost.then(next);
         }
+        self.keep_reads(reads);
         cost
     }
 
@@ -12567,6 +12578,29 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); let mut slots = vec![None]; \
                  slots[{ source = None; 0 }] = source; \
+                 slots[0].as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a later method argument does not erase what an earlier one gained",
+                "async fn h(repo: PgPostRepository, sink: Sink) -> AutumnResult<usize> { \
+                 let mut source = Vec::new(); \
+                 sink.consume({ source.push(repo); source.pop().unwrap() }, { source.clear() }).await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an invoked closure takes each argument as it ran",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Vec::new(); \
+                 (|r, _| async move { r.find_all().await })\
+                 ({ source.push(repo); source.pop().unwrap() }, { source.clear() }).await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an explicit reborrow points to its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; \
+                 { let target = &mut *slots.get_mut(0).unwrap(); *target = Some(repo); } \
                  slots[0].as_ref().unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
