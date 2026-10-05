@@ -105,7 +105,7 @@ refuses a model whose table is `comments`. Use a different name, for example
 
 After you add the columns, the `Comment` migration creates the shared table.
 `autumn destroy` refuses to remove `Comment` while another model is
-`#[commentable]` and no other migration creates the shared table.
+`#[commentable]` and the generator did not write a separate shared migration.
 
 ### Why `commentable_id` has no foreign key
 

@@ -161,19 +161,6 @@ pub fn already_migrated(project_root: &Path) -> bool {
     matches!(comments_table(project_root), CommentsTable::Shared)
 }
 
-/// Whether one migration, read alone, creates the whole shared table.
-///
-/// False for an adopted table: a plain `CREATE TABLE` plus a later `ALTER`.
-/// Then the plain migration is the foundation, and `destroy` must keep it.
-#[must_use]
-pub fn a_migration_creates_the_shared_table(project_root: &Path) -> bool {
-    migration_up_sql(project_root).into_iter().any(|sql| {
-        replay_migration_history(&[sql])
-            .get(&TableRef::comments())
-            .is_some_and(|table| table.exists && table.missing_columns().is_empty())
-    })
-}
-
 /// The `comments` table the migration history leaves behind.
 #[derive(Debug, PartialEq, Eq)]
 enum CommentsTable {
@@ -1268,8 +1255,11 @@ fn commentable_declared_below(dir: &Path, destroying_path: &Path) -> bool {
 
 /// Whether some migration's `up.sql` is byte-identical to what [`up_sql`]
 /// emits for `backend` — i.e. this generator wrote it.
+///
+/// `destroy` of a `Comment` model also asks this (#2283): only such a
+/// migration is sure to be a separate one that creates the shared table.
 #[must_use]
-fn generator_owned_comments_migration(
+pub fn generator_owned_comments_migration(
     project_root: &Path,
     backend: autumn_web::config::DatabaseBackend,
 ) -> bool {

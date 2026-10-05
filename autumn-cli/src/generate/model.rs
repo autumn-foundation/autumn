@@ -356,12 +356,12 @@ fn plan_model_with_options_impl(
     }
     // The other way round: a `comments` table adopted as the shared one still
     // starts with this model's `CREATE TABLE`. Removing it breaks every other
-    // `#[commentable]` model on a fresh database. When a separate migration
-    // creates the shared table, this model's migration is not needed.
+    // `#[commentable]` model on a fresh database. When the generator wrote a
+    // separate shared migration, this model's migration is not needed.
     if for_revert
         && table == super::commentable::COMMENTS_TABLE
         && super::commentable::another_model_is_still_commentable(project_root, &snake_name)
-        && !super::commentable::a_migration_creates_the_shared_table(project_root)
+        && !super::commentable::generator_owned_comments_migration(project_root, backend)
     {
         return Err(GenerateError::Config(format!(
             "cannot destroy `{pascal_name}`: other `#[commentable]` models use its \
@@ -7740,6 +7740,40 @@ autumn-web = \"0.3\"\n";
                 &ModelOptions::default(),
             )
             .is_ok()
+        );
+    }
+
+    /// A `Comment` migration that declares every shared column is still the
+    /// only `CREATE TABLE comments`. `destroy` would remove it, so refuse.
+    #[test]
+    fn a_comment_model_revert_is_refused_when_its_own_migration_is_the_shared_table() {
+        let tmp = project();
+        let own = tmp.path().join("migrations/20260101000000_create_comments");
+        fs::create_dir_all(&own).unwrap();
+        fs::write(
+            own.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, commentable_type TEXT NOT NULL, \
+             commentable_id BIGINT NOT NULL, parent_id BIGINT, author_id BIGINT NOT NULL, \
+             body TEXT NOT NULL, created_at TIMESTAMP NOT NULL, deleted_at TIMESTAMP);\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+        fs::write(
+            tmp.path().join("src/models/post.rs"),
+            "#[commentable]\npub struct Post {}\n",
+        )
+        .unwrap();
+
+        assert!(
+            plan_model_with_options_for_revert(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into()],
+                "20260101000000",
+                &ModelOptions::default(),
+            )
+            .is_err(),
+            "the migration `destroy` removes is the only shared table"
         );
     }
 }
