@@ -1018,8 +1018,8 @@ enum Kind {
     /// `Vec<PgPostRepository>`. A known container method on it is not a
     /// query. Its parts are handles (see `Analyzer::expr_is_carrier`).
     Carrier,
-    /// A user value that holds a handle: `Ctx { repo }`. Its parts are
-    /// handles, and every method on it is reported.
+    /// A user value that holds a handle: `Ctx { repo }`. Every method on it
+    /// is reported. A part is what its literal recorded, or else `Nested`.
     Holder,
     /// A database handle.
     Handle,
@@ -1037,9 +1037,10 @@ impl Kind {
     const fn element(self) -> Self {
         match self {
             Self::Plain => Self::Plain,
-            Self::Carrier | Self::Holder | Self::Handle => Self::Handle,
+            Self::Carrier | Self::Handle => Self::Handle,
             Self::LazyDb => Self::LazyDb,
-            Self::Nested => Self::Nested,
+            // A part of a user value may itself be a container.
+            Self::Holder | Self::Nested => Self::Nested,
         }
     }
 
@@ -1362,7 +1363,12 @@ impl Analyzer {
             }
             // rustc checks the annotation. A type made only of standard and
             // primitive types cannot hold a handle.
-            Pat::Type(p) if type_is_plain_std(&p.ty) => self.bind_pat(&p.pat, Kind::Plain),
+            Pat::Type(p) if type_is_plain_std(&p.ty) => {
+                self.bind_pat(&p.pat, Kind::Plain);
+                if let Pat::Ident(id) = &*p.pat {
+                    self.env.set_shape(&id.ident.to_string(), type_shape(&p.ty));
+                }
+            }
             Pat::Type(p) => {
                 self.bind_pat(&p.pat, kind.max(type_kind(&p.ty)));
                 if let Pat::Ident(id) = &*p.pat {
@@ -1426,6 +1432,29 @@ impl Analyzer {
             return;
         }
         match (pat, init) {
+            // `let Ctx { repos } = Ctx { repos: vec![repo] };`: field by field.
+            (Pat::Struct(p), Expr::Struct(e)) => {
+                let rest = self.value_of(init).element();
+                for field in &p.fields {
+                    let name = member_name(&field.member);
+                    match e.fields.iter().find(|f| member_name(&f.member) == name) {
+                        Some(value) => self.bind_init(&field.pat, &value.expr),
+                        None => self.bind_pat(&field.pat, rest),
+                    }
+                }
+            }
+            // A struct pattern over a name with recorded parts.
+            (Pat::Struct(p), _) if path_ident(init).is_some() => {
+                let name = path_ident(init).unwrap_or_default();
+                let rest = self.value_of(init).element();
+                for field in &p.fields {
+                    let kind = self
+                        .env
+                        .part(&name, &member_name(&field.member))
+                        .unwrap_or(rest);
+                    self.bind_pat(&field.pat, kind);
+                }
+            }
             (Pat::Paren(p), _) => self.bind_init(&p.pat, init),
             (_, Expr::Paren(e)) => self.bind_init(pat, &e.expr),
             (Pat::Ident(p), _) if p.subpat.is_none() => {
@@ -2272,12 +2301,19 @@ impl Analyzer {
     fn method_args(&mut self, method: &ExprMethodCall) -> Cost {
         let name = method.method.to_string();
         let is_transaction = TRANSACTION_METHODS.contains(&name.as_str());
-        let runs_once = is_transaction || AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str());
+        // Only an `Option` or a `Result` is known to call its closure at most
+        // once; a user type's `unwrap_or_else` may call it many times.
+        let runs_once = is_transaction
+            || (AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str())
+                && matches!(
+                    self.shape_of(&method.receiver),
+                    Some(Shape::Opt | Shape::Res)
+                ));
         // A closure handed to a method on a carrier takes its elements:
         // `repos.iter().for_each(|r| …)`.
         let param = if is_transaction {
             Kind::Handle
-        } else if self.expr_is_nested(&method.receiver) {
+        } else if self.expr_is_nested(&method.receiver) || self.expr_is_holder(&method.receiver) {
             Kind::Nested
         } else if self.expr_is_carrier(&method.receiver) {
             Kind::Handle
@@ -2577,11 +2613,14 @@ impl Analyzer {
             Expr::RawAddr(r) => self.expr_is_nested(&r.expr),
             Expr::Paren(p) => self.expr_is_nested(&p.expr),
             Expr::Group(g) => self.expr_is_nested(&g.expr),
-            Expr::Field(f) => self
-                .part_kind(f)
-                .map_or_else(|| self.expr_is_nested(&f.base), |k| k == Kind::Nested),
-            Expr::Index(i) => self.expr_is_nested(&i.expr),
-            Expr::Try(t) => self.expr_is_nested(&t.expr),
+            // A part of a user value with no recorded parts may itself be a
+            // container.
+            Expr::Field(f) => self.part_kind(f).map_or_else(
+                || self.expr_is_nested(&f.base) || self.expr_is_holder(&f.base),
+                |k| k == Kind::Nested,
+            ),
+            Expr::Index(i) => self.expr_is_nested(&i.expr) || self.expr_is_holder(&i.expr),
+            Expr::Try(t) => self.expr_is_nested(&t.expr) || self.expr_is_holder(&t.expr),
             // Any part of a nested value, the result of a user method on a
             // holder, or a mapping whose closure gives containers or user
             // values (`map(|r| Ctx { repo: r })`): its shape is not known.
@@ -2636,10 +2675,27 @@ impl Analyzer {
         for input in &closure.inputs {
             probe.bind_pat(input, Kind::Handle);
         }
-        matches!(
-            probe.value_of(&closure.body),
-            Kind::Carrier | Kind::Holder | Kind::Nested
-        )
+        let output = match &*closure.body {
+            Expr::Block(b) => probe.block_value(&b.block),
+            body => probe.value_of(body),
+        };
+        matches!(output, Kind::Carrier | Kind::Holder | Kind::Nested)
+    }
+
+    /// Run a block's statements, then give what its tail expression holds.
+    fn block_value(&mut self, block: &Block) -> Kind {
+        self.scoped(|s| {
+            let mut kind = Kind::Plain;
+            for (i, stmt) in block.stmts.iter().enumerate() {
+                match stmt {
+                    Stmt::Expr(tail, None) if i + 1 == block.stmts.len() => kind = s.value_of(tail),
+                    _ => {
+                        s.stmt(stmt);
+                    }
+                }
+            }
+            kind
+        })
     }
 
     /// Is `e` a user value that holds a handle (`Ctx { repo }`)? Its methods
@@ -6078,11 +6134,13 @@ mod tests {
                 "let mut deps = (Vec::new(), 1); deps.0 = repo; let _ = deps.0.find_all();",
                 Expect::Exact(1),
             ),
+            // The parts of `st` are not known, so the part is opaque: the
+            // query is reported rather than counted.
             (
                 "a handle assigned into a nested field",
                 "let mut st = State::default(); st.inner.repo = repo; \
                  let _ = st.inner.repo.find_all();",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
                 "json! naming a handle without await",
@@ -6370,6 +6428,40 @@ mod tests {
                 "map closure producing user values",
                 "let contexts = vec![repo].into_iter().map(|r| Ctx { repo: r }).collect::<Vec<_>>(); \
                  let _ = contexts[0].clear();",
+                Expect::Unbounded,
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    #[test]
+    fn nested_values_survive_blocks_patterns_and_callbacks() {
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "block-bodied map closure",
+                "let contexts = vec![repo].into_iter() \
+                     .map(|r| { let ctx = Ctx { repo: r }; ctx }).collect::<Vec<_>>(); \
+                 let _ = contexts[0].clear();",
+                Expect::Unbounded,
+            ),
+            (
+                "struct pattern over a struct literal",
+                "let Ctx { repos } = Ctx { repos: vec![repo] }; let _ = repos.refresh_all();",
+                Expect::Unbounded,
+            ),
+            (
+                "tuple-struct pattern over a user value",
+                r#"#[query_exempt(reason = "wraps only")]
+                   let ctx = Ctx(vec![repo]);
+                   let Ctx(repos) = ctx;
+                   let _ = repos.refresh_all();"#,
+                Expect::Unbounded,
+            ),
+            // `runner` is not known to be an `Option` or a `Result`, so its
+            // `unwrap_or_else` may call the closure many times.
+            (
+                "at-most-once name on an unknown receiver",
+                "let _ = runner.unwrap_or_else(|| repo.find_all());",
                 Expect::Unbounded,
             ),
         ];
