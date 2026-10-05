@@ -530,18 +530,23 @@ async fn password_file_refuses_urls_it_cannot_rewrite() {
     }
 }
 
-/// H12: the provider builds only the primary pool. It refuses a replica,
-/// because Autumn would build the replica pool with no password file.
+/// H12: the provider refuses shards. Autumn builds each shard pool from its
+/// own URL, with no password file.
 #[tokio::test]
-async fn password_file_refuses_a_replica() {
+async fn password_file_refuses_shards() {
+    use autumn_web::config::ShardConfig;
     use autumn_web::db::DatabasePoolProvider;
 
     let mut config = password_file_config("postgres://app@db/app");
-    config.replica_url = Some("postgres://app@replica/app".to_owned());
+    config.shards = vec![ShardConfig {
+        name: "s0".to_owned(),
+        primary_url: "postgres://app@shard0/app".to_owned(),
+        ..ShardConfig::default()
+    }];
     let result = PasswordFilePool::new("/run/secrets/db-password")
-        .create_pool(&config)
+        .create_topology(&config)
         .await;
-    assert!(result.is_err(), "a replica must be refused");
+    assert!(result.is_err(), "shards must be refused");
 }
 
 // ── Postgres tier (Docker) ──────────────────────────────────────────────
@@ -1172,4 +1177,35 @@ async fn report_refuses_a_bad_top() {
             response.status
         );
     }
+}
+
+/// H12: the replica pool reads the same file. Startup migrations get a URL
+/// with the password, because they do not use the pool.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn password_file_covers_the_replica_and_migrations() {
+    use autumn_web::config::DatabaseConfig;
+    use autumn_web::db::DatabasePoolProvider;
+
+    let db = autumn_web::test::TestDb::shared().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("db-password");
+    std::fs::write(&file, "postgres\n").expect("write password");
+    let without_password = db.url().replace("postgres:postgres@", "postgres@");
+
+    let config = DatabaseConfig {
+        url: Some(without_password.clone()),
+        replica_url: Some(without_password),
+        connect_timeout_secs: 5,
+        ..DatabaseConfig::default()
+    };
+    let topology = PasswordFilePool::new(&file)
+        .create_topology(&config)
+        .await
+        .expect("build topology")
+        .expect("a topology");
+
+    let replica = topology.replica().expect("a replica pool");
+    assert!(replica.get().await.is_ok(), "the replica reads the file");
+    assert_eq!(topology.migration_url(), Some(db.url()));
 }

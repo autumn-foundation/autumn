@@ -2,7 +2,8 @@
 //! pages, or an exception filter. So this test proves that `app()` wires
 //! them, and the other hatches that read the environment:
 //!
-//! - H12: the URL has no password. The pool reads it from a file.
+//! - H12: the URL has no password. The pool reads it from a file. The app
+//!   applies its own migration at boot with that password.
 //! - H7: pages carry `Cache-Control: no-store`.
 //! - H10: an unknown SKU gets the stockroom 404 page.
 //! - H8: the exports folder is the project folder's `exports/`.
@@ -19,7 +20,6 @@
 use autumn_web::reexports::diesel::Connection;
 use autumn_web::reexports::diesel::connection::SimpleConnection;
 use autumn_web::reexports::diesel::pg::PgConnection;
-use escape_hatches::MIGRATIONS;
 
 const TOKEN: &str = "boot-test-token";
 
@@ -28,21 +28,6 @@ const TOKEN: &str = "boot-test-token";
 async fn real_binary_wires_app_level_hatches() {
     let db = example_e2e::provision_postgres(1).await;
     let url = db.urls()[0].clone();
-
-    // In production, a release step runs migrations with its own credentials.
-    // So the app starts with auto-migrate off.
-    let setup_url = url.clone();
-    tokio::task::spawn_blocking(move || {
-        autumn_web::migrate::run_pending(&setup_url, MIGRATIONS).expect("migrate");
-        let mut conn = PgConnection::establish(&setup_url).expect("connect");
-        conn.batch_execute(
-            "INSERT INTO products (sku, name, category, stock, price_cents) \
-             VALUES ('A-1', 'Hammer', 'tools', 4, 1500);",
-        )
-        .expect("seed");
-    })
-    .await
-    .expect("setup task");
 
     // H12: only a file holds the password. A secrets sidecar writes it.
     let secrets = tempfile::tempdir().expect("tempdir");
@@ -80,7 +65,6 @@ async fn real_binary_wires_app_level_hatches() {
         &[
             ("AUTUMN_MANIFEST_DIR", project_path),
             ("AUTUMN_DATABASE__URL", &url_without_password),
-            ("AUTUMN_DATABASE__AUTO_MIGRATE", "false"),
             ("STOCKROOM_DB_PASSWORD_FILE", password_path),
             ("STOCKROOM_SCANNER_TOKEN", TOKEN),
         ],
@@ -90,6 +74,19 @@ async fn real_binary_wires_app_level_hatches() {
     .expect("spawn the escape-hatches binary");
     let base = app.base_url();
     let http = reqwest::Client::new();
+
+    // The app applied its migration at boot, so the table exists.
+    let setup_url = url.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = PgConnection::establish(&setup_url).expect("connect");
+        conn.batch_execute(
+            "INSERT INTO products (sku, name, category, stock, price_cents) \
+             VALUES ('A-1', 'Hammer', 'tools', 4, 1500);",
+        )
+        .expect("seed: the app must have applied its migration");
+    })
+    .await
+    .expect("setup task");
 
     // H12 + H7: a page that reads the database works.
     let page = http
