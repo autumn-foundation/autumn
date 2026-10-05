@@ -146,3 +146,39 @@ async fn test_app_with_redis_channels_config_has_no_channels_indicator() {
         assert!(body["components"].get("redis:channels").is_none(), "{body}");
     });
 }
+
+#[autumn_web::event]
+struct RedisHealthProbeEvent {
+    value: i64,
+}
+
+#[autumn_web::listener(RedisHealthProbeEvent, durable)]
+async fn redis_health_durable_listener(
+    _state: autumn_web::AppState,
+    _event: RedisHealthProbeEvent,
+) -> autumn_web::AutumnResult<()> {
+    Ok(())
+}
+
+/// A durable listener is a job, so it starts the Redis job runtime even
+/// when the app registers no jobs itself.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn durable_listener_jobs_get_a_redis_jobs_indicator() {
+    let _job_lock = autumn_web::job::global_job_runtime_test_lock().lock().await;
+    let (_container, url) = start_redis().await;
+    let mut config = AutumnConfig::default();
+    config.health.detailed = true;
+    config.health.cache_ttl_ms = 0;
+    config.jobs.backend = "redis".to_owned();
+    config.jobs.redis.url = Some(url);
+    let client = TestApp::new()
+        .config(config)
+        .listeners(autumn_web::listeners![redis_health_durable_listener])
+        .build();
+
+    let health = client.get("/actuator/health").send().await;
+    health.assert_json::<serde_json::Value, _>(|body| {
+        assert_eq!(body["components"]["redis:jobs"]["status"], "UP", "{body}");
+    });
+}
