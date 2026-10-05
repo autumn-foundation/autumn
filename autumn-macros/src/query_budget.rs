@@ -1466,6 +1466,9 @@ struct Binding {
     pending_query: bool,
     /// The shape of a part, when known: a part of an `Option<Db>` is a `Db`.
     inner: Option<Shape>,
+    /// What the declared type gives: `let mut repo: PgPostRepository = …;`.
+    /// An assignment to the name keeps it.
+    declared: Option<Box<Binding>>,
 }
 
 impl Binding {
@@ -1479,6 +1482,7 @@ impl Binding {
             output: None,
             pending_query: false,
             inner: None,
+            declared: None,
         }
     }
 
@@ -1532,6 +1536,7 @@ impl Binding {
             } else {
                 None
             },
+            declared: self.declared.clone().or_else(|| other.declared.clone()),
         }
     }
 }
@@ -1873,6 +1878,13 @@ impl Analyzer {
         if let Some(sides) = result_sides(ty) {
             binding.parts = Some(sides);
         }
+        binding.declared = Some(Box::new(Binding {
+            kind: type_kind(ty),
+            parts: binding.parts.clone(),
+            shape: type_shape(ty),
+            inner: binding.inner,
+            ..Binding::of(Kind::Plain)
+        }));
         self.env.declare(name, binding);
     }
 
@@ -2066,6 +2078,7 @@ impl Analyzer {
                 other => path_ident(other).and_then(|name| self.env.binding(&name).output),
             },
             inner: wrapper_root(init).and_then(|name| self.env.binding(&name).inner),
+            declared: None,
         }
     }
 
@@ -2163,7 +2176,7 @@ impl Analyzer {
             (Expr::Path(p), _) if p.path.get_ident().is_some() => {
                 let binding = self.binding_of(value);
                 if let Some(ident) = p.path.get_ident() {
-                    self.env.assign(ident.to_string(), binding);
+                    self.assign_name(ident.to_string(), binding);
                 }
             }
             _ => {
@@ -2173,11 +2186,26 @@ impl Analyzer {
         }
     }
 
+    /// `name = …`. A declared type stays a floor: `repo = make();` on a
+    /// `PgPostRepository` binding is still a handle.
+    fn assign_name(&mut self, name: String, mut binding: Binding) {
+        if let Some(declared) = self.env.binding(&name).declared {
+            binding.kind = binding.kind.max(declared.kind);
+            binding.shape = declared.shape.or(binding.shape);
+            binding.inner = declared.inner.or(binding.inner);
+            if declared.parts.is_some() {
+                binding.parts.clone_from(&declared.parts);
+            }
+            binding.declared = Some(declared);
+        }
+        self.env.assign(name, binding);
+    }
+
     fn assign_kind(&mut self, place: &Expr, kind: Kind) {
         match place {
             Expr::Path(p) => {
                 if let Some(ident) = p.path.get_ident() {
-                    self.env.assign(ident.to_string(), Binding::of(kind));
+                    self.assign_name(ident.to_string(), Binding::of(kind));
                 }
             }
             Expr::Paren(p) => self.assign_kind(&p.expr, kind),
@@ -5049,6 +5077,32 @@ fn type_is_lazy_db(ty: &Type) -> bool {
 /// are this macro's own vocabulary and mean nothing to rustc.
 struct StripAnnotations;
 
+/// Writes a closure behind `&`, `&mut`, parentheses or a group as the
+/// closure itself: `map(&mut |r| …)` reads as `map(|r| …)`.
+struct PeelClosureRefs;
+
+impl VisitMut for PeelClosureRefs {
+    fn visit_expr_mut(&mut self, e: &mut Expr) {
+        syn::visit_mut::visit_expr_mut(self, e);
+        if matches!(e, Expr::Reference(_) | Expr::Paren(_) | Expr::Group(_))
+            && let Some(closure) = wrapped_closure(e)
+        {
+            *e = Expr::Closure(closure.clone());
+        }
+    }
+}
+
+/// The closure under `&`, `&mut`, parentheses and groups.
+fn wrapped_closure(e: &Expr) -> Option<&syn::ExprClosure> {
+    match e {
+        Expr::Closure(c) => Some(c),
+        Expr::Reference(r) => wrapped_closure(&r.expr),
+        Expr::Paren(p) => wrapped_closure(&p.expr),
+        Expr::Group(g) => wrapped_closure(&g.expr),
+        _ => None,
+    }
+}
+
 impl VisitMut for StripAnnotations {
     fn visit_item_fn_mut(&mut self, item_fn: &mut ItemFn) {
         // Includes the annotated handler itself: a stray `#[query_cost]` on the
@@ -5219,8 +5273,11 @@ pub fn query_budget_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         return quote! { #input_fn #err };
     }
 
-    let mut analyzer = Analyzer::new(&input_fn);
-    let cost = analyzer.function_body(&input_fn.block);
+    // The analysis reads a copy with `&mut |r| …` written as `|r| …`.
+    let mut analyzed = input_fn.clone();
+    PeelClosureRefs.visit_item_fn_mut(&mut analyzed);
+    let mut analyzer = Analyzer::new(&analyzed);
+    let cost = analyzer.function_body(&analyzed.block);
 
     let mut errors: Vec<syn::Error> = std::mem::take(&mut analyzer.errors);
     let proven = match (&budget, &cost) {
@@ -9645,6 +9702,36 @@ mod tests {
                 "async fn h(db: Db, repo: PgPostRepository) -> AutumnResult<usize> { \
                  #[query_cost(1)] let _ = db.tx(run); let _ = (|r| r.tx(|c| c.find_all()))(repo); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn closure_references_and_declared_types() {
+        check_handlers(&[
+            (
+                "a callback closure behind &mut is still a closure",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let _ = Some(&repo).map(&mut |r| r.find_all()).unwrap().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a loop callback behind & is still a closure",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 repos.into_iter().for_each(&|r: PgPostRepository| { let _ = r.find_all(); }); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a typed handle keeps its type when reassigned",
+                "async fn h(x: i64) -> AutumnResult<usize> { \
+                 let mut repo: PgPostRepository = make(x); repo = make(x); let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a typed Result keeps its sides when reassigned",
+                "async fn h(x: i64) -> AutumnResult<usize> { \
+                 let mut result: Result<PgPostRepository, Error> = make(x); result = make(x); let e = result.unwrap_err(); render(e); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
