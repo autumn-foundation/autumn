@@ -784,7 +784,12 @@ async fn dead_letter_on(
 ///
 /// This is what makes a crash mid-job recoverable: the worker is gone, but the
 /// row is still there.
-async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, state: &AppState) {
+async fn recover_stale_claims(
+    pool: &SqlitePool,
+    visibility_timeout_ms: u64,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
     use diesel_async::RunQueryDsl as _;
 
     let Ok(mut conn) = pool.get().await else {
@@ -857,6 +862,9 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
                 "visibility timeout expired".to_owned(),
                 true,
             );
+            // Also tells a lease-lost worker in this process that the job is
+            // already recorded (see `record_lease_lost`).
+            job_admin.record_failure(&row.id, "visibility timeout expired".to_owned());
             crate::alerts::notify_dead_lettered_job(
                 state,
                 &row.name,
@@ -1308,7 +1316,9 @@ async fn settle_outcome(
 ) {
     let attempt = u32::try_from(row.attempt).unwrap_or(0);
     match outcome {
-        JobExecutionOutcome::LeaseLost => record_lease_lost(&row.name, &row.id, state, job_admin),
+        JobExecutionOutcome::LeaseLost => {
+            record_lease_lost(&row.name, &row.id, attempt, state, job_admin);
+        }
         JobExecutionOutcome::Succeeded => {
             let ack = ack_success(pool, now_ms(state), &row.id, worker_id).await;
             record_pg_lifecycle_ack_result(
@@ -1442,6 +1452,7 @@ async fn maintenance_loop(
     survey_blocked: bool,
     history_window: Option<std::time::Duration>,
     state: AppState,
+    job_admin: JobAdminMemoryBackend,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let interval_duration = maintenance_interval(visibility_timeout_ms);
@@ -1450,7 +1461,7 @@ async fn maintenance_loop(
     };
     // Sweep once at start: a row still marked running belongs to a process that
     // is no longer here.
-    recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
+    recover_stale_claims(&pool, visibility_timeout_ms, &state, &job_admin).await;
     let mut tracking_cleanup = tokio::time::interval(TRACKING_CLEANUP_INTERVAL);
     tracking_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut interval = tokio::time::interval(interval_duration);
@@ -1458,7 +1469,7 @@ async fn maintenance_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
+                recover_stale_claims(&pool, visibility_timeout_ms, &state, &job_admin).await;
                 if survey_blocked {
                     update_concurrency_blocked_gauges(&pool, &state).await;
                 }
@@ -1629,6 +1640,7 @@ pub(super) fn start_runtime(
     {
         let queue_handle = queue_handle.clone();
         let state = state.clone();
+        let job_admin = job_admin.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             maintenance_loop(
@@ -1637,6 +1649,7 @@ pub(super) fn start_runtime(
                 survey_blocked,
                 history_window,
                 state,
+                job_admin,
                 shutdown,
             )
             .await;
