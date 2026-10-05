@@ -3931,11 +3931,12 @@ esac
         );
         assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
         assert!(patches[1].contains("\"signing-secret\""), "{}", patches[1]);
-        let active_at = calls
-            .find("--query properties.active")
-            .unwrap_or_else(|| panic!("the script must check the old revision: {calls}"));
+        let first_patch_at = calls.find("az rest --method patch").unwrap();
         let second_patch_at = calls.rfind("az rest --method patch").unwrap();
-        assert!(active_at < second_patch_at, "{calls}");
+        assert!(
+            calls[first_patch_at..second_patch_at].contains("az containerapp revision list"),
+            "the script must check the active revisions: {calls}"
+        );
     }
 
     #[cfg(unix)]

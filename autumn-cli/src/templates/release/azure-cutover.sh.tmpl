@@ -180,6 +180,24 @@ patch_app() {
   az rest --method patch --url "$APP_ID?$API" --body "@$BODY" --output none
 }
 
+# Waits until the given revision is the only active one. Provisioned is not
+# ready: Azure keeps the old revision active until the new one scales and
+# passes its probes. The script checks 30 times, 10 seconds apart.
+sole_active() {
+  local list others=unknown
+  for _ in $(seq 1 30); do
+    list=$(az containerapp revision list \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --query "[?properties.active].[name, properties.template.containers[0].image]" \
+      --output tsv) || return 1
+    others=$(cut -f1 <<< "$list" | grep -vxF -- "$1" || true)
+    [ -z "$others" ] && return 0
+    sleep 10
+  done
+  return 1
+}
+
 # Removes the job's credentials from the app: its identity, the registry
 # entry that uses that identity, the three secrets and the four env vars
 # that this script sets. Other identities, registries, secrets, env vars and
@@ -191,7 +209,7 @@ patch_app() {
 # provisioned and no other revision is active. Stage 2 then removes the
 # identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local live status state latest revision active others body containers source first
+  local live status state latest revision body containers source first
   live=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -274,18 +292,7 @@ remove_credentials() {
     # Wait until no other revision is active. The latest revision before
     # stage 1 can be a failed one while an older placeholder is the active
     # one, so the script checks every active revision.
-    others=unknown
-    for _ in $(seq 1 30); do
-      active=$(az containerapp revision list \
-        --name "$AZURE_APP_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" \
-        --query "[?properties.active].[name, properties.template.containers[0].image]" \
-        --output tsv) || return 1
-      others=$(cut -f1 <<< "$active" | grep -vxF -- "$revision" || true)
-      [ -z "$others" ] && break
-      sleep 10
-    done
-    [ -z "$others" ] || return 1
+    sole_active "$revision" || return 1
   fi
   body=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
     --arg id "$JOB_IDENTITY" "$SECRET_REF"'
@@ -483,6 +490,13 @@ if [ -n "$RESTART" ]; then
     --output none || fail "cannot restart revision $REVISION"
 fi
 
+# On the first cutover, the placeholder now has the identity and secrets.
+# Ingress must not wake it, so the script waits until the new revision is
+# the only active one.
+if [ -z "$RELEASED" ]; then
+  sole_active "$REVISION" || fail "the placeholder revision is still active"
+fi
+
 # The new revision runs the real image. Open external ingress now. On a
 # later run, this command changes nothing.
 az containerapp ingress enable \
@@ -493,21 +507,12 @@ az containerapp ingress enable \
   --transport http \
   --output none
 
-# Remove the unused redis-url secret when the old revision is inactive. The
+# Remove the unused redis-url secret when no other revision is active. The
 # release runs already, so a failure here is only a warning.
 if [ -n "$STALE_REDIS" ]; then
   ACTIVE=true
   if [ -n "$OLD_REVISION" ]; then
-    for _ in $(seq 1 30); do
-      ACTIVE=$(az containerapp revision show \
-        --name "$AZURE_APP_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" \
-        --revision "$OLD_REVISION" \
-        --query properties.active \
-        --output tsv) || break
-      [ "$ACTIVE" = false ] && break
-      sleep 10
-    done
+    sole_active "$REVISION" && ACTIVE=false
   else
     # No new revision: the current env has no Redis reference.
     ACTIVE=false
