@@ -19,7 +19,7 @@
   namespace sweep per declared read after commit (issue #3056). On Redis this
   is a `SCAN MATCH`, so write latency grows with the keyspace. `with_lock`
   invalidates too; `find_or_create_by_*` invalidates only when it creates a
-  row. With
+  row; the scheduled retention sweep invalidates when it deletes a row. With
   `commit_hooks`, the durable runner sweeps again. A failed sweep is logged and
   counted; it does not fail the write or the hook row.
 - **cache:** `coherence::invalidate_namespace` now logs `warn!` and counts

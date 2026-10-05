@@ -130,6 +130,10 @@ impl GetOrComputeOptions {
     }
 
     /// Enable stale-while-revalidate with the given grace period.
+    ///
+    /// As for [`stale_if_error`](Self::stale_if_error): a
+    /// `MokaCache` instance TTL shorter than
+    /// `ttl + grace` removes the value before the grace ends.
     #[must_use]
     pub const fn stale_while_revalidate(mut self, grace: Duration) -> Self {
         self.stale_while_revalidate = Some(grace);
@@ -141,6 +145,11 @@ impl GetOrComputeOptions {
     /// When a fill fails and the last value ended its freshness less than
     /// `window` ago, the caller gets that value instead of the error. The
     /// value is kept for `ttl + window`, so it is still there to serve.
+    ///
+    /// A backend with native per-entry expiry (Redis) gets `ttl + window`. A
+    /// `MokaCache` uses one TTL for the whole instance and
+    /// ignores the per-entry TTL. Build it with no TTL, or a TTL of at least
+    /// `ttl + window`, or the value expires before the window ends.
     #[must_use]
     pub const fn stale_if_error(mut self, window: Duration) -> Self {
         self.stale_if_error = Some(window);

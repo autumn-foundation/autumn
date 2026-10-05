@@ -264,7 +264,7 @@ insert of a reader that read the old row before the commit.
 | --- | --- |
 | The write returns `Err` | Invalidated too: a write can commit and then fail in an `after_*` hook. After a rollback, the cost is one cache miss. |
 | The request is cancelled, or the write panics | A guard spawns the invalidation, so it still runs. A cancel during the `COMMIT` round trip can invalidate before the server applies the commit; `commit_hooks` covers that case. |
-| `with_lock`, `find_or_create_by_*` | Also invalidate. `find_or_create_by_*` skips it when it found the row and wrote nothing. |
+| `with_lock`, `find_or_create_by_*`, the retention sweep | Also invalidate. `find_or_create_by_*` skips it when it found the row, and the sweep skips it when it deleted nothing. |
 | The backend sweep fails | Retried (Redis: 3 attempts, jittered backoff). Then `warn!` and `autumn_cache_invalidation_failures_total`. The write stays `Ok`: it is committed. |
 | The repository has `commit_hooks` | The durable runner also invalidates, before `after_*_commit`. This covers a crash between the commit and the inline invalidation. A failure is logged and counted. It does not fail the row, so a cache outage does not delay or dead-letter your hooks. |
 | Each write | One namespace sweep per declared read. On Redis this is a `SCAN MATCH` over the keyspace, so write latency grows with the keyspace. |

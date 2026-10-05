@@ -86,7 +86,7 @@ Status: implemented. Part of #3050.
 | Criterion | Test |
 | --- | --- |
 | `DEL` failure surfaced or retried | `autumn-cache-redis` Docker tests: `redis_invalidate_async_surfaces_readonly_del_failure`, `redis_invalidate_retries_until_del_succeeds`, `redis_invalidate_namespace_async_surfaces_failure`, `redis_sync_invalidate_counts_final_failure`, `coherence_async_invalidation_reaches_redis_and_reports_failure` |
-| After-commit invalidation, no refill of the old value | `autumn/tests/integration/cache_invalidation_after_commit.rs` (Docker): `each_generated_write_invalidates_after_commit_with_no_manual_call`, `a_reader_that_read_before_the_commit_cannot_repopulate_the_old_value`, `a_write_that_commits_then_fails_still_invalidates`, `a_reader_inside_the_transaction_window_cannot_keep_the_old_value` |
+| After-commit invalidation, no refill of the old value | `autumn/tests/integration/cache_invalidation_after_commit.rs` (Docker): `each_generated_write_invalidates_after_commit_with_no_manual_call`, `a_reader_that_read_before_the_commit_cannot_repopulate_the_old_value`, `a_write_that_commits_then_fails_still_invalidates`, `a_reader_inside_the_transaction_window_cannot_keep_the_old_value`, `the_retention_sweep_invalidates_after_it_deletes_rows` |
 | `stale_if_error` serves the old value | `autumn/tests/integration/cache_stampede.rs` |
 
 ## Out of scope

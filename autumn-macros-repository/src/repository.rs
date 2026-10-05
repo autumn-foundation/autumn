@@ -6350,8 +6350,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     if config.declared_invalidation_edges {
         let writes = write_method_names(&config, &trait_def);
         // Also writes, but rolled up for the gate (see `write_method_names`):
-        // the closure of `with_lock`, and the insert of `find_or_create_by_*`.
-        let mut also: Vec<String> = vec!["with_lock".to_owned()];
+        // the closure of `with_lock`, the insert of `find_or_create_by_*`, and
+        // the scheduled retention sweep (not its dry run).
+        let mut also: Vec<String> = vec![
+            "with_lock".to_owned(),
+            "__autumn_retention_sweep".to_owned(),
+        ];
         also.extend(trait_def.items.iter().filter_map(|item| match item {
             TraitItem::Fn(f) if f.sig.ident.to_string().starts_with("find_or_create_by_") => {
                 Some(f.sig.ident.to_string())
@@ -6410,8 +6414,18 @@ fn invalidate_after_each_write(
                 syn::ReturnType::Default => quote! { () },
             };
             let body = &method.block;
-            // A `find_or_create_by_*` that found the row wrote nothing.
-            let finish = if name.starts_with("find_or_create_by_") {
+            // A `find_or_create_by_*` that found the row, or a retention sweep
+            // that deleted nothing, wrote nothing. A failed sweep can still
+            // have committed earlier batches, so it invalidates.
+            let finish = if name == "__autumn_retention_sweep" {
+                quote! {
+                    if ::core::matches!(&__autumn_write_result, ::core::result::Result::Ok(report) if report.rows_swept == 0) {
+                        __autumn_invalidation.disarm();
+                    } else {
+                        let _ = __autumn_invalidation.run().await;
+                    }
+                }
+            } else if name.starts_with("find_or_create_by_") {
                 quote! {
                     if ::core::matches!(&__autumn_write_result, ::core::result::Result::Ok((_, false))) {
                         __autumn_invalidation.disarm();
@@ -20397,6 +20411,34 @@ mod tests {
         assert!(
             !save.contains("is_ok ()"),
             "it must not depend on Ok: {save}"
+        );
+    }
+
+    #[test]
+    fn the_retention_sweep_invalidates_when_it_deletes_rows() {
+        let out = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                invalidates(crate::views::recent_posts),
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let sweep = generated_fn(&out, "pub async fn __autumn_retention_sweep");
+        assert!(
+            sweep.contains("__autumn_invalidate_after_commit"),
+            "a sweep commits deletes, so it must invalidate: {sweep}"
+        );
+        assert!(
+            sweep.contains("report . rows_swept == 0") && sweep.contains("disarm ()"),
+            "a sweep that deleted nothing must not invalidate: {sweep}"
+        );
+        let dry_run = generated_fn(&out, "pub fn __autumn_retention_dry_run");
+        assert!(
+            !dry_run.contains("__autumn_invalidate_after_commit"),
+            "a dry run writes nothing: {dry_run}"
         );
     }
 

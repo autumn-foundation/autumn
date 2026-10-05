@@ -143,6 +143,44 @@ impl autumn_web::hooks::MutationHooks for GatedBeforeCreateHooks {
 )]
 pub trait GatedNoteRepository {}
 
+// ── The retention sweep (Codex review on #3137) ─────────────────────
+
+mod aged_schema {
+    autumn_web::reexports::diesel::table! {
+        after_commit_aged (id) {
+            id -> Int8,
+            created_at -> Timestamp,
+        }
+    }
+}
+
+use aged_schema::after_commit_aged;
+
+#[autumn_web::model(table = "after_commit_aged")]
+pub struct AfterCommitAged {
+    #[id]
+    pub id: i64,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// How many aged rows exist. Cached, keyed by `scope` only.
+#[autumn_web::cached(key(scope), reads(AfterCommitAged), result)]
+pub async fn after_commit_aged_count(
+    scope: u8,
+    repo: &PgAfterCommitAgedRepository,
+) -> AutumnResult<usize> {
+    let _ = scope;
+    Ok(repo.find_all().await?.len())
+}
+
+#[autumn_web::repository(
+    AfterCommitAged,
+    table = "after_commit_aged",
+    invalidates(after_commit_aged_count),
+    retention(after = "30d", basis = created_at)
+)]
+pub trait AfterCommitAgedRepository {}
+
 /// Creates the table once. Two concurrent `CREATE TABLE IF NOT EXISTS` can
 /// still collide in Postgres.
 static TABLE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
@@ -351,4 +389,53 @@ async fn a_reader_inside_the_transaction_window_cannot_keep_the_old_value() {
     );
 
     repo.delete_by_label(label).await.expect("clean up");
+}
+
+#[derive(diesel::QueryableByName)]
+struct AgedId {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_retention_sweep_invalidates_after_it_deletes_rows() {
+    let _serial = SERIAL.lock().await;
+    let pool = pool().await;
+    let mut conn = pool.get().await.expect("db connection");
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS after_commit_aged (
+            id BIGSERIAL PRIMARY KEY,
+            created_at TIMESTAMP NOT NULL
+        )",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("create after_commit_aged");
+    diesel::sql_query("DELETE FROM after_commit_aged")
+        .execute(&mut *conn)
+        .await
+        .expect("empty after_commit_aged");
+    diesel::sql_query(
+        "INSERT INTO after_commit_aged (created_at) VALUES (NOW() - INTERVAL '90 days') RETURNING id",
+    )
+    .get_result::<AgedId>(&mut *conn)
+    .await
+    .expect("seed an expired row");
+    drop(conn);
+
+    let repo = PgAfterCommitAgedRepository::with_pool_untracked(pool.clone());
+    assert_eq!(after_commit_aged_count(0, &repo).await.expect("count"), 1);
+
+    let state = autumn_web::AppState::for_test().with_pool(pool);
+    let report = PgAfterCommitAgedRepository::__autumn_retention_sweep(&state)
+        .await
+        .expect("sweep");
+    assert_eq!(report.rows_swept, 1, "the expired row is swept");
+
+    assert_eq!(
+        after_commit_aged_count(0, &repo).await.expect("count"),
+        0,
+        "the sweep committed a delete, so the cached 1 must be gone"
+    );
 }

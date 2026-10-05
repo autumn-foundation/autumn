@@ -146,6 +146,11 @@ let opts = GetOrComputeOptions::new()
   - The fill fails, and the window has ended: the caller gets the error.
 - Coalesced waiters get the same fallback as the leader.
 - The backend keeps the value for `ttl + window`, so it is there to serve.
+  Redis applies this per entry. An in-process `MokaCache` uses one TTL for the
+  whole instance and ignores the per-entry TTL: build it with no TTL, or a TTL
+  of at least `ttl + window` (and at least `ttl + grace` for
+  stale-while-revalidate). A shorter instance TTL removes the value before the
+  window ends.
 - A key that has no value yet returns the error. There is nothing to serve.
 
 It uses the same stored envelope as stale-while-revalidate, so a key must use
