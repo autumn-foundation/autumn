@@ -885,10 +885,10 @@ fn http_request(
     uri: &str,
     headers: &[(String, String)],
 ) -> http::Request<axum::body::Body> {
-    let mut builder = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("accept-encoding", "identity");
+    let mut builder = http::Request::builder().method(method).uri(uri);
+    if !headers.iter().any(|(name, _)| name == "accept-encoding") {
+        builder = builder.header("accept-encoding", "identity");
+    }
     for (name, value) in headers {
         builder = builder.header(name.as_str(), value.as_str());
     }
@@ -908,16 +908,25 @@ impl Origin {
     /// operator copies them into the CDN configuration.
     async fn new() -> Self {
         let router = origin().into_router();
-        let response =
+        let probe = || async {
             tower::ServiceExt::oneshot(router.clone(), http_request("GET", "/stats/count", &[]))
                 .await
-                .unwrap_or_else(|never| match never {});
-        let security_headers: Vec<_> = response
+                .unwrap_or_else(|never| match never {})
+        };
+        let (first, second) = (probe().await, probe().await);
+        let mut security_headers: Vec<_> = first
             .headers()
             .iter()
             .filter(|(name, _)| SECURITY_HEADERS.contains(&name.as_str()))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
+        // The CSP is static when the nonce is off. Then the host sets it too.
+        let csp = http::header::CONTENT_SECURITY_POLICY;
+        if let Some(value) = first.headers().get(&csp)
+            && second.headers().get(&csp) == Some(value)
+        {
+            security_headers.push((csp, value.clone()));
+        }
         assert!(
             !security_headers.is_empty(),
             "the origin sets security headers; the gateway must copy them"
@@ -956,11 +965,12 @@ fn gateway(
     }
 }
 
-/// Check one request through the gateway.
+/// Check one request through the gateway. `Ok` is the lane and the status the
+/// client got.
 ///
 /// - Edge lane: the client gets what the origin would send (`direct`), with
 ///   only [`VOLATILE_HEADERS`](autumn_edge::conformance::VOLATILE_HEADERS)
-///   excused. The origin is not asked.
+///   excused. A static CSP must match too. The origin is not asked.
 /// - Fallthrough: the gateway returns, unchanged, the response the origin
 ///   gave it — and the origin was asked exactly once.
 async fn check_gateway(
@@ -968,7 +978,7 @@ async fn check_gateway(
     origin: &Origin,
     edge: &EdgeOutcome,
     direct: Option<&EdgeResponse>,
-) -> Result<Lane, String> {
+) -> Result<(Lane, u16), String> {
     let recorded = Recorded::default();
     let name = &case.name;
     let response = gateway(origin, &recorded, case.capabilities)
@@ -998,6 +1008,21 @@ async fn check_gateway(
                     "[{name}] the client got different bytes from the edge — {detail}"
                 ));
             }
+            // `compare` excuses the CSP as volatile. A static one must match.
+            let csp = |response: &EdgeResponse| {
+                response
+                    .headers
+                    .iter()
+                    .find(|(header, _)| header == "content-security-policy")
+                    .map(|(_, value)| value.clone())
+            };
+            if csp(direct) != csp(&got) {
+                return Err(format!(
+                    "[{name}] CSP differs: origin {:?}, edge {:?}",
+                    csp(direct),
+                    csp(&got)
+                ));
+            }
         }
         (EdgeOutcome::Fallthrough { reason, .. }, Lane::Fallthrough(lane_reason))
             if *reason == lane_reason =>
@@ -1022,7 +1047,7 @@ async fn check_gateway(
             ));
         }
     }
-    Ok(lane)
+    Ok((lane, got.status))
 }
 
 #[tokio::test]
@@ -1045,11 +1070,11 @@ async fn tier_c_the_gateway_serves_from_the_edge_or_forwards_to_the_origin_uncha
             EdgeOutcome::Served(_) => Some(origin_answer(&origin.router, &case_request).await),
             EdgeOutcome::Fallthrough { .. } => None,
         };
-        let lane = check_gateway(&case_request, &origin, &edge, direct.as_ref()).await;
+        let checked = check_gateway(&case_request, &origin, &edge, direct.as_ref()).await;
         if let Some(previous) = previous {
             std::panic::set_hook(previous);
         }
-        let lane = lane.unwrap_or_else(|failure| panic!("{failure}"));
+        let (lane, _) = checked.unwrap_or_else(|failure| panic!("{failure}"));
 
         let expected = match case.expect {
             Expectation::Served => Lane::Edge,
@@ -1229,7 +1254,9 @@ fn generate(seed: u64, count: usize) -> Vec<Generated> {
         .map(|index| {
             let method = generator.method();
             let uri = generator.uri();
-            let headers = generator.headers();
+            let mut headers = generator.headers();
+            // Every lane sees the same headers, the gateway's included.
+            headers.push(("accept-encoding".to_owned(), "identity".to_owned()));
             let capabilities: &'static [EdgeCapability] = if generator.chance(80) {
                 &[EdgeCapability::Kv]
             } else {
@@ -1282,9 +1309,11 @@ async fn check_generated(
     // The decline reason is the one the rules give.
     let write = !matches!(case.method, "GET" | "HEAD");
     if let EdgeOutcome::Fallthrough { reason, detail } = &edge {
-        let expected_reason = write || *reason != FallthroughReason::MethodNotEdgeEligible;
-        let no_capsule_error = *reason != FallthroughReason::CapsuleError;
-        if !expected_reason || !no_capsule_error {
+        // A write declines on its method. A read never does, and no request
+        // here traps.
+        let expected = (*reason == FallthroughReason::MethodNotEdgeEligible) == write
+            && *reason != FallthroughReason::CapsuleError;
+        if !expected {
             return Err(format!("[{}] unexpected `{reason}`: {detail}", case.name));
         }
     } else if write {
@@ -1309,7 +1338,29 @@ async fn check_generated(
 
     // Tier C: the gateway takes the lane the capsule chose, and the client gets
     // the origin's bytes either way.
-    check_gateway(case, origin, &edge, direct.as_ref()).await
+    let (lane, status) = check_gateway(case, origin, &edge, direct.as_ref()).await?;
+
+    // A declined read gets the origin's canonical answer. For a missing
+    // capability, that is what the edge answers when the host provides it.
+    let expected = match lane {
+        Lane::Fallthrough(FallthroughReason::UnknownRoute) => Some(404),
+        Lane::Fallthrough(FallthroughReason::MissingCapability) => {
+            run_wasm(&request, &[EdgeCapability::Kv], kv)
+                .served()
+                .map(|served| served.status)
+        }
+        _ => None,
+    };
+    if expected.is_some_and(|expected| expected != status) {
+        return Err(format!(
+            "[{}] the origin answered a `{lane:?}` decline with {status}, not {expected:?}",
+            case.name
+        ));
+    }
+    if status >= 500 {
+        return Err(format!("[{}] the client got a {status}", case.name));
+    }
+    Ok(lane)
 }
 
 #[tokio::test]

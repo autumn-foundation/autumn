@@ -2452,10 +2452,10 @@ jobs:
         # around the deliberately-panicking `/boom` handler.
         run: cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
       - name: autumn build emits the capsule
-        # AC-1: one `autumn build` makes the capsule. `--debug` keeps the
-        # native half fast; the capsule is always a release build. The app
-        # has no static routes, so this also proves that an edge-only app
-        # builds clean.
+        # AC-1: one `autumn build` makes the capsule. `--debug` makes the
+        # native build fast. The capsule is always a release build. The app
+        # has no static routes. Thus this step also proves that an edge-only
+        # app builds without an error.
         working-directory: examples/edge-greeting
         run: |
           cargo run -q -p autumn-cli --bin autumn -- build --debug --edge

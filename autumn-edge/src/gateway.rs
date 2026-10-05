@@ -3,7 +3,8 @@
 //! [`EdgeGateway`] does what a CDN shim does. It offers each request to the
 //! capsule. When the capsule serves it, the gateway returns those bytes. When
 //! the capsule declines, the gateway sends the *original* request to the
-//! origin and returns the origin's answer. The author writes no glue.
+//! origin and returns the origin's answer. The app needs no extra code for
+//! this.
 //!
 //! The origin is any `tower::Service`, for example the app's `axum::Router`.
 //! The lane that answered is in the response extensions as [`Lane`], not in a
@@ -14,19 +15,24 @@
 //! - **The capsule never gets a body.** An edge handler cannot read one (no
 //!   body extractor is on the `EdgeHandler` list). The gateway does not buffer
 //!   the body; it keeps it for the origin.
-//! - **Credentials go to the origin only.** [`EdgeArtifact::run`] strips them
-//!   from the capsule's copy. The forwarded request keeps them.
-//! - **Writes skip the capsule.** A method other than `GET`/`HEAD` goes to the
-//!   origin at once, with the same reason the capsule would give.
+//! - **Credentials go to the origin only.** [`EdgeArtifact::run`] strips
+//!   [`SENSITIVE_HEADERS`] from the capsule's copy. The forwarded request
+//!   keeps them.
+//! - **Writes skip the capsule.** A method other than `GET`/`HEAD` goes
+//!   directly to the origin, with the same reason the capsule would give.
 //! - **A request the wire cannot carry skips the capsule.** A header value
 //!   that is not UTF-8 goes to the origin as [`Lane::OriginOnly`].
-//! - **A bad edge response is a fallthrough.** An invalid status or header
-//!   from the capsule becomes a `capsule_error` fallthrough.
+//! - **The gateway does not trust the capsule.** A status outside 200-599, an
+//!   invalid header, `set-cookie`, or [`FALLTHROUGH_SENTINEL`] in an edge
+//!   response becomes a `capsule_error` fallthrough.
+//! - **No identity.** The gateway attaches no `EdgeIdentity`. A
+//!   `needs(identity)` route falls through with `missing_capability`.
 //! - **Fallthrough detail stays in the gateway.** It never reaches the client.
 //!
-//! The capsule runs synchronously on the calling task. This is a reference
-//! host, not a production server: a production shim runs it off the request
-//! thread and sets its own time limit.
+//! The capsule runs on the calling task, before [`EdgeGateway::handle`]
+//! returns. Thus a `tower::timeout` layer around the gateway cannot stop it;
+//! only the fuel budget does. This is a reference host. A production shim
+//! runs the capsule off the request thread and sets a time limit.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -41,7 +47,10 @@ use tower::{Service, ServiceExt};
 use crate::host::EdgeArtifact;
 use crate::kv::{EdgeKv, EmptyEdgeKv};
 use crate::route::EdgeCapability;
-use crate::wire::{EdgeOutcome, EdgeRequest, EdgeResponse, FallthroughReason};
+use crate::wire::{
+    EdgeOutcome, EdgeRequest, EdgeResponse, FALLTHROUGH_SENTINEL, FallthroughReason,
+    SENSITIVE_HEADERS,
+};
 
 /// The lane that answered a request. Stored in the response extensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,11 +123,12 @@ where
     }
 
     /// Set these headers on every edge response, as the origin's security
-    /// middleware does on its own. A value replaces one the capsule set.
+    /// middleware does. They replace a header of the same name from the
+    /// capsule. A name given more than once keeps every value.
     ///
-    /// Give the same headers the origin sends (`x-frame-options`,
-    /// `x-content-type-options`, ...). Then the client gets the same headers
-    /// from both lanes.
+    /// Give the static headers the origin sends: `x-frame-options`,
+    /// `x-content-type-options`, and `content-security-policy` when the CSP
+    /// nonce is off. Then the client gets the same headers from both lanes.
     #[must_use]
     pub fn with_response_headers(
         mut self,
@@ -136,12 +146,12 @@ where
         &self,
         request: Request<Body>,
     ) -> impl Future<Output = Response<Body>> + Send + 'static {
-        let lane = match edge_request(&request) {
-            None => Err(Lane::OriginOnly),
-            Some(edge) if !is_edge_method(&edge.method) => {
-                Err(Lane::Fallthrough(FallthroughReason::MethodNotEdgeEligible))
-            }
-            Some(edge) => self.ask_capsule(&edge).map_err(Lane::Fallthrough),
+        let lane = if is_edge_method(request.method().as_str()) {
+            edge_request(&request).map_or(Err(Lane::OriginOnly), |edge| {
+                self.ask_capsule(&edge).map_err(Lane::Fallthrough)
+            })
+        } else {
+            Err(Lane::Fallthrough(FallthroughReason::MethodNotEdgeEligible))
         };
         let origin = self.origin.clone();
         async move {
@@ -166,8 +176,12 @@ where
         {
             Ok(EdgeOutcome::Served(response)) => {
                 let mut response = into_http(response).ok_or(FallthroughReason::CapsuleError)?;
+                let headers = response.headers_mut();
+                for (name, _) in &self.response_headers {
+                    headers.remove(name);
+                }
                 for (name, value) in &self.response_headers {
-                    response.headers_mut().insert(name.clone(), value.clone());
+                    headers.append(name.clone(), value.clone());
                 }
                 Ok(response)
             }
@@ -204,12 +218,16 @@ fn is_edge_method(method: &str) -> bool {
     method == "GET" || method == "HEAD"
 }
 
-/// The capsule's view of `request`: no body. `None` when a header value is
-/// not UTF-8 and so cannot cross the wire.
+/// The capsule's view of `request`: no body and no credentials. `None` when a
+/// header value is not UTF-8 and so cannot cross the wire.
 fn edge_request<B>(request: &Request<B>) -> Option<EdgeRequest> {
     let mut headers = Vec::with_capacity(request.headers().len());
     for (name, value) in request.headers() {
-        headers.push((name.as_str().to_owned(), value.to_str().ok()?.to_owned()));
+        if SENSITIVE_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        let value = std::str::from_utf8(value.as_bytes()).ok()?;
+        headers.push((name.as_str().to_owned(), value.to_owned()));
     }
     let uri = request
         .uri()
@@ -224,16 +242,23 @@ fn edge_request<B>(request: &Request<B>) -> Option<EdgeRequest> {
     })
 }
 
-/// The capsule's answer as an HTTP response. `None` when the status or a
-/// header is not valid HTTP.
+/// The capsule's answer as an HTTP response. `None` when the edge runtime
+/// would refuse it: a status outside 200-599, an invalid header, `set-cookie`,
+/// or the fallthrough sentinel. A capsule that Autumn did not build can send
+/// these, so the gateway checks again.
 fn into_http(response: EdgeResponse) -> Option<Response<Body>> {
+    if !(200..=599).contains(&response.status) {
+        return None;
+    }
     let mut http = Response::new(Body::from(response.body));
     *http.status_mut() = StatusCode::from_u16(response.status).ok()?;
     for (name, value) in response.headers {
-        http.headers_mut().append(
-            HeaderName::from_bytes(name.as_bytes()).ok()?,
-            HeaderValue::from_str(&value).ok()?,
-        );
+        let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+        if name == http::header::SET_COOKIE || name.as_str() == FALLTHROUGH_SENTINEL {
+            return None;
+        }
+        http.headers_mut()
+            .append(name, HeaderValue::from_str(&value).ok()?);
     }
     Some(http)
 }

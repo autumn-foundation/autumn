@@ -144,11 +144,27 @@ pub const EDGE_CAPABILITIES: &[&str] = &["kv", "identity"];
 /// Route attributes for methods the edge lane does not serve.
 const EDGE_WRITE_METHOD_ATTRS: &[&str] = &["post", "put", "delete", "patch"];
 
+/// Attributes the `#[edge]` macro refuses for a reason other than the method.
+const EDGE_REFUSED_ATTRS: &[&str] = &["static_get", "ws", "oauth2_callback", "agent_operable"];
+
+/// Route attributes. Only a routed function has an edge companion, so only a
+/// routed function has its extractors checked.
+const ROUTE_ATTRS: &[&str] = &[
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "static_get",
+    "ws",
+    "oauth2_callback",
+];
+
 /// Extractors that need a capability only the origin has, and that capability.
 ///
-/// A denylist on purpose: each name also fails the `EdgeHandler` whitelist at
-/// compile time, so a match here is never a false positive. A type alias hides
-/// the name from this scan; the compiler still catches it.
+/// This is a denylist. Each name also fails the `EdgeHandler` allowlist at
+/// compile time. Thus a match here is never a false positive. A type alias
+/// hides the name from this scan. The compiler still stops it.
 const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("Db", "a database"),
     ("LazyDb", "a database"),
@@ -181,6 +197,8 @@ pub enum EdgeUnsupported {
     Need(String),
     /// A write-method route attribute, such as `post`.
     Method(String),
+    /// Another attribute the `#[edge]` macro refuses, such as `static_get`.
+    Refused(String),
     /// A parameter whose extractor needs an origin-only capability.
     Extractor {
         /// The extractor's type name.
@@ -215,8 +233,12 @@ impl std::fmt::Display for EdgeUnsupported {
         match self {
             Self::Need(name) => write!(f, "needs({name}) is not an edge capability"),
             Self::Method(method) => {
-                write!(f, "#[{method}] is a write method; the edge serves GET only")
+                write!(
+                    f,
+                    "#[{method}] is a write method; the edge serves only GET and HEAD"
+                )
             }
+            Self::Refused(name) => write!(f, "#[{name}] cannot be an edge route"),
             Self::Extractor { name, capability } => {
                 write!(f, "takes `{name}`, which needs {capability}")
             }
@@ -2876,7 +2898,7 @@ fn edge_fn(
     if cfg_excludes {
         return None;
     }
-    let unsupported = unsupported_capabilities(attrs, &names, sig);
+    let unsupported = unsupported_capabilities(attrs, &names, sig, default_features);
     let guards: Vec<String> = names
         .into_iter()
         .filter(|n| EDGE_GUARD_ATTRS.contains(&n.as_str()))
@@ -2895,24 +2917,33 @@ fn edge_fn(
 /// Every capability an `#[edge]` function needs that the edge cannot provide.
 ///
 /// `names` are the function's attribute names, `cfg_attr` payloads included.
-/// `needs(...)` is read from a direct `#[edge(...)]` attribute only.
+/// Each reason is one the macro or the `EdgeHandler` bound also gives, so a
+/// valid app gets none.
 fn unsupported_capabilities(
     attrs: &[syn::Attribute],
     names: &[String],
     sig: &syn::Signature,
+    default_features: &BTreeSet<String>,
 ) -> Vec<EdgeUnsupported> {
-    let needs = edge_needs(attrs);
+    let needs = edge_needs(attrs, default_features);
     let mut found: Vec<EdgeUnsupported> = needs
         .iter()
+        .flatten()
         .filter(|need| !EDGE_CAPABILITIES.contains(&need.as_str()))
         .map(|need| EdgeUnsupported::Need(need.clone()))
         .collect();
-    found.extend(
-        names
-            .iter()
-            .filter(|n| EDGE_WRITE_METHOD_ATTRS.contains(&n.as_str()))
-            .map(|n| EdgeUnsupported::Method(n.clone())),
-    );
+    for name in names {
+        if EDGE_WRITE_METHOD_ATTRS.contains(&name.as_str()) {
+            found.push(EdgeUnsupported::Method(name.clone()));
+        } else if EDGE_REFUSED_ATTRS.contains(&name.as_str()) {
+            found.push(EdgeUnsupported::Refused(name.clone()));
+        }
+    }
+    // Without a route macro there is no edge companion, and rustc accepts
+    // any extractor.
+    if !names.iter().any(|n| ROUTE_ATTRS.contains(&n.as_str())) {
+        return found;
+    }
     let mut extractors = Vec::new();
     for input in &sig.inputs {
         if let syn::FnArg::Typed(pat_type) = input {
@@ -2921,7 +2952,11 @@ fn unsupported_capabilities(
     }
     for name in extractors {
         if name == "EdgeIdentity" {
-            if !needs.iter().any(|need| need == "identity") {
+            // Unknown needs (`None`) add no reason: the macro reports those.
+            if needs
+                .as_ref()
+                .is_some_and(|needs| !needs.iter().any(|need| need == "identity"))
+            {
                 found.push(EdgeUnsupported::UndeclaredIdentity);
             }
         } else if let Some((_, capability)) = ORIGIN_ONLY_EXTRACTORS
@@ -2934,34 +2969,102 @@ fn unsupported_capabilities(
     found
 }
 
-/// The capability names in `#[edge(needs(a, b))]`. Empty for a bare `#[edge]`
-/// or a malformed argument list (the macro reports that one).
-fn edge_needs(attrs: &[syn::Attribute]) -> Vec<String> {
-    let parser = |input: syn::parse::ParseStream| {
-        let key: syn::Ident = input.parse()?;
-        if key != "needs" {
-            return Err(syn::Error::new(key.span(), "expected `needs`"));
+/// The capabilities every `#[edge(...)]` on the function declares, from
+/// direct attributes and from active `cfg_attr` payloads. `None` when an
+/// argument list does not parse: the macro reports that one, and the scan
+/// cannot tell what it declares.
+fn edge_needs(
+    attrs: &[syn::Attribute],
+    default_features: &BTreeSet<String>,
+) -> Option<Vec<String>> {
+    let mut metas = Vec::new();
+    for attr in attrs {
+        match attr_name(attr).as_deref() {
+            Some("edge") => metas.push(attr.meta.clone()),
+            Some("cfg_attr") => {
+                if let syn::Meta::List(list) = &attr.meta {
+                    active_edge_metas(list, default_features, &mut metas);
+                }
+            }
+            _ => {}
         }
-        let content;
-        syn::parenthesized!(content in input);
-        let names =
-            syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(&content)?;
-        Ok(names.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+    let mut needs = Vec::new();
+    for meta in &metas {
+        match meta {
+            syn::Meta::Path(_) => {}
+            syn::Meta::List(list) => {
+                needs
+                    .extend(syn::parse::Parser::parse2(parse_edge_args, list.tokens.clone()).ok()?);
+            }
+            syn::Meta::NameValue(_) => return None,
+        }
+    }
+    Some(needs)
+}
+
+/// The `edge` metas in an active `cfg_attr(condition, ...)` payload, nested
+/// `cfg_attr` included.
+fn active_edge_metas(
+    list: &syn::MetaList,
+    default_features: &BTreeSet<String>,
+    out: &mut Vec<syn::Meta>,
+) {
+    let Some((condition, metas)) = cfg_attr_payload(list, default_features) else {
+        return;
     };
-    attrs
-        .iter()
-        .filter(|attr| {
-            attr.path()
-                .segments
-                .last()
-                .is_some_and(|s| s.ident == "edge")
-        })
-        .filter_map(|attr| match &attr.meta {
-            syn::Meta::List(list) => syn::parse::Parser::parse2(parser, list.tokens.clone()).ok(),
-            _ => None,
-        })
-        .flatten()
-        .collect()
+    if condition == Some(false) {
+        return;
+    }
+    for meta in metas {
+        match meta
+            .path()
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .as_deref()
+        {
+            Some("edge") => out.push(meta),
+            Some("cfg_attr") => {
+                if let syn::Meta::List(inner) = &meta {
+                    active_edge_metas(inner, default_features, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The macro's `#[edge(...)]` grammar: `needs(a, b)` and `crate = "path"`, in
+/// any order, with an optional trailing comma. Returns the `needs` names, with
+/// any `r#` prefix removed.
+fn parse_edge_args(input: syn::parse::ParseStream) -> syn::Result<Vec<String>> {
+    let mut needs = Vec::new();
+    while !input.is_empty() {
+        let key: syn::Ident = syn::ext::IdentExt::parse_any(input)?;
+        if key == "crate" {
+            input.parse::<syn::Token![=]>()?;
+            input.parse::<syn::LitStr>()?;
+        } else if key == "needs" {
+            let content;
+            syn::parenthesized!(content in input);
+            let names =
+                syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(
+                    &content,
+                )?;
+            needs.extend(names.iter().map(|name| {
+                let name = name.to_string();
+                name.strip_prefix("r#").unwrap_or(&name).to_owned()
+            }));
+        } else {
+            return Err(syn::Error::new(key.span(), "unknown `#[edge]` option"));
+        }
+        if input.is_empty() {
+            break;
+        }
+        input.parse::<syn::Token![,]>()?;
+    }
+    Ok(needs)
 }
 
 /// The extractor type names in one parameter type: its last path segment, the
@@ -9868,7 +9971,7 @@ mod tests {
 
     #[test]
     fn an_undeclared_identity_is_unsupported() {
-        let found = unsupported_of("#[edge]\nasync fn f(who: EdgeIdentity) {}");
+        let found = unsupported_of("#[get(\"/me\")]\n#[edge]\nasync fn f(who: EdgeIdentity) {}");
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("needs(identity)"), "{found:?}");
     }
@@ -9878,5 +9981,60 @@ mod tests {
         let scan = scan_one("#[edge]\nfn ok() {}\n#[edge(needs(fs))]\nfn bad() {}");
         let names: Vec<&str> = scan.unsupported().iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["bad"]);
+    }
+
+    /// Every shape the macro accepts must pass the scan: a false positive
+    /// stops a valid build.
+    #[test]
+    fn every_needs_shape_the_macro_accepts_is_read() {
+        for attr in [
+            "#[edge(needs(identity),)]",
+            "#[edge(crate = \"autumn_web\", needs(identity))]",
+            "#[edge(needs(r#identity))]",
+            "#[cfg_attr(feature = \"edge\", edge(needs(identity)))]",
+            "#[cfg_attr(feature = \"edge\", cfg_attr(feature = \"edge\", edge(needs(identity))))]",
+        ] {
+            let scan = scan_one_with_features(
+                &format!("#[get(\"/me\")]\n{attr}\nasync fn me(who: EdgeIdentity) {{}}"),
+                &["edge"],
+            );
+            assert_eq!(scan.functions.len(), 1, "{attr}");
+            assert!(
+                scan.unsupported().is_empty(),
+                "{attr}: {:?}",
+                scan.functions
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_edge_argument_adds_no_reason() {
+        // The macro reports this one. The scan cannot tell what it declares.
+        let found = unsupported_of(
+            "#[get(\"/me\")]\n#[edge(needs(identity) junk)]\nfn me(who: EdgeIdentity) {}",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_edge_fn_without_a_route_is_not_checked_for_extractors() {
+        // `#[edge]` alone emits no companion, so rustc accepts any extractor.
+        let found = unsupported_of("#[edge]\nasync fn helper(db: Db, who: EdgeIdentity) {}");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_route_kind_the_edge_refuses_is_unsupported() {
+        for attr in [
+            "static_get(\"/x\")",
+            "ws(\"/x\")",
+            "oauth2_callback(\"/x\")",
+            "agent_operable",
+        ] {
+            let found = unsupported_of(&format!("#[{attr}]\n#[edge]\nfn f() {{}}"));
+            assert_eq!(found.len(), 1, "{attr}: {found:?}");
+            let name = attr.split('(').next().unwrap_or(attr);
+            assert!(found[0].contains(&format!("#[{name}]")), "{found:?}");
+        }
     }
 }

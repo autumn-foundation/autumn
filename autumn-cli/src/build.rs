@@ -115,7 +115,7 @@ pub enum EdgePlan {
     Build,
 }
 
-/// Tells the static renderer that no static routes is not an error. Read by
+/// Tells the static renderer that an empty route set is not an error. Read by
 /// `autumn-web`'s static build.
 const STATIC_ALLOW_EMPTY_ENV: &str = "AUTUMN_BUILD_STATIC_ALLOW_EMPTY";
 
@@ -317,14 +317,16 @@ fn format_unregistered_warning(unregistered: &[&EdgeFn]) -> String {
     )
 }
 
-/// The error for `#[edge]` routes that need what the edge cannot provide, or
-/// `None` when there are none. The same text as doctor's `edge_capabilities`.
-fn format_unsupported_error(unsupported: &[&EdgeFn]) -> Option<String> {
+/// The warning for `#[edge]` routes that need what the edge cannot provide,
+/// or `None` when there are none. The same text as doctor's
+/// `edge_capabilities`.
+fn format_unsupported_warning(unsupported: &[&EdgeFn]) -> Option<String> {
     if unsupported.is_empty() {
         return None;
     }
     Some(format!(
-        "\u{2717} {} #[edge] route(s) need what the edge cannot provide:\n{}\n  {}",
+        "\u{26A0} {} #[edge] route(s) need what the edge cannot provide. The compiler \
+         stops on each one:\n{}\n  {}",
         unsupported.len(),
         crate::edge_scan::format_unsupported(unsupported),
         crate::edge_scan::EDGE_UNSUPPORTED_HINT,
@@ -609,9 +611,10 @@ pub fn run(
     // build. The capsule itself is compiled much later — after the native build
     // and fingerprinting — by `run_edge_capsule_build`.
     let edge_scan = resolve_project_edge_scan(debug, embed, package, bin, features);
-    if let Some(error) = format_unsupported_error(&edge_scan.unsupported()) {
-        eprintln!("{error}");
-        std::process::exit(1);
+    // A warning, not a stop: the scan reads every file under `src/`, also one
+    // that no `mod` declares. rustc stops a real case with the macro's error.
+    if let Some(warning) = format_unsupported_warning(&edge_scan.unsupported()) {
+        eprintln!("{warning}\n");
     }
     let plan = plan_edge_step(!edge_scan.is_empty(), edge, embed, debug).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
@@ -675,6 +678,9 @@ pub fn run(
     cmd.env("AUTUMN_BUILD_STATIC", "1");
     if static_render_allows_empty(plan) {
         cmd.env(STATIC_ALLOW_EMPTY_ENV, "1");
+    } else {
+        // A value from the caller's environment must not hide a missing route.
+        cmd.env_remove(STATIC_ALLOW_EMPTY_ENV);
     }
     apply_renderer_env(
         &mut cmd,
@@ -1457,13 +1463,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_error_names_the_route_the_reason_and_the_fix() {
+    fn unsupported_warning_names_the_route_the_reason_and_the_fix() {
         let scan = crate::edge_scan::scan_sources(&[(
             "src/routes.rs",
             "#[edge]\nfn ok() {}\n#[post(\"/x\")]\n#[edge]\nfn write() {}",
         )]);
-        assert!(format_unsupported_error(&[]).is_none());
-        let error = format_unsupported_error(&scan.unsupported()).expect("one route");
+        assert!(format_unsupported_warning(&[]).is_none());
+        let error = format_unsupported_warning(&scan.unsupported()).expect("one route");
         assert!(error.contains("1 #[edge] route(s)"), "{error}");
         assert!(
             error.contains("write @ src/routes.rs:5: #[post]"),

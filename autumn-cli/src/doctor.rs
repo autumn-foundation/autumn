@@ -11922,11 +11922,11 @@ mod tests {
 
     #[test]
     fn edge_capabilities_fails_on_a_capability_the_edge_cannot_provide() {
-        let scan = edge_scan_of("#[edge(needs(db))]\nfn dash(db: Db) {}");
+        let scan = edge_scan_of("#[get(\"/d\")]\n#[edge(needs(db))]\nfn dash(db: Db) {}");
         let r = check_edge_capabilities_impl(&scan);
         assert_eq!(r.status, CheckStatus::Fail);
         let detail = r.detail.unwrap();
-        assert!(detail.contains("dash @ src/routes.rs:2"), "{detail}");
+        assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
         assert!(detail.contains("needs(db)"), "{detail}");
         assert!(detail.contains("`Db`"), "{detail}");
         let hint = r.hint.unwrap();

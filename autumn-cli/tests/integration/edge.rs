@@ -192,8 +192,11 @@ fn doctor_fails_on_edge_route_with_unsupported_capability() {
     );
 }
 
+/// The build names the route before it compiles. It does not stop on the
+/// scan alone: the scan reads files that `mod` may not declare, so rustc
+/// decides. Here the empty `PATH` makes cargo fail.
 #[test]
-fn build_fails_on_unsupported_edge_capability_before_compiling() {
+fn build_names_an_unsupported_edge_capability_before_compiling() {
     let dir = project(&[
         ("src/main.rs", DB_EDGE_APP),
         (
@@ -205,13 +208,17 @@ fn build_fails_on_unsupported_edge_capability_before_compiling() {
     let combined = format!("{stdout}{stderr}");
 
     assert_ne!(code, Some(0), "{combined}");
-    assert!(combined.contains("dashboard @ src/main.rs:"), "{combined}");
+    let named = combined
+        .find("dashboard @ src/main.rs:")
+        .unwrap_or_else(|| panic!("the route must be named: {combined}"));
     assert!(combined.contains("needs(db)"), "{combined}");
     assert!(combined.contains("Remove #[edge]"), "{combined}");
-    assert!(
-        !combined.contains("Compiling"),
-        "the capability check must run before the native build: {combined}"
-    );
+    if let Some(compiling) = combined.find("Compiling") {
+        assert!(
+            named < compiling,
+            "the name must come before the compile: {combined}"
+        );
+    }
 }
 
 #[test]

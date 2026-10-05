@@ -159,8 +159,7 @@ fn a_declined_request_is_forwarded_unchanged_and_the_origin_answer_is_returned()
     let (method, uri, headers, _) = &seen[0];
     assert_eq!(method, "GET");
     assert_eq!(uri, "/nope?a=1&a=2");
-    // The origin owns credentials: they reach it although the capsule never
-    // sees them.
+    // The origin gets the credentials. The capsule does not see them.
     for (name, value) in [
         ("cookie", "session=s1"),
         ("authorization", "Bearer t1"),
@@ -305,4 +304,96 @@ fn response_headers_are_set_on_edge_responses_only() {
     .with_response_headers(headers);
     let response = block_on(declined.handle(Request::get("/x").body(Body::empty()).unwrap()));
     assert!(response.headers().get("x-frame-options").is_none());
+}
+
+/// The gateway does not trust the capsule: a response the edge runtime would
+/// refuse is a fallthrough, also when a capsule not built by Autumn sends it.
+#[test]
+fn a_response_the_runtime_would_refuse_falls_through() {
+    for (status, header) in [
+        (200, Some(("set-cookie", "sid=1"))),
+        (
+            200,
+            Some((autumn_edge::FALLTHROUGH_SENTINEL, "unknown_route")),
+        ),
+        (101, None),
+    ] {
+        let artifact = guest(&GuestFrame::Response(EdgeResponse {
+            status,
+            headers: header
+                .map(|(name, value)| vec![(name.to_owned(), value.to_owned())])
+                .unwrap_or_default(),
+            body: Vec::new(),
+        }));
+        let seen = Seen::default();
+        let gateway = EdgeGateway::new(artifact, origin(&seen));
+
+        let response = block_on(gateway.handle(Request::get("/x").body(Body::empty()).unwrap()));
+
+        assert_eq!(
+            lane(&response),
+            Lane::Fallthrough(FallthroughReason::CapsuleError),
+            "{status} {header:?}"
+        );
+        assert_eq!(body_text(response), "origin");
+    }
+}
+
+#[test]
+fn a_write_with_a_bad_header_is_still_a_method_fallthrough() {
+    let seen = Seen::default();
+    let gateway = EdgeGateway::new(serving_guest(), origin(&seen));
+    let request = Request::post("/feedback")
+        .header(
+            "x-latin1",
+            http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let response = block_on(gateway.handle(request));
+
+    assert_eq!(
+        lane(&response),
+        Lane::Fallthrough(FallthroughReason::MethodNotEdgeEligible)
+    );
+}
+
+#[test]
+fn a_utf8_header_value_and_a_bad_credential_still_reach_the_capsule() {
+    let seen = Seen::default();
+    let gateway = EdgeGateway::new(serving_guest(), origin(&seen));
+    // `é` is UTF-8 but not visible ASCII. The cookie never reaches the
+    // capsule, so its bytes do not matter.
+    let request = Request::get("/greet")
+        .header(
+            "x-name",
+            http::HeaderValue::from_bytes("José".as_bytes()).unwrap(),
+        )
+        .header(
+            "cookie",
+            http::HeaderValue::from_bytes(b"sid=\xff").unwrap(),
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    let response = block_on(gateway.handle(request));
+
+    assert_eq!(lane(&response), Lane::Edge);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn response_headers_keep_every_value_of_a_repeated_name() {
+    let name = http::HeaderName::from_static("x-policy");
+    let seen = Seen::default();
+    let gateway = EdgeGateway::new(serving_guest(), origin(&seen)).with_response_headers([
+        (name.clone(), http::HeaderValue::from_static("a")),
+        (name.clone(), http::HeaderValue::from_static("b")),
+    ]);
+
+    let response = block_on(gateway.handle(Request::get("/greet").body(Body::empty()).unwrap()));
+
+    let values: Vec<_> = response.headers().get_all(&name).iter().collect();
+    assert_eq!(values, ["a", "b"]);
 }

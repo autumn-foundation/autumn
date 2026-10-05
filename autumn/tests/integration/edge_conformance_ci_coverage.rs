@@ -11,6 +11,9 @@
 //!
 //! This test pins the CI step's `CARGO_TARGET_DIR` so a future edit cannot
 //! silently reintroduce the double build.
+//!
+//! The job's last step, "autumn build emits the capsule", builds the capsule
+//! again on purpose. It tests the CLI path (AC-1 of #1790), not the suite.
 
 use std::path::{Path, PathBuf};
 

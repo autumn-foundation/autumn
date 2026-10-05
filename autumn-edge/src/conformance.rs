@@ -222,8 +222,8 @@ pub fn compare(native: &EdgeResponse, edge: &EdgeResponse) -> Verdict {
 /// Compare an origin response with a raw capsule response.
 ///
 /// The same as [`compare`], but [`SECURITY_HEADERS`] are dropped from both
-/// sides first: the host sets them, not the capsule. Every other header must
-/// match in both directions.
+/// sides first: the host sets them, not the capsule. Every header that is not
+/// volatile must match in both directions.
 #[must_use]
 pub fn compare_capsule(origin: &EdgeResponse, capsule: &EdgeResponse) -> Verdict {
     let without_security = |response: &EdgeResponse| EdgeResponse {
