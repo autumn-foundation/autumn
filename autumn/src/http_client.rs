@@ -1982,10 +1982,13 @@ impl RequestBuilder {
 
             let mut req = self.client.request(self.method.clone(), &self.url);
 
-            // Inject W3C trace context headers from the active span.
-            req = inject_trace_context(req);
+            // One CLIENT span per attempt. Inject trace context and request id
+            // headers inside it, so the next service's parent is this attempt.
+            // A caller header of the same name wins.
+            let span = client_attempt_span(&self.method, &self.url, attempt);
+            req = span.in_scope(|| inject_propagation_headers(req, &self.extra_headers));
 
-            // Apply caller-supplied headers (may override or extend trace headers).
+            // Apply caller-supplied headers.
             for (name, value) in &self.extra_headers {
                 req = req.header(name.clone(), value.clone());
             }
@@ -1994,7 +1997,8 @@ impl RequestBuilder {
                 req = req.body(body.clone());
             }
 
-            match req.send().await {
+            let sent = send_in_span(req, &span).await;
+            match sent {
                 Ok(resp) => {
                     let status = resp.status();
                     let headers = resp.headers().clone();
@@ -2622,9 +2626,9 @@ async fn serve_sim_host(
         let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
         builder = builder.header(reqwest::header::HOST, authority);
     }
-    // Trace context first, as on the real send path. A caller header of the
-    // same name wins.
-    for (name, value) in trace_context_headers() {
+    // Trace context and request id first, as on the real send path. A caller
+    // header of the same name wins.
+    for (name, value) in propagation_headers() {
         if !request.extra_headers.contains_key(name.as_str()) {
             builder = builder.header(name, value);
         }
@@ -2805,7 +2809,8 @@ async fn send_one(
         if let Some(d) = deadline {
             req = req.timeout(d.saturating_duration_since(crate::time::ambient_instant()));
         }
-        req = inject_trace_context(req);
+        let span = client_attempt_span(method, url, attempt);
+        req = span.in_scope(|| inject_propagation_headers(req, extra_headers));
         for (name, value) in extra_headers {
             req = req.header(name.clone(), value.clone());
         }
@@ -2813,7 +2818,7 @@ async fn send_one(
             req = req.body(body.clone());
         }
 
-        match req.send().await {
+        match send_in_span(req, &span).await {
             Ok(resp) => {
                 let status = resp.status();
                 let headers = resp.headers().clone();
@@ -3137,16 +3142,87 @@ fn log_request(
     );
 }
 
-/// Inject the active span's W3C `traceparent` / `tracestate` headers into the
-/// request builder.  No-ops when the `telemetry-otlp` feature is disabled or
-/// when there is no active span with a valid context.
-#[allow(clippy::missing_const_for_fn)]
-fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+/// Open the CLIENT span for one outbound attempt (issue #3064).
+///
+/// Field names follow the OpenTelemetry HTTP client conventions. The span
+/// holds the URL path only, not the query: a query can hold secrets.
+fn client_attempt_span(method: &Method, url: &str, attempt: u32) -> tracing::Span {
+    let parsed = reqwest::Url::parse(url).ok();
+    let host = parsed
+        .as_ref()
+        .and_then(reqwest::Url::host_str)
+        .unwrap_or_default();
+    let path = parsed.as_ref().map_or("", reqwest::Url::path);
+    tracing::info_span!(
+        "http.client.request",
+        otel.name = %method,
+        otel.kind = "client",
+        http.request.method = %method,
+        server.address = host,
+        url.path = path,
+        http.request.resend_count = attempt,
+        http.response.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+    )
+}
+
+/// Send `request` inside `span`, then record the status code or the error
+/// class on the span.
+async fn send_in_span(
+    request: reqwest::RequestBuilder,
+    span: &tracing::Span,
+) -> Result<reqwest::Response, reqwest::Error> {
+    use tracing::Instrument as _;
+
+    let sent = request.send().instrument(span.clone()).await;
+    match &sent {
+        Ok(response) => {
+            span.record("http.response.status_code", response.status().as_u16());
+        }
+        Err(error) => {
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            span.record("error.type", kind);
+        }
+    }
+    sent
+}
+
+/// Inject the [`propagation_headers`] into the request builder. Skip a name
+/// that `caller_headers` holds: `RequestBuilder::header` appends, so both
+/// values would otherwise go out.
+fn inject_propagation_headers(
+    builder: reqwest::RequestBuilder,
+    caller_headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
     let mut builder = builder;
-    for (name, value) in trace_context_headers() {
-        builder = builder.header(name, value);
+    for (name, value) in propagation_headers() {
+        if !caller_headers.contains_key(name.as_str()) {
+            builder = builder.header(name, value);
+        }
     }
     builder
+}
+
+/// Headers that carry the current request's context to the next service:
+/// - W3C `traceparent` / `tracestate` from the active span (with the
+///   `telemetry-otlp` feature),
+/// - `x-request-id` from the current request (issue #3064).
+///
+/// Empty outside a request with no active span.
+fn propagation_headers() -> Vec<(String, HeaderValue)> {
+    let mut headers = trace_context_headers();
+    if let Some(value) =
+        crate::log::context::current_request_id().and_then(|id| HeaderValue::from_str(&id).ok())
+    {
+        headers.push(("x-request-id".to_owned(), value));
+    }
+    headers
 }
 
 /// The W3C trace-context headers for the active span. Empty when the
@@ -4024,16 +4100,44 @@ mod tests {
         });
     }
 
-    // TEST 34: inject_trace_context passthrough (without telemetry-otlp feature).
+    // TEST 34: no propagation headers outside a request.
     #[test]
-    fn inject_trace_context_passthrough_without_telemetry() {
-        let inner = reqwest::Client::new();
-        let builder = inner.get("https://example.com");
-        // Without telemetry-otlp the function is a no-op; verify it doesn't panic.
-        let _b = inject_trace_context(builder);
+    fn propagation_headers_are_empty_outside_a_request() {
+        #[cfg(not(feature = "telemetry-otlp"))]
+        assert!(propagation_headers().is_empty());
+        assert!(
+            !propagation_headers()
+                .iter()
+                .any(|(name, _)| name == "x-request-id")
+        );
     }
 
-    // TEST 35: Real GET request exercises inject_trace_context, log_request, and
+    #[tokio::test]
+    async fn propagation_headers_carry_the_current_request_id() {
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let headers = crate::log::context::scope(ctx, async { propagation_headers() }).await;
+        let id = headers
+            .iter()
+            .find(|(name, _)| name == "x-request-id")
+            .map(|(_, value)| value.to_str().unwrap().to_owned());
+        assert_eq!(id.as_deref(), Some("rid-1"));
+    }
+
+    #[tokio::test]
+    async fn caller_header_suppresses_the_propagated_one() {
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let mut caller = HeaderMap::new();
+        caller.insert("x-request-id", HeaderValue::from_static("mine"));
+        let request = crate::log::context::scope(ctx, async {
+            inject_propagation_headers(reqwest::Client::new().get("https://example.com"), &caller)
+        })
+        .await
+        .build()
+        .unwrap();
+        assert!(request.headers().get("x-request-id").is_none());
+    }
+
+    // TEST 35: Real GET request exercises inject_propagation_headers, log_request, and
     // the success branch of the retry loop.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -4061,6 +4165,140 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         assert!(resp.url().is_some());
         assert_eq!(resp.text(), "pong");
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Records each `http.client.request` span and the fields set on it.
+    #[derive(Clone, Default)]
+    struct ClientSpanCapture {
+        spans: std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<u64, std::collections::BTreeMap<String, String>>,
+            >,
+        >,
+    }
+
+    struct SpanFieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for SpanFieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(
+                field.name().to_owned(),
+                format!("{value:?}").trim_matches('"').to_owned(),
+            );
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ClientSpanCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "http.client.request" {
+                return;
+            }
+            let mut fields = std::collections::BTreeMap::new();
+            attrs.record(&mut SpanFieldVisitor(&mut fields));
+            self.spans.lock().unwrap().insert(id.into_u64(), fields);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(fields) = self.spans.lock().unwrap().get_mut(&id.into_u64()) {
+                values.record(&mut SpanFieldVisitor(fields));
+            }
+        }
+    }
+
+    // One CLIENT span per outbound attempt (issue #3064), on the plain and
+    // the custom send paths.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn each_attempt_opens_one_client_span() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        for custom_path in [false, true] {
+            let capture = ClientSpanCapture::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            tracing::callsite::rebuild_interest_cache();
+
+            // The first call answers 503, the next 200: two attempts.
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route(
+                "/flaky",
+                get(move || {
+                    let calls = std::sync::Arc::clone(&calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let mut request = Client::new().get(format!("http://{addr}/flaky"));
+            if custom_path {
+                request = request.no_redirect();
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+
+            let spans = capture.spans.lock().unwrap();
+            let mut attempts: Vec<_> = spans.values().cloned().collect();
+            attempts.sort_by_key(|f| f.get("http.request.resend_count").cloned());
+            assert_eq!(attempts.len(), 2, "custom={custom_path}: {attempts:?}");
+            for (n, fields) in attempts.iter().enumerate() {
+                assert_eq!(fields.get("otel.kind").map(String::as_str), Some("client"));
+                assert_eq!(
+                    fields.get("http.request.method").map(String::as_str),
+                    Some("GET")
+                );
+                assert_eq!(
+                    fields.get("server.address").map(String::as_str),
+                    Some("127.0.0.1")
+                );
+                assert_eq!(
+                    fields.get("http.request.resend_count"),
+                    Some(&n.to_string())
+                );
+            }
+            assert_eq!(
+                attempts[0]
+                    .get("http.response.status_code")
+                    .map(String::as_str),
+                Some("503")
+            );
+            assert_eq!(
+                attempts[1]
+                    .get("http.response.status_code")
+                    .map(String::as_str),
+                Some("200")
+            );
+        }
 
         crate::circuit_breaker::global_registry().clear();
     }

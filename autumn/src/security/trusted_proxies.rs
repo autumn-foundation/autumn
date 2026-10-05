@@ -188,6 +188,25 @@ impl ProxyResolver {
         self.ranges.iter().any(|r| r.contains(ip))
     }
 
+    /// Returns `true` when the immediate peer is a trusted proxy, so headers
+    /// it sets (such as `X-Request-Id`) can be honoured.
+    ///
+    /// - `trust_forwarded_headers = false`: never.
+    /// - `trusted_hops` set: always (the operator declares a proxy in front).
+    /// - Ranges set: the peer IP must be in a range.
+    /// - Neither set: every peer.
+    pub(crate) fn is_trusted_peer<B>(&self, req: &Request<B>) -> bool {
+        if !self.trust_forwarded_headers {
+            return false;
+        }
+        if self.trusted_hops.is_some() {
+            return true;
+        }
+        let peer_ip = Self::peer_ip(req);
+        peer_ip.is_some_and(|ip| self.is_trusted_ip(ip))
+            || (!self.ranges_configured && peer_ip.is_none())
+    }
+
     /// Build a resolver that trusts loopback addresses only (dev-profile default).
     #[must_use]
     pub fn loopback_only() -> Self {
@@ -525,6 +544,12 @@ impl TrustedProxiesLayer {
         Self {
             resolver: Arc::new(ProxyResolver::from_config(config)),
         }
+    }
+
+    /// The resolver this layer uses. Other layers share it, so the trust
+    /// decision has one source.
+    pub(crate) fn resolver(&self) -> Arc<ProxyResolver> {
+        Arc::clone(&self.resolver)
     }
 }
 

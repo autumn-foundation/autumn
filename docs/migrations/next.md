@@ -151,6 +151,54 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Metrics: `autumn_http_request_duration_seconds` is now a histogram
+
+**Why:** A summary cannot be aggregated across replicas (issue #3064). A
+histogram gives fleet p99 and SLO burn rates.
+
+**Before (`{X.Y}`):** the family was a summary with quantile lines.
+
+```promql
+autumn_http_request_duration_seconds{version="canary",quantile="0.99"}
+```
+
+**After (`{(X+1).0}`):** the family is a histogram with `method`, `route`
+and `status_class` labels. Compute a quantile from the buckets:
+
+```promql
+histogram_quantile(0.99,
+  sum by (le, version) (rate(autumn_http_request_duration_seconds_bucket[5m])))
+```
+
+The old quantile lines stay, deprecated, under a new name:
+`autumn_http_request_duration_quantiles_seconds`. For a quick fix, rename
+the family in your queries, alerts and canary gates. A later release removes
+the summary.
+
+**Automation:** `manual` - the change is in PromQL queries and dashboards,
+not in Rust code.
+
+### Telemetry: `TelemetryConfig` and `OtlpTraceRuntime` have a new field
+
+**Why:** The OTLP sampler takes a ratio now (issue #3064).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let telemetry = TelemetryConfig { enabled: true, /* every field */ strict: false };
+```
+
+**After (`{(X+1).0}`):** add `sample_ratio`, or fill the rest from
+`Default`.
+
+```rust
+let telemetry = TelemetryConfig { enabled: true, ..TelemetryConfig::default() };
+```
+
+`OtlpTraceRuntime` has a new `sample_ratio: SampleRatio` field too.
+
+**Automation:** `manual` - a codemod cannot pick the ratio for you.
+
 ---
 
 ## Plugin authors
@@ -190,6 +238,9 @@ single most valuable section of the guide — keep it factual and short.
 
 If nothing changed, delete this section.
 
+- New key `telemetry.sample_ratio` (`AUTUMN_TELEMETRY__SAMPLE_RATIO`),
+  default `1.0`. See [Overload signals](../guide/observability/overload-signals.md).
+
 ## Behavior changes
 
 Changes that still compile but behave differently at runtime. Examples:
@@ -197,6 +248,13 @@ Changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+- A trusted proxy can now set the request id. When
+  `[security.trusted_proxies]` trusts the peer and the peer sends a UUID in
+  `X-Request-Id`, the app keeps it. Before, the app always made a new id.
+- `http_client` sends the current request's id as `x-request-id`. A header
+  that you set on the request builder wins.
+- A metric `method` label shows `_other` for a non-standard HTTP method.
 
 If nothing changed, delete this section.
 

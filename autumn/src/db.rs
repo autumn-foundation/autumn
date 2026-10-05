@@ -3477,7 +3477,20 @@ impl Db {
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
 
-        let mut conn = checkout_future.instrument(span.clone()).await?;
+        // Pool wait time (issue #3064): from the checkout request to a
+        // connection or an error. A timeout is the wait that matters most, so
+        // it is recorded too.
+        let wait_start = params.clock.monotonic();
+        let checkout = checkout_future.instrument(span.clone()).await;
+        if let Some(metrics) = &params.metrics {
+            metrics.record_db_pool_wait(
+                params
+                    .clock
+                    .monotonic()
+                    .saturating_duration_since(wait_start),
+            );
+        }
+        let mut conn = checkout?;
 
         // `statement_timeout` is a Postgres session GUC; it is intentionally
         // unused on the SQLite backend (see the gating note below), so consume
@@ -4015,6 +4028,36 @@ mod tests {
 
     use super::*;
     use crate::config::DatabaseConfig;
+
+    /// A failed checkout still records its pool wait (issue #3064): a
+    /// checkout timeout is the overload signal operators need most.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn checkout_records_pool_wait_even_on_failure() {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            RuntimeConnection,
+        >::new("postgres://autumn:autumn@127.0.0.1:1/nothing");
+        let pool = Pool::builder(manager).max_size(1).build().unwrap();
+        let metrics = crate::middleware::MetricsCollector::new();
+
+        let result = Db::checkout(DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            route_key: None,
+            metrics: Some(metrics.clone()),
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
+            clock: std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK),
+        })
+        .await;
+
+        assert!(result.is_err(), "nothing listens on port 1");
+        assert_eq!(metrics.db_pool_wait().count(), 1);
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;

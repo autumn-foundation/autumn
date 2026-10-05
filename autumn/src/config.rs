@@ -85,6 +85,7 @@
 //! | `AUTUMN_TELEMETRY__OTLP_ENDPOINT` | `telemetry.otlp_endpoint` | `String` |
 //! | `AUTUMN_TELEMETRY__PROTOCOL` | `telemetry.protocol` | `Grpc` / `HttpProtobuf` |
 //! | `AUTUMN_TELEMETRY__STRICT` | `telemetry.strict` | `bool` |
+//! | `AUTUMN_TELEMETRY__SAMPLE_RATIO` | `telemetry.sample_ratio` | `f64` |
 //! | `AUTUMN_METRICS__MAX_SERIES_PER_METRIC` | `metrics.max_series_per_metric` | `usize` |
 //! | `AUTUMN_METRICS__MAX_INSTRUMENTS` | `metrics.max_instruments` | `usize` |
 //! | `AUTUMN_METRICS__MAX_LABELS_PER_SERIES` | `metrics.max_labels_per_series` | `usize` |
@@ -5182,6 +5183,7 @@ impl AutumnConfig {
     /// - `AUTUMN_TELEMETRY__OTLP_ENDPOINT` -> `telemetry.otlp_endpoint` (String)
     /// - `AUTUMN_TELEMETRY__PROTOCOL` -> `telemetry.protocol` (`Grpc` | `HttpProtobuf`)
     /// - `AUTUMN_TELEMETRY__STRICT` -> `telemetry.strict` (bool)
+    /// - `AUTUMN_TELEMETRY__SAMPLE_RATIO` -> `telemetry.sample_ratio` (f64)
     ///
     /// # Health / Probes
     /// - `AUTUMN_HEALTH__PATH` → `health.path` (String)
@@ -5969,6 +5971,14 @@ impl AutumnConfig {
             }
         }
         parse_env_bool(env, "AUTUMN_TELEMETRY__STRICT", &mut self.telemetry.strict);
+        if let Ok(val) = env.var("AUTUMN_TELEMETRY__SAMPLE_RATIO") {
+            match val.trim().parse::<f64>() {
+                Ok(ratio) => self.telemetry.sample_ratio = ratio,
+                Err(_) => eprintln!(
+                    "Warning: AUTUMN_TELEMETRY__SAMPLE_RATIO={val:?} is not a number, ignoring"
+                ),
+            }
+        }
     }
 
     fn apply_health_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -9439,6 +9449,18 @@ pub struct TelemetryConfig {
     /// When `true`, telemetry initialization failures abort startup.
     #[serde(default)]
     pub strict: bool,
+
+    /// Fraction of new traces to sample, from `0.0` to `1.0`. Default: `1.0`.
+    ///
+    /// The sampler is parent-based: a span with a sampled parent is sampled,
+    /// and a span with an unsampled parent is not. The ratio applies only to
+    /// root spans. A value out of range is clamped. `NaN` reads as `1.0`.
+    #[serde(default = "default_telemetry_sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+const fn default_telemetry_sample_ratio() -> f64 {
+    1.0
 }
 
 /// OTLP transport protocol selection.
@@ -10382,6 +10404,7 @@ impl Default for TelemetryConfig {
             otlp_endpoint: None,
             protocol: TelemetryProtocol::default(),
             strict: false,
+            sample_ratio: default_telemetry_sample_ratio(),
         }
     }
 }
@@ -17418,6 +17441,19 @@ path = "/healthz"
         );
         assert_eq!(config.telemetry.protocol, TelemetryProtocol::HttpProtobuf);
         assert!(config.telemetry.strict);
+    }
+
+    #[test]
+    fn env_override_telemetry_sample_ratio() {
+        let env = MockEnv::new().with("AUTUMN_TELEMETRY__SAMPLE_RATIO", "0.25");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!((config.telemetry.sample_ratio - 0.25).abs() < f64::EPSILON);
+
+        let env = MockEnv::new().with("AUTUMN_TELEMETRY__SAMPLE_RATIO", "half");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!((config.telemetry.sample_ratio - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]

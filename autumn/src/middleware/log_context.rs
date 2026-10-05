@@ -6,7 +6,9 @@
 //! [`RequestIdLayer`](crate::middleware::RequestIdLayer)). The request is then
 //! driven inside both that task-local context and a `tracing` span carrying
 //! `request_id`/`user_id`/`tenant_id`, so every event emitted during the
-//! request automatically correlates back to it.
+//! request automatically correlates back to it. With the `telemetry-otlp`
+//! feature and an active OpenTelemetry span, the span also carries
+//! `trace_id`/`span_id`.
 //!
 //! This layer is **not** gated behind any telemetry feature — it is applied on
 //! the default ingress path. Place it inner to `RequestIdLayer` so the request
@@ -60,6 +62,29 @@ impl<S> Layer<S> for LogContextLayer {
     }
 }
 
+/// Record the OpenTelemetry trace id and span id of `span` (issue #3064).
+///
+/// The ids go on the span, so the fmt output shows them, and into the log
+/// context, so the capture buffer shows them. No-op when no OpenTelemetry
+/// layer is installed: the span context is then not valid.
+#[cfg(feature = "telemetry-otlp")]
+fn record_trace_ids(span: &tracing::Span, ctx: &LogContext) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let otel_cx = span.context();
+    let span_context = otel_cx.span().span_context().clone();
+    if !span_context.is_valid() {
+        return;
+    }
+    let trace_id = span_context.trace_id().to_string();
+    let span_id = span_context.span_id().to_string();
+    span.record("trace_id", trace_id.as_str());
+    span.record("span_id", span_id.as_str());
+    ctx.insert_field("trace_id", trace_id);
+    ctx.insert_field("span_id", span_id);
+}
+
 /// Tower [`Service`] produced by [`LogContextLayer`].
 #[derive(Clone)]
 pub struct LogContextService<S> {
@@ -94,6 +119,8 @@ where
             request_id = tracing::field::Empty,
             user_id = tracing::field::Empty,
             tenant_id = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
         );
         if let Some(ref rid) = request_id {
             span.record("request_id", tracing::field::display(rid));
@@ -103,6 +130,8 @@ where
         // it directly, rather than whatever child span happens to be current.
         let ctx =
             LogContext::with_filter(request_id, Arc::clone(&self.filter)).with_span(span.clone());
+        #[cfg(feature = "telemetry-otlp")]
+        record_trace_ids(&span, &ctx);
         let body_ctx = ctx.clone();
 
         // Construct the inner future with the request span entered *and* the log
@@ -282,6 +311,72 @@ mod tests {
             vec![Some("req-stream".to_owned())],
             "streaming body frame production lost the request context"
         );
+    }
+
+    /// Run one request through the framework layering and return the log
+    /// fields the handler saw.
+    fn handler_log_fields() -> crate::log::context::LogFields {
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async { serde_json::to_string(&context::snapshot().unwrap()).unwrap() }),
+            )
+            .layer(LogContextLayer::new(filter()))
+            .layer(RequestIdLayer::default());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let body = rt.block_on(async {
+            let response = app
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        });
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        crate::log::context::LogFields {
+            request_id: json["request_id"].as_str().map(str::to_owned),
+            fields: json
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_trace_ids_without_an_otel_span() {
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer::default().boxed());
+        with_default(subscriber, || {
+            let fields = handler_log_fields();
+            assert!(fields.request_id.is_some());
+            assert!(!fields.fields.contains_key("trace_id"));
+            assert!(!fields.fields.contains_key("span_id"));
+        });
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn otel_span_adds_trace_and_span_ids() {
+        use opentelemetry::trace::TracerProvider as _;
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        with_default(subscriber, || {
+            let fields = handler_log_fields();
+            let trace_id = fields.fields.get("trace_id").expect("trace_id");
+            let span_id = fields.fields.get("span_id").expect("span_id");
+            assert_eq!(trace_id.len(), 32, "{trace_id}");
+            assert_eq!(span_id.len(), 16, "{span_id}");
+            assert!(trace_id.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_ne!(trace_id.as_str(), "00000000000000000000000000000000");
+        });
     }
 
     #[test]

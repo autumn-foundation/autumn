@@ -251,6 +251,17 @@ pub fn current() -> Option<LogContext> {
     CURRENT.try_with(Clone::clone).ok()
 }
 
+/// The request id of the current request context, if any.
+///
+/// Cheaper than [`snapshot`]: it clones one field, not the whole context.
+#[must_use]
+pub fn current_request_id() -> Option<String> {
+    CURRENT
+        .try_with(|ctx| ctx.inner.read().ok()?.request_id.clone())
+        .ok()
+        .flatten()
+}
+
 /// Snapshot the current request context's fields, if any.
 #[must_use]
 pub fn snapshot() -> Option<LogFields> {
