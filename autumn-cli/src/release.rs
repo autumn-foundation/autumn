@@ -4311,27 +4311,24 @@ esac
     fn azure_cutover_script_assigns_every_identity_of_the_job_secrets() {
         // A Key Vault job secret can use another user-assigned identity. The
         // app needs each one to read the secret.
-        for (identity, want) in [("/kv-id-2", "\"/kv-id-2\":{}")] {
-            let Some((status, calls, bodies)) = run_azure_cutover(
-                "mcr.microsoft.com/k8se/quickstart:latest",
-                "Provisioned",
-                false,
-                0,
-                &[
-                    ("STUB_JOB_CUSTOM_KV", "1"),
-                    ("STUB_JOB_CUSTOM_KV_IDENTITY", identity),
-                ],
-            ) else {
-                return;
-            };
-            assert!(status.success(), "{identity}: {calls}");
-            let cutover = bodies
-                .lines()
-                .find(|line| line.contains("\"template\""))
-                .unwrap_or_else(|| panic!("{bodies}"));
-            assert!(cutover.contains(want), "{identity}: {cutover}");
-            assert!(cutover.contains("userAssignedIdentities"), "{cutover}");
-        }
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "/kv-id-2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let cutover = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(cutover.contains("\"/kv-id-2\":{}"), "{cutover}");
     }
 
     #[cfg(unix)]

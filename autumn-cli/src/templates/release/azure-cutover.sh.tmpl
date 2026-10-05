@@ -179,17 +179,15 @@ done <<< "$ACTIVE"
 # registries too, so the script selects the entry by server.
 JOB_IDENTITY=$(jq -r --arg acr "$ACR_LOGIN_SERVER" \
   '[.properties.configuration.registries // [] | .[] | select(.server == $acr)][0].identity // ""' <<< "$JOB")
-# The identities that the app needs: the ACR identity, and each identity
-# that a Key Vault job secret uses. "system" is the app's system identity.
+# The identities that the app needs: the ACR identity, and each
+# user-assigned identity that a Key Vault job secret uses. A job secret on
+# the job's system identity cannot move: the app's system identity is
+# another principal, without access to the vault. The cutover stops on it.
 JOB_UIDS=$(jq -c --arg id "$JOB_IDENTITY" '[$id] + [.[] | select(.keyVaultUrl) | .identity // empty
     | select(ascii_downcase != "system")]
   | map(select(. != "")) | unique_by(ascii_downcase)' "$JOB_SECRETS")
-NEED_SYSTEM=$(jq -c 'any(.[]; .keyVaultUrl and ((.identity // "") | ascii_downcase) == "system")' "$JOB_SECRETS")
-# When the cutover turns the system identity on for a job secret, it tags
-# the app with autumn-system-identity=cutover. Credential removal turns the
-# system identity off only with that tag: an app's own system identity
-# stays.
-DROP_SYSTEM=false
+SYSTEM_SECRETS=$(jq -r '[.[] | select(.keyVaultUrl and ((.identity // "") | ascii_downcase) == "system") | .name]
+  | join(", ")' "$JOB_SECRETS")
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
 JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$JOB")
@@ -229,7 +227,6 @@ APPLIED='
      | {name, keyVaultUrl, identity: (.identity // "" | ascii_downcase)}] as $have
   | .properties.provisioningState == "Succeeded"
     and ($uids | all(ascii_downcase as $u | $ids | index($u) != null))
-    and (($sys | not) or (.identity.type // "" | test("SystemAssigned")))
     and any(.properties.configuration.registries // [] | .[];
             .server == $acr and (.identity // "" | ascii_downcase) == $lid)
     and ($want | all(. as $s | $have | index([$s]) != null))'
@@ -240,7 +237,6 @@ REMOVED="$MANAGED_DEF"'
      | select(.value != null) | .key | ascii_downcase] as $ids
   | .properties.provisioningState == "Succeeded"
     and ($ids | all(IN($lids[]) | not))
-    and (($dropsys | not) or (.identity.type // "None" | test("SystemAssigned") | not))
     and all(.properties.configuration.registries // [] | .[];
             (.identity // "" | ascii_downcase) | IN($lids[]) | not)
     and all(.properties.configuration.secrets // [] | .[];
@@ -265,7 +261,7 @@ app_shows() {
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --output json) || return 1
   jq -e --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" \
-    --argjson uids "$JOB_UIDS" --argjson sys "$NEED_SYSTEM" --argjson dropsys "$DROP_SYSTEM" \
+    --argjson uids "$JOB_UIDS" \
     --argjson want "$JOB_SECRET_REFS" "$1" <<< "$now" > /dev/null
 }
 
@@ -501,13 +497,11 @@ remove_credentials() {
     # one, so the script checks every active revision.
     sole_active "$revision" || return 1
   fi
-  DROP_SYSTEM=$(jq -c '(.tags["autumn-system-identity"] // "") == "cutover"' <<< "$live")
   body=$(jq -cn --argjson app "$APP" --argjson live "$live" --slurpfile app_secrets "$APP_SECRETS" \
-    --argjson uids "$JOB_UIDS" --argjson dropsys "$DROP_SYSTEM" "$SECRET_REF$MANAGED_DEF"'
+    --argjson uids "$JOB_UIDS" "$SECRET_REF$MANAGED_DEF"'
     ($uids | map(ascii_downcase)) as $lids
-    | ($live.identity.type // "None") as $type
-    # Only a system identity that the cutover turned on (its tag) goes.
-    | (($type | test("SystemAssigned")) and ($dropsys | not)) as $keep_system
+    # The cutover never turns the system identity on, so it stays.
+    | ($live.identity.type // "None" | test("SystemAssigned")) as $keep_system
     | ($app.identity.userAssignedIdentities // {}) as $ids
     | ($ids | with_entries(select(.key | ascii_downcase | IN($lids[]) | not)) | map_values({})) as $own
     # The snapshot can predate the cutover, so it can lack a job identity.
@@ -516,9 +510,8 @@ remove_credentials() {
     | ($uids | map(. as $u
         | ($ids | with_entries(select(.key | ascii_downcase == ($u | ascii_downcase))) | map_values(null))
         | if . == {} then {($u): null} else . end) | add // {}) as $drop
-    | {location: $app.location}
-    + (if $dropsys then {tags: {"autumn-system-identity": null}} else {} end)
-    + {identity: (if $own != {}
+    | {location: $app.location,
+       identity: (if $own != {}
                   then {type: (if $keep_system then "SystemAssigned,UserAssigned" else "UserAssigned" end),
                         userAssignedIdentities: ($drop + $own)}
                   elif $keep_system then {type: "SystemAssigned", userAssignedIdentities: null}
@@ -577,6 +570,10 @@ fail() {
 if [ -z "$JOB_IDENTITY" ] \
   || ! jq -e '(.properties.configuration.secrets // []) | length > 0' <<< "$JOB" > /dev/null; then
   echo "::error::the migration job has no identity or secrets to copy. Run terraform apply first." >&2
+  exit 1
+fi
+if [ -n "$SYSTEM_SECRETS" ]; then
+  echo "::error::the job secret(s) $SYSTEM_SECRETS use the job's system identity. The app's system identity is another principal, without access to the vault. Give the secret a user-assigned identity that can read the vault, and try again." >&2
   exit 1
 fi
 
@@ -702,7 +699,7 @@ fi
 # The secrets, registries and identities that you add to the app stay.
 PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slurpfile job_secrets "$JOB_SECRETS" \
   --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" --argjson containers "$CONTAINERS" \
-  --argjson uids "$JOB_UIDS" --argjson sys "$NEED_SYSTEM" "$SECRET_REF"'
+  --argjson uids "$JOB_UIDS" "$SECRET_REF"'
   ($job_secrets[0] | map(secret_ref)) as $job_secrets
   | if $id == "" or ($job_secrets | length) == 0
     then error("the migration job has no identity or secrets to copy")
@@ -711,11 +708,9 @@ PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slu
   | ($app_secrets[0]
      | map(select(.name as $n | $job_names | index($n) | not) | secret_ref)
      + $job_secrets) as $secrets
-  | {location: $app.location}
-  + (if $sys and ($app.identity.type // "None" | test("SystemAssigned") | not)
-     then {tags: {"autumn-system-identity": "cutover"}} else {} end)
-  + {identity: {
-       type: (if ($app.identity.type // "None" | test("SystemAssigned")) or $sys
+  | {location: $app.location,
+     identity: {
+       type: (if ($app.identity.type // "None" | test("SystemAssigned"))
               then "SystemAssigned,UserAssigned" else "UserAssigned" end),
        userAssignedIdentities: ($uids | map({(.): {}}) | add)},
      properties: {

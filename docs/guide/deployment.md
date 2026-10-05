@@ -2048,7 +2048,9 @@ first revision, and a brand-new ACR has none yet). The placeholder **app**
 never gets production credentials (#2314): `main.tf` creates the app with no
 managed identity, no registry and no secret refs. The scaffolded
 `azure-cutover.sh` copies them from the migration job and sets the real image
-in one write. The identity applies to all revisions, so the first cutover
+in one write. A Key Vault secret that you add to the job must use a
+user-assigned identity: the app cannot use the job's system identity, so
+the script stops on such a secret. The identity applies to all revisions, so the first cutover
 disables ingress (also the internal route) and waits until the placeholder
 runs no replica. Then nothing can start the placeholder again. Keep
 `min_replicas = 0` until then: the script stops if the template or an active
