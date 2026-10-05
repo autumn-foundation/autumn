@@ -3281,6 +3281,8 @@ fi
   scale=""
   [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"'"$STUB_SCALE_SECRET_REF"'","triggerParameter":"connection"}]}}]}'
   [ -n "$STUB_MIN_REPLICAS" ] && scale=',"scale":{"minReplicas":'"$STUB_MIN_REPLICAS"'}'
+  # An HTTP scale rule that authenticates with the job's identity.
+  [ -n "$STUB_APP_SCALE_IDENTITY" ] && scale=',"scale":{"rules":[{"name":"h","http":{"metadata":{"concurrentRequests":"10"},"identity":"'"$id"'"}}]}'
   # A placeholder has closed ingress; a real release has open ingress. Both
   # have a custom domain that the cutover must keep.
   external=false
@@ -3329,6 +3331,8 @@ case "$1 $2" in
       exit 0
     fi
     registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
+    # The job pulls from the ACR with its system identity.
+    [ -n "$STUB_JOB_ACR_SYSTEM" ] && registries='{"server":"acr.azurecr.io","identity":"system"}'
     # An operator-added registry listed before the ACR.
     [ -n "$STUB_JOB_EXTRA_REGISTRY" ] && registries="{\"server\":\"other.example.io\",\"identity\":\"/other-id\"},$registries"
     echo "{\"properties\":{\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]}}}"
@@ -3553,6 +3557,8 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_APP_SCALE_IDENTITY",
+        "STUB_JOB_ACR_SYSTEM",
         "STUB_APP_SHARED_SECRET",
         "STUB_LATEST",
         "STUB_STATUS_SEQ",
@@ -4519,6 +4525,60 @@ esac
                 "{args:?}: {calls}"
             );
             assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_a_scale_rule_uses_the_job_identity() {
+        // A scale rule can authenticate with an identity. Removal would drop
+        // the job identity under it, so the script stops before any write.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_SCALE_IDENTITY", "1"), ("STUB_APP_LEGACY", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rejects_a_system_acr_identity() {
+        // "system" is not a user-assigned identity ID, and the app's system
+        // identity has no AcrPull. The script stops before any write, on a
+        // first cutover and on a later deploy.
+        for old_image in [
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "acr.azurecr.io/app:t0",
+        ] {
+            let Some((status, calls, bodies)) = run_azure_cutover(
+                old_image,
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_JOB_ACR_SYSTEM", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{old_image}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{old_image}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{old_image}: {calls}"
+            );
+            assert!(!bodies.contains("\"system\":{}"), "{bodies}");
         }
     }
 
