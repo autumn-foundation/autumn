@@ -1723,19 +1723,26 @@ fn strip_lock_timeout(existing: Option<&str>) -> Option<String> {
 
 /// The `PGOPTIONS` the `diesel` subprocess gets. When a pending migration is
 /// non-transactional, the session gets `lock_timeout=0`, and any inherited
-/// `lock_timeout` option is removed.
+/// `lock_timeout` option is removed. `english` adds `lc_messages=C`, so the
+/// retry can read the lock-timeout message.
 fn child_pgoptions(
     inherited: Option<&str>,
     lock_timeout: std::time::Duration,
     non_transactional_pending: bool,
+    english: bool,
 ) -> Option<String> {
-    if non_transactional_pending {
+    let options = if non_transactional_pending {
         diesel_pgoptions(
             strip_lock_timeout(inherited).as_deref(),
             std::time::Duration::ZERO,
         )
     } else {
         diesel_pgoptions(inherited, lock_timeout)
+    };
+    if english {
+        options.map(|options| format!("{options} -c lc_messages=C"))
+    } else {
+        options
     }
 }
 
@@ -1752,6 +1759,8 @@ fn run_user_migrations(
     lock_policy: autumn_web::migrate::MigrationLockPolicy,
 ) -> bool {
     eprintln!("  Running pending migrations...\n");
+    // Ask for English server messages only when the role may set them.
+    let english = autumn_web::migrate::can_set_lc_messages(database_url);
     let non_transactional: std::collections::HashSet<String> =
         non_transactional_versions(dir).into_iter().collect();
     let pending = if non_transactional.is_empty() {
@@ -1766,15 +1775,20 @@ fn run_user_migrations(
                 dir,
                 lock_policy,
                 &migration_batches(&pending, &non_transactional),
+                english,
             )
         }
         // All pending migrations are transactional.
-        Some(_) => run_diesel_with_policy(database_url, dir, lock_policy, true),
+        Some(_) => run_diesel_with_policy(database_url, dir, lock_policy, true, english),
         // No non-transactional migration exists, or the pending set is
         // unknown: then the timeout stays off when one exists.
-        None => {
-            run_diesel_with_policy(database_url, dir, lock_policy, non_transactional.is_empty())
-        }
+        None => run_diesel_with_policy(
+            database_url,
+            dir,
+            lock_policy,
+            non_transactional.is_empty(),
+            english,
+        ),
     };
 
     match outcome {
@@ -1802,6 +1816,7 @@ fn run_diesel_in_batches(
     dir: &Path,
     lock_policy: autumn_web::migrate::MigrationLockPolicy,
     batches: &[(bool, Vec<String>)],
+    english: bool,
 ) -> Result<(), MigrationError> {
     for (transactional, versions) in batches {
         if !transactional {
@@ -1816,7 +1831,13 @@ fn run_diesel_in_batches(
         copy_migration_subset(dir, batch_dir.path(), versions).map_err(|e| {
             MigrationError::Migration(format!("could not copy migrations for a batch: {e}"))
         })?;
-        run_diesel_with_policy(database_url, batch_dir.path(), lock_policy, *transactional)?;
+        run_diesel_with_policy(
+            database_url,
+            batch_dir.path(),
+            lock_policy,
+            *transactional,
+            english,
+        )?;
     }
     Ok(())
 }
@@ -1828,11 +1849,13 @@ fn run_diesel_with_policy(
     dir: &Path,
     lock_policy: autumn_web::migrate::MigrationLockPolicy,
     transactional: bool,
+    english: bool,
 ) -> Result<(), MigrationError> {
     let mut pgoptions = child_pgoptions(
         std::env::var("PGOPTIONS").ok().as_deref(),
         lock_policy.lock_timeout,
         !transactional,
+        english,
     );
     autumn_web::migrate::retry_on_lock_timeout(
         lock_policy,
@@ -4857,12 +4880,25 @@ primary_url = "postgres://prod-s0:5432/app"
         let five = std::time::Duration::from_secs(5);
         let inherited = Some("-c search_path=app -c lock_timeout=9000");
         assert_eq!(
-            child_pgoptions(inherited, five, true).as_deref(),
+            child_pgoptions(inherited, five, true, false).as_deref(),
             Some("-c search_path=app -c lock_timeout=0")
         );
         assert_eq!(
-            child_pgoptions(inherited, five, false).as_deref(),
+            child_pgoptions(inherited, five, false, false).as_deref(),
             Some("-c search_path=app -c lock_timeout=9000 -c lock_timeout=5000")
+        );
+    }
+
+    #[test]
+    fn child_pgoptions_asks_for_english_messages_when_allowed() {
+        let five = std::time::Duration::from_secs(5);
+        assert_eq!(
+            child_pgoptions(None, five, false, true).as_deref(),
+            Some("-c lock_timeout=5000 -c lc_messages=C")
+        );
+        assert_eq!(
+            child_pgoptions(None, five, true, true).as_deref(),
+            Some("-c lock_timeout=0 -c lc_messages=C")
         );
     }
 

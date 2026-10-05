@@ -178,7 +178,8 @@ value is always set explicitly, so a role or database default does not apply.
 `"0s"` turns such a default off too.
 
 The check reads the English Postgres message. The migrator sets
-`lc_messages = 'C'` on its session. When the role may not set it, a
+`lc_messages = 'C'` on its session. `autumn migrate` adds `-c lc_messages=C`
+to `PGOPTIONS`, but only after a check shows that the role may set it. When the role may not set it, a
 non-English lock timeout still stops the migration, but it is not retried.
 
 The Rust API takes the policy explicitly:

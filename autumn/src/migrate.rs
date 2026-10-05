@@ -585,6 +585,22 @@ pub fn run_pending_with_policy(
     })
 }
 
+/// Whether the role in `database_url` may set `lc_messages` (#3057).
+///
+/// The `autumn migrate` CLI adds `-c lc_messages=C` to its `diesel` subprocess
+/// only then, so the lock-timeout retry can read the message. A startup option
+/// the role may not set stops the connection, so it is not sent blindly.
+#[doc(hidden)]
+#[must_use]
+pub fn can_set_lc_messages(database_url: &str) -> bool {
+    let result: Result<(), MigrationError> = with_migration_connection!(database_url, |conn| {
+        use diesel::connection::SimpleConnection as _;
+        conn.batch_execute("SET lc_messages = 'C'")
+            .map_err(|e| MigrationError::Migration(e.to_string()))
+    });
+    result.is_ok()
+}
+
 /// Return names of pending (not yet applied) migrations.
 ///
 /// # Errors
@@ -5192,6 +5208,19 @@ mod tests {
             lock_timeout_statement(std::time::Duration::from_secs(u64::MAX)),
             format!("SET LOCAL lock_timeout = {}", i32::MAX)
         );
+    }
+
+    /// The `postgres` superuser may set `lc_messages`.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn superuser_may_set_lc_messages() {
+        let (_container, url) = lock_probe_database().await;
+        let allowed = crate::time::spawn_blocking(move || can_set_lc_messages(&url))
+            .await
+            .expect("join");
+        assert!(allowed);
+        assert!(!can_set_lc_messages("postgres://nobody@127.0.0.1:1/none"));
     }
 
     #[test]
