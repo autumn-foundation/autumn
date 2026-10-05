@@ -2175,10 +2175,12 @@ impl Analyzer {
                     || HANDLE_TRANSITIONS.contains(&method.as_str())
             }
             // A constructor is not a future (`Some(&repo)`, `Arc::new(&repo)`).
+            // A free function (`drop`) is not one either.
             Expr::Call(call) => {
                 !(is_handle_constructor(call)
                     || is_container_constructor(call)
-                    || is_smart_pointer_new(call))
+                    || is_smart_pointer_new(call)
+                    || call_path_name(call).is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str())))
             }
             // A path that diverges gives no value.
             Expr::Async(_)
@@ -2701,10 +2703,15 @@ impl Analyzer {
             Expr::Closure(_) => Flow::cost(self.closure_arg(expr, Kind::Plain, false)),
 
             Expr::ForLoop(f) => {
-                let iter = self.cost_of(&f.expr);
                 let element = self.value_of(&f.expr).element();
+                let iter = self.expr(&f.expr);
                 let shape = LoopShape {
-                    bound: const_bound(&f.expr),
+                    // An iterable that never falls through leaves before the body.
+                    bound: if iter.fall.is_none() {
+                        Some(0)
+                    } else {
+                        const_bound(&f.expr)
+                    },
                     span: f.span(),
                     label: f.label.as_ref(),
                     ends: true,
@@ -2713,7 +2720,7 @@ impl Analyzer {
                     s.bind_pat(&f.pat, element);
                     s.block(&f.body)
                 });
-                Flow::cost(iter).then(body)
+                iter.then(body)
             }
             // The condition runs on every pass, so a query in it
             // (`while let Some(job) = repo.next_pending().await?`) is
@@ -3499,7 +3506,8 @@ impl Analyzer {
         if runs_once || matches!(cost, Cost::Unbounded(_)) {
             return cost;
         }
-        if name.as_deref().is_some_and(|n| SAFE_FREE_FNS.contains(&n)) {
+        // An awaited `drop` is a user `async fn` of that name.
+        if !awaited && name.as_deref().is_some_and(|n| SAFE_FREE_FNS.contains(&n)) {
             return cost;
         }
         // `Some(repo)`, `Ok(db)`, `Arc::new(repo)`, `PgPostRepository(pool)`:
@@ -3584,6 +3592,14 @@ impl Analyzer {
 
     /// What `expr` evaluates to.
     fn value_of(&self, expr: &Expr) -> Kind {
+        // Std `drop` gives `()`. A value from a `drop` that took a handle is
+        // a user function's, and may hold it (`let pending = drop(repo);`).
+        if let Expr::Call(c) = peel_parens(expr)
+            && call_path_name(c).is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()))
+            && c.args.iter().any(|a| self.expr_carries_handle(a))
+        {
+            return Kind::Holder;
+        }
         if self.expr_is_nested(expr) {
             Kind::Nested
         } else if self.expr_is_lazy_db(expr) {
@@ -5197,13 +5213,9 @@ const fn is_compound_assign(op: &syn::BinOp) -> bool {
 fn pattern_always_matches(pat: &Pat) -> bool {
     match pat {
         Pat::Wild(_) => true,
-        Pat::Ident(id) => {
-            id.subpat.is_none()
-                && id
-                    .ident
-                    .to_string()
-                    .starts_with(|c: char| c.is_lowercase() || c == '_')
-        }
+        // A bare name may be a constant (`const foo: u8 = 1;`). Only `ref`
+        // or `mut` makes it a binding for certain.
+        Pat::Ident(id) => id.subpat.is_none() && (id.by_ref.is_some() || id.mutability.is_some()),
         Pat::Paren(p) => pattern_always_matches(&p.pat),
         Pat::Type(p) => pattern_always_matches(&p.pat),
         _ => false,
@@ -10927,6 +10939,48 @@ mod tests {
                 "different literals are disjoint",
                 "async fn h(repo: PgPostRepository, x: i64) -> AutumnResult<usize> { \
                  let _ = match x { 1 if repo.a().await? => plain(), 2 => repo.b().await?, _ => plain() }; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn constant_patterns_awaited_drop_and_diverging_iterables() {
+        check_handlers(&[
+            (
+                "guard: a lowercase name pattern may be a constant",
+                "async fn h(repo: PgPostRepository, x: u8) -> AutumnResult<usize> { \
+                 match x { foo if { return Ok(0); } => (), _ => { let _ = repo.find_all().await?; } } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a mut binding pattern always matches",
+                "async fn h(repo: PgPostRepository, x: u8) -> AutumnResult<usize> { \
+                 match x { mut y if { return Ok(0); } => { y += 1; } _ => { let _ = repo.find_all().await?; } } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: an awaited drop is a user function",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 drop(repo).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a stored drop that is awaited is a user function",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = drop(repo); pending.await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "drop that is not awaited stays free",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 drop(repo); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a for iterable that returns skips the body",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 for _ in { return repo.a().await; } { repo.b().await?; } Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
