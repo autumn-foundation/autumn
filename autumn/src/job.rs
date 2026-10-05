@@ -938,14 +938,16 @@ impl LeaseHeartbeat {
                     // The give-up time also bounds a renewal that stalls.
                     let give_up_at =
                         crate::time_math::saturating_tokio_deadline(last_renewed, give_up_after);
+                    // Biased: a renewal that completes at the give-up time counts.
                     let renewal = tokio::select! {
+                        biased;
                         () = stop.cancelled() => return,
+                        renewal = renew() => renewal,
                         () = tokio::time::sleep_until(give_up_at) => {
                             tracing::warn!("job lease renewal stalled too long; stopping the job");
                             lost.cancel();
                             return;
                         }
-                        renewal = renew() => renewal,
                     };
                     match renewal {
                         LeaseRenewal::Renewed => last_renewed = started,
@@ -23391,7 +23393,7 @@ mod lease_tests {
     #[tokio::test(start_paused = true)]
     async fn heartbeat_gives_up_while_a_renewal_stalls() {
         // A renewal that never returns, as on a pool wait or a reconnect.
-        let heartbeat = LeaseHeartbeat::spawn(300, || std::future::pending::<LeaseRenewal>());
+        let heartbeat = LeaseHeartbeat::spawn(300, std::future::pending::<LeaseRenewal>);
         let lost = heartbeat.lost_token();
         tokio::time::sleep(Duration::from_millis(190)).await;
         assert!(!lost.is_cancelled(), "inside two thirds of the timeout");

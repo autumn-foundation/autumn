@@ -1450,11 +1450,16 @@ async fn maintenance_loop(
     queue_handle: SqliteJobQueue,
     visibility_timeout_ms: u64,
     survey_blocked: bool,
-    history_window: Option<std::time::Duration>,
     state: AppState,
     job_admin: JobAdminMemoryBackend,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    // Opt-in, and read from the same `retention.job_history` window the
+    // Postgres sweep uses. Unset means history is kept forever, as on Postgres.
+    let history_window = state
+        .extension::<crate::config::AutumnConfig>()
+        .and_then(|config| config.retention.job_history.clone())
+        .and_then(|window| crate::config::parse_duration_str(&window).ok());
     let interval_duration = maintenance_interval(visibility_timeout_ms);
     let Some(pool) = wait_ready(&queue_handle, interval_duration, &shutdown).await else {
         return;
@@ -1628,12 +1633,6 @@ pub(super) fn start_runtime(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
         .any(|job| job.concurrency.is_some());
-    // Opt-in, and read from the same `retention.job_history` window the
-    // Postgres sweep uses. Unset means history is kept forever, as on Postgres.
-    let history_window = state
-        .extension::<crate::config::AutumnConfig>()
-        .and_then(|config| config.retention.job_history.clone())
-        .and_then(|window| crate::config::parse_duration_str(&window).ok());
     let poll_interval = std::time::Duration::from_millis(config.sqlite.poll_interval_ms.max(1));
     let worker_count = config.workers.max(1);
 
@@ -1647,7 +1646,6 @@ pub(super) fn start_runtime(
                 queue_handle,
                 visibility_timeout_ms,
                 survey_blocked,
-                history_window,
                 state,
                 job_admin,
                 shutdown,
