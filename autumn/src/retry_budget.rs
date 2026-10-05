@@ -80,11 +80,7 @@ impl RetryBudget {
     #[must_use]
     pub fn try_acquire(&self, kind: RetryKind) -> bool {
         let cost = self.cost(kind);
-        self.milli_tokens
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |tokens| {
-                tokens.checked_sub(cost)
-            })
-            .is_ok()
+        self.update(|tokens| tokens.checked_sub(cost))
     }
 
     /// Give back the tokens of a retry of `kind` that succeeded.
@@ -108,11 +104,29 @@ impl RetryBudget {
     }
 
     fn add(&self, amount: u64) {
-        let _ = self
-            .milli_tokens
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |tokens| {
-                Some(tokens.saturating_add(amount).min(self.capacity))
-            });
+        self.update(|tokens| Some(tokens.saturating_add(amount).min(self.capacity)));
+    }
+
+    /// Apply `next` to the tokens in one atomic step. `false` when `next`
+    /// returns `None`; then the tokens do not change. A compare-exchange
+    /// loop: `fetch_update` is deprecated on new toolchains, and its
+    /// replacement is newer than the MSRV.
+    fn update(&self, next: impl Fn(u64) -> Option<u64>) -> bool {
+        let mut current = self.milli_tokens.load(Ordering::Acquire);
+        loop {
+            let Some(value) = next(current) else {
+                return false;
+            };
+            match self.milli_tokens.compare_exchange_weak(
+                current,
+                value,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 

@@ -1019,7 +1019,7 @@ fn build_router_pre_state(
             mcp_router = apply_request_timeout_middleware(
                 mcp_router,
                 config,
-                &state,
+                state,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 false,
             );
