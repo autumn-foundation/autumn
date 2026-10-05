@@ -658,13 +658,44 @@ const OPTION_METHODS: &[&str] = &[
     "ok_or_else",
     "as_ref",
     "as_mut",
-    "as_deref",
-    "as_deref_mut",
+    "iter",
+    "into_iter",
+    "clone",
+];
+
+/// An `Option` of a reference also has `cloned`, `copied` and `as_deref`. On
+/// an `Option` of a value, an extension trait may give those names.
+const OPTION_REF_METHODS: &[&str] = &[
+    "is_some",
+    "is_none",
+    "is_some_and",
+    "is_none_or",
+    "unwrap",
+    "expect",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "map",
+    "map_or",
+    "map_or_else",
+    "and_then",
+    "or",
+    "or_else",
+    "filter",
+    "take",
+    "replace",
+    "insert",
+    "get_or_insert_with",
+    "ok_or",
+    "ok_or_else",
+    "as_ref",
+    "as_mut",
     "iter",
     "into_iter",
     "clone",
     "cloned",
     "copied",
+    "as_deref",
 ];
 
 const RESULT_METHODS: &[&str] = &[
@@ -689,12 +720,9 @@ const RESULT_METHODS: &[&str] = &[
     "or_else",
     "as_ref",
     "as_mut",
-    "as_deref",
     "iter",
     "into_iter",
     "clone",
-    "cloned",
-    "copied",
 ];
 
 const MAP_METHODS: &[&str] = &[
@@ -794,7 +822,11 @@ enum Shape {
     Heap,
     /// An iterator over parts.
     Iter,
+    /// An iterator over references to parts: `repos.iter()`.
+    IterRef,
     Opt,
+    /// An `Option` of a reference: `repos.first()`.
+    OptRef,
     Res,
     /// `HashMap` or `IndexMap`.
     Map,
@@ -817,8 +849,9 @@ impl Shape {
             Self::Deque => DEQUE_METHODS,
             Self::List => LIST_METHODS,
             Self::Heap => HEAP_METHODS,
-            Self::Iter => ITER_METHODS,
+            Self::Iter | Self::IterRef => ITER_METHODS,
             Self::Opt => OPTION_METHODS,
+            Self::OptRef => OPTION_REF_METHODS,
             Self::Res => RESULT_METHODS,
             Self::Map => MAP_METHODS,
             Self::SortedMap => SORTED_MAP_METHODS,
@@ -836,7 +869,7 @@ impl Shape {
     /// the part? `Vec::insert` gives `()`, `HashSet::remove` gives `bool`.
     fn scalar_result(self, method: &str) -> bool {
         match method {
-            "insert" => !matches!(self, Self::Opt | Self::Map | Self::SortedMap),
+            "insert" => !matches!(self, Self::Opt | Self::OptRef | Self::Map | Self::SortedMap),
             "remove" => matches!(self, Self::Set | Self::SortedSet),
             _ => false,
         }
@@ -857,11 +890,32 @@ impl Shape {
         if self == Self::Bool {
             return matches!(method, "then" | "then_some").then_some(Self::Opt);
         }
+        // What gives references, and what gives values.
+        let by_ref = matches!(self, Self::IterRef | Self::OptRef)
+            || !matches!(self, Self::Iter | Self::Opt | Self::Res);
         match method {
-            "iter" | "iter_mut" | "into_iter" | "drain" | "chunks" | "windows" | "keys"
-            | "values" | "values_mut" | "into_keys" | "into_values" => Some(Self::Iter),
+            "iter" | "iter_mut" | "keys" | "values" | "values_mut" | "chunks" | "windows" => {
+                Some(Self::IterRef)
+            }
+            "into_iter" if self == Self::IterRef => Some(Self::IterRef),
+            "into_iter" | "drain" | "into_keys" | "into_values" => Some(Self::Iter),
+            // An `Option` of a reference: an element in place.
+            "first" | "last" | "get" | "get_mut" | "next" | "nth" | "find" | "max" | "min"
+                if by_ref && self != Self::OptRef =>
+            {
+                Some(Self::OptRef)
+            }
+            "as_ref" | "as_mut" if matches!(self, Self::Opt | Self::OptRef) => Some(Self::OptRef),
             "first" | "last" | "get" | "get_mut" | "pop" | "pop_back" | "pop_front" | "next"
             | "nth" | "find" | "find_map" | "ok" | "err" => Some(Self::Opt),
+            // The items are no longer references.
+            "map" | "cloned" | "copied" | "enumerate" | "zip" | "filter_map" | "flat_map" => {
+                match self {
+                    Self::IterRef => Some(Self::Iter),
+                    Self::OptRef => Some(Self::Opt),
+                    other => Some(other),
+                }
+            }
             "ok_or" | "ok_or_else" => Some(Self::Res),
             _ if self.option_of_part(method) => Some(Self::Opt),
             "to_vec" => Some(Self::Vec),
@@ -903,6 +957,10 @@ fn type_shape(ty: &Type) -> Option<Shape> {
             match segment.ident.to_string().as_str() {
                 name if SMART_POINTERS.contains(&name) => {
                     generic_types(segment).next().and_then(type_shape)
+                }
+                // `Option<&T>`.
+                "Option" if matches!(generic_types(segment).next(), Some(Type::Reference(_))) => {
+                    Some(Shape::OptRef)
                 }
                 name => shape_named(name),
             }
@@ -2703,7 +2761,7 @@ impl Analyzer {
             || (AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str())
                 && matches!(
                     self.shape_of(&method.receiver),
-                    Some(Shape::Opt | Shape::Res)
+                    Some(Shape::Opt | Shape::OptRef | Shape::Res)
                 ));
         // A closure handed to a method on a carrier takes its elements:
         // `repos.iter().for_each(|r| …)`.
@@ -2957,6 +3015,9 @@ impl Analyzer {
                 c.args.first().and_then(|a| self.shape_of(a))
             }
             Expr::Call(c) => match call_path_name(c).as_deref() {
+                Some("Some") if matches!(c.args.first(), Some(Expr::Reference(_))) => {
+                    Some(Shape::OptRef)
+                }
                 Some("Some") => Some(Shape::Opt),
                 Some("Ok" | "Err") => Some(Shape::Res),
                 // `Vec::new()`, `HashMap::with_capacity(n)`.
@@ -3092,7 +3153,7 @@ impl Analyzer {
                 // a user's `ctx.clear()` may return anything.
                 !(SCALAR_METHODS.contains(&method.as_str())
                     && self.known_container_method(&mc.receiver, &method))
-                    && (self.expr_is_nested(&mc.receiver)
+                    && ((self.expr_is_nested(&mc.receiver) && !self.maps_away(mc))
                         // `repos.chunks(2)` yields slices of handles.
                         || (matches!(method.as_str(), "chunks" | "windows")
                             && self.expr_is_carrier(&mc.receiver))
@@ -3381,6 +3442,19 @@ impl Analyzer {
         }
     }
 
+    /// Does this `map` replace every part of an `Option` or an iterator with
+    /// its closure's output? Then the result holds only what the closure
+    /// returns (`Some(repo).map(|_| 1)` is plain). A `Result`'s `map` keeps
+    /// its `Err` side.
+    fn maps_away(&self, mc: &ExprMethodCall) -> bool {
+        mc.method == "map"
+            && matches!(mc.args.last(), Some(Expr::Closure(_)))
+            && matches!(
+                self.shape_of(&mc.receiver),
+                Some(Shape::Opt | Shape::OptRef | Shape::Iter | Shape::IterRef)
+            )
+    }
+
     /// Does this call give an `Option` of a part (`deque.remove(0)`)?
     fn gives_option_of_part(&self, mc: &ExprMethodCall) -> bool {
         let method = mc.method.to_string();
@@ -3527,6 +3601,7 @@ impl Analyzer {
             Expr::MethodCall(mc) => {
                 ((CARRIER_METHODS.contains(&mc.method.to_string().as_str())
                     || self.gives_option_of_part(mc))
+                    && !self.maps_away(mc)
                     && self.expr_is_carrier(&mc.receiver))
                     // `ids.iter().map(|_| &repo)` gives handles.
                     || self.callback_result(mc) == Kind::Carrier
@@ -7809,6 +7884,83 @@ mod tests {
     }
 
     #[test]
+    fn conditional_std_methods_and_mapped_options() {
+        check_handlers(&[
+            (
+                "Option::cloned does not exist on an Option of a value",
+                "async fn h(maybe: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 maybe.cloned().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "Option::as_deref needs a Deref value",
+                "async fn h(maybe: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 maybe.as_deref().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "Result::copied does not exist on a Result of a value",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 result.copied().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an Option mapped to a plain value",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let status = Some(repo).map(|_| 1); render(status); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "an iterator mapped to a plain value",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let ids: Vec<_> = repos.iter().map(|_| 1).collect(); render(ids); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            // Guards: `cloned` on an `Option` of a reference is known, and a
+            // `Result` mapped on its `Ok` side keeps its `Err` side.
+            (
+                "first().cloned() on a Vec of handles",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let r = repos.first().cloned().unwrap(); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "iter().find().cloned() on a Vec of handles",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let r = repos.iter().find(|_| true).cloned().unwrap(); \
+                 let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "as_ref().cloned() on an Option of a handle",
+                "async fn h(maybe: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 let r = maybe.as_ref().cloned().unwrap(); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "an iterator mapped to its own handles",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let all: Vec<_> = repos.iter().map(|r| r).collect(); \
+                 for r in &all { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an iterator of containers mapped to clones",
+                "async fn h(groups: Vec<Vec<PgPostRepository>>) -> AutumnResult<usize> { \
+                 let all: Vec<_> = groups.iter().map(|g| g.clone()).collect(); \
+                 all[0].refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a Result mapped on its Ok side keeps its Err side",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let mapped = result.map(|_| 1); render(mapped); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
     fn each_container_type_has_its_own_methods() {
         // `(parameter type, call)`: the type has no such method, so an
         // extension trait gives it, and it may query.
@@ -7884,7 +8036,9 @@ mod tests {
             Shape::List,
             Shape::Heap,
             Shape::Iter,
+            Shape::IterRef,
             Shape::Opt,
+            Shape::OptRef,
             Shape::Res,
             Shape::Map,
             Shape::SortedMap,
