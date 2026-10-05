@@ -3258,18 +3258,33 @@ const fn shard_framework_migration_sets() -> [&'static EmbeddedMigrations; 3] {
 pub fn run_pending_shard_framework_migrations(
     database_url: &str,
 ) -> Result<MigrationResult, MigrationError> {
+    run_pending_shard_framework_migrations_with_policy(database_url, MigrationLockPolicy::default())
+}
+
+/// [`run_pending_shard_framework_migrations`] with an explicit
+/// [`MigrationLockPolicy`] (#3057).
+///
+/// # Errors
+///
+/// As [`run_pending_shard_framework_migrations`], plus
+/// [`MigrationError::LockContention`] when every attempt timed out on a
+/// table lock.
+pub fn run_pending_shard_framework_migrations_with_policy(
+    database_url: &str,
+    policy: MigrationLockPolicy,
+) -> Result<MigrationResult, MigrationError> {
     #[cfg(feature = "db")]
     {
         let mut applied: Vec<String> = Vec::new();
         for set in shard_framework_migration_sets() {
-            let result = run_pending(database_url, EmbeddedMigrationsRef(set))?;
+            let result = run_pending_with_policy(database_url, EmbeddedMigrationsRef(set), policy)?;
             applied.extend(result.applied);
         }
         Ok(MigrationResult { applied })
     }
     #[cfg(not(feature = "db"))]
     {
-        let _ = database_url;
+        let _ = (database_url, policy);
         Ok(MigrationResult {
             applied: Vec::new(),
         })

@@ -303,8 +303,9 @@ pub fn run(
         MigrateAction::Run => {
             // Resolve the effective startup wait (--wait flag > config > 0).
             let wait = resolve_startup_wait(wait_override, config_table.as_ref());
+            // Same env as target resolution: the real env over the `.env` overlay.
             let lock_policy = resolve_migration_lock_policy_from_sources(
-                |key| std::env::var(key),
+                |key| autumn_web::config::Env::var(&env, key),
                 config_table.as_ref(),
             );
             run_all_targets(
@@ -754,7 +755,7 @@ fn run_single_target(
     record_checksums_after_apply(database_url, dir);
 
     let framework_ok = if is_shard {
-        run_shard_framework_migrations(database_url)
+        run_shard_framework_migrations(database_url, lock_policy)
     } else {
         run_framework_migrations(database_url, lock_policy)
     };
@@ -1648,20 +1649,54 @@ where
 }
 
 /// The `PGOPTIONS` value for the `diesel` subprocess: `existing` plus
-/// `-c lock_timeout=<ms>`. `None` when `lock_timeout` is zero, so the
-/// environment stays as it is.
+/// `-c lock_timeout=<ms>`. A zero `lock_timeout` passes `existing` through.
+/// `None` means the child gets no `PGOPTIONS`.
 fn diesel_pgoptions(existing: Option<&str>, lock_timeout: std::time::Duration) -> Option<String> {
+    let existing = existing.map(str::trim).filter(|e| !e.is_empty());
     if lock_timeout.is_zero() {
-        return None;
+        return existing.map(str::to_owned);
     }
     let ms = u64::try_from(lock_timeout.as_millis())
         .unwrap_or(u64::MAX)
         .min(i32::MAX.unsigned_abs().into());
     let option = format!("-c lock_timeout={ms}");
-    Some(match existing.map(str::trim).filter(|e| !e.is_empty()) {
+    Some(match existing {
         Some(existing) => format!("{existing} {option}"),
         None => option,
     })
+}
+
+/// `existing` without any `lock_timeout` option (`-c lock_timeout=…`,
+/// `-clock_timeout=…`, `--lock_timeout=…`). `None` when nothing is left.
+fn strip_lock_timeout(existing: Option<&str>) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut tokens = existing.unwrap_or_default().split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if token == "-c"
+            && tokens
+                .peek()
+                .is_some_and(|next| next.starts_with("lock_timeout="))
+        {
+            tokens.next();
+        } else if !token.starts_with("-clock_timeout=") && !token.starts_with("--lock_timeout=") {
+            kept.push(token);
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join(" "))
+}
+
+/// The `PGOPTIONS` the `diesel` subprocess gets. When a pending migration is
+/// non-transactional, no `lock_timeout` reaches it, inherited ones included.
+fn child_pgoptions(
+    inherited: Option<&str>,
+    lock_timeout: std::time::Duration,
+    non_transactional_pending: bool,
+) -> Option<String> {
+    if non_transactional_pending {
+        strip_lock_timeout(inherited)
+    } else {
+        diesel_pgoptions(inherited, lock_timeout)
+    }
 }
 
 /// Run the user migrations through the `diesel` CLI, with `lock_timeout` and
@@ -1676,17 +1711,17 @@ fn run_user_migrations(
     // fail fast, then the jittered retry runs it again (#3057).
     // `PGOPTIONS` sets the timeout for the whole session, so it stays off when
     // a pending migration is non-transactional (`CREATE INDEX CONCURRENTLY`).
-    let mut pgoptions = if pending_non_transactional(database_url, dir) {
+    let non_transactional = pending_non_transactional(database_url, dir);
+    if non_transactional {
         eprintln!(
             "  A pending migration has run_in_transaction = false; running without lock_timeout."
         );
-        None
-    } else {
-        diesel_pgoptions(
-            std::env::var("PGOPTIONS").ok().as_deref(),
-            lock_policy.lock_timeout,
-        )
-    };
+    }
+    let mut pgoptions = child_pgoptions(
+        std::env::var("PGOPTIONS").ok().as_deref(),
+        lock_policy.lock_timeout,
+        non_transactional,
+    );
     let outcome = autumn_web::migrate::retry_on_lock_timeout(
         lock_policy,
         |delay| {
@@ -1785,9 +1820,12 @@ fn run_diesel_migrations_once(
         .arg(dir)
         .env("DATABASE_URL", database_url)
         .stderr(std::process::Stdio::piped());
-    if let Some(options) = pgoptions {
-        command.env("PGOPTIONS", options);
-    }
+    // Set the value, or remove an inherited one: `None` must not let the
+    // parent's `PGOPTIONS` through.
+    match pgoptions {
+        Some(options) => command.env("PGOPTIONS", options),
+        None => command.env_remove("PGOPTIONS"),
+    };
     let mut child = command.spawn().map_err(|e| {
         MigrationError::Connection(format!("failed to run diesel migration run: {e}"))
     })?;
@@ -1905,13 +1943,15 @@ where
 /// In production this delegates to
 /// [`autumn_web::migrate::run_pending_shard_framework_migrations`]; the inner
 /// helper takes a closure so the dispatch can be tested without a live database.
-fn run_shard_framework_migrations(database_url: &str) -> bool {
+fn run_shard_framework_migrations(
+    database_url: &str,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> bool {
     eprintln!("  Running pending Autumn shard framework migrations...\n");
 
-    match run_shard_framework_migrations_inner(
-        database_url,
-        autumn_web::migrate::run_pending_shard_framework_migrations,
-    ) {
+    match run_shard_framework_migrations_inner(database_url, |url| {
+        autumn_web::migrate::run_pending_shard_framework_migrations_with_policy(url, lock_policy)
+    }) {
         Ok(result) if result.applied.is_empty() => {
             eprintln!("\n\u{2713} Shard framework migrations are up to date.");
             true
@@ -4592,8 +4632,39 @@ primary_url = "postgres://prod-s0:5432/app"
             diesel_pgoptions(Some("-c search_path=app"), five).as_deref(),
             Some("-c search_path=app -c lock_timeout=5000")
         );
-        // `0` leaves the environment as it is.
+        // `0` passes the inherited value through unchanged.
         assert_eq!(diesel_pgoptions(None, std::time::Duration::ZERO), None);
+        assert_eq!(
+            diesel_pgoptions(Some("-c search_path=app"), std::time::Duration::ZERO).as_deref(),
+            Some("-c search_path=app")
+        );
+    }
+
+    #[test]
+    fn strip_lock_timeout_removes_every_spelling() {
+        assert_eq!(
+            strip_lock_timeout(Some(
+                "-c search_path=app -c lock_timeout=5000 -clock_timeout=1 --lock_timeout=2"
+            ))
+            .as_deref(),
+            Some("-c search_path=app")
+        );
+        assert_eq!(strip_lock_timeout(Some("-c lock_timeout=5000")), None);
+        assert_eq!(strip_lock_timeout(None), None);
+    }
+
+    #[test]
+    fn child_pgoptions_never_sends_lock_timeout_to_a_non_transactional_run() {
+        let five = std::time::Duration::from_secs(5);
+        let inherited = Some("-c search_path=app -c lock_timeout=9000");
+        assert_eq!(
+            child_pgoptions(inherited, five, true).as_deref(),
+            Some("-c search_path=app")
+        );
+        assert_eq!(
+            child_pgoptions(inherited, five, false).as_deref(),
+            Some("-c search_path=app -c lock_timeout=9000 -c lock_timeout=5000")
+        );
     }
 
     #[test]
