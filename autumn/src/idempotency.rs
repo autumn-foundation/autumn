@@ -54,6 +54,10 @@ const MAX_CACHEABLE_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 /// `security.upload.max_request_size_bytes`.
 const DEFAULT_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
 
+/// Default in-flight lock TTL. It applies only after a crash, a cancelled
+/// request, or a failed record write. It is separate from the response TTL.
+pub const DEFAULT_IN_FLIGHT_TTL: Duration = Duration::from_secs(60);
+
 const fn is_mutating_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -414,84 +418,54 @@ impl IdempotencyStoreError {
     }
 }
 
+/// Future returned by every [`IdempotencyStore`] operation.
+pub type IdempotencyFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, IdempotencyStoreError>> + Send + 'a>>;
+
 /// Pluggable storage backend for idempotency entries.
 ///
-/// Implementors must be `Send + Sync + 'static` to be used across async tasks.
-/// All methods are synchronous; long-running I/O backends should use
-/// [`tokio::task::block_in_place`] internally.
-pub trait IdempotencyStore: Send + Sync + 'static {
-    /// Return the cached entry if it exists and has not expired.
-    fn get(&self, key: &str) -> Option<IdempotencyEntry>;
+/// All operations are async and return [`IdempotencyFuture`]. Do not block a
+/// runtime thread in an implementation: the middleware also runs on a
+/// current-thread runtime.
+///
+/// Every error fails closed. A `get` or `set` error gives `503`. A `try_lock`
+/// error gives `409`. An `unlock` error is logged; the lock then expires by
+/// its TTL.
+pub trait IdempotencyStore: std::any::Any + Send + Sync {
+    /// Return the entry for `key`, or `None` if there is none or it expired.
+    fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>>;
 
-    /// Return the cached entry if it exists, surfacing backend read failures.
-    ///
-    /// Infallible stores can implement only [`Self::get`]. Fallible shared
-    /// backends should override this method so lookup failures fail closed
-    /// instead of being treated as cache misses that can duplicate mutations.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdempotencyStoreError`] when the backend cannot determine
-    /// whether a record exists for this key.
-    fn try_get(&self, key: &str) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
-        Ok(self.get(key))
-    }
-
-    /// Persist a response with the given TTL.
-    fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration);
-
-    /// Persist a response with the given TTL, surfacing backend failures.
-    ///
-    /// Existing infallible stores can implement only [`Self::set`]. Fallible
-    /// backends should override this method so the middleware can fail closed
-    /// rather than reporting a cacheable success that was not stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`IdempotencyStoreError`] when the backend cannot persist the
-    /// response record.
-    fn try_set(
-        &self,
-        key: &str,
+    /// Store the response for `key` for `ttl`.
+    fn set<'a>(
+        &'a self,
+        key: &'a str,
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
-    ) -> Result<(), IdempotencyStoreError> {
-        self.set(key, record, body_hash, ttl);
-        Ok(())
-    }
+    ) -> IdempotencyFuture<'a, ()>;
 
-    /// Acquire an in-flight lock for `key`.
+    /// Acquire the in-flight lock for `key` as `owner` for `lock_ttl`.
     ///
-    /// Returns `true` if the lock was acquired (no concurrent request in flight)
-    /// or `false` if another request is already processing this key.
-    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool;
+    /// Returns `true` when acquired, `false` when another owner holds it.
+    fn try_lock<'a>(
+        &'a self,
+        key: &'a str,
+        owner: &'a str,
+        lock_ttl: Duration,
+    ) -> IdempotencyFuture<'a, bool>;
 
-    /// Acquire an in-flight lock owned by a unique request token.
-    ///
-    /// Stores that support expiring locks should override this together with
-    /// [`Self::unlock_owned`] so a stale request cannot release a newer lock
-    /// acquired after the first lock expired.
-    fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
-        let _ = owner;
-        self.try_lock(key, lock_ttl)
-    }
+    /// Release the in-flight lock for `key` only if `owner` still holds it.
+    fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()>;
 
-    /// Release the in-flight lock for `key`.
-    fn unlock(&self, key: &str);
-
-    /// Release the in-flight lock only if it is still owned by `owner`.
-    fn unlock_owned(&self, key: &str, owner: &str) {
-        let _ = owner;
-        self.unlock(key);
-    }
-
-    /// The preferred TTL for this store. Used by [`IdempotencyLayer::new`] as
-    /// the default expiry when no explicit `.with_ttl()` is given. Defaults to
-    /// 24 hours if the store does not override this method.
+    /// The response retention for [`IdempotencyLayer::new`]. Default: 24 hours.
     fn default_ttl(&self) -> Duration {
         Duration::from_secs(86_400)
     }
+}
+
+/// Wrap an already-known value as an [`IdempotencyFuture`].
+fn ready<'a, T: Send + 'a>(value: T) -> IdempotencyFuture<'a, T> {
+    Box::pin(std::future::ready(Ok(value)))
 }
 
 // ── Memory store ──────────────────────────────────────────────────────────────
@@ -542,8 +516,8 @@ impl MemoryIdempotencyStore {
     }
 }
 
-impl IdempotencyStore for MemoryIdempotencyStore {
-    fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+impl MemoryIdempotencyStore {
+    fn get_now(&self, key: &str) -> Option<IdempotencyEntry> {
         // Release the read lock immediately after cloning.
         let entry = self
             .entries
@@ -554,7 +528,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         entry.filter(|e| e.expires_at > crate::time::ambient_instant())
     }
 
-    fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+    fn set_now(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
         let entry = IdempotencyEntry {
             record,
             body_hash,
@@ -571,11 +545,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         }
     }
 
-    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
-        self.try_lock_owned(key, "", lock_ttl)
-    }
-
-    fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
+    fn try_lock_now(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
         let now = crate::time::ambient_instant();
         let mut in_flight = self
             .in_flight
@@ -604,14 +574,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
         true
     }
 
-    fn unlock(&self, key: &str) {
-        self.in_flight
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(key);
-    }
-
-    fn unlock_owned(&self, key: &str, owner: &str) {
+    fn unlock_now(&self, key: &str, owner: &str) {
         let mut in_flight = self
             .in_flight
             .write()
@@ -623,9 +586,91 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             in_flight.remove(key);
         }
     }
+}
+
+impl IdempotencyStore for MemoryIdempotencyStore {
+    fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+        ready(self.get_now(key))
+    }
+
+    fn set<'a>(
+        &'a self,
+        key: &'a str,
+        record: IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: Duration,
+    ) -> IdempotencyFuture<'a, ()> {
+        self.set_now(key, record, body_hash, ttl);
+        ready(())
+    }
+
+    fn try_lock<'a>(
+        &'a self,
+        key: &'a str,
+        owner: &'a str,
+        lock_ttl: Duration,
+    ) -> IdempotencyFuture<'a, bool> {
+        ready(self.try_lock_now(key, owner, lock_ttl))
+    }
+
+    fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+        self.unlock_now(key, owner);
+        ready(())
+    }
 
     fn default_ttl(&self) -> Duration {
         self.default_ttl
+    }
+}
+
+// ── Shared encoding ───────────────────────────────────────────────────────────
+
+/// Encoded entry. The Redis and database stores keep entries in this form.
+#[cfg(any(feature = "redis", feature = "db"))]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredEntry {
+    status: u16,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+    #[serde(default)]
+    metadata: Vec<(String, Vec<u8>)>,
+    body_hash: Vec<u8>,
+}
+
+#[cfg(any(feature = "redis", feature = "db"))]
+impl StoredEntry {
+    fn encode(
+        record: IdempotencyRecord,
+        body_hash: Vec<u8>,
+    ) -> Result<Vec<u8>, IdempotencyStoreError> {
+        let entry = Self {
+            status: record.status,
+            headers: record.headers,
+            body: record.body,
+            metadata: record.metadata,
+            body_hash,
+        };
+        serde_json::to_vec(&entry).map_err(|e| {
+            IdempotencyStoreError::backend(format!("failed to serialize idempotency entry: {e}"))
+        })
+    }
+
+    /// Decode an entry. The backend owns the expiry, so the in-process expiry
+    /// is set 24 h out and never fires first.
+    fn decode(bytes: &[u8]) -> Result<IdempotencyEntry, IdempotencyStoreError> {
+        let entry: Self = serde_json::from_slice(bytes).map_err(|e| {
+            IdempotencyStoreError::backend(format!("failed to deserialize idempotency entry: {e}"))
+        })?;
+        Ok(IdempotencyEntry {
+            record: IdempotencyRecord {
+                status: entry.status,
+                headers: entry.headers,
+                body: entry.body,
+                metadata: entry.metadata,
+            },
+            body_hash: entry.body_hash,
+            expires_at: saturating_deadline(Duration::from_secs(86_400)),
+        })
     }
 }
 
@@ -634,27 +679,20 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 #[cfg(feature = "redis")]
 mod redis_store {
     use super::{
-        IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError,
-        saturating_deadline,
+        IdempotencyEntry, IdempotencyFuture, IdempotencyRecord, IdempotencyStore,
+        IdempotencyStoreError, StoredEntry,
     };
     use redis::{AsyncCommands, aio::ConnectionManager, aio::ConnectionManagerConfig};
-    use serde::{Deserialize, Serialize};
     use std::time::Duration;
-
-    #[derive(Serialize, Deserialize)]
-    struct StoredEntry {
-        status: u16,
-        headers: Vec<(String, Vec<u8>)>,
-        body: Vec<u8>,
-        #[serde(default)]
-        metadata: Vec<(String, Vec<u8>)>,
-        body_hash: Vec<u8>,
-    }
 
     /// Redis-backed idempotency store for multi-replica deployments.
     ///
     /// Configured via `[idempotency.redis]` in `autumn.toml` or
     /// `AUTUMN_IDEMPOTENCY__REDIS__URL` env var.
+    ///
+    /// The response is written after the handler returns, not in the handler's
+    /// database transaction. Use [`DbIdempotencyStore`](super::DbIdempotencyStore)
+    /// when the record must commit with the mutation.
     pub struct RedisIdempotencyStore {
         connection: ConnectionManager,
         key_prefix: String,
@@ -697,171 +735,90 @@ mod redis_store {
         }
     }
 
-    impl IdempotencyStore for RedisIdempotencyStore {
-        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
-            match self.try_get(key) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Redis GET failed for idempotency key"
-                    );
-                    None
-                }
-            }
-        }
+    fn backend_error(action: &str, error: &redis::RedisError) -> IdempotencyStoreError {
+        IdempotencyStoreError::backend(format!("failed to {action} in Redis: {error}"))
+    }
 
-        fn try_get(&self, key: &str) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
+    impl IdempotencyStore for RedisIdempotencyStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
             let redis_key = self.entry_key(key);
             let mut conn = self.connection.clone();
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    let data: Option<Vec<u8>> = conn.get(&redis_key).await.map_err(|e| {
-                        IdempotencyStoreError::backend(format!(
-                            "failed to read idempotency entry from Redis: {e}"
-                        ))
-                    })?;
-                    data.map(|bytes| {
-                        serde_json::from_slice::<StoredEntry>(&bytes)
-                            .map(|e| {
-                                IdempotencyEntry {
-                                    record: IdempotencyRecord {
-                                        status: e.status,
-                                        headers: e.headers,
-                                        body: e.body,
-                                        metadata: e.metadata,
-                                    },
-                                    body_hash: e.body_hash,
-                                    // Redis manages TTL natively. Use a fixed 24 h offset
-                                    // so the in-process expiry check never fires early.
-                                    // Routed through the saturating helper so this can
-                                    // never panic on an exotic platform clock either.
-                                    expires_at: saturating_deadline(Duration::from_secs(86_400)),
-                                }
-                            })
-                            .map_err(|e| {
-                                IdempotencyStoreError::backend(format!(
-                                    "failed to deserialize idempotency entry from Redis: {e}"
-                                ))
-                            })
-                    })
-                    .transpose()
-                })
+            Box::pin(async move {
+                let data: Option<Vec<u8>> = conn
+                    .get(&redis_key)
+                    .await
+                    .map_err(|e| backend_error("read idempotency entry", &e))?;
+                data.map(|bytes| StoredEntry::decode(&bytes)).transpose()
             })
         }
 
-        fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
-            if let Err(error) = self.try_set(key, record, body_hash, ttl) {
-                tracing::warn!(
-                    error = %error,
-                    "Failed to persist idempotency entry to Redis"
-                );
-            }
-        }
-
-        fn try_set(
-            &self,
-            key: &str,
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
             record: IdempotencyRecord,
             body_hash: Vec<u8>,
             ttl: Duration,
-        ) -> Result<(), IdempotencyStoreError> {
+        ) -> IdempotencyFuture<'a, ()> {
             let redis_key = self.entry_key(key);
             let mut conn = self.connection.clone();
-            let entry = StoredEntry {
-                status: record.status,
-                headers: record.headers,
-                body: record.body,
-                metadata: record.metadata,
-                body_hash,
-            };
-            let bytes = serde_json::to_vec(&entry).map_err(|e| {
-                IdempotencyStoreError::backend(format!(
-                    "failed to serialize idempotency entry: {e}"
-                ))
-            })?;
-            let ttl_secs = ttl.as_secs().max(1);
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    conn.set_ex::<_, _, ()>(&redis_key, bytes, ttl_secs)
-                        .await
-                        .map_err(|e| {
-                            IdempotencyStoreError::backend(format!(
-                                "failed to persist idempotency entry to Redis: {e}"
-                            ))
-                        })
-                })
+            Box::pin(async move {
+                let bytes = StoredEntry::encode(record, body_hash)?;
+                conn.set_ex::<_, _, ()>(&redis_key, bytes, ttl.as_secs().max(1))
+                    .await
+                    .map_err(|e| backend_error("persist idempotency entry", &e))
             })
         }
 
-        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
-            self.try_lock_owned(key, "", lock_ttl)
-        }
-
-        fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
-            let lock_key = self.lock_key(key);
-            let lock_ttl_secs = lock_ttl.as_secs().max(1);
-            let mut conn = self.connection.clone();
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    let result: Result<Option<String>, _> = redis::cmd("SET")
-                        .arg(&lock_key)
-                        .arg(owner)
-                        .arg("NX")
-                        .arg("EX")
-                        .arg(lock_ttl_secs)
-                        .query_async(&mut conn)
-                        .await;
-                    match result {
-                        Ok(opt) => opt.is_some(), // Some("OK") = acquired, None = already held
-                        Err(e) => {
-                            // Redis unavailable: fail closed so concurrent retries during an
-                            // outage cannot both enter the handler and duplicate side effects.
-                            // Clients receive 409 and should retry; once Redis recovers the
-                            // lock can be acquired normally.
-                            tracing::warn!(
-                                error = %e,
-                                "Redis idempotency lock unavailable; \
-                                 failing closed to prevent duplicate processing"
-                            );
-                            false
-                        }
-                    }
-                })
-            })
-        }
-
-        fn unlock(&self, key: &str) {
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
             let lock_key = self.lock_key(key);
             let mut conn = self.connection.clone();
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    let _: Result<(), _> = conn.del(&lock_key).await;
-                });
-            });
-        }
-
-        fn unlock_owned(&self, key: &str, owner: &str) {
-            let lock_key = self.lock_key(key);
-            let mut conn = self.connection.clone();
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    let _: Result<i32, _> = redis::Script::new(
-                        "if redis.call('GET', KEYS[1]) == ARGV[1] then \
-                         return redis.call('DEL', KEYS[1]) else return 0 end",
-                    )
-                    .key(&lock_key)
+            Box::pin(async move {
+                let acquired: Option<String> = redis::cmd("SET")
+                    .arg(&lock_key)
                     .arg(owner)
-                    .invoke_async(&mut conn)
-                    .await;
-                });
-            });
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(lock_ttl.as_secs().max(1))
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| backend_error("acquire idempotency lock", &e))?;
+                // `Some("OK")` = acquired; `None` = already held.
+                Ok(acquired.is_some())
+            })
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            let lock_key = self.lock_key(key);
+            let mut conn = self.connection.clone();
+            Box::pin(async move {
+                let released: redis::RedisResult<i32> = redis::Script::new(
+                    "if redis.call('GET', KEYS[1]) == ARGV[1] then \
+                     return redis.call('DEL', KEYS[1]) else return 0 end",
+                )
+                .key(&lock_key)
+                .arg(owner)
+                .invoke_async(&mut conn)
+                .await;
+                released
+                    .map(drop)
+                    .map_err(|e| backend_error("release idempotency lock", &e))
+            })
         }
     }
 }
 
 #[cfg(feature = "redis")]
 pub use redis_store::RedisIdempotencyStore;
+
+#[cfg(feature = "db")]
+mod db_store;
+#[cfg(feature = "db")]
+pub use db_store::{DbIdempotencyStore, IdempotencyTx};
 
 #[doc(hidden)]
 #[derive(Clone)]
@@ -1047,13 +1004,16 @@ pub struct IdempotencyLayer {
 }
 
 impl IdempotencyLayer {
+    /// Create the layer. The response TTL is the store's
+    /// [`IdempotencyStore::default_ttl`]; the in-flight TTL is
+    /// [`DEFAULT_IN_FLIGHT_TTL`].
     #[must_use]
     pub fn new(store: Arc<dyn IdempotencyStore>) -> Self {
         let ttl = store.default_ttl();
         Self {
             store,
             ttl,
-            in_flight_ttl: ttl,
+            in_flight_ttl: DEFAULT_IN_FLIGHT_TTL,
             replay_through_inner: false,
             fail_closed_on_replay: false,
             metrics: None,
@@ -1210,6 +1170,12 @@ fn in_flight_conflict_response() -> Response<Body> {
         .unwrap()
 }
 
+/// `409` for a key in flight, counted as a conflict.
+fn in_flight_conflict(metrics: Option<&crate::middleware::MetricsCollector>) -> Response<Body> {
+    metrics.inspect(|m| m.record_idempotency_conflict());
+    in_flight_conflict_response()
+}
+
 #[allow(
     clippy::unwrap_used,
     reason = "infallible: response built from static status/body"
@@ -1245,56 +1211,35 @@ struct PreparedIdempotencyRequest {
     body_bytes: Bytes,
 }
 
-struct InFlightLockGuard {
+/// The in-flight lock one request holds.
+///
+/// Dropping it keeps the lock; the store's in-flight TTL then frees the key.
+/// This fails closed when the handler future is cancelled or panics: the
+/// mutation may have committed, so a retry gets `409` until the TTL expires.
+/// Only [`Self::release`] frees the key at once.
+struct InFlightLock {
     store: Arc<dyn IdempotencyStore>,
     key: String,
     owner: String,
-    /// When `true`, `drop` releases the in-flight lock. This is set only on
-    /// outcomes we have *observed to completion* (a successful handler response,
-    /// a cache double-check hit, a too-large/streamed body). It deliberately
-    /// defaults to `false` so that if the inner handler future is dropped
-    /// without one of those explicit outcomes — i.e. cancelled by the outer
-    /// request-timeout layer, or unwound by a panic — the lock is left in place
-    /// to expire via the store's in-flight safety TTL instead of being released
-    /// immediately. A mutation may have committed its side effect before the
-    /// cancellation point, so eagerly unlocking would let a retry carrying the
-    /// same `Idempotency-Key` re-execute it; holding the lock fails closed
-    /// (the retry gets an in-flight `409`) until the TTL elapses.
-    unlock_on_drop: bool,
 }
 
-impl InFlightLockGuard {
-    fn new(store: Arc<dyn IdempotencyStore>, key: String, owner: String) -> Self {
-        Self {
-            store,
-            key,
-            owner,
-            // Fail closed by default: only the explicit completion paths below
-            // arm the unlock. See the field doc above.
-            unlock_on_drop: false,
+impl InFlightLock {
+    /// Free the key now. Call this only on an outcome observed to completion.
+    async fn release(self) {
+        if let Err(error) = self.store.unlock(&self.key, &self.owner).await {
+            tracing::warn!(
+                error = %error,
+                "Idempotency unlock failed; the lock expires by its in-flight TTL"
+            );
         }
     }
 
-    fn unlock_now(&mut self) {
-        // Unconditional: this is called only on observed-complete outcomes, and
-        // because the guard now defaults to *not* unlocking on drop, the unlock
-        // must happen here regardless of the current flag value. `unlock_owned`
-        // is owner-checked and idempotent, so a redundant call is harmless.
-        self.store.unlock_owned(&self.key, &self.owner);
-        self.unlock_on_drop = false;
-    }
-
-    const fn keep_locked_until_ttl(&mut self) {
-        self.unlock_on_drop = false;
-    }
-}
-
-impl Drop for InFlightLockGuard {
-    fn drop(&mut self) {
-        if self.unlock_on_drop {
-            self.store.unlock_owned(&self.key, &self.owner);
-        }
-    }
+    /// Keep the key locked until the in-flight TTL expires.
+    #[allow(
+        clippy::unused_self,
+        reason = "consumes the lock; the store's TTL frees the key"
+    )]
+    fn hold_until_ttl(self) {}
 }
 
 #[derive(Clone)]
@@ -1312,7 +1257,7 @@ struct DeferredIdempotencyState {
     record: IdempotencyRecord,
     body_hash: Vec<u8>,
     ttl: Duration,
-    lock_guard: InFlightLockGuard,
+    lock: InFlightLock,
 }
 
 impl DeferredIdempotencyCommit {
@@ -1322,13 +1267,18 @@ impl DeferredIdempotencyCommit {
         }
     }
 
-    fn commit_with_final_headers(&self, headers: &HeaderMap) -> Result<(), IdempotencyStoreError> {
-        let Some(mut state) = self
-            .inner
+    fn take(&self) -> Option<DeferredIdempotencyState> {
+        self.inner
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
-        else {
+    }
+
+    async fn commit_with_final_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<(), IdempotencyStoreError> {
+        let Some(mut state) = self.take() else {
             return Ok(());
         };
 
@@ -1339,38 +1289,29 @@ impl DeferredIdempotencyCommit {
             FINALIZED_SESSION_CURRENT_SCOPE
         };
         let primary_record = finalized_session_record(state.record.clone(), primary_scope);
-        if let Err(error) = state.store.try_set(
-            &state.storage_key,
-            primary_record,
-            state.body_hash.clone(),
-            state.ttl,
-        ) {
-            tracing::error!(
-                idempotency.key = %state.idempotency_key,
-                error = %error,
-                "Deferred idempotency persistence failed after finalized session response; failing closed"
-            );
-            state.lock_guard.keep_locked_until_ttl();
-            return Err(error);
-        }
         let alias_record = finalized_session_record(state.record, FINALIZED_SESSION_CURRENT_SCOPE);
-        for storage_key in state.alias_storage_keys {
-            if let Err(error) = state.store.try_set(
-                &storage_key,
-                alias_record.clone(),
-                state.body_hash.clone(),
-                state.ttl,
-            ) {
+        let writes = std::iter::once((state.storage_key, primary_record)).chain(
+            state
+                .alias_storage_keys
+                .into_iter()
+                .map(|key| (key, alias_record.clone())),
+        );
+        for (storage_key, record) in writes {
+            if let Err(error) = state
+                .store
+                .set(&storage_key, record, state.body_hash.clone(), state.ttl)
+                .await
+            {
                 tracing::error!(
                     idempotency.key = %state.idempotency_key,
                     error = %error,
                     "Deferred idempotency persistence failed after finalized session response; failing closed"
                 );
-                state.lock_guard.keep_locked_until_ttl();
+                state.lock.hold_until_ttl();
                 return Err(error);
             }
         }
-        state.lock_guard.unlock_now();
+        state.lock.release().await;
         Ok(())
     }
 
@@ -1409,19 +1350,13 @@ impl DeferredIdempotencyCommit {
     }
 
     fn keep_locked_until_ttl(&self) {
-        let Some(mut state) = self
-            .inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        else {
-            return;
-        };
-        state.lock_guard.keep_locked_until_ttl();
+        if let Some(state) = self.take() {
+            state.lock.hold_until_ttl();
+        }
     }
 }
 
-pub(crate) fn finalize_deferred_session_commit(
+pub(crate) async fn finalize_deferred_session_commit(
     response: &mut Response<Body>,
 ) -> Result<(), IdempotencyStoreError> {
     let Some(commit) = response
@@ -1430,7 +1365,7 @@ pub(crate) fn finalize_deferred_session_commit(
     else {
         return Ok(());
     };
-    commit.commit_with_final_headers(response.headers())
+    commit.commit_with_final_headers(response.headers()).await
 }
 
 /// Register the storage key a retry presenting `session_id` will compute as
@@ -1531,21 +1466,41 @@ async fn prepare_idempotency_request(
     })
 }
 
-fn lookup_prepared_entry(
+async fn lookup_prepared_entry(
     store: &dyn IdempotencyStore,
     prepared: &PreparedIdempotencyRequest,
 ) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
     if let Some(key) = prepared.stale_cookie_storage_key.as_deref()
-        && let Some(entry) = store.try_get(key)?
+        && let Some(entry) = store.get(key).await?
     {
         return Ok(Some(entry));
     }
 
-    store.try_get(&prepared.storage_key)
+    store.get(&prepared.storage_key).await
 }
 
-fn stale_cookie_fallback_in_flight(
+/// Acquire the in-flight lock for `key`. A store error counts as "held", so
+/// an outage fails closed with `409` and never runs the handler twice.
+async fn acquire_lock(
     store: &dyn IdempotencyStore,
+    key: &str,
+    owner: &str,
+    in_flight_ttl: Duration,
+) -> bool {
+    match store.try_lock(key, owner, in_flight_ttl).await {
+        Ok(acquired) => acquired,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Idempotency lock unavailable; failing closed to prevent duplicate processing"
+            );
+            false
+        }
+    }
+}
+
+async fn stale_cookie_fallback_in_flight(
+    store: &Arc<dyn IdempotencyStore>,
     prepared: &PreparedIdempotencyRequest,
     in_flight_ttl: Duration,
     entropy: &dyn crate::entropy::Entropy,
@@ -1555,11 +1510,71 @@ fn stale_cookie_fallback_in_flight(
     };
 
     let owner = in_flight_lock_owner(entropy);
-    if store.try_lock_owned(key, &owner, in_flight_ttl) {
-        store.unlock_owned(key, &owner);
+    if acquire_lock(store.as_ref(), key, &owner, in_flight_ttl).await {
+        InFlightLock {
+            store: Arc::clone(store),
+            key: key.to_owned(),
+            owner,
+        }
+        .release()
+        .await;
         false
     } else {
         true
+    }
+}
+
+/// Tells the middleware whether the handler stored the record in its own
+/// transaction, through [`IdempotencyTx::commit`].
+#[derive(Default)]
+struct TxProbe {
+    #[cfg(feature = "db")]
+    tx: Option<IdempotencyTx>,
+}
+
+impl TxProbe {
+    /// Give the handler an [`IdempotencyTx`] when the store is a
+    /// [`DbIdempotencyStore`].
+    #[cfg(feature = "db")]
+    fn attach(
+        store: &Arc<dyn IdempotencyStore>,
+        prepared: &mut PreparedIdempotencyRequest,
+        owner: &str,
+        ttl: Duration,
+    ) -> Self {
+        let store: &dyn std::any::Any = store.as_ref();
+        if !store.is::<DbIdempotencyStore>() {
+            return Self::default();
+        }
+        let tx = IdempotencyTx::new(
+            prepared.storage_key.clone(),
+            owner.to_owned(),
+            prepared.body_hash.clone(),
+            ttl,
+        );
+        prepared.parts.extensions.insert(tx.clone());
+        Self { tx: Some(tx) }
+    }
+
+    #[cfg(not(feature = "db"))]
+    fn attach(
+        _store: &Arc<dyn IdempotencyStore>,
+        _prepared: &mut PreparedIdempotencyRequest,
+        _owner: &str,
+        _ttl: Duration,
+    ) -> Self {
+        Self::default()
+    }
+
+    fn committed(&self) -> bool {
+        #[cfg(feature = "db")]
+        {
+            self.tx.as_ref().is_some_and(IdempotencyTx::committed)
+        }
+        #[cfg(not(feature = "db"))]
+        {
+            false
+        }
     }
 }
 
@@ -1606,13 +1621,13 @@ where
         return inner.call(req).await;
     };
 
-    let prepared = match prepare_idempotency_request(idempotency_key, req).await {
+    let mut prepared = match prepare_idempotency_request(idempotency_key, req).await {
         Ok(prepared) => prepared,
         Err(response) => return Ok(response),
     };
 
     // ── Cache hit ──────────────────────────────────────────────────────────
-    match lookup_prepared_entry(store.as_ref(), &prepared) {
+    match lookup_prepared_entry(store.as_ref(), &prepared).await {
         Ok(Some(entry)) => {
             return replay_cache_hit(
                 &mut inner,
@@ -1635,37 +1650,41 @@ where
         }
     }
 
-    if stale_cookie_fallback_in_flight(store.as_ref(), &prepared, in_flight_ttl, entropy.as_ref()) {
+    if stale_cookie_fallback_in_flight(&store, &prepared, in_flight_ttl, entropy.as_ref()).await {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
             "Stale session cookie idempotency key already in flight — returning 409"
         );
-        metrics
-            .as_ref()
-            .inspect(|m| m.record_idempotency_conflict());
-        return Ok(in_flight_conflict_response());
+        return Ok(in_flight_conflict(metrics.as_ref()));
     }
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
     let lock_owner = in_flight_lock_owner(entropy.as_ref());
-    if !store.try_lock_owned(&prepared.storage_key, &lock_owner, in_flight_ttl) {
+    if !acquire_lock(
+        store.as_ref(),
+        &prepared.storage_key,
+        &lock_owner,
+        in_flight_ttl,
+    )
+    .await
+    {
         tracing::debug!(
             idempotency.key = %prepared.idempotency_key,
             "Idempotency key already in flight — returning 409"
         );
-        metrics
-            .as_ref()
-            .inspect(|m| m.record_idempotency_conflict());
-        return Ok(in_flight_conflict_response());
+        return Ok(in_flight_conflict(metrics.as_ref()));
     }
-    let mut lock_guard =
-        InFlightLockGuard::new(store.clone(), prepared.storage_key.clone(), lock_owner);
+    let lock = InFlightLock {
+        store: store.clone(),
+        key: prepared.storage_key.clone(),
+        owner: lock_owner,
+    };
 
     // Double-check after acquiring the lock: a concurrent request may have
     // completed between our miss check and lock acquisition.
-    match lookup_prepared_entry(store.as_ref(), &prepared) {
+    match lookup_prepared_entry(store.as_ref(), &prepared).await {
         Ok(Some(entry)) => {
-            lock_guard.unlock_now();
+            lock.release().await;
             return replay_cache_hit(
                 &mut inner,
                 entry,
@@ -1678,7 +1697,7 @@ where
         }
         Ok(None) => {}
         Err(error) => {
-            lock_guard.keep_locked_until_ttl();
+            lock.hold_until_ttl();
             tracing::error!(
                 idempotency.key = %prepared.idempotency_key,
                 error = %error,
@@ -1688,7 +1707,8 @@ where
         }
     }
 
-    handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock_guard).await
+    let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, ttl);
+    handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock, probe).await
 }
 
 async fn handle_cache_miss<S>(
@@ -1697,7 +1717,8 @@ async fn handle_cache_miss<S>(
     ttl: Duration,
     prepared: PreparedIdempotencyRequest,
     metrics: Option<&crate::middleware::MetricsCollector>,
-    mut lock_guard: InFlightLockGuard,
+    lock: InFlightLock,
+    probe: TxProbe,
 ) -> Result<Response<Body>, std::convert::Infallible>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
@@ -1730,7 +1751,7 @@ where
     // buffering to avoid materialising large responses in memory.
     let resp_bytes = match collect_response_for_cache(resp_body).await {
         CollectedResponseBody::StreamError(passthrough_body) => {
-            lock_guard.unlock_now();
+            lock.release().await;
             tracing::warn!(
                 idempotency.key = %idempotency_key,
                 "I/O error reading response body; passing the body error through without storing idempotency entry"
@@ -1741,7 +1762,7 @@ where
             passthrough_body, ..
         } => {
             // Body exceeded MAX_CACHEABLE_RESPONSE_BODY — stream through.
-            lock_guard.unlock_now();
+            lock.release().await;
             tracing::debug!(
                 idempotency.key = %idempotency_key,
                 limit_bytes = MAX_CACHEABLE_RESPONSE_BODY,
@@ -1752,6 +1773,8 @@ where
         CollectedResponseBody::Cacheable(bytes) => bytes,
     };
 
+    // The handler stored the record in its own transaction, with its mutation.
+    let committed_in_tx = probe.committed();
     let replay_metadata = resp_parts
         .extensions
         .remove::<IdempotencyReplayMetadata>()
@@ -1765,7 +1788,7 @@ where
     // errors; store before unlocking so concurrent duplicates still see a
     // locked key rather than racing to re-execute the handler.
     let status = resp_parts.status.as_u16();
-    if (200u32..400).contains(&u32::from(status)) || cache_committed_error {
+    if (200u32..400).contains(&u32::from(status)) || cache_committed_error || committed_in_tx {
         let session_mutated = if let Some(session) = &session {
             session.has_pending_changes().await
         } else {
@@ -1789,29 +1812,27 @@ where
                     record,
                     body_hash,
                     ttl,
-                    lock_guard,
+                    lock,
                 },
             ));
-            if let Some(m) = metrics {
-                m.record_idempotency_miss();
-            }
+            metrics.inspect(|m| m.record_idempotency_miss());
             return Ok(Response::from_parts(resp_parts, Body::from(resp_bytes)));
         }
-        if let Err(error) = store.try_set(&storage_key, record, body_hash, ttl) {
+        if committed_in_tx {
+            // Nothing to write: the record committed with the mutation.
+        } else if let Err(error) = store.set(&storage_key, record, body_hash, ttl).await {
             tracing::error!(
                 idempotency.key = %idempotency_key,
                 error = %error,
                 "Idempotency persistence failed after handler success; failing closed"
             );
-            lock_guard.keep_locked_until_ttl();
+            lock.hold_until_ttl();
             return Ok(persistence_failed_response());
         }
     }
-    lock_guard.unlock_now();
+    lock.release().await;
 
-    if let Some(m) = metrics {
-        m.record_idempotency_miss();
-    }
+    metrics.inspect(|m| m.record_idempotency_miss());
 
     // Reconstruct from original parts — preserves set-cookie and extensions.
     Ok(Response::from_parts(resp_parts, Body::from(resp_bytes)))
@@ -2038,22 +2059,35 @@ mod tests {
     }
 
     impl IdempotencyStore for RecordingStore {
-        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
             self.record_key(key);
-            None
+            ready(None)
         }
 
-        fn set(&self, key: &str, _record: IdempotencyRecord, _body_hash: Vec<u8>, _ttl: Duration) {
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            _record: IdempotencyRecord,
+            _body_hash: Vec<u8>,
+            _ttl: Duration,
+        ) -> IdempotencyFuture<'a, ()> {
             self.record_key(key);
+            ready(())
         }
 
-        fn try_lock(&self, key: &str, _lock_ttl: Duration) -> bool {
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            _owner: &'a str,
+            _lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
             self.record_key(key);
-            true
+            ready(true)
         }
 
-        fn unlock(&self, key: &str) {
+        fn unlock<'a>(&'a self, key: &'a str, _owner: &'a str) -> IdempotencyFuture<'a, ()> {
             self.record_key(key);
+            ready(())
         }
     }
 
@@ -2088,8 +2122,8 @@ mod tests {
             body: b"ok".to_vec(),
             metadata: Vec::new(),
         };
-        store.set("k", record, b"body-hash".to_vec(), Duration::from_secs(60));
-        let fetched = store.get("k");
+        store.set_now("k", record, b"body-hash".to_vec(), Duration::from_secs(60));
+        let fetched = store.get_now("k");
         assert!(
             fetched.is_some(),
             "store must remain usable after a poisoned lock (into_inner recovery)",
@@ -2201,60 +2235,60 @@ mod tests {
     fn memory_lock_unlock_owned_does_not_release_newer_owner() {
         let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
 
-        assert!(store.try_lock_owned("key", "owner-a", Duration::from_millis(5)));
+        assert!(store.try_lock_now("key", "owner-a", Duration::from_millis(5)));
         std::thread::sleep(Duration::from_millis(20));
-        assert!(store.try_lock_owned("key", "owner-b", Duration::from_secs(60)));
+        assert!(store.try_lock_now("key", "owner-b", Duration::from_secs(60)));
 
-        store.unlock_owned("key", "owner-a");
+        store.unlock_now("key", "owner-a");
         assert!(
-            !store.try_lock_owned("key", "owner-c", Duration::from_secs(60)),
+            !store.try_lock_now("key", "owner-c", Duration::from_secs(60)),
             "stale owners must not release a newer in-flight lock"
         );
 
-        store.unlock_owned("key", "owner-b");
-        assert!(store.try_lock_owned("key", "owner-c", Duration::from_secs(60)));
+        store.unlock_now("key", "owner-b");
+        assert!(store.try_lock_now("key", "owner-c", Duration::from_secs(60)));
     }
 
     #[test]
-    fn in_flight_guard_holds_lock_when_dropped_without_explicit_unlock() {
+    fn in_flight_lock_held_when_dropped_without_release() {
         // Simulates the inner handler future being cancelled (by the outer
-        // request-timeout layer) or unwound by a panic: the guard is dropped
-        // without any of the explicit completion paths calling `unlock_now`.
+        // request-timeout layer) or unwound by a panic: the lock is dropped
+        // without any of the explicit completion paths calling `release`.
         // The lock must stay held so a retry carrying the same Idempotency-Key
         // cannot re-run a mutation whose side effect may already have committed.
-        let store: Arc<dyn IdempotencyStore> =
-            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
-        assert!(store.try_lock_owned("key", "owner-a", Duration::from_secs(60)));
+        let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        assert!(memory.try_lock_now("key", "owner-a", Duration::from_secs(60)));
 
-        {
-            let _guard =
-                InFlightLockGuard::new(store.clone(), "key".to_owned(), "owner-a".to_owned());
-            // Dropped here with no explicit unlock — fail closed.
-        }
+        drop(InFlightLock {
+            store: memory.clone(),
+            key: "key".to_owned(),
+            owner: "owner-a".to_owned(),
+        });
 
         assert!(
-            !store.try_lock_owned("key", "owner-b", Duration::from_secs(60)),
+            !memory.try_lock_now("key", "owner-b", Duration::from_secs(60)),
             "a cancelled/panicked handler must leave the in-flight lock held until its TTL"
         );
     }
 
-    #[test]
-    fn in_flight_guard_releases_lock_on_explicit_unlock() {
-        // The normal completion paths call `unlock_now`, which must release the
-        // lock immediately so a subsequent distinct request can proceed.
-        let store: Arc<dyn IdempotencyStore> =
-            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
-        assert!(store.try_lock_owned("key", "owner-a", Duration::from_secs(60)));
+    #[tokio::test]
+    async fn in_flight_lock_release_frees_the_key() {
+        // The normal completion paths call `release`, which must free the key
+        // at once so a subsequent distinct request can proceed.
+        let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        assert!(memory.try_lock_now("key", "owner-a", Duration::from_secs(60)));
 
-        {
-            let mut guard =
-                InFlightLockGuard::new(store.clone(), "key".to_owned(), "owner-a".to_owned());
-            guard.unlock_now();
+        InFlightLock {
+            store: memory.clone(),
+            key: "key".to_owned(),
+            owner: "owner-a".to_owned(),
         }
+        .release()
+        .await;
 
         assert!(
-            store.try_lock_owned("key", "owner-b", Duration::from_secs(60)),
-            "an explicitly unlocked guard must release the in-flight lock"
+            memory.try_lock_now("key", "owner-b", Duration::from_secs(60)),
+            "a released lock must free the key"
         );
     }
 
@@ -2273,16 +2307,16 @@ mod tests {
 
         // Both of these overflow `Instant + Duration` on the underlying clock.
         for extreme in [Duration::from_secs(u64::MAX), Duration::MAX] {
-            store.set("extreme-ttl-key", record.clone(), Vec::new(), extreme);
+            store.set_now("extreme-ttl-key", record.clone(), Vec::new(), extreme);
             // Entry must be retrievable and (far-future) unexpired.
             assert!(
-                store.get("extreme-ttl-key").is_some(),
+                store.get_now("extreme-ttl-key").is_some(),
                 "entry stored with an extreme TTL should be present and unexpired"
             );
         }
 
         // The in-flight lock path uses the same arithmetic and must not panic.
-        assert!(store.try_lock_owned("lock-key", "owner", Duration::MAX));
+        assert!(store.try_lock_now("lock-key", "owner", Duration::MAX));
 
         // saturating_deadline itself clamps to a representable far future.
         let deadline = saturating_deadline(Duration::MAX);
@@ -2522,5 +2556,36 @@ mod tests {
         let response = response_from_record(corrupted);
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Issue #3061 AC3: the Redis store runs on a current-thread runtime.
+    ///
+    /// The store used `block_in_place`, which panics on this runtime flavour.
+    /// Redis is not reachable here, so the lookup fails and the middleware
+    /// fails closed with `503`. The handler does not run.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn redis_store_on_current_thread_runtime_fails_closed_without_panic() {
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let mut config = crate::config::IdempotencyConfig::default();
+        config.redis.url = Some("redis://127.0.0.1:1/".to_owned());
+        let store = Arc::new(RedisIdempotencyStore::from_config(&config).expect("lazy client"));
+        let app = axum::Router::new()
+            .route(
+                "/charge",
+                axum::routing::post(|| async {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    "charged"
+                }),
+            )
+            .layer(IdempotencyLayer::new(store));
+
+        let response = app
+            .oneshot(idempotent_post("/charge", "current-thread", ""))
+            .await
+            .expect("infallible");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0, "the handler must not run");
     }
 }

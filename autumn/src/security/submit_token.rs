@@ -185,6 +185,18 @@ fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     )
 }
 
+/// Lock owner for submit-token locks. One token is one request, so all
+/// attempts share an owner and any of them may release the lock.
+const LOCK_OWNER: &str = "";
+
+/// Release the in-flight lock for `key`. An error is logged; the lock then
+/// expires by its in-flight TTL.
+async fn release_lock(store: &Arc<dyn IdempotencyStore>, key: &str) {
+    if let Err(error) = store.unlock(key, LOCK_OWNER).await {
+        tracing::warn!(error = %error, "Submit-token unlock failed; the lock expires by its TTL");
+    }
+}
+
 /// Derive the store key for a submitted token. The token is a per-render random
 /// UUID, so it is globally unique and needs no method/path/principal scoping —
 /// the token itself identifies the single logical submission.
@@ -583,7 +595,7 @@ where
             // collapsing to a cache miss: a swallowed error would fall through,
             // acquire a fresh lock, and re-run the mutation for an
             // already-consumed token. No lock is held yet, so surface `503`.
-            match settings.store.try_get(&key) {
+            match settings.store.get(&key).await {
                 Ok(Some(entry)) => return Ok(replay_response(&entry.record)),
                 Ok(None) => {}
                 Err(error) => {
@@ -597,7 +609,19 @@ where
 
             // Acquire the in-flight lock. A concurrent duplicate that loses the
             // race gets a 409 so it can never re-run the handler.
-            if !settings.store.try_lock(&key, settings.in_flight_ttl) {
+            let acquired = settings
+                .store
+                .try_lock(&key, LOCK_OWNER, settings.in_flight_ttl)
+                .await
+                .unwrap_or_else(|error| {
+                    // Fail closed: an outage must not let two submits run.
+                    tracing::warn!(
+                        error = %error,
+                        "Submit-token lock unavailable; failing closed"
+                    );
+                    false
+                });
+            if !acquired {
                 return Ok(in_flight_conflict_response());
             }
 
@@ -608,9 +632,9 @@ where
             // `in_flight_ttl`) so a retry with the same token is rejected
             // in-flight rather than re-running the handler — exactly as
             // `IdempotencyService` does on a post-lock lookup error.
-            match settings.store.try_get(&key) {
+            match settings.store.get(&key).await {
                 Ok(Some(entry)) => {
-                    settings.store.unlock(&key);
+                    release_lock(&settings.store, &key).await;
                     return Ok(replay_response(&entry.record));
                 }
                 Ok(None) => {}
@@ -661,7 +685,8 @@ async fn cache_consumed_token_response(
                 // success.
                 if let Err(error) = settings
                     .store
-                    .try_set(key, record, Vec::new(), settings.ttl)
+                    .set(key, record, Vec::new(), settings.ttl)
+                    .await
                 {
                     tracing::error!(
                         error = %error,
@@ -670,14 +695,14 @@ async fn cache_consumed_token_response(
                     return crate::idempotency::persistence_failed_response();
                 }
             }
-            settings.store.unlock(key);
+            release_lock(&settings.store, key).await;
             Response::from_parts(parts, Body::from(bytes))
         }
         CollectedBody::Oversized { body, .. } => {
             // Too large to cache — stream through. The lock is released; a later
             // retry re-runs (acceptable: form responses are tiny redirects, so
             // this path is not hit in practice).
-            settings.store.unlock(key);
+            release_lock(&settings.store, key).await;
             Response::from_parts(parts, body)
         }
         CollectedBody::Errored(error) => {
@@ -702,7 +727,7 @@ async fn cache_consumed_token_response(
                 "Submit-token response buffering failed on a read error; failing closed"
             );
             if !(200..400).contains(&status) {
-                settings.store.unlock(key);
+                release_lock(&settings.store, key).await;
             }
             response_read_error_response()
         }
@@ -712,7 +737,9 @@ async fn cache_consumed_token_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::idempotency::{IdempotencyEntry, IdempotencyStoreError, MemoryIdempotencyStore};
+    use crate::idempotency::{
+        IdempotencyEntry, IdempotencyFuture, IdempotencyStoreError, MemoryIdempotencyStore,
+    };
     use axum::Router;
     use axum::routing::{get, post};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1189,27 +1216,30 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn expired_token_re_runs_after_ttl() {
+    #[tokio::test]
+    async fn expired_token_re_runs_after_ttl() {
         // A very short TTL means the stored record expires and a later submit
         // re-runs rather than replaying.
         let store = MemoryIdempotencyStore::new(Duration::from_millis(10));
         let key = storage_key("ttl-token");
-        store.set(
-            &key,
-            IdempotencyRecord {
-                status: 200,
-                headers: Vec::new(),
-                body: b"first".to_vec(),
-                metadata: Vec::new(),
-            },
-            Vec::new(),
-            Duration::from_millis(10),
-        );
-        assert!(store.get(&key).is_some());
+        store
+            .set(
+                &key,
+                IdempotencyRecord {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"first".to_vec(),
+                    metadata: Vec::new(),
+                },
+                Vec::new(),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        assert!(store.get(&key).await.unwrap().is_some());
         std::thread::sleep(Duration::from_millis(30));
         assert!(
-            store.get(&key).is_none(),
+            store.get(&key).await.unwrap().is_none(),
             "record must expire after its TTL"
         );
     }
@@ -1424,33 +1454,35 @@ mod tests {
     }
 
     impl IdempotencyStore for FailingSetStore {
-        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
             self.inner.get(key)
         }
 
-        fn set(&self, _key: &str, _record: IdempotencyRecord, _body_hash: Vec<u8>, _ttl: Duration) {
-            // No-op: the fallible `try_set` path is what the guard uses; this
-            // simulated backend never persists so retries cannot see a record.
-        }
-
-        fn try_set(
-            &self,
-            _key: &str,
+        fn set<'a>(
+            &'a self,
+            _key: &'a str,
             _record: IdempotencyRecord,
             _body_hash: Vec<u8>,
             _ttl: Duration,
-        ) -> Result<(), IdempotencyStoreError> {
-            Err(IdempotencyStoreError::backend(
-                "simulated consumed-token persistence failure",
-            ))
+        ) -> IdempotencyFuture<'a, ()> {
+            Box::pin(async {
+                Err(IdempotencyStoreError::backend(
+                    "simulated consumed-token persistence failure",
+                ))
+            })
         }
 
-        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
-            self.inner.try_lock(key, lock_ttl)
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
         }
 
-        fn unlock(&self, key: &str) {
-            self.inner.unlock(key);
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
         }
     }
 
@@ -1556,7 +1588,7 @@ mod tests {
         // No consumed-token record was persisted (the body never fully buffered).
         let key = storage_key(token);
         assert!(
-            store.get(&key).is_none(),
+            store.get(&key).await.unwrap().is_none(),
             "a response-stream error must not persist a consumed-token record"
         );
 
@@ -1631,7 +1663,7 @@ mod tests {
         // never fully buffered).
         let key = storage_key(token);
         assert!(
-            store.get(&key).is_none(),
+            store.get(&key).await.unwrap().is_none(),
             "a non-success response-stream error must not persist a consumed-token record"
         );
 
@@ -1670,37 +1702,39 @@ mod tests {
     }
 
     impl IdempotencyStore for FailingGetStore {
-        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
-            // The infallible path collapses a read failure to a cache miss —
-            // exactly the fail-open behaviour the guard must NOT rely on. It
-            // uses `try_get` instead, so this stays here only for the trait.
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
             if self.fail_reads.load(Ordering::SeqCst) {
-                None
+                Box::pin(async {
+                    Err(IdempotencyStoreError::backend(
+                        "simulated consumed-token lookup failure",
+                    ))
+                })
             } else {
                 self.inner.get(key)
             }
         }
 
-        fn try_get(&self, key: &str) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
-            if self.fail_reads.load(Ordering::SeqCst) {
-                Err(IdempotencyStoreError::backend(
-                    "simulated consumed-token lookup failure",
-                ))
-            } else {
-                self.inner.try_get(key)
-            }
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, ()> {
+            self.inner.set(key, record, body_hash, ttl)
         }
 
-        fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
-            self.inner.set(key, record, body_hash, ttl);
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
         }
 
-        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
-            self.inner.try_lock(key, lock_ttl)
-        }
-
-        fn unlock(&self, key: &str) {
-            self.inner.unlock(key);
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
         }
     }
 
@@ -1823,22 +1857,33 @@ mod tests {
     }
 
     impl IdempotencyStore for TtlRecordingStore {
-        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
             self.inner.get(key)
         }
 
-        fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, ()> {
             *self.set_ttl.lock().unwrap() = Some(ttl);
-            self.inner.set(key, record, body_hash, ttl);
+            self.inner.set(key, record, body_hash, ttl)
         }
 
-        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
             *self.lock_ttl.lock().unwrap() = Some(lock_ttl);
-            self.inner.try_lock(key, lock_ttl)
+            self.inner.try_lock(key, owner, lock_ttl)
         }
 
-        fn unlock(&self, key: &str) {
-            self.inner.unlock(key);
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
         }
     }
 
@@ -1925,7 +1970,12 @@ mod tests {
         // consumed response yet.
         let token = "tok-inflight";
         let key = storage_key(token);
-        assert!(store.try_lock(&key, Duration::from_secs(86_400)));
+        assert!(
+            store
+                .try_lock(&key, LOCK_OWNER, Duration::from_secs(86_400))
+                .await
+                .unwrap()
+        );
 
         // A concurrent retry with the same token is rejected in-flight and never
         // reaches the handler.

@@ -55,9 +55,9 @@ X-Idempotent-Replayed: true
 ```toml
 [idempotency]
 enabled   = true
-backend   = "memory"   # "memory" | "redis"
+backend   = "memory"   # "memory" | "redis" | "database"
 ttl_secs  = 86400      # how long to cache responses (default: 24 h)
-in_flight_ttl_secs = 86400 # Redis safety expiry for active in-flight locks
+in_flight_ttl_secs = 60 # lock expiry after a crash or a failed save (default: 60 s)
 
 # Memory backend: allow in production (off by default, see below)
 allow_memory_in_production = false
@@ -86,13 +86,33 @@ Environment overrides:
 | `enabled` | `false` (opt-in) |
 | `backend` | `"memory"` |
 | `ttl_secs` | `86400` (24 hours) |
-| `in_flight_ttl_secs` | `86400` (24 hours) |
+| `in_flight_ttl_secs` | `60` (1 minute) |
 | `allow_memory_in_production` | `false` |
 | `redis.key_prefix` | `"autumn:idempotency"` |
+
+`in_flight_ttl_secs` and `ttl_secs` are separate. The middleware releases the
+in-flight lock when the handler finishes. After a crash, a cancelled request,
+or a failed record write, the lock stays until its TTL expires. During that
+time, a retry gets `409`. Keep the TTL longer than your slowest mutating
+request. If a request runs longer, a retry can run the handler a second time. Autumn logs a warning at
+boot when the TTL is shorter than `server.timeouts.request_timeout_ms`, and a
+note when no request timeout is set.
 
 ---
 
 ## Backends
+
+Each backend gives a different guarantee:
+
+| Backend | Shared by replicas | Record and mutation commit together | After a crash between commit and record |
+|---|---|---|---|
+| `memory` | No | No | After a restart, the retry runs again. After a failed save, `409` until `in_flight_ttl_secs`, then the retry runs again |
+| `redis` | Yes | No | Retry gets `409` until `in_flight_ttl_secs`, then runs again |
+| `database` + `IdempotencyTx::commit` | Yes | Yes | Retry replays the committed response |
+| `database` without `IdempotencyTx` | Yes | No | Same as `redis` |
+
+Use `database` with `IdempotencyTx::commit` for payments, billing, and other
+mutations that must not run twice.
 
 ### Memory
 
@@ -120,7 +140,81 @@ backend = "redis"
 url = "redis://redis:6379/0"
 ```
 
-Requires the `redis` Cargo feature on `autumn-web`.
+Requires the `redis` Cargo feature on `autumn-web`. The store is async, so
+it also works on a current-thread runtime.
+
+### Database
+
+The database backend keeps records in the app database, in the
+`autumn_idempotency_keys` table. It works on Postgres, and on SQLite under the
+`sqlite` feature. The table comes from `FRAMEWORK_MIGRATIONS`.
+
+```toml
+[idempotency]
+enabled = true
+backend = "database"
+```
+
+To commit the response with the mutation, take the `IdempotencyTx`
+extractor and call `commit` inside your `Db::tx`. Return the response that
+`commit` gives back:
+
+```rust,ignore
+use autumn_web::idempotency::IdempotencyTx;
+use autumn_web::prelude::*;
+use autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+
+#[post("/payments")]
+async fn pay(idem: IdempotencyTx, mut db: Db) -> AutumnResult<axum::response::Response> {
+    db.tx(|conn| {
+        async move {
+            let payment = insert_payment(conn).await?;
+            idem.commit(conn, (StatusCode::CREATED, Json(payment))).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
+```
+
+- The payment row and the stored response commit in one transaction, or
+  neither commits.
+- If the process stops after the commit, the retry replays the stored
+  response. The handler does not run again.
+- If the in-flight lock expired and another request took the key, `commit`
+  returns `409` and the transaction rolls back. Only one request commits its
+  database writes.
+- The lock does not fence work outside the database, such as a call to a
+  payment provider. Give that call its own idempotency key, for example
+  `IdempotencyContext::scoped_key`.
+- Without an `Idempotency-Key`, or with another backend, `commit` returns the
+  response unchanged. The same handler works with every backend.
+- `commit` reads the whole body. A body larger than 10 MiB gives `500`.
+- If the handler also changes the session, Autumn rewrites the record after
+  the session is saved, so a replay gets the final `Set-Cookie`.
+- Autumn finds the store by its type. A wrapper around `DbIdempotencyStore`
+  makes `commit` a no-op.
+
+#### Multi-step handlers
+
+A handler with more than one transaction can record its progress. A retry
+after a crash reads the last recovery point and skips the done steps:
+
+```rust,ignore
+if idem.recovery_point(&mut db).await?.is_none() {
+    let step = idem.clone();
+    db.tx(|conn| async move {
+        charge_card(conn).await?;
+        step.set_recovery_point(conn, "charged").await
+    }.scope_boxed()).await?;
+}
+db.tx(|conn| async move {
+    idem.commit(conn, (StatusCode::CREATED, "done")).await
+}.scope_boxed()).await
+```
+
+Lock expiry uses the app clock, not the database clock. Keep replica clocks
+in sync, and keep `in_flight_ttl_secs` much larger than the clock skew.
 
 ---
 
@@ -234,6 +328,7 @@ clear error message if the config is invalid:
   → startup aborts.
 - **Redis backend** with no URL configured (and no `AUTUMN_IDEMPOTENCY__REDIS__URL`
   environment variable) → startup aborts.
+- **Database backend** with no database configured → startup aborts.
 
 ---
 
@@ -295,39 +390,47 @@ let app = axum::Router::new()
 
 ## Low-level API
 
-When you need a custom backend (e.g. DynamoDB, Postgres advisory locks), implement the `IdempotencyStore` trait:
+When you need a custom backend (e.g. DynamoDB), implement the async
+`IdempotencyStore` trait. Each method returns a boxed future:
 
 ```rust,ignore
 use autumn_web::idempotency::{
-    IdempotencyEntry, IdempotencyRecord, IdempotencyStore, IdempotencyStoreError,
+    IdempotencyEntry, IdempotencyFuture, IdempotencyRecord, IdempotencyStore,
 };
 use std::time::Duration;
 
 struct MyStore { /* ... */ }
 
 impl IdempotencyStore for MyStore {
-    fn get(&self, key: &str) -> Option<IdempotencyEntry> { /* ... */ }
-
-    fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
-        /* ... */
+    fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+        Box::pin(async move { /* ... */ })
     }
 
-    fn try_set(
-        &self,
-        key: &str,
+    fn set<'a>(
+        &'a self,
+        key: &'a str,
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
-    ) -> Result<(), IdempotencyStoreError> {
-        self.set(key, record, body_hash, ttl);
-        Ok(())
+    ) -> IdempotencyFuture<'a, ()> {
+        Box::pin(async move { /* ... */ })
     }
 
-    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool { /* true = lock acquired */ }
+    /// `true` = lock acquired by `owner`.
+    fn try_lock<'a>(&'a self, key: &'a str, owner: &'a str, ttl: Duration) -> IdempotencyFuture<'a, bool> {
+        Box::pin(async move { /* ... */ })
+    }
 
-    fn unlock(&self, key: &str) { /* ... */ }
+    /// Release only when `owner` holds the lock.
+    fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+        Box::pin(async move { /* ... */ })
+    }
 }
 ```
+
+Return backend errors. Do not block the runtime thread. The middleware fails
+closed: a `get` or `set` error gives `503`, and a `try_lock` error gives
+`409`.
 
 Wire it into the layer and apply it to your router:
 

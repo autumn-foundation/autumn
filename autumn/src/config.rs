@@ -3327,9 +3327,13 @@ fn default_scheduler_key_prefix() -> String {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum IdempotencyBackend {
+    /// In-process store. One replica only.
     #[default]
     Memory,
+    /// Redis store. Shared by replicas; the record is written after the handler.
     Redis,
+    /// App-database store. A handler can commit the record with its mutation.
+    Database,
 }
 
 impl IdempotencyBackend {
@@ -3339,6 +3343,7 @@ impl IdempotencyBackend {
         match value.trim().to_ascii_lowercase().as_str() {
             "memory" | "mem" => Some(Self::Memory),
             "redis" => Some(Self::Redis),
+            "database" | "db" => Some(Self::Database),
             _ => None,
         }
     }
@@ -3386,11 +3391,13 @@ pub struct IdempotencyConfig {
     /// Time-to-live in seconds for stored idempotency records.
     #[serde(default = "default_idempotency_ttl_secs")]
     pub ttl_secs: u64,
-    /// Maximum stale lifetime for distributed in-flight locks.
+    /// Maximum lifetime of an in-flight lock, in seconds. Default: 60.
     ///
-    /// The lock is released as soon as the handler finishes. This value is only
-    /// the backend safety expiry for crashes or lost unlocks, so it should be
-    /// comfortably longer than any supported mutating request duration.
+    /// The lock is released when the handler finishes. This expiry applies
+    /// only after a crash, a cancelled request, or a failed record write; it
+    /// sets how long a retry gets `409`. Keep it longer than your slowest
+    /// mutating request. It is separate from `ttl_secs`, the response
+    /// retention.
     #[serde(default = "default_idempotency_in_flight_ttl_secs")]
     pub in_flight_ttl_secs: u64,
     /// Allow the in-memory backend in production environments.
@@ -3419,7 +3426,7 @@ const fn default_idempotency_ttl_secs() -> u64 {
 }
 
 const fn default_idempotency_in_flight_ttl_secs() -> u64 {
-    86_400
+    crate::idempotency::DEFAULT_IN_FLIGHT_TTL.as_secs()
 }
 
 /// `OpenAPI` spec runtime exposure settings.

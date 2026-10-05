@@ -1299,6 +1299,12 @@ jobs:
           cargo test -p autumn-web --features "redis,ws" --lib job::tests::redis_page_spans \
             | tee "${RUNNER_TEMP}/redis-page-spans.log"
           assert_ran "${RUNNER_TEMP}/redis-page-spans.log" "redis_page_spans unit tests"
+          # Issue #3061: the Redis idempotency store on a current-thread
+          # runtime. It used `block_in_place`, which panics there. No Docker:
+          # the store points at a closed port and must fail closed.
+          cargo test -p autumn-web --features "redis,ws" --lib idempotency::tests::redis_store_on_current_thread \
+            | tee "${RUNNER_TEMP}/redis-idempotency-current-thread.log"
+          assert_ran "${RUNNER_TEMP}/redis-idempotency-current-thread.log" "redis idempotency current-thread test"
       - name: Run direct-TLS (HTTPS) tests
         if: matrix.lane == 'tls'
         # `tls` is not a default feature, so the `test` job's workspace `cargo
@@ -2363,6 +2369,7 @@ jobs:
             --test sqlite_framework_migrations \
             --test sim_chaos \
             --test sim_fault_plan_db \
+            --test sim_idempotency_db \
             --test sqlite_jobs_scheduler_e2e \
             --test confidential_repository_bidx \
             --test sim_sqlite_substrate \

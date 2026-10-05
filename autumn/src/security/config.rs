@@ -871,7 +871,7 @@ pub struct SubmitTokenConfig {
     /// window): lowering `ttl_secs` must never shorten how long an active
     /// submission is excluded from re-entry, which would let a slow request's
     /// retry acquire a fresh lock and double-execute. Default: `86_400`
-    /// (24 hours), matching `[idempotency].in_flight_ttl_secs`.
+    /// (24 hours). `[idempotency].in_flight_ttl_secs` is separate (60 s).
     #[serde(default = "default_submit_token_in_flight_ttl_secs")]
     pub in_flight_ttl_secs: u64,
 

@@ -85,18 +85,27 @@ async fn sim_ambient_modules_idempotency_ttl_runs_on_into_the_next_sim(sim: Sim)
     let store = MemoryIdempotencyStore::new(minute);
     let first = Sim::from_seed(sim.seed.wrapping_add(1));
     first.advance(Duration::from_secs(3600)).await;
-    store.set("k", idempotency_record(), b"hash".to_vec(), minute);
-    assert!(store.try_lock("lock", minute));
+    store
+        .set("k", idempotency_record(), b"hash".to_vec(), minute)
+        .await
+        .unwrap();
+    assert!(store.try_lock("lock", "a", minute).await.unwrap());
     drop(first);
 
     // The next sim's instants start after the first sim's. The entry and the
     // lock live out their minute there, and no longer.
     let second = Sim::from_seed(sim.seed.wrapping_add(2));
-    assert!(store.get("k").is_some(), "inside its TTL");
-    assert!(!store.try_lock("lock", minute), "still held");
+    assert!(store.get("k").await.unwrap().is_some(), "inside its TTL");
+    assert!(
+        !store.try_lock("lock", "b", minute).await.unwrap(),
+        "still held"
+    );
     second.advance(minute + Duration::from_secs(1)).await;
-    assert!(store.get("k").is_none(), "its TTL ran out");
-    assert!(store.try_lock("lock", minute), "the lock ran out");
+    assert!(store.get("k").await.unwrap().is_none(), "its TTL ran out");
+    assert!(
+        store.try_lock("lock", "b", minute).await.unwrap(),
+        "the lock ran out"
+    );
 }
 
 #[sim_test]
@@ -107,17 +116,26 @@ async fn sim_ambient_modules_idempotency_ttl_runs_on_after_a_nested_sim(sim: Sim
     let store = MemoryIdempotencyStore::new(minute);
     let inner = Sim::from_seed(sim.seed.wrapping_add(1));
     inner.advance(Duration::from_secs(3600)).await;
-    store.set("k", idempotency_record(), b"hash".to_vec(), minute);
-    assert!(store.try_lock("lock", minute));
+    store
+        .set("k", idempotency_record(), b"hash".to_vec(), minute)
+        .await
+        .unwrap();
+    assert!(store.try_lock("lock", "a", minute).await.unwrap());
     drop(inner);
 
     // The outer sim's instants go on from the nested sim's. The entry and
     // the lock live out their minute here, and no longer.
-    assert!(store.get("k").is_some(), "inside its TTL");
-    assert!(!store.try_lock("lock", minute), "still held");
+    assert!(store.get("k").await.unwrap().is_some(), "inside its TTL");
+    assert!(
+        !store.try_lock("lock", "b", minute).await.unwrap(),
+        "still held"
+    );
     sim.advance(minute + Duration::from_secs(1)).await;
-    assert!(store.get("k").is_none(), "its TTL ran out");
-    assert!(store.try_lock("lock", minute), "the lock ran out");
+    assert!(store.get("k").await.unwrap().is_none(), "its TTL ran out");
+    assert!(
+        store.try_lock("lock", "b", minute).await.unwrap(),
+        "the lock ran out"
+    );
 }
 
 #[sim_test]

@@ -151,6 +151,83 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Idempotency: `IdempotencyStore` is async
+
+**Why:** The Redis store called `block_in_place` on each operation. That
+panics on a current-thread runtime and holds a Tokio worker while Redis is
+slow (issue #3061).
+
+**Before (`{X.Y}`):**
+
+```rust
+impl IdempotencyStore for MyStore {
+    fn get(&self, key: &str) -> Option<IdempotencyEntry> { /* ... */ }
+    fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {}
+    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool { /* ... */ }
+    fn unlock(&self, key: &str) {}
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+impl IdempotencyStore for MyStore {
+    fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+        Box::pin(async move { /* ... */ })
+    }
+    fn set<'a>(
+        &'a self,
+        key: &'a str,
+        record: IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: Duration,
+    ) -> IdempotencyFuture<'a, ()> {
+        Box::pin(async move { /* ... */ })
+    }
+    fn try_lock<'a>(&'a self, key: &'a str, owner: &'a str, ttl: Duration) -> IdempotencyFuture<'a, bool> {
+        Box::pin(async move { /* ... */ })
+    }
+    fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+        Box::pin(async move { /* ... */ })
+    }
+}
+```
+
+- Return an error from the backend. Do not log it and return a default: the
+  middleware fails closed on each error.
+- `try_get`, `try_set`, `try_lock_owned` and `unlock_owned` are removed. Put
+  their bodies in `get`, `set`, `try_lock` and `unlock`.
+- `unlock` must release the lock only when `owner` holds it.
+- A direct call to a store method needs `.await`.
+
+**Automation:** `manual` - each method needs a new body and a new return
+type; no codemod can write them.
+
+### Idempotency: the in-flight lock expires after 60 s
+
+**Why:** When the record write failed after the handler, the key stayed
+locked for the in-flight TTL. That was 24 h. Retries got `409` for a day
+(issue #3061).
+
+**Before (`{X.Y}`):** `in_flight_ttl_secs = 86400`. `IdempotencyLayer::new`
+used the response TTL for the lock.
+
+**After (`{(X+1).0}`):** `in_flight_ttl_secs = 60`, for config and for
+`IdempotencyLayer::new`. The response TTL (`ttl_secs`) does not change.
+
+If a mutating request can run longer than 60 s, set the TTL above it:
+
+```toml
+[idempotency]
+in_flight_ttl_secs = 300
+```
+
+Otherwise a retry can run while the first request still runs. The database
+store with `IdempotencyTx::commit` stops the second commit. The memory and
+Redis stores do not.
+
+**Automation:** `manual` - it is a configuration default.
+
 ---
 
 ## Plugin authors
@@ -183,6 +260,10 @@ single most valuable section of the guide — keep it factual and short.
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 
 ## Configuration changes
+
+- `idempotency.in_flight_ttl_secs` defaults to `60`, not `86400`. See
+  [Idempotency: the in-flight lock expires after 60 s](#idempotency-the-in-flight-lock-expires-after-60-s).
+- `idempotency.backend` accepts `"database"`.
 
 - `autumn.toml` keys that were renamed, removed, or have new defaults.
 - New `AUTUMN_*` environment variables.

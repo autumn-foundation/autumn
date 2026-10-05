@@ -1202,6 +1202,15 @@ path = "tests/sim_fault_plan_db.rs"
 name = "sim_chaos_crash"
 path = "tests/sim_chaos_crash.rs"
 
+# Issue #3061 AC1: a crash between the handler commit and the response write.
+# The handler commits its response in its own `Db::tx`; a retry replays it.
+# Over the in-memory SQLite sim substrate, so no Docker. Same isolated-binary
+# rationale as `sim_chaos_crash` above. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_idempotency_db`.
+[[test]]
+name = "sim_idempotency_db"
+path = "tests/sim_idempotency_db.rs"
+
 # W5.a (item 5, issue #1797): deterministic per-send SMTP transport fault
 # schedule ("send #7 fails, #8 times out") over the in-memory SQLite sim
 # substrate. Same isolated-binary rationale as `sim_chaos` above, but it needs

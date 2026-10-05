@@ -67,7 +67,7 @@ before setting those three.
 | `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` | **forever** | sweep |
 | `commit_hooks` | Finished `#[after_commit]` hook rows (`completed`/`failed`/`after_hook_failed`) | `autumn_repository_commit_hooks` | **forever** | sweep |
 | `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking`, or Redis — follows `jobs.backend` | jobs.tracking.ttl_secs (24h by default) | sweep on `postgres`, backend TTL otherwise |
-| `idempotency` | Stored `Idempotency-Key` responses | memory / Redis | idempotency.ttl_secs (24h by default) | backend TTL |
+| `idempotency` | Stored `Idempotency-Key` responses | memory / Redis / `autumn_idempotency_keys` | idempotency.ttl_secs (24h by default) | backend TTL; the database store deletes expired rows as it writes |
 | `experiment_assignments` | Sticky actor → variant assignments | `autumn_experiment_assignments` | **forever** | sweep |
 | `webhook_replay` | Inbound webhook replay markers | memory / Redis | the endpoint's replay_window_secs (24h by default) | backend TTL |
 | `sessions` | Server-side session records | memory / Redis | session.max_age_secs (the session cookie's lifetime) | backend TTL |

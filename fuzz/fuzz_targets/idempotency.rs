@@ -9,7 +9,18 @@
 
 use autumn::idempotency::{IdempotencyRecord, IdempotencyStore, MemoryIdempotencyStore};
 use libfuzzer_sys::fuzz_target;
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
+
+/// Poll a memory-store future once. The memory store never suspends.
+fn now<T>(future: impl Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(value) => value,
+        Poll::Pending => unreachable!("the memory store is synchronous"),
+    }
+}
 
 fn take_u64(data: &[u8]) -> (u64, &[u8]) {
     if let Some(head) = data.get(..8) {
@@ -55,8 +66,8 @@ fuzz_target!(|data: &[u8]| {
         metadata: Vec::new(),
     };
     // set() computes an expiry deadline from `ttl` — the overflow site.
-    store.set(&key, record, body.to_vec(), ttl);
-    let _ = store.get(&key);
+    let _ = now(store.set(&key, record, body.to_vec(), ttl));
+    let _ = now(store.get(&key));
     // The in-flight lock path computes a deadline from the same TTL.
-    let _ = store.try_lock(&key, ttl);
+    let _ = now(store.try_lock(&key, "fuzz", ttl));
 });
