@@ -3279,8 +3279,22 @@ case "$1 $2" in
   "containerapp revision")
     # The active revision. After a canceled first cutover, the template has
     # the real image while the placeholder revision stays active.
+    # After a PATCH with a template, the new revision is active. The old one
+    # stays active for the first STUB_ACTIVE_LAG reads, like Azure while the
+    # new revision scales and passes its probes.
     if [ "$3" = list ]; then
-      printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+      n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
+      if [ "${n:-0}" -eq 0 ]; then
+        printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+        exit 0
+      fi
+      [ -f "$STUB_LOG.lag" ] || echo "${STUB_ACTIVE_LAG:-0}" > "$STUB_LOG.lag"
+      lag=$(cat "$STUB_LOG.lag")
+      if [ "$lag" -gt 0 ]; then
+        echo $((lag - 1)) > "$STUB_LOG.lag"
+        printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+      fi
+      printf 'app--new%s\t%s\n' "$n" "$STUB_OLD_IMAGE"
       exit 0
     fi
     case "$query" in
@@ -3392,6 +3406,7 @@ esac
             .env_remove("STUB_SIDECAR_SECRET_REF")
             .env_remove("STUB_SCALE_SECRET_REF")
             .env_remove("STUB_ACTIVE_IMAGE")
+            .env_remove("STUB_ACTIVE_LAG")
             .env_remove("STUB_PATCH_PENDING");
         if args.contains(&"--remove-credentials") {
             command.env_remove("IMAGE_TAG");
@@ -3918,6 +3933,42 @@ esac
         };
         assert!(status.success(), "{calls}");
         assert!(calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_deletes_secrets_only_when_no_other_revision_is_active() {
+        // After a canceled first cutover, the latest revision is the failed
+        // one, but the placeholder is the active one. Stage 2 must wait
+        // until only the stage 1 revision is active.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+                ("STUB_ACTIVE_LAG", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let first_patch = calls.find("az rest --method patch").unwrap();
+        let second_patch = calls.rfind("az rest --method patch").unwrap();
+        assert!(first_patch < second_patch, "{calls}");
+        assert!(
+            calls[first_patch..second_patch]
+                .matches("az containerapp revision list")
+                .count()
+                >= 3,
+            "stage 2 must wait until the old revision is inactive: {calls}"
+        );
     }
 
     #[cfg(unix)]
