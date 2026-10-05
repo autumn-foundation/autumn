@@ -3153,12 +3153,31 @@ mod tests {
     }
 
     #[test]
-    fn model_static_finders_count_as_one_query() {
-        // `Post::published(&mut db)` is the `#[model]` finder idiom the blog and
-        // todo-app examples are written in — a framework finder, not opaque code.
+    fn an_associated_fn_handed_the_handle_is_reported() {
+        // `Post::published(&mut db)` and `ReportBuilder::build(&mut db)` have the
+        // same shape. Nothing local tells a one-query finder from a helper that
+        // loops, so both are opaque (#2316).
+        for call in ["Post::published(&mut db)", "ReportBuilder::build(&mut db)"] {
+            let handler = format!(
+                "async fn index(mut db: Db) -> AutumnResult<usize> {{
+                    let rows = {call}.await?;
+                    Ok(rows.len())
+                }}"
+            );
+            let name = call.split('(').next().unwrap_or_default();
+            let name = name.rsplit("::").next().unwrap_or_default();
+            assert_error_contains("50", &handler, &[name]);
+        }
+    }
+
+    #[test]
+    fn an_associated_fn_with_a_declared_cost_is_counted_as_declared() {
+        // The migration path for a model finder: declare its cost.
         let handler = r"
             async fn index(mut db: Db, page: PageRequest) -> AutumnResult<usize> {
+                #[query_cost(1)]
                 let posts = Post::published(&mut db).await?;
+                #[query_cost(1)]
                 let page = Todo::page(&page, &mut db).await?;
                 Ok(posts.len() + page.len())
             }
@@ -3836,6 +3855,630 @@ mod tests {
         );
     }
 
+    // ── Binding environment matrix (#2316) ──────────────────────────
+
+    /// The cost a test expects the analysis to prove.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Expect {
+        Exact(u32),
+        Unbounded,
+    }
+
+    impl Expect {
+        /// Add `extra` to an exact cost.
+        const fn plus(self, extra: u32) -> Self {
+            match self {
+                Self::Exact(n) => Self::Exact(n + extra),
+                Self::Unbounded => Self::Unbounded,
+            }
+        }
+    }
+
+    /// One way to wrap a body. `extra` is the cost the wrapper adds. `repeats`
+    /// is true when the body can run more than once, so a query in it is
+    /// unbounded. `always_runs` is true when the body runs exactly once.
+    struct Construct {
+        name: &'static str,
+        wrap: fn(&str) -> String,
+        extra: u32,
+        repeats: bool,
+        always_runs: bool,
+    }
+
+    const CONSTRUCTS: &[Construct] = &[
+        Construct {
+            name: "function body",
+            wrap: |b| b.to_string(),
+            extra: 0,
+            repeats: false,
+            always_runs: true,
+        },
+        Construct {
+            name: "block",
+            wrap: |b| format!("{{ {b} }}"),
+            extra: 0,
+            repeats: false,
+            always_runs: true,
+        },
+        Construct {
+            name: "labeled block",
+            wrap: |b| format!("'outer: {{ {b} }}"),
+            extra: 0,
+            repeats: false,
+            always_runs: true,
+        },
+        Construct {
+            name: "if arm",
+            wrap: |b| format!("if flag {{ {b} }}"),
+            extra: 0,
+            repeats: false,
+            always_runs: false,
+        },
+        Construct {
+            name: "match arm",
+            wrap: |b| format!("match mode {{ Mode::A => {{ {b} }} _ => {{}} }}"),
+            extra: 0,
+            repeats: false,
+            always_runs: false,
+        },
+        Construct {
+            name: "loop body",
+            wrap: |b| format!("for _id in &ids {{ {b} }}"),
+            extra: 0,
+            repeats: true,
+            always_runs: false,
+        },
+        Construct {
+            name: "closure body",
+            wrap: |b| format!("let _f = || {{ {b} }};"),
+            extra: 0,
+            repeats: true,
+            always_runs: false,
+        },
+        Construct {
+            name: "IIFE",
+            wrap: |b| format!("(|| {{ {b} }})();"),
+            extra: 0,
+            repeats: false,
+            always_runs: true,
+        },
+        Construct {
+            name: "async block",
+            wrap: |b| format!("let _fut = async {{ {b} }};"),
+            extra: 0,
+            repeats: false,
+            always_runs: false,
+        },
+        Construct {
+            name: "tx callback",
+            wrap: |b| format!("let _ = db.tx(|_conn| async move {{ {b} }});"),
+            extra: 1,
+            repeats: false,
+            always_runs: false,
+        },
+    ];
+
+    /// One query built through `active`.
+    const USE_ACTIVE: &str = "let _ = active.find_all();";
+
+    /// Each form binds `active` to the handle `repo`, then runs `{Q}` in the
+    /// binding's scope. The cost is the form's own cost with one query.
+    const BINDING_FORMS: &[(&str, &str, Expect)] = &[
+        ("let", "let active = repo; {Q}", Expect::Exact(1)),
+        (
+            "typed let",
+            "let active: PgPostRepository = make(); {Q}",
+            Expect::Exact(1),
+        ),
+        (
+            "annotated let",
+            r#"#[query_exempt(reason = "alias")] let active = repo; {Q}"#,
+            Expect::Exact(1),
+        ),
+        (
+            "assignment",
+            "let active; active = repo; {Q}",
+            Expect::Exact(1),
+        ),
+        (
+            "annotated assignment",
+            r#"let active; #[query_exempt(reason = "alias")] active = repo; {Q}"#,
+            Expect::Exact(1),
+        ),
+        (
+            "tuple let",
+            "let (active, _k) = (repo, 1); {Q}",
+            Expect::Exact(1),
+        ),
+        (
+            "nested tuple let",
+            "let ((_k, active), _j) = ((1, repo), 2); {Q}",
+            Expect::Exact(1),
+        ),
+        (
+            "let-else",
+            "let Some(active) = Some(repo) else { return Ok(0); }; {Q}",
+            Expect::Exact(1),
+        ),
+        (
+            "if let",
+            "if let Some(active) = Some(repo) { {Q} }",
+            Expect::Exact(1),
+        ),
+        (
+            "while let",
+            "let mut slot = Some(repo); while let Some(active) = slot.take() { {Q} }",
+            Expect::Unbounded,
+        ),
+        (
+            "match arm",
+            "match repo { active => { {Q} } }",
+            Expect::Exact(1),
+        ),
+        (
+            "match arm with guard",
+            "match Some(repo) { Some(active) if flag => { {Q} } _ => {} }",
+            Expect::Exact(1),
+        ),
+        (
+            "for pattern",
+            "for active in [repo] { {Q} }",
+            Expect::Exact(1),
+        ),
+        (
+            "closure param",
+            "[repo].iter().for_each(|active| { {Q} });",
+            Expect::Unbounded,
+        ),
+        (
+            "typed closure param",
+            "let _g = |active: &PgPostRepository| { {Q} };",
+            Expect::Unbounded,
+        ),
+        ("IIFE param", "(|active| { {Q} })(repo);", Expect::Exact(1)),
+        (
+            "tx callback param",
+            "let _ = db.tx(|active| async move { {Q} });",
+            Expect::Exact(2),
+        ),
+    ];
+
+    /// A handler around `body`, with every name the matrix uses in scope.
+    fn matrix_handler(body: &str) -> String {
+        format!(
+            "async fn h(repo: PgPostRepository, mut db: Db, ids: Vec<i64>, flag: bool, \
+             mode: Mode) -> AutumnResult<usize> {{ {body} Ok(0) }}"
+        )
+    }
+
+    /// `None` when the analysis proves `expect`, else a line saying why not.
+    fn check(handler: &str, expect: Expect) -> Option<String> {
+        match expect {
+            Expect::Exact(n) => {
+                if let Some(err) = error_of(&n.to_string(), handler) {
+                    return Some(format!("expected {n}, got an error: {err}"));
+                }
+                if n > 0 && error_of(&(n - 1).to_string(), handler).is_none() {
+                    return Some(format!("expected {n}, but budget {} passes", n - 1));
+                }
+                None
+            }
+            Expect::Unbounded => error_of("50", handler)
+                .is_none()
+                .then(|| "expected unbounded, but budget 50 passes".to_string()),
+        }
+    }
+
+    fn assert_matrix(failures: &[String]) {
+        assert!(
+            failures.is_empty(),
+            "{} matrix cell(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_binding_form_tracks_the_handle_in_every_construct() {
+        let mut failures = Vec::new();
+        for (form, template, form_cost) in BINDING_FORMS {
+            let body = template.replace("{Q}", USE_ACTIVE);
+            for c in CONSTRUCTS {
+                let expect = if c.repeats {
+                    Expect::Unbounded
+                } else {
+                    form_cost.plus(c.extra)
+                };
+                let handler = matrix_handler(&(c.wrap)(&body));
+                if let Some(why) = check(&handler, expect) {
+                    failures.push(format!("{form} in {}: {why}\n  {handler}", c.name));
+                }
+            }
+        }
+        assert_matrix(&failures);
+    }
+
+    /// Each form rebinds `repo` to a plain value inside its own scope, then
+    /// runs `{S}` there. `{S}` must be free.
+    const SHADOW_FORMS: &[(&str, &str)] = &[
+        ("let", "let repo = 1; {S}"),
+        (
+            "let-else",
+            "let Some(repo) = Some(1) else { return Ok(0); }; {S}",
+        ),
+        ("if let", "if let Some(repo) = Some(1) { {S} }"),
+        ("while let", "while let Some(repo) = stack.pop() { {S} }"),
+        ("match arm", "match 1 { repo => { {S} } }"),
+        ("for pattern", "for repo in &ids { {S} }"),
+        ("closure param", "ids.iter().for_each(|repo| { {S} });"),
+        ("IIFE param", "(|repo| { {S} })(1);"),
+    ];
+
+    /// Free when `repo` is plain; a query when `repo` is still the handle.
+    const USE_SHADOW: &str = "let _ = repo.len();";
+
+    #[test]
+    fn an_inner_shadow_never_strips_the_outer_handle() {
+        // Inside the scope, `repo.len()` is free. After it, the real handle is
+        // still a handle. The "function body" construct is left out: there, a
+        // `let` shadow really does last to the end of the function.
+        let mut failures = Vec::new();
+        for (form, template) in SHADOW_FORMS {
+            let body = template.replace("{S}", USE_SHADOW);
+            for c in CONSTRUCTS.iter().filter(|c| c.name != "function body") {
+                let handler = matrix_handler(&format!(
+                    "let mut stack = vec![1]; {} let _ = repo.find_all();",
+                    (c.wrap)(&body)
+                ));
+                if let Some(why) = check(&handler, Expect::Exact(1 + c.extra)) {
+                    failures.push(format!("{form} in {}: {why}\n  {handler}", c.name));
+                }
+            }
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_scope_never_undoes_an_assignment_made_through_it() {
+        // `active` is declared outside; the scope assigns it. The handle must
+        // survive the scope.
+        let mut failures = Vec::new();
+        for c in CONSTRUCTS {
+            let handler = matrix_handler(&format!(
+                "let active; {} {USE_ACTIVE}",
+                (c.wrap)("active = repo;")
+            ));
+            if let Some(why) = check(&handler, Expect::Exact(1 + c.extra)) {
+                failures.push(format!("{}: {why}\n  {handler}", c.name));
+            }
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_clearing_assignment_strips_the_handle_only_on_paths_that_run_it() {
+        // Where the scope always runs, the handle is gone after it. Where it
+        // may not run, the other path keeps the handle, so the query counts.
+        let mut failures = Vec::new();
+        for c in CONSTRUCTS {
+            let handler = matrix_handler(&format!(
+                "let mut active = repo; {} {USE_ACTIVE}",
+                (c.wrap)("active = Vec::new();")
+            ));
+            let expect = Expect::Exact(u32::from(!c.always_runs) + c.extra);
+            if let Some(why) = check(&handler, expect) {
+                failures.push(format!("{}: {why}\n  {handler}", c.name));
+            }
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_handle_assigned_late_in_a_loop_reaches_the_next_iteration() {
+        // First pass: `cur` is plain. Second pass: it is the handle. The
+        // analysis must see the second pass.
+        let handler = matrix_handler(
+            "let mut cur = Vec::new(); for _id in &ids { let _ = cur.find_all(); cur = repo; }",
+        );
+        assert_error_contains("50", &handler, &["loop"]);
+    }
+
+    #[test]
+    fn exit_edges_carry_their_bindings_to_where_they_land() {
+        // Each exit skips a clearing assignment. The state at the exit must
+        // reach the code after the construct.
+        let cases = [
+            (
+                "continue",
+                "let mut active = Vec::new(); \
+                 for _id in &ids { active = repo; if flag { continue; } active = Vec::new(); }",
+            ),
+            (
+                "break",
+                "let mut active = Vec::new(); \
+                 for _id in &ids { active = repo; if flag { break; } active = Vec::new(); }",
+            ),
+            (
+                "labeled block break",
+                "let mut active = repo; 'a: { if flag { break 'a; } active = Vec::new(); }",
+            ),
+            (
+                "return from a closure",
+                "let mut active = Vec::new(); \
+                 let _f = || { active = repo; if flag { return; } active = Vec::new(); };",
+            ),
+            (
+                "? in an async block",
+                "let mut active = Vec::new(); \
+                 let _fut = async { active = repo; check()?; active = Vec::new(); Ok(()) };",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, body) in cases {
+            let handler = matrix_handler(&format!("{body} {USE_ACTIVE}"));
+            if let Some(why) = check(&handler, Expect::Exact(1)) {
+                failures.push(format!("{name}: {why}\n  {handler}"));
+            }
+        }
+        assert_matrix(&failures);
+    }
+
+    // ── Early exits (#2316) ──────────────────────────────────────────
+
+    #[test]
+    fn early_exits_count_each_path_on_its_own() {
+        let cases: &[(&str, &str, u32)] = &[
+            (
+                "early return",
+                "if flag { return Ok(repo.find_cached().await?.len()); }
+                 let _ = repo.find_fresh().await?;",
+                1,
+            ),
+            (
+                "early return in a nested block",
+                "{ if flag { return Ok(repo.find_cached().await?.len()); } }
+                 let _ = repo.find_fresh().await?;",
+                1,
+            ),
+            (
+                "both arms return",
+                "if flag { return Ok(repo.a().await?.len()); } else { return Ok(repo.b().await?.len()); }",
+                1,
+            ),
+            (
+                "match arm returns",
+                "let row = match repo.find(1).await? { Some(r) => r, None => return Ok(0) };
+                 let _ = repo.more(row).await?;",
+                2,
+            ),
+            (
+                "let-else returns",
+                "let Some(row) = repo.find(1).await? else { return Ok(repo.fallback().await?.len()); };
+                 let _ = repo.more(row).await?;",
+                2,
+            ),
+            (
+                "return in a tx callback leaves the callback only",
+                "let _ = db.tx(|c| async move { if flag { return c.a().await; } c.b().await }).await?;
+                 let _ = repo.after().await?;",
+                3,
+            ),
+            (
+                "return in a bounded loop",
+                "for _ in 0..2 { if flag { return Ok(repo.a().await?.len()); } }",
+                2,
+            ),
+            (
+                "question mark sums",
+                "let _ = repo.a().await?; let _ = repo.b().await?;",
+                2,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, body, n) in cases {
+            let handler = matrix_handler(body);
+            if let Some(why) = check(&handler, Expect::Exact(*n)) {
+                failures.push(format!("{name}: {why}\n  {handler}"));
+            }
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_break_never_hides_the_cost_after_its_target() {
+        // Soundness guards: real maximum on the left; the analysis must reject
+        // any budget below it.
+        let cases: &[(&str, &str, u32)] = &[
+            (
+                "labeled block break",
+                "'a: { if flag { let _ = repo.x().await?; break 'a; } }
+                 let _ = repo.y().await?;",
+                2,
+            ),
+            (
+                "break out of a bounded loop",
+                "for _ in 0..2 { if flag { let _ = repo.a().await?; break; } }
+                 let _ = repo.b().await?;",
+                2,
+            ),
+            (
+                "labeled break out of two loops",
+                "'o: for _ in 0..2 { for _ in 0..2 { let _ = repo.a().await?; break 'o; } }
+                 let _ = repo.b().await?;",
+                2,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, body, real_max) in cases {
+            let handler = matrix_handler(body);
+            if error_of(&(real_max - 1).to_string(), &handler).is_none() {
+                failures.push(format!(
+                    "{name}: budget {} passes\n  {handler}",
+                    real_max - 1
+                ));
+            }
+        }
+        assert_matrix(&failures);
+    }
+
+    // ── Containers (#2316) ───────────────────────────────────────────
+
+    #[test]
+    fn a_container_of_handles_yields_handles() {
+        // Rule: a value built from a handle carries it. Iterating, indexing,
+        // destructuring, unwrapping or reading a field of it gives a handle.
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "array local, then for",
+                "let repos = [repo]; for active in repos { let _ = active.find_all(); }",
+                Expect::Unbounded,
+            ),
+            (
+                "vec! local, then for",
+                "let repos = vec![repo]; for active in &repos { let _ = active.find_all(); }",
+                Expect::Unbounded,
+            ),
+            (
+                "iterator adapter closure",
+                "let repos = vec![repo]; repos.iter().for_each(|r| { let _ = r.find_all(); });",
+                Expect::Unbounded,
+            ),
+            (
+                "index",
+                "let repos = [repo]; let _ = repos[0].find_all();",
+                Expect::Exact(1),
+            ),
+            (
+                "tuple field",
+                "let pair = (repo, 1); let _ = pair.0.find_all();",
+                Expect::Exact(1),
+            ),
+            (
+                "Option, then if let",
+                "let maybe = Some(repo); if let Some(r) = maybe { let _ = r.find_all(); }",
+                Expect::Exact(1),
+            ),
+            (
+                "Option, then unwrap",
+                "let maybe = Some(repo); let _ = maybe.unwrap().find_all();",
+                Expect::Exact(1),
+            ),
+            (
+                "method on the container is free",
+                "let repos = vec![repo]; let _ = repos.len();",
+                Expect::Exact(0),
+            ),
+            (
+                "helper handed the container",
+                "let repos = vec![repo]; let _ = audit(&repos);",
+                Expect::Unbounded,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, body, expect) in cases {
+            let handler = matrix_handler(body);
+            if let Some(why) = check(&handler, *expect) {
+                failures.push(format!("{name}: {why}\n  {handler}"));
+            }
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_signature_collection_of_handles_is_a_container() {
+        let handler = r"
+            async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
+                for r in &repos { let _ = r.find_all().await?; }
+                Ok(repos.len())
+            }
+            ";
+        assert_error_contains("50", handler, &["loop"]);
+        let only_len = r"
+            async fn h(repos: Vec<PgPostRepository>, slots: Option<PgPostRepository>) -> AutumnResult<usize> {
+                Ok(repos.len() + usize::from(slots.is_some()))
+            }
+            ";
+        assert_clean("0", only_len);
+    }
+
+    #[test]
+    fn an_err_pattern_binds_the_error_not_the_handle() {
+        // `Result<Db, E>` is a handle. `Ok(db)` binds the handle; `Err(e)` binds
+        // the error, so `e.to_string()` is not a query.
+        let handler = r"
+            async fn h(conn: Result<Db, DbError>) -> AutumnResult<usize> {
+                match conn {
+                    Ok(db) => { let _ = db.find_all(); }
+                    Err(e) => { let _ = e.to_string(); }
+                }
+                Ok(0)
+            }
+            ";
+        assert_clean("1", handler);
+        assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn an_annotation_on_an_assignment_statement_is_read() {
+        // `syn` hangs a statement attribute on the left operand of `=`, `+=`
+        // or `as`. The annotation must still replace the statement's cost.
+        for stmt in [
+            "links = load_links(&mut db).await?;",
+            "total += load_links(&mut db).await?.len();",
+        ] {
+            let handler = format!(
+                "async fn h(mut db: Db) -> AutumnResult<usize> {{
+                    let mut links = Vec::new();
+                    let mut total = 0;
+                    #[query_cost(2)]
+                    {stmt}
+                    Ok(links.len() + total)
+                }}"
+            );
+            assert_clean("2", &handler);
+            assert_error_contains("1", &handler, &["2"]);
+        }
+    }
+
+    // ── Round-six threads on #2315 ───────────────────────────────────
+
+    #[test]
+    fn round_six_annotated_assignment_keeps_the_alias() {
+        let handler = r#"
+            async fn h(repo: PgPostRepository) -> AutumnResult<usize> {
+                let active;
+                #[query_exempt(reason = "alias only")]
+                active = repo;
+                Ok(active.find_all().await?.len())
+            }
+            "#;
+        assert_error_contains("0", handler, &["1"]);
+        assert_clean("1", handler);
+    }
+
+    #[test]
+    fn round_six_match_arm_pattern_binds_the_handle() {
+        let handler = r"
+            async fn h(repo: PgPostRepository) -> AutumnResult<usize> {
+                Ok(match repo { active => active.find_all().await?.len() })
+            }
+            ";
+        assert_error_contains("0", handler, &["1"]);
+        assert_clean("1", handler);
+    }
+
+    #[test]
+    fn round_six_collection_local_keeps_provenance() {
+        let handler = r"
+            async fn h(repo: PgPostRepository) -> AutumnResult<usize> {
+                let repos = [repo];
+                for active in repos { active.find_all().await?; }
+                Ok(0)
+            }
+            ";
+        assert_error_contains("50", handler, &["loop"]);
+    }
+
     // ── Seeded N+1 corpus (the issue's success metric) ───────────────
 
     /// Handlers seeded with a known N+1, one per shape the bug takes in real
@@ -4188,15 +4831,21 @@ mod tests {
             }",
         ),
         (
-            "blog: model static finders",
+            "blog: model static finder, cost declared",
             "1",
-            r"async fn index(mut db: Db) -> R { Ok(Post::published(&mut db).await?.len()) }",
+            r"async fn index(mut db: Db) -> R {
+                #[query_cost(1)]
+                let posts = Post::published(&mut db).await?;
+                Ok(posts.len())
+            }",
         ),
         (
-            "todo-app: paginated model finder",
+            "todo-app: paginated model finder, cost declared",
             "1",
             r"async fn list(page: PageRequest, mut db: Db) -> R {
-                Ok(Todo::page(&page, &mut db).await?.len())
+                #[query_cost(1)]
+                let page = Todo::page(&page, &mut db).await?;
+                Ok(page.len())
             }",
         ),
         (
