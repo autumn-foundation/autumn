@@ -2824,7 +2824,9 @@ impl Analyzer {
                 && matches!(
                     self.shape_of(&method.receiver),
                     Some(Shape::Opt | Shape::OptRef | Shape::Res)
-                ));
+                ))
+            // `bool::then` runs its closure at most once.
+            || (name == "then" && self.shape_of(&method.receiver) == Some(Shape::Bool));
         // A closure handed to a method on a carrier takes its elements:
         // `repos.iter().for_each(|r| …)`.
         let param = if is_transaction {
@@ -3206,6 +3208,13 @@ impl Analyzer {
             Kind::Carrier if flat => Kind::Carrier,
             Kind::Handle | Kind::LazyDb => Kind::Holder,
             _ => Kind::Nested,
+        };
+        // A store into a part (`lists[0].push(repo)`) puts the handle one
+        // layer down: the root holds it at an unknown depth.
+        let kind = if matches!(peel_refs(receiver), Expr::Path(_)) {
+            kind
+        } else {
+            Kind::Nested
         };
         let mut binding = self.env.binding(&root);
         if kind > binding.kind {
@@ -8303,6 +8312,46 @@ mod tests {
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let r = repos.as_slice().first().unwrap(); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn stores_through_entries_and_bool_then_runs_once() {
+        check_handlers(&[
+            (
+                "a store through a map entry",
+                "async fn h(repo: PgPostRepository, mut map: HashMap<i64, PgPostRepository>) \
+                 -> AutumnResult<usize> { let mut fresh = HashMap::new(); \
+                 fresh.entry(1).or_insert(repo); \
+                 for r in fresh.into_values() { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a store through a map entry, with no loop",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut fresh = HashMap::new(); fresh.entry(1).or_insert(repo); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a store into an element of a container nests it",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut lists = vec![Vec::new()]; lists[0].push(repo); \
+                 lists[0].refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "bool::then runs its closure at most once",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let _ = flag.then(|| repo.find_all()); Ok(0) }",
+                Expect::Exact(1),
+            ),
+            // Guard: `then` on an unknown receiver may run many times.
+            (
+                "then on an unknown receiver",
+                "async fn h(repo: PgPostRepository, s: Stream) -> AutumnResult<usize> { \
+                 let _ = s.then(|_| repo.find_all()); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }

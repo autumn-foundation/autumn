@@ -127,7 +127,7 @@ Both halves are compiled in CI as trybuild fixtures — see
 | An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
 | `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported. The receiver must be a database connection (`Db`, `PgConnection`, `state.db()`, the callback's `conn`): on a repository or another value, the callback may run many times |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
-| An `Option`/`Result` combinator closure (`map`, `and_then`, `unwrap_or_else`, …) | counted **once** when the receiver is known to be an `Option` or a `Result`; otherwise it may run per element |
+| An `Option`/`Result` combinator closure (`map`, `and_then`, `unwrap_or_else`, …) | counted **once** when the receiver is known to be an `Option` or a `Result`, and `then` on a `bool`; otherwise it may run per element |
 
 A repository future is counted where it is **built**, not where it is awaited,
 so collecting futures in a `.map(…)` and driving them with `join_all` later is
