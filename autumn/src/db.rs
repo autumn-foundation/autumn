@@ -1423,6 +1423,7 @@ fn build_pool(
 
     #[cfg(not(feature = "sqlite"))]
     {
+        let _ = crate::lock::pooler::warn_if_pooled(url);
         let timeout = Duration::from_secs(connect_timeout_secs);
         let config = pg_manager_config(url);
         let manager =

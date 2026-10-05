@@ -127,7 +127,10 @@ pub use crate::htmx::{HtmxFragments, OobSwap};
 pub use crate::live::LiveFragment;
 /// Named, cluster-wide distributed lock for run-once-across-replicas work.
 #[cfg(feature = "db")]
-pub use crate::lock::{Lock, LockError, LockGuard};
+pub use crate::lock::{FencingToken, Lock, LockError, LockGuard};
+/// Fencing lease lock: a lease with a token that a resource can check.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+pub use crate::lock::{LeaseGuard, LeaseLock};
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{

@@ -1855,8 +1855,19 @@ that already gates migrations and ISR. (`#[scheduled]` uses a tick table.)
   only — under the `sqlite` feature `from_state` refuses rather than pretending
   to hold a lock (see below).
 
-See `docs/guide/distributed-locks.md` and
-`docs/adr/0010-app-facing-distributed-lock.md`.
+- `Lock` is mutual exclusion for efficiency, not correctness. When overlap
+  corrupts data, use `LeaseLock` (Postgres only): each grant gets a strictly
+  larger `FencingToken`, the lease renews in the background, and
+  `lease_lost()` signals loss. `try_with(|lease| ..)` passes the `Lease` and
+  stops the closure on loss (`LockError::LeaseLost`). Check the token at the
+  resource: `UPDATE .. SET fencing_token = $t WHERE .. AND fencing_token <= $t`.
+- Behind a transaction-mode pooler (PgBouncer, RDS Proxy), session advisory
+  locks (`Lock`, migrations) are not safe; `LeaseLock` and the Postgres scheduler
+  (a tick row since #3052) work.
+
+See `docs/guide/distributed-locks.md`,
+`docs/adr/0010-app-facing-distributed-lock.md` and
+`docs/adr/0015-fencing-lease-lock.md`.
 
 ## Postgres-only subsystems on a SQLite app (0.8.0, issue #1905)
 
