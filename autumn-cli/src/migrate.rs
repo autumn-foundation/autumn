@@ -1851,8 +1851,11 @@ fn run_diesel_with_policy(
     transactional: bool,
     english: bool,
 ) -> Result<(), MigrationError> {
+    let inherited = std::env::var("PGOPTIONS")
+        .ok()
+        .filter(|options| !options.trim().is_empty());
     let mut pgoptions = child_pgoptions(
-        std::env::var("PGOPTIONS").ok().as_deref(),
+        inherited.as_deref(),
         lock_policy.lock_timeout,
         !transactional,
         english,
@@ -1867,19 +1870,33 @@ fn run_diesel_with_policy(
             std::thread::sleep(delay);
         },
         || match run_diesel_migrations_once(database_url, dir, pgoptions.as_deref()) {
-            Err(MigrationError::Migration(text))
-                if pgoptions.is_some() && startup_options_rejected(&text) =>
-            {
+            Err(MigrationError::Migration(text)) if startup_options_rejected(&text) => {
+                let Some(fallback) = pooler_fallback(pgoptions.as_deref(), inherited.as_deref())
+                else {
+                    return Err(MigrationError::Migration(text));
+                };
                 eprintln!(
                     "  The server refused PGOPTIONS (a pooler such as PgBouncer?); \
-                     running without lock_timeout."
+                     running again with only the inherited options, without lock_timeout."
                 );
-                pgoptions = None;
-                run_diesel_migrations_once(database_url, dir, None)
+                pgoptions = fallback;
+                run_diesel_migrations_once(database_url, dir, pgoptions.as_deref())
             }
             other => other,
         },
     )
+}
+
+/// The `PGOPTIONS` to run with after a pooler refused `current`: the
+/// inherited value, unchanged, so the operator's own settings (such as
+/// `search_path`) stay. `None` when `current` is already the inherited value,
+/// so there is nothing to fall back from.
+#[allow(
+    clippy::option_option,
+    reason = "outer None: no fallback; inner None: run with no PGOPTIONS"
+)]
+fn pooler_fallback(current: Option<&str>, inherited: Option<&str>) -> Option<Option<String>> {
+    (current != inherited).then(|| inherited.map(str::to_owned))
 }
 
 /// Versions of the migrations in `dir` with `run_in_transaction = false`.
@@ -4828,6 +4845,20 @@ primary_url = "postgres://prod-s0:5432/app"
             std::fs::read_to_string(dst.path().join("2026-01-02-000000_two/up.sql")).unwrap(),
             "2026-01-02-000000_two"
         );
+    }
+
+    #[test]
+    fn pooler_fallback_keeps_the_inherited_options() {
+        let inherited = Some("-c search_path=tenant");
+        let composed = Some("-c search_path=tenant -c lock_timeout=5000");
+        // The framework's own options go; the operator's stay.
+        assert_eq!(
+            pooler_fallback(composed, inherited),
+            Some(Some("-c search_path=tenant".to_owned()))
+        );
+        assert_eq!(pooler_fallback(composed, None), Some(None));
+        // Nothing was added, so there is nothing to fall back from.
+        assert_eq!(pooler_fallback(inherited, inherited), None);
     }
 
     #[test]

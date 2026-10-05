@@ -199,7 +199,7 @@ run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
   pending set in batches of one kind. Transactional batches get the timeout.
   Non-transactional batches get `lock_timeout=0`.
 - When the server refuses the option (`PgBouncer` can), the CLI runs again
-  without it.
+  with only the `PGOPTIONS` it inherited, unchanged.
 - An `options` parameter in `DATABASE_URL` replaces `PGOPTIONS`. Then the
   timeout does not apply.
 
