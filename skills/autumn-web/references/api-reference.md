@@ -1731,7 +1731,39 @@ Frequently used env keys:
 | `AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION` | `mail.allow_in_process_deliver_later_in_production` |
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
+| `AUTUMN_HEALTH__CACHE_TTL_MS` | `health.cache_ttl_ms` (default `1000`; `0` = no cache) (#3059) |
+| `AUTUMN_HEALTH__PING_TIMEOUT_MS` | `health.ping_timeout_ms` (default `2000`; `0` refused) (#3059) |
+| `AUTUMN_HEALTH__DB_READINESS` | `health.db_readiness` (default `true`) (#3059) |
+| `AUTUMN_HEALTH__REDIS_READINESS` | `health.redis_readiness` (default `false`) (#3059) |
 | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (0.6.0) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
+
+### `[health]` — readiness pings and result cache (#3059)
+
+`/ready`, `/health` and the `db` component of `/actuator/health` send
+`SELECT 1` to the primary on one dedicated connection outside the pool. Pool
+saturation is **not** a readiness signal: do not write a health indicator that
+reads `pool.status()`. To shed load, set `server.max_concurrent_requests`.
+
+```toml
+[health]
+cache_ttl_ms = 1000      # one refresh per window; probers share it; 0 = off
+ping_timeout_ms = 2000   # a late DB/Redis ping is DOWN; keep below the probe timeout
+db_readiness = true      # false: a failed primary ping does not gate /ready
+redis_readiness = false  # true: redis:<subsystem> indicators gate /ready
+```
+
+- The read replica and `db:shard:<name>` use the same ping.
+- Each Redis-backed subsystem (cache, channels, idempotency, jobs, rate_limit,
+  sessions, submit_token, webhook_replay) gets a `redis:<subsystem>` indicator
+  (feature `redis`). It is health-only by default, because all replicas share
+  Redis. For another Redis, register
+  `autumn_web::redis_health::RedisHealthIndicator::new(url)?.with_timeout(..)`
+  with `.health_indicator(name, Arc::new(..))`.
+- Registered indicators are cached too
+  (`HealthIndicatorRegistry::set_cache_ttl`). In a `TestApp` test that flips an
+  indicator and reads it again at once, set `health.cache_ttl_ms = 0`.
+- The DB error text appears only when `health.detailed = true`.
+- See `docs/guide/health-indicators.md` ("Fail open on shared dependencies").
 
 ### `[cluster]` — embedded clustering (0.7.0, #1762)
 
