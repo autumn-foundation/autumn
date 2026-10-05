@@ -1855,6 +1855,9 @@ struct Analyzer {
     /// The next closure body's parameters are connections: it is a
     /// transaction callback.
     connection_params: bool,
+    /// What the next closure body's parameters borrow into: the places the
+    /// method's receiver borrows.
+    param_referents: Vec<String>,
     /// Names the handler body defines or imports (`macro_rules! vec`, `fn
     /// drop`, `use x::format`). A std name among them is not trusted.
     shadowed: Rc<Vec<String>>,
@@ -1870,6 +1873,7 @@ impl Analyzer {
             errors: Vec::new(),
             returned: Kind::Plain,
             connection_params: false,
+            param_referents: Vec::new(),
             shadowed: Rc::new(local_names(&input_fn.block)),
         };
         for arg in &input_fn.sig.inputs {
@@ -2167,17 +2171,7 @@ impl Analyzer {
             whole: self.borrows_whole(init),
             future: self.is_known_future(init),
             pending_query: self.is_pending_query(init),
-            output: match peel_parens(init) {
-                Expr::Async(a) => Some(self.async_output(&a.block)),
-                // `(|| async { &repo })()`: what its `async` block gives.
-                Expr::Call(call)
-                    if immediately_invoked_closure(&call.func)
-                        .is_some_and(|c| matches!(peel_parens(&c.body), Expr::Async(_))) =>
-                {
-                    self.invoked(call, true)
-                }
-                other => path_ident(other).and_then(|name| self.env.binding(&name).output),
-            },
+            output: self.output_of(init),
             inner: wrapper_root(init).and_then(|name| self.env.binding(&name).inner),
             declared: None,
         }
@@ -2292,6 +2286,13 @@ impl Analyzer {
                             }
                         })
                         .unwrap_or_default()
+                } else if matches!(
+                    peel_parens(&mc.receiver),
+                    Expr::MethodCall(_) | Expr::Path(_)
+                ) {
+                    // `slots.iter_mut().next()`, `it.next()`: a method on a
+                    // borrow may give a borrow into it.
+                    self.referents_of(&mc.receiver)
                 } else {
                     Vec::new()
                 }
@@ -2836,8 +2837,14 @@ impl Analyzer {
                     label: f.label.as_ref(),
                     ends: true,
                 };
+                // `for target in slots.iter_mut()`, `for target in &mut slots`:
+                // each element borrows into the container.
+                let targets = self.referents_of(&f.expr);
                 let body = self.loop_flow(&shape, |s| {
                     s.bind_pat(&f.pat, element);
+                    for name in bound_names(&f.pat) {
+                        s.add_referents(name, &targets);
+                    }
                     s.block(&f.body)
                 });
                 iter.then(body)
@@ -3153,10 +3160,14 @@ impl Analyzer {
     /// `rest` past the end. A `return` inside leaves the closure only.
     fn closure_body(&mut self, closure: &syn::ExprClosure, params: &[Kind], rest: Kind) -> Cost {
         let connection = std::mem::take(&mut self.connection_params);
+        let borrows = std::mem::take(&mut self.param_referents);
         self.framed(Target::Body, None, |s| {
             s.scoped(|s| {
                 for (i, input) in closure.inputs.iter().enumerate() {
                     s.bind_pat(input, params.get(i).copied().unwrap_or(rest));
+                    for name in bound_names(input) {
+                        s.add_referents(name, &borrows);
+                    }
                     // A transaction hands its callback a connection.
                     if connection && let Pat::Ident(id) = input {
                         s.env.set_shape(&id.ident.to_string(), Some(Shape::Db));
@@ -3553,15 +3564,22 @@ impl Analyzer {
         let last = method.args.len().saturating_sub(1);
         let every = name == "map_or_else";
         let mut cost = Cost::ZERO;
+        // `slots.iter_mut().for_each(|t| …)`: a parameter borrows into the
+        // place the receiver borrows.
+        let borrows = self.referents_of(&method.receiver);
         for (i, arg) in method.args.iter().enumerate() {
             let callback = takes_callback && (every || i == last);
             let param = self.side_param(method, i).unwrap_or(param);
+            self.param_referents.clone_from(&borrows);
             let next = if runs_once {
                 self.connection_params = is_transaction;
                 self.callback_arg(arg, param, callback)
             } else {
                 self.closure_arg(arg, param, callback)
             };
+            // Only this argument's closure borrows: a named callback never
+            // takes the field, so it must not reach a later closure.
+            self.param_referents.clear();
             cost = cost.then(next);
         }
         cost
@@ -4162,6 +4180,7 @@ impl Analyzer {
             errors: Vec::new(),
             returned: Kind::Plain,
             connection_params: false,
+            param_referents: Vec::new(),
             shadowed: Rc::clone(&self.shadowed),
         }
     }
@@ -4226,15 +4245,7 @@ impl Analyzer {
             }
             Expr::Await(a) => {
                 let base = peel_parens(&a.base);
-                let output = match base {
-                    // `pending.await` on `let pending = async { &repo };`.
-                    Expr::Path(_) => {
-                        path_ident(base).and_then(|name| self.env.binding(&name).output)
-                    }
-                    Expr::Async(block) => Some(self.async_output(&block.block)),
-                    Expr::Call(call) => self.invoked(call, true),
-                    _ => None,
-                };
+                let output = self.output_of(base);
                 // `.await` on a value that holds a handle and is not a known
                 // future (`PgPostRepository::new(&mut db).await`) gives what
                 // that value holds.
@@ -4243,6 +4254,27 @@ impl Analyzer {
                         .filter(|kind| *kind != Kind::Plain && !self.is_known_future(base))
                 })
             }
+            _ => None,
+        }
+    }
+
+    /// What `.await` on `e` gives, when `e` is an `async` block, an invoked
+    /// closure, a name bound to one, or an `if`, `match` or block whose
+    /// tails are: `{ async move { repo } }` gives the handle.
+    fn output_of(&self, e: &Expr) -> Option<Kind> {
+        match peel_parens(e) {
+            Expr::Async(a) => Some(self.async_output(&a.block)),
+            // `(|| async { &repo })()`: what its `async` block gives.
+            Expr::Call(call) => self.invoked(call, true),
+            Expr::Path(_) => path_ident(e).and_then(|name| self.env.binding(&name).output),
+            other @ (Expr::If(_)
+            | Expr::Match(_)
+            | Expr::Block(_)
+            | Expr::Unsafe(_)
+            | Expr::Loop(_)) => value_tails(other)
+                .into_iter()
+                .filter_map(|tail| self.output_of(tail))
+                .max(),
             _ => None,
         }
     }
@@ -11598,6 +11630,54 @@ mod tests {
                  let mut groups = HashMap::new(); \
                  { let list: &mut Vec<PgPostRepository> = groups.entry(1).or_default(); list.push(repo); } \
                  render(groups); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn wrapped_async_outputs_and_iterator_borrows() {
+        check_handlers(&[
+            (
+                "guard: a block-wrapped async block keeps its output",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = { async move { repo } }; let alias = pending.await; \
+                 let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an if of async blocks keeps their output",
+                "async fn h(repo: PgPostRepository, other: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let pending = if flag { async move { repo } } else { async move { other } }; \
+                 let alias = pending.await; let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an iterator element borrows its container",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; { let target = slots.iter_mut().next().unwrap(); *target = Some(repo); } \
+                 render(slots); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a for element borrows its container",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; for target in slots.iter_mut() { *target = Some(repo.clone()); } \
+                 render(slots); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a callback element borrows its container",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; slots.iter_mut().for_each(|t| *t = Some(repo.clone())); \
+                 render(slots); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a for element over a mut borrow borrows its container",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; for target in &mut slots { *target = Some(repo.clone()); } \
+                 render(slots); Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
