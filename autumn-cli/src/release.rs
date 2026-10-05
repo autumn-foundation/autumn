@@ -3467,6 +3467,7 @@ esac
             .env_remove("STUB_INGRESS_INTERNAL")
             .env_remove("STUB_INGRESS_EXTERNAL")
             .env_remove("STUB_JOB_EXTRA_REGISTRY")
+            .env_remove("AZURE_BOOTSTRAP_IMAGE")
             .env_remove("STUB_PATCH_PENDING");
         if args.contains(&"--remove-credentials") {
             command.env_remove("IMAGE_TAG");
@@ -4448,6 +4449,56 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_keeps_credentials_on_a_release_from_another_registry() {
+        // A real release can come from GHCR or Docker Hub. Only the bootstrap
+        // image is the placeholder.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "ghcr.io/acme/app:v1",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_treats_a_release_from_another_registry_as_released() {
+        let Some((status, calls, _)) =
+            run_azure_cutover("ghcr.io/acme/app:v1", "Provisioned", false, 0, &[])
+        else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(
+            !calls.contains("ingress disable"),
+            "a real release keeps serving: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_honors_a_custom_bootstrap_image() {
+        let Some((status, calls, _)) = run_azure_cutover(
+            "example.io/placeholder:1",
+            "Provisioned",
+            false,
+            0,
+            &[("AZURE_BOOTSTRAP_IMAGE", "example.io/placeholder:1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("ingress disable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_retries_a_canceled_first_cutover_as_a_first_cutover() {
         let Some((status, calls, _)) = run_azure_cutover(
             "acr.azurecr.io/app:t0",
@@ -4552,6 +4603,10 @@ esac
             .find("run: bash azure-cutover.sh")
             .expect("workflow must run the cutover script");
         assert!(migrate_at < cutover_at);
+        assert!(
+            workflow.contains("AZURE_BOOTSTRAP_IMAGE: ${{ vars.AZURE_BOOTSTRAP_IMAGE }}"),
+            "the workflow must pass a custom bootstrap image: {workflow}"
+        );
         let cutover_step = &workflow[cutover_at..];
         let cutover_step = cutover_step
             .split("\n      - name:")
