@@ -23,8 +23,9 @@
 //! - **A request the wire cannot carry skips the capsule.** A header value
 //!   that is not UTF-8 goes to the origin as [`Lane::OriginOnly`].
 //! - **The gateway does not trust the capsule.** A status outside 200-599, an
-//!   invalid header, `set-cookie`, or [`FALLTHROUGH_SENTINEL`] in an edge
-//!   response becomes a `capsule_error` fallthrough.
+//!   invalid header, `set-cookie`, [`FALLTHROUGH_SENTINEL`], a hop-by-hop
+//!   header, or a `content-length` that does not match the body becomes a
+//!   `capsule_error` fallthrough.
 //! - **No identity.** The gateway attaches no `EdgeIdentity`. A
 //!   `needs(identity)` route falls through with `missing_capability`.
 //! - **Fallthrough detail stays in the gateway.** It never reaches the client.
@@ -170,12 +171,14 @@ where
 
     /// Run the capsule. `Err` is the reason to fall through.
     fn ask_capsule(&self, request: &EdgeRequest) -> Result<Response<Body>, FallthroughReason> {
+        let head = request.method == "HEAD";
         match self
             .artifact
             .run(request, &self.capabilities, self.kv.as_ref())
         {
             Ok(EdgeOutcome::Served(response)) => {
-                let mut response = into_http(response).ok_or(FallthroughReason::CapsuleError)?;
+                let mut response =
+                    into_http(response, head).ok_or(FallthroughReason::CapsuleError)?;
                 let headers = response.headers_mut();
                 for (name, _) in &self.response_headers {
                     headers.remove(name);
@@ -242,20 +245,37 @@ fn edge_request<B>(request: &Request<B>) -> Option<EdgeRequest> {
     })
 }
 
+/// Headers that describe the connection, not the response. A capsule must not
+/// set them.
+const HOP_BY_HOP: &[&str] = &["connection", "keep-alive", "transfer-encoding", "upgrade"];
+
 /// The capsule's answer as an HTTP response. `None` when the edge runtime
-/// would refuse it: a status outside 200-599, an invalid header, `set-cookie`,
-/// or the fallthrough sentinel. A capsule that Autumn did not build can send
-/// these, so the gateway checks again.
-fn into_http(response: EdgeResponse) -> Option<Response<Body>> {
-    if !(200..=599).contains(&response.status) {
+/// would refuse it, or when it would break on the wire: a status outside
+/// 200-599, an invalid header, `set-cookie`, the fallthrough sentinel, a
+/// hop-by-hop header, or a `content-length` that does not match the body. A
+/// `HEAD` answer has no body and keeps the length of the `GET` body. A
+/// capsule that Autumn did not build can send any of these, so the gateway
+/// checks again.
+fn into_http(response: EdgeResponse, head: bool) -> Option<Response<Body>> {
+    if !(200..=599).contains(&response.status) || (head && !response.body.is_empty()) {
         return None;
     }
+    let body_len = response.body.len();
     let mut http = Response::new(Body::from(response.body));
     *http.status_mut() = StatusCode::from_u16(response.status).ok()?;
     for (name, value) in response.headers {
         let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
-        if name == http::header::SET_COOKIE || name.as_str() == FALLTHROUGH_SENTINEL {
+        if name == http::header::SET_COOKIE
+            || name.as_str() == FALLTHROUGH_SENTINEL
+            || HOP_BY_HOP.contains(&name.as_str())
+        {
             return None;
+        }
+        if name == http::header::CONTENT_LENGTH {
+            let declared: usize = value.trim().parse().ok()?;
+            if !head && declared != body_len {
+                return None;
+            }
         }
         http.headers_mut()
             .append(name, HeaderValue::from_str(&value).ok()?);

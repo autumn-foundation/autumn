@@ -397,3 +397,56 @@ fn response_headers_keep_every_value_of_a_repeated_name() {
     let values: Vec<_> = response.headers().get_all(&name).iter().collect();
     assert_eq!(values, ["a", "b"]);
 }
+
+/// A framing header that does not match the body would break the response on
+/// the wire. The gateway falls through instead.
+#[test]
+fn a_framing_header_that_does_not_match_the_body_falls_through() {
+    for (name, value) in [
+        ("content-length", "0"),
+        ("content-length", "999"),
+        ("transfer-encoding", "chunked"),
+        ("connection", "close"),
+    ] {
+        let artifact = guest(&GuestFrame::Response(EdgeResponse {
+            status: 200,
+            headers: vec![(name.to_owned(), value.to_owned())],
+            body: b"from the edge".to_vec(),
+        }));
+        let seen = Seen::default();
+        let gateway = EdgeGateway::new(artifact, origin(&seen));
+
+        let response = block_on(gateway.handle(Request::get("/x").body(Body::empty()).unwrap()));
+
+        assert_eq!(
+            lane(&response),
+            Lane::Fallthrough(FallthroughReason::CapsuleError),
+            "{name}: {value}"
+        );
+    }
+}
+
+#[test]
+fn a_correct_content_length_is_served_and_head_keeps_the_get_length() {
+    let artifact = guest(&GuestFrame::Response(EdgeResponse {
+        status: 200,
+        headers: vec![("content-length".into(), "13".into())],
+        body: b"from the edge".to_vec(),
+    }));
+    let seen = Seen::default();
+    let gateway = EdgeGateway::new(artifact, origin(&seen));
+    let response = block_on(gateway.handle(Request::get("/x").body(Body::empty()).unwrap()));
+    assert_eq!(lane(&response), Lane::Edge);
+    assert_eq!(body_text(response), "from the edge");
+
+    // HEAD: no body, and the length of the GET body.
+    let artifact = guest(&GuestFrame::Response(EdgeResponse {
+        status: 200,
+        headers: vec![("content-length".into(), "13".into())],
+        body: Vec::new(),
+    }));
+    let gateway = EdgeGateway::new(artifact, origin(&seen));
+    let response = block_on(gateway.handle(Request::head("/x").body(Body::empty()).unwrap()));
+    assert_eq!(lane(&response), Lane::Edge);
+    assert_eq!(response.headers()["content-length"], "13");
+}

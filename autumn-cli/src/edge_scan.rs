@@ -188,6 +188,27 @@ const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("Csv", "a request body"),
     ("Multipart", "a request body"),
     ("Request", "the whole request"),
+    // axum's own extractors. The edge passes only `Path`, `Query` and
+    // `HeaderMap` from the request.
+    ("Bytes", "a request body"),
+    ("String", "a request body"),
+    ("Body", "a request body"),
+    ("RawForm", "a request body"),
+    ("OriginalUri", "request data the edge does not pass"),
+    ("MatchedPath", "request data the edge does not pass"),
+    ("NestedPath", "request data the edge does not pass"),
+    ("RawQuery", "request data the edge does not pass"),
+    ("RawPathParams", "request data the edge does not pass"),
+    ("Method", "request data the edge does not pass"),
+    ("Uri", "request data the edge does not pass"),
+    ("Version", "request data the edge does not pass"),
+    ("Host", "request data the edge does not pass"),
+    ("ConnectInfo", "the client connection"),
+    ("TypedHeader", "a typed header (use `HeaderMap`)"),
+    ("CookieJar", "cookies"),
+    ("SignedCookieJar", "cookies"),
+    ("PrivateCookieJar", "cookies"),
+    ("WebSocketUpgrade", "a WebSocket"),
 ];
 
 /// One reason an `#[edge]` route needs something the edge cannot provide.
@@ -9967,6 +9988,28 @@ mod tests {
         assert!(found[0].contains("`Db`"), "{found:?}");
         assert!(found[1].contains("`Session`"), "{found:?}");
         assert!(found[2].contains("`Clock`"), "{found:?}");
+    }
+
+    #[test]
+    fn every_axum_extractor_outside_the_edge_list_is_unsupported() {
+        for extractor in [
+            "OriginalUri",
+            "MatchedPath",
+            "RawQuery",
+            "Method",
+            "Uri",
+            "ConnectInfo<std::net::SocketAddr>",
+            "Bytes",
+            "String",
+            "TypedHeader<Host>",
+            "CookieJar",
+            "WebSocketUpgrade",
+        ] {
+            let found = unsupported_of(&format!(
+                "#[get(\"/x\")]\n#[edge]\nasync fn f(x: {extractor}) {{}}"
+            ));
+            assert_eq!(found.len(), 1, "{extractor}: {found:?}");
+        }
     }
 
     #[test]
