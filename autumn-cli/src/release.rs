@@ -2732,29 +2732,18 @@ previous_secrets = []
             content.contains("azurerm_key_vault_secret\" \"redis_url\""),
             "main.tf must store the Redis connection string in Key Vault: {content}"
         );
-        // Autumn's actual config path is `[cache.redis] url` (env:
-        // AUTUMN_CACHE__REDIS__URL, double underscore before URL) — not
-        // AUTUMN_CACHE__REDIS_URL, which Autumn never reads.
+        // The cutover sets the env vars (#2314). Autumn's config path is
+        // `[cache.redis] url` (env: AUTUMN_CACHE__REDIS__URL, double
+        // underscore before URL). Without AUTUMN_CACHE__BACKEND=redis,
+        // Autumn keeps its in-memory cache and never reads the URL.
+        let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
         assert!(
-            content.contains("AUTUMN_CACHE__REDIS__URL"),
-            "main.tf must wire AUTUMN_CACHE__REDIS__URL into the Container App \
-             when enable_redis_cache is true: {content}"
+            workflow.contains("AUTUMN_CACHE__BACKEND=redis AUTUMN_CACHE__REDIS__URL=secretref:redis-url"),
+            "the cutover must select the Redis backend and wire its URL: {workflow}"
         );
         assert!(
-            !content.contains("AUTUMN_CACHE__REDIS_URL\""),
-            "main.tf must not use the single-underscore variant, which Autumn ignores: {content}"
-        );
-        // Without selecting the backend, Autumn stays on its default
-        // in-memory cache and never reads the URL at all.
-        assert!(
-            content.contains("name  = \"AUTUMN_CACHE__BACKEND\"")
-                || content.contains("name = \"AUTUMN_CACHE__BACKEND\""),
-            "main.tf must set AUTUMN_CACHE__BACKEND=redis so Autumn actually selects the \
-             Redis cache backend: {content}"
-        );
-        assert!(
-            content.contains("value = \"redis\""),
-            "AUTUMN_CACHE__BACKEND must be set to \"redis\": {content}"
+            !workflow.contains("AUTUMN_CACHE__REDIS_URL"),
+            "the cutover must not use the single-underscore variant, which Autumn ignores: {workflow}"
         );
     }
 
@@ -3001,7 +2990,7 @@ previous_secrets = []
         let lifecycle = app
             .split("ignore_changes = [")
             .nth(1)
-            .and_then(|rest| rest.split(']').next())
+            .and_then(|rest| rest.split("\n    ]").next())
             .expect("the app must declare lifecycle.ignore_changes");
         for ignored in [
             "identity",

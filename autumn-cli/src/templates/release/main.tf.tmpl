@@ -22,6 +22,11 @@
 # `az containerapp update`/`az containerapp job start --image`, and Terraform
 # is told to ignore that drift (see the `lifecycle` blocks below) so a later
 # `terraform apply` doesn't revert a live deploy back to the placeholder.
+#
+# The app starts with no managed identity, registry or secret refs (#2314),
+# so the public placeholder never gets production credentials. The deploy
+# step copies them from the migration job, which runs only when CI starts
+# it, in the same step that sets the real image.
 
 terraform {
   required_version = ">= 1.5"
@@ -312,8 +317,9 @@ resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
 # Optional Redis Cache, gated behind the `enable_redis_cache` flag — off by
 # default so a plain deploy incurs no extra cost.
 #
-# This provisions the infrastructure and wires AUTUMN_CACHE__BACKEND /
-# AUTUMN_CACHE__REDIS__URL into the Container App, but that alone does NOT
+# This provisions the infrastructure, and the deploy step wires
+# AUTUMN_CACHE__BACKEND / AUTUMN_CACHE__REDIS__URL into the Container App
+# (#2314), but that alone does NOT
 # make the app use it: Autumn's cache subsystem has no built-in Redis
 # implementation (unlike sessions/channels/jobs, which activate from config
 # alone once compiled with the `redis` Cargo feature). Your application must
@@ -357,47 +363,15 @@ resource "azurerm_container_app" "this" {
   resource_group_name          = azurerm_resource_group.this.name
   revision_mode                = "Single"
 
-  identity {
-    type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.this.id]
-  }
-
-  registry {
-    server   = azurerm_container_registry.this.login_server
-    identity = azurerm_user_assigned_identity.this.id
-  }
-
-  secret {
-    name                = "database-url"
-    key_vault_secret_id = azurerm_key_vault_secret.database_url.id
-    identity            = azurerm_user_assigned_identity.this.id
-  }
-
-  secret {
-    name                = "signing-secret"
-    key_vault_secret_id = azurerm_key_vault_secret.signing_secret.id
-    identity            = azurerm_user_assigned_identity.this.id
-  }
-
-  dynamic "secret" {
-    for_each = var.enable_redis_cache ? [1] : []
-    content {
-      name                = "redis-url"
-      key_vault_secret_id = azurerm_key_vault_secret.redis_url[0].id
-      identity            = azurerm_user_assigned_identity.this.id
-    }
-  }
+  # No identity, registry or secret refs here (#2314). The public bootstrap
+  # image must not get production credentials. The deploy step attaches them
+  # from the migration job when it swaps in the real image.
 
   # External ingress stays DISABLED until the first real image is deployed
-  # (#2312). Between `terraform apply` and the cutover, any inbound request
-  # to the public FQDN would otherwise start the bootstrap placeholder
-  # revision — with the production secret refs and the Key Vault-capable
-  # managed identity attached. `min_replicas = 0` only permits
-  # scale-to-zero; it does not stop the HTTP scale rule below from waking
-  # the placeholder on traffic. The cutover (`az containerapp update
-  # --image`, in azure-deploy.yml and the deployment guide) enables
-  # external ingress via `az containerapp ingress enable` once the real
-  # image is serving.
+  # (#2312), so no inbound request wakes the placeholder. `min_replicas = 0`
+  # does not stop the HTTP scale rule below from starting it. The cutover
+  # (azure-deploy.yml and the deployment guide) enables external ingress
+  # with `az containerapp ingress enable` after the real image serves.
   ingress {
     external_enabled = false
     target_port      = 3000
@@ -439,38 +413,6 @@ resource "azurerm_container_app" "this" {
         name  = "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS"
         value = local.app_fqdn
       }
-
-      env {
-        name        = "AUTUMN_DATABASE__PRIMARY_URL"
-        secret_name = "database-url"
-      }
-
-      env {
-        name        = "AUTUMN_SECURITY__SIGNING_SECRET"
-        secret_name = "signing-secret"
-      }
-
-      # Autumn's cache config is `[cache] backend` + `[cache.redis] url`
-      # (env: AUTUMN_CACHE__BACKEND / AUTUMN_CACHE__REDIS__URL — note the
-      # double underscore before URL, matching the nested `cache.redis.url`
-      # TOML path). Without the backend switch, Autumn stays on its default
-      # in-memory cache and never reads the URL at all, silently ignoring
-      # this (paid) Redis instance.
-      dynamic "env" {
-        for_each = var.enable_redis_cache ? [1] : []
-        content {
-          name  = "AUTUMN_CACHE__BACKEND"
-          value = "redis"
-        }
-      }
-
-      dynamic "env" {
-        for_each = var.enable_redis_cache ? [1] : []
-        content {
-          name        = "AUTUMN_CACHE__REDIS__URL"
-          secret_name = "redis-url"
-        }
-      }
     }
 
     # Scale-to-N on concurrent HTTP requests — see the "Scale config
@@ -481,24 +423,24 @@ resource "azurerm_container_app" "this" {
     }
   }
 
-  # Both must exist before Azure creates the app's first revision: ACR pull
-  # so the image can be pulled, and the Key Vault access policy so the
-  # secret refs above resolve (neither is otherwise referenced by attribute,
-  # so Terraform wouldn't infer the ordering on its own).
-  depends_on = [
-    azurerm_role_assignment.acr_pull,
-    azurerm_key_vault_access_policy.container_app,
-  ]
-
   lifecycle {
     # CI manages the real image after bootstrap (see the header comment);
     # without this, `terraform apply` would revert every live deploy back
     # to `var.bootstrap_image`. CI also opens external ingress at the first
     # cutover (#2312); ignoring it here stops a later `terraform apply` from
     # closing it again and taking the live app offline.
+    #
+    # The cutover also attaches the identity, registry, secret refs and
+    # secret env vars (#2314). Ignore them, or `terraform apply` removes
+    # them from the live app. Terraform sets env vars at create time only.
+    # To change one later, use `az containerapp update --set-env-vars`.
     ignore_changes = [
       template[0].container[0].image,
+      template[0].container[0].env,
       ingress[0].external_enabled,
+      identity,
+      registry,
+      secret,
     ]
   }
 }
@@ -535,10 +477,28 @@ resource "azurerm_container_app_job" "migrate" {
     identity = azurerm_user_assigned_identity.this.id
   }
 
+  # The deploy step copies these secret refs to the app (#2314). Keep the
+  # full app set here. The identity can read the whole vault, so this does
+  # not give the job more access.
   secret {
     name                = "database-url"
     key_vault_secret_id = azurerm_key_vault_secret.database_url.id
     identity            = azurerm_user_assigned_identity.this.id
+  }
+
+  secret {
+    name                = "signing-secret"
+    key_vault_secret_id = azurerm_key_vault_secret.signing_secret.id
+    identity            = azurerm_user_assigned_identity.this.id
+  }
+
+  dynamic "secret" {
+    for_each = var.enable_redis_cache ? [1] : []
+    content {
+      name                = "redis-url"
+      key_vault_secret_id = azurerm_key_vault_secret.redis_url[0].id
+      identity            = azurerm_user_assigned_identity.this.id
+    }
   }
 
   template {

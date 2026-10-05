@@ -2041,17 +2041,13 @@ terraform apply
 
 The Container App and migration job both start from a public placeholder
 image (`bootstrap_image` — Container Apps must pull *some* image to create a
-first revision, and a brand-new ACR has none yet). The generated
-`min_replicas = 0` default is intentional: keep it at zero for the initial
-apply so the placeholder app container is not started with production secret
-refs or the app's Key Vault-capable managed identity. That alone is not the
-whole guarantee, though — `min_replicas = 0` permits scale-to-zero but does
-not stop the HTTP scale rule waking the placeholder on traffic, so the
-generated `main.tf` also keeps external ingress **disabled** until the first
-real image is deployed: between `terraform apply` and the cutover below,
-inbound requests to the public FQDN cannot start the placeholder with
-production secrets attached (#2312). Build and push your
-real image, run migrations, then cut the app over:
+first revision, and a brand-new ACR has none yet). The placeholder never gets
+production credentials (#2314): `main.tf` creates the app with no managed
+identity, no registry and no secret refs. The cutover below copies them from
+the migration job, which runs only when you start it, and sets the real image
+in the same step. Two more safeguards stay in place: `min_replicas = 0`, and
+external ingress stays **disabled** until the real image serves (#2312).
+Build and push your real image, run migrations, then cut the app over:
 
 ```bash
 APP_NAME="$(terraform output -raw app_name)"           # sanitized — may differ from your Cargo package name
@@ -2121,17 +2117,33 @@ for _ in $(seq 1 66); do   # 660s — must exceed the job's own 600s replica_tim
 done
 [ "$STATUS" = "Succeeded" ] || { echo "migration did not finish within the time budget" >&2; exit 1; }
 
+# Attach the identity, registry and Key Vault secret refs that main.tf
+# keeps off the placeholder (#2314). Copy them from the migration job.
+IDENTITY="$(az containerapp job show --name "$MIGRATE_JOB" --resource-group "$RG" \
+  --query "keys(identity.userAssignedIdentities)[0]" -o tsv)"
+SECRETS=()
+while IFS=$'\t' read -r NAME URL; do
+  SECRETS+=("$NAME=keyvaultref:$URL,identityref:$IDENTITY")
+done < <(az containerapp job show --name "$MIGRATE_JOB" --resource-group "$RG" \
+  --query "properties.configuration.secrets[].[name, keyVaultUrl]" -o tsv)
+az containerapp identity assign --name "$APP_NAME" --resource-group "$RG" \
+  --user-assigned "$IDENTITY" --output none
+az containerapp registry set --name "$APP_NAME" --resource-group "$RG" \
+  --server "$ACR" --identity "$IDENTITY" --output none
+az containerapp secret set --name "$APP_NAME" --resource-group "$RG" \
+  --secrets "${SECRETS[@]}" --output none
+
+# With enable_redis_cache = true, also set
+# AUTUMN_CACHE__BACKEND=redis AUTUMN_CACHE__REDIS__URL=secretref:redis-url.
 az containerapp update \
   --name "$APP_NAME" \
   --resource-group "$RG" \
-  --image "$ACR/$APP_NAME:$TAG" &&
+  --image "$ACR/$APP_NAME:$TAG" \
+  --set-env-vars AUTUMN_DATABASE__PRIMARY_URL=secretref:database-url \
+                 AUTUMN_SECURITY__SIGNING_SECRET=secretref:signing-secret &&
 
-# Open external ingress now that the real image is serving. Until this
-# point the app has been unreachable from the public FQDN by design
-# (#2312); the placeholder revision could never be woken by inbound
-# traffic with production secrets attached. The `&&` above matters: if the
-# image update fails, ingress must stay closed rather than expose the
-# placeholder.
+# Open external ingress now that the real image serves (#2312). The `&&`
+# above keeps ingress closed if the image update fails.
 az containerapp ingress enable \
   --name "$APP_NAME" \
   --resource-group "$RG" \
@@ -2142,7 +2154,21 @@ az containerapp ingress enable \
 
 Terraform is told to ignore both resources' image afterward
 (`lifecycle.ignore_changes`), so a later `terraform apply` won't revert a
-live deploy back to the bootstrap placeholder.
+live deploy back to the bootstrap placeholder. It also ignores the app's
+identity, registry, secrets and env vars, which the cutover owns. Terraform
+sets env vars at create time only: change one later with `az containerapp
+update --set-env-vars`.
+
+**Turning Redis off after the first deploy.** The deploy step does not
+remove a secret ref from the app. Before you set `enable_redis_cache =
+false` and apply, remove the env vars and the secret from the app:
+
+```bash
+az containerapp update --name "$APP_NAME" --resource-group "$RG" \
+  --remove-env-vars AUTUMN_CACHE__BACKEND AUTUMN_CACHE__REDIS__URL
+az containerapp secret remove --name "$APP_NAME" --resource-group "$RG" \
+  --secret-names redis-url
+```
 
 **Automated deploys on tag push:** `.github/workflows/azure-deploy.yml` only
 runs once you add the required repository secrets and variables it documents
@@ -2154,13 +2180,15 @@ config) `ACR_LOGIN_SERVER`/`AZURE_RESOURCE_GROUP`/`AZURE_MIGRATE_JOB_NAME`/
 `AZURE_APP_NAME` (all four are `terraform output` values — never hand-typed)
 — until then it stays dormant. Once configured, pushing a `v*` tag builds,
 pushes to ACR, runs the migration job to completion (aborting before any
-deploy if it fails), and runs `az containerapp update` automatically.
+deploy if it fails), attaches the identity, registry and secret refs, and
+runs `az containerapp update` automatically.
 
 **Grant the service principal Contributor at the resource-group scope**, not
 just on the Container App: the migration job is a separate resource in the
 same group, and Azure RBAC granted on one resource does not inherit to a
 sibling — a principal scoped only to the app 403s the moment the workflow
-tries to start the migration job.
+tries to start the migration job. The same scope lets the workflow assign
+the app's user-assigned identity at cutover.
 
 **The image tag is unique per execution, not just per commit**, e.g.
 `v1.2.3-a1b2c3d4e5f6-4821903-1` — the sanitized ref, the commit SHA, the
@@ -2213,7 +2241,7 @@ update` actually serves traffic instead of crash-looping — the same value
 hostname rather than a revision-specific one (which would send a `Host`
 header the app doesn't trust, and would go stale the moment CI creates a new
 revision outside Terraform). Add a comma-separated custom domain to the env
-var once you bind one.
+var once you bind one, with `az containerapp update --set-env-vars`.
 
 **State file security.** `terraform apply` writes `database_admin_password`,
 the derived database connection string, and `signing_secret` into
@@ -2834,7 +2862,21 @@ gcloud run services update "$SERVICE_NAME" --project "$PROJECT_ID" --region "$RE
 
 Terraform is told to ignore both resources' image afterward
 (`lifecycle.ignore_changes`), so a later `terraform apply` won't revert a
-live deploy back to the bootstrap placeholder.
+live deploy back to the bootstrap placeholder. It also ignores the app's
+identity, registry, secrets and env vars, which the cutover owns. Terraform
+sets env vars at create time only: change one later with `az containerapp
+update --set-env-vars`.
+
+**Turning Redis off after the first deploy.** The deploy step does not
+remove a secret ref from the app. Before you set `enable_redis_cache =
+false` and apply, remove the env vars and the secret from the app:
+
+```bash
+az containerapp update --name "$APP_NAME" --resource-group "$RG" \
+  --remove-env-vars AUTUMN_CACHE__BACKEND AUTUMN_CACHE__REDIS__URL
+az containerapp secret remove --name "$APP_NAME" --resource-group "$RG" \
+  --secret-names redis-url
+```
 
 **Automated deploys on tag push:** `.github/workflows/gcp-deploy.yml` only
 runs once you add the required repository secrets and variables it
