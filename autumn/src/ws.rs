@@ -220,6 +220,9 @@ pub struct WebSocketUpgrade {
     inner: axum::extract::ws::WebSocketUpgrade,
     limits: SocketLimits,
     permit: Option<SocketPermit>,
+    /// Keeps an HTTP/2 connection out of its idle timer while the socket is
+    /// open.
+    tunnel: Option<crate::http_server::TunnelGuard>,
 }
 
 impl std::fmt::Debug for WebSocketUpgrade {
@@ -272,6 +275,7 @@ where
             inner,
             limits: SocketLimits::from_config(realtime),
             permit,
+            tunnel: parts.extensions.remove::<crate::http_server::TunnelGuard>(),
         })
     }
 }
@@ -353,12 +357,13 @@ impl WebSocketUpgrade {
             inner,
             limits,
             permit,
+            tunnel,
         } = self;
         let inner = match limits.max_message_bytes {
             Some(bytes) => inner.max_message_size(bytes),
             None => inner,
         };
-        inner.on_upgrade(move |socket| callback(WebSocket::new(socket, limits, permit)))
+        inner.on_upgrade(move |socket| callback(WebSocket::new(socket, limits, (permit, tunnel))))
     }
 
     /// The axum upgrade, without the `[realtime]` limits. The connection slot
@@ -413,7 +418,12 @@ pub struct WebSocket {
     /// one inside tungstenite. So after each such send, the read side wakes
     /// it. Without this, a `split()` writer task can wait forever.
     writer_waker: Option<std::task::Waker>,
-    _permit: Option<SocketPermit>,
+    /// The `max_connections` slot and the HTTP/2 tunnel mark. Both are
+    /// released when the socket drops.
+    _hold: (
+        Option<SocketPermit>,
+        Option<crate::http_server::TunnelGuard>,
+    ),
 }
 
 impl std::fmt::Debug for WebSocket {
@@ -444,7 +454,10 @@ impl WebSocket {
     fn new(
         inner: axum::extract::ws::WebSocket,
         limits: SocketLimits,
-        permit: Option<SocketPermit>,
+        hold: (
+            Option<SocketPermit>,
+            Option<crate::http_server::TunnelGuard>,
+        ),
     ) -> Self {
         Self {
             inner,
@@ -455,7 +468,7 @@ impl WebSocket {
             closing: None,
             done: false,
             writer_waker: None,
-            _permit: permit,
+            _hold: hold,
         }
     }
 

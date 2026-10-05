@@ -593,6 +593,17 @@ impl Drop for InFlight {
     }
 }
 
+/// The in-flight mark of an HTTP/2 `CONNECT` stream (a WebSocket, RFC 8441).
+///
+/// The tunnel stays open after its response, so the mark rides in the
+/// request extensions instead of the response body. The WebSocket upgrade
+/// keeps it until the socket closes. When no handler keeps it (for example a
+/// `404`), it drops with the request.
+#[derive(Clone)]
+pub(crate) struct TunnelGuard {
+    _mark: Arc<InFlight>,
+}
+
 impl<S> tower::Service<axum::extract::Request> for Tracked<S>
 where
     S: tower::Service<
@@ -609,14 +620,18 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
-        // An HTTP/2 CONNECT stream (a WebSocket, RFC 8441) stays open after
-        // its response body is gone. Keep it in flight for the connection's
-        // life, so the idle timer cannot close the tunnel.
-        let tunnel = req.method() == axum::http::Method::CONNECT;
+    fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
         let guard = self.timers.as_ref().and_then(|timers| {
             timers.request_started();
-            (!tunnel).then(|| InFlight(Arc::clone(timers)))
+            let mark = InFlight(Arc::clone(timers));
+            if req.method() == axum::http::Method::CONNECT {
+                req.extensions_mut().insert(TunnelGuard {
+                    _mark: Arc::new(mark),
+                });
+                None
+            } else {
+                Some(mark)
+            }
         });
         TrackedFuture {
             inner: self.inner.call(req),
@@ -754,6 +769,70 @@ mod tests {
         timers.on_read(&full[9..]);
         let (_, expiry) = timers.deadline_and_expiry().expect("idle again");
         assert_eq!(expiry, Expiry::Idle);
+    }
+
+    fn connect_request() -> axum::extract::Request {
+        axum::http::Request::builder()
+            .method(axum::http::Method::CONNECT)
+            .uri("/ws")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn idle_timers() -> Arc<ConnTimers> {
+        let timers = Arc::new(ConnTimers::new(&HttpLimits {
+            keep_alive_timeout: Some(Duration::from_secs(60)),
+            ..HttpLimits::default()
+        }));
+        timers.request_started();
+        timers.request_finished();
+        timers
+    }
+
+    fn expiry(timers: &ConnTimers) -> Option<Expiry> {
+        timers.deadline_and_expiry().map(|(_, expiry)| expiry)
+    }
+
+    #[tokio::test]
+    async fn a_rejected_connect_releases_its_in_flight_mark() {
+        use tower::Service as _;
+        let timers = idle_timers();
+        let mut service = Tracked {
+            inner: tower::service_fn(|_req: axum::extract::Request| async {
+                Ok::<_, Infallible>(
+                    axum::response::Response::builder()
+                        .status(404)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+            }),
+            timers: Some(Arc::clone(&timers)),
+        };
+        drop(service.call(connect_request()).await.unwrap());
+        assert_eq!(expiry(&timers), Some(Expiry::Idle));
+    }
+
+    #[tokio::test]
+    async fn a_kept_tunnel_guard_holds_the_connection_until_dropped() {
+        use tower::Service as _;
+        let timers = idle_timers();
+        let (tx, rx) = std::sync::mpsc::channel::<TunnelGuard>();
+        let mut service = Tracked {
+            inner: tower::service_fn(move |mut req: axum::extract::Request| {
+                // What the WebSocket upgrade does: keep the guard.
+                let guard = req.extensions_mut().remove::<TunnelGuard>();
+                tx.send(guard.expect("CONNECT carries a guard")).unwrap();
+                async {
+                    Ok::<_, Infallible>(axum::response::Response::new(axum::body::Body::empty()))
+                }
+            }),
+            timers: Some(Arc::clone(&timers)),
+        };
+        drop(service.call(connect_request()).await.unwrap());
+        let guard = rx.recv().unwrap();
+        assert_eq!(expiry(&timers), None, "the tunnel is still open");
+        drop(guard);
+        assert_eq!(expiry(&timers), Some(Expiry::Idle));
     }
 
     #[tokio::test]
