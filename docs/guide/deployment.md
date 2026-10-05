@@ -2135,6 +2135,22 @@ live deploy back to the bootstrap placeholder. It also ignores the app's
 identity, registry, secrets and env vars, which the cutover owns. Terraform
 sets env vars at create time only: change one later with `az containerapp
 update --set-env-vars`. The cutover keeps the env vars that it does not set.
+If a cutover keeps the current revision (the same image and env), it restarts
+that revision, so it reads changed secret refs.
+
+**Upgrading an app made by an older template.** An older `main.tf` gave the
+placeholder app the identity, registry and secret refs. `terraform apply`
+does not remove them, because Terraform now ignores these attributes. If your
+app still runs the placeholder image, remove them after `terraform apply`:
+
+```bash
+AZURE_APP_NAME="$APP_NAME" AZURE_RESOURCE_GROUP="$RG" \
+AZURE_MIGRATE_JOB_NAME="$MIGRATE_JOB" ACR_LOGIN_SERVER="$ACR" \
+  bash azure-cutover.sh --remove-credentials
+```
+
+The script stops with an error if the app runs a real release, because that
+release needs its credentials.
 
 **Secret changes reach the app without a deploy.** The app refers to the
 latest version of each Key Vault secret. Container Apps gets a new version

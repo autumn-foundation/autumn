@@ -10,5 +10,7 @@
   both run it. Terraform now ignores the app's env vars after it creates the
   app. To change one, use `az containerapp update --set-env-vars`. Before you
   use a regenerated workflow on an existing app, regenerate `main.tf`. Then
-  run `terraform apply`. The script needs all app secrets on the migration
-  job.
+  run `terraform apply`. If the app still runs the bootstrap image, then run
+  `bash azure-cutover.sh --remove-credentials`: the old template gave the
+  placeholder the credentials, and `terraform apply` does not remove them.
+  The script needs all app secrets on the migration job.

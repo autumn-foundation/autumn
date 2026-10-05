@@ -3178,16 +3178,26 @@ previous_secrets = []
             .and_then(|(_, rest)| rest.split_once("\n}\n"))
             .expect("the script must define rollback()")
             .0;
+        assert!(
+            rollback.contains("remove_credentials"),
+            "rollback must remove the credentials: {rollback}"
+        );
+        let remove = script
+            .split_once("remove_credentials() {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .expect("the script must define remove_credentials()")
+            .0;
         for field in [
             "type: \"None\"",
-            "{($id): null}",
-            "registries: ($app.properties.configuration.registries // [])",
-            "secrets: ($app_secrets[0] | map(secret_ref))",
+            "map_values(null)) as $drop",
+            "select((.identity // \"\" | ascii_downcase) != $lid)",
+            r#"IN("database-url", "signing-secret", "redis-url") | not"#,
+            "\"AUTUMN_DATABASE__PRIMARY_URL\", \"AUTUMN_SECURITY__SIGNING_SECRET\"",
             "patch_app",
         ] {
             assert!(
-                rollback.contains(field),
-                "rollback must set `{field}`: {rollback}"
+                remove.contains(field),
+                "remove_credentials must set `{field}`: {remove}"
             );
         }
         assert!(

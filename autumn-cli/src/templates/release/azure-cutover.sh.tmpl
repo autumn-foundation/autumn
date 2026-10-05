@@ -16,26 +16,42 @@
 #
 # Then the script waits for the new revision. It opens external ingress
 # (#2312) only when that revision runs the real image. If the FIRST cutover
-# fails, the script removes the credentials from the app again.
+# fails, the script removes the credentials from the app again. If the
+# current revision stays (the same image and env), the script restarts it,
+# because a revision reads changed secrets only when it starts.
+#
+# An app made by an older template has the credentials while it runs the
+# placeholder, and terraform apply does not remove them. To remove them, run
+# `bash azure-cutover.sh --remove-credentials`. It does nothing to an app that
+# runs a real release.
 #
 # azure-deploy.yml runs this script after migrations. To run it manually, set
 # these variables. All except IMAGE_TAG come from `terraform output`. Then run
 # `bash azure-cutover.sh`.
 #
 #   AZURE_APP_NAME, AZURE_RESOURCE_GROUP, AZURE_MIGRATE_JOB_NAME,
-#   ACR_LOGIN_SERVER, IMAGE_TAG (the tag you pushed to ACR)
+#   ACR_LOGIN_SERVER, IMAGE_TAG (the tag you pushed to ACR; not used by
+#   --remove-credentials)
 #
 # Needs: az (logged in) and jq.
 
 set -euo pipefail
 
+MODE=cutover
+case "${1:-}" in
+  "") ;;
+  --remove-credentials) MODE=remove ;;
+  *) echo "usage: azure-cutover.sh [--remove-credentials]" >&2; exit 2 ;;
+esac
+
 : "${AZURE_APP_NAME:?set AZURE_APP_NAME (terraform output app_name)}"
 : "${AZURE_RESOURCE_GROUP:?set AZURE_RESOURCE_GROUP (terraform output resource_group_name)}"
 : "${AZURE_MIGRATE_JOB_NAME:?set AZURE_MIGRATE_JOB_NAME (terraform output migrate_job_name)}"
 : "${ACR_LOGIN_SERVER:?set ACR_LOGIN_SERVER (terraform output acr_login_server)}"
-: "${IMAGE_TAG:?set IMAGE_TAG (the tag you pushed to ACR)}"
-
-IMAGE="$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG"
+if [ "$MODE" = cutover ]; then
+  : "${IMAGE_TAG:?set IMAGE_TAG (the tag you pushed to ACR)}"
+  IMAGE="$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG"
+fi
 API="api-version=2024-03-01"
 # Secret values go through these private files, never through a process
 # argument (visible in /proc/*/cmdline).
@@ -72,41 +88,71 @@ patch_app() {
   az rest --method patch --url "$APP_ID?$API" --body "@$BODY" --output none
 }
 
-# Only the first cutover rolls back. On a later deploy, the old image is a
-# real release, so the script keeps the credentials. The rollback removes
-# what the cutover added, and restores the app's own identities, registries
-# and secrets.
-rollback() {
-  case "$OLD_IMAGE" in "$ACR_LOGIN_SERVER"/*) return ;; esac
-  echo "::warning::removing the credentials from the placeholder app" >&2
+# Removes the job's credentials from the app: its identity, the registry
+# entry that uses that identity, the three secrets and the four env vars
+# that this script sets. Other identities, registries, secrets, env vars and
+# containers stay. Then waits for the update.
+remove_credentials() {
   local body
   body=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
     --arg id "$JOB_IDENTITY" "$SECRET_REF"'
-    ($app.identity.userAssignedIdentities // {} | map_values({})) as $own
-    | {identity: (if ($app.identity.type // "None") == "None"
-                  then {type: "None", userAssignedIdentities: null}
-                  else {type: $app.identity.type,
-                        userAssignedIdentities: (if $own == {} then null
-                                                 else {($id): null} + $own end)} end),
+    ($id | ascii_downcase) as $lid
+    | ($app.identity.type // "None") as $type
+    | ($app.identity.userAssignedIdentities // {}) as $ids
+    | ($ids | with_entries(select(.key | ascii_downcase != $lid)) | map_values({})) as $own
+    | ($ids | with_entries(select(.key | ascii_downcase == $lid)) | map_values(null)) as $drop
+    | {identity: (if $own != {} then {type: $type, userAssignedIdentities: ($drop + $own)}
+                  elif ($type | test("SystemAssigned")) then {type: "SystemAssigned", userAssignedIdentities: null}
+                  else {type: "None", userAssignedIdentities: null} end),
        properties: {
          configuration: {
-           registries: ($app.properties.configuration.registries // []),
-           secrets: ($app_secrets[0] | map(secret_ref))},
-         template: {containers: $app.properties.template.containers}}}')
-  if patch_app "$body"; then
-    for _ in $(seq 1 30); do
-      sleep 10
-      STATE=$(az containerapp show --name "$AZURE_APP_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" \
-        --query properties.provisioningState --output tsv) || break
-      case "$STATE" in
-        Succeeded) return ;;
-        Failed|Canceled) break ;;
-      esac
-    done
-  fi
+           registries: [($app.properties.configuration.registries // [])[]
+                        | select((.identity // "" | ascii_downcase) != $lid)],
+           secrets: ($app_secrets[0]
+                     | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not)
+                           | secret_ref))},
+         template: {containers: ($app.properties.template.containers
+           | .[0].env = [(.[0].env // [])[] | select(.name | IN(
+               "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
+               "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)])}}}')
+  patch_app "$body" || return 1
+  for _ in $(seq 1 30); do
+    sleep 10
+    STATE=$(az containerapp show --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --query properties.provisioningState --output tsv) || return 1
+    case "$STATE" in
+      Succeeded) return 0 ;;
+      Failed|Canceled) return 1 ;;
+    esac
+  done
+  return 1
+}
+
+# Only the first cutover rolls back. On a later deploy, the old image is a
+# real release, so the script keeps the credentials.
+rollback() {
+  case "$OLD_IMAGE" in "$ACR_LOGIN_SERVER"/*) return ;; esac
+  echo "::warning::removing the credentials from the placeholder app" >&2
+  remove_credentials && return
   echo "::error::rollback failed: remove the identity and secrets from $AZURE_APP_NAME manually" >&2
 }
+
+if [ "$MODE" = remove ]; then
+  case "$OLD_IMAGE" in
+    "$ACR_LOGIN_SERVER"/*)
+      echo "::error::$AZURE_APP_NAME runs $OLD_IMAGE, a real release. It needs its credentials." >&2
+      exit 1
+      ;;
+  esac
+  if [ -z "$JOB_IDENTITY" ]; then
+    echo "::error::the migration job has no identity. Run terraform apply first." >&2
+    exit 1
+  fi
+  remove_credentials || { echo "::error::cannot remove the credentials from $AZURE_APP_NAME" >&2; exit 1; }
+  echo "removed the credentials from the placeholder app $AZURE_APP_NAME"
+  exit 0
+fi
 
 fail() {
   echo "::error::$1" >&2
@@ -162,6 +208,9 @@ CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAG
 if jq -en --argjson app "$APP" --argjson containers "$CONTAINERS" \
   '$app.properties.template.containers == $containers' > /dev/null; then
   OLD_REVISION=""
+  RESTART=1
+else
+  RESTART=""
 fi
 
 # The secrets, registries and identities that you add to the app stay.
@@ -222,6 +271,16 @@ for _ in $(seq 1 60); do
   esac
 done
 [ -n "$READY" ] || fail "the new revision was not provisioned in time"
+
+# No new revision: secrets are application-scope, and the running revision
+# reads them only when it starts.
+if [ -n "$RESTART" ]; then
+  az containerapp revision restart \
+    --name "$AZURE_APP_NAME" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --revision "$REVISION" \
+    --output none || fail "cannot restart revision $REVISION"
+fi
 
 # The new revision runs the real image. Open external ingress now. On a
 # later run, this command changes nothing.
