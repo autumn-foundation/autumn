@@ -183,9 +183,15 @@ JOB_IDENTITY=$(jq -r --arg acr "$ACR_LOGIN_SERVER" \
 # user-assigned identity that a Key Vault job secret uses. A job secret on
 # the job's system identity cannot move: the app's system identity is
 # another principal, without access to the vault. The cutover stops on it.
-JOB_UIDS=$(jq -c --arg id "$JOB_IDENTITY" '[$id] + [.[] | select(.keyVaultUrl) | .identity // empty
-    | select(ascii_downcase != "system")]
-  | map(select(. != "")) | unique_by(ascii_downcase)' "$JOB_SECRETS")
+JOB_UIDS=$(jq -c --arg id "$JOB_IDENTITY" '[$id] + [.[] | select(.keyVaultUrl) | .identity // empty]
+  | map(select(. != "" and ascii_downcase != "system")) | unique_by(ascii_downcase)' "$JOB_SECRETS")
+# The job can pull from the ACR with its system identity. "system" is not a
+# user-assigned identity, and the app's system identity has no AcrPull, so
+# the cutover cannot copy it. The script stops before any write.
+if [ "$(tr '[:upper:]' '[:lower:]' <<< "$JOB_IDENTITY")" = system ]; then
+  echo "::error::the migration job pulls from $ACR_LOGIN_SERVER with its system identity. The app cannot use it. Give the job's ACR registry entry a user-assigned identity with AcrPull, and try again." >&2
+  exit 1
+fi
 SYSTEM_SECRETS=$(jq -r '[.[] | select(.keyVaultUrl and ((.identity // "") | ascii_downcase) == "system") | .name]
   | join(", ")' "$JOB_SECRETS")
 # A secret in PATCH form: a Key Vault ref, or a name and value.
@@ -205,7 +211,10 @@ SHARED_IDENTITY=$(jq -r --argjson app "$APP" --argjson uids "$JOB_UIDS" --arg ac
   | [(.[] | select(.keyVaultUrl and ((.identity // "" | ascii_downcase) | IN($lids[]))
                and (.name | IN(managed[]) | not)) | "secret " + .name),
      ($app.properties.configuration.registries // [] | .[]
-      | select(.server != $acr and ((.identity // "" | ascii_downcase) | IN($lids[]))) | "registry " + .server)]
+      | select(.server != $acr and ((.identity // "" | ascii_downcase) | IN($lids[]))) | "registry " + .server),
+     ($app.properties.template.scale.rules // [] | .[]
+      | select([.. | objects | .identity? // empty | strings | ascii_downcase] | any(IN($lids[])))
+      | "scale rule " + .name)]
   | join(", ")' "$APP_SECRETS")
 shared_identity_stop() {
   echo "::error::the app's $SHARED_IDENTITY use(s) an identity of the migration job. Credential removal would drop that identity. Give them another identity, and try again." >&2
