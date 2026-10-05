@@ -136,8 +136,8 @@ let ddl = autumn_web::scheduler::PG_TICK_TABLE_DDL;
 
 Three behaviour changes come with it:
 
-- A row stays for `scheduler.lease_ttl_secs`. A fixed-delay row stays for at
-  least its delay.
+- A row stays for `scheduler.lease_ttl_secs`. A fixed-delay row stays for its
+  delay plus `scheduler.lease_ttl_secs`.
 - A leader that crashes mid-tick does not free the tick. The next tick runs.
 - `PostgresAdvisorySchedulerCoordinator` is a deprecated alias of
   `PostgresTickSchedulerCoordinator`.

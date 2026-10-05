@@ -55,10 +55,10 @@ Only the replica that gets a `generation` back runs the tick. The row stays
 after the run. Thus, a replica whose timer reaches the same tick later (timer
 skew, a GC pause, a slow boot) does not run it again.
 
-- A row stays for `lease_ttl_secs`. A fixed-delay row stays for at least its
-  delay, because each replica starts its timer at its own boot. Then the next
-  claim deletes the row. Set `lease_ttl_secs` longer than the spread between
-  the replicas' timers.
+- A row stays for `lease_ttl_secs`. A fixed-delay row stays for its delay plus
+  `lease_ttl_secs`, because each replica starts its timer at its own boot.
+  Then the next claim deletes the row. Set `lease_ttl_secs` longer than the
+  spread between the replicas' clocks.
 - The claim and the prune use the database clock (`now()`), not the replica
   clocks.
 - The coordinator keeps no session state and holds no connection while a tick

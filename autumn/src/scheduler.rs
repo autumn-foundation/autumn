@@ -97,6 +97,8 @@ pub struct SchedulerLease {
     fencing_token: Option<i64>,
     #[cfg(test)]
     release_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(feature = "db")]
+    postgres: Option<PostgresTickRow>,
     #[cfg(feature = "sqlite")]
     sqlite: Option<SqliteTableLease>,
 }
@@ -109,6 +111,8 @@ impl SchedulerLease {
             fencing_token: None,
             #[cfg(test)]
             release_count: None,
+            #[cfg(feature = "db")]
+            postgres: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
         }
@@ -135,9 +139,10 @@ impl SchedulerLease {
 
     /// A lease granted by the Postgres tick-table coordinator.
     #[cfg(feature = "db")]
-    fn postgres(leader_id: impl Into<String>, generation: i64) -> Self {
+    fn postgres(leader_id: impl Into<String>, row: PostgresTickRow) -> Self {
         Self {
-            fencing_token: Some(generation),
+            fencing_token: Some(row.generation),
+            postgres: Some(row),
             ..Self::local("postgres", leader_id)
         }
     }
@@ -195,6 +200,29 @@ impl SchedulerLease {
         }
 
         Ok(())
+    }
+
+    /// Release the lease and free its key at once. The next `try_acquire` on
+    /// the same key then wins.
+    ///
+    /// Use it only when a constant key works as a mutex, as ACME issuance
+    /// does. A schedule tick uses [`Self::release`]: a freed tick can run
+    /// again. Only this lease's own row is deleted, so a row that expired and
+    /// went to another replica stays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] when the backend cannot delete the row.
+    pub async fn release_and_free(mut self) -> AutumnResult<()> {
+        #[cfg(feature = "db")]
+        if let Some(row) = self.postgres.take() {
+            row.free().await?;
+        }
+        #[cfg(feature = "sqlite")]
+        if let Some(lease) = self.sqlite.as_ref() {
+            lease.free().await?;
+        }
+        self.release().await
     }
 }
 
@@ -366,6 +394,62 @@ const DEFAULT_TICK_RETENTION: Duration = Duration::from_secs(300);
 #[cfg(feature = "db")]
 const MIN_TICK_RETENTION: Duration = Duration::from_secs(1);
 
+/// Cap on how long a tick row stays: 100 years. A longer interval is out of
+/// range for Postgres, and every claim would fail.
+#[cfg(feature = "db")]
+const MAX_TICK_HOLD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+/// How long a claimed tick stays claimed: the retention plus the period.
+///
+/// Add, not take the larger: a replica whose clock is behind can still reach
+/// the tick after one full period. The retention is the margin for that skew.
+#[cfg(feature = "db")]
+fn tick_hold(retention: Duration, period: Duration) -> Duration {
+    retention.saturating_add(period).min(MAX_TICK_HOLD)
+}
+
+/// A claimed Postgres tick row, kept so that
+/// [`SchedulerLease::release_and_free`] can delete it.
+#[cfg(feature = "db")]
+struct PostgresTickRow {
+    pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    key_prefix: String,
+    task_name: String,
+    tick_key: String,
+    generation: i64,
+}
+
+#[cfg(feature = "db")]
+impl PostgresTickRow {
+    /// Delete this row. The `generation` match keeps a row that another
+    /// replica claimed after this one expired.
+    async fn free(self) -> AutumnResult<()> {
+        use diesel_async::RunQueryDsl as _;
+
+        let mut conn = self.pool.get().await.map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "scheduler postgres connection unavailable: {error}"
+            ))
+        })?;
+        diesel::sql_query(
+            "DELETE FROM autumn_scheduler_ticks \
+             WHERE key_prefix = $1 AND task_name = $2 AND tick_key = $3 AND generation = $4",
+        )
+        .bind::<diesel::sql_types::Text, _>(&self.key_prefix)
+        .bind::<diesel::sql_types::Text, _>(&self.task_name)
+        .bind::<diesel::sql_types::Text, _>(&self.tick_key)
+        .bind::<diesel::sql_types::BigInt, _>(self.generation)
+        .execute(&mut *conn)
+        .await
+        .map_err(|error| {
+            AutumnError::internal_server_error_msg(format!(
+                "postgres scheduler tick free failed: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+}
+
 /// DDL of the Postgres tick table.
 ///
 /// If the app's database role cannot run `CREATE TABLE`, apply this before
@@ -417,7 +501,7 @@ impl PostgresTickSchedulerCoordinator {
     /// longer than the spread between replica timers.
     #[must_use]
     pub fn with_tick_retention(mut self, retention: Duration) -> Self {
-        self.retention = retention.max(MIN_TICK_RETENTION);
+        self.retention = retention.clamp(MIN_TICK_RETENTION, MAX_TICK_HOLD);
         self
     }
 
@@ -544,7 +628,7 @@ impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
             .bind::<diesel::sql_types::Text, _>(task_name)
             .bind::<diesel::sql_types::Text, _>(tick_key)
             .bind::<diesel::sql_types::Text, _>(&self.replica_id)
-            .bind::<diesel::sql_types::Double, _>(self.retention.max(period).as_secs_f64())
+            .bind::<diesel::sql_types::Double, _>(tick_hold(self.retention, period).as_secs_f64())
             .load::<TickGenerationRow>(&mut *conn)
             .await
             .map_err(|error| {
@@ -553,10 +637,18 @@ impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
                 ))
             })?;
 
-            Ok(claimed
-                .into_iter()
-                .next()
-                .map(|row| SchedulerLease::postgres(self.replica_id.clone(), row.generation)))
+            Ok(claimed.into_iter().next().map(|row| {
+                SchedulerLease::postgres(
+                    self.replica_id.clone(),
+                    PostgresTickRow {
+                        pool: self.pool.clone(),
+                        key_prefix: self.key_prefix.clone(),
+                        task_name: task_name.to_owned(),
+                        tick_key: tick_key.to_owned(),
+                        generation: row.generation,
+                    },
+                )
+            }))
         })
     }
 }
@@ -724,8 +816,8 @@ impl SchedulerCoordinator for SqliteLeaseSchedulerCoordinator {
             self.ensure_table(&mut conn).await?;
 
             let now_ms = self.now_ms();
-            // A fixed-delay tick stays for at least its delay (issue #3052).
-            let hold = self.lease_ttl.max(period);
+            // A fixed-delay tick stays for its delay plus the TTL (issue #3052).
+            let hold = tick_hold(self.lease_ttl, period);
             let ttl_ms = i64::try_from(hold.as_millis()).unwrap_or(i64::MAX);
             let expires_at = now_ms.saturating_add(ttl_ms);
 
@@ -768,7 +860,11 @@ impl SchedulerCoordinator for SqliteLeaseSchedulerCoordinator {
             }
             Ok(Some(SchedulerLease::sqlite(
                 self.replica_id.clone(),
-                SqliteTableLease { key },
+                SqliteTableLease {
+                    key,
+                    owner,
+                    pool: self.pool.clone(),
+                },
             )))
         })
     }
@@ -788,10 +884,35 @@ impl SchedulerCoordinator for SqliteLeaseSchedulerCoordinator {
 #[cfg(feature = "sqlite")]
 struct SqliteTableLease {
     key: i64,
+    owner: String,
+    pool: diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
 }
 
 #[cfg(feature = "sqlite")]
 impl SqliteTableLease {
+    /// Delete this lease's row. The `owner` match keeps a row that another
+    /// process claimed after this one expired.
+    async fn free(&self) -> AutumnResult<()> {
+        use diesel_async::RunQueryDsl as _;
+
+        let mut conn = self.pool.get().await.map_err(|error| {
+            AutumnError::service_unavailable_msg(format!(
+                "scheduler sqlite lease connection unavailable: {error}"
+            ))
+        })?;
+        diesel::sql_query("DELETE FROM autumn_scheduler_leases WHERE lock_key = ? AND owner = ?")
+            .bind::<diesel::sql_types::BigInt, _>(self.key)
+            .bind::<diesel::sql_types::Text, _>(&self.owner)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "sqlite scheduler lease free failed: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
     #[allow(
         clippy::unused_async,
         reason = "`SchedulerLease::release` is async; this keeps one shape across backends"
@@ -1181,6 +1302,19 @@ mod tests {
         assert_eq!(seen.0.and_then(|tick| tick.fencing_token()), Some(42));
         assert_eq!(seen.1, None, "a spawned task does not inherit the tick");
         assert_eq!(current_tick(), None);
+    }
+
+    // Issue #3052: the hold adds the period to the retention, so a replica
+    // whose clock is behind still finds the tick claimed. It is capped, so a
+    // huge `lease_ttl_secs` cannot overflow the Postgres interval.
+    #[cfg(feature = "db")]
+    #[test]
+    fn tick_hold_adds_the_period_and_is_capped() {
+        let minute = Duration::from_secs(60);
+        assert_eq!(tick_hold(minute, Duration::ZERO), minute);
+        assert_eq!(tick_hold(minute, 10 * minute), 11 * minute);
+        assert_eq!(tick_hold(Duration::MAX, minute), MAX_TICK_HOLD);
+        assert_eq!(tick_hold(minute, Duration::MAX), MAX_TICK_HOLD);
     }
 
     #[test]

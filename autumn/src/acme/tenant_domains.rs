@@ -872,11 +872,17 @@ impl CustomDomainTask {
 
         // One replica per hostname orders. `Fleet` grants unconditionally on
         // the in-process backend (correct for a single replica) and to exactly
-        // one replica on a distributed one.
+        // one replica on a distributed one. The key works as a mutex: hold it
+        // through the order, then free it.
         let tick_key = format!("custom-domain:{hostname}");
         let lease = match self
             .coordinator
-            .try_acquire(CUSTOM_DOMAIN_TASK, &tick_key, TaskCoordination::Fleet)
+            .try_acquire_for_period(
+                CUSTOM_DOMAIN_TASK,
+                &tick_key,
+                TaskCoordination::Fleet,
+                crate::acme::renewal::ACME_LEADER_HOLD,
+            )
             .await
         {
             Ok(Some(lease)) => lease,
@@ -915,7 +921,7 @@ impl CustomDomainTask {
                     "abandoning a custom-domain order: the hostname is no longer this tenant's to \
                      order for"
                 );
-                if let Err(e) = lease.release().await {
+                if let Err(e) = lease.release_and_free().await {
                     tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
                 }
                 return;
@@ -935,7 +941,7 @@ impl CustomDomainTask {
                     true,
                 )
                 .await;
-                if let Err(e) = lease.release().await {
+                if let Err(e) = lease.release_and_free().await {
                     tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
                 }
                 return;
@@ -950,8 +956,8 @@ impl CustomDomainTask {
         // An order can take minutes; what follows it is stamped with when it
         // actually finished, not when it began.
         let now_unix = elapsed_since(now_unix, order_started);
-        // Always release the lease, whatever the order did.
-        if let Err(e) = lease.release().await {
+        // Always free the key, whatever the order did.
+        if let Err(e) = lease.release_and_free().await {
             tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
         }
 

@@ -413,3 +413,58 @@ async fn pg_dml_only_role_claims_ticks_on_a_premade_table() {
     assert!(run_tick(&a, "nightly-invoice:1", &runs).await);
     assert!(!run_tick(&a, "nightly-invoice:1", &runs).await);
 }
+
+/// A constant key used as a mutex (ACME issuance): `release_and_free` frees
+/// it at once, and frees only the caller's own row.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn pg_release_and_free_frees_only_its_own_row() {
+    let (_container, url) = start_postgres().await;
+    let a = coordinator(replica_pool(&url, "replica-a", 2), "replica-a")
+        .with_tick_retention(Duration::from_secs(1));
+    let b = coordinator(replica_pool(&url, "replica-b", 2), "replica-b");
+    let fleet = TaskCoordination::Fleet;
+    let hold = Duration::from_secs(7_200);
+
+    let lease = a
+        .try_acquire_for_period(TASK, "acme:cert", fleet, hold)
+        .await
+        .expect("acquire")
+        .expect("A leads");
+    assert!(
+        b.try_acquire_for_period(TASK, "acme:cert", fleet, hold)
+            .await
+            .expect("acquire")
+            .is_none(),
+        "the key is held while A works"
+    );
+    lease.release_and_free().await.expect("free");
+    let b_lease = b
+        .try_acquire_for_period(TASK, "acme:cert", fleet, hold)
+        .await
+        .expect("acquire")
+        .expect("a freed key is free at once");
+    b_lease.release_and_free().await.expect("free");
+
+    // A's row expires and B takes the key. A late free from A must not
+    // delete B's row.
+    let stale = a
+        .try_acquire(TASK, "acme:other", fleet)
+        .await
+        .expect("acquire")
+        .expect("A leads");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let _b_holds = b
+        .try_acquire_for_period(TASK, "acme:other", fleet, hold)
+        .await
+        .expect("acquire")
+        .expect("A's row expired");
+    stale.release_and_free().await.expect("free");
+    assert!(
+        a.try_acquire(TASK, "acme:other", fleet)
+            .await
+            .expect("acquire")
+            .is_none(),
+        "B still holds the key"
+    );
+}

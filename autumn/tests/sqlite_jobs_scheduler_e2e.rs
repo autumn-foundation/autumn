@@ -1988,3 +1988,71 @@ async fn sqlite_fixed_delay_tick_stays_claimed_for_its_delay() {
         "with no period, the row frees after the TTL"
     );
 }
+
+/// Issue #3052: a constant key used as a mutex (ACME issuance).
+/// `release_and_free` frees it at once, and only the caller's own row.
+#[tokio::test]
+async fn sqlite_release_and_free_frees_only_its_own_row() {
+    use chrono::TimeZone as _;
+    use scheduler::SchedulerCoordinator as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let clock = autumn_web::time::TickingClock::starting_at(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid date"),
+    );
+    let pool = build_sqlite_pool(&tmp);
+    let build = |replica: &str| {
+        scheduler::SqliteLeaseSchedulerCoordinator::new(
+            pool.clone(),
+            replica,
+            "app:scheduler",
+            Duration::from_secs(10),
+            Arc::new(clock.clone()),
+        )
+    };
+    let (a, b) = (build("replica-a"), build("replica-b"));
+    let fleet = TaskCoordination::Fleet;
+
+    let lease = a
+        .try_acquire("acme", "acme:cert", fleet)
+        .await
+        .expect("acquire")
+        .expect("A leads");
+    assert!(
+        b.try_acquire("acme", "acme:cert", fleet)
+            .await
+            .expect("acquire")
+            .is_none()
+    );
+    lease.release_and_free().await.expect("free");
+    assert!(
+        b.try_acquire("acme", "acme:cert", fleet)
+            .await
+            .expect("acquire")
+            .is_some(),
+        "a freed key is free at once"
+    );
+
+    let stale = a
+        .try_acquire("acme", "acme:other", fleet)
+        .await
+        .expect("acquire")
+        .expect("A leads");
+    clock.advance(Duration::from_secs(60));
+    let _b_holds = b
+        .try_acquire("acme", "acme:other", fleet)
+        .await
+        .expect("acquire")
+        .expect("A's row expired");
+    stale.release_and_free().await.expect("free");
+    assert!(
+        a.try_acquire("acme", "acme:other", fleet)
+            .await
+            .expect("acquire")
+            .is_none(),
+        "B still holds the key"
+    );
+}
