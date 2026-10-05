@@ -275,7 +275,7 @@ sole_active() {
 # provisioned and no other revision is active. Stage 2 then removes the
 # identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local live status state latest revision body containers source first patch
+  local live status state latest revision body containers source active first patch
   live=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -283,16 +283,19 @@ remove_credentials() {
   # Stage 1 starts from the active revision's containers. After a canceled
   # first cutover, the app template has the real image, which cannot start
   # without its secrets; the active revision still runs the placeholder.
-  source=$(jq -c '.properties.template.containers' <<< "$APP")
+  # The script reads the complete template of that revision: its scale
+  # rules and volumes can also refer to a secret.
+  active=$(jq -c '.properties.template' <<< "$APP")
   read -r first _ <<< "$PLACEHOLDER_REVISIONS"
   if [ -n "${first:-}" ]; then
-    source=$(az containerapp revision show \
+    active=$(az containerapp revision show \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
       --revision "$first" \
-      --query properties.template.containers \
+      --query properties.template \
       --output json) || return 1
   fi
+  source=$(jq -c '.containers' <<< "$active")
   # The stage 1 containers: no env var that refers to a managed secret (in
   # any container), and not the four env vars that this script sets.
   containers=$(jq -c "$APP_C"'
@@ -309,12 +312,13 @@ remove_credentials() {
     echo "::error::a scale rule or volume of $AZURE_APP_NAME uses a managed secret. Remove that reference, then run the script again." >&2
     return 1
   fi
-  # Stage 1 runs when the desired template or the active revision refers to
-  # a managed secret. If only the active revision does, an earlier run sent
-  # the stage 1 PATCH already: the script waits for that revision instead.
+  # Stage 1 runs when the desired template or the active revision (in a
+  # container, a scale rule or a volume) refers to a managed secret. If only
+  # the active revision does, the template is clean already (an earlier
+  # run, or the operator): the script waits for the clean revision instead.
   if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null \
     || jq -e '[.. | objects | .secretRef? // empty]
-              | any(IN("database-url", "signing-secret", "redis-url"))' <<< "$source" > /dev/null; then
+              | any(IN("database-url", "signing-secret", "redis-url"))' <<< "$active" > /dev/null; then
     status=$(az containerapp show \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
