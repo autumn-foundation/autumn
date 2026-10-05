@@ -3331,8 +3331,8 @@ esac
         )
     }
 
-    /// [`run_azure_cutover`] with script arguments. With arguments, the
-    /// script gets no `IMAGE_TAG`.
+    /// [`run_azure_cutover`] with script arguments. With
+    /// `--remove-credentials`, the script gets no `IMAGE_TAG`.
     #[cfg(unix)]
     fn run_azure_cutover_with_args(
         args: &[&str],
@@ -3393,7 +3393,7 @@ esac
             .env_remove("STUB_SCALE_SECRET_REF")
             .env_remove("STUB_ACTIVE_IMAGE")
             .env_remove("STUB_PATCH_PENDING");
-        if !args.is_empty() {
+        if args.contains(&"--remove-credentials") {
             command.env_remove("IMAGE_TAG");
         }
         command.envs(extra_env.iter().copied());
@@ -3774,6 +3774,33 @@ esac
         assert!(status.success(), "{calls}");
         let restart_at = calls.find("revision restart").expect("restart");
         assert!(full_reads_after_patch(&calls[..restart_at]) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_using_redis_before_terraform_removes_it() {
+        // To turn Redis off, the app must stop using it while the cache
+        // and the job's redis-url still exist. Terraform deletes them after.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[("STUB_APP_REDIS", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(!patches[0].contains("AUTUMN_CACHE__"), "{}", patches[0]);
+        assert!(
+            patches[0].contains("\"redis-url\""),
+            "the old revision still uses redis-url: {}",
+            patches[0]
+        );
+        assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
     }
 
     #[cfg(unix)]
