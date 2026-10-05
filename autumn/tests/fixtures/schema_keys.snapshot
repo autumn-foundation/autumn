@@ -271,11 +271,14 @@ reporting.sample_rate
 resilience
 resilience.circuit_breaker
 resilience.circuit_breaker.defaults
+resilience.circuit_breaker.defaults.cancelled_call_outcome
 resilience.circuit_breaker.defaults.failure_ratio_threshold
 resilience.circuit_breaker.defaults.half_open_trial_count
 resilience.circuit_breaker.defaults.minimum_sample_count
 resilience.circuit_breaker.defaults.open_duration_secs
 resilience.circuit_breaker.defaults.sample_window_secs
+resilience.circuit_breaker.defaults.slow_call_duration_threshold_ms
+resilience.circuit_breaker.defaults.slow_call_rate_threshold
 resilience.circuit_breaker.hosts
 retention
 retention.audit_archives

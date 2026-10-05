@@ -151,6 +151,43 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Resilience: `CircuitBreakerPolicy` has slow-call fields
+
+**Why:** The breaker opened on failures only. A dependency that became slow
+but did not fail did not open it (issue #3060).
+
+**Before (`{X.Y}`):**
+
+```rust
+let policy = CircuitBreakerPolicy {
+    failure_ratio_threshold: 0.5,
+    sample_window: Duration::from_secs(10),
+    minimum_sample_count: 10,
+    open_duration: Duration::from_secs(60),
+    half_open_trial_count: 3,
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let policy = CircuitBreakerPolicy {
+    failure_ratio_threshold: 0.5,
+    sample_window: Duration::from_secs(10),
+    minimum_sample_count: 10,
+    open_duration: Duration::from_secs(60),
+    half_open_trial_count: 3,
+    ..CircuitBreakerPolicy::default()
+};
+```
+
+The defaults are a 60 s slow-call threshold, a slow-call rate threshold of
+`1.0`, and `CancelledCallOutcome::Slow`. Set `slow_call_duration_threshold:
+None` to keep the old behaviour.
+
+**Automation:** `manual` - each struct literal needs a value for the new
+fields, and the choice changes when the breaker opens.
+
 ---
 
 ## Plugin authors

@@ -40,6 +40,43 @@ impl CircuitState {
     }
 }
 
+/// What a call cancelled at or after the slow-call threshold counts as.
+///
+/// A call cancelled before the threshold counts as nothing: the caller left,
+/// and the dependency was not slow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelledCallOutcome {
+    /// A slow call that did not fail.
+    #[default]
+    Slow,
+    /// A slow call that failed.
+    Failure,
+}
+
+impl CancelledCallOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Slow => "slow",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+impl std::str::FromStr for CancelledCallOutcome {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "slow" => Ok(Self::Slow),
+            "failure" => Ok(Self::Failure),
+            other => Err(format!(
+                "unknown cancelled_call_outcome {other:?}: use \"slow\" or \"failure\""
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerPolicy {
     pub failure_ratio_threshold: f64,
@@ -47,6 +84,13 @@ pub struct CircuitBreakerPolicy {
     pub minimum_sample_count: u64,
     pub open_duration: Duration,
     pub half_open_trial_count: u64,
+    /// A call that takes this long or longer is slow. `None` turns slow-call
+    /// detection off.
+    pub slow_call_duration_threshold: Option<Duration>,
+    /// The breaker opens when this share of calls in the window is slow.
+    pub slow_call_rate_threshold: f64,
+    /// What a call cancelled at or after the slow-call threshold counts as.
+    pub cancelled_call_outcome: CancelledCallOutcome,
 }
 
 impl Default for CircuitBreakerPolicy {
@@ -57,6 +101,9 @@ impl Default for CircuitBreakerPolicy {
             minimum_sample_count: 10,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 3,
+            slow_call_duration_threshold: Some(Duration::from_secs(60)),
+            slow_call_rate_threshold: 1.0,
+            cancelled_call_outcome: CancelledCallOutcome::Slow,
         }
     }
 }
@@ -64,42 +111,58 @@ impl Default for CircuitBreakerPolicy {
 impl CircuitBreakerPolicy {
     pub fn from_config(rc: &crate::config::ResilienceConfig, name: &str) -> Self {
         let mut policy = Self::default();
-        let defs = &rc.circuit_breaker.defaults;
-        if let Some(ratio) = defs.failure_ratio_threshold {
-            policy.failure_ratio_threshold = ratio.clamp(0.000_1, 1.0);
-        }
-        if let Some(window) = defs.sample_window_secs {
-            policy.sample_window = Duration::from_secs(window);
-        }
-        if let Some(count) = defs.minimum_sample_count {
-            policy.minimum_sample_count = count;
-        }
-        if let Some(duration) = defs.open_duration_secs {
-            policy.open_duration = Duration::from_secs(duration);
-        }
-        if let Some(trials) = defs.half_open_trial_count {
-            policy.half_open_trial_count = trials.max(1);
-        }
-
+        policy.apply(&rc.circuit_breaker.defaults);
         if let Some(host_cfg) = rc.circuit_breaker.hosts.get(name) {
-            if let Some(ratio) = host_cfg.failure_ratio_threshold {
-                policy.failure_ratio_threshold = ratio.clamp(0.000_1, 1.0);
-            }
-            if let Some(window) = host_cfg.sample_window_secs {
-                policy.sample_window = Duration::from_secs(window);
-            }
-            if let Some(count) = host_cfg.minimum_sample_count {
-                policy.minimum_sample_count = count;
-            }
-            if let Some(duration) = host_cfg.open_duration_secs {
-                policy.open_duration = Duration::from_secs(duration);
-            }
-            if let Some(trials) = host_cfg.half_open_trial_count {
-                policy.half_open_trial_count = trials.max(1);
-            }
+            policy.apply(host_cfg);
         }
         policy
     }
+
+    /// Sets each field that `cfg` sets.
+    fn apply(&mut self, cfg: &crate::config::CircuitBreakerPolicyConfig) {
+        if let Some(ratio) = cfg.failure_ratio_threshold {
+            self.failure_ratio_threshold = clamp_ratio(ratio);
+        }
+        if let Some(window) = cfg.sample_window_secs {
+            self.sample_window = Duration::from_secs(window);
+        }
+        if let Some(count) = cfg.minimum_sample_count {
+            self.minimum_sample_count = count;
+        }
+        if let Some(duration) = cfg.open_duration_secs {
+            self.open_duration = Duration::from_secs(duration);
+        }
+        if let Some(trials) = cfg.half_open_trial_count {
+            self.half_open_trial_count = trials.max(1);
+        }
+        if let Some(ms) = cfg.slow_call_duration_threshold_ms {
+            self.slow_call_duration_threshold = (ms > 0).then(|| Duration::from_millis(ms));
+        }
+        if let Some(ratio) = cfg.slow_call_rate_threshold {
+            self.slow_call_rate_threshold = clamp_ratio(ratio);
+        }
+        if let Some(outcome) = cfg.cancelled_call_outcome {
+            self.cancelled_call_outcome = outcome;
+        }
+    }
+
+    /// Clamps both ratio thresholds into `(0, 1]`.
+    fn clamped(mut self) -> Self {
+        self.failure_ratio_threshold = clamp_ratio(self.failure_ratio_threshold);
+        self.slow_call_rate_threshold = clamp_ratio(self.slow_call_rate_threshold);
+        self
+    }
+
+    /// True when a call that took `elapsed` is slow.
+    fn is_slow(&self, elapsed: Duration) -> bool {
+        self.slow_call_duration_threshold
+            .is_some_and(|threshold| elapsed >= threshold)
+    }
+}
+
+/// A ratio threshold of `0` would trip on every call, so the floor is above it.
+fn clamp_ratio(ratio: f64) -> f64 {
+    ratio.clamp(0.000_1, 1.0)
 }
 
 #[derive(Debug, Error)]
@@ -108,6 +171,113 @@ pub enum CircuitBreakerError<E> {
     Open,
     #[error("execution failed: {0}")]
     Execution(E),
+}
+
+/// The number of buckets in a [`SampleWindow`].
+pub(crate) const WINDOW_BUCKETS: usize = 10;
+
+/// Call counters for one bucket or for the full window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WindowCounts {
+    pub(crate) total: u64,
+    pub(crate) failed: u64,
+    pub(crate) slow: u64,
+}
+
+impl WindowCounts {
+    fn add(&mut self, other: Self) {
+        self.total = self.total.saturating_add(other.total);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.slow = self.slow.saturating_add(other.slow);
+    }
+
+    pub(crate) fn failure_ratio(self) -> f64 {
+        ratio(self.failed, self.total)
+    }
+
+    pub(crate) fn slow_call_ratio(self) -> f64 {
+        ratio(self.slow, self.total)
+    }
+}
+
+fn ratio(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 / total as f64
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Bucket {
+    /// The time slice this bucket holds: `(now - origin) / width`.
+    epoch: u64,
+    counts: WindowCounts,
+}
+
+/// A fixed ring of counter buckets over the sample window.
+///
+/// Each bucket holds the calls that ended in one slice of
+/// `window / WINDOW_BUCKETS`. The window is the current slice and the
+/// `WINDOW_BUCKETS - 1` slices before it. Memory does not change with the
+/// call rate.
+#[derive(Debug, Clone)]
+pub(crate) struct SampleWindow {
+    origin: Instant,
+    width_nanos: u128,
+    buckets: [Bucket; WINDOW_BUCKETS],
+}
+
+impl SampleWindow {
+    pub(crate) fn new(window: Duration, origin: Instant) -> Self {
+        Self {
+            origin,
+            width_nanos: (window.as_nanos() / WINDOW_BUCKETS as u128).max(1),
+            buckets: [Bucket::default(); WINDOW_BUCKETS],
+        }
+    }
+
+    fn epoch(&self, now: Instant) -> u64 {
+        let slice = now.saturating_duration_since(self.origin).as_nanos() / self.width_nanos;
+        u64::try_from(slice).unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn record(&mut self, now: Instant, failed: bool, slow: bool) {
+        let epoch = self.epoch(now);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the modulus is < WINDOW_BUCKETS"
+        )]
+        let bucket = &mut self.buckets[(epoch % WINDOW_BUCKETS as u64) as usize];
+        if bucket.epoch != epoch {
+            *bucket = Bucket {
+                epoch,
+                counts: WindowCounts::default(),
+            };
+        }
+        bucket.counts.add(WindowCounts {
+            total: 1,
+            failed: u64::from(failed),
+            slow: u64::from(slow),
+        });
+    }
+
+    pub(crate) fn counts(&self, now: Instant) -> WindowCounts {
+        let epoch = self.epoch(now);
+        let mut sum = WindowCounts::default();
+        for bucket in &self.buckets {
+            // A bucket with a later epoch than `now` is stale: the clock went
+            // back. Skip it.
+            if bucket.epoch <= epoch && epoch - bucket.epoch < WINDOW_BUCKETS as u64 {
+                sum.add(bucket.counts);
+            }
+        }
+        sum
+    }
+
+    pub(crate) fn reset(&mut self, window: Duration, origin: Instant) {
+        *self = Self::new(window, origin);
+    }
 }
 
 #[derive(Clone)]
@@ -122,84 +292,144 @@ pub struct CircuitBreaker {
 
 pub(crate) struct CircuitBreakerInner {
     pub(crate) state: CircuitState,
-    pub(crate) history: Vec<(Instant, bool)>,
+    pub(crate) window: SampleWindow,
     pub(crate) open_until: Option<Instant>,
     pub(crate) half_open_successes: u64,
     pub(crate) half_open_failures: u64,
     pub(crate) half_open_in_flight: u64,
     pub(crate) config: CircuitBreakerPolicy,
+    /// Slow calls since the breaker was made, in all states.
+    pub(crate) slow_calls_total: u64,
 }
 
 impl CircuitBreakerInner {
-    fn clean_history(&mut self, window: Duration, now: Instant) {
-        let cutoff = now.checked_sub(window).unwrap_or(now);
-        self.history.retain(|(t, _)| *t >= cutoff);
-    }
-
-    fn failure_ratio(&self) -> f64 {
-        if self.history.is_empty() {
-            return 0.0;
+    /// Moves an expired `Open` breaker to `HalfOpen`.
+    fn half_open_if_due(&mut self, name: &str, now: Instant) {
+        if self.state == CircuitState::Open && self.open_until.is_some_and(|until| now >= until) {
+            self.half_open_successes = 0;
+            self.half_open_failures = 0;
+            self.half_open_in_flight = 0;
+            self.open_until = None;
+            self.transition_to(name, CircuitState::HalfOpen, 1.0, 0.0);
         }
-        let failures = self.history.iter().filter(|(_, ok)| !*ok).count();
-        failures as f64 / self.history.len() as f64
     }
 
     /// Records a state transition and logs it.
     ///
     /// Must be the *last* mutation of every transition: callers set all
-    /// associated fields (`open_until`, half-open counters, history) before
+    /// associated fields (`open_until`, half-open counters, window) before
     /// calling this. The `tracing` call below can panic in a user-provided
     /// subscriber, and because [`CircuitBreaker::lock_inner`] recovers
     /// poisoned state, a mid-transition panic must still leave the breaker
     /// fully consistent (the state write below precedes the log, so the new
     /// state is complete by the time anything can panic).
-    fn transition_to(&mut self, name: &str, new_state: CircuitState, failure_ratio: f64) {
+    fn transition_to(
+        &mut self,
+        name: &str,
+        new_state: CircuitState,
+        failure_ratio: f64,
+        slow_call_ratio: f64,
+    ) {
         let old_state = self.state;
         self.state = new_state;
         tracing::info!(
             circuit.name = name,
             circuit.state = new_state.as_str(),
             circuit.failure_ratio = failure_ratio,
+            circuit.slow_call_ratio = slow_call_ratio,
             "circuit breaker state transition from {:?} to {:?}",
             old_state,
             new_state
         );
     }
+
+    /// Counts one finished or cancelled call, and trips or closes the breaker.
+    fn record(&mut self, name: &str, now: Instant, failed: bool, slow: bool) {
+        if slow {
+            self.slow_calls_total = self.slow_calls_total.saturating_add(1);
+        }
+        match self.state {
+            CircuitState::Closed => {
+                self.window.record(now, failed, slow);
+                let counts = self.window.counts(now);
+                if counts.total < self.config.minimum_sample_count {
+                    return;
+                }
+                let failure_ratio = counts.failure_ratio();
+                let slow_call_ratio = counts.slow_call_ratio();
+                let too_slow = self.config.slow_call_duration_threshold.is_some()
+                    && slow_call_ratio >= self.config.slow_call_rate_threshold;
+                if failure_ratio >= self.config.failure_ratio_threshold || too_slow {
+                    self.open_until = Some(crate::time_math::saturating_deadline(
+                        now,
+                        self.config.open_duration,
+                    ));
+                    self.transition_to(name, CircuitState::Open, failure_ratio, slow_call_ratio);
+                }
+            }
+            CircuitState::HalfOpen => {
+                self.half_open_in_flight = self.half_open_in_flight.saturating_sub(1);
+                // A slow trial is a failed trial: the dependency has not
+                // recovered.
+                if failed || slow {
+                    self.half_open_failures += 1;
+                    self.open_until = Some(crate::time_math::saturating_deadline(
+                        now,
+                        self.config.open_duration,
+                    ));
+                    let failure_ratio = if failed { 1.0 } else { 0.0 };
+                    let slow_call_ratio = if slow { 1.0 } else { 0.0 };
+                    self.transition_to(name, CircuitState::Open, failure_ratio, slow_call_ratio);
+                } else {
+                    self.half_open_successes += 1;
+                    if self.half_open_successes >= self.config.half_open_trial_count {
+                        let window = self.config.sample_window;
+                        self.window.reset(window, now);
+                        self.transition_to(name, CircuitState::Closed, 0.0, 0.0);
+                    }
+                }
+            }
+            CircuitState::Open => {}
+        }
+    }
 }
 
 impl CircuitBreaker {
-    pub fn new(name: impl Into<String>, mut config: CircuitBreakerPolicy) -> Self {
-        config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
+    pub fn new(name: impl Into<String>, config: CircuitBreakerPolicy) -> Self {
+        Self::with_clock(name, config, false)
+    }
+
+    /// A breaker on the system clock. See the `system_clock` field.
+    fn new_on_system_clock(name: impl Into<String>, config: CircuitBreakerPolicy) -> Self {
+        Self::with_clock(name, config, true)
+    }
+
+    fn with_clock(
+        name: impl Into<String>,
+        config: CircuitBreakerPolicy,
+        system_clock: bool,
+    ) -> Self {
+        let config = config.clamped();
+        let origin = read_clock(system_clock);
         Self {
             name: name.into(),
             inner: Arc::new(Mutex::new(CircuitBreakerInner {
                 state: CircuitState::Closed,
-                history: Vec::new(),
+                window: SampleWindow::new(config.sample_window, origin),
                 open_until: None,
                 half_open_successes: 0,
                 half_open_failures: 0,
                 half_open_in_flight: 0,
                 config,
+                slow_calls_total: 0,
             })),
-            system_clock: false,
-        }
-    }
-
-    /// A breaker on the system clock. See the `system_clock` field.
-    fn new_on_system_clock(name: impl Into<String>, config: CircuitBreakerPolicy) -> Self {
-        Self {
-            system_clock: true,
-            ..Self::new(name, config)
+            system_clock,
         }
     }
 
     /// The current instant on this breaker's clock.
     fn now(&self) -> Instant {
-        if self.system_clock {
-            crate::time::system_instant()
-        } else {
-            crate::time::ambient_instant()
-        }
+        read_clock(self.system_clock)
     }
 
     pub fn name(&self) -> &str {
@@ -208,28 +438,18 @@ impl CircuitBreaker {
 
     /// Locks the inner state, recovering from a poisoned mutex.
     ///
-    /// Circuit breaker state is simple and self-correcting (a sliding sample
-    /// window plus counters), so the data behind a poisoned lock is still
-    /// safe to use. Recovering here keeps a single panicking lock holder from
-    /// permanently poisoning the breaker and panicking every subsequent call.
+    /// Circuit breaker state is simple and self-correcting (a ring of window
+    /// counters plus state counters), so the data behind a poisoned lock is
+    /// still safe to use. Recovering here keeps a single panicking lock
+    /// holder from permanently poisoning the breaker and panicking every
+    /// subsequent call.
     fn lock_inner(&self) -> MutexGuard<'_, CircuitBreakerInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn state(&self) -> CircuitState {
         let mut inner = self.lock_inner();
-        let now = self.now();
-        if inner.state == CircuitState::Open {
-            if let Some(until) = inner.open_until {
-                if now >= until {
-                    inner.half_open_successes = 0;
-                    inner.half_open_failures = 0;
-                    inner.half_open_in_flight = 0;
-                    inner.open_until = None;
-                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
-                }
-            }
-        }
+        inner.half_open_if_due(&self.name, self.now());
         inner.state
     }
 
@@ -238,35 +458,42 @@ impl CircuitBreaker {
         inner.config.clone()
     }
 
-    pub fn update_config(&self, mut config: CircuitBreakerPolicy) {
-        config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
+    /// Replaces the policy. A new `sample_window` clears the window, because
+    /// the bucket width changes.
+    pub fn update_config(&self, config: CircuitBreakerPolicy) {
+        let config = config.clamped();
+        let now = self.now();
         let mut inner = self.lock_inner();
+        if inner.config.sample_window != config.sample_window {
+            inner.window.reset(config.sample_window, now);
+        }
         inner.config = config;
     }
 
+    fn window_counts(&self) -> WindowCounts {
+        let now = self.now();
+        self.lock_inner().window.counts(now)
+    }
+
     pub fn failure_ratio(&self) -> f64 {
-        let mut inner = self.lock_inner();
-        let window = inner.config.sample_window;
-        inner.clean_history(window, self.now());
-        inner.failure_ratio()
+        self.window_counts().failure_ratio()
+    }
+
+    /// The share of slow calls in the current window.
+    pub fn slow_call_ratio(&self) -> f64 {
+        self.window_counts().slow_call_ratio()
+    }
+
+    /// Slow calls since the breaker was made. Cancelled slow calls are
+    /// included.
+    pub fn slow_calls_total(&self) -> u64 {
+        self.lock_inner().slow_calls_total
     }
 
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
         let mut inner = self.lock_inner();
-        let now = self.now();
-
-        if inner.state == CircuitState::Open {
-            if let Some(until) = inner.open_until {
-                if now >= until {
-                    inner.half_open_successes = 0;
-                    inner.half_open_failures = 0;
-                    inner.half_open_in_flight = 0;
-                    inner.open_until = None;
-                    inner.transition_to(&self.name, CircuitState::HalfOpen, 1.0);
-                }
-            }
-        }
+        inner.half_open_if_due(&self.name, self.now());
 
         match inner.state {
             CircuitState::Open => Err(CircuitBreakerError::Open),
@@ -283,50 +510,30 @@ impl CircuitBreaker {
         }
     }
 
+    /// Counts a finished call that was not slow.
+    #[cfg(test)]
     pub(crate) fn after_call(&self, success: bool) {
-        let mut inner = self.lock_inner();
+        self.finish_call(!success, Duration::ZERO);
+    }
+
+    /// Counts a finished call that took `elapsed`.
+    fn finish_call(&self, failed: bool, elapsed: Duration) {
         let now = self.now();
-        let window = inner.config.sample_window;
-        inner.clean_history(window, now);
+        let mut inner = self.lock_inner();
+        let slow = inner.config.is_slow(elapsed);
+        inner.record(&self.name, now, failed, slow);
+    }
 
-        match inner.state {
-            CircuitState::Closed => {
-                inner.history.push((now, success));
-                let window = inner.config.sample_window;
-                inner.clean_history(window, now);
-
-                let min_sample = inner.config.minimum_sample_count;
-                let failure_ratio_threshold = inner.config.failure_ratio_threshold;
-                let open_duration = inner.config.open_duration;
-                if inner.history.len() as u64 >= min_sample {
-                    let ratio = inner.failure_ratio();
-                    if ratio >= failure_ratio_threshold {
-                        inner.open_until =
-                            Some(crate::time_math::saturating_deadline(now, open_duration));
-                        inner.transition_to(&self.name, CircuitState::Open, ratio);
-                    }
-                }
-            }
-            CircuitState::HalfOpen => {
-                if inner.half_open_in_flight > 0 {
-                    inner.half_open_in_flight -= 1;
-                }
-                let trial_count = inner.config.half_open_trial_count;
-                let open_duration = inner.config.open_duration;
-                if success {
-                    inner.half_open_successes += 1;
-                    if inner.half_open_successes >= trial_count {
-                        inner.history.clear();
-                        inner.transition_to(&self.name, CircuitState::Closed, 0.0);
-                    }
-                } else {
-                    inner.half_open_failures += 1;
-                    inner.open_until =
-                        Some(crate::time_math::saturating_deadline(now, open_duration));
-                    inner.transition_to(&self.name, CircuitState::Open, 1.0);
-                }
-            }
-            CircuitState::Open => {}
+    /// Counts a call that was dropped after `elapsed`, before it finished.
+    fn cancel_call(&self, elapsed: Duration) {
+        let now = self.now();
+        let mut inner = self.lock_inner();
+        if inner.config.is_slow(elapsed) {
+            let failed = inner.config.cancelled_call_outcome == CancelledCallOutcome::Failure;
+            inner.record(&self.name, now, failed, true);
+        } else if inner.state == CircuitState::HalfOpen {
+            // Not slow: count nothing, but free the half-open slot.
+            inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
         }
     }
 
@@ -359,39 +566,51 @@ impl CircuitBreaker {
     }
 }
 
+/// The current instant on the system clock or the ambient clock.
+fn read_clock(system_clock: bool) -> Instant {
+    if system_clock {
+        crate::time::system_instant()
+    } else {
+        crate::time::ambient_instant()
+    }
+}
+
+/// Counts one call. It keeps the start instant, so the breaker can see a slow
+/// call. Drop it before `success` or `failure` to count a cancelled call.
 pub struct CircuitBreakerGuard {
     breaker: CircuitBreaker,
+    started: Instant,
     completed: bool,
 }
 
 impl CircuitBreakerGuard {
     pub fn new(breaker: CircuitBreaker) -> Self {
         Self {
+            started: breaker.now(),
             breaker,
             completed: false,
         }
     }
 
+    fn elapsed(&self) -> Duration {
+        self.breaker.now().saturating_duration_since(self.started)
+    }
+
     pub fn success(mut self) {
         self.completed = true;
-        self.breaker.after_call(true);
+        self.breaker.finish_call(false, self.elapsed());
     }
 
     pub fn failure(mut self) {
         self.completed = true;
-        self.breaker.after_call(false);
+        self.breaker.finish_call(true, self.elapsed());
     }
 }
 
 impl Drop for CircuitBreakerGuard {
     fn drop(&mut self) {
         if !self.completed {
-            let mut inner = self.breaker.lock_inner();
-            if inner.state == CircuitState::HalfOpen {
-                if inner.half_open_in_flight > 0 {
-                    inner.half_open_in_flight -= 1;
-                }
-            }
+            self.breaker.cancel_call(self.elapsed());
         }
     }
 }
@@ -596,6 +815,7 @@ mod tests {
             minimum_sample_count: 5,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..CircuitBreakerPolicy::default()
         };
         let breaker = CircuitBreaker::new("test", policy);
         assert_eq!(breaker.state(), CircuitState::Closed);
@@ -630,6 +850,7 @@ mod tests {
             minimum_sample_count: 5,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..CircuitBreakerPolicy::default()
         };
         let breaker = CircuitBreaker::new("tower_test", policy);
 
@@ -681,6 +902,7 @@ mod tests {
                     minimum_sample_count: None,
                     open_duration_secs: None,
                     half_open_trial_count: Some(0),
+                    ..Default::default()
                 },
                 hosts: {
                     let mut m = std::collections::HashMap::new();
@@ -692,6 +914,7 @@ mod tests {
                             minimum_sample_count: None,
                             open_duration_secs: None,
                             half_open_trial_count: Some(0),
+                            ..Default::default()
                         },
                     );
                     m
@@ -717,6 +940,7 @@ mod tests {
             minimum_sample_count: 5,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..CircuitBreakerPolicy::default()
         };
         let breaker = CircuitBreaker::new("tower_cancel_test", policy);
 
@@ -768,6 +992,7 @@ mod tests {
             minimum_sample_count: 5,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..CircuitBreakerPolicy::default()
         };
         let breaker = CircuitBreaker::new("clamp_test", policy);
         let config = breaker.config();
@@ -791,6 +1016,7 @@ mod tests {
             minimum_sample_count: 2,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 1,
+            ..CircuitBreakerPolicy::default()
         };
         let breaker = CircuitBreaker::new("fallback_test", policy);
 
@@ -895,6 +1121,7 @@ mod tests {
             minimum_sample_count: 1,
             open_duration: Duration::ZERO,
             half_open_trial_count: 1,
+            ..CircuitBreakerPolicy::default()
         };
         // Panic mid-transition (Closed -> Open) while holding the lock; this
         // both poisons the mutex and interrupts `transition_to`.
@@ -939,5 +1166,313 @@ mod tests {
         assert!(breaker.before_call().is_ok());
         breaker.after_call(true);
         assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    /// A policy that opens on slow calls only.
+    fn slow_policy(threshold: Duration) -> CircuitBreakerPolicy {
+        CircuitBreakerPolicy {
+            minimum_sample_count: 2,
+            slow_call_duration_threshold: Some(threshold),
+            slow_call_rate_threshold: 0.5,
+            ..CircuitBreakerPolicy::default()
+        }
+    }
+
+    /// A guard that started `ago` before now.
+    fn guard_started(breaker: &CircuitBreaker, ago: Duration) -> CircuitBreakerGuard {
+        let mut guard = CircuitBreakerGuard::new(breaker.clone());
+        guard.started = guard.started.checked_sub(ago).expect("instant in range");
+        guard
+    }
+
+    #[test]
+    fn slow_successes_open_the_breaker() {
+        let breaker = CircuitBreaker::new("slow_ok", slow_policy(Duration::from_secs(5)));
+        guard_started(&breaker, Duration::from_secs(10)).success();
+        assert_eq!(breaker.state(), CircuitState::Closed, "1 of 2 samples");
+        guard_started(&breaker, Duration::from_secs(10)).success();
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert!((breaker.slow_call_ratio() - 1.0).abs() < f64::EPSILON);
+        assert!(breaker.failure_ratio() < f64::EPSILON);
+        assert_eq!(breaker.slow_calls_total(), 2);
+    }
+
+    #[test]
+    fn fast_calls_are_not_slow() {
+        let breaker = CircuitBreaker::new("fast_ok", slow_policy(Duration::from_secs(5)));
+        for _ in 0..4 {
+            guard_started(&breaker, Duration::from_secs(1)).success();
+        }
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert_eq!(breaker.slow_calls_total(), 0);
+    }
+
+    #[test]
+    fn no_threshold_turns_slow_detection_off() {
+        let policy = CircuitBreakerPolicy {
+            slow_call_duration_threshold: None,
+            ..slow_policy(Duration::ZERO)
+        };
+        let breaker = CircuitBreaker::new("slow_off", policy);
+        for _ in 0..4 {
+            guard_started(&breaker, Duration::from_secs(3600)).success();
+        }
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert_eq!(breaker.slow_calls_total(), 0);
+    }
+
+    #[test]
+    fn cancelled_slow_call_counts_as_slow() {
+        let breaker = CircuitBreaker::new("cancel_slow", slow_policy(Duration::from_secs(5)));
+        drop(guard_started(&breaker, Duration::from_secs(5)));
+        drop(guard_started(&breaker, Duration::from_secs(30)));
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert!(breaker.failure_ratio() < f64::EPSILON, "slow, not failed");
+        assert_eq!(breaker.slow_calls_total(), 2);
+    }
+
+    #[test]
+    fn cancelled_slow_call_counts_as_failure_when_configured() {
+        let policy = CircuitBreakerPolicy {
+            slow_call_rate_threshold: 1.0,
+            minimum_sample_count: 3,
+            cancelled_call_outcome: CancelledCallOutcome::Failure,
+            ..slow_policy(Duration::from_secs(5))
+        };
+        let breaker = CircuitBreaker::new("cancel_fail", policy);
+        guard_started(&breaker, Duration::ZERO).success();
+        drop(guard_started(&breaker, Duration::from_secs(30)));
+        assert!((breaker.failure_ratio() - 0.5).abs() < f64::EPSILON);
+        assert!((breaker.slow_call_ratio() - 0.5).abs() < f64::EPSILON);
+        drop(guard_started(&breaker, Duration::from_secs(30)));
+        assert_eq!(breaker.state(), CircuitState::Open, "failure ratio 2/3");
+    }
+
+    #[test]
+    fn cancelled_fast_call_counts_nothing() {
+        let breaker = CircuitBreaker::new("cancel_fast", slow_policy(Duration::from_secs(5)));
+        for _ in 0..4 {
+            drop(guard_started(&breaker, Duration::from_secs(1)));
+        }
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        assert_eq!(breaker.lock_inner().window.counts(breaker.now()).total, 0);
+    }
+
+    #[test]
+    fn dropped_tower_future_counts_as_slow_after_threshold() {
+        use tower::{Layer, Service};
+        struct Hang;
+        impl tower::Service<()> for Hang {
+            type Response = ();
+            type Error = ();
+            type Future = std::future::Pending<Result<(), ()>>;
+            fn poll_ready(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), ()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, (): ()) -> Self::Future {
+                std::future::pending()
+            }
+        }
+
+        let breaker = CircuitBreaker::new("tower_slow", slow_policy(Duration::from_secs(5)));
+        let mut svc = CircuitBreakerLayer::new(breaker.clone()).layer(Hang);
+        for _ in 0..2 {
+            let mut fut = svc.call(());
+            if let CircuitBreakerServiceFuture::Executing { guard, .. } = &mut fut {
+                let g = guard.as_mut().expect("guard");
+                g.started = g.started.checked_sub(Duration::from_secs(6)).unwrap();
+            }
+            drop(fut);
+        }
+        assert_eq!(breaker.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn slow_half_open_trial_opens_the_breaker_again() {
+        let breaker = CircuitBreaker::new("half_open_slow", slow_policy(Duration::from_secs(5)));
+        breaker.lock_inner().state = CircuitState::HalfOpen;
+        breaker.before_call().expect("trial slot");
+        guard_started(&breaker, Duration::from_secs(10)).success();
+        assert_eq!(breaker.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn slow_cancelled_half_open_trial_opens_the_breaker_again() {
+        let breaker = CircuitBreaker::new("half_open_cancel", slow_policy(Duration::from_secs(5)));
+        breaker.lock_inner().state = CircuitState::HalfOpen;
+        breaker.before_call().expect("trial slot");
+        drop(guard_started(&breaker, Duration::from_secs(10)));
+        let inner = breaker.lock_inner();
+        assert_eq!(inner.state, CircuitState::Open);
+        assert_eq!(inner.half_open_in_flight, 0);
+    }
+
+    #[test]
+    fn new_sample_window_clears_the_window() {
+        let breaker = CircuitBreaker::new("resize", CircuitBreakerPolicy::default());
+        breaker.after_call(false);
+        assert!(breaker.failure_ratio() > 0.0);
+        breaker.update_config(CircuitBreakerPolicy::default());
+        assert!(breaker.failure_ratio() > 0.0, "same window: kept");
+        breaker.update_config(CircuitBreakerPolicy {
+            sample_window: Duration::from_secs(30),
+            ..CircuitBreakerPolicy::default()
+        });
+        assert!(
+            breaker.failure_ratio() < f64::EPSILON,
+            "new window: cleared"
+        );
+    }
+
+    #[test]
+    fn policy_from_config_reads_slow_call_keys() {
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.defaults.slow_call_duration_threshold_ms = Some(2500);
+        rc.circuit_breaker.defaults.slow_call_rate_threshold = Some(0.0);
+        rc.circuit_breaker.defaults.cancelled_call_outcome = Some(CancelledCallOutcome::Failure);
+        rc.circuit_breaker.hosts.insert(
+            "off".to_owned(),
+            crate::config::CircuitBreakerPolicyConfig {
+                slow_call_duration_threshold_ms: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let policy = CircuitBreakerPolicy::from_config(&rc, "any");
+        assert_eq!(
+            policy.slow_call_duration_threshold,
+            Some(Duration::from_millis(2500))
+        );
+        assert!(policy.slow_call_rate_threshold > 0.0, "clamped above zero");
+        assert_eq!(policy.cancelled_call_outcome, CancelledCallOutcome::Failure);
+
+        let off = CircuitBreakerPolicy::from_config(&rc, "off");
+        assert_eq!(off.slow_call_duration_threshold, None, "0 turns it off");
+        assert_eq!(off.cancelled_call_outcome, CancelledCallOutcome::Failure);
+
+        let defaults = CircuitBreakerPolicy::default();
+        assert_eq!(
+            defaults.slow_call_duration_threshold,
+            Some(Duration::from_secs(60))
+        );
+        assert!((defaults.slow_call_rate_threshold - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cancelled_call_outcome_parses() {
+        assert_eq!("slow".parse(), Ok(CancelledCallOutcome::Slow));
+        assert_eq!(" Failure ".parse(), Ok(CancelledCallOutcome::Failure));
+        assert!("drop".parse::<CancelledCallOutcome>().is_err());
+    }
+
+    #[test]
+    fn zero_sample_window_does_not_divide_by_zero() {
+        let origin = Instant::now();
+        let mut window = SampleWindow::new(Duration::ZERO, origin);
+        window.record(origin, true, false);
+        assert_eq!(window.counts(origin).total, 1);
+        let later = origin + Duration::from_secs(1);
+        assert_eq!(window.counts(later).total, 0);
+    }
+
+    #[test]
+    fn window_skips_buckets_after_a_backward_clock_step() {
+        let origin = Instant::now();
+        let mut window = SampleWindow::new(Duration::from_secs(10), origin);
+        window.record(origin + Duration::from_secs(5), true, true);
+        assert_eq!(window.counts(origin + Duration::from_secs(1)).total, 0);
+    }
+
+    /// The naive model: it keeps every sample, and it puts each sample in
+    /// the same time slice as [`SampleWindow`].
+    struct ReferenceWindow {
+        origin: Instant,
+        width: Duration,
+        samples: Vec<(Instant, bool, bool)>,
+    }
+
+    impl ReferenceWindow {
+        fn slice(&self, t: Instant) -> u128 {
+            t.duration_since(self.origin).as_nanos() / self.width.as_nanos().max(1)
+        }
+
+        fn counts(&self, now: Instant) -> WindowCounts {
+            let current = self.slice(now);
+            let mut counts = WindowCounts::default();
+            for &(t, failed, slow) in &self.samples {
+                if current - self.slice(t) < WINDOW_BUCKETS as u128 {
+                    counts.total += 1;
+                    counts.failed += u64::from(failed);
+                    counts.slow += u64::from(slow);
+                }
+            }
+            counts
+        }
+
+        /// Samples younger than `age`.
+        fn younger_than(&self, now: Instant, age: Duration) -> u64 {
+            self.samples
+                .iter()
+                .filter(|(t, _, _)| now.duration_since(*t) < age)
+                .count() as u64
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn ring_window_agrees_with_reference(
+            window_secs in 1_u64..30,
+            steps in proptest::collection::vec((0_u64..4_000, proptest::bool::ANY, proptest::bool::ANY), 1..300),
+        ) {
+            let origin = Instant::now();
+            let window = Duration::from_secs(window_secs);
+            let mut ring = SampleWindow::new(window, origin);
+            let mut reference = ReferenceWindow {
+                origin,
+                width: window / WINDOW_BUCKETS as u32,
+                samples: Vec::new(),
+            };
+            let mut now = origin;
+            for (advance_ms, failed, slow) in steps {
+                now += Duration::from_millis(advance_ms);
+                ring.record(now, failed, slow);
+                reference.samples.push((now, failed, slow));
+
+                let got = ring.counts(now);
+                let want = reference.counts(now);
+                proptest::prop_assert_eq!(got, want);
+                proptest::prop_assert_eq!(got.failure_ratio().to_bits(), want.failure_ratio().to_bits());
+                proptest::prop_assert_eq!(got.slow_call_ratio().to_bits(), want.slow_call_ratio().to_bits());
+
+                // The ring holds every call younger than 9/10 of the window,
+                // and no call older than the window.
+                let width = reference.width;
+                proptest::prop_assert!(reference.younger_than(now, width * 9) <= got.total);
+                proptest::prop_assert!(got.total <= reference.younger_than(now, width * 10));
+            }
+        }
+    }
+
+    #[test]
+    fn ring_window_memory_does_not_grow_with_rate() {
+        let origin = Instant::now();
+        let mut window = SampleWindow::new(Duration::from_secs(10), origin);
+        let size = std::mem::size_of_val(&window);
+        // 10 s of calls at 100k calls per second.
+        for i in 0..1_000_000_u64 {
+            window.record(
+                origin + Duration::from_micros(i * 10),
+                i % 3 == 0,
+                i % 5 == 0,
+            );
+        }
+        assert_eq!(std::mem::size_of_val(&window), size);
+        assert_eq!(window.buckets.len(), WINDOW_BUCKETS);
+        let counts = window.counts(origin + Duration::from_secs(10));
+        assert!(counts.total <= 1_000_000);
+        assert!(counts.total > 0);
     }
 }

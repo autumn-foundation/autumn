@@ -18281,6 +18281,7 @@ mod tests {
                 minimum_sample_count: 3,
                 open_duration: Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             };
             let breaker =
                 crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
@@ -20096,6 +20097,7 @@ mod tests {
             minimum_sample_count: 3,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..crate::circuit_breaker::CircuitBreakerPolicy::default()
         };
         let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
 
