@@ -14,7 +14,9 @@ impl SupplierPlugin {
     /// The plugin with the sample catalog.
     #[must_use]
     pub fn sample() -> Self {
-        Self { catalog: Catalog::sample() }
+        Self {
+            catalog: Catalog::sample(),
+        }
     }
 }
 

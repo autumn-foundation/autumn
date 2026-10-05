@@ -23,7 +23,12 @@ async fn report_gate_sheds_a_second_report_and_then_recovers() {
         .build();
 
     // Free slot: the report runs.
-    client.get("/gated").send().await.assert_ok().assert_body_eq("report");
+    client
+        .get("/gated")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_eq("report");
 
     // Another report holds the only slot: a second caller gets 503 at once.
     let slot = hold_report_slot().expect("the slot is free");

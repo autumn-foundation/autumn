@@ -15,7 +15,9 @@ pub struct PasswordFilePool {
 impl PasswordFilePool {
     /// Read the password from `file`.
     pub fn new(file: impl AsRef<Path>) -> Self {
-        Self { file: file.as_ref().to_path_buf() }
+        Self {
+            file: file.as_ref().to_path_buf(),
+        }
     }
 }
 

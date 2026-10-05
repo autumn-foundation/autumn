@@ -55,8 +55,14 @@ async fn real_binary_wires_every_app_level_hatch() {
     let config_dir = tempfile::tempdir().expect("tempdir");
     let config = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/autumn.toml"))
         .expect("read autumn.toml");
-    let config = config.replace(r#"statement_timeout = "5s""#, r#"statement_timeout = "20ms""#);
-    assert!(config.contains("20ms"), "autumn.toml must set statement_timeout");
+    let config = config.replace(
+        r#"statement_timeout = "5s""#,
+        r#"statement_timeout = "20ms""#,
+    );
+    assert!(
+        config.contains("20ms"),
+        "autumn.toml must set statement_timeout"
+    );
     std::fs::write(config_dir.path().join("autumn.toml"), config).expect("write config");
 
     let password_path = password_file.to_str().expect("utf-8 path");
@@ -78,19 +84,31 @@ async fn real_binary_wires_every_app_level_hatch() {
     let http = reqwest::Client::new();
 
     // H12 + H7: a page that reads the database works.
-    let page = http.get(format!("{base}/products/A-1")).send().await.expect("GET product");
+    let page = http
+        .get(format!("{base}/products/A-1"))
+        .send()
+        .await
+        .expect("GET product");
     assert_eq!(page.status(), 200);
     assert_eq!(page.headers()["cache-control"], "no-store");
     assert!(page.text().await.expect("body").contains("Hammer"));
 
     // H10: the stockroom 404 page, with a link to order the SKU.
-    let missing = http.get(format!("{base}/products/ZZ-9")).send().await.expect("GET 404");
+    let missing = http
+        .get(format!("{base}/products/ZZ-9"))
+        .send()
+        .await
+        .expect("GET 404");
     assert_eq!(missing.status(), 404);
     let body = missing.text().await.expect("body");
     assert!(body.contains(r#"href="/supplier/items/ZZ-9""#), "{body}");
 
     // H11: the report times out in Postgres. The filter adds `Retry-After`.
-    let report = http.get(format!("{base}/reports/stock-value")).send().await.expect("GET report");
+    let report = http
+        .get(format!("{base}/reports/stock-value"))
+        .send()
+        .await
+        .expect("GET report");
     assert_eq!(report.status(), 503);
     assert_eq!(report.headers()["retry-after"], "2");
 }

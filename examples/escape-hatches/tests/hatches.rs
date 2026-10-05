@@ -30,7 +30,7 @@ use escape_hatches::hatches::retry_after::RetryAfterOn503;
 use escape_hatches::hatches::supplier_plugin::SupplierPlugin;
 use escape_hatches::models::{Cart, CartLine, Receipt, UpdateProduct};
 use escape_hatches::repositories::{PgProductRepository, ProductRepository};
-use escape_hatches::{supplier, scanner_guard};
+use escape_hatches::{scanner_guard, supplier};
 use serde_json::{Value, json};
 use support::{SCANNER_TOKEN, fresh_db, product, seed, stock_of};
 
@@ -38,10 +38,21 @@ use support::{SCANNER_TOKEN, fresh_db, product, seed, stock_of};
 
 /// The app as `TestApp` can build it. `app()` wires the same pieces; the
 /// `boot` test proves the parts that `TestApp` cannot reach.
-fn client(pool: Option<autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<autumn_web::RuntimeConnection>>, exports_dir: &std::path::Path) -> TestClient {
+fn client(
+    pool: Option<
+        autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+            autumn_web::RuntimeConnection,
+        >,
+    >,
+    exports_dir: &std::path::Path,
+) -> TestClient {
     let app = TestApp::new()
         .routes(escape_hatches::routes())
-        .scoped("/api", scanner_guard(Some(SCANNER_TOKEN)), escape_hatches::api_routes())
+        .scoped(
+            "/api",
+            scanner_guard(Some(SCANNER_TOKEN)),
+            escape_hatches::api_routes(),
+        )
         .nest(exports::PREFIX, exports::router(exports_dir))
         .plugin(SupplierPlugin::sample())
         .layer(escape_hatches::hatches::cache_control::no_store());
@@ -61,7 +72,10 @@ fn cart(order_ref: &str, lines: &[(&str, i32)]) -> Value {
         order_ref: order_ref.to_owned(),
         lines: lines
             .iter()
-            .map(|(sku, quantity)| CartLine { sku: (*sku).to_owned(), quantity: *quantity })
+            .map(|(sku, quantity)| CartLine {
+                sku: (*sku).to_owned(),
+                quantity: *quantity
+            })
             .collect(),
     })
 }
@@ -123,7 +137,11 @@ async fn exports_serves_runtime_files() {
         .assert_ok()
         .assert_body_eq("sku,stock\nA-1,5\n")
         .assert_header("cache-control", "no-store");
-    client.get("/exports/missing.csv").send().await.assert_status(404);
+    client
+        .get("/exports/missing.csv")
+        .send()
+        .await
+        .assert_status(404);
 }
 
 /// H8: a path cannot climb out of the exports folder.
@@ -136,7 +154,11 @@ async fn exports_refuses_path_traversal() {
     let client = client(None, &exports_dir);
 
     let response = client.get("/exports/../secret.txt").send().await;
-    assert_ne!(response.status, StatusCode::OK, "path traversal must not serve a file");
+    assert_ne!(
+        response.status,
+        StatusCode::OK,
+        "path traversal must not serve a file"
+    );
     assert!(!response.text().contains("secret"));
 }
 
@@ -153,8 +175,16 @@ fn exports_declares_its_route() {
 #[tokio::test]
 async fn supplier_plugin_serves_the_catalog() {
     let client = no_db_client();
-    let items: Value = client.get("/supplier/items").send().await.assert_ok().json();
-    assert!(items.as_array().is_some_and(|items| !items.is_empty()), "{items}");
+    let items: Value = client
+        .get("/supplier/items")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    assert!(
+        items.as_array().is_some_and(|items| !items.is_empty()),
+        "{items}"
+    );
 
     let sku = items[0]["sku"].as_str().expect("sku").to_owned();
     let item: Value = client
@@ -164,7 +194,11 @@ async fn supplier_plugin_serves_the_catalog() {
         .assert_ok()
         .json();
     assert_eq!(item["sku"], sku);
-    client.get("/supplier/items/NO-SUCH-SKU").send().await.assert_status(404);
+    client
+        .get("/supplier/items/NO-SUCH-SKU")
+        .send()
+        .await
+        .assert_status(404);
 }
 
 /// H9: the plugin passes the framework's plugin conformance checks. Its
@@ -185,8 +219,13 @@ fn supplier_plugin_passes_conformance() {
 /// `autumn routes audit` can see all of them.
 #[test]
 fn app_declares_every_route() {
-    let routes = escape_hatches::app().plugin_route_infos().expect("route manifest");
-    let mut listed: Vec<String> = routes.iter().map(|r| format!("{} {}", r.method, r.path)).collect();
+    let routes = escape_hatches::app()
+        .plugin_route_infos()
+        .expect("route manifest");
+    let mut listed: Vec<String> = routes
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
     listed.sort();
     for expected in [
         "GET /",
@@ -200,7 +239,10 @@ fn app_declares_every_route() {
         "POST /api/products/{sku}/reserve",
         "POST /api/restock",
     ] {
-        assert!(listed.contains(&expected.to_owned()), "missing {expected}: {listed:#?}");
+        assert!(
+            listed.contains(&expected.to_owned()),
+            "missing {expected}: {listed:#?}"
+        );
     }
 }
 
@@ -212,7 +254,10 @@ async fn merged_raw_router_gets_app_middleware() {
         .build();
     let response = client.get("/items").send().await;
     response.assert_ok();
-    assert!(response.header("x-request-id").is_some(), "request id layer must run");
+    assert!(
+        response.header("x-request-id").is_some(),
+        "request id layer must run"
+    );
 }
 
 /// H10: a 404 for an unknown SKU links to the supplier catalog.
@@ -369,7 +414,11 @@ async fn csrf_exempts_the_bearer_api_only() {
     let client = TestApp::new()
         .config(config)
         .routes(routes![form])
-        .scoped("/api", scanner_guard(Some(SCANNER_TOKEN)), escape_hatches::api_routes())
+        .scoped(
+            "/api",
+            scanner_guard(Some(SCANNER_TOKEN)),
+            escape_hatches::api_routes(),
+        )
         .build();
 
     // No CSRF token on a browser route: refused.
@@ -377,7 +426,12 @@ async fn csrf_exempts_the_bearer_api_only() {
     // No CSRF token on the bearer API: not refused by CSRF. (No DB here, so
     // the handler answers 503. The point is that it is not 403.)
     let response = post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)])).await;
-    assert_ne!(response.status, StatusCode::FORBIDDEN, "{}", response.text());
+    assert_ne!(
+        response.status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        response.text()
+    );
 }
 
 // ── Tier 2: Postgres (Docker) ──────────────────────────────────────────────
@@ -395,7 +449,10 @@ async fn hazard_repository_read_modify_write_loses_an_update() {
     let first = repo.find_by_sku("A-1".to_owned()).await.expect("read")[0].clone();
     let second = repo.find_by_sku("A-1".to_owned()).await.expect("read")[0].clone();
     for read in [first, second] {
-        let change = UpdateProduct { stock: Patch::Set(read.stock - 1), ..Default::default() };
+        let change = UpdateProduct {
+            stock: Patch::Set(read.stock - 1),
+            ..Default::default()
+        };
         repo.update(read.id, &change).await.expect("write");
     }
 
@@ -408,15 +465,26 @@ async fn hazard_repository_read_modify_write_loses_an_update() {
 async fn convention_reserve_with_lock_never_oversells() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 3, 100)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
     let body = json!({ "quantity": 1 });
     let calls = (0..10)
         .map(|_| post_api(&client, "/api/products/A-1/reserve", &body))
         .collect();
     let statuses: Vec<u16> = futures_join(calls).await;
-    assert_eq!(statuses.iter().filter(|s| **s == 200).count(), 3, "{statuses:?}");
-    assert_eq!(statuses.iter().filter(|s| **s == 409).count(), 7, "{statuses:?}");
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 200).count(),
+        3,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 409).count(),
+        7,
+        "{statuses:?}"
+    );
     assert_eq!(stock_of(db, "A-1").await, 0);
 }
 
@@ -437,17 +505,36 @@ where
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_reserves_every_line_or_none() {
     let db = fresh_db().await;
-    seed(db, &[product("A-1", "tools", 5, 100), product("B-1", "tools", 1, 100)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    seed(
+        db,
+        &[
+            product("A-1", "tools", 5, 100),
+            product("B-1", "tools", 1, 100),
+        ],
+    )
+    .await;
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
-    let response = post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 2), ("B-1", 2)])).await;
+    let response = post_api(
+        &client,
+        "/api/checkout",
+        &cart("o-1", &[("A-1", 2), ("B-1", 2)]),
+    )
+    .await;
     response.assert_status(409).assert_body_contains("B-1");
     assert_eq!(stock_of(db, "A-1").await, 5, "line one rolled back");
     assert_eq!(stock_of(db, "B-1").await, 1);
 
-    post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 2), ("B-1", 1)]))
-        .await
-        .assert_status(201);
+    post_api(
+        &client,
+        "/api/checkout",
+        &cart("o-1", &[("A-1", 2), ("B-1", 1)]),
+    )
+    .await
+    .assert_status(201);
     assert_eq!(stock_of(db, "A-1").await, 3);
     assert_eq!(stock_of(db, "B-1").await, 0);
 }
@@ -458,13 +545,21 @@ async fn checkout_reserves_every_line_or_none() {
 async fn checkout_returns_201_with_location() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
     let response = post_api(&client, "/api/checkout", &cart("o-7", &[("A-1", 2)])).await;
-    response.assert_status(201).assert_header("location", "/api/orders/o-7");
+    response
+        .assert_status(201)
+        .assert_header("location", "/api/orders/o-7");
     let expected = Receipt {
         order_ref: "o-7".to_owned(),
-        lines: vec![CartLine { sku: "A-1".to_owned(), quantity: 2 }],
+        lines: vec![CartLine {
+            sku: "A-1".to_owned(),
+            quantity: 2,
+        }],
     };
     assert_eq!(response.json::<Receipt>(), expected);
 
@@ -484,9 +579,14 @@ async fn checkout_returns_201_with_location() {
 async fn checkout_with_a_used_order_ref_changes_nothing() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
-    post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)])).await.assert_status(201);
+    post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)]))
+        .await
+        .assert_status(201);
     post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)]))
         .await
         .assert_status(409)
@@ -500,11 +600,20 @@ async fn checkout_with_a_used_order_ref_changes_nothing() {
 async fn checkout_refuses_bad_carts() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 5, 100)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
-    post_api(&client, "/api/checkout", &cart("o-1", &[])).await.assert_status(422);
-    post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 0)])).await.assert_status(422);
-    post_api(&client, "/api/checkout", &cart("", &[("A-1", 1)])).await.assert_status(422);
+    post_api(&client, "/api/checkout", &cart("o-1", &[]))
+        .await
+        .assert_status(422);
+    post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 0)]))
+        .await
+        .assert_status(422);
+    post_api(&client, "/api/checkout", &cart("", &[("A-1", 1)]))
+        .await
+        .assert_status(422);
     post_api(&client, "/api/checkout", &cart("o-1", &[("NOPE", 1)]))
         .await
         .assert_status(404)
@@ -518,11 +627,18 @@ async fn checkout_refuses_bad_carts() {
 async fn checkout_merges_lines_for_the_same_sku() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 3, 100)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
-    post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 2), ("A-1", 2)]))
-        .await
-        .assert_status(409);
+    post_api(
+        &client,
+        "/api/checkout",
+        &cart("o-1", &[("A-1", 2), ("A-1", 2)]),
+    )
+    .await
+    .assert_status(409);
     assert_eq!(stock_of(db, "A-1").await, 3);
 }
 
@@ -532,8 +648,18 @@ async fn checkout_merges_lines_for_the_same_sku() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_concurrent_carts_never_oversell_or_deadlock() {
     let db = fresh_db().await;
-    seed(db, &[product("A-1", "tools", 6, 100), product("B-1", "tools", 6, 100)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    seed(
+        db,
+        &[
+            product("A-1", "tools", 6, 100),
+            product("B-1", "tools", 6, 100),
+        ],
+    )
+    .await;
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
     let bodies: Vec<Value> = (0..10)
         .map(|n| {
@@ -544,11 +670,21 @@ async fn checkout_concurrent_carts_never_oversell_or_deadlock() {
             }
         })
         .collect();
-    let calls = bodies.iter().map(|body| post_api(&client, "/api/checkout", body)).collect();
+    let calls = bodies
+        .iter()
+        .map(|body| post_api(&client, "/api/checkout", body))
+        .collect();
     let statuses = futures_join(calls).await;
 
-    assert!(statuses.iter().all(|s| *s == 201 || *s == 409), "{statuses:?}");
-    assert_eq!(statuses.iter().filter(|s| **s == 201).count(), 6, "{statuses:?}");
+    assert!(
+        statuses.iter().all(|s| *s == 201 || *s == 409),
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 201).count(),
+        6,
+        "{statuses:?}"
+    );
     assert_eq!(stock_of(db, "A-1").await, 0);
     assert_eq!(stock_of(db, "B-1").await, 0);
 }
@@ -567,20 +703,35 @@ async fn restock_adds_to_a_whole_category() {
         ],
     )
     .await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
-    let body: Value = post_api(&client, "/api/restock", &json!({ "category": "tools", "add": 5 }))
-        .await
-        .assert_ok()
-        .json();
+    let body: Value = post_api(
+        &client,
+        "/api/restock",
+        &json!({ "category": "tools", "add": 5 }),
+    )
+    .await
+    .assert_ok()
+    .json();
     assert_eq!(body["updated"], 2);
     assert_eq!(stock_of(db, "A-1").await, 6);
     assert_eq!(stock_of(db, "A-2").await, 5);
-    assert_eq!(stock_of(db, "P-1").await, 2, "other categories do not change");
+    assert_eq!(
+        stock_of(db, "P-1").await,
+        2,
+        "other categories do not change"
+    );
 
-    post_api(&client, "/api/restock", &json!({ "category": "tools", "add": 0 }))
-        .await
-        .assert_status(422);
+    post_api(
+        &client,
+        "/api/restock",
+        &json!({ "category": "tools", "add": 0 }),
+    )
+    .await
+    .assert_status(422);
 }
 
 /// H2: restock is relative. A checkout that runs between the restock's read
@@ -590,7 +741,10 @@ async fn restock_adds_to_a_whole_category() {
 async fn restock_and_checkout_together_lose_nothing() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 50, 100)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
     let restock = json!({ "category": "tools", "add": 1 });
     let mut bodies = Vec::new();
@@ -598,9 +752,15 @@ async fn restock_and_checkout_together_lose_nothing() {
         bodies.push(("/api/checkout", cart(&format!("o-{n}"), &[("A-1", 1)])));
         bodies.push(("/api/restock", restock.clone()));
     }
-    let calls = bodies.iter().map(|(path, body)| post_api(&client, path, body)).collect();
+    let calls = bodies
+        .iter()
+        .map(|(path, body)| post_api(&client, path, body))
+        .collect();
     let statuses = futures_join(calls).await;
-    assert!(statuses.iter().all(|s| *s == 200 || *s == 201), "{statuses:?}");
+    assert!(
+        statuses.iter().all(|s| *s == 200 || *s == 201),
+        "{statuses:?}"
+    );
     assert_eq!(stock_of(db, "A-1").await, 50, "ten out, ten in");
 }
 
@@ -621,9 +781,17 @@ async fn report_ranks_top_three_per_category() {
         ],
     )
     .await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
-    let rows: Value = client.get("/reports/stock-value").send().await.assert_ok().json();
+    let rows: Value = client
+        .get("/reports/stock-value")
+        .send()
+        .await
+        .assert_ok()
+        .json();
     let summary: Vec<(String, String, i64, i64)> = rows
         .as_array()
         .expect("array")
@@ -655,7 +823,10 @@ async fn report_ranks_top_three_per_category() {
 async fn pages_list_and_show_products() {
     let db = fresh_db().await;
     seed(db, &[product("A-1", "tools", 4, 250)]).await;
-    let client = client(Some(db.pool()), tempfile::tempdir().expect("tempdir").path());
+    let client = client(
+        Some(db.pool()),
+        tempfile::tempdir().expect("tempdir").path(),
+    );
 
     client
         .get("/")
