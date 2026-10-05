@@ -9029,6 +9029,15 @@ async fn execute_fixed_delay_task(
     lease_ttl: std::time::Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    // Cost gate (#1720). The loop awaits this run, so later ticks wait too.
+    let gate = CostGate {
+        shutdown,
+        waiting: None,
+    };
+    let wait_first = CostGate::waits_before_lease(&*coordinator);
+    if wait_first && !gate.wait(&state, &name).await {
+        return;
+    }
     let tick_key = crate::scheduler::fixed_delay_tick_key(
         &name,
         delay,
@@ -9051,13 +9060,7 @@ async fn execute_fixed_delay_task(
     state
         .task_registry
         .record_leader(&name, lease.leader_id(), &tick_key);
-    // Cost gate (#1720): wait with the lease held, so only this replica runs
-    // the tick. The loop awaits this run, so later ticks wait too.
-    let gate = CostGate {
-        shutdown,
-        waiting: None,
-    };
-    if !gate.wait(&state, &name).await {
+    if !wait_first && !gate.wait(&state, &name).await {
         release_task_lease(lease, &name, &tick_key).await;
         return;
     }
@@ -9134,6 +9137,16 @@ impl CostGate {
         resumed
     }
 
+    /// `true` when the tick waits before it takes its lease.
+    ///
+    /// A Postgres advisory lock and an in-process lease do not expire, so a
+    /// tick waits while it holds one: only the holder runs the tick. A
+    /// `SQLite` lease expires after `lease_ttl_secs`, and a wait can be
+    /// longer. So with `SQLite` the tick waits first, then takes the lease.
+    fn waits_before_lease(coordinator: &dyn crate::scheduler::SchedulerCoordinator) -> bool {
+        coordinator.backend() == "sqlite"
+    }
+
     /// The tick no longer waits: later ticks run again.
     fn release(&self) {
         if let Some(flag) = &self.waiting {
@@ -9165,6 +9178,11 @@ async fn execute_cron_task(
     gate: CostGate,
 ) {
     let tick_key = crate::scheduler::cron_tick_key(&name, scheduled_unix_secs);
+    // Cost gate (#1720), as in `execute_fixed_delay_task`.
+    let wait_first = CostGate::waits_before_lease(&*coordinator);
+    if wait_first && !gate.wait(&state, &name).await {
+        return;
+    }
     let lease = match coordinator
         .try_acquire(&name, &tick_key, coordination)
         .await
@@ -9184,9 +9202,7 @@ async fn execute_cron_task(
     state
         .task_registry
         .record_leader(&name, lease.leader_id(), &tick_key);
-    // Cost gate (#1720): wait with the lease held, so only this replica runs
-    // the tick.
-    if !gate.wait(&state, &name).await {
+    if !wait_first && !gate.wait(&state, &name).await {
         release_task_lease(lease, &name, &tick_key).await;
         return;
     }
@@ -9355,9 +9371,11 @@ async fn run_cron_task_loop(
                     cursor = scheduled_at;
                     continue;
                 }
-                // Mark the wait before the lease attempt: a slow lease must not
-                // let the next ticks spawn and pile up behind the signal.
-                if crate::cost::deferral_signal(&state, crate::cost::WorkKind::Task, &name).is_some() {
+                // Reserve the tick before the lease attempt, whatever the signal
+                // is now: a slow lease must not let the next ticks spawn and
+                // pile up behind a signal that rises meanwhile. The tick clears
+                // the mark when it stops to wait or to take its lease.
+                if crate::cost::is_deferrable(crate::cost::WorkKind::Task, &name) {
                     deferring.store(true, std::sync::atomic::Ordering::Release);
                 }
                 let scheduled_unix_secs = u64::try_from(scheduled_at.timestamp()).unwrap_or_default();
@@ -19619,6 +19637,52 @@ mod tests {
         assert_eq!(status.total_runs, 0);
         assert!(status.current_leader.is_none());
         assert!(status.last_tick.is_none());
+    }
+
+    /// A `SQLite` lease expires, so a deferred tick takes it only after the wait.
+    /// A Postgres advisory lock does not expire, so the tick holds it while it
+    /// waits (#1720).
+    #[tokio::test(start_paused = true)]
+    async fn deferred_tick_takes_an_expiring_lease_only_after_the_wait() {
+        for (backend, acquired_while_high) in [("sqlite", 0), ("postgres", 1)] {
+            let name = format!("cost_lease_order_{backend}");
+            crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
+            let state = AppState::for_test();
+            let signal = crate::cost::CostSignal::new(Some(1.0));
+            signal.set(5.0);
+            state.insert_extension(signal.clone());
+            let tick_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+                backend,
+                tick_keys: std::sync::Arc::clone(&tick_keys),
+                release_count: None,
+            });
+            let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+            let run = tokio::spawn(super::execute_cron_task(
+                name,
+                state,
+                handler,
+                crate::task::TaskCoordination::Fleet,
+                coordinator,
+                std::time::Duration::from_secs(30),
+                1_700_000_000,
+                super::CostGate {
+                    shutdown: tokio_util::sync::CancellationToken::new(),
+                    waiting: None,
+                },
+            ));
+
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            assert_eq!(
+                tick_keys.lock().unwrap().len(),
+                acquired_while_high,
+                "{backend}"
+            );
+
+            signal.set(0.5);
+            run.await.expect("the tick ends");
+            assert_eq!(tick_keys.lock().unwrap().len(), 1, "{backend}");
+        }
     }
 
     /// A cron tick that does not get its lease clears the cost-gate flag, or

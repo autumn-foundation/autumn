@@ -231,7 +231,9 @@ While the signal is high:
   drops it. An operator can cancel it while it waits.
 - A deferrable task takes its tick lease, then waits. Only the replica that
   holds the tick waits, so the tick runs one time. When the signal falls, the
-  tick runs. Later ticks on that replica fold into that one run.
+  tick runs. Later ticks on that replica fold into that one run. With the
+  `sqlite` scheduler the tick waits first and then takes the lease, because a
+  SQLite lease expires after `lease_ttl_secs`.
 - Request handlers and work that is not deferrable run as usual.
 
 `signal.deferrals` in `/actuator/cost` counts each job or tick that started to
@@ -249,6 +251,10 @@ For a `JobInfo` or `TaskInfo` that you make by hand, call
   it loses any other queued local job.
 - A task that waits holds its tick lease. On the `postgres` scheduler, this
   keeps one pooled connection for each task that waits.
+- On the `sqlite` scheduler, replicas can resume at different times, up to
+  `defer_recheck_secs` plus `signal_refresh_secs` apart. Set `lease_ttl_secs`
+  longer than that plus the task run time. Then a replica that resumes late
+  finds the tick taken.
 - With more than one replica, each replica can hold one waiting tick of a
   task. So after the window, the task can run one time on each replica.
 - With metering on, the DB lane installs the query timer on each checked-out
