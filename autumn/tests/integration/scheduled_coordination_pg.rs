@@ -299,3 +299,117 @@ async fn pg_tick_rows_are_pruned_after_the_retention() {
     .count;
     assert_eq!(other_rows, 1, "another app keeps its rows");
 }
+
+/// A fixed-delay tick stays claimed for its whole delay, even when the delay
+/// is longer than the retention. Replica timers can reach one bucket up to a
+/// full delay apart.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn pg_fixed_delay_tick_stays_claimed_for_its_delay() {
+    let (_container, url) = start_postgres().await;
+    let a = coordinator(replica_pool(&url, "replica-a", 2), "replica-a")
+        .with_tick_retention(Duration::from_secs(1));
+    let b = coordinator(replica_pool(&url, "replica-b", 2), "replica-b")
+        .with_tick_retention(Duration::from_secs(1));
+    let delay = Duration::from_secs(30);
+
+    let lease = a
+        .try_acquire_for_period(TASK, "nightly-invoice:1", TaskCoordination::Fleet, delay)
+        .await
+        .expect("acquire")
+        .expect("replica A leads");
+    lease.release().await.expect("release");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // This claim prunes every expired row first.
+    let runs = AtomicUsize::new(0);
+    assert!(run_tick(&b, "nightly-invoice:2", &runs).await);
+
+    let late = b
+        .try_acquire_for_period(TASK, "nightly-invoice:1", TaskCoordination::Fleet, delay)
+        .await
+        .expect("acquire");
+    assert!(
+        late.is_none(),
+        "past the retention but inside the delay, the tick must stay claimed"
+    );
+}
+
+/// `coordinator_from_config` sets the tick retention from
+/// `scheduler.lease_ttl_secs`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn pg_config_lease_ttl_sets_the_tick_retention() {
+    use autumn_web::config::{SchedulerBackend, SchedulerConfig};
+
+    let (_container, url) = start_postgres().await;
+    let state = autumn_web::AppState::for_test().with_pool(replica_pool(&url, "replica-a", 2));
+    let config = SchedulerConfig {
+        backend: SchedulerBackend::Postgres,
+        lease_ttl_secs: 1,
+        replica_id: Some("replica-a".to_owned()),
+        key_prefix: PREFIX.to_owned(),
+    };
+    let coordinator =
+        autumn_web::scheduler::coordinator_from_config(&config, &state).expect("coordinator");
+    let runs = AtomicUsize::new(0);
+
+    assert!(run_tick(coordinator.as_ref(), "nightly-invoice:1", &runs).await);
+    assert!(!run_tick(coordinator.as_ref(), "nightly-invoice:1", &runs).await);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(run_tick(coordinator.as_ref(), "nightly-invoice:2", &runs).await);
+    assert!(
+        run_tick(coordinator.as_ref(), "nightly-invoice:1", &runs).await,
+        "a 1s lease_ttl_secs frees the row after 1s, not after the 300s default"
+    );
+}
+
+/// The old name still builds the new coordinator.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+#[allow(deprecated)]
+async fn pg_deprecated_advisory_name_builds_the_tick_coordinator() {
+    let (_container, url) = start_postgres().await;
+    let old = autumn_web::scheduler::PostgresAdvisorySchedulerCoordinator::new(
+        replica_pool(&url, "replica-a", 1),
+        "replica-a",
+        PREFIX,
+    );
+    let lease = old
+        .try_acquire(TASK, "nightly-invoice:1", TaskCoordination::Fleet)
+        .await
+        .expect("acquire")
+        .expect("first claim");
+    assert!(lease.fencing_token().is_some());
+}
+
+/// A role that cannot run `CREATE` still claims ticks when an operator made
+/// the table first.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn pg_dml_only_role_claims_ticks_on_a_premade_table() {
+    use diesel_async::SimpleAsyncConnection as _;
+
+    let (_container, url) = start_postgres().await;
+    let admin = replica_pool(&url, "admin", 1);
+    {
+        let mut conn = admin.get().await.expect("conn");
+        conn.batch_execute(autumn_web::scheduler::PG_TICK_TABLE_DDL)
+            .await
+            .expect("operator applies the DDL");
+        conn.batch_execute(
+            "CREATE ROLE app_dml LOGIN PASSWORD 'app'; \
+             REVOKE CREATE ON SCHEMA public FROM PUBLIC; \
+             GRANT USAGE ON SCHEMA public TO app_dml; \
+             GRANT SELECT, INSERT, DELETE ON autumn_scheduler_ticks TO app_dml; \
+             GRANT USAGE ON SEQUENCE autumn_scheduler_ticks_generation_seq TO app_dml;",
+        )
+        .await
+        .expect("create a DML-only role");
+    }
+    let dml_url = url.replacen("postgres:postgres@", "app_dml:app@", 1);
+    let a = coordinator(replica_pool(&dml_url, "replica-a", 1), "replica-a");
+
+    let runs = AtomicUsize::new(0);
+    assert!(run_tick(&a, "nightly-invoice:1", &runs).await);
+    assert!(!run_tick(&a, "nightly-invoice:1", &runs).await);
+}

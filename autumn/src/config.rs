@@ -2790,13 +2790,16 @@ pub enum SchedulerBackend {
     #[serde(alias = "local", alias = "memory")]
     #[default]
     InProcess,
-    /// Fleet coordination with Postgres advisory locks.
+    /// Fleet coordination with a Postgres tick table (issue #3052).
+    ///
+    /// Each fleet tick is one row. Only the replica that inserts the row runs
+    /// the tick.
     Postgres,
     /// Single-host coordination with a `SQLite` lease table (issue #1907).
     ///
     /// Each `(task, tick)` is leased in the app's own database file, so several
-    /// processes on one host elect exactly one leader per tick. `SQLite` has no
-    /// advisory locks, and a `SQLite` deployment is single-host by definition.
+    /// processes on one host elect exactly one leader per tick. A `SQLite`
+    /// deployment is single-host by definition.
     #[serde(alias = "single_host")]
     Sqlite,
 }
@@ -4976,7 +4979,7 @@ impl AutumnConfig {
         // believes is enforced but isn't is worse than no policy.
         self.retention.validate()?;
         self.validate_retention_against_replay_protection()?;
-        // Framework state (autumn_jobs, scheduler advisory locks) lives on
+        // Framework state (autumn_jobs, the scheduler tick table) lives on
         // the control topology and is never sharded. Sharded apps that use a
         // Postgres-backed jobs or scheduler backend therefore need a control
         // role alongside their shards.

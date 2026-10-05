@@ -1,19 +1,31 @@
+### Breaking Changes
+
+- **Breaking:** the Postgres scheduler needs a new table ([migration guide](docs/migrations/next.md)).
+  `scheduler.backend = "postgres"` claims ticks in `autumn_scheduler_ticks`
+  (issue #3052). The runtime creates it on first use. If the app's database
+  role cannot run `CREATE TABLE`, apply `scheduler::PG_TICK_TABLE_DDL` before
+  you deploy.
+
 ### Fixed
 
 - **scheduler:** the Postgres scheduler runs each fleet tick at most once
-  (issue #3052). It used a session advisory lock and freed it when the leader
-  finished, so a replica whose timer reached the same tick later ran it again.
-  Each tick is now a row in `autumn_scheduler_ticks`, inserted with
-  `ON CONFLICT DO NOTHING`. The row stays for `scheduler.lease_ttl_secs`. A
-  leader that crashes mid-tick does not free its tick. The coordinator holds no
-  connection while a tick runs, and it works behind a transaction-mode
-  PgBouncer.
+  (issue #3052). It freed its session advisory lock when the leader finished.
+  A replica whose timer reached the same tick later ran it again. Now each
+  tick is a row in `autumn_scheduler_ticks`, inserted with
+  `ON CONFLICT DO NOTHING`. The row stays for `scheduler.lease_ttl_secs`, and a
+  fixed-delay row stays for at least its delay. A leader that crashes
+  mid-tick does not free its tick. The coordinator holds no connection while a
+  tick runs, so it works behind a transaction-mode PgBouncer.
+- **scheduler:** the `sqlite` backend keeps a fixed-delay tick claimed for at
+  least its delay, not only for `scheduler.lease_ttl_secs`.
 
 ### Added
 
 - **scheduler:** `scheduler::current_tick()` gives a running `#[scheduled]`
-  task its tick key and, on the Postgres backend, a fencing token (the tick's
-  `generation`).
+  task its tick key. On the Postgres backend it also gives a fencing token
+  (the tick's `generation`).
+- **scheduler:** `SchedulerCoordinator::try_acquire_for_period`. It has a
+  default, so a custom coordinator needs no change.
 - **scheduler:** a boot warning when `scheduler.backend = "in_process"` runs
   fleet tasks and a hint shows more than one replica: `jobs.backend` is
   `postgres` or `redis`, `AUTUMN_REPLICAS` is more than 1, or
@@ -22,4 +34,4 @@
 ### Deprecated
 
 - **scheduler:** `PostgresAdvisorySchedulerCoordinator` is now an alias of
-  `PostgresTickSchedulerCoordinator`. It no longer uses advisory locks.
+  `PostgresTickSchedulerCoordinator`. It does not use advisory locks.

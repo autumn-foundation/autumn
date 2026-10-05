@@ -1929,3 +1929,62 @@ async fn sqlite_pool_serves_connections_opened_at_the_same_instant() {
         }
     }
 }
+
+/// Issue #3052: a fixed-delay tick stays claimed for its whole delay, even
+/// when the delay is longer than `lease_ttl_secs`. A tick claimed with no
+/// period frees after the TTL.
+#[tokio::test]
+async fn sqlite_fixed_delay_tick_stays_claimed_for_its_delay() {
+    use chrono::TimeZone as _;
+    use scheduler::SchedulerCoordinator as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let clock = autumn_web::time::TickingClock::starting_at(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid date"),
+    );
+    let coordinator = scheduler::SqliteLeaseSchedulerCoordinator::new(
+        build_sqlite_pool(&tmp),
+        "replica-a",
+        "app:scheduler",
+        Duration::from_secs(10),
+        Arc::new(clock.clone()),
+    );
+    let fleet = TaskCoordination::Fleet;
+    let hour = Duration::from_secs(3_600);
+
+    assert!(
+        coordinator
+            .try_acquire_for_period("hourly", "hourly:1", fleet, hour)
+            .await
+            .expect("acquire")
+            .is_some()
+    );
+    assert!(
+        coordinator
+            .try_acquire("cron", "cron:1", fleet)
+            .await
+            .expect("acquire")
+            .is_some()
+    );
+    clock.advance(Duration::from_secs(60));
+
+    assert!(
+        coordinator
+            .try_acquire_for_period("hourly", "hourly:1", fleet, hour)
+            .await
+            .expect("acquire")
+            .is_none(),
+        "past the TTL but inside the delay, the tick must stay claimed"
+    );
+    assert!(
+        coordinator
+            .try_acquire("cron", "cron:1", fleet)
+            .await
+            .expect("acquire")
+            .is_some(),
+        "with no period, the row frees after the TTL"
+    );
+}

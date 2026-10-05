@@ -45,26 +45,44 @@ id. Set it explicitly when you want stable names in `/actuator/tasks`.
 Each fleet tick is one row in `autumn_scheduler_ticks`:
 
 ```sql
-INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, owner)
-VALUES ($1, $2, $3, $4)
+INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, owner, expires_at)
+VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
 ON CONFLICT DO NOTHING
 RETURNING generation
 ```
 
 Only the replica that gets a `generation` back runs the tick. The row stays
-after the run. Thus a replica whose timer reaches the same tick later (timer
+after the run. Thus, a replica whose timer reaches the same tick later (timer
 skew, a GC pause, a slow boot) does not run it again.
 
-- The runtime creates the table on first use. If the database role cannot run
-  `CREATE TABLE`, create it before you deploy. Use the DDL in
-  `autumn/src/scheduler.rs` (`PG_TICK_TABLE_DDL`).
-- A row stays for `lease_ttl_secs` after its claim. Then the next claim with
-  the same `key_prefix` deletes it. Set `lease_ttl_secs` longer than the spread
-  between the replicas' timers.
+- A row stays for `lease_ttl_secs`. A fixed-delay row stays for at least its
+  delay, because each replica starts its timer at its own boot. Then the next
+  claim deletes the row. Set `lease_ttl_secs` longer than the spread between
+  the replicas' timers.
 - The claim and the prune use the database clock (`now()`), not the replica
   clocks.
 - The coordinator keeps no session state and holds no connection while a tick
-  runs. Thus it works behind a transaction-mode PgBouncer.
+  runs. Thus, it works behind a transaction-mode PgBouncer.
+
+The runtime creates the table on first use. If the database role cannot run
+`CREATE TABLE`, apply this DDL (`autumn_web::scheduler::PG_TICK_TABLE_DDL`)
+before you deploy, and grant `SELECT`, `INSERT`, `DELETE` on the table and
+`USAGE` on its sequence:
+
+```sql
+CREATE TABLE IF NOT EXISTS autumn_scheduler_ticks (
+    key_prefix TEXT        NOT NULL,
+    task_name  TEXT        NOT NULL,
+    tick_key   TEXT        NOT NULL,
+    owner      TEXT        NOT NULL,
+    generation BIGSERIAL   NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (key_prefix, task_name, tick_key)
+);
+CREATE INDEX IF NOT EXISTS idx_autumn_scheduler_ticks_expires_at
+    ON autumn_scheduler_ticks (expires_at);
+```
 
 ### Fencing token
 
@@ -72,11 +90,10 @@ skew, a GC pause, a slow boot) does not run it again.
 can read it as a fencing token:
 
 ```rust
-#[scheduled(cron = "0 0 * * *", name = "nightly-invoice")]
-async fn nightly_invoice(state: AppState) -> AutumnResult<()> {
-    let tick = autumn_web::scheduler::current_tick();
-    let token = tick.as_ref().and_then(|tick| tick.fencing_token());
-    // Write `token` with each side effect. Refuse a write with an older token.
+#[scheduled(cron = "0 0 0 * * *", name = "nightly-invoice")]
+async fn nightly_invoice(_state: AppState) -> AutumnResult<()> {
+    let _token = autumn_web::scheduler::current_tick().and_then(|tick| tick.fencing_token());
+    // Write the token with each side effect. Refuse a write with an older token.
     Ok(())
 }
 ```
@@ -87,7 +104,7 @@ the handler spawns. `fencing_token()` is `None` on the `in_process` and
 
 ## Configure SQLite Coordination
 
-SQLite has no advisory locks, and a SQLite deployment is single-host, so
+SQLite has no shared server, and a SQLite deployment is single-host, so
 `backend = "postgres"` is refused at boot there. Use `backend = "sqlite"` when
 several processes share one host — a web tier next to a worker tier, or the
 overlap window of a rolling restart:

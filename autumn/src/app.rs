@@ -5819,7 +5819,11 @@ impl AppBuilder {
             // the scheduler must not regress readiness: mark_startup_complete and
             // signal_serve_ready below still run.
             if role.runs_workers() && !tasks.is_empty() {
-                warn_on_in_process_fleet_hint(&config, &tasks);
+                if let Some(warning) =
+                    in_process_fleet_warning(&config, &tasks, &crate::config::OsEnv)
+                {
+                    tracing::warn!("{warning}");
+                }
                 let res = start_task_scheduler_with_config(
                     tasks,
                     &state,
@@ -8896,36 +8900,38 @@ pub(crate) fn start_task_scheduler_with_config(
     Ok(())
 }
 
-/// Warn when an `in_process` scheduler runs fleet tasks and a hint shows more
-/// than one replica: each replica would run each tick (issue #3052).
-fn warn_on_in_process_fleet_hint(config: &AutumnConfig, tasks: &[crate::task::TaskInfo]) {
+/// The boot warning for an `in_process` scheduler that runs fleet tasks while
+/// a hint shows more than one replica. Each replica would run each tick
+/// (issue #3052). `None` when there is nothing to warn about.
+fn in_process_fleet_warning(
+    config: &AutumnConfig,
+    tasks: &[crate::task::TaskInfo],
+    env: &dyn crate::config::Env,
+) -> Option<String> {
     let has_fleet_task = tasks
         .iter()
         .any(|task| task.coordination == crate::task::TaskCoordination::Fleet);
     if !has_fleet_task {
-        return;
+        return None;
     }
-    let replicas = std::env::var("AUTUMN_REPLICAS").ok();
-    let kubernetes = std::env::var_os("KUBERNETES_SERVICE_HOST").is_some();
-    let Some(hint) = crate::scheduler::in_process_fleet_hint(
+    let replicas = env.var("AUTUMN_REPLICAS").ok();
+    let kubernetes = env.var("KUBERNETES_SERVICE_HOST").is_ok();
+    let hint = crate::scheduler::in_process_fleet_hint(
         config.scheduler.backend,
         &config.jobs.backend,
         replicas.as_deref(),
         kubernetes,
-    ) else {
-        return;
-    };
+    )?;
     let fix = if cfg!(feature = "sqlite") {
-        "scheduler.backend = \"sqlite\""
+        "sqlite"
     } else {
-        "scheduler.backend = \"postgres\""
+        "postgres"
     };
-    tracing::warn!(
-        hint,
-        "scheduler.backend = \"in_process\" runs each fleet tick on every replica. \
-         If more than one replica runs, set {fix}. \
+    Some(format!(
+        "scheduler.backend = \"in_process\" runs each fleet tick on every replica \
+         ({hint}). If more than one replica runs, set scheduler.backend = \"{fix}\". \
          See docs/guide/scheduled-multi-replica.md"
-    );
+    ))
 }
 
 #[allow(unused_variables, clippy::needless_pass_by_value)]
@@ -9061,8 +9067,9 @@ async fn execute_fixed_delay_task(
         delay,
         crate::time::clock_unix_duration(state.clock()),
     );
+    // Pass the delay: replica timers can reach one bucket a full delay apart.
     let lease = match coordinator
-        .try_acquire(&name, &tick_key, coordination)
+        .try_acquire_for_period(&name, &tick_key, coordination, delay)
         .await
     {
         Ok(Some(lease)) => lease,
@@ -19651,6 +19658,122 @@ mod tests {
                 ))
             })
         }
+    }
+
+    /// Records the period that `try_acquire_for_period` gets.
+    struct PeriodRecordingCoordinator {
+        period: std::sync::Mutex<Option<std::time::Duration>>,
+    }
+
+    impl crate::scheduler::SchedulerCoordinator for PeriodRecordingCoordinator {
+        fn backend(&self) -> &'static str {
+            "postgres"
+        }
+
+        fn replica_id(&self) -> &'static str {
+            "replica-a"
+        }
+
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn try_acquire_for_period<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+            period: std::time::Duration,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            *self.period.lock().unwrap() = Some(period);
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    // Issue #3052: a fixed-delay tick stays claimed for its whole delay.
+    #[tokio::test]
+    async fn fixed_delay_task_claims_its_tick_for_the_delay() {
+        let coordinator = std::sync::Arc::new(PeriodRecordingCoordinator {
+            period: std::sync::Mutex::new(None),
+        });
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+
+        super::execute_fixed_delay_task(
+            "hourly_task".to_owned(),
+            AppState::for_test(),
+            handler,
+            std::time::Duration::from_secs(3_600),
+            crate::task::TaskCoordination::Fleet,
+            std::sync::Arc::clone(&coordinator) as _,
+            std::time::Duration::from_secs(300),
+        )
+        .await;
+
+        assert_eq!(
+            *coordinator.period.lock().unwrap(),
+            Some(std::time::Duration::from_secs(3_600))
+        );
+    }
+
+    fn fleet_task_info(coordination: crate::task::TaskCoordination) -> crate::task::TaskInfo {
+        crate::task::TaskInfo {
+            name: "nightly".to_owned(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination,
+            handler: |_| Box::pin(async { Ok(()) }),
+        }
+    }
+
+    // Issue #3052: the boot warning reads its hints through the env seam.
+    #[test]
+    fn in_process_fleet_warning_names_the_hint_and_the_fix() {
+        let config = AutumnConfig::default();
+        let tasks = [fleet_task_info(crate::task::TaskCoordination::Fleet)];
+        let env = crate::config::MockEnv::new().with("AUTUMN_REPLICAS", "3");
+
+        let warning = super::in_process_fleet_warning(&config, &tasks, &env)
+            .expect("three replicas on in_process must warn");
+        assert!(
+            warning.contains("AUTUMN_REPLICAS is more than 1"),
+            "{warning}"
+        );
+        assert!(warning.contains("scheduler.backend = \""), "{warning}");
+
+        let k8s = crate::config::MockEnv::new().with("KUBERNETES_SERVICE_HOST", "10.0.0.1");
+        assert!(super::in_process_fleet_warning(&config, &tasks, &k8s).is_some());
+    }
+
+    #[test]
+    fn in_process_fleet_warning_is_silent_without_a_hint_or_a_fleet_task() {
+        let config = AutumnConfig::default();
+        let fleet = [fleet_task_info(crate::task::TaskCoordination::Fleet)];
+        let local = [fleet_task_info(crate::task::TaskCoordination::PerReplica)];
+        let crowd = crate::config::MockEnv::new().with("AUTUMN_REPLICAS", "5");
+
+        assert!(
+            super::in_process_fleet_warning(&config, &fleet, &crate::config::MockEnv::new())
+                .is_none(),
+            "no hint"
+        );
+        assert!(
+            super::in_process_fleet_warning(&config, &local, &crowd).is_none(),
+            "per-replica tasks run on every replica by design"
+        );
+
+        let mut coordinated = AutumnConfig::default();
+        coordinated.scheduler.backend = crate::config::SchedulerBackend::Postgres;
+        assert!(super::in_process_fleet_warning(&coordinated, &fleet, &crowd).is_none());
     }
 
     // Issue #3052: the handler reads its tick and fencing token.

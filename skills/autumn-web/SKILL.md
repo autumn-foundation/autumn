@@ -1824,7 +1824,7 @@ For "run this exactly once across replicas right now" work (nightly cleanup,
 cache warming, one-shot backfills, "send the daily digest once"), use
 `autumn_web::lock::Lock` (re-exported from the prelude) instead of hand-rolling
 `pg_try_advisory_lock` raw SQL. It is the same Postgres advisory-lock machinery
-that already gates migrations, `#[scheduled]` leader election, and ISR.
+that already gates migrations and ISR. (`#[scheduled]` uses a tick table.)
 
 - Build: `Lock::from_state(&state, "name")?` (primary pool) or
   `Lock::new(pool, "name")`. Names hash to a stable, namespaced 64-bit key via
