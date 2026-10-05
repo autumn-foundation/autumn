@@ -485,8 +485,9 @@ impl Plugin for MediaPlugin {
         // Both primitives are off by default. With neither, install nothing.
         if !enable_broadcast && !enable_rooms {
             tracing::warn!(
+                recordings_root_ignored = recordings_root.is_some(),
                 "🍂 Autumn Media: no primitive enabled; call `with_broadcast()` or \
-                 `with_rooms()`. The plugin installs nothing."
+                 `with_rooms()`. The plugin installs nothing, and no retention sweep starts."
             );
             return app;
         }
@@ -1180,15 +1181,20 @@ mod config_section_tests {
 // Each primitive installs only its own surface (#1974).
 #[cfg(test)]
 mod primitive_surface_tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime};
 
     use autumn_web::AppState;
     use autumn_web::test::TestApp;
 
     use super::MediaPlugin;
     use crate::config::{MediaConfig, MediaStorageBackend};
-    use crate::{MediaMtxClient, MediaStorage, MediaUrls, MediaWorkflows, RoomService};
+    use crate::{
+        MediaMtxClient, MediaStorage, MediaUrls, MediaWorkflows, RetentionDefer, RoomService,
+        media_job_infos,
+    };
 
     /// The extensions a built app holds.
     #[allow(clippy::struct_excessive_bools)] // one flag per extension
@@ -1314,5 +1320,76 @@ mod primitive_surface_tests {
             },
         );
         assert_eq!(api_base.as_deref(), Some("http://mediamtx.internal:9997"));
+    }
+
+    /// The media job names `plugin` registers.
+    fn media_jobs(plugin: MediaPlugin) -> HashSet<String> {
+        // Jobs register after the probe runs. The registry clone shares state,
+        // so read it after `build`.
+        let state = probe(plugin, AppState::clone);
+        let registered = state.job_registry().snapshot();
+        media_job_infos("media")
+            .into_iter()
+            .map(|info| info.name)
+            .filter(|name| registered.contains_key(name))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn encode_jobs_register_only_with_a_primitive() {
+        let all: HashSet<String> = media_job_infos("media")
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        assert!(media_jobs(MediaPlugin::new()).is_empty());
+        assert_eq!(media_jobs(MediaPlugin::new().with_broadcast()), all);
+        assert_eq!(media_jobs(MediaPlugin::new().with_rooms()), all);
+    }
+
+    #[test]
+    fn only_rooms_declare_routes() {
+        let routes = |plugin| {
+            autumn_web::app()
+                .plugin(plugin)
+                .plugin_route_infos()
+                .expect("route infos")
+        };
+        assert!(routes(MediaPlugin::new()).is_empty());
+        assert!(routes(MediaPlugin::new().with_broadcast()).is_empty());
+        assert!(!routes(MediaPlugin::new().with_rooms()).is_empty());
+    }
+
+    /// Build `plugin` over a root with one expired file. Return `true` if the
+    /// retention sweep looks at the file within `wait`.
+    async fn sweep_runs(plugin: MediaPlugin, wait: Duration) -> bool {
+        let root = tempfile::tempdir().expect("tempdir");
+        let old = root.path().join("old.mp4");
+        std::fs::write(&old, b"old").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .and_then(|file| file.set_modified(SystemTime::now() - Duration::from_secs(3 * 86_400)))
+            .expect("set_modified");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Keep the file; only report that the sweep saw it.
+        let defer: RetentionDefer = Arc::new(move |path| {
+            let _ = tx.send(path);
+            Box::pin(async { true })
+        });
+        let plugin = plugin
+            .recordings_root(root.path())
+            .retention_days(1)
+            .retention_defer(defer);
+        let _client = TestApp::new().plugin(plugin).build();
+        let seen = tokio::time::timeout(wait, rx.recv()).await;
+        assert!(Path::new(&old).exists(), "the defer hook keeps the file");
+        matches!(seen, Ok(Some(_)))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retention_sweep_starts_only_with_a_primitive() {
+        assert!(sweep_runs(MediaPlugin::new().with_rooms(), Duration::from_secs(5)).await);
+        assert!(!sweep_runs(MediaPlugin::new(), Duration::from_millis(300)).await);
     }
 }
