@@ -1636,8 +1636,8 @@ An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
 | `conformance::compare(origin, served)` | What the client gets vs origin; excuses `VOLATILE_HEADERS` only |
 
 The gateway refuses an edge response with `set-cookie`, a hop-by-hop header,
-a wrong `content-length`, or a status outside 200-599 (`capsule_error`
-fallthrough). An app with only edge routes and no static routes builds
+a wrong `content-length`, a body on 204/205/304, or a status outside 200-599
+(`capsule_error` fallthrough). An app with only edge routes and no static routes builds
 without an error.
 
 ## Cache-Control freshness (`etag::cache_for` / `CacheControl`)

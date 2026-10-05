@@ -195,6 +195,31 @@ fn doctor_fails_on_edge_route_with_unsupported_capability() {
 /// The build names the route before it compiles. It does not stop on the
 /// scan alone: the scan reads files that `mod` may not declare, so rustc
 /// decides. Here the empty `PATH` makes cargo fail.
+/// A file that no `mod` declares is not compiled. doctor must not fail the
+/// app for a route in it, even one registered in the same file.
+#[test]
+fn doctor_only_warns_for_an_unsupported_route_in_an_orphan_file() {
+    let dir = project(&[
+        ("src/main.rs", "fn main() {}\n"),
+        ("src/old_routes.rs", DB_EDGE_APP),
+        (
+            "src/bin/edge-capsule.rs",
+            "fn main() { autumn_edge::serve(edgeapp::edge_route_list()); }\n",
+        ),
+    ]);
+    let (report, _) = doctor_json(dir.path());
+
+    let caps = check(&report, "edge_capabilities");
+    assert_eq!(caps["status"], "warn", "{caps}");
+    assert!(
+        caps["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("dashboard @ src/old_routes.rs:"),
+        "{caps}"
+    );
+}
+
 #[test]
 fn build_names_an_unsupported_edge_capability_before_compiling() {
     let dir = project(&[

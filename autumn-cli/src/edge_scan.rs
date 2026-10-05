@@ -957,6 +957,83 @@ pub fn resolve_edge_scan_with_extra_file(
     resolve_edge_scan_impl(project_root, requested_features, extra_file)
 }
 
+/// Every source file the compiler reads, relative to `project_root` with `/`
+/// separators (the form of [`EdgeFn::file`]).
+///
+/// Starts at each crate root — the library (`src/lib.rs` or a custom
+/// `[lib] path`), `src/main.rs`, every `src/bin/` target, each `[[bin]]
+/// path`, and `capsule_bin` — and follows `mod name;` declarations. A
+/// `#[cfg(...)]` that is definitely false stops the walk. A file this misses
+/// (a module made by a macro, say) only turns a doctor failure into a warning.
+#[must_use]
+pub fn reachable_files(project_root: &Path, capsule_bin: Option<&Path>) -> BTreeSet<String> {
+    let manifest = std::fs::read_to_string(project_root.join("Cargo.toml")).ok();
+    let table = manifest
+        .as_deref()
+        .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok());
+    let resolver_v1 = resolver_v1_is_in_effect(project_root, table.as_ref());
+    let default_features = manifest
+        .as_deref()
+        .map(|manifest| enabled_features_from_manifest_for_resolver(manifest, &[], resolver_v1))
+        .unwrap_or_default();
+
+    let mut roots: Vec<PathBuf> = vec![
+        table
+            .as_ref()
+            .and_then(custom_lib_path_from_manifest)
+            .map_or_else(
+                || project_root.join("src/lib.rs"),
+                |lib| project_root.join(lib),
+            ),
+        project_root.join("src/main.rs"),
+    ];
+    if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            roots.push(if path.is_dir() {
+                path.join("main.rs")
+            } else {
+                path
+            });
+        }
+    }
+    if let Some(bins) = table
+        .as_ref()
+        .and_then(|t| t.get("bin"))
+        .and_then(toml::Value::as_array)
+    {
+        roots.extend(
+            bins.iter()
+                .filter_map(|bin| bin.get("path").and_then(toml::Value::as_str))
+                .map(|path| project_root.join(path)),
+        );
+    }
+    roots.extend(capsule_bin.map(Path::to_path_buf));
+
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let mut reachable = BTreeSet::new();
+    for root in roots.iter().filter(|root| root.is_file()) {
+        let mut scratch = EdgeScan::default();
+        let (touched, _) = scan_bin_crate_tree(
+            root,
+            project_root,
+            "",
+            Vec::new(),
+            &default_features,
+            &mut scratch,
+        );
+        for file in touched {
+            let file = file.canonicalize().unwrap_or(file);
+            if let Ok(rel) = file.strip_prefix(&canonical_root) {
+                reachable.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    reachable
+}
+
 /// The scanned crate's own `[package] name`, when the manifest table parses
 /// far enough to say. Used only by
 /// [`enabled_features_from_manifest_for_resolver`], which matches Cargo's
@@ -9988,6 +10065,46 @@ mod tests {
         assert!(found[0].contains("`Db`"), "{found:?}");
         assert!(found[1].contains("`Session`"), "{found:?}");
         assert!(found[2].contains("`Clock`"), "{found:?}");
+    }
+
+    #[test]
+    fn reachable_files_follow_mod_declarations_from_every_crate_root() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write = |rel: &str, src: &str| {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, src).expect("write");
+        };
+        write(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            "src/main.rs",
+            "mod routes;\n#[cfg(feature = \"off\")]\nmod gated;\nfn main() {}",
+        );
+        write("src/routes.rs", "mod nested;");
+        write("src/routes/nested.rs", "");
+        write("src/gated.rs", "");
+        write("src/orphan.rs", "");
+        write("src/bin/edge-capsule.rs", "fn main() {}");
+
+        let reachable = reachable_files(dir.path(), None);
+
+        for file in [
+            "src/main.rs",
+            "src/routes.rs",
+            "src/routes/nested.rs",
+            "src/bin/edge-capsule.rs",
+        ] {
+            assert!(reachable.contains(file), "{file} missing: {reachable:?}");
+        }
+        for file in ["src/orphan.rs", "src/gated.rs"] {
+            assert!(
+                !reachable.contains(file),
+                "{file} is not compiled: {reachable:?}"
+            );
+        }
     }
 
     #[test]

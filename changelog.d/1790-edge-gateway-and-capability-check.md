@@ -7,8 +7,8 @@
   `with_response_headers` sets the origin's static security headers on edge
   responses. The gateway refuses an edge response with `set-cookie`.
 - **edge:** `autumn doctor` has a new `edge_capabilities` check. It fails when
-  a registered `#[edge]` route needs something the edge cannot provide (it
-  warns for an unregistered one): an unknown
+  an `#[edge]` route needs something the edge cannot provide (it warns for a
+  route in a file that no `mod` declaration reaches): an unknown
   `needs(...)` capability, a write method, an origin-only extractor such as
   `Db` or `Session`, or `EdgeIdentity` without `needs(identity)`. `autumn
   build` names the same routes before it compiles.

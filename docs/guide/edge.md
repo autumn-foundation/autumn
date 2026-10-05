@@ -429,7 +429,7 @@ error rather than a silently skipped step.
 | `edge_target` | **Fail** | the project has `#[edge]` routes and `wasm32-wasip1` is not installed — hinting ``Run `rustup target add wasm32-wasip1` `` |
 | `edge_routes` | **Fail** | an `#[edge]` handler also carries an auth/rate guard or `#[intercept]` (the build would fail too; doctor catches it first) |
 | `edge_routes` | **Warn** | a handler is marked but never registered with `edge_routes![]`, or `src/bin/edge-capsule.rs` is missing |
-| `edge_capabilities` | **Fail** (a registered route) / **Warn** (an unregistered one) | an `#[edge]` route needs what the edge cannot provide: an unknown `needs(...)`, a write method (`#[post]`, …), a route kind the edge refuses (`#[static_get]`, `#[ws]`, …), an origin-only extractor (`Db`, `Session`, `Clock`, `Extension`, …), or `EdgeIdentity` without `needs(identity)` |
+| `edge_capabilities` | **Fail** (a compiled file) / **Warn** (a file no `mod` reaches) | an `#[edge]` route needs what the edge cannot provide: an unknown `needs(...)`, a write method (`#[post]`, …), a route kind the edge refuses (`#[static_get]`, `#[ws]`, …), an origin-only extractor (`Db`, `Session`, `Clock`, `Extension`, …), or `EdgeIdentity` without `needs(identity)` |
 
 `edge_routes` and `edge_capabilities` report `handler @ file:line` for the
 handler at fault; `edge_target` names the files that carry edge routes. All
@@ -438,8 +438,8 @@ three pass with "no `#[edge]` routes" on a project that has none.
 The scan reads names, not types. A type alias hides an extractor from it. The
 compiler still stops that route (see "What an edge handler may use"). The scan
 also reads a file that no `mod` declares. For this reason `autumn build` only
-warns, and the compiler decides. Doctor fails only for a route that
-`edge_routes![]` registers, and warns for the others.
+warns, and the compiler decides. Doctor fails only for a route in a file
+that a `mod` declaration reaches from a crate root, and warns for the others.
 
 ### Deploying
 
@@ -486,8 +486,9 @@ What it does:
   unchanged. The fallthrough detail does not reach the client.
 - It sends a write, or a request with a header value that is not UTF-8, to
   the origin. It does not ask the capsule.
-- It does not trust the capsule. A status outside 200-599, `set-cookie`, or
-  the fallthrough header in an edge response is a `capsule_error`
+- It does not trust the capsule. A status outside 200-599, `set-cookie`, the
+  fallthrough header, a hop-by-hop header, a body on 204/205/304, or a
+  `content-length` that does not match the body is a `capsule_error`
   fallthrough.
 - It attaches no identity. A `needs(identity)` route falls through with
   `missing_capability`.

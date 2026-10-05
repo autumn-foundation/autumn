@@ -407,6 +407,10 @@ fn a_framing_header_that_does_not_match_the_body_falls_through() {
         ("content-length", "999"),
         ("transfer-encoding", "chunked"),
         ("connection", "close"),
+        ("te", "trailers"),
+        ("trailer", "x-checksum"),
+        ("proxy-authenticate", "Basic"),
+        ("proxy-connection", "keep-alive"),
     ] {
         let artifact = guest(&GuestFrame::Response(EdgeResponse {
             status: 200,
@@ -449,4 +453,27 @@ fn a_correct_content_length_is_served_and_head_keeps_the_get_length() {
     let response = block_on(gateway.handle(Request::head("/x").body(Body::empty()).unwrap()));
     assert_eq!(lane(&response), Lane::Edge);
     assert_eq!(response.headers()["content-length"], "13");
+}
+
+/// 204, 205 and 304 have no body in HTTP. A capsule that sends one falls
+/// through instead.
+#[test]
+fn a_body_on_a_no_content_status_falls_through() {
+    for status in [204, 205, 304] {
+        let artifact = guest(&GuestFrame::Response(EdgeResponse {
+            status,
+            headers: Vec::new(),
+            body: b"not allowed".to_vec(),
+        }));
+        let seen = Seen::default();
+        let gateway = EdgeGateway::new(artifact, origin(&seen));
+
+        let response = block_on(gateway.handle(Request::get("/x").body(Body::empty()).unwrap()));
+
+        assert_eq!(
+            lane(&response),
+            Lane::Fallthrough(FallthroughReason::CapsuleError),
+            "{status}"
+        );
+    }
 }

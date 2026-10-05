@@ -10521,7 +10521,9 @@ pub fn run(opts: DoctorOptions) {
             &[],
             capsule_bin.as_deref(),
         );
-        check_edge_capabilities_impl(&scan)
+        let reachable =
+            crate::edge_scan::reachable_files(std::path::Path::new("."), capsule_bin.as_deref());
+        check_edge_capabilities_impl(&scan, &reachable)
     }));
 
     // 18. Orphaned plugin residue (issue #1631): a dependency with no mount, a
@@ -11778,10 +11780,14 @@ pub fn check_edge_routes_impl(
 /// extractor, or an undeclared `EdgeIdentity`. Each one also stops the build
 /// in rustc; doctor names it before the build starts.
 ///
-/// Fails for a route that `edge_routes![]` registers: the capsule needs it,
-/// so the build stops. Only warns for an unregistered one: the scan reads
-/// every file under `src/`, also a file that no `mod` declares.
-pub fn check_edge_capabilities_impl(scan: &crate::edge_scan::EdgeScan) -> CheckResult {
+/// Fails for a route in a file the compiler reads (`reachable`, from
+/// [`crate::edge_scan::reachable_files`]): the build stops on it. Only warns
+/// for a route in another file: the scan reads every file under `src/`, also
+/// one that no `mod` declares.
+pub fn check_edge_capabilities_impl(
+    scan: &crate::edge_scan::EdgeScan,
+    reachable: &std::collections::BTreeSet<String>,
+) -> CheckResult {
     const NAME: &str = "edge_capabilities";
     if scan.is_empty() {
         return CheckResult {
@@ -11803,8 +11809,7 @@ pub fn check_edge_capabilities_impl(scan: &crate::edge_scan::EdgeScan) -> CheckR
             hint: None,
         };
     }
-    let registered = scan.registered_fns();
-    let status = if unsupported.iter().any(|f| registered.contains(f)) {
+    let status = if unsupported.iter().any(|f| reachable.contains(&f.file)) {
         CheckStatus::Fail
     } else {
         CheckStatus::Warn
@@ -11918,7 +11923,7 @@ mod tests {
 
     #[test]
     fn edge_capabilities_passes_without_edge_routes() {
-        let r = check_edge_capabilities_impl(&edge_scan_of("fn plain() {}"));
+        let r = check_edge_capabilities_impl(&edge_scan_of("fn plain() {}"), &reachable());
         assert_eq!(r.status, CheckStatus::Pass);
         assert_eq!(r.detail.as_deref(), Some("no #[edge] routes"));
     }
@@ -11926,16 +11931,14 @@ mod tests {
     #[test]
     fn edge_capabilities_passes_for_supported_capabilities() {
         let scan = edge_scan_of("#[edge(needs(kv))]\nfn note(cache: EdgeCache) {}");
-        let r = check_edge_capabilities_impl(&scan);
+        let r = check_edge_capabilities_impl(&scan, &reachable());
         assert_eq!(r.status, CheckStatus::Pass, "{:?}", r.detail);
     }
 
     #[test]
     fn edge_capabilities_fails_on_a_capability_the_edge_cannot_provide() {
-        let scan = edge_scan_of(
-            "#[get(\"/d\")]\n#[edge(needs(db))]\nfn dash(db: Db) {}\nfn wire() { edge_routes![dash]; }",
-        );
-        let r = check_edge_capabilities_impl(&scan);
+        let scan = edge_scan_of("#[get(\"/d\")]\n#[edge(needs(db))]\nfn dash(db: Db) {}");
+        let r = check_edge_capabilities_impl(&scan, &reachable());
         assert_eq!(r.status, CheckStatus::Fail);
         let detail = r.detail.unwrap();
         assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
@@ -11946,12 +11949,19 @@ mod tests {
         assert!(hint.contains("Remove #[edge]"), "{hint}");
     }
 
-    /// An unregistered route may sit in a file that no `mod` declares. The
-    /// scan cannot tell, so doctor warns instead of failing a valid app.
+    /// The files the compiler reads, for the `edge_scan_of` fixtures.
+    fn reachable() -> std::collections::BTreeSet<String> {
+        std::iter::once("src/routes.rs".to_owned()).collect()
+    }
+
+    /// A file that no `mod` declares is not compiled. A route in it, even a
+    /// registered one, only warns.
     #[test]
-    fn edge_capabilities_only_warns_for_an_unregistered_route() {
-        let scan = edge_scan_of("#[get(\"/d\")]\n#[edge]\nfn dash(db: Db) {}");
-        let r = check_edge_capabilities_impl(&scan);
+    fn edge_capabilities_only_warns_for_a_file_the_compiler_does_not_read() {
+        let scan = edge_scan_of(
+            "#[get(\"/d\")]\n#[edge]\nfn dash(db: Db) {}\nfn wire() { edge_routes![dash]; }",
+        );
+        let r = check_edge_capabilities_impl(&scan, &std::collections::BTreeSet::new());
         assert_eq!(r.status, CheckStatus::Warn);
         let detail = r.detail.unwrap();
         assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
