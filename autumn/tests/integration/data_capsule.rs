@@ -426,6 +426,24 @@ async fn export_rejects_an_exclusion_that_names_no_column() {
 }
 
 #[tokio::test]
+async fn export_rejects_blob_and_relationship_columns_that_name_no_column() {
+    // A typo must not give a capsule without its blobs or its links.
+    for (model, typo) in [
+        (CapsuleModel::new("users", "id").blob("avatarr"), "avatarr"),
+        (
+            CapsuleModel::new("posts", "author_id").belongs_to("authr_id", "users"),
+            "authr_id",
+        ),
+    ] {
+        let err = export_subject(&[model], &seeded_store(), "1")
+            .await
+            .expect_err("unknown column");
+        assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains(typo), "{err}");
+    }
+}
+
+#[tokio::test]
 async fn every_viewer_link_points_at_a_file_and_an_anchor() {
     let (_dir, root) = written().await;
     let mut pages = vec![root.join("viewer/index.html")];
@@ -635,7 +653,10 @@ mod blobs {
     use std::time::Duration;
 
     use autumn_web::gdpr::portability::{collect_blobs, restore_blobs};
-    use autumn_web::storage::{BlobStore, LocalBlobStore, local::SigningKey};
+    use autumn_web::storage::{
+        Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream, LocalBlobStore,
+        local::SigningKey,
+    };
     use bytes::Bytes;
 
     use super::*;
@@ -789,6 +810,106 @@ mod blobs {
         assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
         let head = other_type.head("avatars/ada.png").await.unwrap().unwrap();
         assert_eq!(head.content_type, "text/plain");
+    }
+
+    /// A blob store where another writer takes `raced` just before the
+    /// conditional write.
+    struct RacedStore {
+        inner: LocalBlobStore,
+        raced: &'static str,
+    }
+
+    impl BlobStore for RacedStore {
+        fn provider_id(&self) -> &str {
+            self.inner.provider_id()
+        }
+        fn put<'a>(
+            &'a self,
+            key: &'a str,
+            content_type: &'a str,
+            bytes: Bytes,
+        ) -> BlobFuture<'a, Blob> {
+            self.inner.put(key, content_type, bytes)
+        }
+        fn put_if_absent<'a>(
+            &'a self,
+            key: &'a str,
+            content_type: &'a str,
+            bytes: Bytes,
+        ) -> BlobFuture<'a, Option<Blob>> {
+            Box::pin(async move {
+                if key == self.raced {
+                    self.inner
+                        .put(key, "text/plain", Bytes::from_static(b"theirs"))
+                        .await?;
+                }
+                self.inner.put_if_absent(key, content_type, bytes).await
+            })
+        }
+        fn put_stream<'a>(
+            &'a self,
+            key: &'a str,
+            content_type: &'a str,
+            data: ByteStream<'a>,
+        ) -> BlobFuture<'a, Blob> {
+            self.inner.put_stream(key, content_type, data)
+        }
+        fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes> {
+            self.inner.get(key)
+        }
+        fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
+            self.inner.delete(key)
+        }
+        fn head<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
+            self.inner.head(key)
+        }
+        fn presigned_url<'a>(
+            &'a self,
+            key: &'a str,
+            expires_in: Duration,
+        ) -> BlobFuture<'a, String> {
+            self.inner.presigned_url(key, expires_in)
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_does_not_overwrite_a_blob_written_during_the_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source_blobs).await.unwrap();
+
+        // The check finds both keys free. Then another writer takes the
+        // second key before the import writes it.
+        let target = RacedStore {
+            inner: blob_store(&tmp.path().join("b")),
+            raced: "docs/ada-cv.txt",
+        };
+        let err = restore_blobs(&capsule, &target)
+            .await
+            .expect_err("lost race");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            target.get("docs/ada-cv.txt").await.unwrap(),
+            Bytes::from_static(b"theirs")
+        );
+        // The blob that this import wrote before the conflict is gone again.
+        assert!(matches!(
+            target.get("avatars/ada.png").await,
+            Err(BlobStoreError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

@@ -387,11 +387,12 @@ fn money_expr(field: &FieldSpec) -> String {
     if field.base_type.as_deref().unwrap_or(&field.data_type) == "money" {
         return format!("(e.j ->> '{name}')::numeric::money");
     }
-    // Keep the element order. A JSON `null` gives SQL `NULL`.
+    // The JSON text of a numeric array is an array literal after `[` and `]`
+    // become `{` and `}`: the items are plain numbers or `null`. Nested
+    // arrays keep their dimensions. A JSON `null` gives SQL `NULL`.
     format!(
-        "CASE WHEN jsonb_typeof(e.j -> '{name}') = 'array' THEN ARRAY(SELECT x::numeric::money \
-         FROM jsonb_array_elements_text(e.j -> '{name}') WITH ORDINALITY AS t(x, n) \
-         ORDER BY n) END"
+        "CASE WHEN jsonb_typeof(e.j -> '{name}') = 'array' \
+         THEN translate((e.j -> '{name}')::text, '[]', '{{}}')::numeric[]::money[] END"
     )
 }
 
@@ -587,11 +588,12 @@ mod tests {
             records: &records,
         })
         .unwrap();
+        // The JSON text becomes an array literal, so nested arrays keep their
+        // dimensions.
         assert!(
             sql.contains(
-                "CASE WHEN jsonb_typeof(e.j -> 'fee') = 'array' THEN ARRAY(SELECT x::numeric::money \
-                 FROM jsonb_array_elements_text(e.j -> 'fee') WITH ORDINALITY AS t(x, n) \
-                 ORDER BY n) END"
+                "CASE WHEN jsonb_typeof(e.j -> 'fee') = 'array' \
+                 THEN translate((e.j -> 'fee')::text, '[]', '{}')::numeric[]::money[] END"
             ),
             "{sql}"
         );

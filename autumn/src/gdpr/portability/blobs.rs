@@ -65,7 +65,11 @@ pub async fn collect_blobs(
 ///
 /// The function first checks all keys. A key that holds different bytes, or the
 /// same bytes with a different MIME type, is a conflict, and then the function
-/// writes nothing. A key with the same bytes and MIME type is not written again. Call it before [`import_capsule`](super::import_capsule):
+/// writes nothing. A key with the same bytes and MIME type is not written again.
+///
+/// The function writes with [`BlobStore::put_if_absent`]. If another writer
+/// takes a key after the check, that is also a conflict. Then the function
+/// deletes the blobs that it wrote and keeps the blob of the other writer. Call it before [`import_capsule`](super::import_capsule):
 /// then no imported record points at a blob that is not there.
 ///
 /// # Errors
@@ -83,41 +87,67 @@ pub async fn restore_blobs(
             .blobs
             .get(&entry.sha256)
             .ok_or_else(|| DataCapsuleError::Blob(format!("no bytes for blob {:?}", entry.key)))?;
-        match store.get(&entry.key).await {
-            Ok(existing) if hex::encode(Sha256::digest(&existing)) == entry.sha256 => {
-                // Export writes `application/octet-stream` when a blob has no
-                // metadata, so compare with the same default.
-                let content_type = match store.head(&entry.key).await {
-                    Ok(Some(meta)) => meta.content_type,
-                    Ok(None) | Err(BlobStoreError::NotFound(_)) => {
-                        "application/octet-stream".to_owned()
-                    }
-                    Err(e) => {
-                        return Err(DataCapsuleError::Blob(format!("head {:?}: {e}", entry.key)));
-                    }
-                };
-                if content_type != entry.content_type {
-                    return Err(DataCapsuleError::Conflict(format!(
-                        "blob {:?} exists with MIME type {content_type:?}, not {:?}",
-                        entry.key, entry.content_type
-                    )));
-                }
-            }
-            Ok(_) => {
-                return Err(DataCapsuleError::Conflict(format!(
-                    "blob {:?} exists with different bytes",
-                    entry.key
-                )));
-            }
-            Err(BlobStoreError::NotFound(_)) => to_write.push((entry, bytes)),
-            Err(e) => return Err(DataCapsuleError::Blob(format!("get {:?}: {e}", entry.key))),
+        if !check_existing(store, entry).await? {
+            to_write.push((entry, bytes));
         }
     }
+    let mut written = Vec::new();
     for (entry, bytes) in to_write {
-        store
-            .put(&entry.key, &entry.content_type, bytes.clone())
+        let result = match store
+            .put_if_absent(&entry.key, &entry.content_type, bytes.clone())
             .await
-            .map_err(|e| DataCapsuleError::Blob(format!("put {:?}: {e}", entry.key)))?;
+        {
+            Ok(Some(_)) => {
+                written.push(entry.key.as_str());
+                Ok(())
+            }
+            // Another writer took the key after the check.
+            Ok(None) => check_existing(store, entry).await.map(drop),
+            Err(e) => Err(DataCapsuleError::Blob(format!("put {:?}: {e}", entry.key))),
+        };
+        if let Err(error) = result {
+            for key in written {
+                if let Err(e) = store.delete(key).await {
+                    tracing::warn!(blob_key = %key, error = %e, "capsule import: rollback failed");
+                }
+            }
+            return Err(error);
+        }
     }
     Ok(capsule.manifest.blobs.len())
+}
+
+/// Compare the blob at `entry.key` with `entry`.
+///
+/// Returns `false` when the key is free, and `true` when it holds the same
+/// bytes and MIME type.
+async fn check_existing(
+    store: &dyn BlobStore,
+    entry: &BlobEntry,
+) -> Result<bool, DataCapsuleError> {
+    let existing = match store.get(&entry.key).await {
+        Ok(existing) => existing,
+        Err(BlobStoreError::NotFound(_)) => return Ok(false),
+        Err(e) => return Err(DataCapsuleError::Blob(format!("get {:?}: {e}", entry.key))),
+    };
+    if hex::encode(Sha256::digest(&existing)) != entry.sha256 {
+        return Err(DataCapsuleError::Conflict(format!(
+            "blob {:?} exists with different bytes",
+            entry.key
+        )));
+    }
+    // Export writes `application/octet-stream` when a blob has no metadata,
+    // so compare with the same default.
+    let content_type = match store.head(&entry.key).await {
+        Ok(Some(meta)) => meta.content_type,
+        Ok(None) | Err(BlobStoreError::NotFound(_)) => "application/octet-stream".to_owned(),
+        Err(e) => return Err(DataCapsuleError::Blob(format!("head {:?}: {e}", entry.key))),
+    };
+    if content_type != entry.content_type {
+        return Err(DataCapsuleError::Conflict(format!(
+            "blob {:?} exists with MIME type {content_type:?}, not {:?}",
+            entry.key, entry.content_type
+        )));
+    }
+    Ok(true)
 }

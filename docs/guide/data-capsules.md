@@ -170,7 +170,10 @@ directory to a link after the open, the reads do not follow it.
 - Import skips generated columns.
 - Import moves each serial or identity sequence past the largest key.
 - Import writes blobs before records. If a blob key holds different bytes or a
-  different MIME type, import stops and writes no blob.
+  different MIME type, import stops and writes no blob. If another writer
+  takes a key during the import, import stops and deletes the blobs that it
+  wrote. Only a blob store with a conditional write, such as
+  `LocalBlobStore`, finds this every time.
 
 ## Data accuracy
 

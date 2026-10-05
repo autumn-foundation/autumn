@@ -296,6 +296,57 @@ impl BlobStore for LocalBlobStore {
         })
     }
 
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        content_type: &'a str,
+        bytes: Bytes,
+    ) -> BlobFuture<'a, Option<Blob>> {
+        Box::pin(async move {
+            let path = self.safe_path_for_key(key).await?;
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(BlobStoreError::io)?;
+            }
+            let etag = sha256_hex(&bytes);
+            // Write a temp file, then hard-link it to `path`. A link fails
+            // when `path` exists, so this never replaces a blob that another
+            // writer made in the meantime.
+            let tmp_path = temp_sibling_path(&path);
+            if let Err(err) = tokio::fs::write(&tmp_path, &bytes).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(BlobStoreError::io(err));
+            }
+            let linked = tokio::fs::hard_link(&tmp_path, &path).await;
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            match linked {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+                Err(err) => return Err(BlobStoreError::io(err)),
+            }
+            if write_meta_sidecar(
+                &path,
+                &StoredBlobMeta {
+                    content_type: content_type.to_owned(),
+                    etag: Some(etag.clone()),
+                },
+            )
+            .await
+            .is_err()
+            {
+                drop_stale_sidecar(&path).await;
+            }
+            Ok(Some(Blob {
+                provider_id: self.inner.provider_id.clone(),
+                key: key.to_owned(),
+                content_type: content_type.to_owned(),
+                byte_size: bytes.len() as u64,
+                etag: Some(etag),
+            }))
+        })
+    }
+
     fn put_stream<'a>(
         &'a self,
         key: &'a str,
@@ -1275,6 +1326,36 @@ mod tests {
         assert!(blob.etag.is_some());
         let bytes = s.get("a/b.png").await.unwrap();
         assert_eq!(&bytes[..], b"abc");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_writes_only_a_free_key() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        let blob = s
+            .put_if_absent("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .unwrap()
+            .expect("the key is free");
+        assert_eq!(blob.byte_size, 3);
+        let head = s.head("a/b.png").await.unwrap().unwrap();
+        assert_eq!(head.content_type, "image/png");
+
+        let second = s
+            .put_if_absent("a/b.png", "text/plain", Bytes::from_static(b"xyz"))
+            .await
+            .unwrap();
+        assert!(second.is_none(), "the key is taken");
+        assert_eq!(&s.get("a/b.png").await.unwrap()[..], b"abc");
+        let head = s.head("a/b.png").await.unwrap().unwrap();
+        assert_eq!(head.content_type, "image/png");
+        // No temp file is left next to the blob.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path().join("a"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["b.png", "b.png.meta"]);
     }
 
     #[tokio::test]

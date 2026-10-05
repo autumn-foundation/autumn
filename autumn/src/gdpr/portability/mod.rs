@@ -149,7 +149,8 @@ fn check_models(models: &[CapsuleModel]) -> Result<(), DataCapsuleError> {
 /// # Errors
 ///
 /// [`DataCapsuleError::InvalidInput`] for an empty subject, a duplicate
-/// model, or an excluded column that the table does not have,
+/// model, or an excluded, blob, or relationship column that the table does not
+/// have,
 /// [`DataCapsuleError::InvalidName`] for an unsafe name, or an error from
 /// `store`.
 pub async fn export_subject(
@@ -167,16 +168,20 @@ pub async fn export_subject(
     let mut manifest = CapsuleManifest::new(subject);
     let mut records = BTreeMap::new();
     for (model, (mut fields, mut rows)) in models.iter().zip(data) {
-        // Fail closed: a typo in an exclusion must not export the real column.
-        if let Some(name) = model
+        // Fail closed: a typo must not export a secret column, or give a
+        // capsule without its blobs or links.
+        let configured = model
             .excluded
             .iter()
-            .find(|name| !fields.iter().any(|f| &f.name == *name))
-        {
-            return Err(DataCapsuleError::InvalidInput(format!(
-                "{} excludes {name:?}, but the table has no such column",
-                model.table
-            )));
+            .chain(&model.blob_columns)
+            .chain(model.relationships.iter().map(|r| &r.column));
+        for name in configured {
+            if !fields.iter().any(|f| &f.name == name) {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "{} names column {name:?}, but the table has no such column",
+                    model.table
+                )));
+            }
         }
         fields.retain(|f| !model.excluded.contains(&f.name));
         for row in &mut rows {
