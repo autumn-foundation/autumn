@@ -306,7 +306,7 @@ async fn steps(
 ) -> AutumnResult<axum::response::Response> {
     let calls = state.extension::<Calls>().expect("calls installed");
     calls.add();
-    let point = idem.recovery_point(&mut *db).await?;
+    let point = idem.recovery_point(&mut db).await?;
     if point.is_none() {
         let idem = idem.clone();
         db.tx(|conn| {
@@ -341,19 +341,21 @@ async fn db_store_recovery_point_survives_a_crash() {
     let client = client(&pool, &calls, Some(Duration::from_secs(5)));
 
     // Drop the request when step 1 committed, while it waits before step 2.
-    let request = send(&client, "/steps", "multi");
-    tokio::pin!(request);
-    loop {
-        tokio::select! {
-            _ = &mut request => panic!("the request finished before the crash"),
-            () = tokio::time::sleep(Duration::from_millis(20)) => {
-                if payments(&pool).await == 1 {
-                    break;
+    {
+        let request = send(&client, "/steps", "multi");
+        tokio::pin!(request);
+        loop {
+            tokio::select! {
+                _ = &mut request => panic!("the request finished before the crash"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if payments(&pool).await == 1 {
+                        break;
+                    }
                 }
             }
         }
+        // The request future drops at the end of this block: the crash.
     }
-    drop(request);
 
     let response = retry(&client, "/steps", "multi").await;
     response.assert_status(201);
