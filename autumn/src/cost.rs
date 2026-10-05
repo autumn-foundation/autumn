@@ -341,10 +341,29 @@ impl CostAccountant {
 }
 
 impl MetricsSource for CostAccountant {
-    #[allow(clippy::cast_precision_loss)]
     fn collect(&self) -> Vec<MetricFamily> {
+        self.metric_families(self.inner.tenant_labels)
+    }
+}
+
+/// The registered metrics view of an accountant that the app inserted: it
+/// shows tenant labels only when the accountant and the actuator both allow
+/// them, so the public endpoints keep tenant ids out by default.
+struct PublicCostMetrics {
+    accountant: CostAccountant,
+    tenant_labels: bool,
+}
+
+impl MetricsSource for PublicCostMetrics {
+    fn collect(&self) -> Vec<MetricFamily> {
+        self.accountant.metric_families(self.tenant_labels)
+    }
+}
+
+impl CostAccountant {
+    #[allow(clippy::cast_precision_loss)]
+    fn metric_families(&self, tenant_labels: bool) -> Vec<MetricFamily> {
         let snapshot = self.snapshot();
-        let tenant_labels = self.inner.tenant_labels;
         let family = |name: &str, help: &str, value: fn(&TenantCost) -> f64| MetricFamily {
             name: name.to_owned(),
             help: help.to_owned(),
@@ -797,19 +816,31 @@ pub(crate) fn install(state: &crate::AppState, config: &crate::config::AutumnCon
     let signal = state.extension_or_insert_with(|| CostSignal::new(cost.defer_threshold));
     signal.set_recheck(Duration::from_secs(cost.defer_recheck_secs));
 
-    if cost.enabled && state.extension::<CostAccountant>().is_none() {
-        let mut accountant =
-            CostAccountant::new(cost.max_tenants).with_tenant_labels(config.actuator.sensitive);
-        if let Some(probe) = state.extension::<Arc<dyn AllocationProbe>>() {
-            accountant = accountant.with_allocation_probe((*probe).clone());
-        }
+    if cost.enabled {
+        let sensitive = config.actuator.sensitive;
+        // An accountant that the app inserted is still the metrics source;
+        // its tenant labels show only in sensitive mode.
+        let source: Arc<dyn MetricsSource> =
+            if let Some(accountant) = state.extension::<CostAccountant>() {
+                Arc::new(PublicCostMetrics {
+                    tenant_labels: accountant.inner.tenant_labels && sensitive,
+                    accountant: (*accountant).clone(),
+                })
+            } else {
+                let mut accountant =
+                    CostAccountant::new(cost.max_tenants).with_tenant_labels(sensitive);
+                if let Some(probe) = state.extension::<Arc<dyn AllocationProbe>>() {
+                    accountant = accountant.with_allocation_probe((*probe).clone());
+                }
+                state.insert_extension(accountant.clone());
+                Arc::new(accountant)
+            };
         let registry = state.metrics_source_registry();
         if !registry.contains(METRICS_SOURCE_NAME)
-            && let Err(error) = registry.register(METRICS_SOURCE_NAME, Arc::new(accountant.clone()))
+            && let Err(error) = registry.register(METRICS_SOURCE_NAME, source)
         {
             tracing::warn!("{error}");
         }
-        state.insert_extension(accountant);
     }
 
     if let Some(service) = state.extension::<Arc<crate::runtime_config::RuntimeConfigService>>()
@@ -940,6 +971,40 @@ mod tests {
         }
         let db = &accountant.collect()[3];
         assert!((db.samples[0].value - 3.0).abs() < f64::EPSILON);
+    }
+
+    /// An accountant that the app inserted is still the metrics source, and
+    /// it keeps tenant ids off the public endpoints (#1720).
+    #[tokio::test]
+    async fn install_registers_an_accountant_the_app_inserted() {
+        for (sensitive, labeled) in [(false, false), (true, true)] {
+            let state = crate::AppState::for_test();
+            let mine = CostAccountant::new(8).with_tenant_labels(true);
+            state.insert_extension(mine.clone());
+            let mut config = crate::config::AutumnConfig::default();
+            config.cost.enabled = true;
+            config.actuator.sensitive = sensitive;
+            install(&state, &config);
+
+            mine.record(&cost(1_000_000, 0, 1).with_tenant("acme"));
+            let sources = state.metrics_source_registry().collect_all();
+            let (_, families) = sources
+                .iter()
+                .find(|(name, _)| name == METRICS_SOURCE_NAME)
+                .expect("the inserted accountant is registered");
+            let requests = &families[0];
+            assert_eq!(
+                requests.samples.iter().any(|s| !s.labels.is_empty()),
+                labeled,
+                "sensitive = {sensitive}"
+            );
+            assert!(
+                state
+                    .extension::<CostAccountant>()
+                    .is_some_and(|a| Arc::ptr_eq(&a.inner, &mine.inner)),
+                "the app's accountant stays in the state"
+            );
+        }
     }
 
     #[test]
