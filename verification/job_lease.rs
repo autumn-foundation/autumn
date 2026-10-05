@@ -2,7 +2,7 @@ use vstd::prelude::*;
 
 verus! {
 
-// Durable job claim lease (issue #3051, ADR 0015).
+// Durable job claim lease (issue #3051, ADR 0016).
 //
 // Time is one clock: the database clock (Postgres), the app clock (SQLite),
 // or Redis `TIME` (Redis). Owner `0` means "no claim".

@@ -1016,8 +1016,17 @@ impl LeaseHeartbeat {
         self.lost.clone()
     }
 
-    /// Stop renewing and wait for the heartbeat task to end, so no renewal
-    /// runs after the caller settles the job.
+    /// Run `settle` (the ack or nack) while the heartbeat still renews the
+    /// claim, then stop it. A settle that stalls past the lease must not let
+    /// stale recovery requeue a job whose handler already finished. A renewal
+    /// that lands after the settle matches no claim, so it changes nothing.
+    async fn stop_after<F: Future>(self, settle: F) -> F::Output {
+        let settled = settle.await;
+        self.stop().await;
+        settled
+    }
+
+    /// Stop renewing and wait for the heartbeat task to end.
     async fn stop(mut self) {
         self.stop.cancel();
         if let Some(task) = self.task.take() {
@@ -9024,55 +9033,58 @@ async fn process_redis_job_record(
         bounds,
     );
     let outcome = tracing::Instrument::instrument(f, job_span).await;
-    heartbeat.stop().await;
-    match outcome {
-        JobExecutionOutcome::LeaseLost => {
-            record_lease_lost(&record.name, &record.id, record.attempt, state, job_admin);
-        }
-        JobExecutionOutcome::Succeeded => {
-            match ack_redis_success(connection, worker_config, &record).await {
-                Ok(true) => {
-                    state.job_registry.record_success(&record.name);
-                    job_admin.record_success(&record.id);
+    heartbeat
+        .stop_after(async {
+        match outcome {
+            JobExecutionOutcome::LeaseLost => {
+                record_lease_lost(&record.name, &record.id, record.attempt, state, job_admin);
+            }
+            JobExecutionOutcome::Succeeded => {
+                match ack_redis_success(connection, worker_config, &record).await {
+                    Ok(true) => {
+                        state.job_registry.record_success(&record.name);
+                        job_admin.record_success(&record.id);
+                    }
+                    Ok(false) => tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        "redis job success ack skipped because claim changed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        error = %error,
+                        "redis job success ack failed"
+                    ),
                 }
-                Ok(false) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    "redis job success ack skipped because claim changed"
-                ),
-                Err(error) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    error = %error,
-                    "redis job success ack failed"
-                ),
+            }
+            JobExecutionOutcome::Failed(error) => {
+                settle_failed_redis_job(
+                    connection,
+                    worker_config,
+                    state,
+                    &record,
+                    error,
+                    "failed",
+                    job_admin,
+                )
+                .await;
+            }
+            JobExecutionOutcome::Panicked(error) => {
+                tracing::error!(job = %record.name, error = %error, "redis job handler panicked");
+                dead_letter_panicked_redis_job(
+                    connection,
+                    worker_config,
+                    state,
+                    &record,
+                    error,
+                    job_admin,
+                )
+                .await;
             }
         }
-        JobExecutionOutcome::Failed(error) => {
-            settle_failed_redis_job(
-                connection,
-                worker_config,
-                state,
-                &record,
-                error,
-                "failed",
-                job_admin,
-            )
-            .await;
-        }
-        JobExecutionOutcome::Panicked(error) => {
-            tracing::error!(job = %record.name, error = %error, "redis job handler panicked");
-            dead_letter_panicked_redis_job(
-                connection,
-                worker_config,
-                state,
-                &record,
-                error,
-                job_admin,
-            )
-            .await;
-        }
-    }
+        })
+        .await;
 }
 
 #[cfg(feature = "redis")]
@@ -10966,17 +10978,17 @@ async fn pg_execute_job(
         bounds,
     );
     let outcome = tracing::Instrument::instrument(f, job_span).await;
-    heartbeat.stop().await;
-    pg_settle_outcome(
-        outcome,
-        &row,
-        pool,
-        worker_id,
-        state,
-        job_admin,
-        pending_unique_key.as_deref(),
-    )
-    .await;
+    heartbeat
+        .stop_after(pg_settle_outcome(
+            outcome,
+            &row,
+            pool,
+            worker_id,
+            state,
+            job_admin,
+            pending_unique_key.as_deref(),
+        ))
+        .await;
 }
 
 /// Write a finished attempt back to `autumn_jobs` and record it.
@@ -24153,6 +24165,37 @@ mod lease_tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "the heartbeat ends");
         heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_keeps_renewing_until_the_settle_finishes() {
+        // A settle (ack/nack) that stalls past the lease, as on a reconnect
+        // or an exhausted pool. Stale recovery must not see the claim expire
+        // while the worker is still writing the result.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(Vec::new(), Arc::clone(&calls));
+        let lost = heartbeat.lost_token();
+        let settled = heartbeat
+            .stop_after(async {
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                "settled"
+            })
+            .await;
+        assert_eq!(settled, "settled");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 9,
+            "renewals continue through a 1s settle on a 300ms lease, got {}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert!(!lost.is_cancelled());
+        let after = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after,
+            "no renewal after the settle"
+        );
     }
 
     #[cfg(any(feature = "db", feature = "redis"))]

@@ -1306,18 +1306,18 @@ async fn execute_job(
         job_span,
     )
     .await;
-    heartbeat.stop().await;
-    settle_outcome(
-        outcome,
-        &row,
-        pool,
-        worker_id,
-        state,
-        job_admin,
-        pending_unique_key.as_deref(),
-        final_attempt,
-    )
-    .await;
+    heartbeat
+        .stop_after(settle_outcome(
+            outcome,
+            &row,
+            pool,
+            worker_id,
+            state,
+            job_admin,
+            pending_unique_key.as_deref(),
+            final_attempt,
+        ))
+        .await;
 }
 
 /// Write a finished attempt back to the queue table and record it.

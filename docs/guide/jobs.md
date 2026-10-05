@@ -477,7 +477,7 @@ async fn crunch(state: AppState, args: CrunchArgs) -> AutumnResult<()> {
 An operator cancel from the dashboard does not set these. It applies only to a
 job that did not start.
 
-[ADR 0015](../adr/0015-durable-job-claim-lease.md) records the design.
+[ADR 0016](../adr/0016-durable-job-claim-lease.md) records the design.
 
 ## Retry/backoff and dead letters
 

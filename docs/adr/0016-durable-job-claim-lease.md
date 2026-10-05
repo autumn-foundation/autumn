@@ -1,4 +1,4 @@
-# ADR 0015: Renew Durable Job Claims With A Heartbeat
+# ADR 0016: Renew Durable Job Claims With A Heartbeat
 
 - Status: Accepted
 - Date: 2026-10-05
