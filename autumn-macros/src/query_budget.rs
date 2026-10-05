@@ -1982,6 +1982,14 @@ impl Analyzer {
     /// or tuple literal records what each part holds.
     fn bind_init(&mut self, pat: &Pat, init: &Expr) {
         self.bind_init_parts(pat, init);
+        // `let target: &mut Vec<Db> = &mut list;` is an alias, as without
+        // the type.
+        if let Pat::Type(typed) = pat
+            && let Pat::Ident(id) = &*typed.pat
+        {
+            let targets = self.referents_of(init);
+            self.add_referents(id.ident.to_string(), &targets);
+        }
         // `let Holder(ref mut bucket) = holder;`: a store into `bucket` is a
         // store into `holder`.
         let names = ref_mut_names(pat);
@@ -1991,15 +1999,23 @@ impl Analyzer {
         let borrow: Expr = syn::parse_quote!(&mut #init);
         let targets = self.referents_of(&borrow);
         for name in names {
-            let mut binding = self.env.binding(&name);
-            for target in &targets {
-                if !binding.referents.contains(target) {
-                    binding.referents.push(target.clone());
-                }
-            }
-            binding.referents.sort();
-            self.env.declare(name, binding);
+            self.add_referents(name, &targets);
         }
+    }
+
+    /// Record that `name` may point to each of `targets`.
+    fn add_referents(&mut self, name: String, targets: &[String]) {
+        if targets.is_empty() {
+            return;
+        }
+        let mut binding = self.env.binding(&name);
+        for target in targets {
+            if !binding.referents.contains(target) {
+                binding.referents.push(target.clone());
+            }
+        }
+        binding.referents.sort();
+        self.env.declare(name, binding);
     }
 
     fn bind_init_parts(&mut self, pat: &Pat, init: &Expr) {
@@ -2219,6 +2235,17 @@ impl Analyzer {
             Expr::Path(_) => path_ident(init)
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
+            // `if flag { &mut left } else { &mut right }`: every tail.
+            Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
+                let mut all: Vec<String> = branch_tails(init)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flat_map(|tail| self.referents_of(tail))
+                    .collect();
+                all.sort();
+                all.dedup();
+                all
+            }
             _ => Vec::new(),
         }
     }
@@ -2279,12 +2306,16 @@ impl Analyzer {
             binding.shape = binding.shape.or(old.shape);
         }
         if let Some(declared) = old.declared {
-            binding.kind = binding.kind.max(declared.kind);
+            // A value that shows what it holds (`slot = None;`) clears. An
+            // opaque one may hold anything its declared type holds.
+            if value.is_none_or(|v| self.is_opaque_value(v)) {
+                binding.kind = binding.kind.max(declared.kind);
+                if declared.parts.is_some() {
+                    binding.parts.clone_from(&declared.parts);
+                }
+            }
             binding.shape = declared.shape.or(binding.shape);
             binding.inner = declared.inner.or(binding.inner);
-            if declared.parts.is_some() {
-                binding.parts.clone_from(&declared.parts);
-            }
             binding.declared = Some(declared);
         }
         self.env.assign(name, binding);
@@ -2883,9 +2914,9 @@ impl Analyzer {
     fn match_expr(&mut self, m: &syn::ExprMatch, whole: &Expr) -> Flow {
         let scrutinee = self.expr(&m.expr);
         let mut entry = self.env.clone();
-        // The guards tried so far: an arm's body runs after every guard
-        // before it, and its own.
-        let mut guards = Cost::ZERO;
+        // The guards tried so far, with their patterns: an arm's body runs
+        // after every guard before it whose pattern can match its value.
+        let mut tried: Vec<(&Pat, Cost)> = Vec::new();
         let mut bodies = Vec::new();
         let mut joined: Option<Env> = None;
         for arm in &m.arms {
@@ -2905,11 +2936,15 @@ impl Analyzer {
                 (guard, after_guard, body)
             });
             let guard_falls = guard.fall.clone();
-            let body = Flow::cost(guards.clone()).then(guard).then(body);
+            let prefix = tried
+                .iter()
+                .filter(|(earlier, _)| !patterns_disjoint(earlier, pat))
+                .fold(Cost::ZERO, |sum, (_, cost)| sum.then(cost.clone()));
+            let body = Flow::cost(prefix).then(guard).then(body);
             // A later arm runs after this guard falls through, or after
             // this pattern fails (and the guard does not run).
             if let Some(cost) = guard_falls.clone() {
-                guards = guards.then(cost);
+                tried.push((pat, cost));
                 // A failing guard falls through to the next arm with its
                 // bindings.
                 let mut after_guard = after_guard;
@@ -3584,6 +3619,16 @@ impl Analyzer {
             && !HANDLE_TRANSITIONS.contains(&last.as_str())
     }
 
+    /// The shape of an `if`, `match` or block whose tails all have it.
+    fn tails_shape(&self, e: &Expr) -> Option<Shape> {
+        let tails = branch_tails(e)?;
+        let first = self.shape_of(tails.first()?)?;
+        tails
+            .iter()
+            .all(|t| self.shape_of(t) == Some(first))
+            .then_some(first)
+    }
+
     /// The container shape of `e`, when it is known.
     fn shape_of(&self, e: &Expr) -> Option<Shape> {
         match e {
@@ -3607,6 +3652,7 @@ impl Analyzer {
             Expr::Group(g) => self.shape_of(&g.expr),
             Expr::Array(_) | Expr::Repeat(_) => Some(Shape::Array),
             Expr::Tuple(_) => Some(Shape::Tuple),
+            Expr::If(_) | Expr::Match(_) | Expr::Block(_) => self.tails_shape(e),
             // A comparison, `&&`, `||`, `!` or a `bool` literal.
             Expr::Binary(b)
                 if matches!(
@@ -5278,6 +5324,65 @@ impl<'a> Visit<'a> for FreeNames<'_> {
         let names = c.inputs.iter().flat_map(bound_names).collect();
         self.scoped(names, |s| s.visit_expr(&c.body));
     }
+}
+
+/// Can no value match both `a` and `b`? Only when they name different
+/// variants (`Some(_)` and `None`, `Msg::A(..)` and `Msg::B { .. }`) or are
+/// different literals. A constant pattern (`A`, `Foo::MAX`) may equal any
+/// other, so it is never disjoint.
+fn patterns_disjoint(a: &Pat, b: &Pat) -> bool {
+    match (a, b) {
+        (Pat::Paren(p), _) => patterns_disjoint(&p.pat, b),
+        (_, Pat::Paren(p)) => patterns_disjoint(a, &p.pat),
+        (Pat::Or(o), _) => o.cases.iter().all(|case| patterns_disjoint(case, b)),
+        (_, Pat::Or(o)) => o.cases.iter().all(|case| patterns_disjoint(a, case)),
+        (Pat::Lit(x), Pat::Lit(y)) => {
+            matches!((literal_value(&x.lit), literal_value(&y.lit)), (Some(x), Some(y)) if x != y)
+        }
+        _ => matches!((pattern_variant(a), pattern_variant(b)), (Some(x), Some(y)) if x != y),
+    }
+}
+
+/// The value of a literal pattern, tagged with its kind. `0x1` and `1`
+/// agree. `None` for a float.
+fn literal_value(lit: &syn::Lit) -> Option<String> {
+    match lit {
+        syn::Lit::Int(i) => Some(format!("int {}", i.base10_digits())),
+        syn::Lit::Str(v) => Some(format!("str {}", v.value())),
+        syn::Lit::Char(v) => Some(format!("char {}", v.value())),
+        syn::Lit::Byte(v) => Some(format!("byte {}", v.value())),
+        syn::Lit::Bool(v) => Some(format!("bool {}", v.value)),
+        _ => None,
+    }
+}
+
+/// The variant a pattern names, as `(owner, variant)`: a std `Some`,
+/// `None`, `Ok` or `Err`, or a tuple-struct or struct pattern with a path
+/// of two or more segments. A bare or unit path may be a constant.
+fn pattern_variant(pat: &Pat) -> Option<(String, String)> {
+    const STD: &[&str] = &["Some", "None", "Ok", "Err"];
+    let (path, unit) = match pat {
+        Pat::TupleStruct(p) => (&p.path, false),
+        Pat::Struct(p) => (&p.path, false),
+        Pat::Path(p) => (&p.path, true),
+        Pat::Ident(p) if p.ident == "None" && p.subpat.is_none() && p.by_ref.is_none() => {
+            return Some(("std".to_string(), "None".to_string()));
+        }
+        _ => return None,
+    };
+    let mut segments = path.segments.iter().rev();
+    let name = segments.next()?.ident.to_string();
+    let owner: Vec<String> = segments.rev().map(|s| s.ident.to_string()).collect();
+    let std_owner = owner.iter().all(|s| {
+        matches!(
+            s.as_str(),
+            "std" | "core" | "option" | "result" | "Option" | "Result"
+        )
+    });
+    if STD.contains(&name.as_str()) && std_owner {
+        return Some(("std".to_string(), name));
+    }
+    (!unit && !owner.is_empty()).then(|| (owner.join("::"), name))
 }
 
 /// The names a pattern binds by `ref mut`.
@@ -10750,6 +10855,79 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut ids = Vec::<i64>::new(); ids = make(); render(ids); let _ = repo; Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn conditional_aliases_declared_clears_and_disjoint_guards() {
+        check_handlers(&[
+            (
+                "guard: a typed alias picked by an if aliases both places",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); let mut right = Vec::new(); \
+                 { let target: &mut Vec<PgPostRepository> = if flag { &mut left } else { &mut right }; target.push(repo); } \
+                 let _ = left[0].find_all().await?; let _ = right; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an alias picked by a match aliases every arm",
+                "async fn h(repo: PgPostRepository, n: i64) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); let mut right = Vec::new(); \
+                 { let target = match n { 0 => &mut left, _ => &mut right }; target.push(repo); } \
+                 let _ = right[0].find_all().await?; let _ = left; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a typed alias of one place aliases it",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); \
+                 { let target: &mut Vec<PgPostRepository> = &mut left; target.push(repo); } \
+                 let _ = left[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "None clears a declared Option",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot: Option<PgPostRepository> = Some(repo); slot = None; render(slot); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: an opaque value keeps a declared Option",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot: Option<PgPostRepository> = None; slot = make(); \
+                 let _ = slot.unwrap().find_all().await?; let _ = repo; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a guard on a disjoint pattern is not charged",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let _ = match x { Some(_) if repo.a().await? => plain(), None => repo.b().await?, Some(_) => plain() }; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a guard on an overlapping pattern is charged",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let _ = match x { Some(_) if repo.a().await? => plain(), _ => repo.b().await? }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: constant patterns may overlap",
+                "async fn h(repo: PgPostRepository, x: i64) -> AutumnResult<usize> { \
+                 let _ = match x { A if repo.a().await? => plain(), B => repo.b().await?, _ => plain() }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: equal literals overlap",
+                "async fn h(repo: PgPostRepository, x: i64) -> AutumnResult<usize> { \
+                 let _ = match x { 1 if repo.a().await? => plain(), 0x1 => repo.b().await?, _ => plain() }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "different literals are disjoint",
+                "async fn h(repo: PgPostRepository, x: i64) -> AutumnResult<usize> { \
+                 let _ = match x { 1 if repo.a().await? => plain(), 2 => repo.b().await?, _ => plain() }; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
