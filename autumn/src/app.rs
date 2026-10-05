@@ -9122,14 +9122,23 @@ struct CostGate {
 impl CostGate {
     /// Wait while the task must defer. Return `false` on shutdown.
     async fn wait(&self, state: &AppState, name: &str) -> bool {
-        crate::cost::wait_while_deferred(
+        let resumed = crate::cost::wait_while_deferred(
             state,
             crate::cost::WorkKind::Task,
             name,
             &self.shutdown,
             self.waiting.as_deref(),
         )
-        .await
+        .await;
+        self.release();
+        resumed
+    }
+
+    /// The tick no longer waits: later ticks run again.
+    fn release(&self) {
+        if let Some(flag) = &self.waiting {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -9163,10 +9172,12 @@ async fn execute_cron_task(
         Ok(Some(lease)) => lease,
         Ok(None) => {
             tracing::debug!(task = %name, tick = %tick_key, "Cron task tick already claimed");
+            gate.release();
             return;
         }
         Err(error) => {
             tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire cron task lease");
+            gate.release();
             return;
         }
     };
@@ -9343,6 +9354,11 @@ async fn run_cron_task_loop(
                     tracing::debug!(task = %name, "cron tick folds into the tick that waits for the cost signal");
                     cursor = scheduled_at;
                     continue;
+                }
+                // Mark the wait before the lease attempt: a slow lease must not
+                // let the next ticks spawn and pile up behind the signal.
+                if crate::cost::deferral_signal(&state, crate::cost::WorkKind::Task, &name).is_some() {
+                    deferring.store(true, std::sync::atomic::Ordering::Release);
                 }
                 let scheduled_unix_secs = u64::try_from(scheduled_at.timestamp()).unwrap_or_default();
                 tokio::spawn(execute_cron_task(
@@ -19603,6 +19619,32 @@ mod tests {
         assert_eq!(status.total_runs, 0);
         assert!(status.current_leader.is_none());
         assert!(status.last_tick.is_none());
+    }
+
+    /// A cron tick that does not get its lease clears the cost-gate flag, or
+    /// every later tick would fold into a wait that never happens (#1720).
+    #[tokio::test]
+    async fn execute_cron_task_clears_the_cost_flag_when_the_lease_is_taken() {
+        let state = AppState::for_test();
+        let waiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+
+        super::execute_cron_task(
+            "cron_lease_taken".to_owned(),
+            state,
+            handler,
+            crate::task::TaskCoordination::Fleet,
+            std::sync::Arc::new(DenyingSchedulerCoordinator),
+            std::time::Duration::from_secs(30),
+            1_700_000_000,
+            super::CostGate {
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                waiting: Some(std::sync::Arc::clone(&waiting)),
+            },
+        )
+        .await;
+
+        assert!(!waiting.load(Ordering::SeqCst), "later ticks run again");
     }
 
     #[tokio::test]

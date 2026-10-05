@@ -342,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_request_keeps_its_tenant() {
-        use crate::log::context::{LogContext, scoped};
+        use crate::log::context::{LogContext, sync_scope};
 
         let accountant = CostAccountant::new(4);
         let mut service = CostLayer::new(accountant.clone(), false).layer(tower::service_fn(
@@ -355,20 +355,14 @@ mod tests {
                 Ok::<_, std::convert::Infallible>(Response::new(()))
             },
         ));
-        let ctx = LogContext::new(None);
-        let mut future = Box::pin(scoped(ctx, async move {
-            // Poll the request one time inside the scope, then hand it out.
+        // Call and poll the request one time inside the scope.
+        let request = sync_scope(LogContext::new(None), || {
             let mut request = Box::pin(service.call(Request::new(())));
             let waker = futures::task::noop_waker();
             let mut cx = Context::from_waker(&waker);
             assert!(request.as_mut().poll(&mut cx).is_pending());
             request
-        }));
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        let Poll::Ready(request) = future.as_mut().poll(&mut cx) else {
-            panic!("the scope body completes in one poll");
-        };
+        });
         // Drop the request outside the log-context scope.
         drop(request);
         assert_eq!(accountant.tenant("acme").map(|t| t.requests), Some(1));
