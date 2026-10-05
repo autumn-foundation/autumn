@@ -3248,7 +3248,11 @@ case "$1 $2" in
       sid="$id"
       [ -n "$STUB_APP_STALE_SECRET_IDENTITY" ] && sid=/old-id
       [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$sid\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$sid\"}"
-      app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
+      sidecar='{"name":"sidecar","image":"busybox"}'
+      [ -n "$STUB_SIDECAR_SECRET_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_DB","secretRef":"database-url"}]}'
+      scale=""
+      [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"database-url","triggerParameter":"connection"}]}}]}'
+      app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
       # A GET shows the app state with each PATCH merged in. Like ARM after
       # a 202, the first STUB_PATCH_PENDING reads after a PATCH still show
       # the state before it.
@@ -3273,6 +3277,12 @@ case "$1 $2" in
     fi
     ;;
   "containerapp revision")
+    # The active revision. After a canceled first cutover, the template has
+    # the real image while the placeholder revision stays active.
+    if [ "$3" = list ]; then
+      printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+      exit 0
+    fi
     case "$query" in
       properties.active) echo false ;;
       # The placeholder image always provisions.
@@ -3379,6 +3389,9 @@ esac
             .env_remove("STUB_APP_NO_REGISTRY")
             .env_remove("STUB_APP_OWN_IDENTITY")
             .env_remove("STUB_APP_STALE_SECRET_IDENTITY")
+            .env_remove("STUB_SIDECAR_SECRET_REF")
+            .env_remove("STUB_SCALE_SECRET_REF")
+            .env_remove("STUB_ACTIVE_IMAGE")
             .env_remove("STUB_PATCH_PENDING");
         if !args.is_empty() {
             command.env_remove("IMAGE_TAG");
@@ -3813,6 +3826,94 @@ esac
             .unwrap_or_else(|| panic!("the script must check the old revision: {calls}"));
         let second_patch_at = calls.rfind("az rest --method patch").unwrap();
         assert!(active_at < second_patch_at, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_sidecar_refs_before_the_secrets() {
+        // A sidecar env var also refers to a managed secret. Stage 1 must
+        // remove every reference, or Azure cannot delete the secret.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_SIDECAR_SECRET_REF", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage1 = bodies.lines().next().unwrap_or_default();
+        assert!(!stage1.contains("database-url"), "{stage1}");
+        assert!(stage1.contains("\"sidecar\""), "{stage1}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_on_a_scale_rule_secret_ref() {
+        // The script cannot remove a scale rule's secret ref by itself
+        // without changing what the app does. It stops before any write.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_SCALE_SECRET_REF", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_credentials_after_a_canceled_first_cutover() {
+        // The template has the real image, but the placeholder revision is
+        // still the active one.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_retries_a_canceled_first_cutover_as_a_first_cutover() {
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[(
+                "STUB_ACTIVE_IMAGE",
+                "mcr.microsoft.com/k8se/quickstart:latest",
+            )],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("ingress disable"), "{calls}");
+        assert!(
+            calls.contains("replica list --name app --resource-group rg --revision app--old"),
+            "the script must wait for the active placeholder revision: {calls}"
+        );
     }
 
     #[cfg(unix)]
