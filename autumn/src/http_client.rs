@@ -2806,7 +2806,11 @@ impl RetryGate {
             .as_deref()
             .zip(host)
             .map(|(budgets, host)| budgets.for_host(host));
-        if let Some(budget) = &budget {
+        // Refill only for a request that can start: one past its deadline
+        // makes no attempt.
+        if let Some(budget) = &budget
+            && !deadline.is_some_and(Deadline::is_expired)
+        {
             budget.record_request();
         }
         Self {
@@ -6088,6 +6092,26 @@ mod tests {
             let open = RetryGate::start(None, None, true);
             let error = open.classify(ClientError::InvalidUrl("dns".into()));
             assert!(matches!(error, ClientError::InvalidUrl(_)));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_request_past_its_deadline_does_not_refill_the_budget() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let budget = budgets.for_host("h:80");
+            while budget.try_acquire(RetryKind::Transient) {}
+            let empty = budget.available();
+            let _late = RetryGate::with_deadline(
+                Some(Deadline::at(tokio::time::Instant::now())),
+                Some(Arc::clone(&budgets)),
+                Some("h:80"),
+                true,
+            );
+            assert!(
+                (budget.available() - empty).abs() < f64::EPSILON,
+                "no refill"
+            );
+            let _live = RetryGate::with_deadline(None, Some(budgets), Some("h:80"), true);
+            assert!(budget.available() > empty, "a live request refills");
         }
 
         #[test]
