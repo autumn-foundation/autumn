@@ -520,11 +520,13 @@ if [ -n "$RESTART" ]; then
     --output none || fail "cannot restart revision $REVISION"
 fi
 
-# On the first cutover, the placeholder now has the identity and secrets.
-# Ingress must not wake it, so the script waits until the new revision is
-# the only active one.
-if [ -z "$RELEASED" ]; then
-  sole_active "$REVISION" || fail "the placeholder revision is still active"
+# A new revision serves only when it is the only active one; until then,
+# the old revision serves. On the first cutover the placeholder now has the
+# identity and secrets, and ingress must not wake it. On a later deploy the
+# deploy is not done while the old image serves. (A restart makes no new
+# revision.)
+if [ -z "$RESTART" ]; then
+  sole_active "$REVISION" || fail "revision $REVISION did not become the only active revision"
 fi
 
 # The new revision runs the real image. Open external ingress now. On a
