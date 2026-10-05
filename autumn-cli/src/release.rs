@@ -3541,6 +3541,54 @@ esac
         )
     }
 
+    /// Every flag that [`AZ_STUB`] reads, plus the script's optional
+    /// inputs. [`run_azure_cutover_with_args`] clears them all first.
+    #[cfg(unix)]
+    const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_LATEST",
+        "STUB_STATUS_SEQ",
+        "STUB_SIDECAR_FIRST",
+        "STUB_INGRESS_PLAIN",
+        "STUB_LATEST_STATE",
+        "STUB_APP_SYSTEM_IDENTITY",
+        "STUB_MIN_REPLICAS",
+        "STUB_ACTIVE_MIN_REPLICAS",
+        "STUB_JOB_CUSTOM_KV_IDENTITY",
+        "STUB_SAVED_INGRESS_TAGS",
+        "STUB_JOB_CUSTOM_KV",
+        "STUB_ACTIVE_EMPTY_FIRST",
+        "STUB_TMP_MODES",
+        "STUB_JOB_INLINE_SECRET",
+        "STUB_ACTIVE_SCALE_REF",
+        "STUB_ACTIVE_BOTH",
+        "STUB_INGRESS_NONE",
+        "STUB_RESTART_FROM_ZERO",
+        "STUB_ACTIVE_SCALE_RULE",
+        "STUB_JOB_NO_SECRETS",
+        "STUB_ACTIVE_EMPTY",
+        "STUB_RESTART_STALE",
+        "STUB_RESTART_UNREADY",
+        "STUB_APP_ENV_FULL",
+        "STUB_APP_LEGACY",
+        "STUB_APP_REDIS",
+        "STUB_APP_NO_REGISTRY",
+        "STUB_APP_OWN_IDENTITY",
+        "STUB_APP_STALE_SECRET_IDENTITY",
+        "STUB_SIDECAR_SECRET_REF",
+        "STUB_SCALE_SECRET_REF",
+        "STUB_ACTIVE_IMAGE",
+        "STUB_ACTIVE_LAG",
+        "STUB_APP_TEMPLATE_CLEAN",
+        "STUB_ACTIVE_HAS_REFS",
+        "STUB_SIDECAR_REDIS_REF",
+        "STUB_LATEST_FAILED",
+        "STUB_INGRESS_INTERNAL",
+        "STUB_INGRESS_EXTERNAL",
+        "STUB_JOB_EXTRA_REGISTRY",
+        "AZURE_BOOTSTRAP_IMAGE",
+        "STUB_PATCH_PENDING",
+    ];
+
     /// [`run_azure_cutover`] with script arguments. With
     /// `--remove-credentials`, the script gets no `IMAGE_TAG`.
     #[cfg(unix)]
@@ -3598,49 +3646,10 @@ esac
             .env("AZURE_MIGRATE_JOB_NAME", "job")
             .env("ACR_LOGIN_SERVER", "acr.azurecr.io")
             .env("IMAGE_TAG", "t1");
-        command
-            .env_remove("STUB_LATEST")
-            .env_remove("STUB_STATUS_SEQ")
-            .env_remove("STUB_SIDECAR_FIRST")
-            .env_remove("STUB_INGRESS_PLAIN")
-            .env_remove("STUB_LATEST_STATE")
-            .env_remove("STUB_APP_SYSTEM_IDENTITY")
-            .env_remove("STUB_MIN_REPLICAS")
-            .env_remove("STUB_ACTIVE_MIN_REPLICAS")
-            .env_remove("STUB_JOB_CUSTOM_KV_IDENTITY")
-            .env_remove("STUB_SAVED_INGRESS_TAGS")
-            .env_remove("STUB_JOB_CUSTOM_KV")
-            .env_remove("STUB_ACTIVE_EMPTY_FIRST")
-            .env_remove("STUB_TMP_MODES")
-            .env_remove("STUB_JOB_INLINE_SECRET")
-            .env_remove("STUB_ACTIVE_SCALE_REF")
-            .env_remove("STUB_ACTIVE_BOTH")
-            .env_remove("STUB_INGRESS_NONE")
-            .env_remove("STUB_RESTART_FROM_ZERO")
-            .env_remove("STUB_ACTIVE_SCALE_RULE")
-            .env_remove("STUB_JOB_NO_SECRETS")
-            .env_remove("STUB_ACTIVE_EMPTY")
-            .env_remove("STUB_RESTART_STALE")
-            .env_remove("STUB_RESTART_UNREADY")
-            .env_remove("STUB_APP_ENV_FULL")
-            .env_remove("STUB_APP_LEGACY")
-            .env_remove("STUB_APP_REDIS")
-            .env_remove("STUB_APP_NO_REGISTRY")
-            .env_remove("STUB_APP_OWN_IDENTITY")
-            .env_remove("STUB_APP_STALE_SECRET_IDENTITY")
-            .env_remove("STUB_SIDECAR_SECRET_REF")
-            .env_remove("STUB_SCALE_SECRET_REF")
-            .env_remove("STUB_ACTIVE_IMAGE")
-            .env_remove("STUB_ACTIVE_LAG")
-            .env_remove("STUB_APP_TEMPLATE_CLEAN")
-            .env_remove("STUB_ACTIVE_HAS_REFS")
-            .env_remove("STUB_SIDECAR_REDIS_REF")
-            .env_remove("STUB_LATEST_FAILED")
-            .env_remove("STUB_INGRESS_INTERNAL")
-            .env_remove("STUB_INGRESS_EXTERNAL")
-            .env_remove("STUB_JOB_EXTRA_REGISTRY")
-            .env_remove("AZURE_BOOTSTRAP_IMAGE")
-            .env_remove("STUB_PATCH_PENDING");
+        // A stub flag from the caller's environment must not leak in.
+        for name in AZ_STUB_FLAGS {
+            command.env_remove(name);
+        }
         if args.contains(&"--remove-credentials") {
             command.env_remove("IMAGE_TAG");
         }
