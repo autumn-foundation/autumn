@@ -754,8 +754,9 @@ impl SqliteLeaseSchedulerCoordinator {
     }
 }
 
-/// Owner token minted per acquire, recorded on the row so an operator reading
-/// the table can tell which process claimed a tick.
+/// Owner token, unique per acquire. `SqliteTableLease::free` deletes only the
+/// row with this owner. An operator can also read it to see which process
+/// claimed a tick.
 #[cfg(feature = "sqlite")]
 fn next_lease_owner(replica_id: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -881,6 +882,8 @@ impl SchedulerCoordinator for SqliteLeaseSchedulerCoordinator {
 /// expires. Set the TTL longer than the spread between the processes' timers.
 ///
 /// The Postgres coordinator keeps its tick row in the same way (issue #3052).
+/// [`SchedulerLease::release_and_free`] deletes the row, for a key that works
+/// as a mutex.
 #[cfg(feature = "sqlite")]
 struct SqliteTableLease {
     key: i64,

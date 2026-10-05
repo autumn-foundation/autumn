@@ -12,10 +12,11 @@
   (issue #3052). It freed its session advisory lock when the leader finished.
   A replica whose timer reached the same tick later ran it again. Now each
   tick is a row in `autumn_scheduler_ticks`, inserted with
-  `ON CONFLICT DO NOTHING`. The row stays for `scheduler.lease_ttl_secs`, and a
-  fixed-delay row stays for its delay plus `scheduler.lease_ttl_secs`. A leader that crashes
-  mid-tick does not free its tick. The coordinator holds no connection while a
-  tick runs, so it works behind a transaction-mode PgBouncer.
+  `ON CONFLICT DO NOTHING`. The row stays for `scheduler.lease_ttl_secs`. A
+  fixed-delay row stays for its delay plus `scheduler.lease_ttl_secs`. A leader
+  that crashes mid-tick does not free its tick. The coordinator holds no
+  connection while a tick runs, so it works behind a transaction-mode
+  PgBouncer.
 - **scheduler:** the `sqlite` backend keeps a fixed-delay tick claimed for its
   delay plus `scheduler.lease_ttl_secs`, not only for the TTL.
 - **acme:** on a distributed scheduler backend, certificate renewal and
