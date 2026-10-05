@@ -125,7 +125,7 @@ Both halves are compiled in CI as trybuild fixtures — see
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
 | An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
-| `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported. The receiver must be a database handle: on another value, the callback may run many times |
+| `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported. The receiver must be a database connection (`Db`, `PgConnection`, `state.db()`, the callback's `conn`): on a repository or another value, the callback may run many times |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
 | An `Option`/`Result` combinator closure (`map`, `and_then`, `unwrap_or_else`, …) | counted **once** when the receiver is known to be an `Option` or a `Result`; otherwise it may run per element |
 
@@ -165,12 +165,17 @@ The analysis follows the handle through every name that holds it:
     `for r in repos`) or `?` gives a handle.
   - A method that the container's own type has (a `Vec` method on a `Vec`,
     an `Option` method on an `Option`) is not a query. Each type has its own
-    list: `sort` is a `Vec` method, not a `VecDeque` one. The method gives a
+    list: `push` is a `Vec` method, not a `VecDeque` one. The method gives a
     handle when it returns a part (`repos.remove(0)`, `maybe.unwrap()`), and
     a container when it returns a view or an `Option` of a part
-    (`repos.iter()`, `repos.first()`, `deque.remove(0)`). Any other method
-    on the container is reported (`repos.refresh_all()`, or an
+    (`repos.as_slice().iter()`, `slice.first()`, `deque.remove(0)`). Any
+    other method on the container is reported (`repos.refresh_all()`, or an
     extension-trait `repos.ok()`).
+  - An extension trait can take over a method that the type gets only
+    through `Deref` or only under a trait bound. So a slice method called on
+    a `Vec` or an array (`repos.iter()`, `repos.first()`, `repos.sort()`) is
+    reported, and so is `clone` on any container. Call the slice method on
+    `repos.as_slice()` instead.
   - A method or function given a handle may store it: after
     `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. A
     callback stores what it returns (`slot.get_or_insert_with(|| &repo)`).

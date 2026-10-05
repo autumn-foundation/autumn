@@ -186,6 +186,10 @@ const SAFE_FREE_FNS: &[&str] = &["drop"];
 /// query issued through it is still counted.
 const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", "connection"];
 
+/// The accessors in [`HANDLE_ACCESSORS`] that give a connection, not a
+/// repository. A transaction runs its callback once only on a connection.
+const DB_ACCESSORS: &[&str] = &["db", "pool", "conn", "connection"];
+
 /// Methods that turn a known `LazyDb` into a live `Db` without a query:
 /// `LazyDb::checkout` (autumn/src/db.rs, #2264). The call costs nothing and
 /// its result is a handle.
@@ -366,6 +370,7 @@ const SCALAR_METHODS: &[&str] = &[
 /// Methods on a carrier that return a carrier: a view, an iterator, or an
 /// `Option` of a part.
 const CARRIER_METHODS: &[&str] = &[
+    "as_mut_slice",
     "xor",
     "err",
     "map_err",
@@ -457,24 +462,23 @@ const ELEMENT_METHODS: &[&str] = &[
 ];
 
 /// The methods of each standard container [`Shape`]. Each list holds only
-/// the methods that container type has (#2316).
+/// the methods that container type has, and that no extension trait can
+/// take over (#2316):
+///
+/// * not a slice method reached through `Deref` (`Vec::first` is `[T]::first`):
+///   a trait method on `Vec<T>` is found first;
+/// * not `clone`: `Clone` for a container needs `T: Clone`, and when it does
+///   not hold, a trait method of that name runs.
 const BOOL_METHODS: &[&str] = &["then", "then_some"];
 
 const VEC_METHODS: &[&str] = &[
     "len",
     "is_empty",
-    "contains",
-    "iter",
-    "iter_mut",
     "into_iter",
     "as_slice",
+    "as_mut_slice",
     "as_ref",
     "as_mut",
-    "clone",
-    "first",
-    "last",
-    "get",
-    "get_mut",
     "pop",
     "push",
     "insert",
@@ -484,26 +488,19 @@ const VEC_METHODS: &[&str] = &[
     "append",
     "clear",
     "truncate",
-    "sort",
-    "sort_by",
-    "sort_by_key",
-    "sort_unstable",
-    "sort_unstable_by",
-    "sort_unstable_by_key",
     "dedup",
-    "reverse",
     "retain",
-    "swap",
     "resize",
     "reserve",
     "shrink_to_fit",
     "drain",
-    "chunks",
-    "windows",
-    "to_vec",
 ];
 
-/// An array or a slice.
+/// An array's own methods. Its slice methods come through unsizing, after
+/// any trait method on the array.
+const ARRAY_METHODS: &[&str] = &["as_slice", "as_mut_slice", "into_iter", "as_ref", "as_mut"];
+
+/// A slice.
 const SLICE_METHODS: &[&str] = &[
     "len",
     "is_empty",
@@ -513,7 +510,6 @@ const SLICE_METHODS: &[&str] = &[
     "into_iter",
     "as_ref",
     "as_mut",
-    "clone",
     "first",
     "last",
     "get",
@@ -538,7 +534,6 @@ const DEQUE_METHODS: &[&str] = &[
     "iter",
     "iter_mut",
     "into_iter",
-    "clone",
     "get",
     "get_mut",
     "push_back",
@@ -566,7 +561,6 @@ const LIST_METHODS: &[&str] = &[
     "iter",
     "iter_mut",
     "into_iter",
-    "clone",
     "push_back",
     "push_front",
     "pop_back",
@@ -581,7 +575,6 @@ const HEAP_METHODS: &[&str] = &[
     "is_empty",
     "iter",
     "into_iter",
-    "clone",
     "push",
     "pop",
     "extend",
@@ -634,7 +627,6 @@ const ITER_METHODS: &[&str] = &[
     "last",
     "cloned",
     "copied",
-    "clone",
 ];
 
 const OPTION_METHODS: &[&str] = &[
@@ -665,7 +657,6 @@ const OPTION_METHODS: &[&str] = &[
     "as_mut",
     "iter",
     "into_iter",
-    "clone",
 ];
 
 /// An `Option` of a reference also has `cloned`, `copied` and `as_deref`. On
@@ -698,7 +689,6 @@ const OPTION_REF_METHODS: &[&str] = &[
     "as_mut",
     "iter",
     "into_iter",
-    "clone",
     "cloned",
     "copied",
     "as_deref",
@@ -728,7 +718,6 @@ const RESULT_METHODS: &[&str] = &[
     "as_mut",
     "iter",
     "into_iter",
-    "clone",
 ];
 
 const MAP_METHODS: &[&str] = &[
@@ -751,7 +740,6 @@ const MAP_METHODS: &[&str] = &[
     "retain",
     "extend",
     "drain",
-    "clone",
     "reserve",
 ];
 
@@ -775,7 +763,6 @@ const SORTED_MAP_METHODS: &[&str] = &[
     "clear",
     "retain",
     "extend",
-    "clone",
 ];
 
 const SET_METHODS: &[&str] = &[
@@ -790,7 +777,6 @@ const SET_METHODS: &[&str] = &[
     "retain",
     "extend",
     "drain",
-    "clone",
 ];
 
 /// `BTreeSet`: no `drain`.
@@ -805,10 +791,9 @@ const SORTED_SET_METHODS: &[&str] = &[
     "clear",
     "retain",
     "extend",
-    "clone",
 ];
 
-const TUPLE_METHODS: &[&str] = &["clone"];
+const TUPLE_METHODS: &[&str] = &[];
 
 /// The kind of standard container a carrier is. A method is known only if
 /// this container has it: an extension trait may add a method with a standard
@@ -817,8 +802,11 @@ const TUPLE_METHODS: &[&str] = &["clone"];
 enum Shape {
     /// A `bool`: `then` gives an `Option`.
     Bool,
+    /// A database connection (`Db`, `PgConnection`): a transaction on it
+    /// runs its callback once.
+    Db,
     Vec,
-    /// An array or a slice.
+    Array,
     Slice,
     /// `VecDeque`.
     Deque,
@@ -850,7 +838,9 @@ impl Shape {
     const fn methods(self) -> &'static [&'static str] {
         match self {
             Self::Bool => BOOL_METHODS,
+            Self::Db => &[],
             Self::Vec => VEC_METHODS,
+            Self::Array => ARRAY_METHODS,
             Self::Slice => SLICE_METHODS,
             Self::Deque => DEQUE_METHODS,
             Self::List => LIST_METHODS,
@@ -925,7 +915,7 @@ impl Shape {
             "ok_or" | "ok_or_else" => Some(Self::Res),
             _ if self.option_of_part(method) => Some(Self::Opt),
             "to_vec" => Some(Self::Vec),
-            "as_slice" => Some(Self::Slice),
+            "as_slice" | "as_mut_slice" => Some(Self::Slice),
             "collect" => None,
             _ => Some(self),
         }
@@ -976,7 +966,8 @@ fn type_shape(ty: &Type) -> Option<Shape> {
         Type::Reference(r) => type_shape(&r.elem),
         Type::Paren(p) => type_shape(&p.elem),
         Type::Group(g) => type_shape(&g.elem),
-        Type::Array(_) | Type::Slice(_) => Some(Shape::Slice),
+        Type::Array(_) => Some(Shape::Array),
+        Type::Slice(_) => Some(Shape::Slice),
         Type::Tuple(_) => Some(Shape::Tuple),
         Type::Path(path) => {
             let segment = path.path.segments.last()?;
@@ -984,6 +975,8 @@ fn type_shape(ty: &Type) -> Option<Shape> {
                 name if SMART_POINTERS.contains(&name) => {
                     generic_types(segment).next().and_then(type_shape)
                 }
+                // A connection: not the name suffix, which a user type may have.
+                name if HANDLE_TYPES.contains(&name) && name != "LazyDb" => Some(Shape::Db),
                 // `Option<&T>`.
                 "Option" if matches!(generic_types(segment).next(), Some(Type::Reference(_))) => {
                     Some(Shape::OptRef)
@@ -1735,6 +1728,9 @@ struct Analyzer {
     errors: Vec<syn::Error>,
     /// What every `return` read so far gives. A closure probe reads it.
     returned: Kind,
+    /// The next closure body's parameters are connections: it is a
+    /// transaction callback.
+    connection_params: bool,
 }
 
 impl Analyzer {
@@ -1746,6 +1742,7 @@ impl Analyzer {
             ledger: Vec::new(),
             errors: Vec::new(),
             returned: Kind::Plain,
+            connection_params: false,
         };
         for arg in &input_fn.sig.inputs {
             if let syn::FnArg::Typed(typed) = arg {
@@ -2522,10 +2519,15 @@ impl Analyzer {
     /// A closure's body, with parameter `i` bound to `params[i]`, or to
     /// `rest` past the end. A `return` inside leaves the closure only.
     fn closure_body(&mut self, closure: &syn::ExprClosure, params: &[Kind], rest: Kind) -> Cost {
+        let connection = std::mem::take(&mut self.connection_params);
         self.framed(Target::Body, None, |s| {
             s.scoped(|s| {
                 for (i, input) in closure.inputs.iter().enumerate() {
                     s.bind_pat(input, params.get(i).copied().unwrap_or(rest));
+                    // A transaction hands its callback a connection.
+                    if connection && let Pat::Ident(id) = input {
+                        s.env.set_shape(&id.ident.to_string(), Some(Shape::Db));
+                    }
                 }
                 s.cost_of(&closure.body)
             })
@@ -2813,8 +2815,8 @@ impl Analyzer {
         let name = method.method.to_string();
         // A user type may have a method with a transaction name that calls
         // its closure many times, so the receiver must be a handle.
-        let is_transaction = TRANSACTION_METHODS.contains(&name.as_str())
-            && matches!(self.value_of(&method.receiver), Kind::Handle | Kind::LazyDb);
+        let is_transaction =
+            TRANSACTION_METHODS.contains(&name.as_str()) && self.is_connection(&method.receiver);
         // Only an `Option` or a `Result` is known to call its closure at most
         // once; a user type's `unwrap_or_else` may call it many times.
         let runs_once = is_transaction
@@ -2866,6 +2868,7 @@ impl Analyzer {
         for (i, arg) in method.args.iter().enumerate() {
             let callback = takes_callback && (every || i == last);
             let next = if runs_once {
+                self.connection_params = is_transaction;
                 self.callback_arg(arg, param, callback)
             } else {
                 self.closure_arg(arg, param, callback)
@@ -2910,10 +2913,7 @@ impl Analyzer {
         let runs_once = name
             .as_deref()
             .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n))
-            && call
-                .args
-                .first()
-                .is_some_and(|a| matches!(self.value_of(a), Kind::Handle | Kind::LazyDb));
+            && call.args.first().is_some_and(|a| self.is_connection(a));
 
         // `fill(&mut repos, &repo)`: a `&mut` argument may receive a handle
         // from another argument.
@@ -2935,6 +2935,7 @@ impl Analyzer {
         let last = call.args.len().saturating_sub(1);
         for (i, arg) in call.args.iter().enumerate() {
             let next = if runs_once {
+                self.connection_params = true;
                 self.callback_arg(arg, Kind::Handle, i == last)
             } else {
                 self.cost_of(arg)
@@ -3072,10 +3073,15 @@ impl Analyzer {
                 Some(Shape::Opt)
             }
             Expr::Path(_) => path_ident(e).and_then(|name| self.env.binding(&name).shape),
+            // `self.db`, `state.conn`: a connection accessor.
+            Expr::Field(f) if member_is_db_accessor(&f.member) => Some(Shape::Db),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.shape_of(&u.expr),
+            Expr::Try(t) => self.shape_of(&t.expr).filter(|s| *s == Shape::Db),
+            Expr::Await(a) => self.shape_of(&a.base).filter(|s| *s == Shape::Db),
             Expr::Reference(r) => self.shape_of(&r.expr),
             Expr::Paren(p) => self.shape_of(&p.expr),
             Expr::Group(g) => self.shape_of(&g.expr),
-            Expr::Array(_) | Expr::Repeat(_) => Some(Shape::Slice),
+            Expr::Array(_) | Expr::Repeat(_) => Some(Shape::Array),
             Expr::Tuple(_) => Some(Shape::Tuple),
             // A comparison, `&&`, `||`, `!` or a `bool` literal.
             Expr::Binary(b)
@@ -3120,6 +3126,10 @@ impl Analyzer {
             },
             Expr::MethodCall(mc) => {
                 let method = mc.method.to_string();
+                // `state.db()`, `ctx.conn().await?`: a connection accessor.
+                if DB_ACCESSORS.contains(&method.as_str()) {
+                    return Some(Shape::Db);
+                }
                 if method == "collect" {
                     // `collect::<Vec<_>>()` names its shape.
                     return mc.turbofish.as_ref().and_then(|t| {
@@ -3331,6 +3341,7 @@ impl Analyzer {
             ledger: Vec::new(),
             errors: Vec::new(),
             returned: Kind::Plain,
+            connection_params: false,
         };
         probe.env.push();
         for input in &closure.inputs {
@@ -3546,6 +3557,17 @@ impl Analyzer {
                 "and_then" => matches!(shape, Some(Shape::Opt | Shape::OptRef)),
                 _ => false,
             }
+    }
+
+    /// Is `e` a database connection: a `LazyDb`, or a handle with the `Db`
+    /// shape? A repository is not one, so a `RunnerRepository::tx` may run
+    /// its callback many times.
+    fn is_connection(&self, e: &Expr) -> bool {
+        match self.value_of(e) {
+            Kind::LazyDb => true,
+            Kind::Handle => self.shape_of(e) == Some(Shape::Db),
+            _ => false,
+        }
     }
 
     /// Does this call give an `Option` of a part (`deque.remove(0)`)?
@@ -4176,6 +4198,13 @@ fn is_handle_builder(method: &str) -> bool {
 }
 
 /// Does this struct field name conventionally hold a database handle?
+fn member_is_db_accessor(member: &syn::Member) -> bool {
+    match member {
+        syn::Member::Named(ident) => DB_ACCESSORS.contains(&ident.to_string().as_str()),
+        syn::Member::Unnamed(_) => false,
+    }
+}
+
 fn member_is_handle_accessor(member: &syn::Member) -> bool {
     match member {
         syn::Member::Named(ident) => HANDLE_ACCESSORS.contains(&ident.to_string().as_str()),
@@ -6948,7 +6977,7 @@ mod tests {
             ),
             (
                 "first, then if let",
-                "let repos = vec![repo]; if let Some(r) = repos.first() { let _ = r.find_all(); }",
+                "let repos = vec![repo]; if let Some(r) = repos.as_slice().first() { let _ = r.find_all(); }",
                 Expect::Exact(1),
             ),
             (
@@ -7168,7 +7197,7 @@ mod tests {
     fn a_smart_pointer_around_a_container_is_a_container() {
         let handler = r"
             async fn h(repos: Arc<Vec<PgPostRepository>>) -> AutumnResult<usize> {
-                for repo in repos.iter() { let _ = repo.find_all().await?; }
+                for repo in repos.as_slice().iter() { let _ = repo.find_all().await?; }
                 Ok(0)
             }
             ";
@@ -7762,7 +7791,7 @@ mod tests {
             (
                 "chain with handles on the argument side",
                 "async fn h(ids: Vec<i64>, repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let all: Vec<_> = Vec::new().iter().chain(repos.iter()).collect(); \
+                 let all: Vec<_> = Vec::new().iter().chain(repos.as_slice().iter()).collect(); \
                  let _ = all[0].find_all().await?; render(ids); Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -8016,7 +8045,7 @@ mod tests {
             (
                 "an iterator mapped to a plain value",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let ids: Vec<_> = repos.iter().map(|_| 1).collect(); render(ids); Ok(0) }",
+                 let ids: Vec<_> = repos.as_slice().iter().map(|_| 1).collect(); render(ids); Ok(0) }",
                 Expect::Exact(0),
             ),
             // Guards: `cloned` on an `Option` of a reference is known, and a
@@ -8024,13 +8053,13 @@ mod tests {
             (
                 "first().cloned() on a Vec of handles",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let r = repos.first().cloned().unwrap(); let _ = r.find_all().await?; Ok(0) }",
+                 let r = repos.as_slice().first().cloned().unwrap(); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
             (
                 "iter().find().cloned() on a Vec of handles",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let r = repos.iter().find(|_| true).cloned().unwrap(); \
+                 let r = repos.as_slice().iter().find(|_| true).cloned().unwrap(); \
                  let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -8204,6 +8233,68 @@ mod tests {
     }
 
     #[test]
+    fn transactions_need_a_connection_and_shadowable_methods_are_reported() {
+        check_handlers(&[
+            (
+                "a transaction name on a repository-named user type",
+                "async fn h(repo: PgPostRepository, runner: RunnerRepository) \
+                 -> AutumnResult<usize> { runner.tx_immediate(|| repo.find_all()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a transaction on an accessor connection runs once",
+                "async fn h(state: AppState) -> AutumnResult<usize> { \
+                 state.db().tx(|c| async move { let _ = c.find_all().await; }).await; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "a nested transaction on the callback connection runs once",
+                "async fn h(mut db: Db) -> AutumnResult<usize> { \
+                 db.tx(|c| async move { c.tx(|d| async move { let _ = d.find_all().await; }).await; }) \
+                 .await; Ok(0) }",
+                Expect::Exact(3),
+            ),
+            (
+                "a slice method reached through a Vec may be shadowed",
+                "async fn h(mut repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 repos.sort().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "clone depends on the element being Clone",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 repos.clone().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a slice method reached through an array may be shadowed",
+                "async fn h(repos: [PgPostRepository; 2]) -> AutumnResult<usize> { \
+                 repos.first().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            // Guards: a Vec's own methods and a slice's methods stay known.
+            (
+                "Vec::remove is the Vec's own method",
+                "async fn h(mut repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let r = repos.remove(0); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a slice's first is the slice's own method",
+                "async fn h(repos: &[PgPostRepository]) -> AutumnResult<usize> { \
+                 let r = repos.first().unwrap(); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "as_slice then first",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let r = repos.as_slice().first().unwrap(); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
     fn each_container_type_has_its_own_methods() {
         // `(parameter type, call)`: the type has no such method, so an
         // extension trait gives it, and it may query.
@@ -8219,9 +8310,9 @@ mod tests {
         ];
         // The type has the method, so it issues nothing.
         let present = [
-            ("Vec<PgPostRepository>", "repos.sort()"),
+            ("Vec<PgPostRepository>", "repos.as_mut_slice().sort()"),
             ("VecDeque<PgPostRepository>", "repos.push_back(other)"),
-            ("[PgPostRepository; 2]", "repos.reverse()"),
+            ("[PgPostRepository; 2]", "repos.as_mut_slice().reverse()"),
             (
                 "BTreeMap<i64, PgPostRepository>",
                 "repos.retain(|_, _| true)",
@@ -8273,7 +8364,9 @@ mod tests {
         // value, and a part taken through it would be lost.
         let shapes = [
             Shape::Bool,
+            Shape::Db,
             Shape::Vec,
+            Shape::Array,
             Shape::Slice,
             Shape::Deque,
             Shape::List,
@@ -8463,14 +8556,14 @@ mod tests {
         // `Vec<i64>` is checked by rustc and cannot hold a handle.
         let handler = matrix_handler(
             "let repos = vec![repo]; \
-             let ids: Vec<i64> = repos.iter().map(|r| r.id).collect(); \
+             let ids: Vec<i64> = repos.as_slice().iter().map(|r| r.id).collect(); \
              let _ = render(ids);",
         );
         assert_clean("0", &handler);
         // A `_` leaves the type open, so the container rule still applies.
         let open = matrix_handler(
             "let repos = vec![repo]; \
-             let ids: Vec<_> = repos.iter().map(|r| r.id).collect(); \
+             let ids: Vec<_> = repos.as_slice().iter().map(|r| r.id).collect(); \
              let _ = render(ids);",
         );
         assert_error_contains("50", &open, &["render"]);
@@ -8504,8 +8597,8 @@ mod tests {
         let known = r"
             async fn h(mut repos: Vec<PgPostRepository>, extra: PgPostRepository) -> AutumnResult<usize> {
                 repos.push(extra);
-                repos.sort_by_key(|r| r.id);
-                repos.iter().for_each(|r| drop(r));
+                repos.as_mut_slice().sort_by_key(|r| r.id);
+                repos.as_slice().iter().for_each(|r| drop(r));
                 Ok(repos.len())
             }
             ";

@@ -26,7 +26,10 @@
   and a container of containers keeps its shape. An unknown method on such
   a container, or any method on a user struct that holds a handle, is
   reported. A container method is known only for the container type that
-  has it: `sort` on a `VecDeque` is reported. After `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds
+  has it: `sort` on a `VecDeque` is reported. A slice method called on a
+  `Vec` or an array (`repos.iter()`) and `clone` on a container are
+  reported too, because an extension trait can take them over; call the
+  slice method on `repos.as_slice()`. After `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds
   a handle. A type annotation made only of standard and primitive types
   (`Vec<i64>`) marks a binding as plain (#2316).
 - **query budgets:** a parameter of type `Arc<PgPostRepository>`, `Box<…>`,
