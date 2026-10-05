@@ -3260,6 +3260,10 @@ fi
   # A placeholder app made by the old template has the job's credentials.
   legacy=""
   [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
+  # The cutover of an older run also attached the identity of a custom job
+  # secret.
+  [ -n "$STUB_APP_LEGACY" ] && [ "${STUB_JOB_CUSTOM_KV_IDENTITY:-}" = /kv-id-2 ] \
+    && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"},\"/kv-id-2\":{\"principalId\":\"q\"}}},"
   # An identity that the operator added to the placeholder.
   [ -n "$STUB_APP_OWN_IDENTITY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"/other\":{\"principalId\":\"o\"}}},"
   registries=""
@@ -3274,6 +3278,7 @@ fi
   [ -n "$STUB_SIDECAR_REDIS_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_REDIS","secretRef":"redis-url"}]}'
   scale=""
   [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"'"$STUB_SCALE_SECRET_REF"'","triggerParameter":"connection"}]}}]}'
+  [ -n "$STUB_MIN_REPLICAS" ] && scale=',"scale":{"minReplicas":'"$STUB_MIN_REPLICAS"'}'
   # A placeholder has closed ingress; a real release has open ingress. Both
   # have a custom domain that the cutover must keep.
   external=false
@@ -3301,11 +3306,11 @@ fi
   app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",\"tags\":$tags,$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$scale}}}"
 case "$1 $2" in
   "containerapp job")
-    secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"$id\"}"; }
+    secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"${2:-$id}\"}"; }
     secrets="$(secret database-url),$(secret signing-secret)"
     [ -n "$STUB_REDIS" ] && secrets="$secrets,$(secret redis-url)"
     [ -n "$STUB_JOB_NO_SECRETS" ] && secrets=""
-    [ -n "$STUB_JOB_CUSTOM_KV" ] && secrets="$secrets,$(secret queue-key)"
+    [ -n "$STUB_JOB_CUSTOM_KV" ] && secrets="$secrets,$(secret queue-key "${STUB_JOB_CUSTOM_KV_IDENTITY:-}")"
     # An inline secret that the operator added: job show omits its value,
     # and `job secret list --show-values` returns it.
     if [ -n "$STUB_JOB_INLINE_SECRET" ]; then
@@ -3441,12 +3446,10 @@ case "$1 $2" in
       properties.active) echo false ;;
       # The scale rules of an active revision. An operator can remove a
       # custom rule from the template while the old revision stays active.
-      properties.template.scale.rules)
-        if [ -n "$STUB_ACTIVE_SCALE_RULE" ]; then
-          echo '[{"name":"q","custom":{"type":"azure-queue"}}]'
-        else
-          echo null
-        fi
+      properties.template.scale)
+        rules=null
+        [ -n "$STUB_ACTIVE_SCALE_RULE" ] && rules='[{"name":"q","custom":{"type":"azure-queue"}}]'
+        echo "{\"minReplicas\":${STUB_ACTIVE_MIN_REPLICAS:-0},\"rules\":$rules}"
         ;;
       # The placeholder image provisions, except a revision that the test
       # names as failed.
@@ -3595,6 +3598,9 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_MIN_REPLICAS")
+            .env_remove("STUB_ACTIVE_MIN_REPLICAS")
+            .env_remove("STUB_JOB_CUSTOM_KV_IDENTITY")
             .env_remove("STUB_SAVED_INGRESS_TAGS")
             .env_remove("STUB_JOB_CUSTOM_KV")
             .env_remove("STUB_ACTIVE_EMPTY_FIRST")
@@ -4264,6 +4270,85 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_stops_on_min_replicas_above_zero() {
+        // With min_replicas above zero, Azure starts the placeholder again
+        // after the zero-replica check, and it would get the credentials.
+        // The template and each active placeholder revision count.
+        for flag in ["STUB_MIN_REPLICAS", "STUB_ACTIVE_MIN_REPLICAS"] {
+            let Some((status, calls, _)) = run_azure_cutover(
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[(flag, "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{flag}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{flag}: {calls}");
+            assert!(!calls.contains("az rest --method patch"), "{flag}: {calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_assigns_every_identity_of_the_job_secrets() {
+        // A Key Vault job secret can use another identity, or the system
+        // identity. The app needs each one to read the secret.
+        for (identity, want) in [
+            ("/kv-id-2", "\"/kv-id-2\":{}"),
+            ("system", "\"type\":\"SystemAssigned,UserAssigned\""),
+        ] {
+            let Some((status, calls, bodies)) = run_azure_cutover(
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[
+                    ("STUB_JOB_CUSTOM_KV", "1"),
+                    ("STUB_JOB_CUSTOM_KV_IDENTITY", identity),
+                ],
+            ) else {
+                return;
+            };
+            assert!(status.success(), "{identity}: {calls}");
+            let cutover = bodies
+                .lines()
+                .find(|line| line.contains("\"template\""))
+                .unwrap_or_else(|| panic!("{bodies}"));
+            assert!(cutover.contains(want), "{identity}: {cutover}");
+            assert!(cutover.contains("userAssignedIdentities"), "{cutover}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_every_identity_of_the_job_secrets() {
+        // --remove-credentials drops the identity of a custom job secret too.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "/kv-id-2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage2 = bodies
+            .lines()
+            .find(|line| line.contains("\"identity\":{"))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(stage2.contains("\"/kv-id-2\":null"), "{stage2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_checks_the_job_before_it_disables_ingress() {
         // Without secrets on the job, the cutover cannot run. The script
         // stops before it changes the ingress.
@@ -4625,7 +4710,7 @@ esac
         };
         assert!(!status.success(), "{calls}");
         assert!(
-            calls.contains("--revision app--old --query properties.template.scale.rules"),
+            calls.contains("--revision app--old --query properties.template.scale --output json"),
             "{calls}"
         );
         assert!(!calls.contains("az rest --method patch"), "{calls}");
