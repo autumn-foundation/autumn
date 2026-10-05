@@ -1374,6 +1374,81 @@ async fn an_audit_deleted_at_column_does_not_hide_the_parent() {
     assert_eq!(counter(&mut conn, "cmt_audit_softs", target).await, 2);
 }
 
+/// Issue #2286: the public helpers must accept a copy of the registered
+/// spec. The copy has a new address, but it must still find the repository
+/// facts, so an audit `deleted_at` does not hide the parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_copied_spec_keeps_the_repository_soft_delete_rule() {
+    use autumn_web::commentable::{
+        add_comment, comment_thread, delete_comment, recompute_comment_count,
+    };
+
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_audit_softs", "title", "t").await;
+    diesel::sql_query("UPDATE cmt_audit_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the audit column");
+
+    let spec = *CmtAuditSoft::commentable_spec();
+    let kind = CmtAuditSoft::COMMENTABLE_TYPE;
+
+    let comment = add_comment(&mut conn, &spec, kind, target, author, "hi", None, None)
+        .await
+        .expect("add_comment: an audit deleted_at must not hide the parent");
+    let thread = comment_thread(&mut conn, &spec, kind, target, None)
+        .await
+        .expect("comment_thread");
+    assert_eq!(flatten(&thread), vec![(0, "hi".to_owned())]);
+    assert_eq!(
+        recompute_comment_count(&mut conn, &spec, kind, target, None)
+            .await
+            .expect("recompute_comment_count"),
+        1
+    );
+    assert_eq!(
+        delete_comment(&mut conn, &spec, kind, target, comment.id, None)
+            .await
+            .expect("delete_comment"),
+        1
+    );
+}
+
+/// Issue #2286, the other side: a copy of the spec of a `soft_delete`
+/// repository must still hide a soft-deleted parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_copied_spec_still_hides_a_soft_deleted_parent() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_softs", "title", "gone").await;
+    diesel::sql_query("UPDATE cmt_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+
+    let spec = *CmtSoft::commentable_spec();
+    let err = autumn_web::commentable::add_comment(
+        &mut conn,
+        &spec,
+        CmtSoft::COMMENTABLE_TYPE,
+        target,
+        author,
+        "hi",
+        None,
+        None,
+    )
+    .await
+    .expect_err("a soft-deleted parent accepts no comment");
+    assert_eq!(err.status().as_u16(), 404, "{err}");
+}
+
 /// The two 404s on the delete path: an unknown comment, and a comment that
 /// belongs to a **different record of the same model**. The second is what
 /// stops any signed-in user deleting any comment by walking ids.
