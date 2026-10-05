@@ -8,8 +8,12 @@ state.
 
 For multi-replica deployments, configure the scheduler backend to `postgres`.
 Autumn then derives a global tick key for each scheduled task invocation and
-uses Postgres advisory locks through the existing `Db` pool. Only the replica
-that acquires the lock runs that tick.
+records the tick in a Postgres table through the existing `Db` pool. Only the
+replica that inserts the tick row runs that tick.
+
+If a replica boots with `backend = "in_process"` and a hint shows more than one
+replica, Autumn logs a warning. The hints are: `jobs.backend` is `postgres` or
+`redis`, `AUTUMN_REPLICAS` is more than 1, or `KUBERNETES_SERVICE_HOST` is set.
 
 ## Configure Postgres Coordination
 
@@ -35,6 +39,51 @@ AUTUMN_SCHEDULER__REPLICA_ID=web-1
 `replica_id` is optional. If it is not configured, Autumn uses platform
 metadata such as `FLY_MACHINE_ID` or `HOSTNAME`, then falls back to the process
 id. Set it explicitly when you want stable names in `/actuator/tasks`.
+
+### The tick table
+
+Each fleet tick is one row in `autumn_scheduler_ticks`:
+
+```sql
+INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, owner)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT DO NOTHING
+RETURNING generation
+```
+
+Only the replica that gets a `generation` back runs the tick. The row stays
+after the run. Thus a replica whose timer reaches the same tick later (timer
+skew, a GC pause, a slow boot) does not run it again.
+
+- The runtime creates the table on first use. If the database role cannot run
+  `CREATE TABLE`, create it before you deploy. Use the DDL in
+  `autumn/src/scheduler.rs` (`PG_TICK_TABLE_DDL`).
+- A row stays for `lease_ttl_secs` after its claim. Then the next claim with
+  the same `key_prefix` deletes it. Set `lease_ttl_secs` longer than the spread
+  between the replicas' timers.
+- The claim and the prune use the database clock (`now()`), not the replica
+  clocks.
+- The coordinator keeps no session state and holds no connection while a tick
+  runs. Thus it works behind a transaction-mode PgBouncer.
+
+### Fencing token
+
+`generation` comes from a sequence, so it increases with each claim. A task
+can read it as a fencing token:
+
+```rust
+#[scheduled(cron = "0 0 * * *", name = "nightly-invoice")]
+async fn nightly_invoice(state: AppState) -> AutumnResult<()> {
+    let tick = autumn_web::scheduler::current_tick();
+    let token = tick.as_ref().and_then(|tick| tick.fencing_token());
+    // Write `token` with each side effect. Refuse a write with an older token.
+    Ok(())
+}
+```
+
+`current_tick()` returns `None` outside a scheduled task, and in a task that
+the handler spawns. `fencing_token()` is `None` on the `in_process` and
+`sqlite` backends, and for `per_replica` tasks.
 
 ## Configure SQLite Coordination
 
@@ -63,8 +112,8 @@ finished or died, so a process whose timer reaches the same tick a moment later
 cannot run it a second time. The next acquire reaps the row once it expires.
 
 Set the TTL longer than both the spread between the processes' timers and the
-longest a tick body can take. This is stricter than the Postgres coordinator,
-which frees the tick key as soon as the leader finishes.
+longest a tick body can take. The Postgres coordinator keeps its tick row in
+the same way.
 
 `backend = "sqlite"` requires the `sqlite` cargo feature, and a **file-backed**
 database: an in-memory target is private to each process, so every replica would
@@ -149,14 +198,19 @@ leader, the last global tick key, and the last fired timestamp:
 
 ## Failure Semantics
 
-Postgres advisory locks are held by the database connection used for the task
-tick and are released when the task completes. If the process crashes, Postgres
-releases the connection lock. `lease_ttl_secs` also bounds how long Autumn will
-wait for a single scheduled invocation before recording it as failed and
-releasing the lease. Tick keys include the schedule bucket, so a stuck older
-tick does not block the next global tick from being claimed.
+The policy is **at-most-once per tick**.
+
+- **The leader finishes.** The tick row stays, so no other replica runs that
+  tick.
+- **The leader crashes mid-tick.** The tick row stays, so no replica runs that
+  tick again. The next tick runs as usual. Autumn does not retry a lost tick.
+- **The tick runs too long.** `lease_ttl_secs` also limits one scheduled
+  invocation. Autumn stops it, records it as failed, and does not run it again.
+- **A stuck tick.** Tick keys include the schedule bucket, so a stuck older
+  tick does not block the next tick.
 
 This is not distributed exactly-once delivery. Under partitions, clock skew, or
-hard restarts near a boundary, design scheduled tasks to be idempotent. If the
-workflow needs durable retries, history, and stronger orchestration semantics,
-use Autumn Harvest instead of `#[scheduled]`.
+hard restarts near a boundary, design scheduled tasks to be idempotent. Use the
+fencing token to reject a stale write. If the workflow needs durable retries,
+history, and stronger orchestration semantics, use Autumn Harvest instead of
+`#[scheduled]`.

@@ -1,8 +1,8 @@
 //! Scheduled-task coordination backends.
 //!
 //! The in-process backend preserves the original single-process behavior.
-//! The Postgres backend uses advisory locks so each fleet-wide task tick is
-//! claimed by at most one replica under normal operation.
+//! The Postgres backend records each fleet-wide task tick in a table, so at
+//! most one replica runs it (issue #3052).
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -77,10 +77,9 @@ pub trait SchedulerCoordinator: Send + Sync {
 pub struct SchedulerLease {
     backend: String,
     leader_id: String,
+    fencing_token: Option<i64>,
     #[cfg(test)]
     release_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    #[cfg(feature = "db")]
-    postgres: Option<PostgresAdvisoryLease>,
     #[cfg(feature = "sqlite")]
     sqlite: Option<SqliteTableLease>,
 }
@@ -90,10 +89,9 @@ impl SchedulerLease {
         Self {
             backend: backend.into(),
             leader_id: leader_id.into(),
+            fencing_token: None,
             #[cfg(test)]
             release_count: None,
-            #[cfg(feature = "db")]
-            postgres: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
         }
@@ -106,26 +104,24 @@ impl SchedulerLease {
         release_count: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         Self {
-            backend: backend.into(),
-            leader_id: leader_id.into(),
             release_count: Some(release_count),
-            #[cfg(feature = "db")]
-            postgres: None,
-            #[cfg(feature = "sqlite")]
-            sqlite: None,
+            ..Self::local(backend, leader_id)
         }
     }
 
+    /// Set the fencing token. Test doubles use it.
+    #[cfg(test)]
+    pub(crate) const fn with_fencing_token(mut self, token: i64) -> Self {
+        self.fencing_token = Some(token);
+        self
+    }
+
+    /// A lease granted by the Postgres tick-table coordinator.
     #[cfg(feature = "db")]
-    fn postgres(leader_id: impl Into<String>, lease: PostgresAdvisoryLease) -> Self {
+    fn postgres(leader_id: impl Into<String>, generation: i64) -> Self {
         Self {
-            backend: "postgres".to_owned(),
-            leader_id: leader_id.into(),
-            #[cfg(test)]
-            release_count: None,
-            postgres: Some(lease),
-            #[cfg(feature = "sqlite")]
-            sqlite: None,
+            fencing_token: Some(generation),
+            ..Self::local("postgres", leader_id)
         }
     }
 
@@ -133,12 +129,8 @@ impl SchedulerLease {
     #[cfg(feature = "sqlite")]
     fn sqlite(leader_id: impl Into<String>, lease: SqliteTableLease) -> Self {
         Self {
-            backend: "sqlite".to_owned(),
-            leader_id: leader_id.into(),
-            #[cfg(test)]
-            release_count: None,
-            postgres: None,
             sqlite: Some(lease),
+            ..Self::local("sqlite", leader_id)
         }
     }
 
@@ -154,7 +146,17 @@ impl SchedulerLease {
         &self.leader_id
     }
 
+    /// Fencing token of this tick: the tick row's `generation`.
+    ///
+    /// It increases with each claim. `None` on backends without a tick table.
+    #[must_use]
+    pub const fn fencing_token(&self) -> Option<i64> {
+        self.fencing_token
+    }
+
     /// Release backend resources associated with this lease.
+    ///
+    /// The Postgres and `SQLite` tick rows stay, so the tick stays claimed.
     ///
     /// # Errors
     ///
@@ -165,11 +167,6 @@ impl SchedulerLease {
             release_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
 
-        #[cfg(feature = "db")]
-        if let Some(lease) = self.postgres {
-            return lease.release().await;
-        }
-
         #[cfg(feature = "sqlite")]
         if let Some(lease) = self.sqlite {
             return lease.release().await;
@@ -177,6 +174,91 @@ impl SchedulerLease {
 
         Ok(())
     }
+}
+
+/// The tick that the running scheduled task runs for.
+///
+/// Read it with [`current_tick`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledTick {
+    tick_key: String,
+    fencing_token: Option<i64>,
+}
+
+impl ScheduledTick {
+    pub(crate) fn new(tick_key: impl Into<String>, lease: &SchedulerLease) -> Self {
+        Self {
+            tick_key: tick_key.into(),
+            fencing_token: lease.fencing_token(),
+        }
+    }
+
+    /// Global tick key, for example `nightly-invoice:1700000000`.
+    #[must_use]
+    pub fn tick_key(&self) -> &str {
+        &self.tick_key
+    }
+
+    /// Fencing token of this tick. See [`SchedulerLease::fencing_token`].
+    ///
+    /// Write it with each side effect, and refuse a write that carries an
+    /// older token.
+    #[must_use]
+    pub const fn fencing_token(&self) -> Option<i64> {
+        self.fencing_token
+    }
+}
+
+tokio::task_local! {
+    static CURRENT_TICK: ScheduledTick;
+}
+
+/// The tick that the calling `#[scheduled]` task runs for.
+///
+/// `None` outside a scheduled task, and in a task that the handler spawns
+/// (a task-local value does not go into `tokio::spawn`).
+#[must_use]
+pub fn current_tick() -> Option<ScheduledTick> {
+    CURRENT_TICK.try_with(Clone::clone).ok()
+}
+
+/// Run `future` with `tick` as its [`current_tick`].
+pub(crate) async fn with_tick<F: Future>(tick: ScheduledTick, future: F) -> F::Output {
+    CURRENT_TICK.scope(tick, future).await
+}
+
+/// Why an `in_process` scheduler can run each fleet tick on more than one
+/// replica (issue #3052).
+///
+/// `None` when the backend is not `in_process`, or when no hint shows more
+/// than one replica. The hints:
+///
+/// - `jobs_backend` is `postgres` or `redis`: a shared queue is for a fleet.
+/// - `replicas` (the `AUTUMN_REPLICAS` value) is a number above 1.
+/// - `kubernetes` (`KUBERNETES_SERVICE_HOST` is set).
+#[must_use]
+pub fn in_process_fleet_hint(
+    backend: SchedulerBackend,
+    jobs_backend: &str,
+    replicas: Option<&str>,
+    kubernetes: bool,
+) -> Option<&'static str> {
+    if backend != SchedulerBackend::InProcess {
+        return None;
+    }
+    if matches!(jobs_backend, "postgres" | "redis") {
+        return Some("jobs.backend is a shared queue");
+    }
+    if replicas
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|count| count > 1)
+    {
+        return Some("AUTUMN_REPLICAS is more than 1");
+    }
+    if kubernetes {
+        return Some("KUBERNETES_SERVICE_HOST is set");
+    }
+    None
 }
 
 /// Local coordinator that always lets this process run.
@@ -223,18 +305,73 @@ impl SchedulerCoordinator for InProcessSchedulerCoordinator {
     }
 }
 
-/// Postgres advisory-lock coordinator.
+/// Postgres tick-table coordinator (issue #3052).
+///
+/// Each fleet tick is one row in `autumn_scheduler_ticks`. The replica whose
+/// `INSERT … ON CONFLICT DO NOTHING` adds the row runs the tick. The row stays
+/// after the run, so a replica whose timer reaches the same tick later does
+/// not run it again. A leader that crashes does not free its tick: the policy
+/// is at-most-once per tick.
+///
+/// The claim keeps no session state and holds no connection while the tick
+/// runs, so it works behind a transaction-mode `PgBouncer`. The row's
+/// `generation` is the fencing token, see [`SchedulerLease::fencing_token`].
 #[cfg(feature = "db")]
 #[derive(Clone)]
-pub struct PostgresAdvisorySchedulerCoordinator {
+pub struct PostgresTickSchedulerCoordinator {
     pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     replica_id: String,
     key_prefix: String,
+    retention: Duration,
+    ready: Arc<tokio::sync::OnceCell<()>>,
 }
 
+/// Old name of [`PostgresTickSchedulerCoordinator`].
 #[cfg(feature = "db")]
-impl PostgresAdvisorySchedulerCoordinator {
-    /// Create a Postgres advisory-lock coordinator.
+#[deprecated(
+    since = "0.8.0",
+    note = "renamed to PostgresTickSchedulerCoordinator: it uses a tick table, not \
+            advisory locks (#3052)"
+)]
+pub type PostgresAdvisorySchedulerCoordinator = PostgresTickSchedulerCoordinator;
+
+/// How long a tick row stays when no retention is set. Matches the default
+/// `scheduler.lease_ttl_secs`.
+#[cfg(feature = "db")]
+const DEFAULT_TICK_RETENTION: Duration = Duration::from_secs(300);
+
+/// Floor on the tick-row retention.
+#[cfg(feature = "db")]
+const MIN_TICK_RETENTION: Duration = Duration::from_secs(1);
+
+/// DDL of the Postgres tick table. Operators whose database role cannot run
+/// `CREATE TABLE` apply it before the deploy.
+///
+/// The runtime sends it as one simple query, so Postgres runs it as one
+/// implicit transaction. The transaction-scoped advisory lock thus holds until
+/// the last statement ends, and two replicas that boot together cannot race on
+/// the `CREATE TABLE`.
+#[cfg(feature = "db")]
+pub const PG_TICK_TABLE_DDL: &str = "\
+SELECT pg_advisory_xact_lock(3052305230523052);
+CREATE TABLE IF NOT EXISTS autumn_scheduler_ticks (
+    key_prefix TEXT        NOT NULL,
+    task_name  TEXT        NOT NULL,
+    tick_key   TEXT        NOT NULL,
+    owner      TEXT        NOT NULL,
+    generation BIGSERIAL   NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (key_prefix, task_name, tick_key)
+);
+CREATE INDEX IF NOT EXISTS idx_autumn_scheduler_ticks_claimed_at
+    ON autumn_scheduler_ticks (key_prefix, claimed_at);";
+
+#[cfg(feature = "db")]
+impl PostgresTickSchedulerCoordinator {
+    /// Create a Postgres tick-table coordinator.
+    ///
+    /// Tick rows stay for 300 seconds. Use [`Self::with_tick_retention`] to
+    /// change that.
     #[must_use]
     pub fn new(
         pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
@@ -245,12 +382,50 @@ impl PostgresAdvisorySchedulerCoordinator {
             pool,
             replica_id: replica_id.into(),
             key_prefix: key_prefix.into(),
+            retention: DEFAULT_TICK_RETENTION,
+            ready: Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    /// Set how long a tick row stays after its claim (floor: 1 second).
+    ///
+    /// A replica whose timer reaches a tick after its row is gone runs the
+    /// tick again. Set this longer than the spread between replica timers.
+    #[must_use]
+    pub fn with_tick_retention(mut self, retention: Duration) -> Self {
+        self.retention = retention.max(MIN_TICK_RETENTION);
+        self
+    }
+
+    /// Create the tick table on first use. A failed attempt leaves the cell
+    /// empty, so the next acquire tries again.
+    async fn ensure_table(&self, conn: &mut diesel_async::AsyncPgConnection) -> AutumnResult<()> {
+        use diesel_async::SimpleAsyncConnection as _;
+
+        self.ready
+            .get_or_try_init(|| async move {
+                conn.batch_execute(PG_TICK_TABLE_DDL)
+                    .await
+                    .map_err(|error| {
+                        AutumnError::internal_server_error_msg(format!(
+                            "postgres scheduler tick table setup failed: {error}"
+                        ))
+                    })
+            })
+            .await?;
+        Ok(())
     }
 }
 
 #[cfg(feature = "db")]
-impl SchedulerCoordinator for PostgresAdvisorySchedulerCoordinator {
+#[derive(diesel::QueryableByName)]
+struct TickGenerationRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    generation: i64,
+}
+
+#[cfg(feature = "db")]
+impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
     fn backend(&self) -> &'static str {
         "postgres"
     }
@@ -266,6 +441,8 @@ impl SchedulerCoordinator for PostgresAdvisorySchedulerCoordinator {
         coordination: TaskCoordination,
     ) -> SchedulerFuture<'a, AutumnResult<Option<SchedulerLease>>> {
         Box::pin(async move {
+            use diesel_async::RunQueryDsl as _;
+
             if coordination == TaskCoordination::PerReplica {
                 return Ok(Some(SchedulerLease::local(
                     "per_replica",
@@ -273,49 +450,52 @@ impl SchedulerCoordinator for PostgresAdvisorySchedulerCoordinator {
                 )));
             }
 
-            let key = advisory_lock_key(&self.key_prefix, task_name, tick_key);
             let mut conn = self.pool.get().await.map_err(|error| {
                 AutumnError::service_unavailable_msg(format!(
-                    "scheduler postgres lock connection unavailable: {error}"
+                    "scheduler postgres connection unavailable: {error}"
                 ))
             })?;
-            let acquired = try_pg_advisory_lock(&mut conn, key).await?;
-            if acquired {
-                Ok(Some(SchedulerLease::postgres(
-                    self.replica_id.clone(),
-                    PostgresAdvisoryLease {
-                        conn: Some(conn),
-                        key,
-                    },
-                )))
-            } else {
-                Ok(None)
-            }
+            self.ensure_table(&mut conn).await?;
+
+            // Prune first, with the database clock, and only this app's rows:
+            // a shorter retention in another app must not free our ticks.
+            diesel::sql_query(
+                "DELETE FROM autumn_scheduler_ticks \
+                 WHERE key_prefix = $1 AND claimed_at < now() - make_interval(secs => $2)",
+            )
+            .bind::<diesel::sql_types::Text, _>(&self.key_prefix)
+            .bind::<diesel::sql_types::Double, _>(self.retention.as_secs_f64())
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "postgres scheduler tick prune failed: {error}"
+                ))
+            })?;
+
+            let claimed = diesel::sql_query(
+                "INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, owner) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT DO NOTHING \
+                 RETURNING generation",
+            )
+            .bind::<diesel::sql_types::Text, _>(&self.key_prefix)
+            .bind::<diesel::sql_types::Text, _>(task_name)
+            .bind::<diesel::sql_types::Text, _>(tick_key)
+            .bind::<diesel::sql_types::Text, _>(&self.replica_id)
+            .load::<TickGenerationRow>(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "postgres scheduler tick claim failed: {error}"
+                ))
+            })?;
+
+            Ok(claimed
+                .into_iter()
+                .next()
+                .map(|row| SchedulerLease::postgres(self.replica_id.clone(), row.generation)))
         })
-    }
-}
-
-#[cfg(feature = "db")]
-struct PostgresAdvisoryLease {
-    conn:
-        Option<diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>>,
-    key: i64,
-}
-
-#[cfg(feature = "db")]
-impl PostgresAdvisoryLease {
-    async fn release(mut self) -> AutumnResult<()> {
-        let Some(mut conn) = self.conn.take() else {
-            return Ok(());
-        };
-        let released = unlock_pg_advisory_lock(&mut conn, self.key).await?;
-        if !released {
-            tracing::warn!(
-                lock_key = self.key,
-                "Postgres advisory scheduler lock was already released"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -530,8 +710,7 @@ impl SchedulerCoordinator for SqliteLeaseSchedulerCoordinator {
 /// `scheduler.lease_ttl_secs`, and the next acquire reaps the row once it
 /// expires. Set the TTL longer than the spread between the processes' timers.
 ///
-/// This is stricter than the Postgres coordinator, whose `pg_advisory_unlock`
-/// frees the key the moment the leader finishes.
+/// The Postgres coordinator keeps its tick row in the same way (issue #3052).
 #[cfg(feature = "sqlite")]
 struct SqliteTableLease {
     key: i64,
@@ -606,8 +785,8 @@ pub fn coordinator_from_config(
             }
 
             // The lease table lives in the app's SQLite file, so this backend
-            // needs a build that has one. On a Postgres build, advisory locks
-            // are the fleet-wide primitive.
+            // needs a build that has one. On a Postgres build, the Postgres
+            // tick table is the fleet-wide primitive.
             #[cfg(not(feature = "sqlite"))]
             {
                 let _ = (state, replica_id);
@@ -625,15 +804,18 @@ pub fn coordinator_from_config(
                         "scheduler.backend = \"postgres\" requires a configured database pool",
                     )
                 })?;
-                Ok(Arc::new(PostgresAdvisorySchedulerCoordinator::new(
-                    pool,
-                    replica_id,
-                    config.key_prefix.clone(),
-                )))
+                Ok(Arc::new(
+                    PostgresTickSchedulerCoordinator::new(
+                        pool,
+                        replica_id,
+                        config.key_prefix.clone(),
+                    )
+                    .with_tick_retention(Duration::from_secs(config.lease_ttl_secs)),
+                ))
             }
 
-            // The Postgres advisory-lock scheduler coordinator is Postgres-only
-            // (it leases via `pg_advisory_lock`). Under the `sqlite` feature the
+            // The Postgres tick-table scheduler coordinator is Postgres-only
+            // (its SQL is Postgres SQL). Under the `sqlite` feature the
             // runtime pool is a SQLite pool with no such primitive, so refuse
             // rather than mis-type. SQLite runs one of the two single-host
             // coordinators instead: `in_process` (the default, one process) or
@@ -676,7 +858,8 @@ pub fn cron_tick_key(task_name: &str, unix_secs: u64) -> String {
     format!("{task_name}:{unix_secs}")
 }
 
-/// Compute a stable signed 64-bit advisory lock key for a task tick.
+/// Compute a stable signed 64-bit key for a task tick. The `SQLite` lease
+/// table uses it as its primary key.
 #[must_use]
 pub fn advisory_lock_key(key_prefix: &str, task_name: &str, tick_key: &str) -> i64 {
     let mut hasher = Sha256::new();
@@ -745,50 +928,6 @@ pub fn now_unix_duration() -> Duration {
         .unwrap_or_default()
 }
 
-#[cfg(feature = "db")]
-#[derive(diesel::QueryableByName)]
-struct AdvisoryLockRow {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    acquired: bool,
-}
-
-#[cfg(feature = "db")]
-async fn try_pg_advisory_lock(
-    conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
-    key: i64,
-) -> AutumnResult<bool> {
-    use diesel_async::RunQueryDsl as _;
-
-    let row = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
-        .bind::<diesel::sql_types::BigInt, _>(key)
-        .get_result::<AdvisoryLockRow>(&mut **conn)
-        .await
-        .map_err(|error| AutumnError::internal_server_error_msg(error.to_string()))?;
-    Ok(row.acquired)
-}
-
-#[cfg(feature = "db")]
-#[derive(diesel::QueryableByName)]
-struct AdvisoryUnlockRow {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    released: bool,
-}
-
-#[cfg(feature = "db")]
-async fn unlock_pg_advisory_lock(
-    conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
-    key: i64,
-) -> AutumnResult<bool> {
-    use diesel_async::RunQueryDsl as _;
-
-    let row = diesel::sql_query("SELECT pg_advisory_unlock($1) AS released")
-        .bind::<diesel::sql_types::BigInt, _>(key)
-        .get_result::<AdvisoryUnlockRow>(&mut **conn)
-        .await
-        .map_err(|error| AutumnError::internal_server_error_msg(error.to_string()))?;
-    Ok(row.released)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,9 +947,9 @@ mod tests {
         assert!(!coordinator.is_fleet_distributed());
     }
 
-    // `PostgresAdvisorySchedulerCoordinator` (feature `db`) needs a live pool
+    // `PostgresTickSchedulerCoordinator` (feature `db`) needs a live pool
     // to construct — covered by the testcontainer-backed
-    // `tests/integration/scheduled_coordination.rs` suite instead. This
+    // `tests/integration/scheduled_coordination_pg.rs` suite instead. This
     // exercises the same default-method derivation (`backend() == "postgres"`)
     // via a minimal double, without a database.
     /// Issue #1907: `scheduler.backend = "sqlite"` is refused on a build with
@@ -911,6 +1050,71 @@ mod tests {
             sqlite_test_coordinator(Duration::from_secs(1)).lease_ttl,
             Duration::from_secs(1),
             "exactly the floor stays the floor"
+        );
+    }
+
+    // Issue #3052: hints that an `in_process` scheduler runs on a fleet.
+    #[test]
+    fn in_process_fleet_hint_flags_a_shared_jobs_backend() {
+        for jobs in ["postgres", "redis"] {
+            assert!(
+                in_process_fleet_hint(SchedulerBackend::InProcess, jobs, None, false).is_some(),
+                "{jobs}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_process_fleet_hint_flags_replica_and_kubernetes_hints() {
+        let hint = |replicas, kubernetes| {
+            in_process_fleet_hint(SchedulerBackend::InProcess, "local", replicas, kubernetes)
+        };
+        assert!(hint(Some("3"), false).is_some());
+        assert!(hint(Some(" 2 "), false).is_some());
+        assert!(hint(None, true).is_some());
+        assert!(hint(Some("1"), false).is_none(), "one replica is safe");
+        assert!(hint(Some("many"), false).is_none(), "not a number");
+        assert!(hint(None, false).is_none(), "no hint");
+    }
+
+    #[test]
+    fn in_process_fleet_hint_is_silent_on_a_coordinated_backend() {
+        for backend in [SchedulerBackend::Postgres, SchedulerBackend::Sqlite] {
+            assert!(in_process_fleet_hint(backend, "postgres", Some("9"), true).is_none());
+        }
+        assert!(
+            in_process_fleet_hint(SchedulerBackend::InProcess, "sqlite", None, false).is_none(),
+            "a sqlite queue is single-host"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_tick_is_set_only_inside_the_tick_scope() {
+        assert_eq!(current_tick(), None, "no tick outside a scheduled task");
+
+        let lease = SchedulerLease::local("postgres", "replica-a").with_fencing_token(42);
+        let tick = ScheduledTick::new("invoice:7", &lease);
+        let seen = with_tick(tick.clone(), async {
+            let inner = tokio::spawn(async { current_tick() }).await.expect("join");
+            (current_tick(), inner)
+        })
+        .await;
+
+        assert_eq!(seen.0, Some(tick));
+        assert_eq!(
+            seen.0.as_ref().map(ScheduledTick::tick_key),
+            Some("invoice:7")
+        );
+        assert_eq!(seen.0.and_then(|tick| tick.fencing_token()), Some(42));
+        assert_eq!(seen.1, None, "a spawned task does not inherit the tick");
+        assert_eq!(current_tick(), None);
+    }
+
+    #[test]
+    fn local_lease_has_no_fencing_token() {
+        assert_eq!(
+            SchedulerLease::local("in_process", "replica-a").fencing_token(),
+            None
         );
     }
 }
