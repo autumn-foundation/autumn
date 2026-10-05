@@ -3573,19 +3573,36 @@ impl Analyzer {
             Expr::Group(g) => self.produced(&g.expr),
             Expr::Call(call) => self.invoked(call, false),
             // `result.unwrap_err()` on a `Result` with known sides: that side.
+            // `result.unwrap_or(0)`: the `Ok` side or what the fallback gives.
             Expr::MethodCall(mc)
                 if matches!(
                     mc.method.to_string().as_str(),
-                    "unwrap" | "expect" | "unwrap_err" | "expect_err"
+                    "unwrap"
+                        | "expect"
+                        | "unwrap_err"
+                        | "expect_err"
+                        | "unwrap_or"
+                        | "unwrap_or_default"
+                        | "unwrap_or_else"
                 ) && self.shape_of(&mc.receiver) == Some(Shape::Res) =>
             {
                 let method = mc.method.to_string();
-                let side = if method.ends_with("_err") {
-                    "Err"
-                } else {
-                    "Ok"
-                };
-                self.env.part(&path_ident(peel_parens(&mc.receiver))?, side)
+                if method.ends_with("_err") {
+                    return self.side_kind(&mc.receiver, "Err");
+                }
+                let ok = self.side_kind(&mc.receiver, "Ok")?;
+                let error = self.side_kind(&mc.receiver, "Err").unwrap_or(Kind::Nested);
+                let fallback = mc
+                    .args
+                    .iter()
+                    .filter(|_| method.starts_with("unwrap_or"))
+                    .map(|a| match a {
+                        Expr::Closure(_) => self.closure_output(a, error),
+                        _ => self.value_of(a),
+                    })
+                    .max()
+                    .unwrap_or(Kind::Plain);
+                Some(ok.max(fallback))
             }
             // `result.err()` on a `Result` with known sides: an `Option` of
             // that side.
@@ -3594,9 +3611,7 @@ impl Analyzer {
                     && self.shape_of(&mc.receiver) == Some(Shape::Res) =>
             {
                 let side = if mc.method == "ok" { "Ok" } else { "Err" };
-                let kind = self
-                    .env
-                    .part(&path_ident(peel_parens(&mc.receiver))?, side)?;
+                let kind = self.side_kind(&mc.receiver, side)?;
                 Some(match kind {
                     Kind::Plain => Kind::Plain,
                     Kind::Handle | Kind::LazyDb => Kind::Carrier,
@@ -3884,9 +3899,7 @@ impl Analyzer {
             "map_err" | "or_else" => "Ok",
             _ => return false,
         };
-        path_ident(peel_parens(&mc.receiver))
-            .and_then(|name| self.env.part(&name, kept))
-            .is_some_and(|kind| kind == Kind::Plain)
+        self.side_kind(&mc.receiver, kept) == Some(Kind::Plain)
     }
 
     /// What callback `arg` of `mc` takes when the receiver is a named
@@ -3895,11 +3908,21 @@ impl Analyzer {
         if self.shape_of(&mc.receiver) != Some(Shape::Res) {
             return None;
         }
-        let Expr::Path(path) = &*mc.receiver else {
-            return None;
-        };
         let side = callback_side(&mc.method.to_string(), arg, mc.args.len())?;
-        self.env.part(&path.path.get_ident()?.to_string(), side)
+        self.side_kind(&mc.receiver, side)
+    }
+
+    /// What side `side` (`Ok` or `Err`) of a named `Result` with known sides
+    /// holds: `result`, `result.as_ref()`, `result.as_mut()`.
+    fn side_kind(&self, e: &Expr, side: &str) -> Option<Kind> {
+        match peel_refs(e) {
+            Expr::MethodCall(mc)
+                if matches!(mc.method.to_string().as_str(), "as_ref" | "as_mut") =>
+            {
+                self.side_kind(&mc.receiver, side)
+            }
+            other => self.env.part(&path_ident(other)?, side),
+        }
     }
 
     /// Is `e` a database connection: a handle with the `Db` shape? A
@@ -9158,6 +9181,48 @@ mod tests {
                 "async fn h(lazy: LazyDb) -> AutumnResult<usize> { \
                  let mut db = lazy.checkout().await?; let _ = db.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn result_sides_hold_through_adapters_and_fallbacks() {
+        check_handlers(&[
+            (
+                "unwrap_or on a Result takes the value side",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = result.unwrap_or(0); render(n); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "unwrap_or_default on a Result takes the value side",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = result.unwrap_or_default(); render(n); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "unwrap_or_else on a Result takes the value side and its callback output",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = result.unwrap_or_else(|_| 0); render(n); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "map_err after as_ref takes the error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.as_ref().map_err(|e| render(e)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: unwrap_or_else that gives the error handle",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = result.unwrap_or_else(|r| r); render(n); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: map after as_ref takes the handle side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.as_ref().map(|r| render(r)); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
