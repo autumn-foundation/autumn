@@ -2316,6 +2316,7 @@ impl TestApp {
         crate::redis_health::register_redis_health_indicators(
             &self.config,
             &state.health_indicator_registry,
+            &[],
         );
 
         // Mirror production `AppBuilder` wiring: surface each configured shard's
@@ -2327,6 +2328,7 @@ impl TestApp {
             crate::sharding::register_shard_health_indicators(
                 set,
                 &state.health_indicator_registry,
+                self.config.health.ping_timeout(),
             );
         }
 

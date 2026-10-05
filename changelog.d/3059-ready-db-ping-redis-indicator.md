@@ -36,7 +36,10 @@
 - **redis:** `RedisHealthIndicator` sends `PING` with a time limit. The
   framework registers `redis:<subsystem>` for each subsystem whose config
   selects Redis (cache, channels, idempotency, jobs, rate limit, sessions,
-  submit tokens, webhook replay). Subsystems on one URL share one connection.
+  submit tokens, webhook replay). Subsystems on one URL share one connection
+  and one concurrent `PING`. A backend installed with the builder
+  (`with_session_store`, `with_cache_backend`, `with_channels_backend`) gets
+  no indicator.
   The indicators show in `/actuator/health` only. Set
   `health.redis_readiness = true` to make them gate `/ready`.
 - Env: `AUTUMN_HEALTH__CACHE_TTL_MS`, `AUTUMN_HEALTH__PING_TIMEOUT_MS`,

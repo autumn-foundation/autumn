@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
-use crate::health_cache::SingleFlightCache;
+use crate::health_cache::{Raced, SingleFlightCache};
 
 pub type DbPool = diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>;
 
@@ -55,21 +55,24 @@ impl DbPing for DedicatedConnectionPing {
             };
             // Take the connection out first. If this future is cancelled, a
             // half-used connection is dropped, not kept.
-            if let Some(mut conn) = slot.take() {
-                // Half the budget: a kept connection that hangs (the server
-                // moved, the network dropped it) must leave time for a new one.
-                if matches!(
-                    tokio::time::timeout(budget / 2, select_one(&mut conn)).await,
-                    Ok(Ok(()))
-                ) {
-                    *slot = Some(conn);
-                    return Ok(());
-                }
+            let Some(mut kept) = slot.take() else {
+                let conn = new_connection_ping(&pool).await?;
+                *slot = Some(conn);
+                return Ok(());
+            };
+            // The server can have closed the kept connection (idle timeout,
+            // restart, pooler), or it can hang. Then use a new connection.
+            let raced = crate::health_cache::race_kept_connection(
+                async { select_one(&mut kept).await.is_ok() },
+                || new_connection_ping(&pool),
+                budget,
+            )
+            .await;
+            match raced {
+                Raced::Kept => *slot = Some(kept),
+                Raced::Fresh(conn) => *slot = Some(conn),
+                Raced::Failed(error) => return Err(error),
             }
-            // No kept connection, or the server closed it (idle timeout,
-            // restart, pooler). Try once on a new connection.
-            let conn = new_connection_ping(&pool).await?;
-            *slot = Some(conn);
             drop(slot);
             Ok(())
         })

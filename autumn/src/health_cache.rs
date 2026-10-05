@@ -59,20 +59,15 @@ impl<T: Clone + Send + Sync + 'static> SingleFlightCache<T> {
     /// Return the cached value, or refresh it and cache the result.
     ///
     /// When a refresh already runs, wait for it. Do not start a second one.
-    /// When the refresh task fails (it panics), return `on_failure()` and
-    /// do not cache it.
+    /// This is also true when the TTL is zero: concurrent callers share one
+    /// refresh, and a later caller starts a new one. When the refresh task
+    /// fails (it panics), return `on_failure()` and do not cache it.
     pub async fn get_or_refresh<F, Fut>(&self, refresh: F, on_failure: impl FnOnce() -> T) -> T
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = T> + Send + 'static,
     {
         let ttl = Duration::from_millis(self.ttl_ms.load(Ordering::Relaxed));
-        if ttl.is_zero() {
-            return tokio::spawn(refresh())
-                .await
-                .unwrap_or_else(|_| on_failure());
-        }
-
         let shared = {
             let mut slot = lock(&self.slot);
             if let Some((at, value)) = &slot.value
@@ -118,6 +113,68 @@ impl<T: Clone + Send + Sync + 'static> SingleFlightCache<T> {
             value
         });
         joined.shared()
+    }
+}
+
+/// Result of [`race_kept_connection`].
+#[cfg(any(feature = "db", feature = "redis"))]
+pub enum Raced<C, E> {
+    /// The kept connection answered.
+    Kept,
+    /// A new connection answered first, or the kept one failed.
+    Fresh(C),
+    /// Both failed. The error is from the new connection.
+    Failed(E),
+}
+
+/// Ping on a kept connection. If it does not answer in half the budget,
+/// also open a new connection, and use the first one that answers.
+///
+/// A kept connection that hangs (the server moved, the network dropped it)
+/// must leave time for a new one. A kept connection that is only slow must
+/// not be dropped while it can still answer in the budget.
+#[cfg(any(feature = "db", feature = "redis"))]
+pub async fn race_kept_connection<C, E, Fresh>(
+    kept: impl Future<Output = bool>,
+    fresh: impl FnOnce() -> Fresh,
+    budget: Duration,
+) -> Raced<C, E>
+where
+    Fresh: Future<Output = Result<C, E>>,
+{
+    let mut kept = std::pin::pin!(kept);
+    match tokio::time::timeout(budget / 2, &mut kept).await {
+        Ok(true) => return Raced::Kept,
+        Ok(false) => {
+            return match fresh().await {
+                Ok(conn) => Raced::Fresh(conn),
+                Err(error) => Raced::Failed(error),
+            };
+        }
+        Err(_slow) => {}
+    }
+    let mut fresh = std::pin::pin!(fresh());
+    tokio::select! {
+        answered = &mut kept => {
+            if answered {
+                Raced::Kept
+            } else {
+                match fresh.await {
+                    Ok(conn) => Raced::Fresh(conn),
+                    Err(error) => Raced::Failed(error),
+                }
+            }
+        }
+        opened = &mut fresh => match opened {
+            Ok(conn) => Raced::Fresh(conn),
+            Err(error) => {
+                if kept.await {
+                    Raced::Kept
+                } else {
+                    Raced::Failed(error)
+                }
+            }
+        },
     }
 }
 
@@ -193,6 +250,71 @@ mod tests {
                 .await;
             assert_eq!(value, expected);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_ttl_still_shares_a_running_refresh() {
+        let cache = Arc::new(SingleFlightCache::new(Duration::ZERO));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let refresh = counted(&calls, Duration::from_millis(50));
+                tokio::spawn(async move { cache.get_or_refresh(refresh, || FAILED).await })
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), 1);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    async fn answer_after(delay: Duration, ok: bool) -> bool {
+        tokio::time::sleep(delay).await;
+        ok
+    }
+
+    async fn open_after(delay: Duration, ok: bool) -> Result<&'static str, &'static str> {
+        tokio::time::sleep(delay).await;
+        if ok { Ok("new") } else { Err("refused") }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_kept_connection_inside_the_budget_is_kept() {
+        // The kept connection answers at 1.5 s of 2 s. A new one needs 1 s
+        // more, so it cannot answer in the budget.
+        let raced = race_kept_connection(
+            answer_after(Duration::from_millis(1_500), true),
+            || open_after(Duration::from_secs(1), true),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(raced, Raced::Kept));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_kept_connection_is_replaced() {
+        let raced = race_kept_connection(
+            std::future::pending::<bool>(),
+            || open_after(Duration::from_millis(200), true),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(raced, Raced::Fresh("new")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_kept_connection_opens_a_new_one_at_once() {
+        let started = Instant::now();
+        let raced = race_kept_connection(
+            answer_after(Duration::ZERO, false),
+            || open_after(Duration::ZERO, false),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(raced, Raced::Failed("refused")));
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[tokio::test(start_paused = true)]

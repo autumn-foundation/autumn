@@ -4053,6 +4053,19 @@ impl AppBuilder {
         // precondition, so the exporter shares both — see
         // `validate_pre_router_preconditions`.)
 
+        // Subsystems whose backend the builder installed do not use the
+        // configured Redis, so they get no Redis indicator (#3059).
+        #[cfg(feature = "redis")]
+        let builder_replaced_backends: Vec<&'static str> = [
+            ("sessions", session_store.is_some()),
+            ("cache", cache_backend.is_some()),
+            #[cfg(feature = "ws")]
+            ("channels", channels_backend.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(subsystem, replaced)| replaced.then_some(subsystem))
+        .collect();
+
         // 6. Build the router (with optional static-file layer)
         let mut state = build_state(
             &config,
@@ -4242,6 +4255,7 @@ impl AppBuilder {
         crate::redis_health::register_redis_health_indicators(
             &config,
             &state.health_indicator_registry,
+            &builder_replaced_backends,
         );
 
         // Continuous SQLite replication (#1628). Resolved here, next to the other
@@ -13964,7 +13978,11 @@ fn build_state(
     // `db:shard:<name>` component (replica readiness refresh + pool stats).
     #[cfg(feature = "db")]
     if let Some(set) = state.shards() {
-        crate::sharding::register_shard_health_indicators(set, &state.health_indicator_registry);
+        crate::sharding::register_shard_health_indicators(
+            set,
+            &state.health_indicator_registry,
+            config.health.ping_timeout(),
+        );
     }
     state.insert_extension(config.clone());
     state.insert_extension(crate::step_up::StepUpGlobalConfig {

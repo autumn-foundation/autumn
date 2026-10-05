@@ -243,8 +243,15 @@ The framework registers one indicator for each subsystem whose config selects
 Redis: `cache`, `channels`, `idempotency`, `jobs`, `rate_limit`, `sessions`,
 `submit_token` and `webhook_replay`. Each sends `PING` with the
 `health.ping_timeout_ms` limit. A failed or late `PING` is `DOWN`, not
-`UNKNOWN`. Subsystems on one URL share one connection. A connection that fails
-is dropped, and the next check opens a new one.
+`UNKNOWN`. Subsystems on one URL share one connection, and checks that run at
+the same time share one `PING`. A subsystem whose backend you install with the
+builder (`with_session_store`, `with_cache_backend`, `with_channels_backend`)
+does not use the configured Redis, so it gets no indicator.
+
+A kept connection (database or Redis) that does not answer in half the time
+limit gets help: the check also opens a new connection and uses the first one
+that answers. So a slow but healthy server stays `UP`, and a hung connection is
+replaced.
 
 They are `HealthOnly` by default. Set `health.redis_readiness = true` to make
 them gate `/ready`. Read

@@ -1325,22 +1325,22 @@ pub(crate) struct ShardHealthIndicator {
     /// shard (#3059). No own cache: the indicator registry caches.
     primary_ping: crate::db_ping::DbPingCheck,
     replica_ping: crate::db_ping::DbPingCheck,
+    /// Time limit of one ping (`health.ping_timeout_ms`).
+    ping_timeout: std::time::Duration,
 }
 
 impl ShardHealthIndicator {
-    pub(crate) fn new(shard: Shard) -> Self {
+    pub(crate) fn new(shard: Shard, ping_timeout: std::time::Duration) -> Self {
         let primary_ping = crate::db_ping::DbPingCheck::new("primary");
         let replica_ping = crate::db_ping::DbPingCheck::new("replica");
         for ping in [&primary_ping, &replica_ping] {
-            ping.configure(
-                std::time::Duration::ZERO,
-                crate::health_cache::DEFAULT_PING_TIMEOUT,
-            );
+            ping.configure(std::time::Duration::ZERO, ping_timeout);
         }
         Self {
             shard,
             primary_ping,
             replica_ping,
+            ping_timeout,
         }
     }
 
@@ -1442,8 +1442,7 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
     /// The ping time limit plus a margin. A late ping then reports its own
     /// `DOWN` result, not the registry's `UNKNOWN` timeout result.
     fn timeout_ms(&self) -> u64 {
-        let limit =
-            crate::health_cache::DEFAULT_PING_TIMEOUT + std::time::Duration::from_millis(500);
+        let limit = self.ping_timeout + std::time::Duration::from_millis(500);
         u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
     }
 }
@@ -1453,13 +1452,14 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
 pub(crate) fn register_shard_health_indicators(
     set: &ShardSet,
     registry: &crate::actuator::HealthIndicatorRegistry,
+    ping_timeout: std::time::Duration,
 ) {
     for shard in set.iter() {
         let name = format!("db:shard:{}", shard.name());
         if let Err(error) = registry.register(
             name,
             crate::actuator::IndicatorGroup::Readiness,
-            Arc::new(ShardHealthIndicator::new(shard.clone())),
+            Arc::new(ShardHealthIndicator::new(shard.clone(), ping_timeout)),
         ) {
             tracing::warn!("{error}");
         }
@@ -2967,11 +2967,22 @@ mod tests {
 
     #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
+    async fn shard_indicator_uses_the_configured_ping_timeout() {
+        use crate::actuator::HealthIndicator as _;
+
+        let shard = shard_with_unreachable_replica(ReplicaFallback::FailReadiness);
+        let indicator = ShardHealthIndicator::new(shard, std::time::Duration::from_millis(700));
+
+        assert_eq!(indicator.timeout_ms(), 1_200);
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
     async fn shard_indicator_gates_readiness_for_fail_readiness_replica() {
         use crate::actuator::HealthIndicator as _;
 
         let shard = shard_with_unreachable_replica(ReplicaFallback::FailReadiness);
-        let indicator = ShardHealthIndicator::new(shard);
+        let indicator = ShardHealthIndicator::new(shard, crate::health_cache::DEFAULT_PING_TIMEOUT);
         let output = indicator.check().await;
 
         assert!(
@@ -2995,7 +3006,7 @@ mod tests {
         // + dead-replica fallback path needs a live primary and is exercised by
         // the `read_pool`/`read_route` fallback tests above, not the indicator.)
         let shard = shard_with_unreachable_replica(ReplicaFallback::Primary);
-        let indicator = ShardHealthIndicator::new(shard);
+        let indicator = ShardHealthIndicator::new(shard, crate::health_cache::DEFAULT_PING_TIMEOUT);
         let output = indicator.check().await;
 
         assert!(
@@ -3023,7 +3034,9 @@ mod tests {
             .expect("configured");
         let shard = set.get(ShardId(0)).expect("shard").clone();
 
-        let output = ShardHealthIndicator::new(shard).check().await;
+        let output = ShardHealthIndicator::new(shard, crate::health_cache::DEFAULT_PING_TIMEOUT)
+            .check()
+            .await;
 
         assert!(
             !output.status.is_healthy(),
@@ -3039,9 +3052,17 @@ mod tests {
         let set = shard_set(&["alpha", "beta"]);
         let registry = crate::actuator::HealthIndicatorRegistry::new();
 
-        register_shard_health_indicators(&set, &registry);
+        register_shard_health_indicators(
+            &set,
+            &registry,
+            crate::health_cache::DEFAULT_PING_TIMEOUT,
+        );
         // Re-registration is ignored with a warning rather than panicking.
-        register_shard_health_indicators(&set, &registry);
+        register_shard_health_indicators(
+            &set,
+            &registry,
+            crate::health_cache::DEFAULT_PING_TIMEOUT,
+        );
 
         let results = registry.run_all().await;
         // run_all also appends process-global results (e.g. circuit

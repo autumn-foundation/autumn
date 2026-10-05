@@ -16,6 +16,7 @@ use crate::actuator::{
     HealthCheckOutput, HealthIndicator, HealthIndicatorRegistry, HealthStatus, IndicatorGroup,
 };
 use crate::config::AutumnConfig;
+use crate::health_cache::{Raced, SingleFlightCache, race_kept_connection};
 
 /// Time the registry gives the indicator after its own `PING` limit. The
 /// indicator then reports its own `DOWN` result, not the registry's
@@ -23,10 +24,12 @@ use crate::config::AutumnConfig;
 const REGISTRY_TIMEOUT_MARGIN: Duration = Duration::from_millis(500);
 
 /// One Redis server and the connection kept for `PING`. Indicators for the
-/// same URL share it.
+/// same URL share it, and share one `PING` when they check at the same time.
 struct RedisPinger {
     client: redis::Client,
     connection: tokio::sync::Mutex<Option<MultiplexedConnection>>,
+    /// No TTL: it only joins checks that run at the same time.
+    running: SingleFlightCache<Result<(), String>>,
 }
 
 impl RedisPinger {
@@ -34,28 +37,51 @@ impl RedisPinger {
         Ok(Self {
             client: crate::redis_tls::open_client(url)?,
             connection: tokio::sync::Mutex::new(None),
+            running: SingleFlightCache::new(Duration::ZERO),
         })
     }
 
-    /// Send `PING`. Use the kept connection first, with half the budget. If
-    /// it fails, open a new connection once.
-    async fn ping(&self, budget: Duration) -> Result<(), String> {
-        // Wait for a ping of another indicator on this URL. It is short, and
-        // the caller's time limit bounds the wait.
+    /// Send `PING`, or wait for the `PING` that already runs for this URL.
+    async fn ping(self: &Arc<Self>, budget: Duration) -> Result<(), String> {
+        let pinger = Arc::clone(self);
+        self.running
+            .get_or_refresh(
+                move || async move { pinger.ping_once(budget).await },
+                || Err("PING check stopped unexpectedly".to_owned()),
+            )
+            .await
+    }
+
+    /// Send one `PING`. Use the kept connection. If it fails or hangs, use a
+    /// new connection.
+    async fn ping_once(&self, budget: Duration) -> Result<(), String> {
         let mut slot = self.connection.lock().await;
         // Take the connection out first. If this future is cancelled, a
         // half-used connection is dropped, not kept.
-        if let Some(mut connection) = slot.take()
-            && matches!(
-                tokio::time::timeout(budget / 2, send_ping(&mut connection)).await,
-                Ok(Ok(()))
-            )
-        {
-            *slot = Some(connection);
+        let Some(mut kept) = slot.take() else {
+            *slot = Some(self.new_connection(budget).await?);
             return Ok(());
+        };
+        // A kept connection can be half-open (the server moved or the
+        // network dropped it). Then use a new connection.
+        let raced = race_kept_connection(
+            async { send_ping(&mut kept).await.is_ok() },
+            || self.new_connection(budget),
+            budget,
+        )
+        .await;
+        match raced {
+            Raced::Kept => *slot = Some(kept),
+            Raced::Fresh(connection) => *slot = Some(connection),
+            Raced::Failed(error) => return Err(error),
         }
-        // A kept connection that fails can be half-open (the server moved
-        // or the network dropped it). Do not use it again.
+        drop(slot);
+        Ok(())
+    }
+
+    /// Open a new connection and send `PING` on it. The budget limits the
+    /// connect time and the reply time.
+    async fn new_connection(&self, budget: Duration) -> Result<MultiplexedConnection, String> {
         let config = redis::AsyncConnectionConfig::new()
             .set_connection_timeout(Some(budget))
             .set_response_timeout(Some(budget));
@@ -67,9 +93,7 @@ impl RedisPinger {
         send_ping(&mut connection)
             .await
             .map_err(|error| format!("PING failed: {error}"))?;
-        *slot = Some(connection);
-        drop(slot);
-        Ok(())
+        Ok(connection)
     }
 }
 
@@ -243,9 +267,14 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
 
 /// Register a `redis:<subsystem>` indicator for each enabled Redis-backed
 /// subsystem. Logs and skips a subsystem whose URL is not valid.
+///
+/// `replaced` names the subsystems whose backend the builder installed (for
+/// example, `with_session_store`). They do not use the configured Redis, so
+/// they get no indicator.
 pub(crate) fn register_redis_health_indicators(
     config: &AutumnConfig,
     registry: &HealthIndicatorRegistry,
+    replaced: &[&str],
 ) {
     let group = if config.health.redis_readiness {
         IndicatorGroup::Readiness
@@ -255,6 +284,9 @@ pub(crate) fn register_redis_health_indicators(
     // One kept connection per Redis server, not per subsystem.
     let mut pingers: HashMap<String, Arc<RedisPinger>> = HashMap::new();
     for (subsystem, url) in redis_subsystems(config) {
+        if replaced.contains(&subsystem) {
+            continue;
+        }
         let name = format!("redis:{subsystem}");
         let pinger = if let Some(pinger) = pingers.get(&url) {
             Arc::clone(pinger)
@@ -363,16 +395,31 @@ mod tests {
         config.session.redis.url = Some("redis://127.0.0.1:1".to_owned());
 
         let health_only = HealthIndicatorRegistry::new();
-        register_redis_health_indicators(&config, &health_only);
+        register_redis_health_indicators(&config, &health_only, &[]);
         assert!(health_only.contains("redis:sessions"));
         assert!(health_only.run_readiness().await.is_empty());
 
         config.health.redis_readiness = true;
         let readiness = HealthIndicatorRegistry::new();
-        register_redis_health_indicators(&config, &readiness);
+        register_redis_health_indicators(&config, &readiness, &[]);
         let results = readiness.run_readiness().await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "redis:sessions");
+    }
+
+    #[tokio::test]
+    async fn subsystems_replaced_by_the_builder_get_no_indicator() {
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Redis;
+        config.session.redis.url = Some("redis://127.0.0.1:1".to_owned());
+        config.cache.backend = crate::config::CacheBackend::Redis;
+        config.cache.redis.url = Some("redis://127.0.0.1:1".to_owned());
+        let registry = HealthIndicatorRegistry::new();
+
+        register_redis_health_indicators(&config, &registry, &["sessions"]);
+
+        assert!(!registry.contains("redis:sessions"));
+        assert!(registry.contains("redis:cache"));
     }
 
     #[test]
@@ -452,6 +499,7 @@ mod tests {
         addr: std::net::SocketAddr,
         accepted: Arc<std::sync::atomic::AtomicUsize>,
         generation: Arc<std::sync::atomic::AtomicUsize>,
+        delay_ms: Arc<std::sync::atomic::AtomicU64>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -466,12 +514,17 @@ mod tests {
             let addr = listener.local_addr().expect("local addr");
             let accepted = Arc::new(AtomicUsize::new(0));
             let generation = Arc::new(AtomicUsize::new(0));
+            let delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(
+                u64::try_from(delay.as_millis()).expect("small delay"),
+            ));
             let (count, current) = (Arc::clone(&accepted), Arc::clone(&generation));
+            let server_delay = Arc::clone(&delay_ms);
             let task = tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     count.fetch_add(1, Ordering::SeqCst);
                     let born = current.load(Ordering::SeqCst);
                     let current = Arc::clone(&current);
+                    let delay_ms = Arc::clone(&server_delay);
                     tokio::spawn(async move {
                         let (read, mut write) = socket.into_split();
                         let mut read = tokio::io::BufReader::new(read);
@@ -496,7 +549,8 @@ mod tests {
                                 continue; // muted: never answer
                             }
                             let reply: &[u8] = if words.first().is_some_and(|w| w == "PING") {
-                                tokio::time::sleep(delay).await;
+                                let delay = delay_ms.load(Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
                                 b"+PONG\r\n"
                             } else {
                                 b"+OK\r\n"
@@ -512,6 +566,7 @@ mod tests {
                 addr,
                 accepted,
                 generation,
+                delay_ms,
                 task,
             }
         }
@@ -522,6 +577,13 @@ mod tests {
 
         fn accepted(&self) -> usize {
             self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn set_delay(&self, delay: Duration) {
+            self.delay_ms.store(
+                u64::try_from(delay.as_millis()).expect("small delay"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
         }
 
         fn mute_open_connections(&self) {
@@ -572,6 +634,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subsystems_on_one_url_share_one_ping() {
+        // Each PING takes 400 ms and the limit is 1 s. Three indicators that
+        // waited for each other would need 1.2 s.
+        let redis = FakeRedis::start(Duration::from_millis(400)).await;
+        let mut config = AutumnConfig::default();
+        config.health.ping_timeout_ms = 1_000;
+        config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
+        config.idempotency.redis.url = Some(redis.url());
+        config.session.backend = crate::session::SessionBackend::Redis;
+        config.session.redis.url = Some(redis.url());
+        let registry = HealthIndicatorRegistry::new();
+        register_redis_health_indicators(&config, &registry, &[]);
+
+        let results = registry.run_all().await;
+
+        let redis_results: Vec<_> = results
+            .iter()
+            .filter(|r| r.name.starts_with("redis:"))
+            .collect();
+        assert_eq!(redis_results.len(), 3);
+        for result in redis_results {
+            assert_eq!(result.output.status, HealthStatus::Up, "{result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_kept_connection_inside_the_limit_is_up() {
+        // The first PING opens the connection. Then each PING takes 700 ms
+        // of the 1 s limit: more than half the limit, less than all of it.
+        let redis = FakeRedis::start(Duration::ZERO).await;
+        let indicator = RedisHealthIndicator::new(&redis.url())
+            .expect("valid url")
+            .with_timeout(Duration::from_secs(1));
+        assert_eq!(indicator.check().await.status, HealthStatus::Up);
+
+        redis.set_delay(Duration::from_millis(700));
+        let output = indicator.check().await;
+
+        assert_eq!(output.status, HealthStatus::Up, "{:?}", output.details);
+    }
+
+    #[tokio::test]
     async fn subsystems_on_one_url_share_one_connection() {
         let redis = FakeRedis::start(Duration::ZERO).await;
         let mut config = AutumnConfig::default();
@@ -580,7 +684,7 @@ mod tests {
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = Some(redis.url());
         let registry = HealthIndicatorRegistry::new();
-        register_redis_health_indicators(&config, &registry);
+        register_redis_health_indicators(&config, &registry, &[]);
 
         let results = registry.run_all().await;
 
