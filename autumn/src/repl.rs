@@ -506,6 +506,10 @@ fn repository_module(repository: &'static ReplRepository, bridge: &Shared<Bridge
     });
 
     let b = Shared::clone(bridge);
+    #[allow(
+        clippy::useless_conversion,
+        reason = "`rhai::INT` is `i32` when an app turns on rhai's `only_i32`"
+    )]
     module.set_native_fn("find_by_id", move |id: rhai::INT| {
         b.call((repository.find_by_id)(
             b.pool(),
