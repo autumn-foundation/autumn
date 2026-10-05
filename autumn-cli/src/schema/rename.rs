@@ -185,7 +185,10 @@ fn index_renames(
                     && i.unique == idx.unique
                     && i.definition.is_none()
             });
-            let taken = base.indexes.iter().any(|i| i.name == new_name);
+            // Index names are global in the schema, so check every table.
+            let taken = work
+                .iter()
+                .any(|t| t.indexes.iter().any(|i| i.name == new_name));
             if new_name != idx.name && declared && !taken {
                 let mut index = idx.clone();
                 index.name = new_name;
@@ -474,8 +477,8 @@ pub fn quoted_len(rest: &str, close: char) -> usize {
 /// - An unquoted match ignores case, as SQL does.
 /// - A quoted identifier (`"from"` or `[from]`) matches too.
 /// - String literals (`'...'`) do not change.
-/// - A function name (a word before `(`) or a cast type (a word after `::`)
-///   does not change.
+/// - A function name (a word before `(`), a typed-literal type (a word before
+///   `'`) or a cast type (a word after `::`) does not change.
 fn replace_word(sql: &str, from: &str, to: &str) -> String {
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
     let mut out = String::with_capacity(sql.len());
@@ -497,7 +500,10 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
             |close| quoted_len(rest, close),
         );
         let token = &rest[..len];
-        let is_call = rest[len..].trim_start().starts_with('(');
+        let next = rest[len..].trim_start();
+        // A word before `(` is a function; before `'` it is a typed literal
+        // (`DATE '2020-01-01'`).
+        let is_call = next.starts_with('(') || next.starts_with('\'');
         let is_cast = out.ends_with("::");
         let quoted_match = matches!(close, Some('"' | ']'))
             && token.len() > 1
@@ -1129,6 +1135,39 @@ mod tests {
     }
 
     #[test]
+    fn an_index_name_taken_on_another_table_is_not_reused() {
+        let users = with_unique_email(
+            table("users", Backend::Postgres, &[("email", ColumnType::Text)]),
+            "email",
+        );
+        // Another table already owns the target name.
+        let mut other = table("audit", Backend::Postgres, &[("x", ColumnType::Text)]);
+        other.indexes.push(Index::new(
+            "idx_users_mail_unique",
+            vec!["x".to_owned()],
+            true,
+        ));
+        let base = vec![users, other.clone()];
+        let want = desired(
+            vec![
+                with_unique_email(
+                    table("users", Backend::Postgres, &[("mail", ColumnType::Text)]),
+                    "mail",
+                ),
+                other,
+            ],
+            vec![col_hint("users", "mail", "email")],
+        );
+        let changes = rename_changes(&base, &want);
+        assert!(
+            !changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::RenameIndex { .. })),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
     fn renamed_baseline_rewrites_exclude_constraints() {
         let mut t = table("posts", Backend::Postgres, &[("span", ColumnType::Text)]);
         let mut ex = Index::new("posts_span_excl", vec!["span".to_owned()], true);
@@ -1168,6 +1207,10 @@ mod tests {
                 "published_on"
             ),
             "published_on >= date('2000-01-01') AND x::date IS NOT NULL"
+        );
+        assert_eq!(
+            replace_word("date >= DATE '2020-01-01'", "date", "published_on"),
+            "published_on >= DATE '2020-01-01'"
         );
         assert_eq!(
             replace_word("lower(TITLE)", "title", "headline"),
