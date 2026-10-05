@@ -562,8 +562,8 @@ Rules:
 - It sets the forwarded headers before the capsule and the origin get the
   request, so both lanes see the same values. It removes `forwarded`.
   - From a `--trusted-proxy` peer, it keeps `x-forwarded-host`, keeps an
-    `http` or `https` `x-forwarded-proto`, and appends the peer to
-    `x-forwarded-for`.
+    `x-forwarded-proto` of `http` and `https` tokens (for example
+    `https, http`), and appends the peer to `x-forwarded-for`.
   - From any other peer, it is the first proxy: `x-forwarded-for` is the
     peer, `x-forwarded-host` is the request `host`, and
     `x-forwarded-proto` is `http`.

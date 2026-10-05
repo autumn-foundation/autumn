@@ -983,3 +983,24 @@ fn a_trusted_proxy_is_an_address_or_a_cidr_range() {
         assert!(TrustedProxy::parse(bad).is_err(), "{bad}");
     }
 }
+
+#[tokio::test]
+async fn a_trusted_proxy_keeps_a_scheme_chain() {
+    let (edge, seen) = recording_node(&["127.0.0.1"]).await;
+
+    for proto in ["https, http", "HTTPS", "https, javascript"] {
+        client()
+            .get(format!("{edge}/x"))
+            .header("x-forwarded-proto", proto)
+            .send()
+            .await
+            .expect("node answers");
+    }
+
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let protos: Vec<_> = seen
+        .iter()
+        .map(|headers| header(headers, "x-forwarded-proto"))
+        .collect();
+    assert_eq!(protos, [Some("https, http"), Some("HTTPS"), Some("http")]);
+}

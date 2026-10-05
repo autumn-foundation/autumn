@@ -277,8 +277,9 @@ fn forwarded_headers(incoming: &HeaderMap) -> HeaderMap {
 
 /// Set the forwarded headers for a request from `peer`.
 ///
-/// From a trusted proxy, the node keeps `x-forwarded-host`, keeps an `http`
-/// or `https` `x-forwarded-proto`, and appends `peer` to `x-forwarded-for`.
+/// From a trusted proxy, the node keeps `x-forwarded-host`, keeps an
+/// `x-forwarded-proto` of `http`/`https` tokens (a chain is allowed), and
+/// appends `peer` to `x-forwarded-for`.
 /// From any other peer, the node is the first proxy: `x-forwarded-for` is
 /// `peer`, `x-forwarded-host` is `host`, `x-forwarded-proto` is `http`. It
 /// always removes `forwarded`.
@@ -296,7 +297,7 @@ fn set_forwarded_headers(headers: &mut HeaderMap, peer: Option<IpAddr>, trusted:
     };
     let proto = headers
         .get(X_FORWARDED_PROTO)
-        .filter(|value| trusted && matches!(value.as_bytes(), b"http" | b"https"))
+        .filter(|value| trusted && is_scheme_chain(value))
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("http"));
     let host = headers
@@ -320,6 +321,17 @@ fn set_forwarded_headers(headers: &mut HeaderMap, peer: Option<IpAddr>, trusted:
     {
         headers.insert(X_FORWARDED_FOR, value);
     }
+}
+
+/// True when each comma-separated token is `http` or `https` (any case),
+/// for example `https, http` from a proxy chain.
+fn is_scheme_chain(value: &HeaderValue) -> bool {
+    value.to_str().is_ok_and(|chain| {
+        chain.split(',').all(|token| {
+            let token = token.trim();
+            token.eq_ignore_ascii_case("http") || token.eq_ignore_ascii_case("https")
+        })
+    })
 }
 
 /// A peer whose forwarded headers the node keeps: an address or a CIDR range.
