@@ -524,3 +524,15 @@ fn conflicting_content_lengths_fall_through() {
         Lane::Fallthrough(FallthroughReason::CapsuleError)
     );
 }
+
+/// A framing or hop-by-hop header in the configuration would bypass the
+/// capsule checks, so the builder refuses it.
+#[test]
+#[should_panic(expected = "cannot set `content-length`")]
+fn response_headers_refuse_a_framing_header() {
+    let seen = Seen::default();
+    let _ = EdgeGateway::new(serving_guest(), origin(&seen)).with_response_headers([(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_static("0"),
+    )]);
+}

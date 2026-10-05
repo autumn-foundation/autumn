@@ -130,12 +130,25 @@ where
     /// Give the static headers the origin sends: `x-frame-options`,
     /// `x-content-type-options`, and `content-security-policy` when the CSP
     /// nonce is off. Then the client gets the same headers from both lanes.
+    ///
+    /// # Panics
+    ///
+    /// On `content-length`, `set-cookie`, the fallthrough sentinel, or a
+    /// hop-by-hop header. These would bypass the checks on the capsule's
+    /// response, so they are a configuration error.
     #[must_use]
     pub fn with_response_headers(
         mut self,
         headers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
     ) -> Self {
-        self.response_headers.extend(headers);
+        for (name, value) in headers {
+            assert!(
+                !is_unsafe_response_header(&name) && name != http::header::CONTENT_LENGTH,
+                "with_response_headers cannot set `{name}`: it changes framing, session or \
+                 hop state, which the gateway checks on the capsule's response"
+            );
+            self.response_headers.push((name, value));
+        }
         self
     }
 
@@ -260,6 +273,14 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// `set-cookie`, the fallthrough sentinel, or a hop-by-hop header: never on an
+/// edge response.
+fn is_unsafe_response_header(name: &HeaderName) -> bool {
+    *name == http::header::SET_COOKIE
+        || name.as_str() == FALLTHROUGH_SENTINEL
+        || HOP_BY_HOP.contains(&name.as_str())
+}
+
 /// Statuses that have no body in HTTP.
 const NO_BODY_STATUSES: &[u16] = &[204, 205, 304];
 
@@ -282,10 +303,7 @@ fn into_http(response: EdgeResponse, head: bool) -> Option<Response<Body>> {
     *http.status_mut() = StatusCode::from_u16(response.status).ok()?;
     for (name, value) in response.headers {
         let name = HeaderName::from_bytes(name.as_bytes()).ok()?;
-        if name == http::header::SET_COOKIE
-            || name.as_str() == FALLTHROUGH_SENTINEL
-            || HOP_BY_HOP.contains(&name.as_str())
-        {
+        if is_unsafe_response_header(&name) {
             return None;
         }
         if name == http::header::CONTENT_LENGTH {
