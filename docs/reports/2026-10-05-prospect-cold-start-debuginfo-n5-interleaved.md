@@ -32,9 +32,11 @@ B,D,B,D,… (5 each) by `run.sh` (below). Repo tree untouched; apparatus not com
 pins its own toolchain (`1.88.0` per `new.rs`); the `Cargo.toml.tmpl` edit only (the API
 template is not covered).
 **Deviation from the registered conditions:** the plan said "warmed CARGO_HOME", but the
-registry cache was cold. Sample base-1 (the first run) therefore paid one-time warm-up
-(downloads, possibly toolchain install). It is reported in the primary numbers; the
-excluded-r1 figure is a disclosed secondary, not the verdict.
+registry cache was cold, so baseline sample 1 (136307 ms) paid one-time warm-up and is **not a
+registered-condition sample**. Per Codex review on PR #3139 it is excluded from the primary
+numbers and replaced by a baseline sample 6 taken afterwards on the warmed cache. Sample 6 was
+run after the interleaved block, not inside it (an ordering confound, disclosed). Sample 1 is
+still listed below as a run that happened.
 
 ## 📊 Assay
 
@@ -42,18 +44,23 @@ Harness-reported cold-start ms, every run:
 
 | i | baseline | debug=1 |
 |---|---|---|
-| 1 | 136307 (warm-up) | 101268 |
+| 1 | 136307 (cold cache; excluded, not a registered sample) | 101268 |
 | 2 | 114976 | 99724 |
 | 3 | 112291 | 99118 |
 | 4 | 112954 | 101272 |
 | 5 | 116371 | 100317 |
+| 6 | 155322 (replacement, run after the block) | — |
 
-- Baseline median 114976 (range 112291–136307); debug=1 median 100317 (range 99118–101272).
-- **Median reduction: 12.75%.** Excluding warm-up sample base-1: 11.98%.
-- Non-overlap holds (max debug=1 101272 < min baseline 112291). debug=1 spread is ~2%,
-  baseline ~21% with warm-up (~4% without).
-- Gate budget (p95 130000ms): baseline 1/5 exceeded it (the warm-up sample), debug=1 0/5;
-  debug=1's max is 78% of budget. Secondary, not verdict-bearing.
+Registered set: baseline = samples 2–6, debug=1 = samples 1–5.
+- Baseline median 114976 (range 112291–155322); debug=1 median 100317 (range 99118–101272).
+- **Median reduction: 12.75%.** (Including cold-cache sample 1 as well: also 12.75%; the
+  median is robust to both choices.)
+- Non-overlap holds (max debug=1 101272 < min baseline 112291).
+- Spread: debug=1 ~2%; baseline 112–155s. Sample 6 is a 155s outlier, so baseline variance
+  is larger than the 4% of samples 2–5 alone suggested.
+- Gate budget (p95 130000ms): baseline 1/5 registered samples exceeded it (sample 6, 155322ms,
+  warm cache); debug=1 0/5, max 77.9% of budget. Secondary, not verdict-bearing. Two of the
+  seven baseline runs overall (1 and 6) exceeded the budget on this box.
 - Worst case: each sample is already a from-scratch build.
 
 ## 🏁 Verdict
@@ -83,7 +90,8 @@ S=$(mktemp -d); git archive f830162 | (mkdir $S/ws && tar -x -C $S/ws)
 cd $S/ws && CARGO_TARGET_DIR=$S/tgt cargo build -p autumn-cli --release && cp $S/tgt/release/autumn $S/autumn-base
 printf '\n[profile.dev]\ndebug = 1\n' >> autumn-cli/src/templates/Cargo.toml.tmpl
 CARGO_TARGET_DIR=$S/tgt cargo build -p autumn-cli --release && cp $S/tgt/release/autumn $S/autumn-d1
-# warm CARGO_HOME first (one throwaway run), then, from $S/ws:
+# warm CARGO_HOME first (one throwaway run), then, from $S/ws (run baseline once more
+# afterwards if you want a 5th warmed sample like this report):
 for i in 1 2 3 4 5; do for c in base d1; do
   $S/autumn-$c dev-loop-bench --cold-start --runs 1 --output $S/out-$c-$i.json; done; done
 # read results[0].stats.p50_ms from each JSON
