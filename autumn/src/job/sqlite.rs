@@ -53,7 +53,10 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 
-use super::{DEFAULT_JOB_ADMIN_HISTORY_LIMIT, JobExecutionOutcome, QueueLimits};
+use super::{
+    DEFAULT_JOB_ADMIN_HISTORY_LIMIT, ExecutionBounds, JobExecutionOutcome, LeaseHeartbeat,
+    LeaseRenewal, QueueLimits, lease_heartbeat_interval, record_lease_lost,
+};
 use super::{
     EnqueueOutcome, JobAdminBackend, JobAdminBackendEntry, JobAdminFuture, JobAdminMemoryBackend,
     JobAdminPage, JobAdminQuery, JobAdminRecord, JobAdminSnapshot, JobAdminStartDecision,
@@ -1126,7 +1129,53 @@ async fn queue_depth_survey_loop(
     }
 }
 
+/// Move a running job's claim expiry forward, if this worker still holds it.
+async fn renew_claim(pool: &SqlitePool, now: i64, job_id: &str, worker_id: &str) -> LeaseRenewal {
+    use diesel_async::RunQueryDsl as _;
+
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(error) => return LeaseRenewal::Failed(format!("sqlite jobs pool error: {error}")),
+    };
+    match diesel::sql_query(format!(
+        "UPDATE autumn_jobs SET claimed_at = ? \
+         WHERE id = ? AND claimed_by = ? AND status = '{STATUS_RUNNING}'"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(now)
+    .bind::<diesel::sql_types::Text, _>(job_id)
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(&mut *conn)
+    .await
+    {
+        Ok(0) => LeaseRenewal::Lost,
+        Ok(_) => LeaseRenewal::Renewed,
+        Err(error) => LeaseRenewal::Failed(format!("sqlite claim renewal failed: {error}")),
+    }
+}
+
+/// Start renewing `row`'s claim for `worker_id`.
+fn lease_heartbeat(
+    pool: &SqlitePool,
+    row: &SqliteJobRow,
+    worker_id: &str,
+    state: &AppState,
+    visibility_timeout_ms: u64,
+) -> LeaseHeartbeat {
+    let pool = pool.clone();
+    let job_id = row.id.clone();
+    let worker_id = worker_id.to_owned();
+    let clock = state.clock_arc();
+    LeaseHeartbeat::spawn(lease_heartbeat_interval(visibility_timeout_ms), move || {
+        let pool = pool.clone();
+        let job_id = job_id.clone();
+        let worker_id = worker_id.clone();
+        let now = clock.now().timestamp_millis();
+        async move { renew_claim(&pool, now, &job_id, &worker_id).await }
+    })
+}
+
 /// Run one claimed job and settle its row.
+#[allow(clippy::too_many_arguments)]
 async fn execute_job(
     row: SqliteJobRow,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
@@ -1134,6 +1183,7 @@ async fn execute_job(
     worker_id: &str,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
+    visibility_timeout_ms: u64,
 ) {
     let attempt = u32::try_from(row.attempt).unwrap_or(0);
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
@@ -1169,13 +1219,13 @@ async fn execute_job(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&row.name)
-        .map(|info| (info.handler, info.uniqueness.clone()));
+        .map(|info| (info.handler, info.uniqueness.clone(), info.timeout));
     let pending_unique_key = job_info_snapshot
         .as_ref()
-        .and_then(|(_, uniqueness)| uniqueness.as_ref())
+        .and_then(|(_, uniqueness, _)| uniqueness.as_ref())
         .filter(|unique| unique.window == JobUniquenessWindow::Pending)
         .map(|unique| job_unique_key(unique, &payload));
-    let Some((handler, _)) = job_info_snapshot else {
+    let Some((handler, _, timeout)) = job_info_snapshot else {
         // No handler exists on this process, so requeueing would make every
         // worker claim and discard the row until its attempts ran out.
         let error = format!("unknown job '{}'", row.name);
@@ -1205,11 +1255,24 @@ async fn execute_job(
         row.tracestate.as_deref(),
     );
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
+    let heartbeat = lease_heartbeat(pool, &row, worker_id, state, visibility_timeout_ms);
+    let bounds = ExecutionBounds {
+        timeout,
+        lease_lost: Some(heartbeat.lost_token()),
+    };
     let outcome = tracing::Instrument::instrument(
-        run_job_handler(&row.name, handler, state.clone(), payload, final_attempt),
+        run_job_handler(
+            &row.name,
+            handler,
+            state.clone(),
+            payload,
+            final_attempt,
+            bounds,
+        ),
         job_span,
     )
     .await;
+    heartbeat.stop().await;
     settle_outcome(
         outcome,
         &row,
@@ -1237,6 +1300,7 @@ async fn settle_outcome(
 ) {
     let attempt = u32::try_from(row.attempt).unwrap_or(0);
     match outcome {
+        JobExecutionOutcome::LeaseLost => record_lease_lost(&row.name, &row.id, state, job_admin),
         JobExecutionOutcome::Succeeded => {
             let ack = ack_success(pool, now_ms(state), &row.id, worker_id).await;
             record_pg_lifecycle_ack_result(
@@ -1311,6 +1375,7 @@ async fn worker_loop(
     schedule: QueueSchedule,
     slots: Arc<QueueSlots>,
     poll_interval: std::time::Duration,
+    visibility_timeout_ms: u64,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut cursor = schedule.cursor();
@@ -1335,7 +1400,16 @@ async fn worker_loop(
             };
             match claim_next_job(&pool, &worker_id, &queue, now_ms(&state)).await {
                 Some(row) => {
-                    execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
+                    execute_job(
+                        row,
+                        &jobs_by_name,
+                        &pool,
+                        &worker_id,
+                        &state,
+                        &job_admin,
+                        visibility_timeout_ms,
+                    )
+                    .await;
                     drop(guard);
                     handled = true;
                     break;
@@ -1580,6 +1654,7 @@ pub(super) fn start_runtime(
                 schedule,
                 slots,
                 poll_interval,
+                visibility_timeout_ms,
                 shutdown,
             )
             .await;

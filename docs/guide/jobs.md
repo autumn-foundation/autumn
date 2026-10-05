@@ -123,6 +123,7 @@ backend = "local"   # local | postgres | redis | sqlite
 workers = 2
 max_attempts = 5
 initial_backoff_ms = 250
+default_timeout_ms = 0   # default: 0 (no limit)
 
 [jobs.postgres]
 # Reuses the configured [database] pool. No extra URL needed.
@@ -299,18 +300,20 @@ the `autumn_jobs` table. Workers claim a row atomically with
 two replicas from claiming the same job simultaneously.
 
 A claimed job's status is set to `running` with a `claimed_at` timestamp and a
-`claimed_by` worker id. A maintenance loop running inside each worker process
-requeues jobs whose `claimed_at` is older than `jobs.postgres.visibility_timeout_ms`.
-Recovered stale claims consume another attempt and record a `last_error`
-explaining the visibility timeout.
+`claimed_by` worker id. While the job runs, the worker renews `claimed_at` (see
+[Claim leases and timeouts](#claim-leases-and-timeouts)). A maintenance loop
+running inside each worker process requeues jobs whose `claimed_at` is older
+than `jobs.postgres.visibility_timeout_ms`. That happens only when the worker
+stopped renewing, for example after a crash. Recovered stale claims consume
+another attempt and record a `last_error` explaining the visibility timeout.
 
 If a job exhausts `max_attempts`, its status is set to `failed`; it is no longer
 retried.
 
 Because the backend provides at-least-once delivery, handlers must be idempotent.
-A slow worker that outlives the visibility timeout can overlap with a recovered
-retry, so external side effects should use natural idempotency keys such as the
-job id, a domain aggregate id, or a provider idempotency token.
+A crash after a side effect and before the ack runs the job again, so external
+side effects should use natural idempotency keys such as the job id, a domain
+aggregate id, or a provider idempotency token.
 
 ## Redis delivery semantics
 
@@ -319,15 +322,18 @@ durable record, queued by id, atomically claimed into an in-flight set, and
 acked only after the handler returns `Ok(())`.
 
 If a worker crashes after claiming a job, the record remains in Redis. Another
-worker requeues the stale claim after `jobs.redis.visibility_timeout_ms`.
+worker requeues the stale claim after `jobs.redis.visibility_timeout_ms`. A
+live worker renews its claim, so this does not happen to a slow job. Claim
+deadlines use the Redis server clock (`TIME`), not the worker clock, so a
+worker with a skewed clock does not see a live claim as expired.
 Recovered stale claims consume another attempt and retain a `last_error`
 explaining the visibility timeout. If the job has exhausted `max_attempts`, it
 is moved to the dead-letter list instead of being requeued.
 
-Because Redis uses at-least-once delivery, handlers must be idempotent. A worker
-that is slow beyond the visibility timeout can overlap with a recovered retry,
-so external side effects should use natural idempotency keys such as the job id,
-domain aggregate id, or provider idempotency token.
+Because Redis uses at-least-once delivery, handlers must be idempotent. A crash
+after a side effect and before the ack runs the job again, so external side
+effects should use natural idempotency keys such as the job id, domain aggregate
+id, or provider idempotency token.
 
 ## SQLite delivery semantics
 
@@ -341,7 +347,8 @@ the single-host analog of `FOR UPDATE SKIP LOCKED`. Two workers can never claim
 one row.
 
 A claimed row is `running` with a `claimed_at` timestamp and a `claimed_by`
-worker id. A maintenance loop re-enqueues rows whose `claimed_at` is older than
+worker id. The worker renews `claimed_at` while the job runs. A maintenance loop
+re-enqueues rows whose `claimed_at` is older than
 `jobs.sqlite.visibility_timeout_ms`, at start and on an interval, so a crash
 mid-job loses nothing. A recovered claim consumes another attempt and records a
 `last_error`. A job that exhausts `max_attempts` becomes `failed` and is not
@@ -361,6 +368,61 @@ migrations are Postgres SQL. Nothing to run by hand.
 
 Because delivery is at-least-once, handlers must be idempotent — the same rule
 as every other durable backend.
+
+## Claim leases and timeouts
+
+A durable worker (`postgres`, `redis`, `sqlite`) holds a lease on each job it
+runs. A heartbeat renews the lease every third of the visibility timeout. So a
+job that runs longer than the visibility timeout runs once, not again on a
+second worker.
+
+- **Crash.** The heartbeat stops with the process. After the visibility
+  timeout, another worker recovers the job and runs it again.
+- **Lost lease.** If a renewal finds that the worker no longer holds the claim,
+  the worker stops the handler and does not settle the job. The worker that
+  holds the claim now owns it. A failed renewal (for example, a database error)
+  is logged and tried again; it does not stop the handler.
+
+Set a timeout to stop a handler that hangs:
+
+```rust
+#[job(timeout = "30s", max_attempts = 3)]
+async fn export_report(state: AppState, args: ExportArgs) -> AutumnResult<()> {
+    // ...
+    Ok(())
+}
+```
+
+`timeout` accepts `ms`, `s`, `m`, and `h` units, for example `"500ms"` or
+`"1m30s"`. A job with no `timeout` uses `jobs.default_timeout_ms`. `0`, the
+default, means no limit. A run that exceeds its timeout fails with
+`job timed out after <n>ms` and retries like any other failure. The worker is
+free for the next job at once. The timeout applies on every backend, `local`
+too.
+
+When the worker stops a run (lost lease or timeout), it drops the handler
+future. Work that the handler spawned continues, so check the signal there:
+
+```rust
+#[job(timeout = "10m")]
+async fn crunch(state: AppState, args: CrunchArgs) -> AutumnResult<()> {
+    let ctx = autumn_web::job::JobContext::current();
+    let _ = tokio::task::spawn_blocking(move || {
+        for chunk in args.chunks() {
+            if ctx.is_cancelled() {
+                return; // lease lost or timeout: stop here
+            }
+            process(chunk);
+        }
+    })
+    .await;
+    Ok(())
+}
+```
+
+- `JobContext::lease_lost()` is `true` after the worker lost its claim.
+- `JobContext::is_cancelled()` is `true` after a lost lease or a timeout.
+- `JobContext::cancelled()` waits for either.
 
 ## Retry/backoff and dead letters
 

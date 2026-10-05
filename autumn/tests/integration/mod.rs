@@ -173,6 +173,7 @@ mod ingress_named_futures;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
+mod job_lease_heartbeat;
 mod job_recorder_integration;
 mod job_tenant_scope;
 mod job_tracking_route;

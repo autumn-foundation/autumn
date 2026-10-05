@@ -275,6 +275,7 @@ async fn job_interceptor_intercepts_enqueue_and_execute() {
         uniqueness: None,
         concurrency: None,
         handler: test_job_handler,
+        timeout: None,
     };
 
     job::start_runtime(vec![job_info], &state, &shutdown, &config, true).unwrap();

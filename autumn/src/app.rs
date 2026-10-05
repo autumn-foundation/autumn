@@ -17977,6 +17977,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: startup_noop_job_handler,
+                timeout: None,
             }])
             .on_startup(|_state| async {
                 crate::job::enqueue("startup-seed", serde_json::json!({ "kind": "warmup" })).await
@@ -18039,6 +18040,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: startup_noop_job_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,

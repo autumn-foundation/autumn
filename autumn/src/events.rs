@@ -154,6 +154,7 @@ impl EventRegistry {
                 concurrency: None,
                 version: 1,
                 handler: listener.handler,
+                timeout: None,
             })
             .collect()
     }

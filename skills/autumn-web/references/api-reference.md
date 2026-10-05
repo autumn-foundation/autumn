@@ -1134,6 +1134,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
+- Unreleased (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
+  durable claims renew on a heartbeat; `JobContext::lease_lost()`,
+  `is_cancelled()`, `cancelled()`.
 
 ## Distributed locks (0.6.0)
 
@@ -1702,6 +1705,7 @@ Frequently used env keys:
 | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.6.0) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` (`local` / `postgres` / `redis` / `sqlite`) |
 | `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` |
+| `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` (`0` = no limit) |
 | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` (`in_process` / `postgres` / `sqlite`) |

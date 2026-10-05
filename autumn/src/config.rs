@@ -124,6 +124,7 @@
 //! | `AUTUMN_JOBS__PIN` | `jobs.pin` | comma-separated queue names |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
@@ -3485,6 +3486,11 @@ pub struct JobConfig {
     /// Default initial retry backoff in milliseconds.
     #[serde(default = "default_job_backoff_ms")]
     pub initial_backoff_ms: u64,
+    /// Default longest time in milliseconds one job run may take, when
+    /// `#[job(timeout = "...")]` is not set (issue #3051). A run that takes
+    /// longer fails and retries. `0` (the default) means no limit.
+    #[serde(default)]
+    pub default_timeout_ms: u64,
     /// Ordered/weighted list of queues workers drain, highest priority first.
     ///
     /// Unset = a single `default` queue (today's behavior). A TOML array such as
@@ -3529,6 +3535,7 @@ impl Default for JobConfig {
             workers: default_job_workers(),
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
+            default_timeout_ms: 0,
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
             fleet: JobFleetConfig::default(),
@@ -5182,6 +5189,7 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__PIN` → `jobs.pin` (comma-separated queue names)
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` → `jobs.default_timeout_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
@@ -6119,6 +6127,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__INITIAL_BACKOFF_MS",
             &mut self.jobs.initial_backoff_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__DEFAULT_TIMEOUT_MS",
+            &mut self.jobs.default_timeout_ms,
         );
         parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
         parse_env_string(
@@ -14546,6 +14559,21 @@ path = "/healthz"
         );
         assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
+    }
+
+    /// `jobs.default_timeout_ms` defaults to `0` (no limit) and reads from
+    /// TOML and the environment (issue #3051).
+    #[test]
+    fn jobs_default_timeout_ms_defaults_to_zero_and_overrides() {
+        assert_eq!(AutumnConfig::default().jobs.default_timeout_ms, 0);
+
+        let config: AutumnConfig = toml::from_str("[jobs]\ndefault_timeout_ms = 30000\n").unwrap();
+        assert_eq!(config.jobs.default_timeout_ms, 30_000);
+
+        let env = MockEnv::new().with("AUTUMN_JOBS__DEFAULT_TIMEOUT_MS", "1500");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.jobs.default_timeout_ms, 1_500);
     }
 
     // ── [retention] unified framework-owned data retention (issue #1605) ──

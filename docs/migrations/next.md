@@ -109,6 +109,47 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Jobs: `JobInfo` has a new `timeout` field
+
+**Why:** A job can now set the longest time one run may take (issue #3051).
+`JobInfo` carries it as `timeout: Option<Duration>`.
+
+**Before (`0.8`):**
+
+```rust
+let info = JobInfo {
+    name: "export".to_string(),
+    max_attempts: 3,
+    initial_backoff_ms: 250,
+    queue: "default".to_string(),
+    uniqueness: None,
+    concurrency: None,
+    version: 1,
+    handler: export_handler,
+};
+```
+
+**After (`0.9`):**
+
+```rust
+let info = JobInfo {
+    name: "export".to_string(),
+    max_attempts: 3,
+    initial_backoff_ms: 250,
+    queue: "default".to_string(),
+    uniqueness: None,
+    concurrency: None,
+    version: 1,
+    timeout: None, // or Some(Duration::from_secs(30))
+    handler: export_handler,
+};
+```
+
+Code that uses `#[job]` or `JobInfo::new` does not change.
+
+**Automation:** `manual` — it adds a field to a struct literal that a user
+wrote by hand. `#[job]` and `JobInfo::new` fill it already.
+
 ---
 
 ## Plugin authors

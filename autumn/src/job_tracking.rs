@@ -226,27 +226,96 @@ struct JobContextInner {
     user_error: Mutex<Option<String>>,
 }
 
+/// Signals that one run of a job shares with its worker (issue #3051).
+#[derive(Clone, Default)]
+pub(crate) struct RunSignals {
+    lease_lost: Arc<std::sync::atomic::AtomicBool>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl RunSignals {
+    /// Record that the worker lost its claim, and stop the run.
+    pub(crate) fn mark_lease_lost(&self) {
+        self.lease_lost.store(true, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+
+    /// Stop the run (lease lost or timeout).
+    pub(crate) fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
 /// Ambient handle a `#[job]` handler uses to report progress and to record a
 /// terminal result or a user-safe error for a tracked job.
 ///
 /// [`JobContext::current`] always returns a value. For a job enqueued via
-/// plain [`crate::job::enqueue`] (not tracked), it is a no-op: every method is
-/// a harmless no-op and [`is_tracked`](Self::is_tracked) reports `false`.
+/// plain [`crate::job::enqueue`] (not tracked), the tracking methods are
+/// no-ops and [`is_tracked`](Self::is_tracked) reports `false`.
+///
+/// The run methods ([`lease_lost`](Self::lease_lost),
+/// [`is_cancelled`](Self::is_cancelled), [`cancelled`](Self::cancelled)) work
+/// for every job. Use them in work that the handler spawns: the worker drops
+/// the handler future when it stops a run, but spawned tasks continue.
 #[derive(Clone)]
-pub struct JobContext(Option<Arc<JobContextInner>>);
+pub struct JobContext {
+    tracked: Option<Arc<JobContextInner>>,
+    run: Option<RunSignals>,
+}
 
 impl JobContext {
     pub(crate) fn tracked(key: String, store: Arc<dyn JobTrackingStore>) -> Self {
-        Self(Some(Arc::new(JobContextInner {
-            key,
-            store,
-            result: Mutex::new(None),
-            user_error: Mutex::new(None),
-        })))
+        Self {
+            tracked: Some(Arc::new(JobContextInner {
+                key,
+                store,
+                result: Mutex::new(None),
+                user_error: Mutex::new(None),
+            })),
+            run: None,
+        }
     }
 
     pub(crate) const fn none() -> Self {
-        Self(None)
+        Self {
+            tracked: None,
+            run: None,
+        }
+    }
+
+    /// Attach the signals of the current run.
+    pub(crate) fn with_run(mut self, run: RunSignals) -> Self {
+        self.run = Some(run);
+        self
+    }
+
+    /// Whether the worker lost its claim on this job.
+    ///
+    /// When `true`, another worker can run the job. Stop work and do not
+    /// commit side effects.
+    #[must_use]
+    pub fn lease_lost(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|run| run.lease_lost.load(Ordering::SeqCst))
+    }
+
+    /// Whether the worker stopped this run: the lease is lost or the
+    /// timeout expired.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.run
+            .as_ref()
+            .is_some_and(|run| run.cancel.is_cancelled())
+    }
+
+    /// Wait until the worker stops this run: the lease is lost or the
+    /// timeout expired. Outside a job run, this never completes.
+    pub async fn cancelled(&self) {
+        match &self.run {
+            Some(run) => run.cancel.cancelled().await,
+            None => std::future::pending().await,
+        }
     }
 
     /// The ambient context for the currently-executing job, or a no-op
@@ -261,7 +330,7 @@ impl JobContext {
     /// Whether this context is bound to a tracked job's status record.
     #[must_use]
     pub const fn is_tracked(&self) -> bool {
-        self.0.is_some()
+        self.tracked.is_some()
     }
 
     /// Report progress. `pct` is clamped to `0..=100`. A no-op for an
@@ -271,7 +340,7 @@ impl JobContext {
     ///
     /// Returns an error if the underlying store write fails.
     pub async fn set_progress(&self, pct: u8, message: Option<&str>) -> AutumnResult<()> {
-        let Some(inner) = &self.0 else {
+        let Some(inner) = &self.tracked else {
             return Ok(());
         };
         inner
@@ -288,7 +357,7 @@ impl JobContext {
     /// Panics if the internal result mutex is poisoned (only possible if a
     /// previous holder panicked while holding it).
     pub fn set_result(&self, result: Value) {
-        if let Some(inner) = &self.0 {
+        if let Some(inner) = &self.tracked {
             *inner
                 .result
                 .lock()
@@ -305,7 +374,7 @@ impl JobContext {
     /// Panics if the internal error mutex is poisoned (only possible if a
     /// previous holder panicked while holding it).
     pub fn set_user_error(&self, message: impl Into<String>) {
-        if let Some(inner) = &self.0 {
+        if let Some(inner) = &self.tracked {
             *inner
                 .user_error
                 .lock()
@@ -315,7 +384,7 @@ impl JobContext {
 
     /// Persist the terminal success result. A no-op for an untracked context.
     pub(crate) async fn settle_success(&self) {
-        let Some(inner) = &self.0 else {
+        let Some(inner) = &self.tracked else {
             return;
         };
         let result = inner
@@ -331,7 +400,7 @@ impl JobContext {
     /// never called [`Self::set_user_error`]. A no-op for an untracked
     /// context.
     pub(crate) async fn settle_failure(&self, default_message: &str) {
-        let Some(inner) = &self.0 else {
+        let Some(inner) = &self.tracked else {
             return;
         };
         let message = inner
