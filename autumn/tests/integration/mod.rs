@@ -366,6 +366,8 @@ mod rich_text;
 mod route_macro;
 mod routes_macro;
 mod scheduled_coordination;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod scheduled_coordination_pg;
 mod schema_drift_guard;
 mod scoped_tokens;
 #[cfg(feature = "db")]

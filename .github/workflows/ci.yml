@@ -1557,7 +1557,6 @@ jobs:
           # the whole set on is its own change. #1186 added
           # `redis_admin_enqueued_page_merges_concurrency_parked_jobs` here,
           # which asserts the enqueued tab lists concurrency-parked jobs.
-          #
           # Same feature set as the `integration_tests` sweep below so both
           # share one autumn-web build. The pass-count check is there because
           # `cargo test` exits 0 when a filter matches nothing: without it a
@@ -1580,6 +1579,17 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-job-admin.log" \
             || { echo "::error::no redis job-admin dashboard tests ran — the ci.yml filters no longer match"; exit 1; }
+          # The Redis dead-letter limit suite (#3055) is `--lib` for the same
+          # reason. It has its own pass count, so an empty filter fails here.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::redis_dead_letter_limit_ \
+              | tee "${RUNNER_TEMP}/redis-dead-letter-limit.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-dead-letter-limit.log" \
+            || { echo "::error::no redis dead-letter limit tests ran — the ci.yml filter no longer matches"; exit 1; }
           # The Postgres relative-delay clock-skew regression (#2111 follow-up)
           # also lives in the `--lib` module (it drives crate-private types:
           # PgDueAt, pg_enqueue_job_at, pg_enqueue_on_conn_at), so it needs its
@@ -2397,13 +2407,15 @@ jobs:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
 
-  # Edge capsule conformance (issue #1790). The proof behind AC-2: the
+  # Edge capsule conformance (issue #1790). The proof behind AC-1 to AC-3: the
   # `edge-greeting` fixture is compiled BOTH ways — natively and to a real
   # `wasm32-wasip1` artifact — and a shared request corpus is driven through
   # the native edge lane, the wasm capsule (via the pure-Rust `wasmi` host in
   # `autumn-edge`, so there is no runtime to install), and the full origin app.
   # Status, headers and body bytes are compared; every fallthrough is checked
-  # against the answer the origin actually gives.
+  # against the answer the origin actually gives. A gateway tier puts the
+  # capsule in front of the origin, and a generated tier sends 10,000
+  # requests through every lane. A last step runs the real `autumn build`.
   #
   # Its own job because it is the only lane that installs a second target, and
   # NOT path-filtered on purpose: byte-identity between the origin and the edge
@@ -2449,6 +2461,15 @@ jobs:
         # `--test-threads=1`: the suite installs a process-global panic hook
         # around the deliberately-panicking `/boom` handler.
         run: cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
+      - name: autumn build emits the capsule
+        # AC-1: one `autumn build` makes the capsule. `--debug` makes the
+        # native build fast. The capsule is always a release build. The app
+        # has no static routes. Thus this step also proves that an edge-only
+        # app builds without an error.
+        working-directory: examples/edge-greeting
+        run: |
+          cargo run -q -p autumn-cli --bin autumn -- build --debug --edge
+          test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
 
   windows-tier1:
     name: Windows Tier 1 journey

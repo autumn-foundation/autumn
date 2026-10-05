@@ -217,7 +217,7 @@ treat cross-shard aggregates as approximate.
 ## The control database
 
 Framework state is **never sharded**. The `autumn_jobs` queue, Postgres
-scheduler advisory locks, sessions, feature flags, and idempotency keys
+scheduler tick table, sessions, feature flags, and idempotency keys
 all live on the control topology (`database.primary_url`/`url`), and the
 plain `Db` extractor still points there. Startup fails fast if you
 configure shards plus a Postgres-backed jobs/scheduler backend without a

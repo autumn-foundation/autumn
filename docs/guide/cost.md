@@ -229,11 +229,11 @@ While the signal is high:
   attempt. The runtime checks the signal again every `defer_recheck_secs`.
   When the signal falls, the job goes back on the queue. The runtime never
   drops it. An operator can cancel it while it waits.
-- A deferrable task takes its tick lease, then waits. Only the replica that
-  holds the tick waits, so the tick runs one time. When the signal falls, the
-  tick runs. Later ticks on that replica fold into that one run. With the
-  `sqlite` scheduler the tick waits first and then takes the lease, because a
-  SQLite lease expires after `lease_ttl_secs`.
+- A deferrable task waits, then runs its tick when the signal falls. Later
+  ticks on that replica fold into that one run.
+  - On the `postgres` and `sqlite` schedulers the tick claim expires, so the
+    tick waits first. Then it takes the claim and checks the signal again.
+  - On the in-process scheduler the tick takes its lease, then waits.
 - Request handlers and work that is not deferrable run as usual.
 
 `signal.deferrals` in `/actuator/cost` counts each job or tick that started to
@@ -249,12 +249,10 @@ For a `JobInfo` or `TaskInfo` that you make by hand, call
   when `defer_threshold` is set. Scheduled tasks defer on every backend.
 - On the `local` backend, a deferred job is in memory. A restart loses it, as
   it loses any other queued local job.
-- A task that waits holds its tick lease. On the `postgres` scheduler, this
-  keeps one pooled connection for each task that waits.
-- On the `sqlite` scheduler, replicas can resume at different times, up to
-  `defer_recheck_secs` plus `signal_refresh_secs` apart. Set `lease_ttl_secs`
-  longer than that plus the task run time. Then a replica that resumes late
-  finds the tick taken.
+- On the `postgres` and `sqlite` schedulers, replicas can resume at
+  different times, up to `defer_recheck_secs` plus `signal_refresh_secs`
+  apart. Set `lease_ttl_secs` longer than that plus the task run time. Then a
+  replica that resumes late finds the tick taken.
 - With more than one replica, each replica can hold one waiting tick of a
   task. So after the window, the task can run one time on each replica.
 - With metering on, the DB lane installs the query timer on each checked-out

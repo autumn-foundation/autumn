@@ -1622,6 +1622,24 @@ Endpoint builders:
   full `200` feed. See `docs/guide/conditional-get.md`. The `blog` example
   wires a `/feed.xml` route this way.
 
+## Edge capsules (`autumn_edge`, trunk-dev, #1790)
+
+An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
+(`autumn build`). See `docs/guide/edge.md`.
+
+| Item | Purpose |
+| --- | --- |
+| `gateway::EdgeGateway::new(artifact, origin)` (feature `host`) | Reference host: runs the capsule in front of any origin `tower::Service`. A decline forwards the original request; the origin's response returns unchanged |
+| `.with_kv(kv)` / `.with_response_headers(headers)` | Provide the `kv` capability; set the origin's static security headers (and a static CSP) on edge responses |
+| `gateway::Lane` | In the response extensions: `Edge`, `Fallthrough(reason)`, `OriginOnly` |
+| `conformance::compare_capsule(origin, capsule)` | Raw capsule vs origin; excuses `VOLATILE_HEADERS` and `SECURITY_HEADERS` only |
+| `conformance::compare(origin, served)` | What the client gets vs origin; excuses `VOLATILE_HEADERS` only |
+
+The gateway refuses an edge response with `set-cookie`, a hop-by-hop header,
+a wrong `content-length`, a body on 204/205/304, or a status outside 200-599
+(`capsule_error` fallthrough). An app with only edge routes and no static routes builds
+without an error.
+
 ## Cache-Control freshness (`etag::cache_for` / `CacheControl`)
 
 Declarative per-handler `Cache-Control` header (0.6.0, issue #1344).
@@ -1704,6 +1722,7 @@ Frequently used env keys:
 | `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` |
 | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
+| `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` (default 10 000; `0` = unbounded) |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` (`in_process` / `postgres` / `sqlite`) |
 | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` |
 | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` |

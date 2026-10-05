@@ -3373,8 +3373,11 @@ version = "0.1.0"
 dependencies = [
  "autumn-edge",
  "autumn-web",
+ "axum",
+ "http 1.5.0",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

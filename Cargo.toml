@@ -22,6 +22,22 @@ incremental = false
 [profile.test.build-override]
 debug = 0
 
+# The edge conformance suite runs about 20k capsule requests through the wasmi
+# interpreter. Unoptimized, that takes minutes. Optimize only the interpreter.
+# `[profile.test]` inherits these. They also apply to `plugin-sandbox`, which
+# uses wasmi too. The first build of wasmi takes longer.
+[profile.dev.package.wasmi]
+opt-level = 3
+
+[profile.dev.package.wasmi_core]
+opt-level = 3
+
+[profile.dev.package.wasmi_ir]
+opt-level = 3
+
+[profile.dev.package.wasmi_collections]
+opt-level = 3
+
 [patch.crates-io]
 autumn-web = { path = "autumn" }
 

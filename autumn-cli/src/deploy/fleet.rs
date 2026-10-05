@@ -1250,6 +1250,16 @@ pub(crate) const DRIFT_PROXY_OPTIONS_UNREADABLE: &str =
 pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
     "the installed proxy unit binds a different public port than `[server] port` configures";
 
+/// State drift: a deployed host has a kamal-proxy unit, but its `--http-port` is
+/// missing, malformed, or ambiguous (issue #2278).
+///
+/// The redeploy path cannot prove the port, so it refuses this host. Only a
+/// `HostMode::Redeploy` host gets this reason. The first-deploy path does not
+/// read the port. `InstalledProxyPort::Absent` is the correct state before the
+/// first deploy.
+pub(crate) const DRIFT_PROXY_PORT_UNREADABLE: &str = "the installed proxy unit's `--http-port` is unreadable — the NEXT deploy of this host \
+     will refuse (re-provision the host or repair its proxy unit)";
+
 /// State drift: this host has a `current` symlink, but it does not point to a
 /// release (issue #1621, review round 2; #2277).
 ///
@@ -1562,12 +1572,17 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         if matches!(status.proxy_options, exec::ProxyOptionsMarker::Unreadable) {
             state_drift.push((status.host.clone(), DRIFT_PROXY_OPTIONS_UNREADABLE));
         }
-        // Only a PROVEN different port is drift: `Absent` (no unit yet) and
-        // `Unreadable` are handled by the deploy path's own fail-closed guard, and
-        // reporting them here would flag every never-deployed host.
-        if matches!(status.installed_proxy_port, exec::InstalledProxyPort::Port(port) if port != status.public_port)
-        {
-            state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
+        // `Absent` is never drift. A host has no proxy unit before its first deploy.
+        // `Unreadable` is drift only on a deployed host. Only the redeploy path reads
+        // the port, and it refuses (#2278).
+        match status.installed_proxy_port {
+            exec::InstalledProxyPort::Port(port) if port != status.public_port => {
+                state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
+            }
+            exec::InstalledProxyPort::Unreadable if status.mode == Some(HostMode::Redeploy) => {
+                state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_UNREADABLE));
+            }
+            _ => {}
         }
         // Review round 1: the maintenance column is only as good as the CLI's
         // knowledge of WHICH file the running unit polls. Both failure shapes are
@@ -4100,6 +4115,81 @@ mod tests {
                 .join("\n")
                 .contains("reported, not counted as drift"),
             "an unreachable host is still reported, not blamed",
+        );
+    }
+
+    #[test]
+    fn a_deployed_host_whose_proxy_port_is_unreadable_is_state_drift() {
+        // #2278. The redeploy path refuses a host whose installed proxy port it
+        // cannot prove. `--strict` must fail before that deploy does.
+        let mut damaged = status("web-b", Some("r1"));
+        damaged.installed_proxy_port = exec::InstalledProxyPort::Unreadable;
+        let rows = [status("web-a", Some("r1")), damaged.clone()];
+        let report = fleet_drift(&rows);
+
+        assert!(!report.version_drift, "{:?}", report.releases);
+        assert_eq!(
+            report.state_drift,
+            vec![("web-b".to_owned(), DRIFT_PROXY_PORT_UNREADABLE)],
+            "the damaged host is named with its own reason"
+        );
+        assert!(report.drifted(), "`--strict` must exit non-zero");
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+        assert!(
+            rendered.contains(DRIFT_PROXY_PORT_UNREADABLE),
+            "the row must name the reason:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("proxy ?"),
+            "the port cell must not guess:\n{rendered}"
+        );
+
+        // A lone damaged host is drift too. The damage is on the host itself.
+        let alone = fleet_drift(std::slice::from_ref(&damaged));
+        assert!(alone.drifted(), "{:?}", alone.state_drift);
+
+        // The mode sets the gate, not the release. A damaged `current` adds its
+        // own reason.
+        let mut both = status("web-b", None);
+        both.installed_proxy_port = exec::InstalledProxyPort::Unreadable;
+        assert_eq!(
+            fleet_drift(&[both]).state_drift,
+            vec![
+                ("web-b".to_owned(), DRIFT_RELEASE_UNREADABLE),
+                ("web-b".to_owned(), DRIFT_PROXY_PORT_UNREADABLE),
+            ],
+        );
+
+        // The first-deploy path does not read the port, so `Unreadable` on a
+        // `First` host is not drift. Next to a deployed peer, that host gets only
+        // `DRIFT_HOST_NOT_DEPLOYED`.
+        let mut first = status("web-b", None);
+        first.mode = Some(HostMode::First);
+        first.installed_proxy_port = exec::InstalledProxyPort::Unreadable;
+        let lone_first = fleet_drift(std::slice::from_ref(&first));
+        assert!(!lone_first.drifted(), "{:?}", lone_first.state_drift);
+        assert_eq!(
+            fleet_drift(&[status("web-a", Some("r1")), first.clone()]).state_drift,
+            vec![("web-b".to_owned(), DRIFT_HOST_NOT_DEPLOYED)],
+        );
+
+        // `Absent` is the correct state before the first deploy. It is never drift.
+        let mut deployed_absent = status("web-a", Some("r1"));
+        deployed_absent.installed_proxy_port = exec::InstalledProxyPort::Absent;
+        first.installed_proxy_port = exec::InstalledProxyPort::Absent;
+        for host in [deployed_absent, first] {
+            let report = fleet_drift(std::slice::from_ref(&host));
+            assert!(!report.drifted(), "{:?}", report.state_drift);
+        }
+
+        // An unreachable host was not probed, so it gives no drift.
+        let mut outage = damaged;
+        outage.reachable = false;
+        let outage_report = fleet_drift(&[outage]);
+        assert!(
+            outage_report.state_drift.is_empty(),
+            "{:?}",
+            outage_report.state_drift
         );
     }
 
