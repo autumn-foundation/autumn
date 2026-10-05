@@ -391,16 +391,42 @@ fn items_map_comments_table(items: &[syn::Item]) -> bool {
     })
 }
 
-/// Whether `item` has a field for each of [`REQUIRED_COLUMNS`].
+/// Whether `item` has a field for each of [`REQUIRED_COLUMNS`]. A field's
+/// column is its `#[diesel(column_name = …)]` when given, else its name.
 fn declares_every_shared_column(item: &syn::ItemStruct) -> bool {
-    let fields: Vec<String> = item
-        .fields
-        .iter()
-        .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
-        .collect();
+    let fields: Vec<String> = item.fields.iter().filter_map(field_column).collect();
     REQUIRED_COLUMNS
         .iter()
         .all(|column| fields.iter().any(|field| field == column))
+}
+
+/// The column a struct field maps to: `#[diesel(column_name = …)]`, else the
+/// field name without a raw `r#` prefix.
+fn field_column(field: &syn::Field) -> Option<String> {
+    let mut renamed = None;
+    for attr in field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("diesel"))
+    {
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("column_name") {
+                let value: syn::Ident = meta.value()?.parse()?;
+                renamed = Some(value.to_string());
+            } else if meta.input.peek(syn::Token![=]) {
+                let _: syn::Expr = meta.value()?.parse()?;
+            }
+            Ok(())
+        });
+    }
+    renamed.or_else(|| {
+        field.ident.as_ref().map(|ident| {
+            let name = ident.to_string();
+            name.strip_prefix("r#")
+                .map(ToOwned::to_owned)
+                .unwrap_or(name)
+        })
+    })
 }
 
 /// The table of a `#[model]` struct, as the macro decides it. `None` when the
@@ -3783,6 +3809,18 @@ mod tests {
         assert_eq!(
             check(&format!(
                 "#[autumn_web::model]\npub struct Comment {{ {fields} }}\n"
+            )),
+            None
+        );
+        // A Diesel rename names the column, not the Rust field.
+        let renamed = fields.replacen(
+            "pub id: i64",
+            "#[diesel(column_name = id)] pub comment_id: i64",
+            1,
+        );
+        assert_eq!(
+            check(&format!(
+                "#[autumn_web::model]\npub struct Comment {{ {renamed} }}\n"
             )),
             None
         );
