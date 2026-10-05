@@ -60,7 +60,7 @@ Registered set: baseline = samples 2–6, debug=1 = samples 1–5.
   is larger than the 4% of samples 2–5 alone suggested.
 - Gate budget (p95 130000ms): baseline 1/5 registered samples exceeded it (sample 6, 155322ms,
   warm cache); debug=1 0/5, max 77.9% of budget. Secondary, not verdict-bearing. Two of the
-  six baseline runs overall (samples 1–6) (1 and 6) exceeded the budget on this box.
+  six baseline runs overall (samples 1 and 6) exceeded the budget on this box.
 - Worst case: each sample is already a from-scratch build.
 
 ## 🏁 Verdict
