@@ -1363,19 +1363,49 @@ impl ShardHealthIndicator {
         if self.shard.runtime().parity_check_due()
             && let Some((primary_url, replica_url)) = self.shard.runtime().migration_check()
         {
-            let readiness = crate::migrate::check_replica_migration_readiness_blocking(
-                primary_url,
-                replica_url,
+            self.record_parity(
+                crate::migrate::check_replica_migration_readiness_blocking(
+                    primary_url,
+                    replica_url,
+                ),
+                PARITY_TIMEOUT,
             )
             .await;
-            if readiness.is_ready() {
+        }
+    }
+
+    /// Run the parity comparison with its own time limit, and record the
+    /// result. A comparison that does not finish in time marks the replica
+    /// migrations unready (fail closed): the throttle already claimed this
+    /// window, so the old result must not stay in use.
+    async fn record_parity(
+        &self,
+        check: impl std::future::Future<Output = crate::migrate::ReplicaMigrationReadiness>,
+        timeout: std::time::Duration,
+    ) {
+        match tokio::time::timeout(timeout, check).await {
+            Ok(readiness) if readiness.is_ready() => {
                 self.shard.runtime().mark_replica_migrations_ready();
-            } else if let Some(detail) = readiness.detail() {
-                self.shard.runtime().mark_replica_migrations_unready(detail);
             }
+            Ok(readiness) => {
+                if let Some(detail) = readiness.detail() {
+                    self.shard.runtime().mark_replica_migrations_unready(detail);
+                }
+            }
+            Err(_elapsed) => self
+                .shard
+                .runtime()
+                .mark_replica_migrations_unready(format!(
+                    "replica migration parity check timed out after {} ms",
+                    timeout.as_millis()
+                )),
         }
     }
 }
+
+/// Time limit for the throttled migration parity comparison. It opens new
+/// connections to both roles, so it gets more time than a ping.
+const PARITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl crate::actuator::HealthIndicator for ShardHealthIndicator {
     fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
@@ -1439,10 +1469,11 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
         })
     }
 
-    /// The ping time limit plus a margin. A late ping then reports its own
-    /// `DOWN` result, not the registry's `UNKNOWN` timeout result.
+    /// The ping time limit, plus the parity time limit, plus a margin. A
+    /// late ping or parity check then reports its own result, not the
+    /// registry's `UNKNOWN` timeout result.
     fn timeout_ms(&self) -> u64 {
-        let limit = self.ping_timeout + std::time::Duration::from_millis(500);
+        let limit = self.ping_timeout + PARITY_TIMEOUT + std::time::Duration::from_millis(500);
         u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
     }
 }
@@ -2967,13 +2998,28 @@ mod tests {
 
     #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
+    async fn parity_check_timeout_fails_closed() {
+        let shard = shard_with_unreachable_replica(ReplicaFallback::FailReadiness);
+        let indicator = ShardHealthIndicator::new(shard, std::time::Duration::from_secs(2));
+
+        indicator
+            .record_parity(std::future::pending(), std::time::Duration::from_millis(10))
+            .await;
+
+        let detail = indicator.shard.runtime().detail().unwrap_or_default();
+        assert!(detail.contains("parity check timed out"), "{detail}");
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
     async fn shard_indicator_uses_the_configured_ping_timeout() {
         use crate::actuator::HealthIndicator as _;
 
         let shard = shard_with_unreachable_replica(ReplicaFallback::FailReadiness);
         let indicator = ShardHealthIndicator::new(shard, std::time::Duration::from_millis(700));
 
-        assert_eq!(indicator.timeout_ms(), 1_200);
+        // 700 ms ping + 5 s parity + 500 ms margin.
+        assert_eq!(indicator.timeout_ms(), 6_200);
     }
 
     #[cfg(not(feature = "sqlite"))]

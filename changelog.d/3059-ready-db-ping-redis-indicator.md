@@ -30,7 +30,8 @@
 - **probes:** `health.ping_timeout_ms` (default `2000`) is the time limit for
   one built-in database or Redis ping. `0` is refused at startup.
 - **probes:** `health.db_readiness = false` keeps a replica in rotation when
-  the primary ping fails. `/actuator/health` still shows `db` as `DOWN`.
+  the primary fails: `/ready` does not ping the primary. `/actuator/health`
+  still pings it and shows `db` as `DOWN`.
 - **probes:** a change of the database ping result writes a `warn` (failed)
   or `info` (recovered) log event.
 - **redis:** `RedisHealthIndicator` sends `PING` with a time limit. The

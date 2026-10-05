@@ -685,13 +685,23 @@ async fn readiness<S: ProvideProbeState + Sync>(state: &S) -> (StatusCode, Json<
     {
         // Run all checks at the same time: the wall time is one ping budget,
         // not the sum.
+        // With `health.db_readiness = false` the primary ping does not gate
+        // `/ready`, so do not wait for it: a hung primary must not delay the
+        // probe. `/actuator/health` still reports it.
+        let primary_gates = state.probes().primary_gates_readiness();
+        let primary_check = async {
+            if primary_gates {
+                check_primary_db(state).await
+            } else {
+                None
+            }
+        };
         let ((), primary, indicators_ready) = tokio::join!(
             refresh_replica_readiness(state),
-            check_primary_db(state),
+            primary_check,
             check_readiness_indicators(state)
         );
-        let primary_ready = !state.probes().primary_gates_readiness()
-            || primary.as_ref().is_none_or(|status| status.up);
+        let primary_ready = primary.as_ref().is_none_or(|status| status.up);
         let (code, Json(mut body)) =
             probe_response(state, ProbeKind::Ready, primary_ready && indicators_ready);
         if state.health_detailed() {
@@ -1351,16 +1361,20 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn db_readiness_off_keeps_ready_when_primary_fails() {
-            let ping = FakePing::new(Duration::ZERO, Err("connection refused".to_owned()));
+        async fn db_readiness_off_does_not_ping_or_wait_for_the_primary() {
+            // A hung primary must not delay `/ready` past the probe timeout of
+            // the platform when the ping does not gate it.
+            let ping = FakePing::new(Duration::from_secs(3_600), Ok(()));
             let state = state_with(ping.clone());
             state.probes.set_db_readiness(false);
 
+            let started = tokio::time::Instant::now();
             let (status, Json(body)) = readiness_response(&state).await;
 
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(body.database.map(|d| d.status), Some("down"));
-            assert_eq!(ping.calls(), 1, "the ping still runs for the report");
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert!(body.database.is_none());
+            assert_eq!(ping.calls(), 0);
         }
 
         #[tokio::test(start_paused = true)]

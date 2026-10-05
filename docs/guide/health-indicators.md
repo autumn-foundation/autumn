@@ -215,7 +215,8 @@ The primary is shared by all app replicas, but it is an exception to
 [Fail open on shared dependencies](#fail-open-on-shared-dependencies): an app
 replica that cannot reach it usually has its own network problem. To keep app
 replicas in rotation when the primary fails, set `health.db_readiness = false`.
-`/actuator/health` still shows `db` as `DOWN`.
+Then `/ready` does not ping the primary, so a hung primary cannot delay it.
+`/actuator/health` still pings it and shows `db` as `DOWN`.
 
 The generated Dockerfile `HEALTHCHECK` probes `/health`, the readiness alias.
 ECS and Docker Swarm replace a container that fails it. On those platforms,
