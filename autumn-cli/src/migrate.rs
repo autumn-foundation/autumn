@@ -1388,6 +1388,19 @@ fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
 ///
 /// Returns `None` when no URL can be resolved, leaving the caller to decide how
 /// to report the failure (the `autumn db` commands surface their own message).
+/// The migration lock policy for `profile`, resolved as `autumn migrate`
+/// resolves it: env and project `.env`, then `autumn.toml`, then the defaults.
+pub fn resolve_migration_lock_policy(
+    profile: Option<&str>,
+) -> autumn_web::migrate::MigrationLockPolicy {
+    use autumn_web::config::Env as _;
+
+    let effective = effective_profile(profile);
+    let config_table = read_autumn_toml_table_with_profile(Some(&effective));
+    let env = os_env_with_dotenv_or_exit();
+    resolve_migration_lock_policy_from_sources(|key| env.var(key), config_table.as_ref())
+}
+
 pub fn resolve_primary_url(profile: Option<&str>) -> Option<String> {
     use autumn_web::config::Env as _;
 
@@ -1871,8 +1884,8 @@ fn run_diesel_with_policy(
         },
         || match run_diesel_migrations_once(database_url, dir, pgoptions.as_deref()) {
             Err(MigrationError::Migration(text)) if startup_options_rejected(&text) => {
-                let Some(fallback) = pooler_fallback(pgoptions.as_deref(), inherited.as_deref())
-                else {
+                let base = pooler_fallback_base(inherited.as_deref(), transactional);
+                let Some(fallback) = pooler_fallback(pgoptions.as_deref(), base.as_deref()) else {
                     return Err(MigrationError::Migration(text));
                 };
                 eprintln!(
@@ -1885,6 +1898,17 @@ fn run_diesel_with_policy(
             other => other,
         },
     )
+}
+
+/// The inherited `PGOPTIONS` a pooler fallback may use. A non-transactional
+/// run drops any inherited `lock_timeout`, so `CREATE INDEX CONCURRENTLY` is
+/// never cancelled; the operator's other settings stay.
+fn pooler_fallback_base(inherited: Option<&str>, transactional: bool) -> Option<String> {
+    if transactional {
+        inherited.map(str::to_owned)
+    } else {
+        strip_lock_timeout(inherited)
+    }
 }
 
 /// The `PGOPTIONS` to run with after a pooler refused `current`: the
@@ -4845,6 +4869,20 @@ primary_url = "postgres://prod-s0:5432/app"
             std::fs::read_to_string(dst.path().join("2026-01-02-000000_two/up.sql")).unwrap(),
             "2026-01-02-000000_two"
         );
+    }
+
+    #[test]
+    fn pooler_fallback_base_strips_lock_timeout_for_non_transactional_runs() {
+        let inherited = Some("-c search_path=tenant -c lock_timeout=9000");
+        assert_eq!(
+            pooler_fallback_base(inherited, true).as_deref(),
+            Some("-c search_path=tenant -c lock_timeout=9000")
+        );
+        assert_eq!(
+            pooler_fallback_base(inherited, false).as_deref(),
+            Some("-c search_path=tenant")
+        );
+        assert_eq!(pooler_fallback_base(None, false), None);
     }
 
     #[test]
