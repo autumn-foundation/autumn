@@ -1912,13 +1912,16 @@ impl Analyzer {
             connection_params: false,
             param_referents: Vec::new(),
             param_referents_each: Vec::new(),
-            shadowed: Rc::new(local_names(&input_fn.block)),
+            shadowed: Rc::new(Vec::new()),
         };
+        // The signature reads names from outside the body, so the body's
+        // items do not shadow its types.
         for arg in &input_fn.sig.inputs {
             if let syn::FnArg::Typed(typed) = arg {
                 analyzer.bind_typed(&typed.pat, &typed.ty, Kind::Plain);
             }
         }
+        analyzer.shadowed = Rc::new(local_names(&input_fn.block));
         analyzer
     }
 
@@ -1938,16 +1941,20 @@ impl Analyzer {
     /// shape of its part (`Db` in `Option<Db>`), and each side of a `Result`
     /// (`Err(e)` on a `Result<Repo, Error>` is not a handle).
     fn record_type(&mut self, name: String, ty: &Type) {
-        self.env.set_shape(&name, type_shape(ty));
+        // A type that names an item of the body may not be the std type:
+        // only its kind, which only raises, is kept.
+        let trusted = !self.type_is_shadowed(ty);
+        let shape = if trusted { type_shape(ty) } else { None };
+        self.env.set_shape(&name, shape);
         let mut binding = self.env.binding(&name);
-        binding.inner = type_inner_shape(ty);
-        if let Some(sides) = result_sides(ty) {
+        binding.inner = if trusted { type_inner_shape(ty) } else { None };
+        if let Some(sides) = result_sides(ty).filter(|_| trusted) {
             binding.parts = Some(sides);
         }
         binding.declared = Some(Box::new(Binding {
             kind: type_kind(ty),
             parts: binding.parts.clone(),
-            shape: type_shape(ty),
+            shape,
             inner: binding.inner,
             ..Binding::of(Kind::Plain)
         }));
@@ -1969,7 +1976,7 @@ impl Analyzer {
         }
         // rustc checks the annotation. A type made only of standard and
         // primitive types cannot hold a handle.
-        if type_is_plain_std(ty) {
+        if type_is_plain_std(ty) && !self.type_is_shadowed(ty) {
             self.bind_pat(pat, Kind::Plain);
             if let Pat::Ident(id) = pat {
                 self.env.set_shape(&id.ident.to_string(), type_shape(ty));
@@ -4131,7 +4138,9 @@ impl Analyzer {
                     // `collect::<Vec<_>>()` names its shape.
                     return mc.turbofish.as_ref().and_then(|t| {
                         t.args.iter().find_map(|arg| match arg {
-                            syn::GenericArgument::Type(ty) => type_shape(ty),
+                            syn::GenericArgument::Type(ty) if !self.type_is_shadowed(ty) => {
+                                type_shape(ty)
+                            }
                             _ => None,
                         })
                     });
@@ -4422,6 +4431,23 @@ impl Analyzer {
     /// Is `name` defined or imported by the handler body?
     fn is_shadowed(&self, name: &str) -> bool {
         shadows(&self.shadowed, name)
+    }
+
+    /// Does `ty` name an item that the handler body defines or imports?
+    fn type_is_shadowed(&self, ty: &Type) -> bool {
+        struct Names<'s>(&'s [String], bool);
+        impl<'a> Visit<'a> for Names<'_> {
+            fn visit_path_segment(&mut self, s: &'a syn::PathSegment) {
+                self.1 |= shadows(self.0, &s.ident.to_string());
+                syn::visit::visit_path_segment(self, s);
+            }
+        }
+        if self.shadowed.is_empty() {
+            return false;
+        }
+        let mut names = Names(&self.shadowed, false);
+        names.visit_type(ty);
+        names.1
     }
 
     /// The elements of a std `vec!`: bare or under a std path, and not
@@ -12555,6 +12581,47 @@ mod tests {
                 "the std Err of a handle result binds the error",
                 "async fn h(res: Result<PgPostRepository, AppError>) -> AutumnResult<usize> { \
                  match res { Err(e) => render(e), Ok(_) => () } Ok(0) }",
+                Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn annotations_with_local_names_are_not_trusted() {
+        check_handlers(&[
+            (
+                "guard: an imported Result has no std sides",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 use custom::Result; \
+                 let r: Result<i64, PgPostRepository> = Result::Ok(repo); \
+                 match r { Result::Ok(x) => { x.find_all().await?; } _ => {} } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an imported Vec alias is not a plain std type",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 use custom::Vec; \
+                 let v: Vec<i64> = vec![repo]; v[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a glob import untrusts annotations",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 use custom::*; \
+                 let v: Vec<i64> = vec![repo]; v[0].find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a parameter type is read outside the body's imports",
+                "async fn h(res: Result<PgPostRepository, AppError>) -> AutumnResult<usize> { \
+                 use custom::Result; \
+                 match res { Err(e) => render(e), Ok(_) => () } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a std annotation stays plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let v: Vec<i64> = vec![1]; render(v); let _ = repo; Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);
