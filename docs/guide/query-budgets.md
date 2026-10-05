@@ -178,7 +178,8 @@ The analysis follows the handle through every name that holds it:
     `repos.as_slice()` instead.
   - A method or function given a handle may store it: after
     `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. A
-    callback stores what it returns (`slot.get_or_insert_with(|| &repo)`).
+    store through a `&mut` alias (`let slot = &mut list; slot.push(repo);`)
+    is a store into `list`. A callback stores what it returns (`slot.get_or_insert_with(|| &repo)`).
     Every method on a user struct that holds a handle (`ctx.clear()` on
     `Ctx { repo }`) is reported too.
   - A callback's result holds what the callback returns, whatever the
@@ -215,7 +216,9 @@ negative ships an N+1 to production.
 - **An associated function handed the handle** — `Post::published(&mut db)`.
   It has the same shape as `ReportBuilder::build(&mut db)`, which can issue any
   number of queries. Put `#[query_cost(1)]` on the statement that calls a
-  one-query finder.
+  one-query finder. An awaited constructor of a handle type
+  (`PgPostRepository::new(&mut db).await`) is reported too: an `async fn` can
+  run queries.
 - **A macro body that `await`s while naming the handle** — `html! { …
   (fetch(&mut db).await?) … }`. A macro body is token soup to `syn`. A template
   that merely *passes* the handle to a render helper is fine: only an `await`

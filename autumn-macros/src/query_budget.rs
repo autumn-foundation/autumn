@@ -1416,6 +1416,9 @@ struct Binding {
     parts: Option<Vec<(String, Kind)>>,
     /// The container shape, for a carrier, when it is known.
     shape: Option<Shape>,
+    /// The name a `&mut` binding points to: `slot` in `let slot = &mut
+    /// repos;` points to `repos`.
+    referent: Option<String>,
 }
 
 impl Binding {
@@ -1424,6 +1427,7 @@ impl Binding {
             kind,
             parts: None,
             shape: None,
+            referent: None,
         }
     }
 
@@ -1462,6 +1466,7 @@ impl Binding {
             kind: self.kind.max(other.kind),
             parts,
             shape,
+            referent: self.referent.clone().or_else(|| other.referent.clone()),
         }
     }
 }
@@ -1976,6 +1981,22 @@ impl Analyzer {
             kind,
             parts,
             shape: self.shape_of(init),
+            referent: self.referent_of(init),
+        }
+    }
+
+    /// The name that `init` points to when it is a `&mut` place or a `&mut`
+    /// binding: `&mut repos`, `&mut *slot`, `slot`.
+    fn referent_of(&self, init: &Expr) -> Option<String> {
+        match init {
+            Expr::Paren(p) => self.referent_of(&p.expr),
+            Expr::Group(g) => self.referent_of(&g.expr),
+            Expr::Reference(r) if r.mutability.is_some() => {
+                let root = place_root(&r.expr)?;
+                self.env.binding(&root).referent.or(Some(root))
+            }
+            Expr::Path(_) => self.env.binding(&path_ident(init)?).referent,
+            _ => None,
         }
     }
 
@@ -2307,7 +2328,7 @@ impl Analyzer {
                 let params: Vec<Kind> = call.args.iter().map(|a| self.value_of(a)).collect();
                 Flow::cost(cost.then(self.closure_body(closure, &params, Kind::Plain)))
             }
-            Expr::Call(call) => Flow::cost(self.call(call)),
+            Expr::Call(call) => Flow::cost(self.call(call, awaited)),
             Expr::Macro(m) => Flow::cost(self.mac(&m.mac)),
             Expr::Closure(_) => Flow::cost(self.closure_arg(expr, Kind::Plain, false)),
 
@@ -2933,7 +2954,7 @@ impl Analyzer {
         Cost::Exact(associations)
     }
 
-    fn call(&mut self, call: &ExprCall) -> Cost {
+    fn call(&mut self, call: &ExprCall, awaited: bool) -> Cost {
         let name = call_path_name(call);
         // `scoped_transaction` / `savepoint` run their closure once and hand
         // it a connection.
@@ -2944,21 +2965,22 @@ impl Analyzer {
             .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n))
             && call.args.first().is_some_and(|a| self.is_connection(a));
 
-        // `fill(&mut repos, &repo)`: a `&mut` argument may receive a handle
-        // from another argument.
+        // `fill(&mut repos, &repo)` or `fill(slot, &repo)`: a `&mut`
+        // argument may receive a handle from another argument.
         for (i, arg) in call.args.iter().enumerate() {
-            if let Expr::Reference(r) = arg
-                && r.mutability.is_some()
-            {
-                let others: Vec<&Expr> = call
-                    .args
-                    .iter()
-                    .enumerate()
-                    .filter(|(j, _)| *j != i)
-                    .map(|(_, a)| a)
-                    .collect();
-                self.store_into(&r.expr, "", &others);
-            }
+            let place = match arg {
+                Expr::Reference(r) if r.mutability.is_some() => &*r.expr,
+                _ if self.referent_of(arg).is_some() => arg,
+                _ => continue,
+            };
+            let others: Vec<&Expr> = call
+                .args
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, a)| a)
+                .collect();
+            self.store_into(place, "", &others);
         }
         let mut cost = self.cost_of(&call.func);
         let last = call.args.len().saturating_sub(1);
@@ -2981,10 +3003,11 @@ impl Analyzer {
         }
         // `Some(repo)`, `Ok(db)`, `Arc::new(repo)`, `PgPostRepository(pool)`:
         // these build a value that holds the handle and run no query. Any
-        // other uppercase callee may be a user type that runs queries.
+        // other uppercase callee may be a user type that runs queries. An
+        // awaited constructor is an `async fn`, which can run queries.
         if is_container_constructor(call)
             || is_smart_pointer_new(call)
-            || is_handle_constructor(call)
+            || (is_handle_constructor(call) && !awaited)
         {
             return cost;
         }
@@ -3243,20 +3266,29 @@ impl Analyzer {
         } else {
             Kind::Nested
         };
-        let mut binding = self.env.binding(&root);
-        if kind > binding.kind {
-            binding.kind = kind;
-            binding.parts = None;
-            if kind != Kind::Carrier {
-                binding.shape = None;
+        // A store through `slot = &mut repos` is a store into `repos` too.
+        let mut next = Some(root);
+        for _ in 0..8 {
+            let Some(root) = next.take() else { break };
+            let mut binding = self.env.binding(&root);
+            next = binding.referent.clone().filter(|r| *r != root);
+            if kind > binding.kind {
+                binding.kind = kind;
+                binding.parts = None;
+                if kind != Kind::Carrier {
+                    binding.shape = None;
+                }
+                self.env.assign(root, binding);
             }
-            self.env.assign(root, binding);
         }
     }
 
     /// Does `e` hold handles at an unknown depth ([`Kind::Nested`])? A
     /// container of containers or of user values, or any part of one.
     fn expr_is_nested(&self, e: &Expr) -> bool {
+        if let Some(kind) = self.produced(e) {
+            return kind == Kind::Nested;
+        }
         let container = |e: &Expr| {
             !self.is_counted_query_future(e)
                 && matches!(
@@ -3371,24 +3403,69 @@ impl Analyzer {
         let Expr::Closure(closure) = f else {
             return Kind::Plain;
         };
-        // Its own record of closed scopes: its handle parameters must not
-        // reach the real one.
+        self.closure_value(closure, param, false)
+    }
+
+    /// A copy of the analysis that reads a body. Its own record of closed
+    /// scopes keeps the body's handle parameters out of the real one.
+    fn probe(&self) -> Self {
         let mut env = self.env.clone();
         env.closed = Rc::default();
-        let mut probe = Self {
+        Self {
             env,
             exits: Vec::new(),
             ledger: Vec::new(),
             errors: Vec::new(),
             returned: Kind::Plain,
             connection_params: false,
-        };
+        }
+    }
+
+    /// What an expression that runs a body at once gives: `(|x| x)(repo)`,
+    /// `async { &repo }.await`, `(|| async { … })().await`. `None` for any
+    /// other expression.
+    fn produced(&self, e: &Expr) -> Option<Kind> {
+        match e {
+            Expr::Paren(p) => self.produced(&p.expr),
+            Expr::Group(g) => self.produced(&g.expr),
+            Expr::Call(call) => self.invoked(call, false),
+            Expr::Await(a) => match peel_parens(&a.base) {
+                Expr::Async(block) => {
+                    let mut probe = self.probe();
+                    let tail = probe.block_value(&block.block);
+                    Some(tail.max(probe.returned))
+                }
+                Expr::Call(call) => self.invoked(call, true),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// What an immediately invoked closure gives. Each parameter may hold
+    /// what any argument holds.
+    fn invoked(&self, call: &ExprCall, awaited: bool) -> Option<Kind> {
+        let closure = immediately_invoked_closure(&call.func)?;
+        let param = call
+            .args
+            .iter()
+            .map(|a| self.value_of(a))
+            .max()
+            .unwrap_or(Kind::Plain);
+        Some(self.closure_value(closure, param, awaited))
+    }
+
+    /// What `closure` returns when its parameters hold `param`. When it is
+    /// `awaited`, a body of `async { … }` gives what its block gives.
+    fn closure_value(&self, closure: &syn::ExprClosure, param: Kind, awaited: bool) -> Kind {
+        let mut probe = self.probe();
         probe.env.push();
         for input in &closure.inputs {
             probe.bind_pat(input, param);
         }
         let tail = match &*closure.body {
             Expr::Block(b) => probe.block_value(&b.block),
+            Expr::Async(a) if awaited => probe.block_value(&a.block),
             body => {
                 // Run the body for its `return`s, then read its value.
                 let _ = probe.expr(body);
@@ -3470,6 +3547,9 @@ impl Analyzer {
     /// Is `e` a user value that holds a handle (`Ctx { repo }`)? Its methods
     /// are the user's, so none of them is a known container method.
     fn expr_is_holder(&self, e: &Expr) -> bool {
+        if let Some(kind) = self.produced(e) {
+            return kind == Kind::Holder;
+        }
         match e {
             Expr::Struct(st) => {
                 !self.expr_is_handle(e)
@@ -3515,6 +3595,9 @@ impl Analyzer {
     fn expr_is_handle(&self, expr: &Expr) -> bool {
         if self.expr_is_nested(expr) {
             return false;
+        }
+        if let Some(kind) = self.produced(expr) {
+            return kind.is_handle();
         }
         match expr {
             Expr::Path(p) => p
@@ -3688,6 +3771,9 @@ impl Analyzer {
     /// handle", never "a `LazyDb`". A missed `LazyDb` only makes its
     /// `checkout` count as a query.
     fn expr_is_lazy_db(&self, expr: &Expr) -> bool {
+        if let Some(kind) = self.produced(expr) {
+            return kind == Kind::LazyDb;
+        }
         match expr {
             Expr::Path(p) => p
                 .path
@@ -3741,6 +3827,9 @@ impl Analyzer {
     fn expr_is_carrier(&self, expr: &Expr) -> bool {
         if self.expr_is_nested(expr) {
             return true;
+        }
+        if let Some(kind) = self.produced(expr) {
+            return matches!(kind, Kind::Carrier | Kind::Holder);
         }
         let holds = |e: &Expr| self.holds(e);
         match expr {
@@ -4267,6 +4356,15 @@ fn call_path_name(call: &ExprCall) -> Option<String> {
     match &*call.func {
         Expr::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
         _ => None,
+    }
+}
+
+/// `e` without the parentheses and groups around it.
+fn peel_parens(e: &Expr) -> &Expr {
+    match e {
+        Expr::Paren(p) => peel_parens(&p.expr),
+        Expr::Group(g) => peel_parens(&g.expr),
+        other => other,
     }
 }
 
@@ -8526,6 +8624,66 @@ mod tests {
                 "guard: reduce then unwrap is a handle",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let _ = repos.into_iter().reduce(|a, _| a).unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn constructors_iifes_async_blocks_and_mut_aliases_keep_handles() {
+        check_handlers(&[
+            (
+                "an awaited handle constructor is opaque",
+                "async fn h(db: Db) -> AutumnResult<usize> { \
+                 let repo = PgPostRepository::new(&mut db).await; let _ = repo; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an immediately invoked closure gives its output",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let r = (|x| x)(repo); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "an awaited async block gives its output",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let r = async { &repo }.await; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a store through a mutable alias",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = Vec::new(); let slot = &mut repos; slot.push(repo); for r in repos { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a store through a chain of mutable aliases",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = Vec::new(); let a = &mut repos; let b = a; b.push(repo); for r in repos { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a mutable alias handed to a function",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = Vec::new(); let slot = &mut repos; fill(slot, &repo); for r in repos { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an awaited closure that gives an async block",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let r = (|| async { &repo })().await; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a plain store through a mutable alias is free",
+                "async fn h(ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mut out = Vec::new(); let slot = &mut out; slot.push(1); for i in out { let _ = i; } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a constructor that is not awaited is free",
+                "async fn h(db: Db) -> AutumnResult<usize> { \
+                 let repo = PgPostRepository::new(db); let _ = repo.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);

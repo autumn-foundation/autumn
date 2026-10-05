@@ -159,7 +159,9 @@ that loops. It counted both as 1 query, and a helper could hide an N+1.
 
 This affects you only if a `#[query_budget(N)]` function gives a database or
 repository handle to `Type::f(…)`. The build fails with "`f` is handed the
-database handle". Put `#[query_cost(N)]` on the statement.
+database handle". Put `#[query_cost(N)]` on the statement. An awaited
+constructor of a handle type (`PgPostRepository::new(&mut db).await`) is
+reported the same way.
 
 **Before (`{X.Y}`):**
 
