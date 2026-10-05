@@ -2260,8 +2260,8 @@ impl Analyzer {
             // A free function (`drop`) is not one either.
             Expr::Call(call) => {
                 !(is_handle_constructor(call)
-                    || is_container_constructor(call)
-                    || is_smart_pointer_new(call)
+                    || self.is_container_constructor(call)
+                    || self.is_smart_pointer_new(call)
                     || self.is_std_free_fn(call))
             }
             // A path that diverges gives no value.
@@ -2339,6 +2339,9 @@ impl Analyzer {
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
             Expr::Cast(c) => self.referents_of(&c.expr),
+            // `pick(&mut slots)?`, `pick(&mut slots).await`.
+            Expr::Try(t) => self.referents_of(&t.expr),
+            Expr::Await(a) => self.referents_of(&a.base),
             // `refs.0`, `refs[i]`: a part may be any borrow of the whole.
             Expr::Field(f) => self.referents_of(&f.base),
             Expr::Index(i) => self.referents_of(&i.expr),
@@ -2587,8 +2590,8 @@ impl Analyzer {
                     && std_prefix(&p.path))
             }
             Expr::Call(c) => {
-                !((is_container_constructor(c)
-                    || is_smart_pointer_new(c)
+                !((self.is_container_constructor(c)
+                    || self.is_smart_pointer_new(c)
                     || is_handle_constructor(c)
                     || self.shape_of(e).is_some())
                     && c.args.iter().all(known))
@@ -3921,8 +3924,8 @@ impl Analyzer {
         // std constructor gives a future, so an awaited one is a user
         // `async fn`, which can run queries.
         if !awaited
-            && (is_container_constructor(call)
-                || is_smart_pointer_new(call)
+            && (self.is_container_constructor(call)
+                || self.is_smart_pointer_new(call)
                 || is_handle_constructor(call))
         {
             return cost;
@@ -4096,9 +4099,12 @@ impl Analyzer {
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => Some(Shape::Bool),
             Expr::Lit(l) if matches!(l.lit, syn::Lit::Bool(_)) => Some(Shape::Bool),
             Expr::Macro(m) => self.std_vec(&m.mac).map(|_| Shape::Vec),
-            Expr::Call(c) if is_smart_pointer_new(c) => {
+            Expr::Call(c) if self.is_smart_pointer_new(c) => {
                 c.args.first().and_then(|a| self.shape_of(a))
             }
+            // `use custom::Item as Some;`: an application item has no std
+            // shape.
+            Expr::Call(c) if self.call_head_shadowed(c) => None,
             Expr::Call(c) => match call_path_name(c).as_deref() {
                 Some("Some") if matches!(c.args.first(), Some(Expr::Reference(_))) => {
                     Some(Shape::OptRef)
@@ -4375,7 +4381,7 @@ impl Analyzer {
             Expr::Tuple(t) => t.elems.iter().any(container),
             Expr::Repeat(r) => container(&r.expr),
             Expr::Call(c) => {
-                ((is_container_constructor(c) || is_smart_pointer_new(c))
+                ((self.is_container_constructor(c) || self.is_smart_pointer_new(c))
                     && c.args.iter().any(container))
                     // `make()`, where `make` is a closure that holds a handle.
                     || path_ident(&c.func).is_some_and(|name| self.env.get(&name) != Kind::Plain)
@@ -4445,6 +4451,28 @@ impl Analyzer {
     /// Is `name` defined or imported by the handler body?
     fn is_shadowed(&self, name: &str) -> bool {
         shadows(&self.shadowed, name)
+    }
+
+    /// Does the handler body define or import the first name of `call`'s
+    /// path: `use custom::Item as Some;`, `use custom::Arc;`?
+    fn call_head_shadowed(&self, call: &ExprCall) -> bool {
+        let Expr::Path(path) = &*call.func else {
+            return false;
+        };
+        path.path
+            .segments
+            .first()
+            .is_some_and(|s| self.is_shadowed(&s.ident.to_string()))
+    }
+
+    /// A std `Some`, `Ok` or `Err` call that the body does not shadow.
+    fn is_container_constructor(&self, call: &ExprCall) -> bool {
+        is_container_constructor_path(call) && !self.call_head_shadowed(call)
+    }
+
+    /// A std smart pointer's `new` that the body does not shadow.
+    fn is_smart_pointer_new(&self, call: &ExprCall) -> bool {
+        is_smart_pointer_new_path(call) && !self.call_head_shadowed(call)
     }
 
     /// Does `ty` name an item that the handler body defines or imports?
@@ -4730,7 +4758,7 @@ impl Analyzer {
             // `Ctx(repo)`: a user tuple struct that holds the handle.
             Expr::Call(c) => {
                 call_path_name(c).is_some_and(|n| n.starts_with(char::is_uppercase))
-                    && !is_container_constructor(c)
+                    && !self.is_container_constructor(c)
                     && !is_handle_constructor(c)
                     && c.args.iter().any(|a| self.holds(a))
             }
@@ -4796,7 +4824,8 @@ impl Analyzer {
             // `Arc::new(repo)`: a smart pointer derefs to the handle.
             // `PgPostRepository(pool)`: a value of a handle type is a handle.
             Expr::Call(c) => {
-                (is_smart_pointer_new(c) && c.args.first().is_some_and(|a| self.expr_is_handle(a)))
+                (self.is_smart_pointer_new(c)
+                    && c.args.first().is_some_and(|a| self.expr_is_handle(a)))
                     || is_handle_constructor(c)
             }
             Expr::Struct(st) => st
@@ -4897,7 +4926,7 @@ impl Analyzer {
         let mc = match peel_refs(e) {
             Expr::MethodCall(mc) => mc,
             // `Ok::<T, E>(x)`: the other side holds nothing.
-            Expr::Call(c) if is_container_constructor(c) => {
+            Expr::Call(c) if self.is_container_constructor(c) => {
                 let held = c.args.first().map_or(Kind::Plain, |a| self.value_of(a));
                 return match call_path_name(c).as_deref() {
                     Some("Ok") => Some((held, Kind::Plain)),
@@ -5125,7 +5154,8 @@ impl Analyzer {
                         || s.rest.as_deref().is_some_and(holds))
             }
             Expr::Call(c) => {
-                (is_container_constructor(c) || is_smart_pointer_new(c)) && c.args.iter().any(holds)
+                (self.is_container_constructor(c) || self.is_smart_pointer_new(c))
+                    && c.args.iter().any(holds)
             }
             Expr::Field(f) => matches!(self.part_kind(f), Some(Kind::Carrier | Kind::Holder)),
             Expr::Macro(m) => self
@@ -5493,7 +5523,7 @@ fn place_root(place: &Expr) -> Option<String> {
 }
 
 /// Is this call `Some(x)`, `Ok(x)` or `Err(x)`?
-fn is_container_constructor(call: &ExprCall) -> bool {
+fn is_container_constructor_path(call: &ExprCall) -> bool {
     let Expr::Path(path) = &*call.func else {
         return false;
     };
@@ -5649,7 +5679,7 @@ fn vec_elems(mac: &syn::Macro) -> Option<Vec<Expr>> {
 }
 
 /// Is this call `Box::new(x)`, `Arc::new(x)` or `Rc::new(x)`?
-fn is_smart_pointer_new(call: &ExprCall) -> bool {
+fn is_smart_pointer_new_path(call: &ExprCall) -> bool {
     let Expr::Path(path) = &*call.func else {
         return false;
     };
@@ -12441,6 +12471,20 @@ mod tests {
                 Expect::Exact(2),
             ),
             (
+                "guard: an imported Some is not a std constructor",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 use custom::Many::Item as Some; \
+                 let many = Some(repo); let _ = many.map(|r| r.find_all()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an imported Arc is not a std smart pointer",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 use custom::Arc; \
+                 let shared = Arc::new(repo); shared.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
                 "std variants without imports stay exclusive",
                 "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
                  let _ = match x { Option::Some(_) if repo.a().await? => (), Option::None if repo.b().await? => (), _ => () }; Ok(0) }",
@@ -12605,6 +12649,20 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
+                "guard: a borrow keeps its owner through a question mark",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; let target = pick(&mut slots)?; \
+                 *target = Some(repo); slots[0].as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a borrow keeps its owner through an await",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; let target = pick(&mut slots).await; \
+                 *target = Some(repo); slots[0].as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
                 "a clear in one statement still holds in the next",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); source = None; render(source); Ok(0) }",
@@ -12643,9 +12701,9 @@ mod tests {
         check_handlers(&[
             (
                 "guard: an imported Result has no std sides",
-                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                "async fn h(other: custom::Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
                  use custom::Result; \
-                 let r: Result<i64, PgPostRepository> = Result::Ok(repo); \
+                 let r: Result<i64, PgPostRepository> = other; \
                  match r { Result::Ok(x) => { x.find_all().await?; } _ => {} } Ok(0) }",
                 Expect::Exact(1),
             ),
