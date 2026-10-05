@@ -15,8 +15,9 @@ tests remain authoritative for unmodeled allocator, HTTP, and concurrency glue.
 
 `.github/workflows/verus.yml` runs `scripts/verify-verus.sh`, which runs Verus
 on every `verification/*.rs` file. A new spec needs no workflow change. The job
-runs when a file in this directory changes, and once each week. It is not a
-required check yet, so a failed proof does not block a merge.
+runs on a change to this directory, to the script, or to the workflow. It also
+runs each Monday. It is not a required check yet, so a failed proof does not
+block a merge. Do not add it to branch protection until it is stable.
 
 Run the same check on your machine:
 

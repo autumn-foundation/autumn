@@ -396,7 +396,8 @@ resource "aws_lb_target_group" "this" {
   target_type = "ip"
 
   # The readiness probe. Autumn sets /ready to 503 when a drain starts, and
-  # the ALB then stops new traffic to the task.
+  # the ALB then stops new traffic to the task. ECS also replaces a task
+  # that stays unhealthy, for example when the database is down.
   health_check {
     path                = "/ready"
     healthy_threshold   = 2

@@ -7002,8 +7002,8 @@ previous_secrets = []
     /// `/ready` gates traffic. `/live` triggers a restart. `/startup` holds
     /// a new instance until startup is complete.
     fn probe_expectations(target: Target) -> &'static [(&'static str, &'static str, &'static str)] {
-        // The Docker HEALTHCHECK is a liveness signal: an unhealthy container
-        // is restarted or replaced, so it must not fail on a dependency.
+        // The Docker HEALTHCHECK is a liveness signal: Swarm replaces an
+        // unhealthy container, so it must not fail on a dependency.
         const DOCKER_LIVENESS: (&str, &str, &str) = (
             "Dockerfile",
             "${AUTUMN_HEALTHCHECK_URL:-",
@@ -7037,6 +7037,7 @@ previous_secrets = []
             ],
             Target::AzureContainerApps => &[
                 DOCKER_LIVENESS,
+                ("main.tf", "startup_probe {", r#"path = "/startup""#),
                 ("main.tf", "readiness_probe {", r#"path = "/ready""#),
                 ("main.tf", "liveness_probe {", r#"path = "/live""#),
             ],

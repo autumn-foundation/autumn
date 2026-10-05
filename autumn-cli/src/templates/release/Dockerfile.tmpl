@@ -126,15 +126,15 @@ LABEL org.opencontainers.image.title="{{project_name}}" \
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000
 
-# Container liveness probe. It uses /live, not /ready: an unhealthy container
-# is restarted or replaced, and /live does not fail when a dependency (the
-# database, say) is down. Platforms that route traffic use their own /ready
-# check instead.
+# Container liveness probe. It uses /live, not /ready. /live does not fail
+# when a dependency, such as the database, is down. An orchestrator that acts
+# on health status (Docker Swarm, for example) replaces an unhealthy
+# container. Platforms that route traffic use their own /ready check.
 #
-# Override AUTUMN_HEALTHCHECK_URL when the app terminates TLS itself
-# ([server.tls], issue #1603) — e.g. `https://localhost:3000/live` — otherwise
-# an HTTPS-serving container would be marked unhealthy forever by a plain-HTTP
-# probe.
+# When the app terminates TLS itself ([server.tls], issue #1603), set
+# AUTUMN_HEALTHCHECK_URL to an https URL, for example
+# `https://localhost:3000/live`. A plain-HTTP probe always fails on an HTTPS
+# listener.
 #
 # Certificate verification is skipped only when AUTUMN_HEALTHCHECK_INSECURE is
 # set to a non-empty value. Set it alongside a LOOPBACK https URL: that probe

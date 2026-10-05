@@ -4,8 +4,8 @@ name: Verus proofs
 # the Cargo workspace, because Verus uses an extended Rust dialect.
 #
 # This is not a required check yet. A red run shows a broken proof, but it
-# does not block a merge. The weekly run finds a new Verus release that
-# breaks a proof.
+# does not block a merge. The weekly run uses the latest Verus release. It
+# shows when a new release breaks a proof.
 
 on:
   pull_request:
@@ -45,8 +45,16 @@ jobs:
         run: |
           dir="$RUNNER_TEMP/verus"
           mkdir -p "$dir"
-          # The latest release. The weekly run finds a release that breaks a proof.
-          gh release download --repo verus-lang/verus --pattern '*x86-linux.zip' --dir "$dir"
+          # The newest release with a Linux asset. Verus can mark its releases
+          # as prereleases, so do not use `gh release download` with no tag.
+          tag="$(gh api 'repos/verus-lang/verus/releases?per_page=30' \
+            --jq '[.[] | select(any(.assets[]; .name | endswith("x86-linux.zip")))][0].tag_name')"
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "::error::no Verus release has an x86-linux.zip asset"
+            exit 1
+          fi
+          echo "Verus release: $tag"
+          gh release download "$tag" --repo verus-lang/verus --pattern '*x86-linux.zip' --dir "$dir"
           unzip -q "$dir"/*.zip -d "$dir"
           verus_bin="$(find "$dir" -type f -name verus -perm -u+x | head -n 1)"
           if [ -z "$verus_bin" ]; then

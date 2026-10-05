@@ -7002,8 +7002,8 @@ impl AutumnConfig {
 ///
 /// Controls how long the server waits for a complete request-response cycle
 /// before it returns `503 Service Unavailable`. A value of `None` or `0`
-/// disables the timeout (the default, so existing applications are not
-/// affected).
+/// disables the timeout. The default is disabled. The `prod` profile sets
+/// `30000` (30s).
 ///
 /// # `autumn.toml` example
 ///

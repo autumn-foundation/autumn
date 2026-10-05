@@ -424,20 +424,36 @@ resource "azurerm_container_app" "this" {
       cpu    = 0.5
       memory = "1Gi"
 
-      # /ready gates traffic. Autumn sets it to 503 when a drain starts, so
-      # the replica gets no new requests before it stops.
+      # The startup probe holds the other probes until startup is complete.
+      # A slow first boot gets 100 seconds (10 x 10s).
+      startup_probe {
+        transport               = "HTTP"
+        port                    = 3000
+        path                    = "/startup"
+        interval_seconds        = 10
+        failure_count_threshold = 10
+        timeout                 = 3
+      }
+
+      # /ready gates traffic. Autumn sets it to 503 when a drain starts. When
+      # the probe fails, the platform stops new requests to the replica. One
+      # success is enough, so a scale-from-zero replica gets traffic quickly.
       readiness_probe {
-        transport = "HTTP"
-        port      = 3000
-        path      = "/ready"
+        transport               = "HTTP"
+        port                    = 3000
+        path                    = "/ready"
+        interval_seconds        = 5
+        success_count_threshold = 1
+        timeout                 = 3
       }
 
       # A failed liveness probe restarts the replica. /live does not fail
-      # when a dependency (the database, say) is down.
+      # when a dependency, such as the database, is down.
       liveness_probe {
         transport = "HTTP"
         port      = 3000
         path      = "/live"
+        timeout   = 3
       }
 
       env {

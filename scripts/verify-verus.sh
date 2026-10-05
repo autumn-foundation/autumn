@@ -8,8 +8,7 @@
 # CI runs this script from .github/workflows/verus.yml. A new spec in
 # verification/ is checked with no workflow change.
 #
-# The script checks every spec, also after a failure, and then exits 1 if
-# one or more specs failed.
+# The script checks all specs. It exits 1 if a spec fails.
 
 set -euo pipefail
 # An empty verification/ must not expand to the literal glob.

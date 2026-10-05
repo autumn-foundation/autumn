@@ -540,9 +540,9 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       # Cloud Run sends no traffic to an instance until its startup probe
-      # passes. Cloud Run has no readiness probe: it stops traffic to an
-      # instance by itself before SIGTERM. The budget is 24 x 5s = 2 minutes
-      # for a slow first boot. The bootstrap "hello" image answers 200 on
+      # passes. This template uses no readiness probe: Cloud Run stops
+      # traffic to an instance by itself before SIGTERM. A slow first boot
+      # gets 2 minutes (24 x 5s). The bootstrap "hello" image answers 200 on
       # every path, so it passes too.
       startup_probe {
         period_seconds    = 5
@@ -554,8 +554,10 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       # A failed liveness probe restarts the instance. /live does not fail
-      # when a dependency (the database, say) is down.
+      # when a dependency, such as the database, is down.
       liveness_probe {
+        period_seconds  = 10
+        timeout_seconds = 3
         http_get {
           path = "/live"
         }

@@ -1673,8 +1673,9 @@ The command emits three files at the project root:
 > recompile what changed), installs `libpq`, `tini`, and `ca-certificates` in the
 > slim runtime, copies compiled Tailwind assets from `static/`, leaves
 > migrations to an explicit primary-role job, and wires the `/live` liveness
-> probe as the container `HEALTHCHECK`. A failed `HEALTHCHECK` restarts the
-> container, so it uses `/live`, not `/ready`.
+> probe as the container `HEALTHCHECK`. An orchestrator that acts on health
+> status (Docker Swarm, for example) replaces an unhealthy container, so the
+> check uses `/live`, not `/ready`.
 
 ---
 
@@ -2401,7 +2402,7 @@ APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply 
 # app can't boot. HealthCheckConfiguration sets the real "/ready" path —
 # main.tf's bootstrap revision used "/" (nginx's own default response)
 # since the bootstrap placeholder doesn't serve /ready. /ready goes to 503
-# when a drain starts, so App Runner stops new traffic first.
+# when a drain starts. /health is only an alias of /ready.
 OPERATION_ID=$(aws apprunner update-service --service-arn "$SERVICE_ARN" \
   --instance-configuration "{\"InstanceRoleArn\": \"$INSTANCE_ROLE\"}" \
   --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/ready\"}" \

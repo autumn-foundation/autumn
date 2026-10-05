@@ -567,8 +567,9 @@ resource "aws_apprunner_service" "this" {
   # "/" (nginx's own default welcome page, always 200), not "/ready" — see
   # the image_configuration.port comment above; the real cutover call in
   # docs/guide/deployment.md sets "/ready" once the actual app (which
-  # serves it) is live. /ready goes to 503 when a drain starts, so App
-  # Runner stops new traffic to that instance.
+  # serves it) is live. /ready goes to 503 when a drain starts. App Runner
+  # also replaces an instance that stays unhealthy. The old alias path gave
+  # the same result.
   health_check_configuration {
     protocol = "HTTP"
     path     = "/"

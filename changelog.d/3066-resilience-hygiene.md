@@ -2,18 +2,19 @@
 
 - **release:** release templates now use `/ready` for traffic checks and
   `/live` for liveness, not the `/health` alias (issue #3066). The ECS target
-  group and the App Runner cutover check `/ready`, so a drain stops traffic
-  first. The image `HEALTHCHECK` checks `/live`, so a database outage does not
-  restart the container. Cloud Run gets a `/startup` startup probe and a
-  `/live` liveness probe. Azure Container Apps gets a `/ready` readiness probe
-  and a `/live` liveness probe. Files that you generated before this change
+  group and the App Runner cutover now check `/ready`. `/health` is only an
+  alias of `/ready`. The image `HEALTHCHECK` checks `/live`, so Docker Swarm does not
+  replace containers during a database outage. Cloud Run gets a `/startup`
+  startup probe and a `/live` liveness probe. Azure Container Apps gets a
+  `/startup` startup probe, a `/ready` readiness probe and a `/live` liveness
+  probe. Files that you generated before this change
   keep the old paths. Change them by hand.
 
 ### Documentation
 
-- **config:** `server.timeouts.request_timeout_ms` returns `503`, not `408`.
-  The doc now says this.
-- **jobs:** Postgres job workers poll every 200ms. They do not use
+- **config:** a request that exceeds `server.timeouts.request_timeout_ms` gets
+  `503`, not `408`. The `RequestTimeoutsConfig` doc now says this.
+- **jobs:** an idle Postgres job worker polls every 200ms. Workers do not use
   `LISTEN`/`NOTIFY`. The jobs guide and the code comments now say this.
 
 ### Testing
