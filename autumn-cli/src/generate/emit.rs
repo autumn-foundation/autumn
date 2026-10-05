@@ -1147,6 +1147,11 @@ impl Plan {
                      skipping — pass --force to remove it anyway.",
                     relative_display(&real_dir, &self.project_root),
                 )),
+                MigrationOutcome::StillNeededByCommentable(real_dir) => warnings.push(format!(
+                    "migration {} creates the `comments` table that another `#[commentable]` \
+                     model still uses; skipping — pass --force to remove it anyway.",
+                    relative_display(&real_dir, &self.project_root),
+                )),
                 MigrationOutcome::NotFound => {}
             }
         }
@@ -1642,6 +1647,10 @@ enum MigrationOutcome {
     /// the ones this destroy is itself removing still opts into
     /// `--list-unsubscribe` — never removed except with `--force`.
     StillNeededElsewhere(PathBuf),
+    /// This migration creates the `comments` table, and another
+    /// `#[commentable]` model still needs it (#2283) — never removed except
+    /// with `--force`.
+    StillNeededByCommentable(PathBuf),
     /// No on-disk directory matches this suffix — already destroyed, or
     /// never generated.
     NotFound,
@@ -1896,6 +1905,18 @@ fn resolve_migration_removal(
     let (version, _) = split_migration_dir_name(real_dir_name);
     match migration_applied_status(version, migrations_root) {
         MigrationStatus::Applied | MigrationStatus::Unknown => MigrationOutcome::Applied(real_dir),
+        // After the status check: `--force` can remove only an unapplied
+        // migration, so only then is it the way out (#2283).
+        MigrationStatus::NotApplied | MigrationStatus::NotConfigured
+            if !force
+                && super::commentable::comments_migration_still_needed(
+                    project_root,
+                    &real_dir,
+                    excluding,
+                ) =>
+        {
+            MigrationOutcome::StillNeededByCommentable(real_dir)
+        }
         MigrationStatus::NotApplied | MigrationStatus::NotConfigured => {
             MigrationOutcome::Remove(real_dir)
         }
@@ -3393,6 +3414,126 @@ mod tests {
             plan.revert(Flags::default()).unwrap();
 
             assert!(!real_dir.exists());
+        });
+    }
+
+    /// #2283: an adopted `comments` table starts with the `Comment` model's
+    /// own migration. Plant it, a later adoption `ALTER`, and a `Post` model
+    /// that is still `#[commentable]`. Returns the real migration directory.
+    fn adopted_comments_fixture(tmp: &tempfile::TempDir, plan: &mut Plan) -> PathBuf {
+        let plain_sql = "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, \
+                     created_at TIMESTAMP NOT NULL);\n";
+        let real_dir = tmp.path().join("migrations/20260101000000_create_comments");
+        fs::create_dir_all(&real_dir).unwrap();
+        fs::write(real_dir.join("up.sql"), plain_sql).unwrap();
+        fs::write(real_dir.join("down.sql"), "DROP TABLE comments;\n").unwrap();
+        let adopt = tmp.path().join("migrations/20260102000000_adopt_comments");
+        fs::create_dir_all(&adopt).unwrap();
+        fs::write(
+            adopt.join("up.sql"),
+            "ALTER TABLE comments ADD COLUMN commentable_type TEXT, \
+             ADD COLUMN commentable_id BIGINT, ADD COLUMN parent_id BIGINT, \
+             ADD COLUMN author_id BIGINT, ADD COLUMN deleted_at TIMESTAMP;\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+        fs::write(
+            tmp.path().join("src/models/post.rs"),
+            "#[commentable]\npub struct Post {}\n",
+        )
+        .unwrap();
+        let plan_dir = tmp.path().join("migrations/99999999999999_create_comments");
+        plan.create(plan_dir.join("up.sql"), plain_sql);
+        plan.create(plan_dir.join("down.sql"), "DROP TABLE comments;\n");
+        real_dir
+    }
+
+    #[test]
+    fn revert_keeps_a_comments_migration_the_shared_table_needs() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            let real_dir = adopted_comments_fixture(&tmp, &mut plan);
+            plan.revert(Flags::default()).unwrap();
+            assert!(real_dir.exists(), "`Post` still needs this `CREATE TABLE`");
+        });
+    }
+
+    #[test]
+    fn revert_with_force_removes_a_comments_migration_the_shared_table_needs() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            let real_dir = adopted_comments_fixture(&tmp, &mut plan);
+            plan.revert(Flags {
+                force: true,
+                dry_run: false,
+            })
+            .unwrap();
+            assert!(!real_dir.exists());
+        });
+    }
+
+    #[test]
+    fn revert_removes_a_comments_migration_no_commentable_model_needs() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            let real_dir = adopted_comments_fixture(&tmp, &mut plan);
+            fs::remove_file(tmp.path().join("src/models/post.rs")).unwrap();
+            plan.revert(Flags::default()).unwrap();
+            assert!(!real_dir.exists());
+        });
+    }
+
+    /// An applied migration is kept even with `--force`, so the warning must
+    /// not offer `--force` as the way out.
+    #[test]
+    fn an_applied_needed_comments_migration_gets_the_applied_warning() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                (
+                    "AUTUMN_DATABASE__URL",
+                    Some("postgres://postgres:x@127.0.0.1:1/nope"),
+                ),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let (tmp, mut plan) = fixture();
+                let real_dir = adopted_comments_fixture(&tmp, &mut plan);
+                let warnings = plan.compute_revert_plan(false).warnings;
+                assert!(
+                    warnings.iter().any(|w| w.contains("appears to be applied")),
+                    "{warnings:#?}"
+                );
+                assert!(
+                    !warnings.iter().any(|w| w.contains("pass --force")),
+                    "{warnings:#?}"
+                );
+                assert!(real_dir.exists());
+            },
+        );
+    }
+
+    /// The old behaviour left a separate generator-written shared migration.
+    /// The plain `Comment` migration is then not needed.
+    #[test]
+    fn revert_removes_a_comments_migration_beside_the_generated_shared_one() {
+        no_db_env(|| {
+            let (tmp, mut plan) = fixture();
+            let real_dir = adopted_comments_fixture(&tmp, &mut plan);
+            fs::remove_dir_all(tmp.path().join("migrations/20260102000000_adopt_comments"))
+                .unwrap();
+            let shared = tmp
+                .path()
+                .join("migrations/202601010000002_create_comments");
+            fs::create_dir_all(&shared).unwrap();
+            fs::write(
+                shared.join("up.sql"),
+                super::super::commentable::up_sql(autumn_web::config::DatabaseBackend::Postgres),
+            )
+            .unwrap();
+            plan.revert(Flags::default()).unwrap();
+            assert!(!real_dir.exists());
+            assert!(shared.exists());
         });
     }
 

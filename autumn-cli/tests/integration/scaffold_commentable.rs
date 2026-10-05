@@ -63,6 +63,15 @@ fn migration_ending_in(project: &Path, suffix: &str) -> Option<std::path::PathBu
         })
 }
 
+/// The number of migration directories whose name ends in `suffix`.
+fn count_migrations_ending_in(project: &Path, suffix: &str) -> usize {
+    fs::read_dir(project.join("migrations"))
+        .expect("migrations dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(suffix))
+        .count()
+}
+
 fn scaffolded(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn_ok(tmp.path(), &["new", name]);
@@ -410,43 +419,103 @@ fn generate_model_with_the_token_also_emits_the_shared_table() {
     assert!(model.contains("pub comment_count: i64"), "{model}");
 }
 
-/// A `Comment` resource scaffolded the ordinary way produces a migration
-/// directory with the very same name. Detecting the shared table by *name*
-/// would make a later `comments:commentable` skip it — while reporting that it
-/// was reused — and every `add_comment` would then fail at runtime on the
-/// missing discriminator columns.
+/// Issue #2283: a `Comment` scaffold makes a plain `comments` table. The shared
+/// table has the same name, so a second `CREATE TABLE comments` stops
+/// `migrate`. Generation must refuse, write no file, and name the remedy. The
+/// remedy must then work.
 #[test]
-fn a_scaffolded_comment_resource_does_not_suppress_the_shared_table() {
+fn a_scaffolded_comment_resource_blocks_the_shared_table() {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn_ok(tmp.path(), &["new", "cmt-collide-app"]);
     let project = tmp.path().join("cmt-collide-app");
     run_autumn_ok(&project, &["generate", "scaffold", "Comment", "body:Text"]);
-    run_autumn_ok(
+    let post_scaffold = [
+        "generate",
+        "scaffold",
+        "Post",
+        "title:String",
+        "comments:commentable",
+    ];
+
+    let (ok, output) = run_autumn(&project, &post_scaffold);
+    assert!(
+        !ok,
+        "a plain `comments` table must block generation:\n{output}"
+    );
+    assert!(output.contains("`commentable_type`"), "{output}");
+    assert!(output.contains("Rename or drop"), "{output}");
+    assert_eq!(
+        count_migrations_ending_in(&project, "_create_comments"),
+        1,
+        "the refusal must not write the shared migration"
+    );
+    assert_eq!(
+        count_migrations_ending_in(&project, "_create_posts"),
+        0,
+        "the refusal must not write the Post scaffold"
+    );
+    assert!(!project.join("src/models/post.rs").exists());
+
+    // The remedy: rename the plain table away. The generator then adds the
+    // shared table beside it, but only once no model still uses `comments`.
+    let rename = project.join("migrations/99990101000000_rename_comments");
+    fs::create_dir_all(&rename).expect("mkdir");
+    fs::write(
+        rename.join("up.sql"),
+        "ALTER TABLE comments RENAME TO notes;\n",
+    )
+    .expect("write");
+    let (ok, output) = run_autumn(&project, &post_scaffold);
+    assert!(!ok, "the `Comment` model still uses `comments`:\n{output}");
+    assert!(output.contains("src/models/comment.rs"), "{output}");
+
+    // Retarget the model at the renamed table.
+    let model = project.join("src/models/comment.rs");
+    let source = fs::read_to_string(&model).expect("model");
+    fs::write(
+        &model,
+        source.replace("schema::comments", "schema::notes").replace(
+            "#[autumn_web::model]",
+            "#[autumn_web::model(table = \"notes\")]",
+        ),
+    )
+    .expect("write");
+    let (ok, output) = run_autumn(&project, &post_scaffold);
+    assert!(ok, "the remedy must unblock generation:\n{output}");
+    assert_eq!(
+        count_migrations_ending_in(&project, "_create_comments"),
+        2,
+        "the shared table is added beside the renamed one"
+    );
+}
+
+/// `generate model` takes the same token, so it must refuse the same way.
+#[test]
+fn generate_model_refuses_a_plain_comments_table() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "cmt-model-collide-app"]);
+    let project = tmp.path().join("cmt-model-collide-app");
+    run_autumn_ok(&project, &["generate", "model", "Comment", "body:Text"]);
+
+    let (ok, output) = run_autumn(
         &project,
         &[
             "generate",
-            "scaffold",
+            "model",
             "Post",
             "title:String",
             "comments:commentable",
         ],
     );
-
-    let polymorphic = fs::read_dir(project.join("migrations"))
-        .expect("migrations dir")
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            // The column DEFINITION, not any mention of it: a commentable
-            // parent's own migration names `commentable_type` too, inside the
-            // cleanup trigger that deletes its comments.
-            fs::read_to_string(entry.path().join("up.sql"))
-                .is_ok_and(|sql| sql.contains("commentable_type TEXT NOT NULL"))
-        })
-        .count();
-    assert_eq!(
-        polymorphic, 1,
-        "the polymorphic table must still be emitted alongside the Comment resource's own"
+    assert!(
+        !ok,
+        "a plain `comments` table must block generation:\n{output}"
     );
+    assert!(output.contains("`commentable_type`"), "{output}");
+    assert!(output.contains("Rename or drop"), "{output}");
+    assert_eq!(count_migrations_ending_in(&project, "_create_comments"), 1);
+    assert_eq!(count_migrations_ending_in(&project, "_create_posts"), 0);
+    assert!(!project.join("src/models/post.rs").exists());
 }
 
 /// `destroy scaffold` must not delete a polymorphic `comments` migration this
