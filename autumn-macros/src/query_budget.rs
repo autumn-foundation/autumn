@@ -2830,10 +2830,14 @@ impl Analyzer {
     /// An argument that runs at most once, such as a transaction callback.
     /// The closure body is a fixed cost.
     fn callback_arg(&mut self, arg: &Expr, param: Kind, takes_callback: bool) -> Cost {
-        let Expr::Closure(closure) = arg else {
-            return self.non_closure_arg(arg, takes_callback);
+        let cost = match arg {
+            Expr::Closure(closure) => self.optional(|s| s.closure_body(closure, &[], param)),
+            _ => self.non_closure_arg(arg, takes_callback),
         };
-        self.optional(|s| s.closure_body(closure, &[], param))
+        // Only this argument's closure gets a connection: a named callback
+        // never consumes the flag, so it must not reach a later closure.
+        self.connection_params = false;
+        cost
     }
 
     /// A loop's flow. `body` runs in its own scope and break frame, zero or
@@ -3149,12 +3153,8 @@ impl Analyzer {
             let callback = takes_callback && (every || i == last);
             let param = self.side_param(method, i).unwrap_or(param);
             let next = if runs_once {
-                // Only this argument's closure gets a connection: a named
-                // callback never consumes the flag.
                 self.connection_params = is_transaction;
-                let next = self.callback_arg(arg, param, callback);
-                self.connection_params = false;
-                next
+                self.callback_arg(arg, param, callback)
             } else {
                 self.closure_arg(arg, param, callback)
             };
@@ -9696,6 +9696,13 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let q = repo.scoped(); let _ = q.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+            (
+                "a named free-function transaction callback does not leak the connection flag",
+                "async fn h(db: Db, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 #[query_cost(1)] let _ = scoped_transaction(&mut db, run); \
+                 let _ = (|r| r.tx(|c| c.find_all()))(repo); Ok(0) }",
+                Expect::Unbounded,
             ),
             (
                 "a named transaction callback does not leak the connection flag",
