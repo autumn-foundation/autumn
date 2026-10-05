@@ -2057,7 +2057,10 @@ impl Analyzer {
             ),
             // `let alias = result;` or `result.as_ref()` keeps the recorded
             // parts.
-            other => wrapper_root(other).and_then(|name| self.env.binding(&name).parts),
+            other => match self.sides_of(other) {
+                Some((ok, err)) => Some(vec![("Ok".to_string(), ok), ("Err".to_string(), err)]),
+                None => wrapper_root(other).and_then(|name| self.env.binding(&name).parts),
+            },
         };
         Binding {
             kind,
@@ -4041,7 +4044,40 @@ impl Analyzer {
     /// What side `side` (`Ok` or `Err`) of a named `Result` with known sides
     /// holds: `result`, `result.as_ref()`, `result.as_mut()`.
     fn side_kind(&self, e: &Expr, side: &str) -> Option<Kind> {
-        self.env.part(&wrapper_root(e)?, side)
+        match (side, self.sides_of(e)) {
+            ("Ok", Some((ok, _))) => Some(ok),
+            ("Err", Some((_, err))) => Some(err),
+            _ => self.env.part(&wrapper_root(e)?, side),
+        }
+    }
+
+    /// What the `Ok` and `Err` sides of a `Result` hold, when known: a named
+    /// `Result`, through `as_ref`, `as_mut`, `inspect`, `inspect_err` and
+    /// `clone`, and after `map` or `map_err`.
+    fn sides_of(&self, e: &Expr) -> Option<(Kind, Kind)> {
+        let Expr::MethodCall(mc) = peel_refs(e) else {
+            let name = path_ident(peel_refs(e))?;
+            return Some((self.env.part(&name, "Ok")?, self.env.part(&name, "Err")?));
+        };
+        let method = mc.method.to_string();
+        let callback = |side: Kind| match mc.args.last() {
+            Some(f @ Expr::Closure(_)) => Some(self.closure_output(f, side)),
+            _ => None,
+        };
+        match method.as_str() {
+            "as_ref" | "as_mut" | "inspect" | "inspect_err" | "clone" => {
+                self.sides_of(&mc.receiver)
+            }
+            "map" => {
+                let (ok, err) = self.sides_of(&mc.receiver)?;
+                Some((callback(ok)?, err))
+            }
+            "map_err" => {
+                let (ok, err) = self.sides_of(&mc.receiver)?;
+                Some((ok, callback(err)?))
+            }
+            _ => None,
+        }
     }
 
     /// Is `e` a database connection: a handle with the `Db` shape? A
@@ -9738,6 +9774,36 @@ mod tests {
                 "a typed Result keeps its sides when reassigned",
                 "async fn h(x: i64) -> AutumnResult<usize> { \
                  let mut result: Result<PgPostRepository, Error> = make(x); result = make(x); let e = result.unwrap_err(); render(e); Ok(0) }",
+                Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn transformed_results_keep_their_sides() {
+        check_handlers(&[
+            (
+                "a mapped Result keeps its error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let mapped = result.map(|r| r); let _ = mapped.map_err(|e| render(e)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a map_err Result keeps its value side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let mapped = result.map_err(|e| e); let _ = mapped.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a mapped Result keeps its handle side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let mapped = result.map(|r| r); let _ = mapped.map(|r| render(r)); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a Result mapped to plain drops the handle",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let ids = result.map(|_| 1); let _ = ids.map(|n| render(n)); Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);
