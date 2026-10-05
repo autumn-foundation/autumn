@@ -106,11 +106,12 @@ impl DbIdempotencyStore {
         {
             return;
         }
-        if let Err(error) =
-            diesel::delete(keys::autumn_idempotency_keys.filter(keys::expires_at_ms.le(now_ms())))
-                .execute(conn)
-                .await
-        {
+        let now = now_ms();
+        // A row with a live lock stays: its owner may still commit to it.
+        let expired = keys::autumn_idempotency_keys
+            .filter(keys::expires_at_ms.le(now))
+            .filter(keys::locked_until_ms.le(now));
+        if let Err(error) = diesel::delete(expired).execute(conn).await {
             tracing::warn!(%error, "Idempotency key sweep failed; the next sweep retries");
         }
     }
@@ -194,10 +195,14 @@ impl IdempotencyStore for DbIdempotencyStore {
             // Check first without a row lock. On Postgres the upsert below
             // waits for any open transaction that changed the row, so a
             // duplicate of a running request must return here, at once.
+            // Busy: a live lock, or a record that has not expired.
             let busy = keys::autumn_idempotency_keys
                 .filter(keys::storage_key.eq(key))
-                .filter(keys::expires_at_ms.gt(now))
-                .filter(keys::record.is_not_null().or(keys::locked_until_ms.gt(now)))
+                .filter(
+                    keys::locked_until_ms
+                        .gt(now)
+                        .or(keys::record.is_not_null().and(keys::expires_at_ms.gt(now))),
+                )
                 .select(keys::storage_key)
                 .first::<String>(&mut conn)
                 .await
@@ -207,11 +212,12 @@ impl IdempotencyStore for DbIdempotencyStore {
             if busy {
                 return Ok(false);
             }
-            // An expired key starts over.
+            // An expired key with no live lock starts over.
             diesel::delete(
                 keys::autumn_idempotency_keys
                     .filter(keys::storage_key.eq(key))
-                    .filter(keys::expires_at_ms.le(now)),
+                    .filter(keys::expires_at_ms.le(now))
+                    .filter(keys::locked_until_ms.le(now)),
             )
             .execute(&mut conn)
             .await

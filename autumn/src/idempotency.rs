@@ -1707,10 +1707,7 @@ where
         }
     }
 
-    // The record must outlive the lock: a row that expires while its owner
-    // still holds the lock could be deleted and claimed by a second request.
-    let record_ttl = ttl.max(in_flight_ttl);
-    let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, record_ttl);
+    let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, ttl);
     handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock, probe).await
 }
 
