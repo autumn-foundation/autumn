@@ -195,6 +195,22 @@ JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' 
 # them all to the app) and the three that main.tf makes. Credential removal
 # and rollback remove all of them.
 MANAGED_DEF="def managed: $(jq -c '. + ["database-url", "signing-secret", "redis-url"] | unique' <<< "$JOB_SECRET_NAMES");"
+# The app's own (unmanaged) secrets and other registries that use a job
+# identity. Credential removal drops that identity, which breaks them, and
+# keeping it would keep vault access on the placeholder. So the script
+# stops before a first cutover (its rollback removes the credentials) or a
+# removal, and names them.
+SHARED_IDENTITY=$(jq -r --argjson app "$APP" --argjson uids "$JOB_UIDS" --arg acr "$ACR_LOGIN_SERVER" "$MANAGED_DEF"'
+  ($uids | map(ascii_downcase)) as $lids
+  | [(.[] | select(.keyVaultUrl and ((.identity // "" | ascii_downcase) | IN($lids[]))
+               and (.name | IN(managed[]) | not)) | "secret " + .name),
+     ($app.properties.configuration.registries // [] | .[]
+      | select(.server != $acr and ((.identity // "" | ascii_downcase) | IN($lids[]))) | "registry " + .server)]
+  | join(", ")' "$APP_SECRETS")
+shared_identity_stop() {
+  echo "::error::the app's $SHARED_IDENTITY use(s) an identity of the migration job. Credential removal would drop that identity. Give them another identity, and try again." >&2
+  exit 1
+}
 JOB_SECRET_REFS=$(jq -c '[.properties.configuration.secrets // [] | .[]
   | {name, keyVaultUrl, identity: (.identity // "" | ascii_downcase)}]' <<< "$JOB")
 # Redis is off now, but the app still has the redis-url secret. The old
@@ -554,6 +570,7 @@ if [ "$MODE" = remove ]; then
     echo "::error::the migration job has no identity. Run terraform apply first." >&2
     exit 1
   fi
+  [ -z "$SHARED_IDENTITY" ] || shared_identity_stop
   remove_credentials || { echo "::error::cannot remove the credentials from $AZURE_APP_NAME" >&2; exit 1; }
   echo "removed the credentials from the placeholder app $AZURE_APP_NAME"
   exit 0
@@ -571,6 +588,10 @@ if [ -z "$JOB_IDENTITY" ] \
   || ! jq -e '(.properties.configuration.secrets // []) | length > 0' <<< "$JOB" > /dev/null; then
   echo "::error::the migration job has no identity or secrets to copy. Run terraform apply first." >&2
   exit 1
+fi
+# A first cutover can roll back, which removes the credentials.
+if [ -z "$RELEASED" ] && [ -n "$SHARED_IDENTITY" ]; then
+  shared_identity_stop
 fi
 if [ -n "$SYSTEM_SECRETS" ]; then
   echo "::error::the job secret(s) $SYSTEM_SECRETS use the job's system identity. The app's system identity is another principal, without access to the vault. Give the secret a user-assigned identity that can read the vault, and try again." >&2

@@ -2050,7 +2050,9 @@ managed identity, no registry and no secret refs. The scaffolded
 `azure-cutover.sh` copies them from the migration job and sets the real image
 in one write. A Key Vault secret that you add to the job must use a
 user-assigned identity: the app cannot use the job's system identity, so
-the script stops on such a secret. The identity applies to all revisions, so the first cutover
+the script stops on such a secret. Do not give a secret or registry that
+you add to the app an identity of the migration job: credential removal
+drops those identities, so the script stops on that too. The identity applies to all revisions, so the first cutover
 disables ingress (also the internal route) and waits until the placeholder
 runs no replica. Then nothing can start the placeholder again. Keep
 `min_replicas = 0` until then: the script stops if the template or an active
