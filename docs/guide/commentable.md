@@ -83,9 +83,18 @@ CREATE INDEX IF NOT EXISTS idx_comments_parent_id ON comments (parent_id);
 exactly that, plus `comment_count BIGINT NOT NULL DEFAULT 0` on the scaffolded
 model and the `#[commentable]` attribute. Run it again for a second model and
 it adds only the column and the attribute — the table is shared, and the
-generator will not recreate it — and if the project already has an unrelated
-`comments` table, the migration fails loudly at `migrate` rather than no-opping
-into a runtime `column "commentable_type" does not exist`.
+generator will not recreate it.
+
+### A `comments` table that is not the shared one (#2283)
+
+A `Comment` model from `autumn generate scaffold Comment body:Text` makes a
+plain `comments` table. The shared table has the same name. The generator
+refuses `comments:commentable` in that project, writes no file, and names the
+missing columns. Do one of these steps, then run the command again:
+
+- Write a migration that renames or drops the existing `comments` table.
+- Write a migration that adds the missing columns, with the types shown above.
+  The generator then uses that table.
 
 ### Why `commentable_id` has no foreign key
 

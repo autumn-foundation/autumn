@@ -22,12 +22,13 @@
 //! already has an unrelated `comments` table (a `Comment` resource scaffolded
 //! the ordinary way, say) is a real conflict the author has to resolve, and
 //! `IF NOT EXISTS` would turn it into a silent no-op whose only symptom is a
-//! `column "commentable_type" does not exist` at request time. Failing the
-//! migration says so at `migrate`, where it is fixable.
+//! `column "commentable_type" does not exist` at request time. The generator
+//! refuses that project instead and names the remedy (#2283).
 
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::generate::GenerateError;
 use crate::generate::emit::Plan;
 
 /// The shared comments table's name. Not configurable from the DSL token: the
@@ -157,36 +158,63 @@ pub fn migration_dir_name(timestamp: &str) -> String {
 /// that is what is matched.
 #[must_use]
 pub fn already_migrated(project_root: &Path) -> bool {
-    let (exists, polymorphic) = comments_table_state(project_root);
-    exists && polymorphic
+    matches!(comments_table(project_root), CommentsTable::Shared)
 }
 
-/// A `comments` table that exists but is NOT the polymorphic one.
-///
-/// A `Comment` model scaffolded the ordinary way creates exactly that, and the
-/// shared table takes the same name — so emitting ours produces a second
-/// `CREATE TABLE comments` and `migrate` stops on "already exists". Skipping
-/// ours instead would be worse (every helper would query discriminator columns
-/// that are not there), so generation still emits and the caller warns. See
-/// #2283 for turning this into a refusal at generate time.
-pub fn conflicting_comments_table(project_root: &Path) -> bool {
-    let (exists, polymorphic) = comments_table_state(project_root);
-    exists && !polymorphic
+/// The `comments` table the migration history leaves behind.
+#[derive(Debug, PartialEq, Eq)]
+enum CommentsTable {
+    /// No `comments` table.
+    Absent,
+    /// The shared, polymorphic table: every helper's column is present.
+    Shared,
+    /// A `comments` table without these [`REQUIRED_COLUMNS`] (#2283). A
+    /// `Comment` model scaffolded the ordinary way makes one.
+    Conflicting(Vec<&'static str>),
 }
 
-/// Replay the history once: does a `comments` table exist, and is it polymorphic.
-/// Replay the history once: does a `comments` table exist, and is it the
-/// polymorphic one (every helper's column present).
-fn comments_table_state(project_root: &Path) -> (bool, bool) {
+/// Replay the history once and classify the `comments` table.
+fn comments_table(project_root: &Path) -> CommentsTable {
     let tables = replay_migration_history(&migration_up_sql(project_root));
-    let state = tables.get(&TableRef::comments());
-    let exists = state.is_some_and(|table| table.exists);
-    let complete = state.is_some_and(|table| {
-        REQUIRED_COLUMNS
-            .iter()
-            .all(|column| table.columns.contains(column))
-    });
-    (exists, complete)
+    match tables.get(&TableRef::comments()) {
+        Some(table) if table.exists => {
+            let missing: Vec<&'static str> = REQUIRED_COLUMNS
+                .iter()
+                .copied()
+                .filter(|column| !table.columns.contains(column))
+                .collect();
+            if missing.is_empty() {
+                CommentsTable::Shared
+            } else {
+                CommentsTable::Conflicting(missing)
+            }
+        }
+        _ => CommentsTable::Absent,
+    }
+}
+
+/// The refusal for a `comments` table that is not the shared one (#2283).
+///
+/// Emitting anyway writes a second `CREATE TABLE comments`, and `migrate`
+/// stops on "already exists". Skipping is worse: every helper then queries
+/// columns that are not there.
+fn conflicting_table_error(missing: &[&str]) -> GenerateError {
+    let missing = missing
+        .iter()
+        .map(|column| format!("`{column}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    GenerateError::Config(format!(
+        "cannot add the shared `{COMMENTS_TABLE}` table: the project already has a \
+         `{COMMENTS_TABLE}` table that is not polymorphic. A `Comment` model from \
+         `autumn generate` makes this type of table. These columns are missing: \
+         {missing}. No file was written. Do one of these steps, then run the command \
+         again:\n\
+         \x20 - Write a migration that renames or drops the existing `{COMMENTS_TABLE}` \
+         table.\n\
+         \x20 - Write a migration that adds the missing columns. The generator then \
+         uses that table. See docs/guide/commentable.md for the column types."
+    ))
 }
 
 /// A table reference parsed from DDL: `[schema.]name`, each half optionally
@@ -681,9 +709,9 @@ fn mentions_column(haystack: &str, column: &str) -> bool {
 /// generation would have SAID it was reusing the table.
 ///
 /// So the whole schema is the question. A table missing any of these is not the
-/// shared table: the generator emits its own and, if the name is taken, says so
-/// (see `conflicting_comments_table`). A loud collision at migrate time beats a
-/// reassuring message and an app that breaks on its first comment.
+/// shared table: the generator emits its own, or refuses when the name is
+/// taken (see [`CommentsTable::Conflicting`]). A refusal beats a reassuring
+/// message and an app that breaks on its first comment.
 const REQUIRED_COLUMNS: &[&str] = &[
     "id",
     "commentable_type",
@@ -1100,18 +1128,27 @@ fn strip_sql_comments(sql: &str) -> String {
 ///
 /// Returns whether the migration was emitted, so the caller can surface the
 /// "already there, reusing it" case as a warning rather than silence.
+///
+/// # Errors
+///
+/// Returns [`GenerateError::Config`] when a `comments` table exists but is not
+/// the shared one (#2283). A revert never refuses.
 pub fn push_commentable_migration(
     plan: &mut Plan,
     project_root: &Path,
     timestamp: &str,
     backend: autumn_web::config::DatabaseBackend,
     for_revert: bool,
-) -> bool {
+) -> Result<bool, GenerateError> {
     // On a revert plan the directory is (by construction) already on disk from
-    // the generate run being undone, so `already_migrated` would always say
-    // "skip" and the revert would never take it back out.
-    if !for_revert && already_migrated(project_root) {
-        return false;
+    // the generate run being undone, so the table always reads as present and
+    // the revert would never take it back out.
+    if !for_revert {
+        match comments_table(project_root) {
+            CommentsTable::Shared => return Ok(false),
+            CommentsTable::Conflicting(missing) => return Err(conflicting_table_error(&missing)),
+            CommentsTable::Absent => {}
+        }
     }
     // …but only take out a migration this generator actually WROTE. A project
     // whose polymorphic `comments` table predates the scaffold got no migration
@@ -1125,14 +1162,14 @@ pub fn push_commentable_migration(
     // foreign key the header suggests, say) is left alone — leaving a file
     // behind is recoverable, deleting one is not.
     if for_revert && !generator_owned_comments_migration(project_root, backend) {
-        return false;
+        return Ok(false);
     }
     let dir = project_root
         .join("migrations")
         .join(migration_dir_name(timestamp));
     plan.create(dir.join("up.sql"), up_sql(backend));
     plan.create(dir.join("down.sql"), down_sql());
-    true
+    Ok(true)
 }
 
 /// Whether any `.rs` file under `dir`, other than `destroying_file`, declares
@@ -1258,6 +1295,11 @@ mod tests {
     use super::*;
 
     use autumn_web::config::DatabaseBackend;
+
+    /// A `comments` table exists, but it is not the shared one.
+    fn conflicting_comments_table(project_root: &Path) -> bool {
+        matches!(comments_table(project_root), CommentsTable::Conflicting(_))
+    }
 
     #[test]
     fn up_sql_declares_the_polymorphic_key_and_the_threading_column() {
@@ -2247,8 +2289,7 @@ mod tests {
         );
         assert!(
             conflicting_comments_table(tmp.path()),
-            "the name is taken: generation emits and migrate fails loudly \
-             rather than claiming a reuse"
+            "the name is taken: generation refuses rather than claiming a reuse"
         );
     }
 
@@ -2763,8 +2804,8 @@ mod tests {
             !already_migrated(tmp.path()),
             "`user_id` is not `author_id`, so the helpers would 42703"
         );
-        // It IS a name collision, so the caller warns rather than silently
-        // emitting a second `CREATE TABLE comments`.
+        // It IS a name collision, so generation refuses rather than emitting
+        // a second `CREATE TABLE comments`.
         assert!(conflicting_comments_table(tmp.path()));
 
         // Every other required column, one at a time, for the same reason.
@@ -2908,5 +2949,100 @@ mod tests {
         )
         .expect("write");
         assert!(another_model_is_still_commentable(single.path(), "post"));
+    }
+
+    /// A plain `comments` table, as a `Comment` scaffold makes it (#2283).
+    fn project_with_a_plain_comments_table() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create_comments");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, \
+             created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL);\n",
+        )
+        .expect("write");
+        tmp
+    }
+
+    /// #2283: a second `CREATE TABLE comments` stops `migrate`. Generation
+    /// must refuse, name the missing columns, and plan no file.
+    #[test]
+    fn a_plain_comments_table_blocks_the_shared_migration() {
+        let tmp = project_with_a_plain_comments_table();
+        let mut plan = Plan::new(tmp.path());
+        let err = push_commentable_migration(
+            &mut plan,
+            tmp.path(),
+            "20260101000000",
+            DatabaseBackend::Postgres,
+            false,
+        )
+        .expect_err("a plain `comments` table must block generation");
+
+        let message = err.to_string();
+        for missing in [
+            "commentable_type",
+            "commentable_id",
+            "parent_id",
+            "author_id",
+            "deleted_at",
+        ] {
+            assert!(message.contains(&format!("`{missing}`")), "{message}");
+        }
+        for present in ["`id`", "`body`", "`created_at`"] {
+            assert!(!message.contains(present), "{present} exists:\n{message}");
+        }
+        assert!(message.contains("rename"), "{message}");
+        assert!(message.contains("add"), "{message}");
+        assert!(plan.actions.is_empty(), "a refusal plans no file");
+    }
+
+    /// `destroy` must not refuse: it only removes what `generate` wrote.
+    #[test]
+    fn a_revert_ignores_a_plain_comments_table() {
+        let tmp = project_with_a_plain_comments_table();
+        let mut plan = Plan::new(tmp.path());
+        let emitted = push_commentable_migration(
+            &mut plan,
+            tmp.path(),
+            "20260101000000",
+            DatabaseBackend::Postgres,
+            true,
+        )
+        .expect("a revert never refuses");
+        assert!(!emitted, "the generator did not write this table");
+        assert!(plan.actions.is_empty());
+    }
+
+    /// The remedy works: add the missing columns, and generation reuses the
+    /// table.
+    #[test]
+    fn adding_the_missing_columns_makes_the_table_reusable() {
+        let tmp = project_with_a_plain_comments_table();
+        let dir = tmp.path().join("migrations").join("0002_adopt_comments");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "ALTER TABLE comments\n\
+             \x20   ADD COLUMN commentable_type TEXT NOT NULL,\n\
+             \x20   ADD COLUMN commentable_id BIGINT NOT NULL,\n\
+             \x20   ADD COLUMN parent_id BIGINT REFERENCES comments(id) ON DELETE CASCADE,\n\
+             \x20   ADD COLUMN author_id BIGINT NOT NULL,\n\
+             \x20   ADD COLUMN deleted_at TIMESTAMP;\n",
+        )
+        .expect("write");
+
+        let mut plan = Plan::new(tmp.path());
+        let emitted = push_commentable_migration(
+            &mut plan,
+            tmp.path(),
+            "20260101000000",
+            DatabaseBackend::Postgres,
+            false,
+        )
+        .expect("a complete table is reused, not refused");
+        assert!(!emitted);
+        assert!(plan.actions.is_empty());
     }
 }
