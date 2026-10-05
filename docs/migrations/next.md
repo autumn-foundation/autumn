@@ -109,20 +109,61 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Scheduler: the Postgres backend needs the `autumn_scheduler_ticks` table
+
+**Why:** The advisory lock freed a tick when the leader finished, so a late
+replica ran the tick again (issue #3052). A row in a table keeps the tick
+claimed.
+
+**Before (`{X.Y}`):** `scheduler.backend = "postgres"` needed no table. Each
+tick held one pool connection while it ran.
+
+```toml
+[scheduler]
+backend = "postgres"
+```
+
+**After (`{(X+1).0}`):** the same config. On first use the runtime creates
+`autumn_scheduler_ticks`. If the app's database role cannot run
+`CREATE TABLE`, apply the DDL before you deploy. Then grant `SELECT`,
+`INSERT`, `DELETE` on the table and `USAGE` on its sequence:
+
+```rust
+// The DDL to apply:
+let ddl = autumn_web::scheduler::PG_TICK_TABLE_DDL;
+```
+
+Three behaviour changes come with it:
+
+- A row stays for the task's period plus `scheduler.lease_ttl_secs`. The
+  period is the fixed delay, or the time to the next cron occurrence.
+- **Rolling upgrade.** A new replica does not claim a tick while an old
+  replica holds its advisory lock for that tick. But an old replica that
+  reaches a tick after a new replica finished it runs the tick again, as old
+  replicas did before. To prevent this, stop the old scheduler replicas
+  before the new ones start (for example, deploy the `worker` role with a
+  recreate strategy).
+- A leader that crashes mid-tick does not free the tick. The next tick runs.
+- `PostgresAdvisorySchedulerCoordinator` is a deprecated alias of
+  `PostgresTickSchedulerCoordinator`.
+
+**Automation:** `manual` - it is a database privilege change, and no code
+rewrite applies.
+
 ### Media: `MediaPlugin` installs only the primitives you enable
 
 **Why:** The docs said both primitives are off by default, but `build`
 installed storage, the encode jobs and the retention sweep for every plugin.
 `with_broadcast()` did nothing. Issue #1974.
 
-**Before (`0.8`):**
+**Before (`{X.Y}`):**
 
 ```rust
 // Storage, encode jobs and the retention sweep installed.
 autumn_web::app().plugin(MediaPlugin::new().config(media).recordings_root("recordings"))
 ```
 
-**After:**
+**After (`{(X+1).0}`):**
 
 ```rust
 // Enable the primitive you use. Broadcast also installs MediaMtxClient and MediaUrls.

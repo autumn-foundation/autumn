@@ -48,6 +48,11 @@ const DNS01_ORDER_READY_TIMEOUT: Duration = Duration::from_secs(180);
 /// The scheduler task name used for ACME renewal leader-election.
 const RENEWAL_TASK_NAME: &str = "acme-renewal";
 
+/// How long an ACME leader holds its key if it crashes before it frees it
+/// (issue #3052). Longer than one issuance: DNS-01 propagation alone can wait
+/// up to one hour. A leader that finishes frees the key at once.
+pub(crate) const ACME_LEADER_HOLD: Duration = Duration::from_secs(2 * 60 * 60);
+
 /// A per-failure callback invoked by the renewal task with a message.
 ///
 /// The app wires this to the registered [`ErrorReporter`] chain (behind the
@@ -528,11 +533,17 @@ impl AcmeRenewalTask {
         }
 
         // `Fleet` is the single-leader mode: the in-process backend always
-        // grants (correct single-replica behavior), while the Postgres backend
-        // grants to exactly one replica via an advisory lock keyed on the cert.
+        // grants (correct single-replica behavior), while a distributed backend
+        // grants to exactly one replica a key row for the cert. The key works
+        // as a mutex: hold it through `issue()`, then free it.
         let tick_key = format!("acme:{}", self.cert_id.as_str());
         let lease = match coordinator
-            .try_acquire(RENEWAL_TASK_NAME, &tick_key, TaskCoordination::Fleet)
+            .try_acquire_for_period(
+                RENEWAL_TASK_NAME,
+                &tick_key,
+                TaskCoordination::Fleet,
+                ACME_LEADER_HOLD,
+            )
             .await
         {
             Ok(Some(lease)) => lease,
@@ -543,7 +554,7 @@ impl AcmeRenewalTask {
                 return;
             }
             Err(e) => {
-                // The coordinator itself errored (e.g. the Postgres advisory-lock
+                // The coordinator itself errored (e.g. the Postgres scheduler
                 // pool is unavailable at first boot). We do NOT know whether we
                 // are the leader, so we must NOT order — but this is a real
                 // failure, not a benign "someone else leads". Record it and
@@ -560,8 +571,9 @@ impl AcmeRenewalTask {
         };
 
         let outcome = self.issue().await;
-        // Always release the lease, regardless of outcome.
-        if let Err(e) = lease.release().await {
+        // Always free the key, regardless of outcome, so the next check can
+        // take it.
+        if let Err(e) = lease.release_and_free().await {
             tracing::warn!(error = %e, "failed to release ACME renewal lease");
         }
 
@@ -1809,6 +1821,65 @@ mod tests {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async { Ok(None) })
         }
+    }
+
+    /// Records the hold period of the leader claim, then answers "another
+    /// replica leads".
+    struct HoldRecordingCoordinator {
+        period: Arc<std::sync::Mutex<Option<Duration>>>,
+    }
+
+    impl SchedulerCoordinator for HoldRecordingCoordinator {
+        fn backend(&self) -> &'static str {
+            "postgres"
+        }
+        fn replica_id(&self) -> &'static str {
+            "test-replica"
+        }
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn try_acquire_for_period<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: TaskCoordination,
+            period: Duration,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            *self.period.lock().unwrap() = Some(period);
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    // Issue #3052: the cert key works as a mutex. The leader claim must hold
+    // it for longer than one issuance, or a second replica orders mid-flight.
+    #[tokio::test]
+    async fn renewal_leader_claim_holds_the_key_for_a_whole_issuance() {
+        let (task, _store_dir, _status) = degraded_test_task(false);
+        let reporter: ReporterFn = Arc::new(|_| {});
+        let period = Arc::new(std::sync::Mutex::new(None));
+        let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(HoldRecordingCoordinator {
+            period: Arc::clone(&period),
+        });
+
+        task.try_renew_once(&coordinator, &reporter).await;
+
+        assert_eq!(*period.lock().unwrap(), Some(ACME_LEADER_HOLD));
+        assert!(
+            ACME_LEADER_HOLD > Duration::from_secs(3_600),
+            "above max DNS-01 wait"
+        );
     }
 
     /// Build a renewal task serving the self-signed placeholder (pre-issuance
