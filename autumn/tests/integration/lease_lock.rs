@@ -553,6 +553,9 @@ fn generations_strictly_increase_under_concurrency() {
         .enable_all()
         .build()
         .expect("runtime");
+    // The container's `Drop` needs a runtime context. Declare this guard
+    // first, so it is dropped last.
+    let _runtime = rt.enter();
     let (url, _container) = rt.block_on(start_postgres());
     let pool = pool_for(&url);
     let case = std::sync::atomic::AtomicUsize::new(0);
