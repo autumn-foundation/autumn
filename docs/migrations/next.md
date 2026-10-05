@@ -147,8 +147,8 @@ let info = JobInfo {
 
 Code that uses `#[job]` or `JobInfo::new` does not change.
 
-**Automation:** `manual` — it adds a field to a struct literal that a user
-wrote by hand. `#[job]` and `JobInfo::new` fill it already.
+**Automation:** `manual` — add `timeout: None` to each hand-written `JobInfo`
+literal. `#[job]` and `JobInfo::new` set it.
 
 ---
 
@@ -198,6 +198,16 @@ Changes that still compile but behave differently at runtime. Examples:
 - A scheduled task now runs on a different worker.
 
 If nothing changed, delete this section.
+
+- **Jobs: a hung handler keeps its claim (#3051).** Durable workers renew each
+  claim while the job runs. Before, a hung handler lost its claim after the
+  visibility timeout, and a second worker ran the job again. Now the claim
+  stays until the process stops. Set `#[job(timeout = "...")]` or
+  `jobs.default_timeout_ms` on a job that can hang.
+- **Jobs: Redis claim deadlines use the Redis server clock (#3051).** During a
+  rolling deploy, an old worker still compares deadlines to its own clock. An
+  old worker whose clock runs ahead of Redis can requeue a live job. Keep
+  worker clocks in sync (NTP) during the deploy.
 
 ## Deprecations retained from `{X.Y}`
 

@@ -3486,9 +3486,9 @@ pub struct JobConfig {
     /// Default initial retry backoff in milliseconds.
     #[serde(default = "default_job_backoff_ms")]
     pub initial_backoff_ms: u64,
-    /// Default longest time in milliseconds one job run may take, when
-    /// `#[job(timeout = "...")]` is not set (issue #3051). A run that takes
-    /// longer fails and retries. `0` (the default) means no limit.
+    /// Maximum time in milliseconds for one run of a job that has no
+    /// `#[job(timeout)]` (issue #3051). A slower run fails and retries. `0`
+    /// (the default) sets no limit.
     #[serde(default)]
     pub default_timeout_ms: u64,
     /// Ordered/weighted list of queues workers drain, highest priority first.

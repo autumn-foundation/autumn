@@ -1934,8 +1934,9 @@ async fn sqlite_pool_serves_connections_opened_at_the_same_instant() {
 
 // ── Claim lease and execution timeout (issue #3051) ──────────────────────────
 
-/// Visibility timeout for the lease tests. The sweep runs every half of it.
-const LEASE_VISIBILITY_MS: u64 = 500;
+/// Visibility timeout for the lease tests. The sweep runs every half of it,
+/// the heartbeat every third.
+const LEASE_VISIBILITY_MS: u64 = 1_000;
 
 fn lease_job_config(workers: usize) -> JobConfig {
     JobConfig {
@@ -2152,7 +2153,7 @@ async fn sqlite_killed_workers_job_is_recovered_after_the_visibility_timeout() {
 static HUNG_RUNS: AtomicUsize = AtomicUsize::new(0);
 static AFTER_HUNG_RAN: AtomicUsize = AtomicUsize::new(0);
 
-/// A job that exceeds its timeout fails, is retried, and does not block the
+/// A job that exceeds its timeout fails, retries, and does not block the
 /// worker. Both attempts hang, so the final one dead-letters with the timeout
 /// error. One worker only: the second job runs only if the worker is free.
 #[tokio::test]
@@ -2233,6 +2234,91 @@ async fn sqlite_job_exceeding_its_timeout_is_failed_retried_and_frees_the_worker
         error.contains("timed out"),
         "the row keeps the timeout error; got: {error}"
     );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+static LOST_RUNS: AtomicUsize = AtomicUsize::new(0);
+static LOST_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// A worker whose claim moves to another worker stops the handler and does
+/// not settle the row. The new owner settles it.
+#[tokio::test]
+async fn sqlite_worker_that_loses_its_claim_stops_the_handler_and_leaves_the_row() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    LOST_RUNS.store(0, Ordering::SeqCst);
+    LOST_SEEN.store(false, Ordering::SeqCst);
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![JobInfo::new(
+            "sqlite_lost_job",
+            3,
+            10,
+            |_state, _payload| {
+                Box::pin(async move {
+                    LOST_RUNS.fetch_add(1, Ordering::SeqCst);
+                    let ctx = job::JobContext::current();
+                    tokio::spawn(async move {
+                        ctx.cancelled().await;
+                        LOST_SEEN.store(ctx.lease_lost(), Ordering::SeqCst);
+                    });
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            },
+        )],
+        &state,
+        &shutdown,
+        &lease_job_config(1),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    job::enqueue("sqlite_lost_job", serde_json::json!({}))
+        .await
+        .expect("enqueue");
+    eventually(400, "the job to start", async || {
+        LOST_RUNS.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // Another worker takes the claim, as a recovery on another host would. Its
+    // claim time is far in the future, so the sweep leaves it alone.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        diesel::sql_query(
+            "UPDATE autumn_jobs SET claimed_by = 'other-worker', claimed_at = 4102444800000",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("move the claim");
+    }
+
+    eventually(400, "the handler to see the lost lease", async || {
+        LOST_SEEN.load(Ordering::SeqCst)
+    })
+    .await;
+    // Give a wrong settle time to show.
+    tokio::time::sleep(Duration::from_millis(LEASE_VISIBILITY_MS / 2)).await;
+    assert_eq!(
+        text(
+            &pool,
+            "SELECT status || ':' || claimed_by || ':' || attempt AS value FROM autumn_jobs",
+        )
+        .await,
+        "running:other-worker:1",
+        "the worker that lost the claim must not settle the row"
+    );
+    assert_eq!(LOST_RUNS.load(Ordering::SeqCst), 1, "the handler ran once");
 
     shutdown.cancel();
     job::clear_global_job_client();

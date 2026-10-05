@@ -1789,11 +1789,12 @@ Job attributes beyond `name`/`max_attempts`/`backoff_ms` (0.5.0):
 coalesced enqueue is a no-op `Ok(())`.
 
 Claim leases and timeouts (unreleased, #3051): durable workers renew each
-claim every third of the visibility timeout, so a long job runs once. If the
-claim is lost, the worker stops the handler. `#[job(timeout = "30s")]` (or
-`jobs.default_timeout_ms`, default `0` = no limit) fails and retries a run that
-takes too long. Spawned work checks `JobContext::is_cancelled()` /
-`lease_lost()` or awaits `cancelled()`. Redis claim deadlines use Redis `TIME`.
+claim every third of the visibility timeout. While renewals succeed, a long job
+does not run on a second worker. If the claim is lost, the worker stops the
+handler. With `#[job(timeout = "30s")]` (or `jobs.default_timeout_ms`; `0` = no
+limit), a run that takes longer fails and retries. Spawned work checks
+`JobContext::is_cancelled()` / `lease_lost()` or awaits `cancelled()`. Redis
+claim deadlines use Redis `TIME`.
 
 **(0.6.0)** jobs additions:
 

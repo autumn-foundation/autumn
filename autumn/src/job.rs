@@ -137,9 +137,9 @@ pub struct JobInfo {
     /// chokepoints (including the transactional free functions) can wrap by
     /// looking the version up from the registry.
     pub version: u32,
-    /// Longest time one run may take (issue #3051). A run that takes longer
-    /// fails and retries like any other failure. `None` uses
-    /// `jobs.default_timeout_ms`; when that is `0`, there is no limit.
+    /// Maximum duration of one run (issue #3051). A slower run fails and
+    /// retries like any other failure. `None` uses `jobs.default_timeout_ms`.
+    /// When that is `0`, there is no limit.
     pub timeout: Option<std::time::Duration>,
     /// The async function that executes the job logic.
     pub handler: JobHandler,
@@ -874,7 +874,6 @@ const MIN_LEASE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::f
 const LEASE_LOST_ERROR: &str = "job lease lost; another worker owns the job";
 
 /// How often a worker renews its claim: a third of the visibility timeout.
-/// Two renewals can fail before the claim expires.
 #[cfg(any(feature = "db", feature = "redis"))]
 fn lease_heartbeat_interval(visibility_timeout_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(visibility_timeout_ms / 3).max(MIN_LEASE_HEARTBEAT_INTERVAL)
@@ -894,9 +893,10 @@ enum LeaseRenewal {
 
 /// Renews a durable job's claim while the job runs (issue #3051).
 ///
-/// The heartbeat is its own task, so a handler that blocks its thread cannot
-/// stop it. It stops when [`Self::stop`] is called or the value is dropped,
-/// and it dies with the process, so crash recovery still works.
+/// The heartbeat is its own task. On a multi-thread runtime, a handler that
+/// blocks its thread does not stop the heartbeat. The heartbeat stops when
+/// [`Self::stop`] runs, when the value is dropped, or when the process stops.
+/// Thus crash recovery continues to work.
 #[cfg(any(feature = "db", feature = "redis"))]
 struct LeaseHeartbeat {
     lost: tokio_util::sync::CancellationToken,
@@ -906,35 +906,54 @@ struct LeaseHeartbeat {
 
 #[cfg(any(feature = "db", feature = "redis"))]
 impl LeaseHeartbeat {
-    /// Call `renew` every `interval`. A `Lost` result cancels the lost token
-    /// and ends the heartbeat. A `Failed` result is logged and retried.
-    fn spawn<R, F>(interval: std::time::Duration, mut renew: R) -> Self
+    /// Call `renew` every third of `visibility_timeout_ms`.
+    ///
+    /// A `Lost` result cancels the lost token and ends the heartbeat. A
+    /// `Failed` result is logged and tried again. When no renewal succeeds
+    /// for two thirds of the visibility timeout, the heartbeat also cancels
+    /// the lost token: another worker can recover the claim soon, so this
+    /// worker must stop first.
+    fn spawn<R, F>(visibility_timeout_ms: u64, mut renew: R) -> Self
     where
         R: FnMut() -> F + Send + 'static,
         F: Future<Output = LeaseRenewal> + Send + 'static,
     {
+        let interval = lease_heartbeat_interval(visibility_timeout_ms);
+        let give_up_after =
+            std::time::Duration::from_millis(visibility_timeout_ms.saturating_mul(2) / 3);
         let lost = tokio_util::sync::CancellationToken::new();
         let stop = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn({
             let lost = lost.clone();
             let stop = stop.clone();
             async move {
+                // The claim was written just before the heartbeat started.
+                let mut last_renewed = tokio::time::Instant::now();
                 loop {
                     tokio::select! {
                         () = stop.cancelled() => return,
                         () = tokio::time::sleep(interval) => {}
                     }
+                    let started = tokio::time::Instant::now();
                     let renewal = tokio::select! {
                         () = stop.cancelled() => return,
                         renewal = renew() => renewal,
                     };
                     match renewal {
-                        LeaseRenewal::Renewed => {}
+                        LeaseRenewal::Renewed => last_renewed = started,
                         LeaseRenewal::Lost => {
                             lost.cancel();
                             return;
                         }
                         LeaseRenewal::Failed(error) => {
+                            if last_renewed.elapsed() >= give_up_after {
+                                tracing::warn!(
+                                    error = %error,
+                                    "job lease renewal failed too long; stopping the job"
+                                );
+                                lost.cancel();
+                                return;
+                            }
                             tracing::warn!(error = %error, "job lease renewal failed; retrying");
                         }
                     }
@@ -6158,6 +6177,7 @@ fn clear_redis_claim(record: &mut RedisJobRecord) {
     record.claimed_at_ms = None;
 }
 
+/// Test model of a claim. Production sets the deadline from Redis `TIME`.
 #[cfg(all(feature = "redis", test))]
 fn claim_redis_record(
     mut record: RedisJobRecord,
@@ -7153,8 +7173,10 @@ async fn claim_next_redis_job(
     // last opening in a group.
     // The claim deadline (the processing-set score) is Redis server time plus
     // ARGV[3], the visibility timeout. Worker clocks never set or read it
-    // (issue #3051).
+    // (issue #3051). `replicate_commands` lets the script write after `TIME`
+    // on Redis before 7; on Redis 7 it does nothing.
     const CLAIM_SCRIPT: &str = r"
+redis.replicate_commands()
 local server_time = redis.call('TIME')
 local deadline = tonumber(server_time[1]) * 1000
   + math.floor(tonumber(server_time[2]) / 1000) + tonumber(ARGV[3])
@@ -8003,6 +8025,7 @@ async fn dead_letter_redis_job(
 
 #[cfg(feature = "redis")]
 const STALE_REDIS_RECOVERY_SCRIPT: &str = r"
+redis.replicate_commands()
 local function trim_dead_history(dead_key, dead_record_prefix, limit)
   local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
   for _, encoded in ipairs(trimmed_records) do
@@ -8153,6 +8176,7 @@ async fn redis_server_time_ms(
 /// The new deadline is Redis server time plus `ARGV[4]`.
 #[cfg(feature = "redis")]
 const RENEW_REDIS_CLAIM_SCRIPT: &str = r"
+redis.replicate_commands()
 local body = redis.call('GET', KEYS[2])
 if not body then
   return 0
@@ -8215,7 +8239,7 @@ fn redis_lease_heartbeat(
     let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
     let record = record.clone();
     let visibility_timeout_ms = worker_config.visibility_timeout_ms;
-    LeaseHeartbeat::spawn(lease_heartbeat_interval(visibility_timeout_ms), move || {
+    LeaseHeartbeat::spawn(visibility_timeout_ms, move || {
         let mut connection = connection.clone();
         let processing_key = processing_key.clone();
         let record_key = record_key.clone();
@@ -10525,7 +10549,7 @@ fn pg_lease_heartbeat(
     let pool = pool.clone();
     let job_id = row.id.clone();
     let worker_id = worker_id.to_owned();
-    LeaseHeartbeat::spawn(lease_heartbeat_interval(visibility_timeout_ms), move || {
+    LeaseHeartbeat::spawn(visibility_timeout_ms, move || {
         let pool = pool.clone();
         let job_id = job_id.clone();
         let worker_id = worker_id.clone();
@@ -23203,7 +23227,8 @@ mod lease_tests {
         calls: Arc<AtomicUsize>,
     ) -> LeaseHeartbeat {
         let results = Arc::new(results);
-        LeaseHeartbeat::spawn(Duration::from_millis(100), move || {
+        // 300ms visibility: renew every 100ms, give up after 200ms of failures.
+        LeaseHeartbeat::spawn(300, move || {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             let result = results.get(n).map_or(LeaseRenewal::Renewed, |f| f());
             async move { result }
@@ -23252,19 +23277,41 @@ mod lease_tests {
     async fn heartbeat_retries_a_failed_renewal_without_losing_the_lease() {
         let calls = Arc::new(AtomicUsize::new(0));
         let heartbeat = scripted_heartbeat(
+            vec![|| LeaseRenewal::Failed("db down".to_owned())],
+            Arc::clone(&calls),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            !lost.is_cancelled(),
+            "one failed renewal is not a lost lease"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the heartbeat keeps trying"
+        );
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_gives_up_when_renewals_fail_for_two_thirds_of_the_timeout() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(
             vec![|| LeaseRenewal::Failed("db down".to_owned()), || {
                 LeaseRenewal::Failed("db down".to_owned())
             }],
             Arc::clone(&calls),
         );
         let lost = heartbeat.lost_token();
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        assert!(!lost.is_cancelled(), "a failed renewal is not a lost lease");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            3,
-            "the heartbeat keeps trying"
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            lost.is_cancelled(),
+            "no renewal for 200ms of a 300ms timeout: another worker can take the job"
         );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the heartbeat ends");
         heartbeat.stop().await;
     }
 

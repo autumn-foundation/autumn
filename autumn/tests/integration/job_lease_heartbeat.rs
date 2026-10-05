@@ -1,15 +1,16 @@
 //! Claim lease and execution timeout on the container backends (issue #3051).
 //!
-//! Each backend gets the same four proofs:
+//! Postgres and Redis get the same three proofs. Redis gets one more. The
+//! labels are the issue's acceptance criteria:
 //!
-//! 1. A job that runs for 3x the visibility timeout runs exactly once. The
-//!    heartbeat keeps the claim fresh, so recovery does not give it to the
-//!    second worker.
-//! 2. A killed worker's job is recovered after the visibility timeout. The
-//!    heartbeat dies with the worker, so crash recovery still works.
-//! 3. A job that exceeds its timeout fails, retries, and frees the worker.
-//! 4. Redis only: the stale-claim check uses Redis server time. A worker with
-//!    a skewed clock does not steal a live claim.
+//! - AC1/AC2: a job that runs for 3x the visibility timeout runs exactly once.
+//!   The heartbeat keeps the claim fresh, so recovery does not give it to the
+//!   second worker.
+//! - AC3: a killed worker's job is recovered after the visibility timeout. The
+//!   heartbeat stops with the worker, so crash recovery continues to work.
+//! - AC4: a job that exceeds its timeout fails, retries, and frees the worker.
+//! - AC5, Redis only: the stale-claim check uses Redis server time. A worker
+//!   with a skewed clock does not steal a live claim.
 //!
 //! A "kill" runs worker A on its own Tokio runtime and shuts that runtime
 //! down. Every task it owns stops at once, the heartbeat too.

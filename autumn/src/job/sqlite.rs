@@ -55,7 +55,7 @@ use serde_json::Value;
 
 use super::{
     DEFAULT_JOB_ADMIN_HISTORY_LIMIT, ExecutionBounds, JobExecutionOutcome, LeaseHeartbeat,
-    LeaseRenewal, QueueLimits, lease_heartbeat_interval, record_lease_lost,
+    LeaseRenewal, QueueLimits, record_lease_lost,
 };
 use super::{
     EnqueueOutcome, JobAdminBackend, JobAdminBackendEntry, JobAdminFuture, JobAdminMemoryBackend,
@@ -1130,13 +1130,21 @@ async fn queue_depth_survey_loop(
 }
 
 /// Move a running job's claim expiry forward, if this worker still holds it.
-async fn renew_claim(pool: &SqlitePool, now: i64, job_id: &str, worker_id: &str) -> LeaseRenewal {
+async fn renew_claim(
+    pool: &SqlitePool,
+    clock: &dyn crate::time::ClockSource,
+    job_id: &str,
+    worker_id: &str,
+) -> LeaseRenewal {
     use diesel_async::RunQueryDsl as _;
 
     let mut conn = match pool.get().await {
         Ok(conn) => conn,
         Err(error) => return LeaseRenewal::Failed(format!("sqlite jobs pool error: {error}")),
     };
+    // Read the time after the wait for a connection, so the wait does not
+    // make the new claim time older than it is.
+    let now = clock.now().timestamp_millis();
     match diesel::sql_query(format!(
         "UPDATE autumn_jobs SET claimed_at = ? \
          WHERE id = ? AND claimed_by = ? AND status = '{STATUS_RUNNING}'"
@@ -1165,12 +1173,12 @@ fn lease_heartbeat(
     let job_id = row.id.clone();
     let worker_id = worker_id.to_owned();
     let clock = state.clock_arc();
-    LeaseHeartbeat::spawn(lease_heartbeat_interval(visibility_timeout_ms), move || {
+    LeaseHeartbeat::spawn(visibility_timeout_ms, move || {
         let pool = pool.clone();
+        let clock = Arc::clone(&clock);
         let job_id = job_id.clone();
         let worker_id = worker_id.clone();
-        let now = clock.now().timestamp_millis();
-        async move { renew_claim(&pool, now, &job_id, &worker_id).await }
+        async move { renew_claim(&pool, clock.as_ref(), &job_id, &worker_id).await }
     })
 }
 

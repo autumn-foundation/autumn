@@ -289,10 +289,10 @@ impl JobContext {
         self
     }
 
-    /// Whether the worker lost its claim on this job.
+    /// Returns `true` after the worker lost its claim on this job.
     ///
-    /// When `true`, another worker can run the job. Stop work and do not
-    /// commit side effects.
+    /// Another worker can then run the job. Stop work and do not commit side
+    /// effects. An operator cancel does not set this.
     #[must_use]
     pub fn lease_lost(&self) -> bool {
         self.run
@@ -300,8 +300,8 @@ impl JobContext {
             .is_some_and(|run| run.lease_lost.load(Ordering::SeqCst))
     }
 
-    /// Whether the worker stopped this run: the lease is lost or the
-    /// timeout expired.
+    /// Returns `true` after the worker stopped this run because it lost the
+    /// lease or the timeout expired. An operator cancel does not set this.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.run
@@ -309,7 +309,7 @@ impl JobContext {
             .is_some_and(|run| run.cancel.is_cancelled())
     }
 
-    /// Wait until the worker stops this run: the lease is lost or the
+    /// Waits until the worker stops this run because it lost the lease or the
     /// timeout expired. Outside a job run, this never completes.
     pub async fn cancelled(&self) {
         match &self.run {

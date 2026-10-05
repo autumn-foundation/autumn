@@ -29,11 +29,12 @@ struct JobAttrs {
     timeout_ms: Option<u64>,
 }
 
-/// Parse a timeout such as `"500ms"`, `"30s"`, `"5m"`, `"1h"`, or `"1m30s"`
-/// to milliseconds. Returns `None` for bad syntax, zero, or overflow.
+/// Parse a timeout such as `"500ms"`, `"30s"`, `"5m"`, `"1h"`, `"1d"`, or
+/// `"1m 30s"` to milliseconds. Units: `ms`, `s`, `m`, `h`, `d`. Spaces between
+/// parts are allowed. Returns `None` for bad syntax, zero, or overflow.
 fn parse_timeout_ms(text: &str) -> Option<u64> {
     let mut total: u64 = 0;
-    let mut rest = text.trim();
+    let mut rest = text.trim_start();
     if rest.is_empty() {
         return None;
     }
@@ -50,9 +51,10 @@ fn parse_timeout_ms(text: &str) -> Option<u64> {
             "s" => 1_000,
             "m" => 60_000,
             "h" => 3_600_000,
+            "d" => 86_400_000,
             _ => return None,
         };
-        rest = &rest[unit_len..];
+        rest = rest[unit_len..].trim_start();
         total = total.checked_add(count.checked_mul(unit_ms)?)?;
     }
     (total > 0).then_some(total)
@@ -101,7 +103,7 @@ fn parse_basic_arg(
             return Err(syn::Error::new(
                 value.span(),
                 "timeout must be a positive duration such as \"500ms\", \"30s\", \"5m\", \
-                 \"1h\", or \"1m30s\"",
+                 \"1h\", \"1d\", or \"1m 30s\"",
             ));
         };
         result.timeout_ms = Some(ms);
@@ -545,6 +547,8 @@ mod tests {
         assert_eq!(attrs.timeout_ms, Some(90_000));
         let attrs = parse(quote! { timeout = "250ms" }).expect("parse");
         assert_eq!(attrs.timeout_ms, Some(250));
+        let attrs = parse(quote! { timeout = "1d 2h" }).expect("parse");
+        assert_eq!(attrs.timeout_ms, Some(93_600_000));
         assert!(
             parse(quote! { max_attempts = 3 })
                 .expect("parse")
