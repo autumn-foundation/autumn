@@ -127,16 +127,17 @@ SAVED_INGRESS=$(jq -c '.properties.configuration.ingress // null | if . then del
 # Before the first cutover disables ingress, the script also saves the
 # snapshot in the app's tags (base64 JSON, in parts of 256 characters, the
 # tag value limit). If a run stops after the disable (a canceled run, a lost
-# runner), the retry finds no ingress and reads the snapshot from the tags.
+# runner), the retry reads the snapshot from the tags. The tags win over
+# the live ingress: after the stop, terraform apply can make a plain
+# ingress again, without the custom domains, CORS or IP restrictions.
 # shellcheck disable=SC2016 # a jq program, not a shell expression
 INGRESS_TAG_NAMES='[.tags // {} | to_entries[] | select(.key | startswith("autumn-ingress-")) | .key]'
-if [ "$SAVED_INGRESS" = null ]; then
-  SAVED_INGRESS=$(jq -c 'try ([.tags // {} | to_entries[]
-      | select((.key | startswith("autumn-ingress-")) and .value != null)
-      | {i: (.key | ltrimstr("autumn-ingress-") | tonumber), v: .value}]
-    | if length == 0 then null
-      else sort_by(.i) | map(.v) | join("") | @base64d | fromjson end) catch null' <<< "$APP")
-fi
+TAGGED_INGRESS=$(jq -c 'try ([.tags // {} | to_entries[]
+    | select((.key | startswith("autumn-ingress-")) and .value != null)
+    | {i: (.key | ltrimstr("autumn-ingress-") | tonumber), v: .value}]
+  | if length == 0 then null
+    else sort_by(.i) | map(.v) | join("") | @base64d | fromjson end) catch null' <<< "$APP")
+[ "$TAGGED_INGRESS" = null ] || SAVED_INGRESS="$TAGGED_INGRESS"
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 # The active revisions decide if a real release runs. The template image is
 # not enough: after a canceled first cutover, the template has the real
@@ -455,7 +456,8 @@ remove_credentials() {
         --revision "$latest" \
         --query properties.provisioningState \
         --output tsv) || return 1
-      [ "$state" = Failed ] && patch=1
+      # A failed or canceled revision never provisions.
+      { [ "$state" = Failed ] || [ "$state" = Canceled ]; } && patch=1
     fi
     if [ -n "$patch" ]; then
       body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" --arg now "$(date +%s)" "$APP_C"'
@@ -489,7 +491,7 @@ remove_credentials() {
         --output tsv) || return 1
       case "$state" in
         Provisioned) break ;;
-        Failed) return 1 ;;
+        Failed|Canceled) return 1 ;;
       esac
       sleep 10
     done
@@ -766,7 +768,7 @@ for _ in $(seq 1 60); do
       READY=1
       break
       ;;
-    Failed) fail "revision $REVISION failed to provision" ;;
+    Failed|Canceled) fail "revision $REVISION ended as $REVISION_STATE" ;;
   esac
 done
 [ -n "$READY" ] || fail "the new revision was not provisioned in time (app state: $STATE)"

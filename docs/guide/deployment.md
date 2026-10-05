@@ -2066,7 +2066,7 @@ disables it, and sends it back, so custom domains, IP restrictions and CORS
 settings stay. It also keeps that snapshot in the app's `autumn-ingress-*`
 tags until the ingress is back. If a run stops after the disable (for
 example, a canceled workflow), the next run reads the snapshot from the
-tags.
+tags, also when `terraform apply` made a new ingress in between.
 Build and push your real image, run migrations, then cut the app over:
 
 ```bash
