@@ -443,7 +443,7 @@ fn a_scaffolded_comment_resource_blocks_the_shared_table() {
         "a plain `comments` table must block generation:\n{output}"
     );
     assert!(output.contains("`commentable_type`"), "{output}");
-    assert!(output.contains("rename"), "{output}");
+    assert!(output.contains("Rename or drop"), "{output}");
     assert_eq!(
         count_migrations_ending_in(&project, "_create_comments"),
         1,
@@ -501,7 +501,9 @@ fn generate_model_refuses_a_plain_comments_table() {
         "a plain `comments` table must block generation:\n{output}"
     );
     assert!(output.contains("`commentable_type`"), "{output}");
+    assert!(output.contains("Rename or drop"), "{output}");
     assert_eq!(count_migrations_ending_in(&project, "_create_comments"), 1);
+    assert_eq!(count_migrations_ending_in(&project, "_create_posts"), 0);
     assert!(!project.join("src/models/post.rs").exists());
 }
 

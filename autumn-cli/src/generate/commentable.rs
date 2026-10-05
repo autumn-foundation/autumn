@@ -23,7 +23,7 @@
 //! the ordinary way, say) is a real conflict the author has to resolve, and
 //! `IF NOT EXISTS` would turn it into a silent no-op whose only symptom is a
 //! `column "commentable_type" does not exist` at request time. The generator
-//! refuses that project instead and names the remedy (#2283).
+//! refuses that project instead, and tells the user how to correct it (#2283).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -168,9 +168,13 @@ enum CommentsTable {
     Absent,
     /// The shared, polymorphic table: every helper's column is present.
     Shared,
-    /// A `comments` table without these [`REQUIRED_COLUMNS`] (#2283). A
-    /// `Comment` model scaffolded the ordinary way makes one.
-    Conflicting(Vec<&'static str>),
+    /// A `comments` table that does not have these [`REQUIRED_COLUMNS`]
+    /// (#2283). A `Comment` model scaffolded the ordinary way makes one.
+    Conflicting {
+        missing: Vec<&'static str>,
+        /// A rename from a table no migration creates: `missing` is a guess.
+        columns_unknown: bool,
+    },
 }
 
 /// Replay the history once and classify the `comments` table.
@@ -186,7 +190,10 @@ fn comments_table(project_root: &Path) -> CommentsTable {
             if missing.is_empty() {
                 CommentsTable::Shared
             } else {
-                CommentsTable::Conflicting(missing)
+                CommentsTable::Conflicting {
+                    missing,
+                    columns_unknown: table.columns_unknown,
+                }
             }
         }
         _ => CommentsTable::Absent,
@@ -198,23 +205,37 @@ fn comments_table(project_root: &Path) -> CommentsTable {
 /// Emitting anyway writes a second `CREATE TABLE comments`, and `migrate`
 /// stops on "already exists". Skipping is worse: every helper then queries
 /// columns that are not there.
-fn conflicting_table_error(missing: &[&str]) -> GenerateError {
-    let missing = missing
-        .iter()
-        .map(|column| format!("`{column}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    GenerateError::Config(format!(
-        "cannot add the shared `{COMMENTS_TABLE}` table: the project already has a \
-         `{COMMENTS_TABLE}` table that is not polymorphic. A `Comment` model from \
-         `autumn generate` makes this type of table. These columns are missing: \
-         {missing}. No file was written. Do one of these steps, then run the command \
-         again:\n\
-         \x20 - Write a migration that renames or drops the existing `{COMMENTS_TABLE}` \
-         table.\n\
-         \x20 - Write a migration that adds the missing columns. The generator then \
-         uses that table. See docs/guide/commentable.md for the column types."
-    ))
+fn conflicting_table_error(missing: &[&str], columns_unknown: bool) -> GenerateError {
+    let rename_or_drop = format!(
+        "  - Rename or drop the existing `{COMMENTS_TABLE}` table in a new migration. \
+         Then update the model that uses it."
+    );
+    let message = if columns_unknown {
+        format!(
+            "cannot add the shared `{COMMENTS_TABLE}` table: a migration renames another \
+             table to `{COMMENTS_TABLE}`, and no migration creates that table. The generator \
+             cannot read its columns. The generator wrote no files. Do one of these steps:\n\
+             {rename_or_drop} Then run the command again.\n\
+             \x20 - If the table is already the shared one, add `#[commentable]` to the model \
+             by hand. Do not use `comments:commentable`."
+        )
+    } else {
+        let missing = missing
+            .iter()
+            .map(|column| format!("`{column}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "cannot add the shared `{COMMENTS_TABLE}` table: the project has a \
+             `{COMMENTS_TABLE}` table that is not the shared one. These columns are missing: \
+             {missing}. The generator wrote no files. Do one of these steps, then run the \
+             command again:\n\
+             {rename_or_drop}\n\
+             \x20 - Add the missing columns in a new migration. Use the types in \
+             docs/guide/commentable.md, section \"The table\"."
+        )
+    };
+    GenerateError::Config(message)
 }
 
 /// A table reference parsed from DDL: `[schema.]name`, each half optionally
@@ -251,6 +272,9 @@ struct TableState {
     exists: bool,
     /// Which of [`REQUIRED_COLUMNS`] the table currently carries.
     columns: Vec<&'static str>,
+    /// The table came from a rename of a table that no migration creates, so
+    /// the replay cannot see its columns.
+    columns_unknown: bool,
 }
 
 /// What one statement does to one table in the replayed history.
@@ -258,7 +282,8 @@ struct TableState {
 enum TableEvent {
     /// `CREATE TABLE name (…)`, and which of [`REQUIRED_COLUMNS`] its body
     /// declares. A fresh table replaces whatever was known about the old one.
-    Create(TableRef, Vec<&'static str>),
+    /// The flag is `IF NOT EXISTS`: then an existing table stays as it is.
+    Create(TableRef, Vec<&'static str>, bool),
     /// `ALTER TABLE name … <column>`, adding it.
     Add(TableRef, &'static str),
     /// `ALTER TABLE name DROP COLUMN <column>` (or a rename away).
@@ -290,13 +315,13 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
     let mut tables: HashMap<TableRef, TableState> = HashMap::new();
     for sql in files {
         let mut events: Vec<(usize, TableEvent)> = Vec::new();
-        for (at, table, body) in create_tables(sql) {
+        for (at, table, body, if_not_exists) in create_tables(sql) {
             let columns = REQUIRED_COLUMNS
                 .iter()
                 .copied()
                 .filter(|column| declares_column(body, column))
                 .collect();
-            events.push((at, TableEvent::Create(table, columns)));
+            events.push((at, TableEvent::Create(table, columns, if_not_exists)));
         }
         for (at, dropped) in drop_tables(sql) {
             for table in dropped {
@@ -327,12 +352,17 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
         events.sort_by_key(|(at, _)| *at);
         for (_, event) in events {
             match event {
-                TableEvent::Create(table, columns) => {
+                TableEvent::Create(table, columns, if_not_exists) => {
+                    // `IF NOT EXISTS` on an existing table does nothing.
+                    if if_not_exists && tables.get(&table).is_some_and(|state| state.exists) {
+                        continue;
+                    }
                     tables.insert(
                         table,
                         TableState {
                             exists: true,
                             columns,
+                            columns_unknown: false,
                         },
                     );
                 }
@@ -351,6 +381,7 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                     let state = tables.entry(table).or_default();
                     state.exists = false;
                     state.columns.clear();
+                    state.columns_unknown = false;
                 }
                 TableEvent::Rename { from, to } => {
                     // A rename is positive evidence the table exists: the
@@ -370,8 +401,10 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                         schema: to.schema.or_else(|| from.schema.clone()),
                         name: to.name,
                     };
+                    let source_known = tables.get(&from).is_some_and(|state| state.exists);
                     let mut state = tables.remove(&from).unwrap_or_default();
                     state.exists = true;
+                    state.columns_unknown |= !source_known;
                     tables.insert(to, state);
                 }
             }
@@ -480,8 +513,9 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
 /// have traded one bug for its mirror image.
 const CREATE_VERBS: &[&str] = &["table", "unlogged table"];
 
-/// Every persistent `CREATE TABLE` in `sql`: (offset, table, column-list body).
-fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
+/// Every persistent `CREATE TABLE` in `sql`: (offset, table, column-list body,
+/// `IF NOT EXISTS`).
+fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str, bool)> {
     let mut found = Vec::new();
     let mut base = 0usize;
     while let Some(at) = sql[base..].find("create ") {
@@ -501,6 +535,9 @@ fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
             continue;
         };
         let after_verb = &rest[verb.len()..];
+        // The pipeline lowercases unquoted SQL, so one spelling matches.
+        let trimmed = after_verb.trim_start();
+        let if_not_exists = strip_keyword(trimmed, "if not exists").len() != trimmed.len();
         let Some((table, used)) = parse_table_ref(after_verb) else {
             continue;
         };
@@ -508,7 +545,7 @@ fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
         let Some(body) = create_table_body(sql, body_start) else {
             continue;
         };
-        found.push((start, table, body));
+        found.push((start, table, body, if_not_exists));
     }
     found
 }
@@ -710,7 +747,7 @@ fn mentions_column(haystack: &str, column: &str) -> bool {
 ///
 /// So the whole schema is the question. A table missing any of these is not the
 /// shared table: the generator emits its own, or refuses when the name is
-/// taken (see [`CommentsTable::Conflicting`]). A refusal beats a reassuring
+/// taken (see `CommentsTable::Conflicting`). A refusal beats a reassuring
 /// message and an app that breaks on its first comment.
 const REQUIRED_COLUMNS: &[&str] = &[
     "id",
@@ -1146,7 +1183,10 @@ pub fn push_commentable_migration(
     if !for_revert {
         match comments_table(project_root) {
             CommentsTable::Shared => return Ok(false),
-            CommentsTable::Conflicting(missing) => return Err(conflicting_table_error(&missing)),
+            CommentsTable::Conflicting {
+                missing,
+                columns_unknown,
+            } => return Err(conflicting_table_error(&missing, columns_unknown)),
             CommentsTable::Absent => {}
         }
     }
@@ -1298,7 +1338,10 @@ mod tests {
 
     /// A `comments` table exists, but it is not the shared one.
     fn conflicting_comments_table(project_root: &Path) -> bool {
-        matches!(comments_table(project_root), CommentsTable::Conflicting(_))
+        matches!(
+            comments_table(project_root),
+            CommentsTable::Conflicting { .. }
+        )
     }
 
     #[test]
@@ -2993,8 +3036,8 @@ mod tests {
         for present in ["`id`", "`body`", "`created_at`"] {
             assert!(!message.contains(present), "{present} exists:\n{message}");
         }
-        assert!(message.contains("rename"), "{message}");
-        assert!(message.contains("add"), "{message}");
+        assert!(message.contains("Rename or drop"), "{message}");
+        assert!(message.contains("Add the missing columns"), "{message}");
         assert!(plan.actions.is_empty(), "a refusal plans no file");
     }
 
@@ -3044,5 +3087,83 @@ mod tests {
         .expect("a complete table is reused, not refused");
         assert!(!emitted);
         assert!(plan.actions.is_empty());
+    }
+
+    /// A `SQLite` `Comment` scaffold spells the plain table differently. The
+    /// check reads column names only, so it refuses the same way.
+    #[test]
+    fn a_plain_sqlite_comments_table_blocks_the_shared_migration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create_comments");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             body TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);\n",
+        )
+        .expect("write");
+        let mut plan = Plan::new(tmp.path());
+        let err = push_commentable_migration(
+            &mut plan,
+            tmp.path(),
+            "20260101000000",
+            DatabaseBackend::Sqlite,
+            false,
+        )
+        .expect_err("a plain `comments` table must block generation");
+        assert!(err.to_string().contains("`commentable_type`"), "{err}");
+        assert!(plan.actions.is_empty());
+    }
+
+    /// A rename from a table the history never creates hides the columns.
+    /// "Add the missing columns" is then wrong advice: it would ask for `id`.
+    #[test]
+    fn a_rename_from_an_unknown_table_says_the_columns_are_unknown() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename_in");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "ALTER TABLE legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        let mut plan = Plan::new(tmp.path());
+        let message = push_commentable_migration(
+            &mut plan,
+            tmp.path(),
+            "20260101000000",
+            DatabaseBackend::Postgres,
+            false,
+        )
+        .expect_err("the name is taken")
+        .to_string();
+        assert!(message.contains("cannot read"), "{message}");
+        assert!(!message.contains("Add the missing columns"), "{message}");
+        assert!(message.contains("Rename or drop"), "{message}");
+    }
+
+    /// `CREATE TABLE IF NOT EXISTS` does nothing when the table exists, so it
+    /// must not replace the replayed table.
+    #[test]
+    fn a_create_if_not_exists_keeps_the_existing_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let first = tmp.path().join("migrations").join("0001_create_comments");
+        std::fs::create_dir_all(&first).expect("mkdir");
+        std::fs::write(first.join("up.sql"), up_sql(DatabaseBackend::Postgres)).expect("write");
+        let second = tmp.path().join("migrations").join("0002_noop");
+        std::fs::create_dir_all(&second).expect("mkdir");
+        std::fs::write(
+            second.join("up.sql"),
+            "CREATE TABLE IF NOT EXISTS comments (id BIGINT, body TEXT);\n",
+        )
+        .expect("write");
+        assert!(
+            already_migrated(tmp.path()),
+            "the IF NOT EXISTS create was a no-op"
+        );
+
+        // On an absent table, the same statement creates it.
+        std::fs::remove_dir_all(&first).expect("rm");
+        assert!(conflicting_comments_table(tmp.path()));
     }
 }

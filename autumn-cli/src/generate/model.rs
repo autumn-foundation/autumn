@@ -337,10 +337,23 @@ fn plan_model_with_options_impl(
     // The `comments:commentable` token also has to bring the shared comments
     // table, or this model's `#[commentable]` compiles and then fails at
     // runtime with `relation "comments" does not exist`. `generate scaffold`
-    // routes through its own copy of this because it owns the warnings; this is
-    // the `generate model` path, which the scaffold does not reach.
+    // reuses this plan, so this is the one place for both commands.
     // On the destroy path the field tokens are not repeated, so the
     // declaration is recovered from the model file instead.
+    //
+    // A model whose own table is `comments` collides with the shared table
+    // (#2283): two `CREATE TABLE comments` stop `migrate`.
+    if !for_revert
+        && table == super::commentable::COMMENTS_TABLE
+        && (fields.iter().any(|f| f.kind.is_commentable())
+            || super::commentable::already_migrated(project_root))
+    {
+        return Err(GenerateError::Config(format!(
+            "cannot create a `{table}` table for `{pascal_name}`: the shared table of \
+             `comments:commentable` uses that name. A second `CREATE TABLE {table}` stops \
+             `autumn migrate`. Use a different model name, for example `Remark`."
+        )));
+    }
     if fields.iter().any(|f| f.kind.is_commentable())
         || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
     {
@@ -359,17 +372,38 @@ fn plan_model_with_options_impl(
         if !for_revert {
             plan.warn(if emitted {
                 format!(
-                    "Added the shared `{table}` table. Every `#[commentable]` model attaches \
-                     to it, so later models need no migration of their own.",
+                    "Added the shared `{table}` table. Every `#[commentable]` model \
+                     attaches to it, so later models need no migration of their own. \
+                     Mount the framework's comment routes once, e.g. \
+                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))`, \
+                     and render a thread with \
+                     `autumn_web::widgets::comment_thread`.",
                     table = super::commentable::COMMENTS_TABLE,
                 )
             } else {
                 format!(
                     "Reusing the existing `{table}` table — the polymorphic comments table \
-                     is shared across every `#[commentable]` model.",
+                     is shared across every `#[commentable]` model, so no migration was \
+                     added for {pascal_name}.",
                     table = super::commentable::COMMENTS_TABLE,
                 )
             });
+            plan.warn(metadata.commentable_author.as_deref().map_or_else(
+                || {
+                    "This project has no `User` model, so the generated \
+                     `#[commentable]` names no author model. Add `by = <AuthorModel>` \
+                     (and `author_name = <column>`) once you have one — until then \
+                     threads render authors as `user #id`."
+                        .to_owned()
+                },
+                |author| {
+                    format!(
+                        "`#[commentable(by = {author}, ...)]` on the generated model \
+                         names this app's author model. Add `author_name = <column>` \
+                         to render display names instead of `user #id`."
+                    )
+                },
+            ));
         }
     }
 
@@ -7555,6 +7589,69 @@ autumn-web = \"0.3\"\n";
             )
             .is_ok(),
             "destroy must be able to recompute a plan it is about to revert"
+        );
+    }
+
+    /// The shared `comments` migration, as `comments:commentable` writes it.
+    fn project_with_the_shared_comments_table() -> TempDir {
+        let tmp = project();
+        let dir = tmp
+            .path()
+            .join("migrations/202604270000002_create_comments");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("up.sql"),
+            super::super::commentable::up_sql(autumn_web::config::DatabaseBackend::Postgres),
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// #2283, the other order: a `Comment` model after the shared table writes
+    /// a second `CREATE TABLE comments`, and `migrate` stops.
+    #[test]
+    fn a_comment_model_over_the_shared_table_is_refused() {
+        let tmp = project_with_the_shared_comments_table();
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260427000000",
+        )
+        .expect_err("the shared table already uses the name `comments`");
+        let message = err.to_string();
+        assert!(message.contains("`comments`"), "{message}");
+        assert!(message.contains("shared"), "{message}");
+    }
+
+    /// The same collision in one command: the model's own table and the shared
+    /// table are both `comments`.
+    #[test]
+    fn a_commentable_comment_model_is_refused() {
+        let tmp = project();
+        let err = plan_model(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into(), "comments:commentable".into()],
+            "20260427000000",
+        )
+        .expect_err("two `CREATE TABLE comments` in one plan");
+        assert!(err.to_string().contains("shared"), "{err}");
+    }
+
+    /// `destroy` must still remove a `Comment` model.
+    #[test]
+    fn a_comment_model_revert_is_not_refused() {
+        let tmp = project_with_the_shared_comments_table();
+        assert!(
+            plan_model_with_options_for_revert(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into()],
+                "20260427000000",
+                &ModelOptions::default(),
+            )
+            .is_ok()
         );
     }
 }

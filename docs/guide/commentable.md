@@ -88,13 +88,20 @@ generator will not recreate it.
 ### A `comments` table that is not the shared one (#2283)
 
 A `Comment` model from `autumn generate scaffold Comment body:Text` makes a
-plain `comments` table. The shared table has the same name. The generator
-refuses `comments:commentable` in that project, writes no file, and names the
+plain `comments` table. The shared table has the same name. In that project,
+the generator refuses `comments:commentable`, writes no files, and names the
 missing columns. Do one of these steps, then run the command again:
 
-- Write a migration that renames or drops the existing `comments` table.
+- Write a migration that renames or drops the existing `comments` table. Then
+  update the model that uses it.
 - Write a migration that adds the missing columns, with the types shown above.
-  The generator then uses that table.
+  If the table has rows, give each `NOT NULL` column a `DEFAULT`. On SQLite,
+  use one `ALTER TABLE … ADD COLUMN` statement for each column. The generator
+  then uses that table.
+
+The other order is refused too. After the shared table exists, the generator
+refuses a model whose table is `comments`. Use a different name, for example
+`Remark`.
 
 ### Why `commentable_id` has no foreign key
 
