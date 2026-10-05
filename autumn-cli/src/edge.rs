@@ -131,6 +131,10 @@ pub fn serve(options: &ServeOptions<'_>) {
     });
     let origin = HttpOrigin::new(options.origin)
         .unwrap_or_else(|err| fail(EXIT_FAIL, &format!("--origin: {err}")));
+    // Both lanes see the origin's `host`; the public one is in
+    // `x-forwarded-host`.
+    let origin_host = HeaderValue::from_str(origin.host())
+        .unwrap_or_else(|err| fail(EXIT_FAIL, &format!("--origin: {err}")));
 
     let mut configured = Vec::new();
     for raw in options.response_headers {
@@ -168,7 +172,9 @@ pub fn serve(options: &ServeOptions<'_>) {
         let gateway = EdgeGateway::new(Arc::new(artifact), origin).with_response_headers(headers);
         let (gateway, kv_state) = with_kv_file(gateway, options.kv);
 
-        let mut edge_node = EdgeNode::new(gateway).with_trusted_proxies(trusted);
+        let mut edge_node = EdgeNode::new(gateway)
+            .with_trusted_proxies(trusted)
+            .with_host(origin_host);
         if !options.quiet {
             edge_node = edge_node.with_access_log(|entry: &AccessEntry| {
                 println!(

@@ -557,7 +557,10 @@ Rules:
   `--no-probe` to start without the header requests.
 - It does not follow redirects. It does not use `HTTP_PROXY` or
   `HTTPS_PROXY`.
-- It removes hop-by-hop headers in both directions.
+- It removes hop-by-hop headers in both directions, also the ones a
+  client names in `connection`, before the capsule gets the request.
+- Both lanes see the origin's `host`. The public host is in
+  `x-forwarded-host`.
 - It sends an `upgrade` request (WebSocket) to the origin, never to the
   capsule. When the origin answers `101`, the node copies bytes both ways
   until one side closes.
@@ -575,7 +578,8 @@ Rules:
   a different path.
 - It streams request and response bodies to and from the origin.
 - It runs each capsule on a blocking thread. At most one capsule for each
-  CPU runs at the same time. Other `GET`s wait. Writes do not wait.
+  CPU runs at the same time. Other `GET`s wait. Writes and upgrades do not
+  wait.
 - An origin that does not connect in 10 s, or stops sending for 60 s,
   gives a `502` (or a cut body).
 - Without `--kv`, a `needs(kv)` route goes to the origin.

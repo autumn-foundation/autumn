@@ -116,6 +116,7 @@ fn base_url(raw: &str) -> Result<String, NodeError> {
 pub struct HttpOrigin {
     client: reqwest::Client,
     base: String,
+    host: String,
 }
 
 impl HttpOrigin {
@@ -127,10 +128,28 @@ impl HttpOrigin {
     /// [`NodeError::Config`] when `base` is not an `http` or `https` URL, or
     /// has a query or a fragment.
     pub fn new(base: &str) -> Result<Self, NodeError> {
+        let base = base_url(base)?;
+        let host = reqwest::Url::parse(&base)
+            .ok()
+            .and_then(|url| {
+                url.host_str().map(|host| {
+                    url.port()
+                        .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"))
+                })
+            })
+            .unwrap_or_default();
         Ok(Self {
             client: http_client()?,
-            base: base_url(base)?,
+            base,
+            host,
         })
+    }
+
+    /// The `host` the origin gets: `host[:port]` of the base URL. Give it to
+    /// [`EdgeNode::with_host`], so the capsule sees the same `host`.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
     }
 
     /// The base URL, without a trailing `/`.
@@ -467,6 +486,7 @@ pub struct EdgeNode<O> {
     access_log: Option<AccessLog>,
     capsules: Arc<Semaphore>,
     trusted: Arc<[TrustedProxy]>,
+    host: Option<HeaderValue>,
 }
 
 impl<O: Clone> Clone for EdgeNode<O> {
@@ -476,6 +496,7 @@ impl<O: Clone> Clone for EdgeNode<O> {
             access_log: self.access_log.clone(),
             capsules: Arc::clone(&self.capsules),
             trusted: Arc::clone(&self.trusted),
+            host: self.host.clone(),
         }
     }
 }
@@ -487,6 +508,7 @@ impl<O> std::fmt::Debug for EdgeNode<O> {
             .field("access_log", &self.access_log.is_some())
             .field("max_capsules", &self.capsules.available_permits())
             .field("trusted", &self.trusted)
+            .field("host", &self.host)
             .finish()
     }
 }
@@ -501,7 +523,17 @@ impl<O> EdgeNode<O> {
             access_log: None,
             capsules: Arc::new(Semaphore::new(cpus)),
             trusted: Arc::from(Vec::new()),
+            host: None,
         }
+    }
+
+    /// Set `host` to `host` for both lanes, after `x-forwarded-host` keeps
+    /// the public one. Give the origin's host ([`HttpOrigin::host`]): then
+    /// the capsule sees the `host` the origin sees.
+    #[must_use]
+    pub fn with_host(mut self, host: HeaderValue) -> Self {
+        self.host = Some(host);
+        self
     }
 
     /// Keep the forwarded headers from these peers, for example the TLS
@@ -553,15 +585,26 @@ where
     }
 
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
-        // Both lanes, the capsule and the origin, get the same forwarded
-        // headers.
+        // Both lanes, the capsule and the origin, get the same headers: no
+        // hop-by-hop headers (an upgrade keeps its pair), the node's
+        // forwarded headers, and the same `host`.
         let peer = request
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|info| info.0.ip());
         let trusted =
             peer.is_some_and(|peer| self.trusted.iter().any(|proxy| proxy.contains(peer)));
-        set_forwarded_headers(request.headers_mut(), peer, trusted);
+        let upgrade = upgrade_protocol(request.headers());
+        let headers = request.headers_mut();
+        remove_hop_by_hop(headers);
+        if let Some(protocol) = &upgrade {
+            headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+            headers.insert(UPGRADE, protocol.clone());
+        }
+        set_forwarded_headers(headers, peer, trusted);
+        if let Some(host) = &self.host {
+            headers.insert(HOST, host.clone());
+        }
         let gateway = self.gateway.clone();
         let access_log = self.access_log.clone();
         let capsules = Arc::clone(&self.capsules);
@@ -572,7 +615,8 @@ where
             .uri()
             .path_and_query()
             .is_some_and(|target| is_safe_path(target.as_str()));
-        let runs_capsule = matches!(method.as_str(), "GET" | "HEAD");
+        // An upgrade never runs the capsule, so it does not wait for a slot.
+        let runs_capsule = matches!(method.as_str(), "GET" | "HEAD") && upgrade.is_none();
         Box::pin(async move {
             let response = if !safe {
                 bad_request()

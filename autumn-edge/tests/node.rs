@@ -850,7 +850,7 @@ type HeaderLog = Arc<Mutex<Vec<Vec<(String, String)>>>>;
 
 /// A node in front of an in-process origin that records the headers the
 /// gateway gives it. The gateway gives the capsule the same request.
-async fn recording_node(trusted: &[&str]) -> (String, HeaderLog) {
+async fn recording_node(trusted: &[&str], host: Option<&str>) -> (String, HeaderLog) {
     use autumn_edge::node::TrustedProxy;
 
     let seen = HeaderLog::default();
@@ -872,8 +872,11 @@ async fn recording_node(trusted: &[&str]) -> (String, HeaderLog) {
         .iter()
         .map(|raw| TrustedProxy::parse(raw).expect("valid proxy"))
         .collect();
-    let node =
+    let mut node =
         EdgeNode::new(EdgeGateway::new(declining_guest(), origin)).with_trusted_proxies(trusted);
+    if let Some(host) = host {
+        node = node.with_host(http::HeaderValue::from_str(host).expect("valid host"));
+    }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -891,7 +894,7 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 #[tokio::test]
 async fn both_lanes_get_the_replaced_forwarded_headers() {
-    let (edge, seen) = recording_node(&[]).await;
+    let (edge, seen) = recording_node(&[], None).await;
 
     client()
         .get(format!("{edge}/x"))
@@ -918,7 +921,7 @@ async fn both_lanes_get_the_replaced_forwarded_headers() {
 
 #[tokio::test]
 async fn a_trusted_proxy_keeps_its_forwarded_headers() {
-    let (edge, seen) = recording_node(&["127.0.0.0/8"]).await;
+    let (edge, seen) = recording_node(&["127.0.0.0/8"], None).await;
 
     client()
         .get(format!("{edge}/x"))
@@ -943,7 +946,7 @@ async fn a_trusted_proxy_keeps_its_forwarded_headers() {
 
 #[tokio::test]
 async fn a_trusted_proxy_cannot_set_a_bad_scheme() {
-    let (edge, seen) = recording_node(&["127.0.0.1"]).await;
+    let (edge, seen) = recording_node(&["127.0.0.1"], None).await;
 
     client()
         .get(format!("{edge}/x"))
@@ -986,7 +989,7 @@ fn a_trusted_proxy_is_an_address_or_a_cidr_range() {
 
 #[tokio::test]
 async fn a_trusted_proxy_keeps_a_scheme_chain() {
-    let (edge, seen) = recording_node(&["127.0.0.1"]).await;
+    let (edge, seen) = recording_node(&["127.0.0.1"], None).await;
 
     for proto in ["https, http", "HTTPS", "https, javascript"] {
         client()
@@ -1003,4 +1006,108 @@ async fn a_trusted_proxy_keeps_a_scheme_chain() {
         .map(|headers| header(headers, "x-forwarded-proto"))
         .collect();
     assert_eq!(protos, [Some("https, http"), Some("HTTPS"), Some("http")]);
+}
+
+#[tokio::test]
+async fn a_connection_named_header_is_gone_before_both_lanes() {
+    // In-process origin: it sees exactly what the capsule sees.
+    let (edge, seen) = recording_node(&[], None).await;
+    client()
+        .get(format!("{edge}/x"))
+        .header("connection", "x-forwarded-for, x-hop")
+        .header("x-hop", "1")
+        .send()
+        .await
+        .expect("node answers");
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(header(&seen[0], "x-forwarded-for"), Some("127.0.0.1"));
+    assert_eq!(header(&seen[0], "x-hop"), None);
+    assert_eq!(header(&seen[0], "connection"), None);
+
+    // Over HTTP: the origin still gets the node's x-forwarded-for.
+    let (origin, log) = origin_with(Answer::created).await;
+    let edge = node(declining_guest(), &origin).await;
+    client()
+        .get(format!("{edge}/x"))
+        .header("connection", "x-forwarded-for")
+        .send()
+        .await
+        .expect("node answers");
+    let [request] = seen_once(&log);
+    assert_eq!(request.header("x-forwarded-for"), Some("127.0.0.1"));
+}
+
+fn seen_once(log: &Log) -> [Seen; 1] {
+    seen(log).try_into().expect("the origin is asked once")
+}
+
+#[tokio::test]
+async fn both_lanes_get_the_same_host() {
+    let (edge, seen) = recording_node(&[], Some("origin.internal:3000")).await;
+    client()
+        .get(format!("{edge}/x"))
+        .send()
+        .await
+        .expect("node answers");
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(header(&seen[0], "host"), Some("origin.internal:3000"));
+    assert_eq!(
+        header(&seen[0], "x-forwarded-host"),
+        Some(edge.trim_start_matches("http://"))
+    );
+}
+
+#[test]
+fn http_origin_gives_its_host() {
+    let origin = HttpOrigin::new("https://origin.example:8443/app").expect("valid");
+    assert_eq!(origin.host(), "origin.example:8443");
+    let origin = HttpOrigin::new("http://origin.example").expect("valid");
+    assert_eq!(origin.host(), "origin.example");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upgrade_does_not_wait_for_a_capsule_slot() {
+    // A guest that loops until its fuel runs out: it holds the only slot
+    // for a long time.
+    let looping = Arc::new(
+        EdgeArtifact::from_bytes(
+            &wat::parse_str(
+                r#"(module (memory (export "memory") 1)
+                     (func (export "_start") (loop br 0)))"#,
+            )
+            .expect("valid WAT"),
+        )
+        .expect("valid module"),
+    );
+    let (origin, _) = origin_with(Answer::created).await;
+    let gateway = EdgeGateway::new(looping, HttpOrigin::new(&origin).expect("origin"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let edge = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(serve(
+        listener,
+        EdgeNode::new(gateway).with_max_capsules(1),
+        std::future::pending(),
+    ));
+
+    let busy = tokio::spawn({
+        let url = format!("{edge}/busy");
+        async move { client().get(url).send().await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let upgrade = client()
+        .get(format!("{edge}/ws"))
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .send()
+        .await
+        .expect("node answers");
+
+    assert_eq!(upgrade.status(), StatusCode::CREATED);
+    assert!(
+        !busy.is_finished(),
+        "the upgrade must not wait for the busy capsule"
+    );
+    let _ = busy.await;
 }

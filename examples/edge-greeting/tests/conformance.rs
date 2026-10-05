@@ -1475,21 +1475,22 @@ async fn edge_node(origin: &str, lanes: &Lanes) -> String {
         !headers.is_empty(),
         "the origin sets security headers; the node must copy them"
     );
-    let gateway = EdgeGateway::new(
-        Arc::clone(artifact()),
-        autumn_edge::node::HttpOrigin::new(origin).expect("valid origin URL"),
-    )
-    .with_kv(edge_greeting::demo_kv())
-    .with_response_headers(headers);
+    let http_origin = autumn_edge::node::HttpOrigin::new(origin).expect("valid origin URL");
+    let host = http::HeaderValue::from_str(http_origin.host()).expect("valid host");
+    let gateway = EdgeGateway::new(Arc::clone(artifact()), http_origin)
+        .with_kv(edge_greeting::demo_kv())
+        .with_response_headers(headers);
     let lanes = Arc::clone(lanes);
-    let node = autumn_edge::node::EdgeNode::new(gateway).with_access_log(move |entry| {
-        if let Some(lane) = entry.lane {
-            lanes
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push((entry.path.clone(), lane));
-        }
-    });
+    let node = autumn_edge::node::EdgeNode::new(gateway)
+        .with_host(host)
+        .with_access_log(move |entry| {
+            if let Some(lane) = entry.lane {
+                lanes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((entry.path.clone(), lane));
+            }
+        });
     listen(node).await
 }
 
