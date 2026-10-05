@@ -255,8 +255,14 @@ impl SampleWindow {
 
     pub(crate) fn record(&mut self, now: Instant, failed: bool, slow: bool) {
         let epoch = self.epoch(now);
-        // The clock went back: the old buckets are not in this timeline.
-        if self.buckets.iter().any(|b| b.epoch > epoch) {
+        // The clock went back by a full window or more: the old buckets are
+        // not in this timeline. A smaller step keeps them; `counts` skips a
+        // bucket after `now`.
+        if self
+            .buckets
+            .iter()
+            .any(|b| b.epoch >= epoch.saturating_add(WINDOW_BUCKETS as u64))
+        {
             self.buckets = [Bucket::default(); WINDOW_BUCKETS];
         }
         let bucket = &mut self.buckets[Self::slot(epoch)];
@@ -493,8 +499,8 @@ impl CircuitBreaker {
     /// [`SampleWindow::resize`].
     pub fn update_config(&self, config: CircuitBreakerPolicy) {
         let config = config.clamped();
-        let now = self.now();
         let mut inner = self.lock_inner();
+        let now = self.now();
         if inner.config.sample_window != config.sample_window {
             inner.window.resize(config.sample_window, now);
         }
@@ -502,8 +508,8 @@ impl CircuitBreaker {
     }
 
     fn window_counts(&self) -> WindowCounts {
-        let now = self.now();
-        self.lock_inner().window.counts(now)
+        let inner = self.lock_inner();
+        inner.window.counts(self.now())
     }
 
     pub fn failure_ratio(&self) -> f64 {
@@ -564,16 +570,17 @@ impl CircuitBreaker {
 
     /// Counts a finished call that took `elapsed`.
     fn finish_call(&self, generation: u64, failed: bool, elapsed: Duration) {
-        let now = self.now();
+        // Read the clock under the lock, so window times follow lock order.
         let mut inner = self.lock_inner();
+        let now = self.now();
         let slow = inner.config.is_slow(elapsed);
         inner.record(&self.name, now, generation, failed, slow);
     }
 
     /// Counts a call that was dropped after `elapsed`, before it finished.
     fn cancel_call(&self, generation: u64, elapsed: Duration) {
-        let now = self.now();
         let mut inner = self.lock_inner();
+        let now = self.now();
         // During a panic, do not change the state: a log in a panicking
         // subscriber would abort the process.
         if inner.config.is_slow(elapsed) && !std::thread::panicking() {
@@ -1547,11 +1554,24 @@ mod tests {
     fn window_skips_buckets_after_a_backward_clock_step() {
         let origin = Instant::now();
         let mut window = SampleWindow::new(Duration::from_secs(10), origin);
-        window.record(origin + Duration::from_secs(5), true, true);
+        window.record(origin + Duration::from_secs(50), true, true);
         assert_eq!(window.counts(origin + Duration::from_secs(1)).total, 0);
-        // A record after the step clears the later bucket.
+        // A step back of a full window or more clears the ring.
         window.record(origin + Duration::from_secs(1), false, false);
-        assert_eq!(window.counts(origin + Duration::from_secs(5)).total, 1);
+        assert_eq!(window.counts(origin + Duration::from_secs(50)).total, 0);
+        assert_eq!(window.counts(origin + Duration::from_secs(1)).total, 1);
+    }
+
+    #[test]
+    fn small_backward_step_keeps_the_window() {
+        // Two racing calls record out of time order across a bucket edge.
+        let origin = Instant::now();
+        let mut window = SampleWindow::new(Duration::from_secs(10), origin);
+        window.record(origin + Duration::from_millis(5_100), true, false);
+        window.record(origin + Duration::from_millis(4_900), true, false);
+        let now = origin + Duration::from_millis(5_200);
+        assert_eq!(window.counts(now).total, 2);
+        assert_eq!(window.counts(now).failed, 2);
     }
 
     /// The naive model: it keeps every sample, and it puts each sample in
