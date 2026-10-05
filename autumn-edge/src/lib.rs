@@ -99,6 +99,10 @@ pub mod wire;
 #[cfg_attr(docsrs, doc(cfg(feature = "host")))]
 pub mod host;
 
+#[cfg(feature = "host")]
+#[cfg_attr(docsrs, doc(cfg(feature = "host")))]
+pub mod gateway;
+
 /// The route macros an edge-safe handler module needs.
 ///
 /// An `#[edge]` module compiles for `wasm32-wasip1`, where `autumn-web` is not

@@ -474,8 +474,8 @@ let log = net.events(); // one NetEvent per attempt
 ```
 
 - Latency is seeded, in virtual time. A drop fails the attempt after its
-  latency. The client's retry policy applies: attempts, backoff, 429
-  `Retry-After`, 502-504 retries and `request_timeout`.
+  latency. The client's retry policy applies: attempts, jittered backoff,
+  `Retry-After` on 429 and 503, 502-504 retries and `request_timeout`.
 - A host with no router falls back to the app's `http_mock`s. A host with
   neither is an error. No call reaches the real network.
 - The same seed records the same `events()`.
@@ -558,14 +558,14 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
 ```
 
 Before the fix, this `always!` fired on every seed: every retry landed in the
-same checkpoint. The fix draws an *equal-jitter* spread — a random delay in
-`[ceil(base_delay / 2), base_delay]` — from the framework's injected `Entropy`
-seam, so the herd spreads out using real OS entropy in production while
-staying bit-for-bit reproducible under a fixed sim seed (the ceiling keeps a
-small configured backoff, like `backoff_ms = 1`, from rounding down to an
-immediate 0ms retry). See
-`autumn/tests/integration/sim_retry_storm.rs` for the full test and
-`jittered_retry_delay_ms` in `autumn/src/job.rs` for the fix.
+same checkpoint. The fix draws a *full-jitter* delay, a random value in
+`[0, min(cap, base_delay)]`, from the framework's injected `Entropy` seam. The
+herd spreads out with real OS entropy in production, and replays bit for bit
+under a fixed sim seed. Issue #3054 moved the helper to `autumn_web::backoff`
+and applied it to every job backend and to the HTTP client. See
+`autumn/tests/integration/sim_retry_storm.rs` and
+`autumn/tests/integration/sim_retry_storm_http.rs` for the tests, and
+`job_retry_delay_ms` in `autumn/src/job.rs` for the job side.
 
 ---
 
