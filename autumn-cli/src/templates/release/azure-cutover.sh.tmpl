@@ -109,7 +109,10 @@ while IFS=$'\t' read -r name image; do
   ACTIVE_REVISIONS="$ACTIVE_REVISIONS $name"
   case "$image" in "$ACR_LOGIN_SERVER"/*) RELEASED=1 ;; esac
 done <<< "$ACTIVE"
-JOB_IDENTITY=$(jq -r '.properties.configuration.registries[0].identity // ""' <<< "$JOB")
+# The identity of the job's ACR registry entry. The job can list other
+# registries too, so the script selects the entry by server.
+JOB_IDENTITY=$(jq -r --arg acr "$ACR_LOGIN_SERVER" \
+  '[.properties.configuration.registries // [] | .[] | select(.server == $acr)][0].identity // ""' <<< "$JOB")
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
 JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$JOB")
@@ -384,8 +387,8 @@ rollback() {
   echo "::warning::removing the credentials from the placeholder app" >&2
   if remove_credentials; then
     # The first cutover disabled ingress. Bring the saved ingress back, as
-    # it was (closed), now that the placeholder has no credentials.
-    [ "$SAVED_INGRESS" = null ] || set_ingress false \
+    # it was, now that the placeholder has no credentials.
+    [ "$SAVED_INGRESS" = null ] || set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")" \
       || echo "::warning::restore the ingress of $AZURE_APP_NAME manually" >&2
     return
   fi
