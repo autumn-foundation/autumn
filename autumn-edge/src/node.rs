@@ -760,13 +760,14 @@ pub async fn origin_static_headers(
 ///
 /// [`measure`](ttfb::measure) sends the same `GET`s to the edge node and to
 /// the origin. For each path, it changes which side goes first on each
-/// round. It records the time to the response head, then reads the body. It
+/// round. Origin requests get the `x-forwarded-host` and
+/// `x-forwarded-proto` that the node sets. It records the time to the response head, then reads the body. It
 /// compares the pair with [`conformance::compare`](crate::conformance::compare),
 /// without the hop-by-hop headers. A pair that is not equal is a divergence.
 pub mod ttfb {
     use std::time::{Duration, Instant};
 
-    use super::{NodeError, base_url, http_client};
+    use super::{HeaderMap, HeaderName, HeaderValue, NodeError, base_url, http_client};
     use crate::conformance::{Verdict, compare};
     use crate::wire::EdgeResponse;
 
@@ -860,6 +861,10 @@ pub mod ttfb {
     pub async fn measure(probe: &Probe) -> Result<Report, NodeError> {
         let edge = base_url(&probe.edge)?;
         let origin = base_url(&probe.origin)?;
+        // A direct origin request gets the forwarded host and scheme that the
+        // node sets, so a handler that reads them answers the same.
+        let as_through_node = forwarded_as_edge(&edge)?;
+        let none = HeaderMap::new();
         if probe.paths.is_empty() || probe.rounds == 0 {
             return Err(NodeError::Config(
                 "give at least one path and at least one round".into(),
@@ -876,7 +881,7 @@ pub mod ttfb {
         // the TCP handshake; that is not what the probe measures.
         for base in [&edge, &origin] {
             if let Some(path) = probe.paths.first() {
-                fetch(&client, base, path).await?;
+                fetch(&client, base, path, &none).await?;
             }
         }
 
@@ -886,11 +891,11 @@ pub mod ttfb {
                 // Each path changes its order on each round.
                 let edge_first = round.wrapping_add(index) % 2 == 0;
                 let (edge_answer, origin_answer) = if edge_first {
-                    let e = fetch(&client, &edge, path).await?;
-                    (e, fetch(&client, &origin, path).await?)
+                    let e = fetch(&client, &edge, path, &none).await?;
+                    (e, fetch(&client, &origin, path, &as_through_node).await?)
                 } else {
-                    let o = fetch(&client, &origin, path).await?;
-                    (fetch(&client, &edge, path).await?, o)
+                    let o = fetch(&client, &origin, path, &as_through_node).await?;
+                    (fetch(&client, &edge, path, &none).await?, o)
                 };
                 report.edge.samples.push(edge_answer.0);
                 report.origin.samples.push(origin_answer.0);
@@ -903,15 +908,44 @@ pub mod ttfb {
     }
 
     /// `GET base+path`: the time to the response head, and the response.
+    /// `x-forwarded-host` and `x-forwarded-proto` as the edge node sets them
+    /// for a request to `edge`.
+    fn forwarded_as_edge(edge: &str) -> Result<HeaderMap, NodeError> {
+        let bad = || NodeError::Config(format!("`{edge}` has no host"));
+        let url = reqwest::Url::parse(edge).map_err(|_| bad())?;
+        let host = url.host_str().ok_or_else(bad)?;
+        let authority = url
+            .port()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_str(&authority).map_err(|_| bad())?,
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_str(url.scheme()).map_err(|_| bad())?,
+        );
+        Ok(headers)
+    }
+
+    /// `GET base+path` with `headers`: the time to the response head, and
+    /// the response.
     async fn fetch(
         client: &reqwest::Client,
         base: &str,
         path: &str,
+        headers: &HeaderMap,
     ) -> Result<(Duration, EdgeResponse), NodeError> {
         let url = format!("{base}{path}");
         let failed = |err: reqwest::Error| NodeError::Request(format!("GET {url}: {err}"));
         let started = Instant::now();
-        let answer = client.get(&url).send().await.map_err(failed)?;
+        let answer = client
+            .get(&url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .map_err(failed)?;
         let ttfb = started.elapsed();
         let status = answer.status().as_u16();
         // Hop-by-hop headers belong to one connection, not to the response.

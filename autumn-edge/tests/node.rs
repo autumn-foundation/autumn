@@ -1176,3 +1176,36 @@ async fn an_asterisk_form_options_is_not_implemented() {
     assert!(answer.starts_with("HTTP/1.1 501"), "{answer}");
     assert!(seen(&log).is_empty());
 }
+
+#[tokio::test]
+async fn the_probe_gives_the_origin_the_same_forwarded_host_and_scheme() {
+    // An origin whose body shows the forwarded host and scheme it got.
+    let router = axum::Router::new().fallback(|request: Request<Body>| async move {
+        let get = |name: &str| {
+            request
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-")
+                .to_owned()
+        };
+        format!("{} {}", get("x-forwarded-host"), get("x-forwarded-proto"))
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let edge = node(declining_guest(), &origin).await;
+
+    let report = measure(&Probe {
+        edge,
+        origin,
+        paths: vec!["/who".into()],
+        rounds: 2,
+    })
+    .await
+    .expect("probe runs");
+
+    assert!(report.divergences.is_empty(), "{:?}", report.divergences);
+}

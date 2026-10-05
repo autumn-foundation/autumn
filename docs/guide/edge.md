@@ -637,7 +637,10 @@ TTFB: 200 request(s) per side
 ```
 
 The probe sends the same `GET`s to the edge node and to the origin. For
-each path, it changes which side goes first on each round. It compares
+each path, it changes which side goes first on each round. On each origin
+request it sets `x-forwarded-host` and `x-forwarded-proto` to the edge
+node's host and scheme, as the node does. It cannot set the same
+`x-forwarded-for`: only the node knows the address it sees. It compares
 each pair with `conformance::compare`, without the hop-by-hop headers. One
 divergence fails the run.
 
