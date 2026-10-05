@@ -185,18 +185,29 @@ fn index_renames(
                     && i.unique == idx.unique
                     && i.definition.is_none()
             });
-            // Index names are global in the schema, so check every table.
-            let taken = work
+            if new_name == idx.name || !declared {
+                continue;
+            }
+            // Index names are global in the schema, so check every table. A
+            // name another table owns is refused: an add would collide too.
+            let owner = work
                 .iter()
-                .any(|t| t.indexes.iter().any(|i| i.name == new_name));
-            if new_name != idx.name && declared && !taken {
-                let mut index = idx.clone();
-                index.name = new_name;
-                out.push(SchemaChange::RenameIndex {
+                .find(|t| t.indexes.iter().any(|i| i.name == new_name));
+            match owner {
+                Some(t) if t.name == name => {}
+                Some(t) => out.push(SchemaChange::RenameConflict {
                     table: name.to_owned(),
-                    from: idx.name.clone(),
-                    index,
-                });
+                    reason: format!("index `{new_name}` already exists on table `{}`", t.name),
+                }),
+                None => {
+                    let mut index = idx.clone();
+                    index.name = new_name;
+                    out.push(SchemaChange::RenameIndex {
+                        table: name.to_owned(),
+                        from: idx.name.clone(),
+                        index,
+                    });
+                }
             }
         }
     }
@@ -478,11 +489,15 @@ pub fn quoted_len(rest: &str, close: char) -> usize {
 /// - A quoted identifier (`"from"` or `[from]`) matches too.
 /// - String literals (`'...'`) do not change.
 /// - A function name (a word before `(`), a typed-literal type (a word before
-///   `'`) or a cast type (a word after `::`) does not change.
+///   `'`) or a cast type (the name after `::`, maybe schema-qualified) does not
+///   change.
 fn replace_word(sql: &str, from: &str, to: &str) -> String {
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
     let mut out = String::with_capacity(sql.len());
     let mut rest = sql;
+    // The type name after `::` (maybe schema-qualified) is not a column.
+    // `expect_name`: after `::` or a `.` in that name; `in_name`: after a part.
+    let (mut expect_name, mut in_name) = (false, false);
     while let Some(c) = rest.chars().next() {
         let close = match c {
             '\'' | '"' => Some(c),
@@ -504,11 +519,12 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
         // A word before `(` is a function; before `'` it is a typed literal
         // (`DATE '2020-01-01'`).
         let is_call = next.starts_with('(') || next.starts_with('\'');
-        let is_cast = out.ends_with("::");
-        let quoted_match = matches!(close, Some('"' | ']'))
+        let in_cast = expect_name && (close.is_some() || is_word(c));
+        let quoted_match = !in_cast
+            && matches!(close, Some('"' | ']'))
             && token.len() > 1
             && &token[1..token.len() - 1] == from;
-        if close.is_none() && token.eq_ignore_ascii_case(from) && !is_call && !is_cast {
+        if close.is_none() && token.eq_ignore_ascii_case(from) && !is_call && !in_cast {
             out.push_str(to);
         } else if quoted_match {
             out.push_str(&token[..1]);
@@ -517,6 +533,13 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
         } else {
             out.push_str(token);
         }
+        (expect_name, in_name) = if out.ends_with("::") || (in_name && c == '.') {
+            (true, false)
+        } else if in_cast {
+            (false, true)
+        } else {
+            (expect_name && c.is_whitespace(), false)
+        };
         rest = &rest[len..];
     }
     out
@@ -1165,6 +1188,10 @@ mod tests {
                 .any(|c| matches!(c, SchemaChange::RenameIndex { .. })),
             "{changes:?}"
         );
+        // Refused: an add of that name would collide too.
+        let err = guard_plan(&diff_schema(&base, &want, OPTS), ALLOW).unwrap_err();
+        assert!(matches!(err, DiffError::RenameConflict { .. }), "{err}");
+        assert!(err.to_string().contains("idx_users_mail_unique"), "{err}");
     }
 
     #[test]
@@ -1207,6 +1234,14 @@ mod tests {
                 "published_on"
             ),
             "published_on >= date('2000-01-01') AND x::date IS NOT NULL"
+        );
+        assert_eq!(
+            replace_word(
+                "date >= v::pg_catalog.date AND date < w:: date",
+                "date",
+                "published_on"
+            ),
+            "published_on >= v::pg_catalog.date AND published_on < w:: date"
         );
         assert_eq!(
             replace_word("date >= DATE '2020-01-01'", "date", "published_on"),

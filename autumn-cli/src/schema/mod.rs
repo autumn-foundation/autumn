@@ -871,20 +871,29 @@ fn replay_baseline(
 /// Warn on stderr when the snapshot does not match the schema the migrations
 /// make (the `--dev-url` replay). The diff still uses the replayed schema.
 fn warn_snapshot_drift(snapshot: &[Table], replayed: &[Table]) {
-    // The same direction as a model diff against a pulled snapshot (replay as
-    // baseline, snapshot as desired), which is clean for a tool-made project.
-    let drift = diff::diff_schema(
-        replayed,
-        &parse::ParsedSchema::from_tables(snapshot.to_vec()),
-        diff::DiffOptions::default(),
-    );
-    if !drift.is_empty() {
-        eprintln!(
-            "warning: the snapshot does not match the migrations. These changes \
-             turn the migrated schema into the snapshot:\n{}",
-            diff::describe_plan(&drift)
-        );
+    if let Some(text) = snapshot_drift(snapshot, replayed) {
+        eprintln!("warning: the snapshot does not match the migrations.\n{text}");
     }
+}
+
+/// The differences between the snapshot and the replayed schema, in both
+/// directions, or `None` when they match. Same comparison as doctor's
+/// database-schema-drift check.
+fn snapshot_drift(snapshot: &[Table], replayed: &[Table]) -> Option<String> {
+    let drift = doctor::compute_db_schema_drift(snapshot, replayed);
+    if drift.is_clean() {
+        return None;
+    }
+    let mut text = String::new();
+    if !drift.forward.is_empty() {
+        text.push_str("Changes that turn the snapshot into the migrated schema:\n");
+        text.push_str(&diff::describe_plan(&drift.forward));
+    }
+    if !drift.reverse.is_empty() {
+        text.push_str("Changes that turn the migrated schema into the snapshot:\n");
+        text.push_str(&diff::describe_plan(&drift.reverse));
+    }
+    Some(text)
 }
 
 /// Project the guarded migration `plan` onto the `baseline` tables to compute the
@@ -1313,6 +1322,27 @@ mod tests {
         )
         .expect("second diff");
         assert_eq!(std::fs::read_dir(&migrations).expect("read").count(), 1);
+    }
+
+    #[test]
+    fn snapshot_drift_sees_replay_only_facets_both_ways() {
+        let mut posts = autumn_schema_core::Table::new("posts", Backend::Postgres);
+        posts
+            .columns
+            .push(Column::new("id", autumn_schema_core::ColumnType::Int64));
+        assert_eq!(snapshot_drift(&[posts.clone()], &[posts.clone()]), None);
+
+        // A hand-written CHECK in the migrations that the snapshot lacks.
+        let mut replayed = posts.clone();
+        replayed.checks.push(autumn_schema_core::CheckConstraint {
+            name: Some("id_positive".to_owned()),
+            expression: "id > 0".to_owned(),
+        });
+        let text = snapshot_drift(&[posts.clone()], &[replayed.clone()]).expect("drift");
+        assert!(text.contains("id_positive"), "{text}");
+        // And the other way: the snapshot has it, the migrations do not.
+        let text = snapshot_drift(&[replayed], &[posts]).expect("drift");
+        assert!(text.contains("id_positive"), "{text}");
     }
 
     #[test]
