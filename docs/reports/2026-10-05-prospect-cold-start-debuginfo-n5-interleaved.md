@@ -65,16 +65,23 @@ Registered set: baseline = samples 2–6, debug=1 = samples 1–5.
 
 ## 🏁 Verdict
 
-**Undetermined against the registered lines.** 12.75% misses the 20% pursue line and clears
-the 10% kill line, so by the pre-registration this is neither pursue nor kill. The line is
-not moved. What the data does settle: the effect is real and reproducible (non-overlapping
-ranges, tight debug=1 spread, same sign as the earlier runs) but its size is ~12–13%, roughly
-a 14s saving on a ~115s cold start. Whether that is worth a template default (and its
-effect on debugger/backtrace quality) is a judgement call for the decider, not a number this
-assay can supply. Together with 09-28 (-14.48%) and Onramp (~8.7% by proxy), the estimates
-span 9–14%; none of three independent measurements reached 20%, so the 20% floor looks
-unreachable for `debug = 1` — a re-charter should reconsider the floor explicitly rather
-than re-run this one.
+**Undetermined, by two independent routes under the pre-registration.**
+1. **Noise rule:** the registered baseline spans 112291–155322 ms (~37% of its median), above
+   the pre-registered 20% threshold, so the plan's own rule returns *undetermined-by-noise*.
+   The 155s outlier (sample 6) is the cause; samples 2–5 alone span ~4%, but dropping an
+   outlier after seeing it is exactly what the registration forbids.
+2. **Lines:** the 12.75% median misses the 20% pursue line and clears the 10% kill line, so
+   it is neither pursue nor kill. The line is not moved.
+
+What the data supports, with that qualification: in all 5 paired runs `debug = 1` finished
+faster than every baseline sample and its own spread was ~2%, in the same direction as the
+09-28 assay. That is consistent with a real ~12% effect, but at n=5 with a noisy baseline it is
+not a settled number, and the 12.75% median should be quoted only alongside the noise
+verdict. Whether ~14 s on a ~115 s cold start justifies a template default (and its effect on
+debugger/backtrace quality) is the decider's call. Together with 09-28 (-14.48%) and Onramp
+(~8.7% by proxy), estimates span 9–14% and none reached 20%; a re-charter should reconsider
+the 20% floor and use a quieter baseline (dedicated runner, more samples) rather than repeat
+this one.
 
 ## 💰 Cost to productionize
 
