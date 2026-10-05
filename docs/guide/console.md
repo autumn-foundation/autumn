@@ -109,6 +109,9 @@ Second
 - `--repl` also sets `AUTUMN_CONSOLE_REPL=1`. Then `SeedContext::build()`
   opens the prompt and ends the process when you exit. The playground code
   after it never runs. Any playground works, also one from before `--repl`.
+- The playground is your code, so code you put before `SeedContext::build()`
+  still runs. A playground that never calls `SeedContext::build()` cannot
+  open the prompt: `autumn console --repl` then fails and says so.
 - Repository methods are `async`. Rhai is synchronous. Each call blocks on the
   runtime handle, with a 30-second limit. The database server stops the
   statement at that limit too.

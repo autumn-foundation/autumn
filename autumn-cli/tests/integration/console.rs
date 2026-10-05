@@ -849,6 +849,28 @@ fn console_repl_runs_and_reports_errors_as_script_errors() {
         !stderr.contains("PLAYGROUND BODY RAN") && !stderr.contains("autumn console: done."),
         "the edit-and-run body does not run in REPL mode:\n{stderr}"
     );
+
+    // A playground that never reaches `SeedContext::build()` cannot open the
+    // prompt. Its run must fail, not end as a finished REPL session.
+    fs::write(
+        playground_path(&project),
+        "#[autumn_web::main]\nasync fn main() {\n    eprintln!(\"NO BUILD CALL\");\n}\n",
+    )
+    .unwrap();
+    let out = Command::new(autumn_bin())
+        .args(["console", "--repl"])
+        .current_dir(&project)
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:1/nodb")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run autumn console --repl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NO BUILD CALL"), "{stderr}");
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("exited without opening the REPL"),
+        "the CLI names the missing prompt:\n{stderr}"
+    );
 }
 
 // ── AC2/AC6: no drift from `autumn seed`, and the docs exist ───────────────

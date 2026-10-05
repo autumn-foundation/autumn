@@ -57,6 +57,10 @@ const CLIENT_GRACE: Duration = Duration::from_secs(1);
 /// Set to `1` by `autumn console --repl`.
 pub const REPL_ENV: &str = "AUTUMN_CONSOLE_REPL";
 
+/// A file path set by `autumn console --repl`. Opening the prompt creates the
+/// file, and the CLI treats a run that never created it as a failure.
+pub const REPL_ACK_ENV: &str = "AUTUMN_CONSOLE_REPL_ACK";
+
 /// The history file, relative to the project directory.
 pub const HISTORY_FILE: &str = "target/autumn/repl_history.txt";
 
@@ -449,7 +453,16 @@ pub fn run_here(pool: &ReplPool) -> Result<(), ReplError> {
 
 /// Opens the prompt (see [`run_here`]) and ends the process.
 pub fn run_in_place(pool: &ReplPool) -> ! {
+    acknowledge();
     exit_with(run_here(pool))
+}
+
+/// Tells `autumn console --repl` that this process reached the prompt, by
+/// creating the file it named in [`REPL_ACK_ENV`].
+pub fn acknowledge() {
+    if let Some(path) = std::env::var_os(REPL_ACK_ENV) {
+        let _ = std::fs::write(path, b"");
+    }
 }
 
 /// Ends the process with the result of the prompt.
@@ -979,6 +992,15 @@ mod tests {
         temp_env::with_var(REPL_ENV, Some("1"), || assert!(requested()));
         temp_env::with_var(REPL_ENV, Some("0"), || assert!(!requested()));
         temp_env::with_var(REPL_ENV, None::<&str>, || assert!(!requested()));
+    }
+
+    #[test]
+    fn acknowledge_creates_the_file_the_cli_named() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let ack = dir.path().join("opened");
+        temp_env::with_var(REPL_ACK_ENV, Some(&ack), acknowledge);
+        assert!(ack.exists(), "the CLI checks this file after the run");
+        temp_env::with_var(REPL_ACK_ENV, None::<&str>, acknowledge);
     }
 
     #[test]
