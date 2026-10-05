@@ -219,6 +219,16 @@ async fn signal_follows_runtime_config_without_redeploy() {
         .state()
         .extension::<CostSignal>()
         .expect("signal installed");
+    // Until the first read lands, deferrable work waits: the store could hold
+    // a high value at boot.
+    assert!(signal.is_pending() && signal.is_high());
+    for _ in 0..300 {
+        if !signal.is_pending() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(!signal.is_pending(), "the first read lands");
     assert!(!signal.is_high());
 
     service

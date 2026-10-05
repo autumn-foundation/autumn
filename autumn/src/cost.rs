@@ -448,6 +448,8 @@ struct SignalInner {
     deferrals: AtomicU64,
     /// Milliseconds between two checks while work waits.
     recheck_ms: AtomicU64,
+    /// `true` until the first value arrives from runtime config.
+    pending: std::sync::atomic::AtomicBool,
 }
 
 /// A point-in-time copy of a [`CostSignal`].
@@ -458,8 +460,11 @@ pub struct CostSignalSnapshot {
     pub value: f64,
     /// The threshold. `None` means that work never waits.
     pub threshold: Option<f64>,
-    /// `true` when the value is above the threshold.
+    /// `true` when the value is above the threshold, or when the first value
+    /// from runtime config has not arrived yet.
     pub high: bool,
+    /// `true` until the first value arrives from runtime config.
+    pub pending: bool,
     /// How many times work started to wait. A job or a task tick that waits
     /// adds one, however long it waits.
     pub deferrals: u64,
@@ -483,6 +488,7 @@ impl CostSignal {
                 threshold: AtomicU64::new(f64::INFINITY.to_bits()),
                 deferrals: AtomicU64::new(0),
                 recheck_ms: AtomicU64::new(DEFAULT_RECHECK_MS),
+                pending: std::sync::atomic::AtomicBool::new(false),
             }),
         };
         signal.set_threshold(threshold);
@@ -493,7 +499,20 @@ impl CostSignal {
     pub fn set(&self, value: f64) {
         if value.is_finite() {
             self.inner.value.store(value.to_bits(), Ordering::Relaxed);
+            self.inner.pending.store(false, Ordering::Release);
         }
+    }
+
+    /// Hold work until the first value arrives: a store can already hold a
+    /// high value when the app starts.
+    fn mark_pending(&self) {
+        self.inner.pending.store(true, Ordering::Release);
+    }
+
+    /// `true` until the first value arrives from runtime config.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.inner.pending.load(Ordering::Acquire)
     }
 
     /// The current value.
@@ -519,11 +538,13 @@ impl CostSignal {
         threshold.is_finite().then_some(threshold)
     }
 
-    /// `true` when the value is above the threshold.
+    /// `true` when the value is above the threshold. With a threshold, it is
+    /// also `true` until the first value arrives from runtime config, so
+    /// deferrable work does not run before the app knows the signal.
     #[must_use]
     pub fn is_high(&self) -> bool {
         self.threshold()
-            .is_some_and(|threshold| self.value() > threshold)
+            .is_some_and(|threshold| self.is_pending() || self.value() > threshold)
     }
 
     /// Copy the current state.
@@ -533,6 +554,7 @@ impl CostSignal {
             value: self.value(),
             threshold: self.threshold(),
             high: self.is_high(),
+            pending: self.is_pending(),
             deferrals: self.inner.deferrals.load(Ordering::Relaxed),
         }
     }
@@ -880,6 +902,7 @@ fn spawn_signal_refresh(
         tracing::warn!("no tokio runtime; the cost signal does not follow runtime config");
         return;
     };
+    signal.mark_pending();
     let weak = Arc::downgrade(&signal.inner);
     handle.spawn(async move {
         loop {
@@ -1077,6 +1100,23 @@ mod tests {
         assert!(signal.is_high());
         signal.set(10.0);
         assert!(!signal.is_high());
+    }
+
+    /// Until the first runtime-config value arrives, a signal with a threshold
+    /// holds deferrable work (#1720).
+    #[test]
+    fn a_pending_signal_holds_work_until_the_first_value() {
+        let signal = CostSignal::new(Some(1.0));
+        signal.mark_pending();
+        assert!(signal.is_high(), "a store can hold a high value at boot");
+        assert!(signal.snapshot().pending);
+        signal.set(0.5);
+        assert!(!signal.is_high());
+        assert!(!signal.is_pending());
+
+        let no_threshold = CostSignal::new(None);
+        no_threshold.mark_pending();
+        assert!(!no_threshold.is_high(), "without a threshold nothing waits");
     }
 
     #[test]

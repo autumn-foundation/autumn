@@ -6219,9 +6219,25 @@ fn apply_startup_barrier(
         crate::middleware::AccessLogLayer::fallback(config.log.access_log_exclude.clone())
     });
 
+    // Cost fallback (#1720), for the same short-circuit paths. It records only
+    // a response without the primary `CostLayer`'s marker, so a request counts
+    // one time. Inside the Server-Timing fallback, as the primary is.
+    let cost_fallback = config
+        .cost
+        .enabled
+        .then(|| state.extension::<crate::cost::CostAccountant>())
+        .flatten()
+        .map(|accountant| {
+            crate::middleware::CostLayer::fallback(
+                (*accountant).clone(),
+                crate::config::server_timing_enabled(config),
+            )
+        });
+
     router.layer((
         trace_context,
         tower::util::option_layer(server_timing_fallback),
+        tower::util::option_layer(cost_fallback),
         tower::util::option_layer(access_log_fallback),
         StartupBarrierLayer::new(barrier_state),
     ))

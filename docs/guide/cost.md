@@ -57,6 +57,9 @@ into `_other`:
 tenant always go to `_none`. The accountant does not remove a key until the app
 restarts.
 
+A response that the router serves before tenancy runs, such as a static-first
+(SSG/ISR) page or a startup `503`, is counted under `_none`.
+
 ---
 
 ## Read the cost
@@ -197,7 +200,10 @@ Use this to connect your own carbon or price feed.
    autumn config set autumn_cost_signal 520 --actor ops@example.com
    ```
 
-The app reads the key every `signal_refresh_secs` (default `5`).
+The app reads the key every `signal_refresh_secs` (default `5`). The store can
+already hold a high value when the app starts, so with a `defer_threshold`,
+deferrable work waits until the first read succeeds. `signal.pending` in
+`/actuator/cost` is `true` until then.
 
 ---
 

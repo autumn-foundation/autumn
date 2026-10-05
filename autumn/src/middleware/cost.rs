@@ -42,7 +42,12 @@ static SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 pub struct CostLayer {
     accountant: CostAccountant,
     emit_header: bool,
+    fallback: bool,
 }
+
+/// Response marker: a primary [`CostLayer`] recorded this response.
+#[derive(Clone, Copy, Debug)]
+struct CostMetered;
 
 impl CostLayer {
     /// Make a layer that records into `accountant`.
@@ -53,6 +58,22 @@ impl CostLayer {
         Self {
             accountant,
             emit_header,
+            fallback: false,
+        }
+    }
+
+    /// Make a fallback layer for the outside of the router.
+    ///
+    /// Some responses never reach the primary layer: a static-first (SSG/ISR)
+    /// hit or a startup 503. A fallback layer records only a response that no
+    /// primary layer recorded, so a request counts one time. It does not
+    /// record a request that the server drops before it completes.
+    #[must_use]
+    pub const fn fallback(accountant: CostAccountant, emit_header: bool) -> Self {
+        Self {
+            accountant,
+            emit_header,
+            fallback: true,
         }
     }
 }
@@ -65,6 +86,7 @@ impl<S> Layer<S> for CostLayer {
             inner,
             accountant: self.accountant.clone(),
             emit_header: self.emit_header,
+            fallback: self.fallback,
         }
     }
 }
@@ -75,6 +97,7 @@ pub struct CostService<S> {
     inner: S,
     accountant: CostAccountant,
     emit_header: bool,
+    fallback: bool,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for CostService<S>
@@ -107,7 +130,10 @@ where
             allocated: 0,
             accountant: self.accountant.clone(),
             emit_header: self.emit_header,
-            recorded: false,
+            // A fallback layer cannot tell whether a dropped request reached
+            // the primary, so only a response that it sees is recorded.
+            recorded: self.fallback,
+            fallback: self.fallback,
         }
     }
 }
@@ -150,6 +176,7 @@ pin_project! {
         emit_header: bool,
         // `true` after the cost is in the accountant.
         recorded: bool,
+        fallback: bool,
     }
 
     impl<F> PinnedDrop for CostFuture<F> {
@@ -196,6 +223,14 @@ where
         match out {
             Poll::Ready(Ok(mut response)) => {
                 *this.recorded = true;
+                if *this.fallback {
+                    // A primary layer recorded this response already.
+                    if response.extensions().get::<CostMetered>().is_some() {
+                        return Poll::Ready(Ok(response));
+                    }
+                } else {
+                    response.extensions_mut().insert(CostMetered);
+                }
                 record(
                     this.accountant,
                     this.log.as_ref(),
@@ -213,6 +248,10 @@ where
                 Poll::Ready(Ok(response))
             }
             Poll::Ready(Err(error)) => {
+                // An error has no marker; only the primary layer records it.
+                if *this.fallback {
+                    return Poll::Ready(Err(error));
+                }
                 *this.recorded = true;
                 record(
                     this.accountant,
@@ -366,6 +405,29 @@ mod tests {
         // Drop the request outside the log-context scope.
         drop(request);
         assert_eq!(accountant.tenant("acme").map(|t| t.requests), Some(1));
+    }
+
+    /// The fallback records a response that no primary layer saw, and only
+    /// that one (#1720).
+    #[tokio::test]
+    async fn the_fallback_records_only_what_the_primary_did_not() {
+        let accountant = CostAccountant::new(4);
+        let handler = || {
+            tower::service_fn(|_req: Request<()>| async {
+                Ok::<_, std::convert::Infallible>(Response::new(()))
+            })
+        };
+
+        // A static-first hit: no primary layer inside.
+        let mut fallback_only = CostLayer::fallback(accountant.clone(), false).layer(handler());
+        fallback_only.call(Request::new(())).await.unwrap();
+        assert_eq!(accountant.snapshot().total.requests, 1);
+
+        // A dynamic request: the primary records, the fallback does not.
+        let mut both = CostLayer::fallback(accountant.clone(), false)
+            .layer(CostLayer::new(accountant.clone(), false).layer(handler()));
+        both.call(Request::new(())).await.unwrap();
+        assert_eq!(accountant.snapshot().total.requests, 2);
     }
 
     #[tokio::test]
