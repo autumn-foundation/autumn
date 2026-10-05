@@ -3229,16 +3229,17 @@ fn path_string(path: &syn::Path) -> String {
 // This module forks `query_budget.rs`'s handle tracking (see the module doc
 // comment), and most of what looks like a sibling function below has since
 // diverged on purpose: `pattern_bindings`/`container_bindings`/`select_part`,
-// `type_handle`, `signature_handles` and friends carry this analyser's
-// `Handle` enum, where `query_budget` keeps a scoped environment of its own
-// `Kind` lattice. `INERT_MACROS` looks identical but is not — see the comment
-// on `mac()` below for why `vec!`/`format!` are excluded here.
+// `type_handle`, `is_constructor_call`, `signature_handles` and friends carry
+// this analyser's `Handle` enum, where `query_budget` keeps a scoped
+// environment of its own `Kind` lattice. `INERT_MACROS` looks identical but
+// is not — see the comment on `mac()` below for why `vec!`/`format!` are
+// excluded here.
 //
 // A handful of items *are* still byte-for-byte copies, because they just
 // enumerate `syn`'s own `Expr`/`Item` variants or do generic token-tree
 // plumbing that owes nothing to either analyser's rules: `expr_attrs`,
 // `expr_attrs_mut`, `item_attrs_mut`, `immediately_invoked_closure`,
-// `call_path_name`, `tokens_contain_await`, `is_constructor_call`, and the
+// `call_path_name`, `tokens_contain_await`, and the
 // `StripAnnotations`/`VisitMut` impl, plus the `EXECUTORS` list above. Fix a
 // bug in one of *those* and fix it in the other — `shared_helpers_match_query_budget`
 // below fails the build if they drift. Two instances is not enough to extract
@@ -4212,7 +4213,7 @@ mod tests {
 
     /// `expr_attrs`, `expr_attrs_mut`, `item_attrs_mut`,
     /// `immediately_invoked_closure`, `call_path_name`, `tokens_contain_await`,
-    /// `is_constructor_call`, `StripAnnotations`'s `VisitMut` impl, and
+    /// `StripAnnotations`'s `VisitMut` impl, and
     /// `EXECUTORS` are a deliberate copy of `query_budget.rs`, modulo
     /// comments (see the comment above `expr_attrs` in this file, and its
     /// mirror in `query_budget.rs`) — everything else nearby has since
@@ -4231,7 +4232,6 @@ mod tests {
             "fn immediately_invoked_closure(func: &Expr) -> Option<&syn::ExprClosure> {",
             "fn call_path_name(call: &ExprCall) -> Option<String> {",
             "fn tokens_contain_await(tokens: &TokenStream) -> bool {",
-            "fn is_constructor_call(call: &ExprCall) -> bool {",
             "impl VisitMut for StripAnnotations {",
         ];
         for sig in braced_items {

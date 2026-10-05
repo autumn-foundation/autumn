@@ -21,8 +21,14 @@
   field, a pattern, `?` or an element method (`remove`, `unwrap`) on
   `[repo]`, `vec![repo]`, `Some(repo)` or a `Vec<PgPostRepository>`
   parameter gives a handle (#2316).
-- **query budgets:** a parameter of type `Arc<PgPostRepository>`, `Box<…>` or
-  `Rc<…>` is a handle. Before, a query through it was not counted (#2316).
+- **query budgets:** a parameter of type `Arc<PgPostRepository>`, `Box<…>`,
+  `Rc<…>`, `dyn PostRepository` or `impl PostRepository` is a handle. A
+  handle assigned into a field (`deps.0 = repo`) is tracked. Before, a query
+  through these was not counted (#2316).
+- **query budgets:** `db.tx_immediate(…)`, `scoped_immediate_transaction`
+  and `maybe_immediate_transaction` count their callback like `db.tx(…)`.
+  A query future built inside `vec![…]` is counted. A function passed by
+  name as a transaction or iterator callback is reported (#2316).
 - **query budgets:** `#[query_cost]` and `#[query_exempt]` on an assignment
   or compound-assignment statement (`=`, `+=`) now apply, as in
   `#[query_cost(2)] links = load_links(&mut db).await?;`. Before, they were

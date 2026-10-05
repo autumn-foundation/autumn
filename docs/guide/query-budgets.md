@@ -125,7 +125,7 @@ Both halves are compiled in CI as trybuild fixtures — see
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
 | An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
-| `db.tx(\|conn\| …)` / `db.tx_with(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported |
+| `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
 | An `Option`/`Result` combinator closure (`unwrap_or_else`, `ok_or_else`, …) | counted **once** — it is not an iterator adapter |
 
@@ -141,7 +141,8 @@ The analysis follows the handle through every name that holds it:
   `let … else`, assignment, `if let`, `while let`, `match` arms, `for`
   patterns, closure parameters and transaction callback parameters. A type
   annotation also marks a handle: `let r: PgPostRepository = …`. An
-  `Arc<PgPostRepository>`, `Box<…>` or `Rc<…>` is a handle too.
+  `Arc<PgPostRepository>`, `Box<…>`, `Rc<…>`, `dyn PostRepository` or
+  `impl PostRepository` is a handle too.
 - **Scopes.** A `let` in a block ends with the block. An assignment to a name
   declared outside the block stays after the block.
 - **Branches.** After an `if`, a `match` or a loop, a name holds a handle when
@@ -151,6 +152,9 @@ The analysis follows the handle through every name that holds it:
   `vec![repo]`, `(repo, 1)`, `Some(repo)`, `Ctx { db }`. A parameter of type
   `Vec`, `VecDeque`, `Option`, tuple, array or slice of a handle type also
   holds handles (`Vec<PgPostRepository>`, `Option<Db>`).
+  - A name bound to a struct or tuple literal records what each part holds.
+    In `let ctx = PageCtx { repo: &repo, user };`, `ctx.repo` is a handle
+    and `ctx.user` is not.
   - An index (`repos[0]`), a field (`pair.0`), a pattern (`Some(r)`,
     `for r in repos`) or `?` gives a handle.
   - A method on the container gives a handle (`repos.remove(0)`), unless it
@@ -158,9 +162,10 @@ The analysis follows the handle through every name that holds it:
     (`repos.iter()`, `repos.first()`). These methods are not queries.
   - A helper handed the container is reported.
 
-The container rule can over-count. `ctx.name.len()` on `Ctx { db, name }` is
-counted as a query. Bind `name` to its own variable before you build the
-struct.
+When the parts are not known, for example in a parameter or a destructured
+value, every part counts as a handle. This can over-count, but it never
+under-counts. A query future in an array (`join_all([repo.a(), repo.b()])`)
+is counted where it is built, so the array does not count as a container.
 
 ## What the analysis refuses to guess
 
