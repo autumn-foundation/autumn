@@ -2473,9 +2473,10 @@ impl AppBuilder {
     /// in production use the Postgres-backed
     /// `autumn_web::feature_flags::pg::PgFlagStore`.
     ///
-    /// At startup the app calls [`FlagStore::preload`](crate::feature_flags::FlagStore::preload)
-    /// once on the blocking pool and waits up to 5 seconds for it. A failed
-    /// preload logs a warning; it does not stop startup.
+    /// At startup, before user startup hooks, the app calls
+    /// [`FlagStore::preload`](crate::feature_flags::FlagStore::preload) once on
+    /// the blocking pool and waits up to 5 seconds for it. A failed preload
+    /// logs a warning; it does not stop startup.
     ///
     /// # Sharing the store with the poll listener
     ///
@@ -2534,11 +2535,9 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn with_flag_service(self, service: crate::feature_flags::FeatureFlagService) -> Self {
-        let preload = service.clone();
         self.state_initializer(move |state| {
             state.insert_extension(service);
         })
-        .on_startup(move |_state| crate::feature_flags::preload_at_startup(preload.clone()))
     }
 
     /// Register a feature-flag store with a group-membership resolver.
@@ -5803,6 +5802,9 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
+        // Load flags before user hooks, behind the startup barrier.
+        crate::feature_flags::preload_registered(&state, Some(crate::feature_flags::PRELOAD_WAIT))
+            .await;
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
             // A cold start already spawned the accept loop above, so stop it.
@@ -6431,7 +6433,7 @@ impl AppBuilder {
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
         // Startup hooks do not run here; load flags before rendering.
-        crate::feature_flags::preload_registered(&state).await;
+        crate::feature_flags::preload_registered(&state, None).await;
         // Static generation has no job runtime, so register only sync listeners.
         // Durable listeners are dropped entirely (not just their jobs) so a
         // static route publishing such an event is a clean no-op for the durable
@@ -7800,7 +7802,7 @@ impl AppBuilder {
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
         run_state_initializers(state_initializers, &state);
         // Startup hooks do not run here; load flags before the task.
-        crate::feature_flags::preload_registered(&state).await;
+        crate::feature_flags::preload_registered(&state, None).await;
         finalize_event_bus(listeners, &mut jobs, &state);
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
@@ -16073,11 +16075,31 @@ mod tests {
     }
 
     #[test]
+    fn server_preloads_flags_before_user_startup_hooks() {
+        // A user hook registered before `with_flag_store` must still see a
+        // loaded store (#3063).
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let from = source.find("pub async fn run(self)").expect("run");
+        let to = from
+            + source[from..]
+                .find("async fn run_build_mode(self)")
+                .expect("build");
+        let body = &source[from..to];
+        let loaded = body
+            .find("Some(crate::feature_flags::PRELOAD_WAIT)")
+            .expect("the server path preloads flags");
+        let hooks = body
+            .find("run_startup_hooks(&startup_hooks, state.clone())")
+            .expect("startup hooks");
+        assert!(loaded < hooks, "flags load before user startup hooks");
+    }
+
+    #[test]
     fn static_builds_and_tasks_preload_flags_before_they_run() {
         // These modes skip startup hooks, so they preload the flag store
         // themselves, after state initializers install it (#3063).
         let source = include_str!("app.rs").replace("\r\n", "\n");
-        let preload = "crate::feature_flags::preload_registered(&state).await;";
+        let preload = "crate::feature_flags::preload_registered(&state, None).await;";
         for (start, end, work) in [
             (
                 "async fn run_build_mode(self)",
@@ -18206,9 +18228,12 @@ mod tests {
             let state = AppState::for_test();
             run_state_initializers(builder.state_initializers, &state);
 
-            run_startup_hooks(&builder.startup_hooks, state)
-                .await
-                .expect("a failed flag preload must not stop startup");
+            // What `run` does before user startup hooks. A failure only warns.
+            crate::feature_flags::preload_registered(
+                &state,
+                Some(crate::feature_flags::PRELOAD_WAIT),
+            )
+            .await;
             // Startup waits for a fast preload.
             assert_eq!(
                 store.preloads.load(std::sync::atomic::Ordering::SeqCst),
@@ -18232,7 +18257,10 @@ mod tests {
             .extension::<crate::feature_flags::FeatureFlagService>()
             .expect("service registered");
         assert!(installed.is_enabled("checkout_v2", None));
-        assert_eq!(builder.startup_hooks.len(), 1, "the store is preloaded");
+        assert!(
+            builder.startup_hooks.is_empty(),
+            "`run` preloads flags itself, before user hooks"
+        );
     }
 
     fn startup_noop_job_handler(

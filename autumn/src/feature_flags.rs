@@ -509,14 +509,51 @@ pub mod pg {
                 .split('&')
                 .any(|pair| pair.split('=').next() == Some("connect_timeout"));
         }
-        // A `key=value` string: the key starts a word, and `=` follows it.
-        url.match_indices("connect_timeout").any(|(at, key)| {
-            let starts_word = url[..at]
-                .chars()
-                .next_back()
-                .is_none_or(char::is_whitespace);
-            starts_word && url[at + key.len()..].trim_start().starts_with('=')
-        })
+        conninfo_keys(url)
+            .iter()
+            .any(|key| key == "connect_timeout")
+    }
+
+    /// The keys of a libpq `key=value` connection string. A value can be in
+    /// single quotes, and `\` escapes the next character.
+    fn conninfo_keys(conninfo: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut chars = conninfo.chars().peekable();
+        loop {
+            while chars.next_if(|c| c.is_whitespace()).is_some() {}
+            let mut key = String::new();
+            while let Some(c) = chars.next_if(|c| *c != '=' && !c.is_whitespace()) {
+                key.push(c);
+            }
+            if key.is_empty() {
+                return keys;
+            }
+            while chars.next_if(|c| c.is_whitespace()).is_some() {}
+            if chars.next_if_eq(&'=').is_none() {
+                // Not a valid pair: libpq refuses the string.
+                return keys;
+            }
+            keys.push(key);
+            while chars.next_if(|c| c.is_whitespace()).is_some() {}
+            // Skip the value.
+            if chars.next_if_eq(&'\'').is_some() {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '\'' => break,
+                        _ => {}
+                    }
+                }
+            } else {
+                while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                    if c == '\\' {
+                        chars.next();
+                    }
+                }
+            }
+        }
     }
 
     /// Wait before the next refresh attempt after `failures` failed attempts
@@ -1307,6 +1344,19 @@ pub mod pg {
                 with_connect_timeout("host=db application_name=connect_timeout"),
                 "host=db application_name=connect_timeout connect_timeout=5"
             );
+            // Text in a quoted value is not a parameter.
+            assert_eq!(
+                with_connect_timeout("host=db application_name='foo connect_timeout=999'"),
+                "host=db application_name='foo connect_timeout=999' connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout(r"host=db password='it\'s connect_timeout=1'"),
+                r"host=db password='it\'s connect_timeout=1' connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("host=db connect_timeout='7'"),
+                "host=db connect_timeout='7'"
+            );
         }
 
         #[test]
@@ -1715,41 +1765,36 @@ impl FeatureFlagService {
     }
 }
 
-/// Longest time that startup waits for [`FlagStore::preload`].
-const PRELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Longest time that server startup waits for [`FlagStore::preload`].
+pub(crate) const PRELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Preload the store of `service` on the blocking pool.
+/// Preload the store of the registered service on the blocking pool.
 ///
-/// Startup waits up to [`PRELOAD_WAIT`], so the first requests see stored
-/// flags. After that, the load continues and startup continues. A failure
-/// logs a warning; it does not stop startup.
-pub(crate) async fn preload_at_startup(service: FeatureFlagService) -> crate::AutumnResult<()> {
-    let load = crate::time::spawn_blocking(move || service.preload());
-    match tokio::time::timeout(PRELOAD_WAIT, load).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(error))) => {
-            tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
-        }
-        Ok(Err(error)) => tracing::warn!(%error, "feature flag preload task failed"),
-        Err(_) => tracing::warn!(
-            wait = ?PRELOAD_WAIT,
-            "feature flag preload is slow; startup continues with declared defaults"
-        ),
-    }
-    Ok(())
-}
-
-/// Preload the store of the registered service and wait until the load ends.
-///
-/// For modes that skip startup hooks, such as a static build or a one-off
-/// task: their output must not use defaults when the store can load. A
-/// failure logs a warning. The store's own timeouts bound the wait.
-pub(crate) async fn preload_registered(state: &crate::AppState) {
+/// The app calls it before user startup hooks, a static build and a one-off
+/// task, so they see stored flags. With `wait`, it stops waiting after that
+/// time and the load continues. Without `wait`, it waits until the load ends;
+/// the store's own timeouts bound that wait. A failure logs a warning; it
+/// does not stop the app.
+pub(crate) async fn preload_registered(state: &crate::AppState, wait: Option<std::time::Duration>) {
     let Some(service) = state.extension::<FeatureFlagService>() else {
         return;
     };
     let service = (*service).clone();
-    match crate::time::spawn_blocking(move || service.preload()).await {
+    let load = crate::time::spawn_blocking(move || service.preload());
+    let loaded = match wait {
+        Some(wait) => {
+            let Ok(loaded) = tokio::time::timeout(wait, load).await else {
+                tracing::warn!(
+                    ?wait,
+                    "feature flag preload is slow; startup continues with declared defaults"
+                );
+                return;
+            };
+            loaded
+        }
+        None => load.await,
+    };
+    match loaded {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
@@ -2576,10 +2621,11 @@ mod tests {
     async fn preload_registered_loads_the_registered_store() {
         let store = Arc::new(ScriptedStore::default());
         let state = crate::AppState::for_test();
-        preload_registered(&state).await; // No service: nothing to do.
+        preload_registered(&state, None).await; // No service: nothing to do.
         state.insert_extension(FeatureFlagService::new(store.clone()));
-        preload_registered(&state).await;
-        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        preload_registered(&state, None).await;
+        preload_registered(&state, Some(PRELOAD_WAIT)).await;
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
