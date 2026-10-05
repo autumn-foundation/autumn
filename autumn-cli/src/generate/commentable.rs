@@ -208,9 +208,18 @@ pub fn comments_migration_still_needed(
     if !commentable_elsewhere {
         return false;
     }
+    let all = migration_up_sql(project_root);
     let without = migration_up_sql_where(project_root, |dir, _| dir.file_name() != name);
-    comments_table(project_root) == CommentsTable::Shared
-        && classify(&without) != CommentsTable::Shared
+    // A later `ALTER` that needs this migration's table also needs the file:
+    // without it, a fresh `migrate` stops on that `ALTER`.
+    let orphans_an_alter = |files: &[String]| {
+        replay(files)
+            .touched_while_absent
+            .contains(&TableRef::comments())
+    };
+    classify(&all) == CommentsTable::Shared
+        && (classify(&without) != CommentsTable::Shared
+            || (orphans_an_alter(&without) && !orphans_an_alter(&all)))
 }
 
 /// Classify the `comments` table that `files`, replayed in order, leave.
@@ -354,7 +363,21 @@ enum TableEvent {
 /// comments`). Now every table is tracked and the rename carries its columns
 /// across; the final answer is a lookup on the `comments` ref.
 fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
+    replay(files).tables
+}
+
+/// The end state of a replay.
+struct Replay {
+    tables: HashMap<TableRef, TableState>,
+    /// Tables that an `ALTER` or a rename touched while they did not exist. A
+    /// real `migrate` stops on that statement (#2283).
+    touched_while_absent: std::collections::HashSet<TableRef>,
+}
+
+/// [`replay_migration_history`], also recording [`Replay::touched_while_absent`].
+fn replay(files: &[String]) -> Replay {
     let mut tables: HashMap<TableRef, TableState> = HashMap::new();
+    let mut touched_while_absent = std::collections::HashSet::new();
     for sql in files {
         let mut events: Vec<(usize, TableEvent)> = Vec::new();
         for (at, table, body, if_not_exists) in create_tables(sql) {
@@ -409,12 +432,18 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                     );
                 }
                 TableEvent::Add(table, column) => {
+                    if !tables.get(&table).is_some_and(|state| state.exists) {
+                        touched_while_absent.insert(table.clone());
+                    }
                     let state = tables.entry(table).or_default();
                     if !state.columns.contains(&column) {
                         state.columns.push(column);
                     }
                 }
                 TableEvent::Remove(table, column) => {
+                    if !tables.get(&table).is_some_and(|state| state.exists) {
+                        touched_while_absent.insert(table.clone());
+                    }
                     if let Some(state) = tables.get_mut(&table) {
                         state.columns.retain(|held| *held != column);
                     }
@@ -444,6 +473,9 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                         name: to.name,
                     };
                     let source_known = tables.get(&from).is_some_and(|state| state.exists);
+                    if !source_known {
+                        touched_while_absent.insert(from.clone());
+                    }
                     let mut state = tables.remove(&from).unwrap_or_default();
                     state.exists = true;
                     state.columns_unknown |= !source_known;
@@ -452,7 +484,10 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
             }
         }
     }
-    tables
+    Replay {
+        tables,
+        touched_while_absent,
+    }
 }
 
 /// Whether `c` can continue a bare SQL identifier.
@@ -3291,5 +3326,31 @@ mod tests {
         let tmp = project_with(&[("0001_create_posts", "CREATE TABLE posts (id BIGINT);\n")]);
         let dir = tmp.path().join("migrations").join("0001_create_posts");
         assert!(!comments_migration_still_needed(tmp.path(), &dir, &[]));
+    }
+
+    /// Without the plain migration, the adoption `ALTER` runs on no table and
+    /// a fresh `migrate` stops there, even though a later migration creates
+    /// a new shared table. `destroy` must keep the plain migration.
+    #[test]
+    fn a_migration_a_later_alter_needs_is_still_needed() {
+        let ours = up_sql(DatabaseBackend::Postgres);
+        let tmp = project_with(&[
+            (
+                "0001_create_comments",
+                "CREATE TABLE comments (id BIGINT, body TEXT, created_at TIMESTAMP);\n",
+            ),
+            (
+                "0002_adopt",
+                "ALTER TABLE comments ADD COLUMN commentable_type TEXT, ADD COLUMN commentable_id BIGINT, \
+                 ADD COLUMN parent_id BIGINT, ADD COLUMN author_id BIGINT, ADD COLUMN deleted_at TIMESTAMP;\n",
+            ),
+            (
+                "0003_retire",
+                "ALTER TABLE comments RENAME TO legacy_comments;\n",
+            ),
+            ("0004_create_comments", &ours),
+        ]);
+        let plain = tmp.path().join("migrations").join("0001_create_comments");
+        assert!(comments_migration_still_needed(tmp.path(), &plain, &[]));
     }
 }
