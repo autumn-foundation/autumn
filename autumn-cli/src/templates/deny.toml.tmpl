@@ -87,8 +87,9 @@ ignore = [
     # fixed `rsa` — or a `jsonwebtoken` without the RSA backend — ships, so the
     # review-by below is Autumn's cadence: on a date that has passed, take the
     # newest autumn-web and re-run the audit before assuming it still stands.
-    # Review-by: 2026-10-01.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; review-by 2026-10-01" },
+    # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05: still no fixed
+    # rsa release; see docs/reports/2026-10-05-ballast-dependency-ledger-audit.md).
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
     # >>> autumn:bundled-pg-waiver
     # RUSTSEC-2024-0384 — `instant` is unmaintained.
     # https://rustsec.org/advisories/RUSTSEC-2024-0384
@@ -99,8 +100,8 @@ ignore = [
     # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
     # (build) postgresql_embedded. Unmaintained, not vulnerable — there is no
     # exploit here, and no safe upgrade (the author recommends `web-time`).
-    # Review-by: 2026-10-01.
-    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; review-by 2026-10-01" },
+    # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
     # <<< autumn:bundled-pg-waiver
 ]
 

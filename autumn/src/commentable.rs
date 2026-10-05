@@ -1083,15 +1083,48 @@ pub async fn comment_thread(
     let soft_deletes = resolve_soft_deletes(spec);
     probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
 
-    // The probe and this read take separate snapshots under read-committed, so
-    // a parent soft-deleted or moved to another tenant in the window between
-    // them would still have its thread served. Re-evaluating the probe's
-    // visibility rule as an `EXISTS` inside this statement closes that window:
-    // one snapshot by construction (issue #2281). The probe is kept: it is
-    // what turns a missing/invisible parent into a `404`.
-    //
-    // If the parent disappears mid-flight, this now returns an empty thread
-    // rather than a `404` — the safe direction.
+    // Under read-committed, the probe and the read use different snapshots.
+    // `thread_statement` checks visibility again inside the read. Thus the
+    // read returns no rows if the parent was soft-deleted or moved to another
+    // tenant after the probe (issues #2281, #2287). The result is then an
+    // empty thread, not a `404`. The probe stays because it gives the `404`.
+    let statement = thread_statement(spec, soft_deletes, tenant);
+    let query = diesel::sql_query(statement.sql)
+        .bind::<Text, _>(parent_type)
+        .bind::<BigInt, _>(parent_id)
+        .bind::<BigInt, _>(parent_id);
+    let rows: Vec<Comment> = match statement.tenant {
+        Some(tenant) => query
+            .bind::<Text, _>(tenant)
+            .load::<Comment>(conn)
+            .await
+            .map_err(AutumnError::from)?,
+        None => query
+            .load::<Comment>(conn)
+            .await
+            .map_err(AutumnError::from)?,
+    };
+
+    Ok(nest(rows))
+}
+
+/// The thread read: SQL text and the tenant bind, if the SQL has one.
+struct ThreadStatement {
+    sql: String,
+    tenant: Option<String>,
+}
+
+/// Build the thread read for `spec`.
+///
+/// Binds: `(parent_type, parent_id)`, then the parent id again, then the
+/// tenant when [`ThreadStatement::tenant`] is `Some`. The `EXISTS` clause
+/// applies [`parent_visibility`] inside the read. Thus the visibility check
+/// and the read use one snapshot.
+fn thread_statement(
+    spec: &CommentableSpec,
+    soft_deletes: bool,
+    tenant: Option<&str>,
+) -> ThreadStatement {
     let visibility = parent_visibility(spec, 3, 4, soft_deletes, tenant);
     let parent_table = quote_ident(spec.parent_table);
     let comments = quote_ident(spec.comments_table);
@@ -1117,25 +1150,10 @@ pub async fn comment_thread(
         ph(2),
         visibility.predicate
     );
-    let query = diesel::sql_query(sql)
-        .bind::<Text, _>(parent_type)
-        .bind::<BigInt, _>(parent_id)
-        .bind::<BigInt, _>(parent_id);
-    // Binds follow the predicate order `parent_visibility` documents: the
-    // parent id, then the tenant when the predicate carries it.
-    let rows: Vec<Comment> = match visibility.tenant {
-        Some(tenant) => query
-            .bind::<Text, _>(tenant)
-            .load::<Comment>(conn)
-            .await
-            .map_err(AutumnError::from)?,
-        None => query
-            .load::<Comment>(conn)
-            .await
-            .map_err(AutumnError::from)?,
-    };
-
-    Ok(nest(rows))
+    ThreadStatement {
+        sql,
+        tenant: visibility.tenant,
+    }
 }
 
 /// `(join clause, author-name expression)` for the thread query.
@@ -1303,8 +1321,8 @@ fn resolve_soft_deletes(spec: &CommentableSpec) -> bool {
 /// One parent-visibility rule, evaluated two ways (issue #2281).
 ///
 /// [`probe_parent`] asks "does a live, visible parent row exist?" as a
-/// standalone statement, so a missing one is a `404`. [`comment_thread`]
-/// asks the same question as an `EXISTS` inside its read statement, because
+/// standalone statement, so a missing one is a `404`. [`thread_statement`]
+/// asks the same question as an `EXISTS` inside the thread read, because
 /// under read-committed the two statements take separate snapshots — a
 /// parent soft-deleted or moved to another tenant in the window between them
 /// would otherwise have its whole thread served to a caller no longer
@@ -1978,31 +1996,54 @@ mod tests {
         assert!(v.tenant.is_none());
     }
 
-    /// The placeholders the fragment occupies must be the ones the enclosing
-    /// statement binds: `comment_thread` binds `(type, id)` first, so the
-    /// `EXISTS` re-binds the parent id at the fragment's own positions.
+    /// Issue #2287: the real thread statement must check parent visibility.
+    /// A test of only the fragment cannot find a read without the `EXISTS`.
     #[test]
-    fn the_thread_exists_predicate_binds_the_parent_id_twice() {
+    fn the_thread_statement_rechecks_parent_visibility() {
         let mut spec = sample_spec();
         spec.parent_tenant_column = Some("tenant_id");
 
-        // Spliced exactly the way `comment_thread` splices it.
-        let v = parent_visibility(&spec, 3, 4, false, Some("acme"));
+        let statement = thread_statement(&spec, true, Some("acme"));
+        // Bind order: type, id, then the `EXISTS` id and tenant.
+        let read = format!(
+            "c.\"commentable_type\" = {} AND c.\"commentable_id\" = {}",
+            ph(1),
+            ph(2)
+        );
         let exists = format!(
-            "AND EXISTS (SELECT 1 FROM {} WHERE {})",
-            quote_ident(spec.parent_table),
-            v.predicate
+            "AND EXISTS (SELECT 1 FROM \"posts\" WHERE \"posts\".\"id\" = {} \
+             AND \"posts\".\"tenant_id\" = {} AND \"posts\".\"deleted_at\" IS NULL)",
+            ph(3),
+            ph(4)
         );
-        assert_eq!(
-            exists,
-            format!(
-                "AND EXISTS (SELECT 1 FROM \"posts\" WHERE \"posts\".\"id\" = {} \
-                 AND \"posts\".\"tenant_id\" = {})",
-                ph(3),
-                ph(4)
-            ),
-            "the EXISTS re-binds the parent id and tenant at its own positions"
+        assert!(statement.sql.contains(&read), "{}", statement.sql);
+        assert!(statement.sql.contains(&exists), "{}", statement.sql);
+        assert!(
+            statement.sql.find(&read) < statement.sql.find(&exists),
+            "{}",
+            statement.sql
         );
+        assert_eq!(statement.tenant.as_deref(), Some("acme"));
+
+        // `across_tenants()` with soft delete: the liveness check stays.
+        let statement = thread_statement(&spec, true, None);
+        let exists = format!(
+            "AND EXISTS (SELECT 1 FROM \"posts\" WHERE \"posts\".\"id\" = {} \
+             AND \"posts\".\"deleted_at\" IS NULL)",
+            ph(3)
+        );
+        assert!(statement.sql.contains(&exists), "{}", statement.sql);
+        assert!(statement.tenant.is_none());
+
+        // No tenant column: a tenant from the caller gives no tenant bind.
+        spec.parent_tenant_column = None;
+        let statement = thread_statement(&spec, false, Some("acme"));
+        let exists = format!(
+            "AND EXISTS (SELECT 1 FROM \"posts\" WHERE \"posts\".\"id\" = {})",
+            ph(3)
+        );
+        assert!(statement.sql.contains(&exists), "{}", statement.sql);
+        assert!(statement.tenant.is_none());
     }
 
     /// A spec built by hand — the one way past the macro's guarantee — is
