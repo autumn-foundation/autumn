@@ -244,16 +244,29 @@ const CALLBACK_METHODS: &[&str] = &[
 /// is a handle.
 const SMART_POINTERS: &[&str] = &["Box", "Arc", "Rc"];
 
-/// Types that hold values without being them. A `Vec` or `Option` of a handle
-/// type (`Vec<Db>`, `Vec<PgPostRepository>`) is a carrier: a method on it is
-/// not a query, and its parts are handles.
-const CARRIER_TYPES: &[&str] = &["Vec", "VecDeque", "Option"];
+/// Standard collection types. One of a handle type (`Vec<Db>`,
+/// `HashMap<i64, PgPostRepository>`) is a carrier: a known container method
+/// on it is not a query, and its parts are handles.
+const CARRIER_TYPES: &[&str] = &[
+    "Vec",
+    "VecDeque",
+    "Option",
+    "HashMap",
+    "HashSet",
+    "BTreeMap",
+    "BTreeSet",
+    "BinaryHeap",
+    "LinkedList",
+    "IndexMap",
+    "IndexSet",
+];
 
 /// Methods on a carrier that return nothing, a number or a `bool`: not a
 /// part of it.
 const SCALAR_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "contains_key",
     "is_some",
     "is_none",
     "is_ok",
@@ -343,6 +356,9 @@ const CARRIER_METHODS: &[&str] = &[
     "drain",
     "values",
     "values_mut",
+    "into_values",
+    "keys",
+    "into_keys",
 ];
 
 /// Methods on a carrier that return a part of it, which is a handle.
@@ -566,8 +582,10 @@ fn worst(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
 struct Flow {
     /// Paths that reach the next statement.
     fall: Option<Cost>,
-    /// Paths that leave by `break` or `continue`.
+    /// Paths that leave by `break` or `continue` with no label.
     brk: Option<Cost>,
+    /// Paths that leave by `break 'label` or `continue 'label`, by label.
+    labeled: Vec<(String, Cost)>,
     /// Paths that leave by `return`.
     ret: Option<Cost>,
 }
@@ -577,16 +595,13 @@ impl Flow {
     const NEVER: Self = Self {
         fall: None,
         brk: None,
-        ret: None,
-    };
-    const BREAK: Self = Self {
-        fall: None,
-        brk: Some(Cost::ZERO),
+        labeled: Vec::new(),
         ret: None,
     };
     const RETURN: Self = Self {
         fall: None,
         brk: None,
+        labeled: Vec::new(),
         ret: Some(Cost::ZERO),
     };
 
@@ -594,8 +609,27 @@ impl Flow {
         Self {
             fall: Some(cost),
             brk: None,
+            labeled: Vec::new(),
             ret: None,
         }
+    }
+
+    /// A `break` or `continue`, to the nearest loop or to `label`.
+    fn exit_to(label: Option<&syn::Lifetime>) -> Self {
+        label.map_or(
+            Self {
+                brk: Some(Cost::ZERO),
+                ..Self::NEVER
+            },
+            |label| Self {
+                labeled: vec![(label.ident.to_string(), Cost::ZERO)],
+                ..Self::NEVER
+            },
+        )
+    }
+
+    const fn has_path(&self) -> bool {
+        self.fall.is_some() || self.brk.is_some() || self.ret.is_some() || !self.labeled.is_empty()
     }
 
     /// `self`, then `next` on the paths that fall through.
@@ -605,16 +639,22 @@ impl Flow {
         };
         // A `next` with no path at all (`match never {}`) ends the run here.
         // The cost so far was still paid.
-        if next.fall.is_none() && next.brk.is_none() && next.ret.is_none() {
+        if !next.has_path() {
             return Self {
                 fall: None,
-                brk: self.brk,
                 ret: worst(self.ret, Some(fall)),
+                ..self
             };
         }
         let after = |cost: Option<Cost>| cost.map(|c| fall.clone().then(c));
+        let labeled = next
+            .labeled
+            .into_iter()
+            .map(|(label, cost)| (label, fall.clone().then(cost)))
+            .collect();
         Self {
             brk: worst(self.brk, after(next.brk)),
+            labeled: merge_labeled(self.labeled, labeled),
             ret: worst(self.ret, after(next.ret)),
             fall: after(next.fall),
         }
@@ -625,6 +665,7 @@ impl Flow {
         Self {
             fall: worst(self.fall, other.fall),
             brk: worst(self.brk, other.brk),
+            labeled: merge_labeled(self.labeled, other.labeled),
             ret: worst(self.ret, other.ret),
         }
     }
@@ -635,14 +676,41 @@ impl Flow {
         Self {
             fall: set(self.fall),
             brk: set(self.brk),
+            labeled: self
+                .labeled
+                .into_iter()
+                .map(|(label, _)| (label, cost.clone()))
+                .collect(),
             ret: set(self.ret),
         }
     }
 
+    /// Remove and return the paths that leave to `label`.
+    fn take_label(&mut self, label: Option<&syn::Label>) -> Option<Cost> {
+        let name = label?.name.ident.to_string();
+        let at = self.labeled.iter().position(|(l, _)| *l == name)?;
+        Some(self.labeled.remove(at).1)
+    }
+
     /// The worst path, wherever it goes.
     fn total(self) -> Cost {
-        worst(worst(self.fall, self.brk), self.ret).unwrap_or(Cost::ZERO)
+        let labeled = self
+            .labeled
+            .into_iter()
+            .fold(None, |acc, (_, cost)| worst(acc, Some(cost)));
+        worst(worst(worst(self.fall, self.brk), self.ret), labeled).unwrap_or(Cost::ZERO)
     }
+}
+
+/// Join two lists of labeled exits, taking the worse cost per label.
+fn merge_labeled(mut into: Vec<(String, Cost)>, from: Vec<(String, Cost)>) -> Vec<(String, Cost)> {
+    for (label, cost) in from {
+        match into.iter_mut().find(|(l, _)| *l == label) {
+            Some(slot) => slot.1 = slot.1.clone().or_worst(cost),
+            None => into.push((label, cost)),
+        }
+    }
+    into
 }
 
 // ── Binding environment ──────────────────────────────────────────────
@@ -654,10 +722,13 @@ impl Flow {
 enum Kind {
     /// No database handle.
     Plain,
-    /// A value that holds handles without being one: `[repo]`, `Some(repo)`,
-    /// `Vec<PgPostRepository>`. A method on it is not a query. Its parts are
-    /// handles (see `Analyzer::expr_is_carrier`).
+    /// A standard container that holds handles: `[repo]`, `Some(repo)`,
+    /// `Vec<PgPostRepository>`. A known container method on it is not a
+    /// query. Its parts are handles (see `Analyzer::expr_is_carrier`).
     Carrier,
+    /// A user value that holds a handle: `Ctx { repo }`. Its parts are
+    /// handles, and every method on it is reported.
+    Holder,
     /// A database handle.
     Handle,
     /// A `LazyDb`: a handle whose `checkout` is not a query.
@@ -669,7 +740,7 @@ impl Kind {
     const fn element(self) -> Self {
         match self {
             Self::Plain => Self::Plain,
-            Self::Carrier | Self::Handle => Self::Handle,
+            Self::Carrier | Self::Holder | Self::Handle => Self::Handle,
             Self::LazyDb => Self::LazyDb,
         }
     }
@@ -687,18 +758,11 @@ struct Binding {
     /// Each part's name and kind, when the value was a struct or tuple
     /// literal. `None`: every part of a carrier is a handle.
     parts: Option<Vec<(String, Kind)>>,
-    /// The value is a user struct, not a standard container, so none of its
-    /// methods is a known container method.
-    user: bool,
 }
 
 impl Binding {
     const fn of(kind: Kind) -> Self {
-        Self {
-            kind,
-            parts: None,
-            user: false,
-        }
+        Self { kind, parts: None }
     }
 
     /// The binding that holds what `self` or `other` holds.
@@ -722,7 +786,6 @@ impl Binding {
         Self {
             kind: self.kind.max(other.kind),
             parts,
-            user: self.user || other.user,
         }
     }
 }
@@ -824,7 +887,14 @@ impl Env {
             None => {}
         }
         if kind != Kind::Plain {
-            binding.kind = binding.kind.max(Kind::Carrier);
+            // A tuple stays a standard container; anything else may be a
+            // user value.
+            let held = if binding.kind == Kind::Carrier {
+                Kind::Carrier
+            } else {
+                Kind::Holder
+            };
+            binding.kind = binding.kind.max(held);
         }
         self.assign(name.to_string(), binding);
     }
@@ -861,6 +931,16 @@ enum Target {
     Body,
     /// A loop or a labeled block. `break` and `continue` land here.
     Break,
+}
+
+/// What a loop is, for [`Analyzer::loop_flow`].
+struct LoopShape<'a> {
+    /// The compile-time number of passes, when there is one.
+    bound: Option<u32>,
+    span: Span,
+    label: Option<&'a syn::Label>,
+    /// A `for` or `while` can end without an exit; a `loop` cannot.
+    ends: bool,
 }
 
 /// Where an exit lands, and the bindings at the exits that land there.
@@ -1035,8 +1115,7 @@ impl Analyzer {
             ),
             _ => None,
         };
-        let user = kind == Kind::Carrier && matches!(init, Expr::Struct(_));
-        Binding { kind, parts, user }
+        Binding { kind, parts }
     }
 
     /// `place = value`. A tuple or array place over a literal of the same
@@ -1099,7 +1178,7 @@ impl Analyzer {
                 }
                 let deref = matches!(place, Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)));
                 if let Some(root) = place_root(place) {
-                    let held = if deref { kind } else { Kind::Carrier };
+                    let held = if deref { kind } else { Kind::Holder };
                     let kind = self.env.get(&root).max(held);
                     self.env.assign(root, Binding::of(kind));
                 }
@@ -1342,21 +1421,42 @@ impl Analyzer {
             Expr::ForLoop(f) => {
                 let iter = self.cost_of(&f.expr);
                 let element = self.value_of(&f.expr).element();
-                let body = self.loop_cost(const_bound(&f.expr), f.span(), |s| {
+                let shape = LoopShape {
+                    bound: const_bound(&f.expr),
+                    span: f.span(),
+                    label: f.label.as_ref(),
+                    ends: true,
+                };
+                let body = self.loop_flow(&shape, |s| {
                     s.bind_pat(&f.pat, element);
-                    s.block(&f.body).total()
+                    s.block(&f.body)
                 });
-                Flow::cost(iter.then(body))
+                Flow::cost(iter).then(body)
             }
             // The condition runs on every pass, so a query in it
             // (`while let Some(job) = repo.next_pending().await?`) is
             // loop-resident.
-            Expr::While(w) => Flow::cost(self.loop_cost(None, w.span(), |s| {
-                let cond = s.cost_of(&w.cond);
-                cond.then(s.block(&w.body).total())
-            })),
+            Expr::While(w) => {
+                let shape = LoopShape {
+                    bound: None,
+                    span: w.span(),
+                    label: w.label.as_ref(),
+                    ends: true,
+                };
+                self.loop_flow(&shape, |s| {
+                    let cond = s.cost_of(&w.cond);
+                    Flow::cost(cond).then(s.block(&w.body))
+                })
+            }
+            // A `loop` ends only by an exit.
             Expr::Loop(l) => {
-                Flow::cost(self.loop_cost(None, l.span(), |s| s.block(&l.body).total()))
+                let shape = LoopShape {
+                    bound: None,
+                    span: l.span(),
+                    label: l.label.as_ref(),
+                    ends: false,
+                };
+                self.loop_flow(&shape, |s| s.block(&l.body))
             }
 
             Expr::If(i) => {
@@ -1386,11 +1486,11 @@ impl Analyzer {
 
             Expr::Block(b) if b.label.is_some() => {
                 // `break 'label` lands after the block.
-                let flow = self.framed(Target::Break, |s| s.block(&b.block));
+                let mut flow = self.framed(Target::Break, |s| s.block(&b.block));
+                let own = flow.take_label(b.label.as_ref());
                 Flow {
-                    fall: worst(flow.fall, flow.brk),
-                    brk: None,
-                    ret: flow.ret,
+                    fall: worst(flow.fall, own),
+                    ..flow
                 }
             }
             Expr::Block(syn::ExprBlock { block, .. })
@@ -1424,11 +1524,11 @@ impl Analyzer {
             Expr::Break(b) => {
                 let value = b.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
                 self.exit_loop();
-                value.then(Flow::BREAK)
+                value.then(Flow::exit_to(b.label.as_ref()))
             }
-            Expr::Continue(_) => {
+            Expr::Continue(c) => {
                 self.exit_loop();
-                Flow::BREAK
+                Flow::exit_to(c.label.as_ref())
             }
             Expr::Cast(c) => self.expr(&c.expr),
             Expr::Field(f) => self.expr(&f.base),
@@ -1593,18 +1693,32 @@ impl Analyzer {
         self.optional(|s| s.closure_body(closure, &[], param))
     }
 
-    /// A loop's cost. `body` runs in its own scope and break frame, zero or
-    /// more times. A `return` in it counts as one more pass: the loop's
-    /// fall-through cost covers it.
-    fn loop_cost(
+    /// A loop's flow. `body` runs in its own scope and break frame, zero or
+    /// more times. Every path out of the loop costs at most every pass: a
+    /// `break` or `continue` to this loop ends here, and an exit to an outer
+    /// label or a `return` leaves with that cost.
+    fn loop_flow(
         &mut self,
-        bound: Option<u32>,
-        span: Span,
-        mut body: impl FnMut(&mut Self) -> Cost,
-    ) -> Cost {
+        shape: &LoopShape<'_>,
+        mut body: impl FnMut(&mut Self) -> Flow,
+    ) -> Flow {
         let before = self.ledger.len();
-        let cost = self.repeated(|s| s.framed(Target::Break, |s| s.scoped(&mut body)));
-        self.bound_loop(cost, bound, span, before)
+        let mut flow = self.repeated(|s| s.framed(Target::Break, |s| s.scoped(&mut body)));
+        let own = flow.take_label(shape.label);
+        let ends = shape.ends || flow.brk.is_some() || own.is_some();
+        let outer = std::mem::take(&mut flow.labeled);
+        let outer_cost = outer
+            .iter()
+            .fold(None, |acc, (_, cost)| worst(acc, Some(cost.clone())));
+        let pass = worst(worst(Some(flow.total()), own), outer_cost).unwrap_or(Cost::ZERO);
+        let total = self.bound_loop(pass, shape.bound, shape.span, before);
+        Flow {
+            fall: ends.then(|| total.clone()),
+            brk: None,
+            labeled: outer.into_iter().map(|(l, _)| (l, total.clone())).collect(),
+            // A `?` or a panic may also leave the loop.
+            ret: Some(total),
+        }
     }
 
     /// Turn a loop body's cost into the loop's cost.
@@ -1771,8 +1885,7 @@ impl Analyzer {
     fn opaque_container_method(&self, methods: &[&ExprMethodCall]) -> Option<Cost> {
         let unknown = methods.iter().find(|m| {
             self.expr_is_carrier(&m.receiver)
-                && (self.expr_is_user_carrier(&m.receiver)
-                    || !is_container_method(&m.method.to_string()))
+                && (self.expr_is_holder(&m.receiver) || !is_container_method(&m.method.to_string()))
         })?;
         Some(Cost::unbounded(
             unknown.span(),
@@ -1803,12 +1916,16 @@ impl Analyzer {
         let takes_callback = is_transaction
             || (CALLBACK_METHODS.contains(&name.as_str())
                 && self.value_of(&method.receiver) != Kind::Plain);
+        // The callback is the last argument: `db.tx_with(opts, |conn| …)`,
+        // `opt.map_or(default, f)`.
+        let last = method.args.len().saturating_sub(1);
         let mut cost = Cost::ZERO;
-        for arg in &method.args {
+        for (i, arg) in method.args.iter().enumerate() {
+            let callback = takes_callback && i == last;
             let next = if runs_once {
-                self.callback_arg(arg, param, takes_callback)
+                self.callback_arg(arg, param, callback)
             } else {
-                self.closure_arg(arg, param, takes_callback)
+                self.closure_arg(arg, param, callback)
             };
             cost = cost.then(next);
         }
@@ -1850,9 +1967,10 @@ impl Analyzer {
             .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n));
 
         let mut cost = self.cost_of(&call.func);
-        for arg in &call.args {
+        let last = call.args.len().saturating_sub(1);
+        for (i, arg) in call.args.iter().enumerate() {
             let next = if runs_once {
-                self.callback_arg(arg, Kind::Handle, true)
+                self.callback_arg(arg, Kind::Handle, i == last)
             } else {
                 self.cost_of(arg)
             };
@@ -1949,6 +2067,8 @@ impl Analyzer {
             Kind::LazyDb
         } else if self.expr_is_handle(expr) || self.chain_root_is_handle(expr) {
             Kind::Handle
+        } else if self.expr_is_holder(expr) {
+            Kind::Holder
         } else if self.expr_is_carrier(expr) {
             Kind::Carrier
         } else {
@@ -1976,18 +2096,20 @@ impl Analyzer {
             && !HANDLE_TRANSITIONS.contains(&last.as_str())
     }
 
-    /// Is `e` a user struct that holds a handle (`Ctx { repo }`)? Its
-    /// methods are the user's, so none of them is a known container method.
-    fn expr_is_user_carrier(&self, e: &Expr) -> bool {
+    /// Is `e` a user value that holds a handle (`Ctx { repo }`)? Its methods
+    /// are the user's, so none of them is a known container method.
+    fn expr_is_holder(&self, e: &Expr) -> bool {
         match e {
-            Expr::Struct(_) => self.expr_is_carrier(e),
-            Expr::Path(_) => path_ident(e).is_some_and(|name| {
-                let binding = self.env.binding(&name);
-                binding.kind == Kind::Carrier && binding.user
-            }),
-            Expr::Reference(r) => self.expr_is_user_carrier(&r.expr),
-            Expr::Paren(p) => self.expr_is_user_carrier(&p.expr),
-            Expr::Group(g) => self.expr_is_user_carrier(&g.expr),
+            Expr::Struct(st) => {
+                !self.expr_is_handle(e)
+                    && (st.fields.iter().any(|f| self.holds(&f.expr))
+                        || st.rest.as_deref().is_some_and(|r| self.holds(r)))
+            }
+            Expr::Path(_) => path_ident(e).is_some_and(|name| self.env.get(&name) == Kind::Holder),
+            Expr::Field(f) => self.part_kind(f) == Some(Kind::Holder),
+            Expr::Reference(r) => self.expr_is_holder(&r.expr),
+            Expr::Paren(p) => self.expr_is_holder(&p.expr),
+            Expr::Group(g) => self.expr_is_holder(&g.expr),
             _ => false,
         }
     }
@@ -2154,8 +2276,9 @@ impl Analyzer {
     /// Does this expression evaluate to a value that holds handles without
     /// being one? The container rule (#2316):
     ///
-    /// * an array, tuple, `vec!`, struct literal or constructor call
-    ///   (`Some(repo)`) that holds a handle is a carrier;
+    /// * an array, tuple, `vec!` or `Some`/`Ok`/`Err` that holds a handle is a
+    ///   carrier; a user struct literal that holds one is a holder
+    ///   ([`Self::expr_is_holder`]), which this also accepts;
     /// * on a carrier, a method in `CARRIER_METHODS` gives a carrier
     ///   (`repos.iter()`), one in `ELEMENT_METHODS` gives a handle
     ///   (`repos.remove(0)`), one in `SCALAR_METHODS` gives a plain value
@@ -2165,10 +2288,9 @@ impl Analyzer {
     fn expr_is_carrier(&self, expr: &Expr) -> bool {
         let holds = |e: &Expr| self.holds(e);
         match expr {
-            Expr::Path(p) => p
-                .path
-                .get_ident()
-                .is_some_and(|i| self.env.get(&i.to_string()) == Kind::Carrier),
+            Expr::Path(p) => p.path.get_ident().is_some_and(|i| {
+                matches!(self.env.get(&i.to_string()), Kind::Carrier | Kind::Holder)
+            }),
             Expr::Reference(r) => self.expr_is_carrier(&r.expr),
             Expr::RawAddr(r) => self.expr_is_carrier(&r.expr),
             Expr::Paren(p) => self.expr_is_carrier(&p.expr),
@@ -2184,7 +2306,7 @@ impl Analyzer {
             Expr::Call(c) => {
                 (is_container_constructor(c) || is_smart_pointer_new(c)) && c.args.iter().any(holds)
             }
-            Expr::Field(f) => self.part_kind(f) == Some(Kind::Carrier),
+            Expr::Field(f) => matches!(self.part_kind(f), Some(Kind::Carrier | Kind::Holder)),
             Expr::Macro(m) => vec_elems(&m.mac).is_some_and(|elems| elems.iter().any(holds)),
             Expr::MethodCall(mc) => {
                 CARRIER_METHODS.contains(&mc.method.to_string().as_str())
@@ -5500,6 +5622,55 @@ mod tests {
         // `clear` here is the user's method, not `Vec::clear`.
         let handler = matrix_handler("let ctx = Ctx { repo }; ctx.clear().await;");
         assert_error_contains("50", &handler, &["clear"]);
+    }
+
+    #[test]
+    fn a_user_struct_stays_opaque_through_any_binding() {
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "alias",
+                "let ctx = Ctx { repo }; let alias = ctx; let _ = alias.clear();",
+                Expect::Unbounded,
+            ),
+            (
+                "IIFE parameter",
+                "(|c| { let _ = c.clear(); })(Ctx { repo });",
+                Expect::Unbounded,
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    #[test]
+    fn a_map_of_handles_is_a_container() {
+        let handler = r"
+            async fn h(repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> {
+                for repo in repos.values() { let _ = repo.find_all().await?; }
+                Ok(0)
+            }
+            ";
+        assert_error_contains("50", handler, &["loop"]);
+    }
+
+    #[test]
+    fn only_the_last_argument_is_a_callback() {
+        let cases: &[(&str, &str, Expect)] = &[(
+            "tx_with options",
+            "let opts = TxOptions::default(); \
+             let _ = db.tx_with(opts, |c| async move { let _ = c.a(); });",
+            Expect::Exact(2),
+        )];
+        check_cases(cases);
+    }
+
+    #[test]
+    fn a_labeled_break_lands_on_its_own_loop() {
+        let cases: &[(&str, &str, Expect)] = &[(
+            "code after an inner loop that always breaks out",
+            "'outer: loop { loop { break 'outer; } let _ = repo.find_all(); }",
+            Expect::Exact(0),
+        )];
+        check_cases(cases);
     }
 
     #[test]
