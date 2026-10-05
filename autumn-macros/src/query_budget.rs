@@ -208,6 +208,9 @@ const HANDLE_TYPES: &[&str] = &[
 /// `checkout()` (Codex review, PR #2762, round 7).
 const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Extension", "State"];
 
+/// Methods whose result has the receiver's type.
+const SAME_TYPE_METHODS: &[&str] = &["clone", "to_owned"];
+
 /// Constructors that build a carrier and run no code.
 const CONTAINER_CONSTRUCTORS: &[&str] = &["Some", "Ok", "Err"];
 
@@ -891,6 +894,15 @@ impl Env {
             Some(part) => part.1 = kind,
             None if kind != Kind::Plain => binding.parts = None,
             None => {}
+        }
+        // With every part known, the value holds what its parts hold.
+        if let Some(parts) = &binding.parts
+            && matches!(binding.kind, Kind::Plain | Kind::Carrier | Kind::Holder)
+            && parts.iter().all(|(_, k)| *k == Kind::Plain)
+        {
+            binding.kind = Kind::Plain;
+            self.assign(name.to_string(), binding);
+            return;
         }
         if kind != Kind::Plain {
             // A tuple stays a standard container; anything else may be a
@@ -2131,9 +2143,15 @@ impl Analyzer {
                 .map_or_else(|| self.expr_is_nested(&f.base), |k| k == Kind::Nested),
             Expr::Index(i) => self.expr_is_nested(&i.expr),
             Expr::Try(t) => self.expr_is_nested(&t.expr),
+            // Any part of a nested value, or the result of a user method on a
+            // holder: its shape is not known.
             Expr::MethodCall(mc) => {
-                !SCALAR_METHODS.contains(&mc.method.to_string().as_str())
-                    && self.expr_is_nested(&mc.receiver)
+                let method = mc.method.to_string();
+                !SCALAR_METHODS.contains(&method.as_str())
+                    && (self.expr_is_nested(&mc.receiver)
+                        || (self.expr_is_holder(&mc.receiver)
+                            && !SAME_TYPE_METHODS.contains(&method.as_str())
+                            && !HANDLE_ACCESSORS.contains(&method.as_str())))
             }
             Expr::Array(a) => a.elems.iter().any(container),
             Expr::Tuple(t) => t.elems.iter().any(container),
@@ -2166,6 +2184,18 @@ impl Analyzer {
             }
             Expr::Path(_) => path_ident(e).is_some_and(|name| self.env.get(&name) == Kind::Holder),
             Expr::Field(f) => self.part_kind(f) == Some(Kind::Holder),
+            // `ctx.clone()` has the type of `ctx`.
+            Expr::MethodCall(mc) => {
+                SAME_TYPE_METHODS.contains(&mc.method.to_string().as_str())
+                    && self.expr_is_holder(&mc.receiver)
+            }
+            // `Ctx(repo)`: a user tuple struct that holds the handle.
+            Expr::Call(c) => {
+                call_path_name(c).is_some_and(|n| n.starts_with(char::is_uppercase))
+                    && !is_container_constructor(c)
+                    && !is_handle_constructor(c)
+                    && c.args.iter().any(|a| self.holds(a))
+            }
             Expr::Reference(r) => self.expr_is_holder(&r.expr),
             Expr::Paren(p) => self.expr_is_holder(&p.expr),
             Expr::Group(g) => self.expr_is_holder(&g.expr),
@@ -5753,6 +5783,33 @@ mod tests {
             }
             ";
         assert_error_contains("50", handler, &["loop"]);
+    }
+
+    #[test]
+    fn a_user_value_stays_opaque_through_its_own_methods() {
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "exempted clone",
+                r#"let ctx = Ctx { repo };
+                   #[query_exempt(reason = "clone is pure")]
+                   let alias = ctx.clone();
+                   let _ = alias.clear();"#,
+                Expect::Unbounded,
+            ),
+            (
+                "exempted tuple-struct wrapper",
+                r#"#[query_exempt(reason = "wraps only")]
+                   let ctx = Ctx(repo);
+                   let _ = ctx.clear();"#,
+                Expect::Unbounded,
+            ),
+            (
+                "clearing the last tracked part",
+                "let mut ctx = Ctx { slot: Some(repo) }; ctx.slot = None; let _ = render(&ctx);",
+                Expect::Exact(0),
+            ),
+        ];
+        check_cases(cases);
     }
 
     #[test]
