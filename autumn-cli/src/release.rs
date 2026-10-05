@@ -3341,6 +3341,17 @@ case "$1 $2" in
     if [ "$3" = list ]; then
       n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
       if [ "${n:-0}" -eq 0 ]; then
+        # Azure can list no active revision during a handoff. The first
+        # STUB_ACTIVE_EMPTY_FIRST reads are empty ("always": every read).
+        if [ -n "$STUB_ACTIVE_EMPTY_FIRST" ]; then
+          [ -f "$STUB_LOG.empty" ] || echo "$STUB_ACTIVE_EMPTY_FIRST" > "$STUB_LOG.empty"
+          left=$(cat "$STUB_LOG.empty")
+          if [ "$left" = always ]; then exit 0; fi
+          if [ "$left" -gt 0 ]; then
+            echo $((left - 1)) > "$STUB_LOG.empty"
+            exit 0
+          fi
+        fi
         # A handoff: the placeholder and a real revision that is not ready
         # yet are both active.
         if [ -n "$STUB_ACTIVE_BOTH" ]; then
@@ -3453,6 +3464,10 @@ case "$1 $2" in
     fi
     ;;
   "rest --method")
+    # The modes of the script's temp files at the time of the PATCH.
+    if [ -n "$STUB_TMP_MODES" ]; then
+      ls -l "$TMPDIR" | grep '^-' | sed 's/^/mode /' >> "$STUB_LOG"
+    fi
     if grep -q '"ingress"' <<< "$body"; then
       echo "az ingress-patch external=$(jq -r '.properties.configuration.ingress.external' <<< "$body")" >> "$STUB_LOG"
     fi
@@ -3547,6 +3562,8 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_ACTIVE_EMPTY_FIRST")
+            .env_remove("STUB_TMP_MODES")
             .env_remove("STUB_JOB_INLINE_SECRET")
             .env_remove("STUB_ACTIVE_SCALE_REF")
             .env_remove("STUB_ACTIVE_BOTH")
@@ -4006,6 +4023,89 @@ esac
             docs.contains("remove that env var from `main.tf` first"),
             "the Redis off steps must cover a sidecar ref in main.tf"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_reads_the_active_revisions_again_when_none_is_listed() {
+        // During a handoff, Azure can list no active revision. That says
+        // nothing about a real release, so the script reads the list again.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_EMPTY_FIRST", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let disable_at = calls.find("ingress disable").expect("first cutover");
+        assert!(
+            calls[..disable_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_no_active_revision_is_listed() {
+        // Without an active revision, the script cannot tell a placeholder
+        // from a real release. It stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "acr.azurecr.io/app:t0",
+                "Provisioned",
+                false,
+                0,
+                &[
+                    ("STUB_ACTIVE_EMPTY_FIRST", "always"),
+                    ("STUB_APP_LEGACY", "1"),
+                ],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_the_filtered_job_secrets_private() {
+        // With --without-redis, the script filters the job's secrets, which
+        // hold inline values. Every temp file must stay readable by the
+        // owner only.
+        let tmpdir = TempDir::new().unwrap();
+        let tmpdir_path = tmpdir.path().to_str().unwrap().to_string();
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[
+                ("STUB_JOB_INLINE_SECRET", "1"),
+                ("STUB_TMP_MODES", "1"),
+                ("TMPDIR", &tmpdir_path),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let modes: Vec<&str> = calls.lines().filter(|l| l.starts_with("mode ")).collect();
+        assert!(!modes.is_empty(), "{calls}");
+        for line in modes {
+            assert!(line.starts_with("mode -rw-------"), "{line}\n{calls}");
+        }
     }
 
     #[cfg(unix)]
