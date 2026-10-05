@@ -9035,14 +9035,18 @@ async fn execute_fixed_delay_task(
         waiting: None,
     };
     let wait_first = CostGate::waits_before_lease(&*coordinator);
+    let mut retry = 0;
     let (lease, tick_key) = loop {
         if wait_first && !gate.wait(&state, &name).await {
             return;
         }
-        let tick_key = crate::scheduler::fixed_delay_tick_key(
-            &name,
-            delay,
-            crate::time::clock_unix_duration(state.clock()),
+        let tick_key = CostGate::retry_key(
+            &crate::scheduler::fixed_delay_tick_key(
+                &name,
+                delay,
+                crate::time::clock_unix_duration(state.clock()),
+            ),
+            retry,
         );
         let lease = match coordinator
             .try_acquire(&name, &tick_key, coordination)
@@ -9059,9 +9063,10 @@ async fn execute_fixed_delay_task(
             }
         };
         // The signal can rise while a `SQLite` lease attempt waits: give the
-        // lease back and wait again.
+        // lease back, wait again, and retry under a key of its own.
         if wait_first && CostGate::must_wait(&state, &name) {
             release_task_lease(lease, &name, &tick_key).await;
+            retry += 1;
             continue;
         }
         break (lease, tick_key);
@@ -9134,16 +9139,25 @@ struct CostGate {
 impl CostGate {
     /// Wait while the task must defer. Return `false` on shutdown.
     async fn wait(&self, state: &AppState, name: &str) -> bool {
-        let resumed = crate::cost::wait_while_deferred(
+        crate::cost::wait_while_deferred(
             state,
             crate::cost::WorkKind::Task,
             name,
             &self.shutdown,
             self.waiting.as_deref(),
         )
-        .await;
-        self.release();
-        resumed
+        .await
+    }
+
+    /// The lease key for a retry: a `SQLite` row stays until its TTL expires,
+    /// so a retry needs a key of its own. Only the replica that held the tick
+    /// retries, so the derived key still runs the tick one time.
+    fn retry_key(tick_key: &str, retry: u32) -> String {
+        if retry == 0 {
+            tick_key.to_owned()
+        } else {
+            format!("{tick_key}#cost-retry-{retry}")
+        }
     }
 
     /// `true` when the tick waits before it takes its lease.
@@ -9162,7 +9176,8 @@ impl CostGate {
         crate::cost::deferral_signal(state, crate::cost::WorkKind::Task, name).is_some()
     }
 
-    /// The tick no longer waits: later ticks run again.
+    /// The tick no longer needs the reservation: later ticks run again. Call it
+    /// on every way out of the lease and wait steps.
     fn release(&self) {
         if let Some(flag) = &self.waiting {
             flag.store(false, std::sync::atomic::Ordering::Release);
@@ -9192,13 +9207,17 @@ async fn execute_cron_task(
     scheduled_unix_secs: u64,
     gate: CostGate,
 ) {
-    let tick_key = crate::scheduler::cron_tick_key(&name, scheduled_unix_secs);
-    // Cost gate (#1720), as in `execute_fixed_delay_task`.
+    let scheduled_key = crate::scheduler::cron_tick_key(&name, scheduled_unix_secs);
+    // Cost gate (#1720), as in `execute_fixed_delay_task`. The fold
+    // reservation holds until this tick has its lease and is done waiting.
     let wait_first = CostGate::waits_before_lease(&*coordinator);
-    let lease = loop {
+    let mut retry = 0;
+    let (lease, tick_key) = loop {
         if wait_first && !gate.wait(&state, &name).await {
+            gate.release();
             return;
         }
+        let tick_key = CostGate::retry_key(&scheduled_key, retry);
         let lease = match coordinator
             .try_acquire(&name, &tick_key, coordination)
             .await
@@ -9219,17 +9238,20 @@ async fn execute_cron_task(
         // `SQLite` lease attempt.
         if wait_first && CostGate::must_wait(&state, &name) {
             release_task_lease(lease, &name, &tick_key).await;
+            retry += 1;
             continue;
         }
-        break lease;
+        break (lease, tick_key);
     };
     state
         .task_registry
         .record_leader(&name, lease.leader_id(), &tick_key);
     if !wait_first && !gate.wait(&state, &name).await {
+        gate.release();
         release_task_lease(lease, &name, &tick_key).await;
         return;
     }
+    gate.release();
     tracing::debug!(task = %name, "Running cron task");
     state.task_registry.record_start(&name);
 
@@ -19709,46 +19731,55 @@ mod tests {
         }
     }
 
+    /// A `SQLite` coordinator that raises the cost signal during its first
+    /// lease attempt, and records the key and the fold flag of each attempt.
+    struct RisingSignal {
+        signal: crate::cost::CostSignal,
+        acquired: std::sync::Arc<AtomicUsize>,
+        /// The key and the fold flag at each lease attempt.
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::scheduler::SchedulerCoordinator for RisingSignal {
+        fn backend(&self) -> &'static str {
+            "sqlite"
+        }
+
+        fn replica_id(&self) -> &'static str {
+            "replica-a"
+        }
+
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async move {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((tick_key.to_owned(), self.flag.load(Ordering::SeqCst)));
+                if self.acquired.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.signal.set(5.0);
+                }
+                Ok(Some(crate::scheduler::SchedulerLease::local(
+                    "sqlite",
+                    "replica-a",
+                )))
+            })
+        }
+    }
+
     /// A `SQLite` lease attempt that the signal outruns: the signal rises while
     /// the tick takes its lease. The tick gives the lease back, waits, and runs
     /// only after the signal falls (#1720).
     #[tokio::test(start_paused = true)]
     async fn deferred_tick_gives_back_a_sqlite_lease_when_the_signal_rises() {
-        struct RisingSignal {
-            signal: crate::cost::CostSignal,
-            acquired: std::sync::Arc<AtomicUsize>,
-        }
-
-        impl crate::scheduler::SchedulerCoordinator for RisingSignal {
-            fn backend(&self) -> &'static str {
-                "sqlite"
-            }
-
-            fn replica_id(&self) -> &'static str {
-                "replica-a"
-            }
-
-            fn try_acquire<'a>(
-                &'a self,
-                _task_name: &'a str,
-                _tick_key: &'a str,
-                _coordination: crate::task::TaskCoordination,
-            ) -> crate::scheduler::SchedulerFuture<
-                'a,
-                crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
-            > {
-                Box::pin(async move {
-                    if self.acquired.fetch_add(1, Ordering::SeqCst) == 0 {
-                        self.signal.set(5.0);
-                    }
-                    Ok(Some(crate::scheduler::SchedulerLease::local(
-                        "sqlite",
-                        "replica-a",
-                    )))
-                })
-            }
-        }
-
         static RAN: AtomicUsize = AtomicUsize::new(0);
         let name = "cost_sqlite_rising_signal".to_owned();
         crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
@@ -19756,9 +19787,14 @@ mod tests {
         let signal = crate::cost::CostSignal::new(Some(1.0));
         state.insert_extension(signal.clone());
         let acquired = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The cron loop reserves the fold flag before it spawns the tick.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let coordinator = std::sync::Arc::new(RisingSignal {
             signal: signal.clone(),
             acquired: std::sync::Arc::clone(&acquired),
+            seen: std::sync::Arc::clone(&seen),
+            flag: std::sync::Arc::clone(&flag),
         });
         let handler: crate::task::TaskHandler = |_| {
             Box::pin(async {
@@ -19776,7 +19812,7 @@ mod tests {
             1_700_000_000,
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
-                waiting: None,
+                waiting: Some(std::sync::Arc::clone(&flag)),
             },
         ));
 
@@ -19794,6 +19830,23 @@ mod tests {
             acquired.load(Ordering::SeqCst),
             2,
             "the lease is taken again"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen[0].0, "cost_sqlite_rising_signal:1700000000",
+            "{seen:?}"
+        );
+        assert!(
+            seen[1].0.ends_with("#cost-retry-1"),
+            "the retry has a key of its own: the first SQLite row stays: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, reserved)| *reserved),
+            "later ticks stay folded while a lease attempt is in flight: {seen:?}"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the tick clears the reservation"
         );
     }
 

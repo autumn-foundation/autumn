@@ -735,9 +735,9 @@ pub(crate) fn deferral_signal(
 
 /// Wait while `name` must defer. Return `false` when `shutdown` fires first.
 ///
-/// The scheduler calls this after it takes the tick lease. Only the replica
-/// that holds the tick waits, so the tick runs one time. `waiting` is `true`
-/// during the wait.
+/// The scheduler calls this after it takes the tick lease, or before it with
+/// a lease that expires. `waiting` is set to `true` when the wait starts. The
+/// caller clears it when the tick no longer needs the reservation.
 pub(crate) async fn wait_while_deferred(
     state: &crate::AppState,
     kind: WorkKind,
@@ -766,9 +766,6 @@ pub(crate) async fn wait_while_deferred(
             }
             () = tokio::time::sleep(signal.recheck()) => {}
         }
-    }
-    if let Some(flag) = waiting {
-        flag.store(false, Ordering::Release);
     }
     if resumed {
         tracing::info!(task = name, "cost signal is low; task resumes");
