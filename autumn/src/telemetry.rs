@@ -143,7 +143,7 @@ impl Eq for SampleRatio {}
 impl SampleRatio {
     /// Clamp `ratio` into `[0.0, 1.0]`. `NaN` becomes `1.0`.
     #[must_use]
-    pub fn new(ratio: f64) -> Self {
+    pub const fn new(ratio: f64) -> Self {
         if ratio.is_nan() {
             Self(1.0)
         } else {
@@ -640,17 +640,19 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
     // text-map propagator slot maintained by `opentelemetry::global`.
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
-    // Parent-based ratio sampler: a child follows its parent's decision, so a
-    // trace is never cut in half. The ratio decides only for root spans.
-    let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-        otlp.sample_ratio.get(),
-    )));
-
     Ok(SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_sampler(sampler)
+        .with_sampler(sampler(otlp.sample_ratio))
         .with_batch_exporter(exporter)
         .build())
+}
+
+/// Parent-based ratio sampler (issue #3064). A child follows the decision of
+/// its parent, so a trace is never cut in half. The ratio decides only for
+/// root spans.
+#[cfg(feature = "telemetry-otlp")]
+fn sampler(ratio: SampleRatio) -> Sampler {
+    Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio.get())))
 }
 
 #[cfg(feature = "telemetry-otlp")]
@@ -917,26 +919,22 @@ mod tests {
     }
 
     #[cfg(feature = "telemetry-otlp")]
-    #[tokio::test]
-    async fn sampler_is_parent_based_ratio() {
-        use opentelemetry::trace::{Span as _, TraceContextExt as _, Tracer as _};
+    #[test]
+    fn sampler_is_parent_based_ratio() {
+        use opentelemetry::trace::{
+            Span as _, TraceContextExt as _, Tracer as _, TracerProvider as _,
+        };
 
-        let otlp = |ratio: f64| OtlpTraceRuntime {
-            endpoint: "http://127.0.0.1:65532".into(),
-            protocol: TelemetryProtocol::Grpc,
-            resource: TelemetryResource {
-                service_name: "unit-test".into(),
-                service_namespace: None,
-                service_version: "0.0.0".into(),
-                environment: "test".into(),
-            },
-            sample_ratio: SampleRatio::new(ratio),
+        // No exporter: the test never waits on a network export.
+        let provider = |ratio: f64| {
+            SdkTracerProvider::builder()
+                .with_sampler(sampler(SampleRatio::new(ratio)))
+                .build()
         };
 
         // Ratio 0: a root span is not sampled.
-        let never = build_tracer_provider(&otlp(0.0)).unwrap();
-        let root = never.tracer("t").start("root");
-        assert!(!root.span_context().is_sampled());
+        let never = provider(0.0);
+        assert!(!never.tracer("t").start("root").span_context().is_sampled());
 
         // Ratio 0, sampled parent: the child follows the parent.
         let parent = opentelemetry::trace::SpanContext::new(
@@ -951,11 +949,8 @@ mod tests {
         assert!(child.span_context().is_sampled());
 
         // Ratio 1: a root span is sampled.
-        let always = build_tracer_provider(&otlp(1.0)).unwrap();
+        let always = provider(1.0);
         assert!(always.tracer("t").start("root").span_context().is_sampled());
-
-        let _ = never.shutdown();
-        let _ = always.shutdown();
     }
 
     #[cfg(feature = "telemetry-otlp")]

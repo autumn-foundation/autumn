@@ -332,6 +332,16 @@ pub trait ProvideActuatorState {
         None
     }
 
+    /// Returns the read-replica pool, used to export its gauges on
+    /// `/actuator/prometheus` with `pool="replica"`. Defaults to `None`.
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    {
+        None
+    }
+
     /// Returns the scaffold-level accessibility posture reported by `/actuator/a11y`.
     ///
     /// Override this in your `AppState` implementation to declare which
@@ -3487,27 +3497,7 @@ fn write_builtin_http_metrics(
 
     write_http_duration_histogram(out, version, duration_series);
 
-    // Deprecated (issue #3064): the global p50/p95/p99 summary. A summary
-    // cannot be aggregated across replicas. Use the histogram above.
-    let name = HTTP_DURATION_QUANTILES_FAMILY;
-    let _ = writeln!(
-        out,
-        "# HELP {name} Deprecated: HTTP request latency quantiles in seconds. \
-         Use autumn_http_request_duration_seconds"
-    );
-    let _ = writeln!(out, "# TYPE {name} summary");
-    for (quantile, millis) in [
-        ("0.5", snapshot.http.latency_ms.p50),
-        ("0.95", snapshot.http.latency_ms.p95),
-        ("0.99", snapshot.http.latency_ms.p99),
-    ] {
-        #[allow(clippy::cast_precision_loss)]
-        let seconds = millis as f64 / 1000.0;
-        let _ = writeln!(
-            out,
-            "{name}{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
-        );
-    }
+    write_http_duration_quantiles(out, version, snapshot);
 
     // autumn_shutdown_aborted_requests_total
     out.push_str(
@@ -3574,6 +3564,36 @@ fn write_builtin_http_metrics(
                 );
             }
         }
+    }
+}
+
+/// Render the deprecated global p50/p95/p99 summary (issue #3064). You cannot
+/// add summaries from different replicas. Use the histogram instead.
+fn write_http_duration_quantiles(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::middleware::metrics::MetricsSnapshot,
+) {
+    use std::fmt::Write;
+
+    let name = HTTP_DURATION_QUANTILES_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Deprecated: HTTP request latency quantiles in seconds. \
+         Use autumn_http_request_duration_seconds"
+    );
+    let _ = writeln!(out, "# TYPE {name} summary");
+    for (quantile, millis) in [
+        ("0.5", snapshot.http.latency_ms.p50),
+        ("0.95", snapshot.http.latency_ms.p95),
+        ("0.99", snapshot.http.latency_ms.p99),
+    ] {
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = millis as f64 / 1000.0;
+        let _ = writeln!(
+            out,
+            "{name}{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
+        );
     }
 }
 
@@ -3760,11 +3780,15 @@ fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegi
     }
 }
 
+/// A pool gauge: metric name, help text, and the `Status` field it reads.
+#[cfg(feature = "db")]
+type PoolGauge = (&'static str, &'static str, fn(&deadpool::Status) -> usize);
+
 /// Render the database pool families into `out` (issue #3064).
 ///
 /// The wait histogram is always present. The gauges are present when the app
-/// has a pool. The `pool` label is `primary`, or `shard:<name>:primary` and
-/// `shard:<name>:replica` for a sharded app.
+/// has a pool. The `pool` label is `primary` or `replica`, or
+/// `shard:<name>:primary` and `shard:<name>:replica` for a sharded app.
 fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
     out: &mut String,
     version: &str,
@@ -3775,7 +3799,7 @@ fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
     let name = DB_POOL_WAIT_FAMILY;
     let _ = writeln!(
         out,
-        "# HELP {name} Time a database checkout waited for a pool connection"
+        "# HELP {name} Time a Db checkout took to get a pool connection, connect time included"
     );
     let _ = writeln!(out, "# TYPE {name} histogram");
     write_histogram_samples(
@@ -3791,6 +3815,9 @@ fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
         if let Some(pool) = state.pool() {
             pools.push(("primary".to_owned(), pool.status()));
         }
+        if let Some(pool) = state.replica_pool() {
+            pools.push(("replica".to_owned(), pool.status()));
+        }
         if let Some(shards) = state.shards() {
             for shard in shards.iter() {
                 pools.push((
@@ -3805,7 +3832,7 @@ fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
         if pools.is_empty() {
             return;
         }
-        let gauges: [(&str, &str, fn(&deadpool::Status) -> usize); 4] = [
+        let gauges: [PoolGauge; 4] = [
             (
                 "autumn_db_pool_max_size",
                 "Maximum connections in the pool",
@@ -6143,6 +6170,10 @@ mod tests {
         pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
         #[cfg(feature = "db")]
         shards: Option<crate::sharding::ShardSet>,
+        #[cfg(feature = "db")]
+        replica_pool: Option<
+            diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+        >,
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels,
         #[cfg(feature = "ws")]
@@ -6192,6 +6223,13 @@ mod tests {
         fn shards(&self) -> Option<&crate::sharding::ShardSet> {
             self.shards.as_ref()
         }
+        #[cfg(feature = "db")]
+        fn replica_pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+        {
+            self.replica_pool.as_ref()
+        }
         #[cfg(feature = "ws")]
         fn channels(&self) -> &crate::channels::Channels {
             &self.channels
@@ -6234,6 +6272,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
@@ -7441,8 +7481,14 @@ mod tests {
             crate::test_urls::primary("actuator_prometheus_pool"),
         );
         state.pool = Some(Pool::builder(manager).max_size(7).build().unwrap());
+        let replica = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
+            crate::test_urls::primary("actuator_prometheus_replica"),
+        );
+        state.replica_pool = Some(Pool::builder(replica).max_size(3).build().unwrap());
 
         let text = scrape_prometheus(state).await;
+        let replica_max = "autumn_db_pool_max_size{version=\"stable\",pool=\"replica\"} ";
+        assert!((sample_value(&text, replica_max) - 3.0).abs() < f64::EPSILON);
 
         for (name, value) in [
             ("autumn_db_pool_max_size", 7.0),

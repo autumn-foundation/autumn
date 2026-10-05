@@ -90,12 +90,16 @@ async fn histogram_buckets_are_present_and_cumulative() {
         .into_iter()
         .filter(|l| l.contains(series))
         .collect();
-    assert!(
-        buckets.len() >= 2,
-        "bucket lines for {series} are missing:\n{text}"
+    let bounds: Vec<&str> = buckets.iter().map(|l| label(l, "le").unwrap()).collect();
+    assert_eq!(
+        bounds,
+        [
+            "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10",
+            "+Inf"
+        ],
+        "bucket lines for {series}:\n{text}"
     );
     let last = buckets.last().unwrap();
-    assert_eq!(label(last, "le"), Some("+Inf"), "+Inf bucket is last");
 
     // Buckets are cumulative: each count is not less than the one before.
     let counts: Vec<f64> = buckets.iter().map(|l| value(l)).collect();

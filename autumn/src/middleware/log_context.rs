@@ -73,7 +73,8 @@ fn record_trace_ids(span: &tracing::Span, ctx: &LogContext) {
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
     let otel_cx = span.context();
-    let span_context = otel_cx.span().span_context().clone();
+    let otel_span = otel_cx.span();
+    let span_context = otel_span.span_context();
     if !span_context.is_valid() {
         return;
     }

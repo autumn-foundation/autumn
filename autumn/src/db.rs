@@ -3403,6 +3403,22 @@ fn capsule_checkout_marker(capture_gap: Option<&str>) -> Option<String> {
     }
 }
 
+/// Await a pool checkout and record its wait time (issue #3064). The wait runs
+/// from the checkout request to a connection or an error. A checkout timeout
+/// is the most important signal, so the code records a failed checkout too.
+async fn timed_pool_wait<T>(
+    clock: &dyn crate::time::ClockSource,
+    metrics: Option<&crate::middleware::MetricsCollector>,
+    checkout: impl std::future::Future<Output = T>,
+) -> T {
+    let start = clock.monotonic();
+    let result = checkout.await;
+    if let Some(metrics) = metrics {
+        metrics.record_db_pool_wait(clock.monotonic().saturating_duration_since(start));
+    }
+    result
+}
+
 impl Db {
     /// Check a connection out of `params.pool` with full instrumentation.
     ///
@@ -3477,20 +3493,12 @@ impl Db {
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
 
-        // Pool wait time (issue #3064): from the checkout request to a
-        // connection or an error. A timeout is the wait that matters most, so
-        // it is recorded too.
-        let wait_start = params.clock.monotonic();
-        let checkout = checkout_future.instrument(span.clone()).await;
-        if let Some(metrics) = &params.metrics {
-            metrics.record_db_pool_wait(
-                params
-                    .clock
-                    .monotonic()
-                    .saturating_duration_since(wait_start),
-            );
-        }
-        let mut conn = checkout?;
+        let mut conn = timed_pool_wait(
+            params.clock.as_ref(),
+            params.metrics.as_ref(),
+            checkout_future.instrument(span.clone()),
+        )
+        .await?;
 
         // `statement_timeout` is a Postgres session GUC; it is intentionally
         // unused on the SQLite backend (see the gating note below), so consume

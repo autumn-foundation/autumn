@@ -2,8 +2,9 @@
 //!
 //! Exposes [`Client`](crate::http_client::Client) as `autumn_web::http::Client` — a thin `reqwest`-backed
 //! outbound HTTP client that propagates the active span's `traceparent` /
-//! `tracestate` headers, retries transient failures, and is mockable in tests
-//! via [`TestApp::http_mock`](crate::test::TestApp::http_mock).
+//! `tracestate` headers and the current request's `x-request-id`, opens one
+//! CLIENT span per attempt, retries transient failures, and is mockable in
+//! tests via [`TestApp::http_mock`](crate::test::TestApp::http_mock).
 //!
 //! # Quick start
 //!
@@ -1379,6 +1380,7 @@ impl Client {
             discard_response_body: false,
             breaker_scoped: false,
             sim_net: self.sim_net.clone(),
+            forward_request_id: true,
         }
     }
 
@@ -1509,6 +1511,10 @@ enum RedirectMode {
 const SSRF_SAFE_MAX_REDIRECTS: usize = 5;
 
 /// Fluent outbound request builder produced by [`Client`] methods.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-request switches; each has its own builder method"
+)]
 pub struct RequestBuilder {
     client: reqwest::Client,
     method: Method,
@@ -1540,9 +1546,22 @@ pub struct RequestBuilder {
     breaker_scoped: bool,
     /// The simulated network, when the client came from a sim app state.
     sim_net: Option<Arc<crate::sim::SimNet>>,
+    /// When `true` (the default), `send` adds the current request's id as
+    /// `x-request-id`. See [`RequestBuilder::without_request_id`].
+    forward_request_id: bool,
 }
 
 impl RequestBuilder {
+    /// Do not send the current request's id as `x-request-id`.
+    ///
+    /// By default, a request sent during an inbound request carries that
+    /// request's id (issue #3064). Use this for a host that must not see it.
+    #[must_use]
+    pub const fn without_request_id(mut self) -> Self {
+        self.forward_request_id = false;
+        self
+    }
+
     /// Append a request header.
     ///
     /// Headers named `authorization`, `cookie`, or `set-cookie` are accepted
@@ -1878,7 +1897,13 @@ impl RequestBuilder {
     }
 
     /// [`send`](Self::send), minus the replay gate and the capture tee.
-    async fn send_recorded(self) -> Result<Response, ClientError> {
+    async fn send_recorded(mut self) -> Result<Response, ClientError> {
+        // After the capture tee armed, so a capsule records only the caller's
+        // own headers and replay compares like with like.
+        if self.forward_request_id {
+            add_current_request_id(&mut self.extra_headers);
+        }
+
         // A sim network serves every send path, so nothing reaches the real
         // network. Like mocks, it bypasses the process-global breaker.
         if let Some(net) = self.sim_net.clone() {
@@ -1982,11 +2007,11 @@ impl RequestBuilder {
 
             let mut req = self.client.request(self.method.clone(), &self.url);
 
-            // One CLIENT span per attempt. Inject trace context and request id
-            // headers inside it, so the next service's parent is this attempt.
-            // A caller header of the same name wins.
+            // One CLIENT span per attempt. Inject the trace context inside it,
+            // so the next service's parent is this attempt. A caller header of
+            // the same name wins.
             let span = client_attempt_span(&self.method, &self.url, attempt);
-            req = span.in_scope(|| inject_propagation_headers(req, &self.extra_headers));
+            req = span.in_scope(|| inject_trace_context(req, &self.extra_headers));
 
             // Apply caller-supplied headers.
             for (name, value) in &self.extra_headers {
@@ -2626,9 +2651,9 @@ async fn serve_sim_host(
         let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
         builder = builder.header(reqwest::header::HOST, authority);
     }
-    // Trace context and request id first, as on the real send path. A caller
-    // header of the same name wins.
-    for (name, value) in propagation_headers() {
+    // Trace context first, as on the real send path. A caller header of the
+    // same name wins.
+    for (name, value) in trace_context_headers() {
         if !request.extra_headers.contains_key(name.as_str()) {
             builder = builder.header(name, value);
         }
@@ -2810,7 +2835,7 @@ async fn send_one(
             req = req.timeout(d.saturating_duration_since(crate::time::ambient_instant()));
         }
         let span = client_attempt_span(method, url, attempt);
-        req = span.in_scope(|| inject_propagation_headers(req, extra_headers));
+        req = span.in_scope(|| inject_trace_context(req, extra_headers));
         for (name, value) in extra_headers {
             req = req.header(name.clone(), value.clone());
         }
@@ -3147,23 +3172,29 @@ fn log_request(
 /// Field names follow the OpenTelemetry HTTP client conventions. The span
 /// holds the URL path only, not the query: a query can hold secrets.
 fn client_attempt_span(method: &Method, url: &str, attempt: u32) -> tracing::Span {
-    let parsed = reqwest::Url::parse(url).ok();
-    let host = parsed
-        .as_ref()
-        .and_then(reqwest::Url::host_str)
-        .unwrap_or_default();
-    let path = parsed.as_ref().map_or("", reqwest::Url::path);
-    tracing::info_span!(
+    let span = tracing::info_span!(
         "http.client.request",
         otel.name = %method,
         otel.kind = "client",
         http.request.method = %method,
-        server.address = host,
-        url.path = path,
-        http.request.resend_count = attempt,
+        server.address = tracing::field::Empty,
+        url.path = tracing::field::Empty,
+        http.request.resend_count = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
-    )
+    );
+    // The conventions leave `resend_count` unset on the first attempt.
+    if attempt > 0 {
+        span.record("http.request.resend_count", attempt);
+    }
+    // Parse the URL only when a subscriber listens.
+    if !span.is_disabled()
+        && let Ok(parsed) = reqwest::Url::parse(url)
+    {
+        span.record("server.address", parsed.host_str().unwrap_or_default());
+        span.record("url.path", parsed.path());
+    }
+    span
 }
 
 /// Send `request` inside `span`, then record the status code or the error
@@ -3193,15 +3224,15 @@ async fn send_in_span(
     sent
 }
 
-/// Inject the [`propagation_headers`] into the request builder. Skip a name
-/// that `caller_headers` holds: `RequestBuilder::header` appends, so both
-/// values would otherwise go out.
-fn inject_propagation_headers(
+/// Inject the W3C trace-context headers of the active span. Skip a name that
+/// `caller_headers` holds: `RequestBuilder::header` appends, so if not, the
+/// request sends both values.
+fn inject_trace_context(
     builder: reqwest::RequestBuilder,
     caller_headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
     let mut builder = builder;
-    for (name, value) in propagation_headers() {
+    for (name, value) in trace_context_headers() {
         if !caller_headers.contains_key(name.as_str()) {
             builder = builder.header(name, value);
         }
@@ -3209,20 +3240,18 @@ fn inject_propagation_headers(
     builder
 }
 
-/// Headers that carry the current request's context to the next service:
-/// - W3C `traceparent` / `tracestate` from the active span (with the
-///   `telemetry-otlp` feature),
-/// - `x-request-id` from the current request (issue #3064).
-///
-/// Empty outside a request with no active span.
-fn propagation_headers() -> Vec<(String, HeaderValue)> {
-    let mut headers = trace_context_headers();
+/// Add the current request's id as `x-request-id` (issue #3064). Do nothing
+/// when the caller set the header, or when there is no current request.
+fn add_current_request_id(headers: &mut HeaderMap) {
+    static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+    if headers.contains_key(&X_REQUEST_ID) {
+        return;
+    }
     if let Some(value) =
         crate::log::context::current_request_id().and_then(|id| HeaderValue::from_str(&id).ok())
     {
-        headers.push(("x-request-id".to_owned(), value));
+        headers.insert(X_REQUEST_ID.clone(), value);
     }
-    headers
 }
 
 /// The W3C trace-context headers for the active span. Empty when the
@@ -4100,44 +4129,87 @@ mod tests {
         });
     }
 
-    // TEST 34: no propagation headers outside a request.
+    // TEST 34: the request id is added only inside a request.
     #[test]
-    fn propagation_headers_are_empty_outside_a_request() {
-        #[cfg(not(feature = "telemetry-otlp"))]
-        assert!(propagation_headers().is_empty());
-        assert!(
-            !propagation_headers()
-                .iter()
-                .any(|(name, _)| name == "x-request-id")
-        );
+    fn no_request_id_outside_a_request() {
+        let mut headers = HeaderMap::new();
+        add_current_request_id(&mut headers);
+        assert!(headers.is_empty());
     }
 
     #[tokio::test]
-    async fn propagation_headers_carry_the_current_request_id() {
+    async fn current_request_id_is_added() {
         let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
-        let headers = crate::log::context::scope(ctx, async { propagation_headers() }).await;
-        let id = headers
-            .iter()
-            .find(|(name, _)| name == "x-request-id")
-            .map(|(_, value)| value.to_str().unwrap().to_owned());
-        assert_eq!(id.as_deref(), Some("rid-1"));
+        let mut headers = HeaderMap::new();
+        crate::log::context::scope(ctx, async { add_current_request_id(&mut headers) }).await;
+        assert_eq!(headers.get("x-request-id").unwrap(), "rid-1");
     }
 
     #[tokio::test]
-    async fn caller_header_suppresses_the_propagated_one() {
+    async fn caller_request_id_is_kept() {
         let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("mine"));
+        crate::log::context::scope(ctx, async { add_current_request_id(&mut headers) }).await;
+        assert_eq!(headers.get_all("x-request-id").iter().count(), 1);
+        assert_eq!(headers.get("x-request-id").unwrap(), "mine");
+    }
+
+    #[test]
+    fn caller_trace_header_suppresses_the_injected_one() {
         let mut caller = HeaderMap::new();
-        caller.insert("x-request-id", HeaderValue::from_static("mine"));
-        let request = crate::log::context::scope(ctx, async {
-            inject_propagation_headers(reqwest::Client::new().get("https://example.com"), &caller)
-        })
-        .await
-        .build()
-        .unwrap();
-        assert!(request.headers().get("x-request-id").is_none());
+        caller.insert("traceparent", HeaderValue::from_static("mine"));
+        let request =
+            inject_trace_context(reqwest::Client::new().get("https://example.com"), &caller)
+                .build()
+                .unwrap();
+        assert!(request.headers().get("traceparent").is_none());
     }
 
-    // TEST 35: Real GET request exercises inject_propagation_headers, log_request, and
+    // A request built with `without_request_id` sends no id.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn without_request_id_sends_no_id() {
+        use axum::{Router, http::HeaderMap as AxumHeaders, routing::get};
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let app = Router::new().route(
+            "/echo",
+            get(|headers: AxumHeaders| async move {
+                headers
+                    .get("x-request-id")
+                    .map_or_else(|| "none".to_owned(), |v| v.to_str().unwrap().to_owned())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let url = format!("http://{addr}/echo");
+        let (forwarded, opted_out) = crate::log::context::scope(ctx, async {
+            let forwarded = Client::new().get(&url).send().await.unwrap().text();
+            let opted_out = Client::new()
+                .get(&url)
+                .without_request_id()
+                .send()
+                .await
+                .unwrap()
+                .text();
+            (forwarded, opted_out)
+        })
+        .await;
+        assert_eq!(forwarded, "rid-1");
+        assert_eq!(opted_out, "none");
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // TEST 35: Real GET request exercises inject_trace_context, log_request, and
     // the success branch of the retry loop.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -4239,7 +4311,12 @@ mod tests {
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::registry().with(capture.clone()),
             );
+            // Another test can register this callsite on a thread with no
+            // subscriber, and cache it as "never". Register it here first,
+            // rebuild the cache, then discard the warm-up span.
+            drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
             tracing::callsite::rebuild_interest_cache();
+            capture.spans.lock().unwrap().clear();
 
             // The first call answers 503, the next 200: two attempts.
             let calls = std::sync::Arc::new(AtomicUsize::new(0));
@@ -4267,8 +4344,7 @@ mod tests {
             let response = request.send().await.unwrap();
             assert_eq!(response.status().as_u16(), 200);
 
-            let spans = capture.spans.lock().unwrap();
-            let mut attempts: Vec<_> = spans.values().cloned().collect();
+            let mut attempts: Vec<_> = capture.spans.lock().unwrap().values().cloned().collect();
             attempts.sort_by_key(|f| f.get("http.request.resend_count").cloned());
             assert_eq!(attempts.len(), 2, "custom={custom_path}: {attempts:?}");
             for (n, fields) in attempts.iter().enumerate() {
@@ -4281,10 +4357,8 @@ mod tests {
                     fields.get("server.address").map(String::as_str),
                     Some("127.0.0.1")
                 );
-                assert_eq!(
-                    fields.get("http.request.resend_count"),
-                    Some(&n.to_string())
-                );
+                let resend = fields.get("http.request.resend_count");
+                assert_eq!(resend, (n > 0).then(|| n.to_string()).as_ref());
             }
             assert_eq!(
                 attempts[0]

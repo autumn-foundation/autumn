@@ -8,10 +8,11 @@
 //!    logs and downstream services.
 //!
 //! The id is a new UUID v4, with one exception. When the peer is a trusted
-//! proxy (see `[security.trusted_proxies]`) and it sends a well-formed
+//! proxy (see `[security.trusted_proxies]`) and it sends one well-formed
 //! `X-Request-Id`, the layer keeps that id. Well-formed means a UUID in the
 //! hyphenated form (36 characters) or the simple form (32 hex digits). The
-//! layer keeps the text as sent. It ignores all other values.
+//! layer keeps the text as sent. It ignores all other values, and it ignores
+//! a request with more than one `X-Request-Id` header.
 //!
 //! The [`RequestIdLayer`] is applied automatically by the framework.
 //! You do not need to register it manually.
@@ -95,8 +96,8 @@ static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 #[derive(Clone, Debug)]
 pub struct RequestId {
     uuid: Uuid,
-    /// The inbound text, as the trusted proxy sent it. `None` for a new id.
-    inbound: Option<Arc<str>>,
+    /// The inbound value, as the trusted proxy sent it. `None` for a new id.
+    inbound: Option<HeaderValue>,
 }
 
 impl RequestId {
@@ -119,8 +120,15 @@ impl RequestId {
         let uuid = Uuid::try_parse(value).ok()?;
         Some(Self {
             uuid,
-            inbound: Some(Arc::from(value)),
+            inbound: Some(HeaderValue::from_str(value).ok()?),
         })
+    }
+
+    /// Returns `true` when a trusted proxy supplied this id. An inbound id is
+    /// not unique: a proxy retry sends the same id again.
+    #[must_use]
+    pub const fn is_inbound(&self) -> bool {
+        self.inbound.is_some()
     }
 
     const fn minted(uuid: Uuid) -> Self {
@@ -131,8 +139,8 @@ impl RequestId {
     }
 
     fn header_value(&self) -> Option<HeaderValue> {
-        if let Some(text) = &self.inbound {
-            return HeaderValue::from_str(text).ok();
+        if let Some(value) = &self.inbound {
+            return Some(value.clone());
         }
         // Format the UUID into a stack buffer to avoid a String allocation.
         let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
@@ -143,7 +151,8 @@ impl RequestId {
 
 impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.inbound {
+        // `parse_inbound` accepts only ASCII, so `to_str` cannot fail.
+        match self.inbound.as_ref().and_then(|value| value.to_str().ok()) {
             Some(text) => f.write_str(text),
             None => write!(f, "{}", self.uuid),
         }
@@ -229,8 +238,10 @@ impl<S> RequestIdService<S> {
     /// The trusted inbound id, if the peer is trusted and the id is valid.
     fn inbound_id<B>(&self, req: &Request<B>) -> Option<RequestId> {
         let trust = self.trust.as_ref()?;
-        let value = req.headers().get(&X_REQUEST_ID)?.to_str().ok()?;
-        if !trust.is_trusted_peer(req) {
+        let mut values = req.headers().get_all(&X_REQUEST_ID).iter();
+        let value = values.next()?.to_str().ok()?;
+        // A proxy that appends, not replaces, leaves the client's value too.
+        if values.next().is_some() || !trust.is_trusted_peer(req) {
             return None;
         }
         RequestId::parse_inbound(value)
@@ -395,19 +406,27 @@ mod tests {
         }
     }
 
-    fn trusting_layer(config: crate::security::config::TrustedProxiesConfig) -> RequestIdLayer {
-        RequestIdLayer::default().with_inbound_trust(Arc::new(ProxyResolver::from_config(&config)))
+    fn trusting_layer(config: &crate::security::config::TrustedProxiesConfig) -> RequestIdLayer {
+        RequestIdLayer::default().with_inbound_trust(Arc::new(ProxyResolver::from_config(config)))
     }
 
     async fn response_id(layer: RequestIdLayer, peer: Option<&str>, inbound: &str) -> String {
+        response_id_with(layer, peer, &[("x-request-id", inbound)]).await
+    }
+
+    async fn response_id_with(
+        layer: RequestIdLayer,
+        peer: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> String {
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
             .layer(layer);
-        let mut request = Request::builder()
-            .uri("/")
-            .header("x-request-id", inbound)
-            .body(Body::empty())
-            .unwrap();
+        let mut builder = Request::builder().uri("/");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
         if let Some(peer) = peer {
             let addr: std::net::SocketAddr = peer.parse().unwrap();
             request
@@ -440,29 +459,80 @@ mod tests {
             trusted_hops: None,
             trust_forwarded_headers: false,
         };
-        let id = response_id(trusting_layer(off), Some("10.1.2.3:4000"), inbound).await;
+        let id = response_id(trusting_layer(&off), Some("10.1.2.3:4000"), inbound).await;
         assert_ne!(id, inbound);
 
         // Peer outside the trusted range.
-        let id = response_id(
-            trusting_layer(ranges.clone()),
-            Some("203.0.113.9:4000"),
-            inbound,
-        )
-        .await;
+        let id = response_id(trusting_layer(&ranges), Some("203.0.113.9:4000"), inbound).await;
         assert_ne!(id, inbound);
 
         // Peer inside the trusted range.
-        let id = response_id(trusting_layer(ranges), Some("10.1.2.3:4000"), inbound).await;
+        let id = response_id(trusting_layer(&ranges), Some("10.1.2.3:4000"), inbound).await;
         assert_eq!(id, inbound);
 
-        // Hop-count mode trusts the declared proxy.
+        // No ranges and no hops: every peer is trusted (documented).
+        let open = crate::security::config::TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        };
+        let id = response_id(trusting_layer(&open), Some("203.0.113.9:4000"), inbound).await;
+        assert_eq!(id, inbound);
+
+        // Ranges that all fail to parse: no peer is trusted.
+        let broken = crate::security::config::TrustedProxiesConfig {
+            ranges: vec!["not-a-range".to_owned()],
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        };
+        let id = response_id(trusting_layer(&broken), Some("10.1.2.3:4000"), inbound).await;
+        assert_ne!(id, inbound);
+    }
+
+    #[tokio::test]
+    async fn hop_mode_needs_a_long_enough_forwarded_chain() {
+        let inbound = "0f8fad5b-d9cb-469f-a165-70867728950e";
         let hops = crate::security::config::TrustedProxiesConfig {
             ranges: Vec::new(),
             trusted_hops: Some(1),
             trust_forwarded_headers: true,
         };
-        let id = response_id(trusting_layer(hops), Some("203.0.113.9:4000"), inbound).await;
+        let peer = Some("203.0.113.9:4000");
+
+        // A direct client sends no X-Forwarded-For.
+        let id = response_id(trusting_layer(&hops), peer, inbound).await;
+        assert_ne!(id, inbound);
+
+        // The proxy appended the client: the chain has two entries.
+        let headers = [
+            ("x-request-id", inbound),
+            ("x-forwarded-for", "198.51.100.7, 10.0.0.2"),
+        ];
+        let id = response_id_with(trusting_layer(&hops), peer, &headers).await;
         assert_eq!(id, inbound);
+    }
+
+    #[tokio::test]
+    async fn repeated_inbound_header_is_ignored() {
+        let open = crate::security::config::TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        };
+        let first = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let headers = [
+            ("x-request-id", first),
+            ("x-request-id", "1f8fad5b-d9cb-469f-a165-70867728950e"),
+        ];
+        let id = response_id_with(trusting_layer(&open), None, &headers).await;
+        assert_ne!(id, first);
+        assert!(Uuid::parse_str(&id).is_ok());
+    }
+
+    #[test]
+    fn inbound_flag_marks_only_proxy_ids() {
+        assert!(!RequestId::minted(Uuid::nil()).is_inbound());
+        let inbound = RequestId::parse_inbound("0f8fad5bd9cb469fa16570867728950e").unwrap();
+        assert!(inbound.is_inbound());
     }
 }

@@ -153,8 +153,8 @@ rewrite applies.
 
 ### Metrics: `autumn_http_request_duration_seconds` is now a histogram
 
-**Why:** A summary cannot be aggregated across replicas (issue #3064). A
-histogram gives fleet p99 and SLO burn rates.
+**Why:** You cannot add summaries from different replicas (issue #3064). A
+histogram gives fleet p99 and SLO error ratios.
 
 **Before (`{X.Y}`):** the family was a summary with quantile lines.
 
@@ -254,7 +254,11 @@ Changes that still compile but behave differently at runtime. Examples:
   `X-Request-Id`, the app keeps it. Before, the app always made a new id.
 - `http_client` sends the current request's id as `x-request-id`. A header
   that you set on the request builder wins.
-- A metric `method` label shows `_other` for a non-standard HTTP method.
+- A metric `method` label shows `_other` for a non-standard HTTP method. The
+  `/actuator/metrics` JSON route keys change too: `PROPFIND /x` is now
+  `_other /x`.
+- To stop `http_client` from sending the request id to a host, call
+  `.without_request_id()` on the request builder.
 
 If nothing changed, delete this section.
 

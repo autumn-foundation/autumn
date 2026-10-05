@@ -143,12 +143,12 @@ const BUCKET_BOUNDS_MICROS: [u64; 12] = [
 ];
 
 /// Prometheus `le` label values for [`BUCKET_BOUNDS_MICROS`], then `+Inf`.
-pub(crate) const BUCKET_LABELS: [&str; 13] = [
+pub const BUCKET_LABELS: [&str; 13] = [
     "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf",
 ];
 
 /// `status_class` label values. Index 5 holds codes outside 100..=599.
-pub(crate) const STATUS_CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
+pub const STATUS_CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
 
 /// `method` label values. All other methods use [`OTHER_METHOD`].
 const KNOWN_METHODS: [&str; 9] = [
@@ -212,7 +212,7 @@ impl Histogram {
     }
 }
 
-/// Lock-free histogram for hot paths with no lock of their own.
+/// Lock-free histogram for a path that runs on each request and has no lock.
 #[derive(Debug, Default)]
 struct AtomicHistogram {
     counts: [AtomicU64; BUCKET_LABELS.len()],
@@ -240,7 +240,7 @@ impl AtomicHistogram {
 
 /// A point-in-time histogram, ready for Prometheus.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct HistogramSnapshot {
+pub struct HistogramSnapshot {
     /// Cumulative count per bucket, in [`BUCKET_LABELS`] order.
     pub cumulative: [u64; BUCKET_LABELS.len()],
     /// Sum of all observations, in seconds.
@@ -270,7 +270,7 @@ impl HistogramSnapshot {
 
 /// One histogram series of `autumn_http_request_duration_seconds`.
 #[derive(Debug, Clone)]
-pub(crate) struct DurationSeries {
+pub struct DurationSeries {
     pub method: String,
     pub route: String,
     pub status_class: &'static str,

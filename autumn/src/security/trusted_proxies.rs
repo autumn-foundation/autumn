@@ -188,19 +188,28 @@ impl ProxyResolver {
         self.ranges.iter().any(|r| r.contains(ip))
     }
 
-    /// Returns `true` when the immediate peer is a trusted proxy, so headers
-    /// it sets (such as `X-Request-Id`) can be honoured.
+    /// Returns `true` when the immediate peer is a trusted proxy, so the app
+    /// can use a header that the proxy sets (such as `X-Request-Id`).
     ///
     /// - `trust_forwarded_headers = false`: never.
-    /// - `trusted_hops` set: always (the operator declares a proxy in front).
+    /// - `trusted_hops = N`: only when the `X-Forwarded-For` chain has more
+    ///   than `N` valid entries, as for the forwarded host. A direct client
+    ///   cannot satisfy the count.
     /// - Ranges set: the peer IP must be in a range.
     /// - Neither set: every peer.
     pub(crate) fn is_trusted_peer<B>(&self, req: &Request<B>) -> bool {
         if !self.trust_forwarded_headers {
             return false;
         }
-        if self.trusted_hops.is_some() {
-            return true;
+        if let Some(hops) = self.trusted_hops {
+            return Self::x_forwarded_for(req).is_some_and(|xff| {
+                xff.rsplit(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(Self::parse_forwarded_ip)
+                    .count()
+                    > hops as usize
+            });
         }
         let peer_ip = Self::peer_ip(req);
         peer_ip.is_some_and(|ip| self.is_trusted_ip(ip))
