@@ -561,6 +561,20 @@ fn exports_dir_ignores_an_empty_setting() {
     );
 }
 
+/// H12: an empty `STOCKROOM_DB_PASSWORD_FILE` counts as unset. The app
+/// uses the default pool, as with no value.
+#[test]
+fn password_file_ignores_an_empty_setting() {
+    assert_eq!(
+        PasswordFilePool::from_value(Some("".into())),
+        PasswordFilePool::default()
+    );
+    assert_eq!(
+        PasswordFilePool::from_value(Some("/run/secrets/db".into())),
+        PasswordFilePool::new("/run/secrets/db")
+    );
+}
+
 // ── Postgres tier (Docker) ──────────────────────────────────────────────
 
 /// Why `with_lock` exists. Two callers read the same row. Each writes an

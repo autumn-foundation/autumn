@@ -46,7 +46,7 @@ use diesel_async::{AsyncConnection, AsyncPgConnection};
 pub const FILE_ENV: &str = "STOCKROOM_DB_PASSWORD_FILE";
 
 /// A pool provider that reads the password from a file.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PasswordFilePool {
     file: Option<PathBuf>,
 }
@@ -63,8 +63,15 @@ impl PasswordFilePool {
     /// Autumn's default pool.
     #[must_use]
     pub fn from_env() -> Self {
+        Self::from_value(std::env::var_os(FILE_ENV))
+    }
+
+    /// The provider for a value of [`FILE_ENV`]. An empty value counts as
+    /// unset, so the app uses the default pool.
+    #[must_use]
+    pub fn from_value(value: Option<std::ffi::OsString>) -> Self {
         Self {
-            file: std::env::var_os(FILE_ENV).map(PathBuf::from),
+            file: value.filter(|file| !file.is_empty()).map(PathBuf::from),
         }
     }
 }
