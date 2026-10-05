@@ -807,7 +807,10 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
          SET status = CASE WHEN attempt < max_attempts THEN '{STATUS_ENQUEUED}' \
                            ELSE '{STATUS_FAILED}' END, \
              attempt = CASE WHEN attempt < max_attempts THEN attempt + 1 ELSE attempt END, \
-             run_at = CASE WHEN attempt < max_attempts THEN ? ELSE run_at END, \
+             run_at = CASE WHEN attempt < max_attempts THEN ? + \
+               ((random() & 9223372036854775807) % (MIN(?, \
+                 initial_backoff_ms * (1 << MIN(MAX(attempt - 1, 0), 62))) + 1)) \
+               ELSE run_at END, \
              started_at = NULL, \
              finished_at = CASE WHEN attempt >= max_attempts THEN ? ELSE NULL END, \
              claimed_by = NULL, \
@@ -834,8 +837,12 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
            LIMIT {STALE_RECOVERY_BATCH}) \
          RETURNING id, name, status, payload"
     );
+    // A per-row jitter, so claims that expire together do not all run again
+    // at once (issue #3054). See `stale_requeue_cap_ms`.
+    let cap_ms = super::stale_requeue_cap_ms(state);
     let recovered = diesel::sql_query(sql)
         .bind::<diesel::sql_types::BigInt, _>(now)
+        .bind::<diesel::sql_types::BigInt, _>(cap_ms)
         .bind::<diesel::sql_types::BigInt, _>(now)
         .bind::<diesel::sql_types::BigInt, _>(cutoff)
         .load::<RecoveredRow>(&mut *conn)

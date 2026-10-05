@@ -7783,7 +7783,11 @@ if ARGV[4] == 'requeue' then
     end
   end
   redis.call('SET', key, ARGV[5])
-  redis.call('LPUSH', KEYS[3], ARGV[1])
+  if ARGV[11] ~= '' then
+    redis.call('ZADD', KEYS[8], tonumber(ARGV[11]), ARGV[1])
+  else
+    redis.call('LPUSH', KEYS[3], ARGV[1])
+  end
   if ARGV[9] == 'running' then
     redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[10]))
   end
@@ -7804,6 +7808,7 @@ async fn apply_stale_redis_recovery(
     worker_config: &RedisWorkerConfig,
     expected: &RedisJobRecord,
     action: &RedisStaleRecovery,
+    requeue_due_at_ms: Option<u64>,
 ) -> Result<bool, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
         return Ok(false);
@@ -7834,7 +7839,7 @@ async fn apply_stale_redis_recovery(
     let requeue_key = redis_queue_key(&worker_config.key_prefix, &record.queue);
     let applied: usize = redis::cmd("EVAL")
         .arg(STALE_REDIS_RECOVERY_SCRIPT)
-        .arg(7)
+        .arg(8)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
         .arg(&requeue_key)
@@ -7842,6 +7847,7 @@ async fn apply_stale_redis_recovery(
         .arg(&worker_config.dead_record_prefix)
         .arg(worker_config.unique_lock_key_for(expected))
         .arg(worker_config.concurrency_counter_key_for(expected))
+        .arg(&worker_config.delayed_key)
         .arg(&expected.id)
         .arg(claimed_by)
         .arg(claimed_at_ms)
@@ -7856,6 +7862,7 @@ async fn apply_stale_redis_recovery(
             ""
         })
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(requeue_due_at_ms.map_or_else(String::new, |due| due.to_string()))
         .query_async(connection)
         .await?;
 
@@ -7909,15 +7916,26 @@ async fn recover_stale_redis_jobs(
                 .await?;
             continue;
         };
-        let Some(action) = recover_stale_redis_record(
-            record.clone(),
-            now_unix_ms(worker_config.clock.as_ref()),
-            worker_config.visibility_timeout_ms,
-        ) else {
+        let now_ms = now_unix_ms(worker_config.clock.as_ref());
+        let Some(action) =
+            recover_stale_redis_record(record.clone(), now_ms, worker_config.visibility_timeout_ms)
+        else {
             continue;
         };
+        // Claims that expire together (handlers that hung on one dependency)
+        // must not all run again at once (issue #3054). A delayed requeue goes
+        // through the `delayed` set; its promotion records the enqueue.
+        let due_at_ms = match &action {
+            RedisStaleRecovery::Requeue(_) => {
+                let delay = job_retry_delay_ms(state, record.initial_backoff_ms, record.attempt);
+                (delay > 0).then(|| now_ms.saturating_add(delay))
+            }
+            RedisStaleRecovery::DeadLetter(_) => None,
+        };
 
-        if apply_stale_redis_recovery(connection, worker_config, &record, &action).await? {
+        if apply_stale_redis_recovery(connection, worker_config, &record, &action, due_at_ms)
+            .await?
+        {
             match &action {
                 RedisStaleRecovery::Requeue(requeued) => {
                     if let Some(error) = requeued.last_error.as_deref() {
@@ -7926,8 +7944,10 @@ async fn recover_stale_redis_jobs(
                             .record_retry(&requeued.name, error, record.attempt);
                         job_admin.record_retrying(&requeued.id, error);
                     }
-                    state.job_registry.record_enqueue(&requeued.name);
-                    job_admin.record_requeued(&requeued.id, requeued.attempt);
+                    if due_at_ms.is_none() {
+                        state.job_registry.record_enqueue(&requeued.name);
+                        job_admin.record_requeued(&requeued.id, requeued.attempt);
+                    }
                 }
                 RedisStaleRecovery::DeadLetter(dead) => {
                     let error = dead
@@ -8976,6 +8996,23 @@ struct PgEnqueuedCounts {
     enqueued_count: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     scheduled_count: i64,
+}
+
+/// The cap for a stale-claim requeue in SQL, in ms.
+///
+/// Claims that expire together (handlers that hung on one dependency) must
+/// not all run again at once (issue #3054). The SQL draws a per-row jitter in
+/// `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]` with the database's
+/// own `random()`, as the recovery updates many rows in one statement. The
+/// cap is clamped like a relative enqueue, so the SQL cannot overflow.
+#[cfg(feature = "db")]
+pub(crate) fn stale_requeue_cap_ms(state: &AppState) -> i64 {
+    let cap = state
+        .extension::<JobMaxBackoff>()
+        .map_or(crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS, |cap| cap.0);
+    i64::try_from(cap)
+        .unwrap_or(i64::MAX)
+        .min(PG_MAX_RELATIVE_DELAY_MS)
 }
 
 /// [`job_retry_delay_ms`] for a durable SQL row, whose columns are signed.
@@ -10032,7 +10069,10 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
              ELSE attempt \
            END, \
            run_at = CASE \
-             WHEN attempt < max_attempts THEN NOW() \
+             WHEN attempt < max_attempts THEN NOW() + \
+               floor(random() * (LEAST($2::BIGINT::FLOAT8, \
+                 initial_backoff_ms::FLOAT8 * power(2::FLOAT8, LEAST(GREATEST(attempt - 1, 0), 62))) \
+                 + 1)) * INTERVAL '1 millisecond' \
              ELSE run_at \
            END, \
            started_at = NULL, \
@@ -10071,6 +10111,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
          RETURNING id, name, payload::TEXT AS payload, status",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(stale_requeue_cap_ms(state))
     .get_results::<PgStaleRecoveryRow>(&mut *conn)
     .await;
 
@@ -21753,13 +21794,31 @@ mod uniqueness_concurrency_tests {
         })
     }
 
+    /// Entropy that makes every retry wait its full 400 ms backoff (the
+    /// largest full-jitter draw), so the test can act during the wait. IDs
+    /// still come from the OS.
+    #[derive(Debug)]
+    struct FullBackoffEntropy;
+
+    impl crate::entropy::Entropy for FullBackoffEntropy {
+        fn next_u64(&self) -> u64 {
+            400
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            crate::entropy::OsEntropy.fill_bytes(dest);
+        }
+    }
+
     #[tokio::test]
     async fn local_pending_window_key_is_reacquired_while_retry_waits_out_backoff() {
         let _guard = global_job_runtime_test_lock().lock().await;
         clear_global_job_client();
         PENDING_RETRY_CALLS.store(0, Ordering::SeqCst);
 
-        let state = AppState::for_test().with_profile("dev");
+        // Full jitter can draw a 0 ms wait (issue #3054). Pin the full wait.
+        let state = AppState::for_test()
+            .with_profile("dev")
+            .with_entropy(Arc::new(FullBackoffEntropy));
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {

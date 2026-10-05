@@ -22,7 +22,10 @@ on `POST` and `PATCH` retries with no `Idempotency-Key`.
    client, because replay does not make those draws again. `Client::new()`
    uses OS entropy.
 3. All four job backends and the HTTP client use it. The `local` backend
-   changes from equal jitter to full jitter, so all backends agree.
+   changes from equal jitter to full jitter, so all backends agree. A claim
+   recovered after its visibility timeout also gets the jitter. Postgres and
+   SQLite recover many rows in one statement, so they draw it with the
+   database's `random()`. Redis puts the job in its `delayed` set.
 4. Caps are configuration: `[http.client] max_backoff_ms` (20 s) and
    `[jobs] max_backoff_ms` (1 h).
 5. The HTTP client reads `Retry-After` on `429` and `503`. The wait is

@@ -4,7 +4,7 @@
 
 ### Changed
 
-- **http client, jobs:** retries use capped exponential backoff with full jitter, `random(0, min(cap, base * 2^n))`, from the new `autumn_web::backoff` module. Callers that fail together no longer retry at the same instant. This applies to the HTTP client and to the `local`, `postgres`, `redis` and `sqlite` job backends. The `local` backend changes from equal jitter to full jitter. New settings: `[http.client] max_backoff_ms` (default 20 s) and `[jobs] max_backoff_ms` / `AUTUMN_JOBS__MAX_BACKOFF_MS` (default 1 h). The durable job backends had no cap before (issue #3054).
+- **http client, jobs:** retries use capped exponential backoff with full jitter, `random(0, min(cap, base * 2^n))`, from the new `autumn_web::backoff` module. Callers that fail together no longer retry at the same instant. This applies to the HTTP client and to the `local`, `postgres`, `redis` and `sqlite` job backends. The `local` backend changes from equal jitter to full jitter. New settings: `[http.client] max_backoff_ms` (default 20 s) and `[jobs] max_backoff_ms` / `AUTUMN_JOBS__MAX_BACKOFF_MS` (default 1 h). The durable job backends had no cap before. A claim recovered after its visibility timeout (a worker that crashed or hung) is also requeued with this jitter, not at once (issue #3054).
 - **http client:** a `503` with `Retry-After` now waits for the hint, as a `429` does. The wait is `backoff + min(hint, 5 s)`, so callers that get the same hint still spread out. A hint above 5 s is cut to about 5 s (issue #3054).
 
 ### Added

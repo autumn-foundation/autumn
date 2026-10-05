@@ -371,6 +371,9 @@ as every other durable backend.
   backends use the same rule. Under a `Sim`, the jitter replays from the seed.
 - `max_backoff_ms` caps the wait. Default: 3 600 000 (1 hour). Set it in
   `[jobs]` or with `AUTUMN_JOBS__MAX_BACKOFF_MS`.
+- A durable backend recovers a claim after its visibility timeout (the worker
+  crashed or the handler hung). The recovered job uses the same jittered
+  wait, so claims that expire together do not all run again at once.
 - Retries stop at `max_attempts` (job-level override or config default).
 - Exhausted jobs are dead-lettered.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
