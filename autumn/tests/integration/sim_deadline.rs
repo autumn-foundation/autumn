@@ -262,13 +262,17 @@ async fn sim_deadline_scope_alone_starts_no_attempt_after_the_deadline(mut sim: 
     assert!(elapsed <= ROUTE_TIMEOUT + EPSILON, "took {elapsed:?}");
 
     sim.advance(Duration::from_secs(60)).await;
-    // 2 s per attempt, backoffs 100 and 200 ms. The third attempt is cut at
-    // 5 s; with no deadline a fourth would start at 6.7 s.
-    let expected: Vec<Duration> = [0, 2_100, 4_300]
-        .into_iter()
-        .map(Duration::from_millis)
-        .collect();
-    assert_eq!(offsets(&starts, begin), expected);
+    // Each attempt takes 2 s, plus a jittered backoff. With no deadline all
+    // 4 attempts run, and the last one starts after 6 s.
+    let offsets = offsets(&starts, begin);
+    assert!(offsets.len() >= 2, "the client retries: {offsets:?}");
+    assert_eq!(offsets[0], Duration::ZERO);
+    for start in &offsets {
+        assert!(
+            *start < ROUTE_TIMEOUT,
+            "an attempt started late: {offsets:?}"
+        );
+    }
 }
 
 #[sim_test]

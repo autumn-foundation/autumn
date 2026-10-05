@@ -99,6 +99,8 @@ die() {
 GATED_MODULES=(
   autumn/src/time.rs:default
   autumn/src/entropy.rs:default
+  # Retry jitter for the HTTP client and every job backend (#3054).
+  autumn/src/backoff.rs:default
   autumn/src/state.rs:default
   autumn/src/scheduler.rs:default
   autumn/src/app.rs:default

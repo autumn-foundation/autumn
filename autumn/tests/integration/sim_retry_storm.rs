@@ -21,12 +21,12 @@
 //! the paused runtime lets zero real time elapse between enqueuing the jobs and
 //! draining their first (failing) attempt.
 //!
-//! The fix (`jittered_retry_delay_ms` in `autumn/src/job.rs`) draws an
-//! equal-jitter spread from the framework's injected [`autumn_web::entropy::Entropy`]
-//! seam (`state.entropy()`) — the same source the [`autumn_web::entropy::Rng`]
-//! extractor and deterministic `Uuid` helpers draw from — so the herd spreads
-//! out using real OS entropy in production, while staying bit-for-bit
-//! reproducible under a fixed `#[sim_test]` seed.
+//! The fix (`job_retry_delay_ms` in `autumn/src/job.rs`, through
+//! `autumn_web::backoff`) draws a full-jitter delay from the framework's
+//! injected [`autumn_web::entropy::Entropy`] seam (`state.entropy()`). The
+//! herd spreads out with real OS entropy in production and replays bit for
+//! bit under a fixed `#[sim_test]` seed. Issue #3054 applied the same helper
+//! to the durable backends and to the HTTP client (`sim_retry_storm_http`).
 //!
 //! # Observing sub-window timing under the sim
 //!
@@ -41,7 +41,7 @@
 //! (`CHECKPOINT`).
 //!
 //! `retries_are_not_synchronized_under_load` is the `DoD` proof for this wave:
-//! reverting `jittered_retry_delay_ms` to the old unjittered
+//! reverting `job_retry_delay_ms` to the old unjittered
 //! `backoff_ms.saturating_mul(2_u64.saturating_pow(attempt - 1))` locally and
 //! rerunning this test reproduces the herd — every retry lands in the exact
 //! same checkpoint bucket — and the assertion below fails, printing the
@@ -77,22 +77,20 @@ use autumn_web::test::TestApp;
 use serde::{Deserialize, Serialize};
 
 /// Number of jobs made to fail "simultaneously" under the sim's virtual clock.
-/// Large enough that an equal-jitter spread over the ~500ms checkpointed
-/// window collides into a single checkpoint bucket only with astronomically
-/// low probability, while staying small enough that the drain settles well
-/// inside `Sim::run_to_idle`'s bound.
+/// Large enough that a full-jitter spread over the 1000ms window collides
+/// into a single checkpoint bucket only with very low probability, and small
+/// enough that the drain settles well inside `Sim::run_to_idle`'s bound.
 const STORM_SIZE: u32 = 12;
 
 /// The virtual-time window this test steps through in checkpoints, in
 /// milliseconds elapsed since the jobs' first (failing) attempt.
 ///
 /// `storm_probe` is configured with `backoff_ms = 1000`, so the un-jittered
-/// exponential delay at attempt 1 is exactly 1000ms; equal jitter spreads the
-/// jittered delay across `[500, 1000)`. These six increments (summing to
-/// 1500ms, past the worst case) straddle that whole range finely enough to
-/// tell "spread across several buckets" (the fix) apart from "every retry
-/// lands in the last bucket" (the un-jittered bug, since 1000ms falls in
-/// `[950, 1500)`).
+/// exponential delay at attempt 1 is exactly 1000ms; full jitter spreads the
+/// delay across `[0, 1000]`. These six increments (summing to 1500ms, past
+/// the worst case) tell "spread across several buckets" (the fix) apart from
+/// "every retry lands in the last bucket" (the un-jittered bug, since 1000ms
+/// falls in `[950, 1500)`).
 const CHECKPOINT_STEPS_MS: [u64; 6] = [550, 100, 100, 100, 100, 550];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,7 +166,7 @@ async fn run_storm(sim: &mut Sim) -> Vec<u32> {
     job::clear_global_job_client();
     reset_probe_state();
 
-    // `jittered_retry_delay_ms` draws from `state.entropy()`, which
+    // `job_retry_delay_ms` draws from `state.entropy()`, which
     // `Sim::build` seeds from `sim.seed`, so the jitter replays from the seed.
     sim.build(TestApp::new().plugin(StormProbeJobPlugin));
 
@@ -182,7 +180,8 @@ async fn run_storm(sim: &mut Sim) -> Vec<u32> {
     }
 
     // Drain the first (failing) attempt for every job. Each schedules its
-    // retry via a backoff timer; none of the retries are due yet.
+    // retry via a backoff timer. A retry with a near-0 ms delay can run in
+    // this drain; it records checkpoint 0.
     sim.run_to_idle().await;
 
     // Step through the backoff window in checkpoints (see
@@ -214,7 +213,7 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
     let spread = retry_checkpoints
         .iter()
         .any(|checkpoint| *checkpoint != first);
-    // `sometimes!` (not `always!`) is the correct assertion here: equal
+    // `sometimes!` (not `always!`) is the correct assertion here: full
     // jitter makes a spread *overwhelmingly likely* for a given seed, not
     // guaranteed by construction the way an `always!` hard invariant should
     // be — a small fraction of seeds could legitimately place every draw in

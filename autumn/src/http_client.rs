@@ -473,18 +473,25 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 // ── RetryPolicy ──────────────────────────────────────────────────────────────
 
 /// Retry configuration for a [`RequestBuilder`].
+///
+/// The wait before retry `n` (0 = first retry) is full jitter:
+/// `random(0, min(max_backoff, 100 ms * 2^n))`. See [`crate::backoff`].
 #[derive(Clone, Debug)]
 pub struct RetryPolicy {
     /// Maximum number of additional attempts after the first failure.  Zero
     /// means no retries (one attempt total).
     pub max_retries: u32,
     /// When `true` (the default), only GET / HEAD / PUT / DELETE / OPTIONS /
-    /// TRACE are retried; POST and PATCH are not.
+    /// TRACE are retried; POST and PATCH are not. Clear it with
+    /// [`RequestBuilder::retry_non_idempotent`].
     pub retry_idempotent_only: bool,
-    /// Maximum Retry-After sleep duration to accept before clamping.
+    /// Cap on a `Retry-After` hint. The wait is also at most the backoff
+    /// plus 5 s, so a value above 5 s has no effect.
     pub max_retry_after: Duration,
     /// Per-request timeout.
     pub request_timeout: Option<Duration>,
+    /// Cap on the jittered backoff between attempts. Default: 20 s.
+    pub max_backoff: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -494,7 +501,55 @@ impl Default for RetryPolicy {
             retry_idempotent_only: true,
             max_retry_after: Duration::from_secs(10),
             request_timeout: Some(Duration::from_secs(30)),
+            max_backoff: Duration::from_millis(crate::backoff::DEFAULT_HTTP_MAX_BACKOFF_MS),
         }
+    }
+}
+
+/// Base of the exponential retry backoff.
+const BASE_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The header that [`RequestBuilder::retry_non_idempotent`] adds.
+const IDEMPOTENCY_KEY: &str = "idempotency-key";
+
+impl RetryPolicy {
+    /// The wait before the retry that follows failed attempt `attempt`
+    /// (0-indexed).
+    ///
+    /// Without a hint, this is the jittered backoff. With a `Retry-After`
+    /// hint, the hint is capped by `max_retry_after` and `request_timeout`.
+    /// The wait is then `backoff + min(hint, 5 s)`. See
+    /// [`crate::backoff::retry_after_wait`].
+    fn retry_delay(
+        &self,
+        entropy: &dyn crate::entropy::Entropy,
+        attempt: u32,
+        hint: Option<Duration>,
+    ) -> Duration {
+        let backoff = crate::backoff::full_jitter(entropy, BASE_BACKOFF, self.max_backoff, attempt);
+        let Some(mut hint) = hint else {
+            return backoff;
+        };
+        hint = hint.min(self.max_retry_after);
+        if let Some(timeout) = self.request_timeout {
+            hint = hint.min(timeout);
+        }
+        crate::backoff::retry_after_wait(hint, backoff)
+    }
+}
+
+/// `true` for a status the client retries: `429` and `502`-`504`.
+const fn is_retryable_response(status: u16) -> bool {
+    status == 429 || is_retryable_status(status)
+}
+
+/// The server's wait hint for a retryable status: `Retry-After` on `429`
+/// (1 s when absent) and on `503`.
+fn retry_hint(status: u16, headers: &HeaderMap) -> Option<Duration> {
+    match status {
+        429 => Some(parse_retry_after(headers).unwrap_or(Duration::from_secs(1))),
+        503 => parse_retry_after(headers),
+        _ => None,
     }
 }
 
@@ -1155,6 +1210,14 @@ pub struct Client {
     sim_net: Option<Arc<crate::sim::SimNet>>,
     /// Retry budgets and deadline header settings (issue #3058).
     retry: RetrySettings,
+    /// Source of retry jitter. `from_state` uses the app's entropy, so a sim
+    /// seed replays the same delays.
+    entropy: Arc<dyn crate::entropy::Entropy>,
+}
+
+/// The entropy a client without app state uses.
+fn os_entropy() -> Arc<dyn crate::entropy::Entropy> {
+    Arc::new(crate::entropy::OsEntropy)
 }
 
 impl Client {
@@ -1183,15 +1246,14 @@ impl Client {
             base_url: None,
             base_urls: HashMap::new(),
             retry_policy: RetryPolicy {
-                max_retries: 3,
-                retry_idempotent_only: true,
-                max_retry_after: Duration::from_secs(10),
                 request_timeout: Some(timeout),
+                ..RetryPolicy::default()
             },
             mock: None,
             resilience_config: None,
             sim_net: None,
             retry: RetrySettings::standalone(),
+            entropy: os_entropy(),
         }
     }
 
@@ -1229,6 +1291,7 @@ impl Client {
                 retry_idempotent_only: true,
                 max_retry_after: Duration::from_secs(config.max_retry_after_secs),
                 request_timeout: Some(timeout),
+                max_backoff: Duration::from_millis(config.max_backoff_ms),
             },
             mock: None,
             resilience_config: None,
@@ -1238,6 +1301,7 @@ impl Client {
                 budgets: None,
                 send_deadline_header: config.send_deadline_header,
             },
+            entropy: os_entropy(),
         }
     }
 
@@ -1259,6 +1323,7 @@ impl Client {
                 budgets: None,
                 send_deadline_header: true,
             },
+            entropy: os_entropy(),
         }
     }
 
@@ -1345,6 +1410,10 @@ impl Client {
             client = client.with_mock(ext.0.clone());
         }
         client.sim_net = state.extension::<crate::sim::SimNet>();
+        // Retry jitter and the automatic key are not made again on capsule
+        // replay, so they must not go on the capsule's random tape.
+        let entropy = state.entropy_arc();
+        client.entropy = entropy.unrecorded().unwrap_or(entropy);
 
         client
     }
@@ -1372,6 +1441,7 @@ impl Client {
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
             retry: self.retry.clone(),
+            entropy: self.entropy.clone(),
         }
     }
 
@@ -1388,6 +1458,7 @@ impl Client {
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
             retry: self.retry.clone(),
+            entropy: self.entropy.clone(),
         }
     }
 
@@ -1423,6 +1494,7 @@ impl Client {
             breaker_scoped: false,
             sim_net: self.sim_net.clone(),
             retry: self.retry.clone(),
+            entropy: self.entropy.clone(),
         }
     }
 
@@ -1586,6 +1658,8 @@ pub struct RequestBuilder {
     sim_net: Option<Arc<crate::sim::SimNet>>,
     /// Retry budgets and deadline header settings (issue #3058).
     retry: RetrySettings,
+    /// Source of retry jitter and of the automatic `Idempotency-Key`.
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 impl RequestBuilder {
@@ -1654,12 +1728,30 @@ impl RequestBuilder {
 
     /// Override the maximum retry count for this request.
     ///
-    /// Also clears the idempotent-only flag so non-idempotent methods such as
-    /// `POST` and `PATCH` are retried when the caller explicitly requests it.
+    /// This does not enable retries for `POST` and `PATCH`. Use
+    /// [`retry_non_idempotent`](Self::retry_non_idempotent) for that.
     #[must_use]
     pub const fn retries(mut self, max: u32) -> Self {
         self.retry_policy.max_retries = max;
+        self
+    }
+
+    /// Retry non-idempotent methods (`POST`, `PATCH`) too.
+    ///
+    /// A retried `POST` can run two times on the server. So for a
+    /// non-idempotent method, the client sends an `Idempotency-Key` header
+    /// with a random value, the same on every attempt. A key you set with
+    /// [`header`](Self::header) is kept.
+    #[must_use]
+    pub const fn retry_non_idempotent(mut self) -> Self {
         self.retry_policy.retry_idempotent_only = false;
+        self
+    }
+
+    /// Override the cap on the jittered backoff between attempts.
+    #[must_use]
+    pub const fn max_backoff(mut self, max: Duration) -> Self {
+        self.retry_policy.max_backoff = max;
         self
     }
 
@@ -1924,7 +2016,11 @@ impl RequestBuilder {
     }
 
     /// [`send`](Self::send), minus the replay gate and the capture tee.
-    async fn send_recorded(self) -> Result<Response, ClientError> {
+    async fn send_recorded(mut self) -> Result<Response, ClientError> {
+        // After the capture tee, so a capsule records the caller's headers
+        // only and replays without a random key.
+        self.ensure_idempotency_key();
+
         // A sim network serves every send path, so nothing reaches the real
         // network. Like mocks, it bypasses the process-global breaker.
         if let Some(net) = self.sim_net.clone() {
@@ -2024,10 +2120,11 @@ impl RequestBuilder {
         let max_attempts = self.max_attempts(suppress_retries);
         let gate = self.retry_gate(url_host(&self.url).as_deref());
         let mut last_retry = None;
+        let mut delay = Duration::ZERO;
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                tokio::time::sleep(retry_backoff(attempt)).await;
+                tokio::time::sleep(delay).await;
             }
             gate.check()?;
             let last = attempt + 1 == max_attempts;
@@ -2061,24 +2158,22 @@ impl RequestBuilder {
                     let headers = resp.headers().clone();
                     let url_used = resp.url().clone();
 
-                    // 429 → honour Retry-After; 502-504 → back off. Retry
-                    // only while attempts, time and budget remain.
-                    if !last {
-                        if status.as_u16() == 429 {
-                            let wait = self.retry_after_delay(&headers);
-                            if gate.allow(RetryKind::Throttling, wait + retry_backoff(attempt + 1))
-                            {
-                                tokio::time::sleep(wait).await;
-                                last_retry = Some(RetryKind::Throttling);
-                                continue;
-                            }
-                        } else if is_retryable_status(status.as_u16())
-                            && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1))
-                        {
-                            last_retry = Some(RetryKind::Transient);
+                    // 429 and 502-504: retry while attempts, time and budget
+                    // remain.
+                    if is_retryable_response(status.as_u16()) && !last {
+                        let wait = self.retry_policy.retry_delay(
+                            &*self.entropy,
+                            attempt,
+                            retry_hint(status.as_u16(), &headers),
+                        );
+                        let kind = retry_kind(status.as_u16());
+                        if gate.allow(kind, wait) {
+                            delay = wait;
+                            last_retry = Some(kind);
                             continue;
                         }
                     }
+
                     let body = if self.discard_response_body {
                         // Dropped unread — see `discard_response_body`.
                         Bytes::new()
@@ -2109,11 +2204,12 @@ impl RequestBuilder {
                 }
                 // Only retry transient connect/timeout errors; non-transient errors
                 // (e.g. malformed URL) fail immediately.
-                Err(e)
-                    if (e.is_connect() || e.is_timeout())
-                        && !last
-                        && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1)) =>
-                {
+                Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
+                    let wait = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
+                    if !gate.allow(RetryKind::Transient, wait) {
+                        return Err(ClientError::Request(e.without_url()));
+                    }
+                    delay = wait;
                     last_retry = Some(RetryKind::Transient);
                 }
                 Err(e) => return Err(ClientError::Request(e.without_url())),
@@ -2131,6 +2227,23 @@ impl RequestBuilder {
             host,
             self.retry.send_deadline_header,
         )
+    }
+
+    /// Add an `Idempotency-Key` header when this request can retry a
+    /// non-idempotent method and the caller set no key. Every attempt sends
+    /// the same key, so the server can drop a duplicate.
+    fn ensure_idempotency_key(&mut self) {
+        let retries_unsafe_method = !is_idempotent_method(&self.method)
+            && !self.retry_policy.retry_idempotent_only
+            && self.retry_policy.max_retries > 0;
+        if !retries_unsafe_method || self.extra_headers.contains_key(IDEMPOTENCY_KEY) {
+            return;
+        }
+        let key = self.entropy.uuid_v4().to_string();
+        if let Ok(value) = HeaderValue::from_str(&key) {
+            self.extra_headers
+                .insert(HeaderName::from_static(IDEMPOTENCY_KEY), value);
+        }
     }
 
     /// How many attempts the retry policy allows for this request.
@@ -2179,18 +2292,9 @@ impl RequestBuilder {
         })
     }
 
-    /// The wait before a retry after a 429: `Retry-After`, capped by the policy.
-    fn retry_after_delay(&self, headers: &HeaderMap) -> Duration {
-        let mut delay = parse_retry_after(headers).unwrap_or(Duration::from_secs(1));
-        delay = delay.min(self.retry_policy.max_retry_after);
-        if let Some(req_timeout) = self.retry_policy.request_timeout {
-            delay = delay.min(req_timeout);
-        }
-        delay
-    }
-
     /// Send through the simulated network (issue #2967), with the attempts,
-    /// backoff, 429 handling and per-attempt timeout of the real retry loop.
+    /// jittered backoff, `Retry-After` on 429 and 503, and per-attempt
+    /// timeout of the real retry loop.
     async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
         let url = self.sim_url()?;
         let host = url
@@ -2200,9 +2304,10 @@ impl RequestBuilder {
         let max_attempts = self.max_attempts(false);
         let gate = self.retry_gate(Some(&host));
         let mut last_retry = None;
+        let mut delay = Duration::ZERO;
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                tokio::time::sleep(retry_backoff(attempt)).await;
+                tokio::time::sleep(delay).await;
             }
             gate.check()?;
             let last = attempt + 1 == max_attempts;
@@ -2225,14 +2330,17 @@ impl RequestBuilder {
                 Ok(response) => response,
                 // A drop or a timeout is transient, like a real connect or
                 // timeout error, so it is retried.
-                Err(SimAttemptError::Transient(_))
-                    if !last && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1)) =>
-                {
-                    last_retry = Some(RetryKind::Transient);
-                    continue;
-                }
                 Err(SimAttemptError::Transient(_)) if gate.expired() => {
                     return Err(ClientError::DeadlineExceeded);
+                }
+                Err(SimAttemptError::Transient(message)) if !last => {
+                    let wait = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
+                    if !gate.allow(RetryKind::Transient, wait) {
+                        return Err(ClientError::SimNetwork(message));
+                    }
+                    delay = wait;
+                    last_retry = Some(RetryKind::Transient);
+                    continue;
                 }
                 Err(SimAttemptError::Transient(message)) => {
                     return Err(ClientError::SimNetwork(message));
@@ -2240,18 +2348,16 @@ impl RequestBuilder {
                 Err(SimAttemptError::Fatal(error)) => return Err(error),
             };
             let status = response.status.as_u16();
-            if !last {
-                if status == 429 {
-                    let wait = self.retry_after_delay(&response.headers);
-                    if gate.allow(RetryKind::Throttling, wait + retry_backoff(attempt + 1)) {
-                        tokio::time::sleep(wait).await;
-                        last_retry = Some(RetryKind::Throttling);
-                        continue;
-                    }
-                } else if is_retryable_status(status)
-                    && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1))
-                {
-                    last_retry = Some(RetryKind::Transient);
+            if is_retryable_response(status) && !last {
+                let wait = self.retry_policy.retry_delay(
+                    &*self.entropy,
+                    attempt,
+                    retry_hint(status, &response.headers),
+                );
+                let kind = retry_kind(status);
+                if gate.allow(kind, wait) {
+                    delay = wait;
+                    last_retry = Some(kind);
                     continue;
                 }
             }
@@ -2407,6 +2513,7 @@ impl RequestBuilder {
             &self.extra_headers,
             self.body.as_ref(),
             &self.retry_policy,
+            &*self.entropy,
             self.discard_response_body,
             None,
             is_half_open,
@@ -2473,6 +2580,7 @@ impl RequestBuilder {
                 &headers,
                 body.as_ref(),
                 &self.retry_policy,
+                &*self.entropy,
                 self.discard_response_body,
                 None,
                 is_half_open,
@@ -2611,6 +2719,7 @@ impl RequestBuilder {
                 &headers,
                 body.as_ref(),
                 &self.retry_policy,
+                &*self.entropy,
                 self.discard_response_body,
                 Some(deadline),
                 is_half_open,
@@ -2732,11 +2841,13 @@ fn breaker_for_url(
 
 // ── Deadline and retry budget (issue #3058) ──────────────────────────────────
 
-/// The backoff before retry `attempt` (1 or more): 100 ms x 2^(attempt - 1).
-/// The exponent stops at 10, so a large `max_retries` cannot overflow.
-fn retry_backoff(attempt: u32) -> Duration {
-    let exp = attempt.saturating_sub(1).min(10);
-    Duration::from_millis(100 * (1_u64 << exp))
+/// Why a retry of a response with `status` is necessary.
+const fn retry_kind(status: u16) -> RetryKind {
+    if status == 429 {
+        RetryKind::Throttling
+    } else {
+        RetryKind::Transient
+    }
 }
 
 /// The retry budget key of `url`: its host and its effective port. `None` for
@@ -2888,13 +2999,6 @@ impl RetryGate {
         self.budget
             .as_ref()
             .is_none_or(|budget| budget.try_acquire(kind))
-    }
-
-    /// Give back the tokens of a retry of `kind` that did not start.
-    fn refund(&self, kind: RetryKind) {
-        if let Some(budget) = &self.budget {
-            budget.release(kind);
-        }
     }
 
     /// Give back the tokens of the last retry when the final `status` is a
@@ -3054,16 +3158,14 @@ fn build_oneshot_client(
 /// Two more `deadline` seams round 9 found `send_ssrf_safe`'s own deadline
 /// fix had missed: `client`'s own reqwest-level timeout is fixed at
 /// build-hop-start, so a retry within the same hop still got the *original*
-/// per-attempt budget rather than what's actually left; and the 429
-/// `Retry-After` sleep is a second sleep, separate from the backoff sleep
-/// above, that the deadline check never covered at all. Both are fixed here:
-/// every attempt sends with an explicit per-request `.timeout()` recomputed
-/// from `deadline` (overriding `client`'s built-in one only when `deadline`
-/// is set, so non-SSRF-safe callers passing `None` are unaffected), and the
-/// `Retry-After` sleep is capped by the remaining budget and followed by the
-/// same deadline check the backoff sleep already has — falling through to
-/// return the 429 response as final, exactly like running out of
-/// `max_attempts` already does, rather than sleeping past the deadline first.
+/// per-attempt budget rather than what's actually left; and the
+/// `Retry-After` wait was not checked against the deadline. Both are fixed
+/// here. Every attempt sends with an explicit per-request `.timeout()`
+/// recomputed from `deadline`. This overrides `client`'s own timeout only
+/// when `deadline` is set, so callers that pass `None` see no change. If a
+/// `Retry-After` wait (on a 429 or 503, issue #3054) reaches the deadline,
+/// the loop does not sleep. It returns that response as final, as it does
+/// when `max_attempts` runs out.
 ///
 /// `suppress_retries`, when `true`, forces a single attempt regardless of
 /// `retry_policy` — the same thing [`RequestBuilder::send_inner`]'s own
@@ -3090,6 +3192,7 @@ async fn send_one(
     extra_headers: &HeaderMap,
     body: Option<&Bytes>,
     retry_policy: &RetryPolicy,
+    entropy: &dyn crate::entropy::Entropy,
     discard_response_body: bool,
     deadline: Option<Instant>,
     suppress_retries: bool,
@@ -3117,17 +3220,19 @@ async fn send_one(
         )
     };
 
+    let mut delay = Duration::ZERO;
     for attempt in 0..max_attempts {
         let last = attempt + 1 == max_attempts;
         if attempt > 0 {
             if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(deadline_exceeded_err(&mut last_transient_err));
             }
-            let mut delay = retry_backoff(attempt);
+            let mut sleep_for = delay;
             if let Some(d) = deadline {
-                delay = delay.min(d.saturating_duration_since(crate::time::ambient_instant()));
+                sleep_for =
+                    sleep_for.min(d.saturating_duration_since(crate::time::ambient_instant()));
             }
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(sleep_for).await;
             if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(deadline_exceeded_err(&mut last_transient_err));
             }
@@ -3168,42 +3273,26 @@ async fn send_one(
                 let headers = resp.headers().clone();
                 let url_used = resp.url().clone();
 
-                if status.as_u16() == 429 && !last {
-                    let mut sleep_delay =
-                        parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
-                    sleep_delay = sleep_delay.min(retry_policy.max_retry_after);
-                    if let Some(req_timeout) = retry_policy.request_timeout {
-                        sleep_delay = sleep_delay.min(req_timeout);
-                    }
-                    if let Some(d) = deadline {
-                        sleep_delay = sleep_delay
-                            .min(d.saturating_duration_since(crate::time::ambient_instant()));
-                    }
-                    if gate.allow(
-                        RetryKind::Throttling,
-                        sleep_delay + retry_backoff(attempt + 1),
-                    ) {
-                        tokio::time::sleep(sleep_delay).await;
-                        if deadline.is_none_or(|d| crate::time::ambient_instant() < d) {
-                            last_retry = Some(RetryKind::Throttling);
-                            continue;
-                        }
-                        // No retry after all: give the tokens back.
-                        gate.refund(RetryKind::Throttling);
-                    }
-                    // Deadline exceeded during (or because of) the
-                    // Retry-After wait — fall through and return this 429
-                    // response as the final outcome, exactly as running out
-                    // of max_attempts already does, instead of sleeping past
-                    // the deadline and only then giving up.
-                }
-                if is_retryable_status(status.as_u16())
+                if is_retryable_response(status.as_u16())
                     && !last
                     && deadline.is_none_or(|d| crate::time::ambient_instant() < d)
-                    && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1))
                 {
-                    last_retry = Some(RetryKind::Transient);
-                    continue;
+                    let hint = retry_hint(status.as_u16(), &headers);
+                    let next = retry_policy.retry_delay(entropy, attempt, hint);
+                    // A server-hinted wait that reaches the deadline cannot
+                    // retry in time, so this response is the final outcome.
+                    let hint_reaches_deadline = hint.is_some()
+                        && deadline.is_some_and(|d| {
+                            crate::time::ambient_instant()
+                                .checked_add(next)
+                                .is_none_or(|resume| resume >= d)
+                        });
+                    let kind = retry_kind(status.as_u16());
+                    if !hint_reaches_deadline && gate.allow(kind, next) {
+                        delay = next;
+                        last_retry = Some(kind);
+                        continue;
+                    }
                 }
                 let body = if discard_response_body {
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
@@ -3231,11 +3320,12 @@ async fn send_one(
             Err(e) if e.is_timeout() && gate.expired() => {
                 return Err(ClientError::DeadlineExceeded);
             }
-            Err(e)
-                if (e.is_connect() || e.is_timeout())
-                    && !last
-                    && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1)) =>
-            {
+            Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
+                let wait = retry_policy.retry_delay(entropy, attempt, None);
+                if !gate.allow(RetryKind::Transient, wait) {
+                    return Err(ClientError::Request(e.without_url()));
+                }
+                delay = wait;
                 last_retry = Some(RetryKind::Transient);
                 last_transient_err = Some(e);
             }
@@ -3852,6 +3942,7 @@ mod tests {
             timeout_secs: 10,
             max_retries: 1,
             max_retry_after_secs: 10,
+            max_backoff_ms: 20_000,
             base_urls: std::collections::HashMap::new(),
             ..HttpClientConfig::default()
         };
@@ -3933,6 +4024,7 @@ mod tests {
             timeout_secs: 30,
             max_retries: 3,
             max_retry_after_secs: 10,
+            max_backoff_ms: 20_000,
             base_urls,
             ..HttpClientConfig::default()
         };
@@ -3978,6 +4070,7 @@ mod tests {
             timeout_secs: 30,
             max_retries: 3,
             max_retry_after_secs: 10,
+            max_backoff_ms: 20_000,
             base_urls,
             ..HttpClientConfig::default()
         };
@@ -4243,16 +4336,93 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
-    // TEST 32: retries() clears retry_idempotent_only so POST actually retries.
+    // TEST 32 (issue #3054): retries() sets only the count. POST retries need
+    // retry_non_idempotent().
     #[test]
-    fn retries_clears_idempotent_only_flag() {
+    fn retries_does_not_clear_idempotent_only_flag() {
         let client = Client::new();
         let builder = client.post("https://example.com").retries(2);
         assert_eq!(builder.retry_policy.max_retries, 2);
-        assert!(
-            !builder.retry_policy.retry_idempotent_only,
-            "explicit retries() call must allow non-idempotent methods to retry"
-        );
+        assert!(builder.retry_policy.retry_idempotent_only);
+        assert_eq!(builder.max_attempts(false), 1, "POST must not retry");
+
+        let builder = builder.retry_non_idempotent();
+        assert!(!builder.retry_policy.retry_idempotent_only);
+        assert_eq!(builder.max_attempts(false), 3);
+    }
+
+    #[test]
+    fn idempotency_key_is_added_only_for_opted_in_unsafe_retries() {
+        let client = Client::new();
+        let key_of = |builder: &RequestBuilder| {
+            builder
+                .extra_headers
+                .get(IDEMPOTENCY_KEY)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+
+        let mut post = client.post("https://example.com").retry_non_idempotent();
+        post.ensure_idempotency_key();
+        let first = key_of(&post).expect("an opted-in POST gets a key");
+        post.ensure_idempotency_key();
+        assert_eq!(key_of(&post), Some(first), "the key does not change");
+
+        let mut caller = client
+            .post("https://example.com")
+            .header("Idempotency-Key", "mine")
+            .retry_non_idempotent();
+        caller.ensure_idempotency_key();
+        assert_eq!(key_of(&caller).as_deref(), Some("mine"));
+
+        for mut builder in [
+            client.post("https://example.com").retries(3),
+            client
+                .post("https://example.com")
+                .retry_non_idempotent()
+                .no_retry(),
+            client.get("https://example.com").retry_non_idempotent(),
+        ] {
+            builder.ensure_idempotency_key();
+            assert_eq!(key_of(&builder), None);
+        }
+    }
+
+    #[test]
+    fn retry_delay_is_jittered_and_capped() {
+        let entropy = crate::entropy::SeededEntropy::new(9);
+        let policy = RetryPolicy {
+            max_backoff: Duration::from_secs(1),
+            ..RetryPolicy::default()
+        };
+        for attempt in 0..40 {
+            let delay = policy.retry_delay(&entropy, attempt, None);
+            let ceiling = Duration::from_millis(crate::backoff::ceiling_ms(100, 1_000, attempt));
+            assert!(delay <= ceiling, "attempt {attempt}: {delay:?}");
+        }
+    }
+
+    #[test]
+    fn retry_delay_clamps_a_hint_to_the_backoff_window() {
+        let entropy = crate::entropy::SeededEntropy::new(10);
+        let policy = RetryPolicy::default();
+        // First retry: the backoff is in [0, 100 ms], added to the hint.
+        let wait = policy.retry_delay(&entropy, 0, Some(Duration::from_secs(2)));
+        assert!(wait >= Duration::from_secs(2) && wait <= Duration::from_millis(2_100));
+        // The 5 s slack bounds a long hint.
+        let wait = policy.retry_delay(&entropy, 0, Some(Duration::from_secs(3_600)));
+        assert!(wait >= Duration::from_secs(5) && wait <= Duration::from_millis(5_100));
+    }
+
+    #[test]
+    fn retry_hint_reads_retry_after_on_429_and_503_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("2"));
+        assert_eq!(retry_hint(429, &headers), Some(Duration::from_secs(2)));
+        assert_eq!(retry_hint(503, &headers), Some(Duration::from_secs(2)));
+        assert_eq!(retry_hint(502, &headers), None);
+        let empty = HeaderMap::new();
+        assert_eq!(retry_hint(429, &empty), Some(Duration::from_secs(1)));
+        assert_eq!(retry_hint(503, &empty), None);
     }
 
     // TEST 33: log_request covers the sensitive-header redaction path.
@@ -4504,7 +4674,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // retries(1): 2 total attempts, 100 ms sleep between them.
+        // retries(1): 2 total attempts, a 0-100 ms jittered sleep between them.
         let resp = Client::new()
             .get(format!("http://127.0.0.1:{}/flaky", addr.port()))
             .retries(1)
@@ -4516,6 +4686,81 @@ mod tests {
         assert_eq!(hit.load(SeqOrdering::SeqCst), 2);
 
         crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Serve `503` + `Retry-After: 1` once, then `200`. Returns the address
+    /// and the hit counter.
+    async fn serve_down_once_with_retry_after() -> (SocketAddr, Arc<AtomicUsize>) {
+        use axum::{Router, response::IntoResponse as _, routing::get};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/down",
+            get(move || {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "1")],
+                        )
+                            .into_response()
+                    } else {
+                        axum::http::StatusCode::OK.into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, hits)
+    }
+
+    /// Issue #3054 on the real network path (`send_inner`) and the custom
+    /// path (`send_one`, via `no_redirect`): a 503 with `Retry-After: 1`
+    /// waits at least 1 s.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn real_paths_honour_retry_after_on_503() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        for custom_path in [false, true] {
+            let (addr, hits) = serve_down_once_with_retry_after().await;
+            let mut request = Client::new()
+                .get(format!("http://127.0.0.1:{}/down", addr.port()))
+                .retries(1);
+            if custom_path {
+                request = request.no_redirect();
+            }
+            let start = std::time::Instant::now();
+            let response = request.send().await.unwrap();
+            let waited = start.elapsed();
+            assert_eq!(response.status().as_u16(), 200, "custom_path={custom_path}");
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            assert!(
+                waited >= Duration::from_secs(1),
+                "custom_path={custom_path}: waited only {waited:?}"
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[test]
+    fn from_config_reads_max_backoff_ms() {
+        let config = HttpClientConfig {
+            max_backoff_ms: 1_500,
+            ..Default::default()
+        };
+        assert_eq!(
+            Client::from_config(&config).retry_policy.max_backoff,
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(RetryPolicy::default().max_backoff, Duration::from_secs(20));
     }
 
     // TEST 38: text_body sets a plain-text body.
@@ -5928,13 +6173,20 @@ mod tests {
         async fn plain_path_does_not_start_a_retry_that_cannot_fit() {
             let _lock = lock();
             let (url, hits) = counting(Some(503), &[]).await;
-            // Backoffs are 100, 200, 400 ms. The third backoff does not fit.
-            let response =
-                with_deadline(Duration::from_millis(700), Client::new().get(&url).send())
-                    .await
-                    .unwrap();
+            // 50 retries with jittered backoff need far more than 700 ms; the
+            // deadline stops them, and the last 503 comes back.
+            let response = with_deadline(
+                Duration::from_millis(700),
+                Client::new().get(&url).retries(50).send(),
+            )
+            .await
+            .unwrap();
             assert_eq!(response.status().as_u16(), 503);
-            assert_eq!(hits.load(Ordering::SeqCst), 3);
+            let made = hits.load(Ordering::SeqCst);
+            assert!(
+                (2..51).contains(&made),
+                "retries stop at the deadline: {made}"
+            );
         }
 
         #[tokio::test]
@@ -5976,20 +6228,28 @@ mod tests {
             let (url, hits) = counting(Some(503), &[]).await;
             let response = with_deadline(
                 Duration::from_millis(700),
-                Client::new().get(&url).no_redirect().send(),
+                Client::new().get(&url).retries(50).no_redirect().send(),
             )
             .await
             .unwrap();
             assert_eq!(response.status().as_u16(), 503);
-            assert_eq!(hits.load(Ordering::SeqCst), 3, "deadline");
+            let made = hits.load(Ordering::SeqCst);
+            assert!(
+                (2..51).contains(&made),
+                "retries stop at the deadline: {made}"
+            );
 
             let client = one_retry_client();
             client.get(&url).no_redirect().send().await.unwrap();
-            assert_eq!(hits.load(Ordering::SeqCst), 5, "one retry from the budget");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                made + 2,
+                "one retry from the budget"
+            );
             client.get(&url).no_redirect().send().await.unwrap();
             assert_eq!(
                 hits.load(Ordering::SeqCst),
-                6,
+                made + 3,
                 "the empty budget blocks retries"
             );
         }
