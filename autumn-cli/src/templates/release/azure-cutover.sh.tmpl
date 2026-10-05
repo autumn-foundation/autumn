@@ -99,13 +99,14 @@ APP_ID=$(jq -r '.id' <<< "$APP")
 # domains, IP restrictions or CORS. So the script sends this saved
 # object back. fqdn is read-only.
 # The app container is the one named after the app (main.tf names it so).
-# An operator can add sidecars before it. A template with one container
-# uses that one.
+# A template with one container uses that one. It must be the first
+# container: main.tf ignores the env of the first container only, so with a
+# sidecar first, a later terraform apply removes the secret env vars.
 NAME_JSON=$(jq -n --arg n "$AZURE_APP_NAME" '$n')
 APP_C="def app_i: (map(.name) | index($NAME_JSON)) // (if length == 1 then 0 else error(\"no container named \" + $NAME_JSON) end);"
 APP_IMAGE="(properties.template.containers[?name=='$AZURE_APP_NAME'] || properties.template.containers)[0].image"
-if ! jq -e "$APP_C"' .properties.template.containers | app_i' <<< "$APP" > /dev/null 2>&1; then
-  echo "::error::$AZURE_APP_NAME has no container named $AZURE_APP_NAME. Give the app container the name of the app." >&2
+if ! jq -e "$APP_C"' .properties.template.containers | app_i == 0' <<< "$APP" > /dev/null 2>&1; then
+  echo "::error::the first container of $AZURE_APP_NAME must be the app container, named $AZURE_APP_NAME. main.tf ignores the env of the first container only. Put the app container first in main.tf, run terraform apply, and try again." >&2
   exit 1
 fi
 SAVED_INGRESS=$(jq -c '.properties.configuration.ingress // null | if . then del(.fqdn) else . end' <<< "$APP")
@@ -632,9 +633,11 @@ sole_active "$REVISION" || fail "revision $REVISION did not become the only acti
 # No new revision: secrets are application-scope, and the running revision
 # reads them only when it starts.
 # A restart replaces the replicas. The deploy is done when no replica from
-# before the restart stays, and a new replica is ready. If no replica ran
-# before (scaled to zero), the next one starts with the new secrets.
+# before the restart stays, and a new replica is ready. That is the proof
+# that the app starts with the new secrets. A revision scaled to zero
+# starts no replica, so the script sends a request to start one.
 if [ -n "$RESTART" ]; then
+  FQDN=$(jq -r '.properties.configuration.ingress.fqdn // ""' <<< "$APP")
   replicas() {
     az containerapp replica list \
       --name "$AZURE_APP_NAME" \
@@ -652,17 +655,19 @@ if [ -n "$RESTART" ]; then
   for _ in $(seq 1 30); do
     sleep 10
     NOW=$(replicas) || fail "cannot list the replicas of revision $REVISION"
+    if jq -e 'length == 0' <<< "$NOW" > /dev/null && [ -n "$FQDN" ] && command -v curl > /dev/null; then
+      curl --silent --output /dev/null --max-time 10 "https://$FQDN/" || true
+    fi
     if jq -e --argjson before "$BEFORE" '
       (map(.name) | any(IN($before[])) | not)
-      and (($before | length) == 0
-           or any(.[]; .properties.runningState == "Running"
-                       and ((.properties.containers // []) | length > 0 and all(.ready == true))))
+      and any(.[]; .properties.runningState == "Running"
+                   and ((.properties.containers // []) | length > 0 and all(.ready == true)))
     ' <<< "$NOW" > /dev/null; then
       STARTED=1
       break
     fi
   done
-  [ -n "$STARTED" ] || fail "revision $REVISION has no ready replica after the restart"
+  [ -n "$STARTED" ] || fail "revision $REVISION has no ready replica after the restart. If ingress is internal and min_replicas = 0, the script cannot start one: set min_replicas to 1 or more, and try again."
 fi
 
 # The new revision runs the real image. Open external ingress now.

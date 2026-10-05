@@ -2146,11 +2146,15 @@ identity, registry, secrets and env vars, which the cutover owns. Terraform
 sets env vars at create time only: change one later with `az containerapp
 update --set-env-vars`. The cutover keeps the env vars that it does not set.
 The cutover changes only the container named after the app, so a sidecar
-that you add stays as it is, in any position.
+that you add stays as it is. Keep the app container first in `main.tf`: the
+`lifecycle` block ignores the env of the first container only. The script
+stops if the app container is not first.
 If a cutover keeps the current revision (the same image and env), it restarts
 that revision, so it reads changed secret refs. Then it waits until a new
 replica is ready. If the revision does not start with the new secrets, the
-cutover fails.
+cutover fails. A revision scaled to zero starts no replica after a restart,
+so the script sends a request to the app to start one. If the runner cannot
+reach the app (internal ingress), set `min_replicas` to 1 or more.
 
 **Upgrading an app made by an older template.** An older `main.tf` gave the
 placeholder app the identity, registry and secret refs. `terraform apply`
