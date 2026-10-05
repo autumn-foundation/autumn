@@ -592,6 +592,9 @@ pub mod pg {
         /// The refresh connection, kept between refreshes. Loads hold this
         /// lock, so they run and install in order.
         refresh_conn: Mutex<Option<diesel::PgConnection>>,
+        /// Held across a write and its snapshot update, so local writes
+        /// reach the snapshot in commit order.
+        write_lock: Mutex<()>,
         refresh_errors: AtomicU64,
         /// Failed refreshes in a row. Zero after a good refresh.
         failures: AtomicU32,
@@ -811,6 +814,7 @@ pub mod pg {
                     generation: AtomicU64::new(0),
                     refreshing: AtomicBool::new(false),
                     refresh_conn: Mutex::new(None),
+                    write_lock: Mutex::new(()),
                     refresh_errors: AtomicU64::new(0),
                     failures: AtomicU32::new(0),
                     #[cfg(test)]
@@ -880,6 +884,11 @@ pub mod pg {
             actor: Option<&str>,
             update: impl FnOnce(&mut diesel::PgConnection) -> QueryResult<FlagRow>,
         ) -> Result<(), FlagStoreError> {
+            let _ordered = self
+                .shared
+                .write_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut conn = self.shared.connect()?;
             let row = conn
                 .transaction::<FlagRow, diesel::result::Error, _>(|conn| {
@@ -1480,78 +1489,92 @@ pub struct FeatureFlagService {
 /// Last-known flag values and store error state, shared by service clones.
 #[derive(Default)]
 struct StoreHealth {
-    last_known: RwLock<HashMap<String, FlagConfig>>,
+    known: RwLock<Known>,
     errors: AtomicU64,
     /// `true` after a failed read, until a read succeeds.
     failing: AtomicBool,
-    /// Increments on each successful write through the service.
+    /// Increments on each write through the service.
     writes: AtomicU64,
 }
 
+/// Values and write generations, under one lock.
+#[derive(Default)]
+struct Known {
+    values: HashMap<String, FlagConfig>,
+    /// The generation of the latest write to each key.
+    last_write: HashMap<String, u64>,
+}
+
+impl Known {
+    /// `true` when a write to `key` began after generation `started`.
+    fn written_after(&self, key: &str, started: u64) -> bool {
+        self.last_write
+            .get(key)
+            .is_some_and(|write| *write > started)
+    }
+}
+
 impl StoreHealth {
-    /// The write generation to pass to [`remember`](Self::remember). Take it
+    /// The generation to pass to [`remember`](Self::remember). Take it
     /// before the read.
     fn read_started(&self) -> u64 {
         self.writes.load(Ordering::Acquire)
     }
 
-    /// Start a write's read-back: reads that started earlier can no longer
-    /// replace a last-known value. Returns the new generation.
-    fn begin_write(&self) -> u64 {
-        let _known = self
-            .last_known
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        self.writes.fetch_add(1, Ordering::AcqRel) + 1
+    /// Start a write's read-back of `key`. Reads of `key` that started
+    /// earlier can no longer replace its last-known value. Returns the
+    /// write's generation.
+    fn begin_write(&self, key: &str) -> u64 {
+        let mut known = self.known.write().unwrap_or_else(PoisonError::into_inner);
+        let write = self.writes.fetch_add(1, Ordering::AcqRel) + 1;
+        known.last_write.insert(key.to_owned(), write);
+        write
     }
 
-    /// Keep the value that the store returned for `key`, unless a write came
-    /// after generation `started`: that read can be older than the write.
+    /// Keep the value that the store returned for `key`, unless a write to
+    /// `key` began after generation `started`: the read can be older than
+    /// the write.
     ///
     /// The hot path takes no write lock when the value is the same.
     fn remember(&self, key: &str, flag: Option<&FlagConfig>, started: u64) {
         if self.failing.load(Ordering::Relaxed) && self.failing.swap(false, Ordering::AcqRel) {
             tracing::info!("feature flag store recovered");
         }
-        let known = self
-            .last_known
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        if known.get(key) == flag {
+        let known = self.known.read().unwrap_or_else(PoisonError::into_inner);
+        if known.values.get(key) == flag {
             return;
         }
         drop(known);
-        let mut known = self
-            .last_known
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        if self.writes.load(Ordering::Acquire) != started {
+        let mut known = self.known.write().unwrap_or_else(PoisonError::into_inner);
+        if known.written_after(key, started) {
             return;
         }
         match flag {
             Some(flag) => {
-                known.insert(key.to_owned(), flag.clone());
+                known.values.insert(key.to_owned(), flag.clone());
             }
             None => {
-                known.remove(key);
+                known.values.remove(key);
             }
         }
     }
 
-    /// Drop the last-known value for `key` after a write that the store
-    /// cannot read back. After a disable, keep the flag off instead.
-    fn forget(&self, key: &str, disabled: bool) {
-        let mut known = self
-            .last_known
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
+    /// After write `write` to `key` that the store cannot read back: a
+    /// disable keeps the flag off, and other writes drop the last-known
+    /// value. A newer write to `key` wins.
+    fn forget(&self, key: &str, disabled: bool, write: u64) {
+        let mut known = self.known.write().unwrap_or_else(PoisonError::into_inner);
+        if known.written_after(key, write) {
+            return;
+        }
         if disabled {
             known
+                .values
                 .entry(key.to_owned())
                 .or_insert_with(|| FlagConfig::new(key))
                 .enabled = false;
         } else {
-            known.remove(key);
+            known.values.remove(key);
         }
     }
 
@@ -1567,9 +1590,10 @@ impl StoreHealth {
                 "feature flag store read failed; serving last-known values or declared defaults"
             );
         }
-        self.last_known
+        self.known
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .values
             .get(key)
             .cloned()
     }
@@ -1688,10 +1712,10 @@ impl FeatureFlagService {
     /// When the store cannot read the flag back, a disable keeps the flag
     /// off, and any other write drops the last-known value.
     fn after_write(&self, flag_key: &str, disabled: bool) {
-        let started = self.health.begin_write();
+        let started = self.health.begin_write(flag_key);
         match self.store.get(flag_key) {
             Ok(flag) => self.health.remember(flag_key, flag.as_ref(), started),
-            Err(_) => self.health.forget(flag_key, disabled),
+            Err(_) => self.health.forget(flag_key, disabled, started),
         }
     }
 
@@ -2582,6 +2606,38 @@ mod tests {
             !svc.is_enabled("kill", None),
             "a read that started before a write must not replace its value"
         );
+    }
+
+    #[test]
+    fn a_write_to_one_flag_keeps_reads_of_other_flags() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        store.enable("b", None).unwrap();
+
+        let started = svc.health.read_started();
+        let read = store.get("b").unwrap();
+        svc.enable("a", None).unwrap(); // A write to another flag.
+        svc.health.remember("b", read.as_ref(), started);
+
+        store.fail(true);
+        assert!(svc.is_enabled("b", None), "the read of `b` is still good");
+    }
+
+    #[test]
+    fn an_older_failed_read_back_does_not_undo_a_newer_write() {
+        let svc = make_svc();
+        let mut on = FlagConfig::new("k");
+        on.enabled = true;
+        on.rollout_pct = 100;
+
+        let disable = svc.health.begin_write("k");
+        let enable = svc.health.begin_write("k");
+        svc.health.remember("k", Some(&on), enable);
+        // The older disable's read-back failed; it ends last.
+        svc.health.forget("k", true, disable);
+
+        let error = FlagStoreError::Backend("down".to_owned());
+        assert_eq!(svc.health.recall("k", &error), Some(on));
     }
 
     #[test]
