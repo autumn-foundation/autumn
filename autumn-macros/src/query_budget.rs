@@ -96,14 +96,25 @@ const HANDLE_BUILDERS: &[&str] = &[
     "per_page",
 ];
 
-/// Closure-taking methods that invoke their closure **at most once** —
-/// `Option`/`Result` combinators, not iterator adapters. A query inside one is
-/// a fixed cost, not a per-element one.
+/// `Option`/`Result` methods that call their closure **at most once**. A
+/// query inside one is a fixed cost. An iterator has some of these names
+/// too, so the receiver must be known to be an `Option` or a `Result`.
 const AT_MOST_ONCE_CLOSURE_METHODS: &[&str] = &[
     "unwrap_or_else",
     "ok_or_else",
     "get_or_insert_with",
     "unwrap_or_default",
+    "map",
+    "map_or",
+    "map_or_else",
+    "and_then",
+    "or_else",
+    "filter",
+    "inspect",
+    "is_some_and",
+    "is_none_or",
+    "is_ok_and",
+    "is_err_and",
 ];
 
 /// Macros that are structurally incapable of issuing a query, however they
@@ -247,6 +258,21 @@ const CALLBACK_METHODS: &[&str] = &[
     "unwrap_or_else",
     "ok_or_else",
     "get_or_insert_with",
+    "or_else",
+    "is_some_and",
+    "is_none_or",
+    "is_ok_and",
+    "is_err_and",
+    "reduce",
+    "max_by",
+    "min_by",
+    "max_by_key",
+    "min_by_key",
+    "retain",
+    "sort_by",
+    "sort_by_key",
+    "sort_unstable_by",
+    "sort_unstable_by_key",
 ];
 
 /// Smart pointers. They deref to what they hold, so `Arc<PgPostRepository>`
@@ -836,6 +862,8 @@ const STORE_METHODS: &[&str] = &[
     "insert",
     "extend",
     "append",
+    "resize",
+    "replace",
 ];
 
 /// Offered when the fix is to stop issuing a query per row.
@@ -2814,7 +2842,10 @@ impl Analyzer {
     /// holds a handle, the name at the root of `receiver` now holds it too.
     fn store_into(&mut self, receiver: &Expr, method: &str, args: &[&Expr]) {
         // An executor uses the connection for one query and gives it back.
-        if EXECUTORS.contains(&method) {
+        // A known container method stores only if it is a store method.
+        if EXECUTORS.contains(&method)
+            || (self.known_container_method(receiver, method) && !STORE_METHODS.contains(&method))
+        {
             return;
         }
         let held = args
@@ -3731,8 +3762,7 @@ fn type_kind(ty: &Type) -> Kind {
 
 /// How deep handles sit in a container type: 1 for `Vec<PgPostRepository>`,
 /// 2 or more for `Vec<Vec<PgPostRepository>>`, 0 for no container of
-/// handles. A smart pointer adds no depth. A `Result` with a handle on its
-/// `Ok` side only is a handle, not a container (see [`type_is_handle`]).
+/// handles. A smart pointer adds no depth.
 fn type_depth(ty: &Type) -> u8 {
     let part = |inner: &Type| {
         if type_is_handle_part(inner) {
@@ -3760,10 +3790,10 @@ fn type_depth(ty: &Type) -> u8 {
             if name == "Result" {
                 let ok = args.next();
                 let err = args.next().map_or(0, part);
-                // A handle on the `Ok` side alone makes a handle. A handle
-                // on the `Err` side too makes a container of both.
+                // A `Result` of a handle is a container of it, like an
+                // `Option`.
                 if ok.is_some_and(type_is_handle_part) {
-                    return err;
+                    return err.max(1);
                 }
                 return ok.map_or(0, part).max(err);
             }
@@ -7003,6 +7033,62 @@ mod tests {
             ),
         ];
         check_cases(cases);
+    }
+
+    #[test]
+    fn option_and_result_combinators_run_their_callback_once() {
+        check_handlers(&[
+            (
+                "Option::map runs its closure once",
+                "async fn h(maybe: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = maybe.map(|r| r.find_all()); Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "Result::and_then runs its closure once",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.ok().and_then(|r| r.find_all()); Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a function passed to or_else is reported",
+                "async fn h(result: Result<(), PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = result.or_else(recover); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a function passed to is_some_and is reported",
+                "async fn h(maybe: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = maybe.is_some_and(check); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "unwrap_or does not store its argument",
+                "async fn h(maybe: Option<PgPostRepository>, fallback: PgPostRepository) \
+                 -> AutumnResult<usize> { let repo = maybe.unwrap_or(fallback); \
+                 let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "resize stores its argument",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut list = vec![]; list.resize(2, &repo); render(list); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "replace stores its argument",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = Some(1); slot.replace(&repo); render(slot); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            // Guard: an iterator's `map` still runs per element.
+            (
+                "Iterator::map runs its closure per element",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = repos.iter().map(|r| r.find_all()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
     }
 
     #[test]

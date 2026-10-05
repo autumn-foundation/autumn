@@ -21,8 +21,8 @@
   forms lost the handle, and a query through it was not counted (#2316).
 - **query budgets:** a handle kept in a container is tracked. An index, a
   field, a pattern, `?` or an element method (`remove`, `unwrap`) on
-  `[repo]`, `vec![repo]`, `Some(repo)` or a `Vec`, `Option`, map or set
-  parameter of a handle type gives a handle. `Arc<Vec<…>>` is a container,
+  `[repo]`, `vec![repo]`, `Some(repo)` or a `Vec`, `Option`, `Result`, map
+  or set parameter of a handle type gives a handle. `Arc<Vec<…>>` is a container,
   and a container of containers keeps its shape. An unknown method on such
   a container, or any method on a user struct that holds a handle, is
   reported. A container method is known only for the container type that

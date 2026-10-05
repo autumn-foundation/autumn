@@ -127,7 +127,7 @@ Both halves are compiled in CI as trybuild fixtures — see
 | An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
 | `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
-| An `Option`/`Result` combinator closure (`unwrap_or_else`, `ok_or_else`, …) | counted **once** when the receiver is known to be an `Option` or a `Result`; otherwise it may run per element |
+| An `Option`/`Result` combinator closure (`map`, `and_then`, `unwrap_or_else`, …) | counted **once** when the receiver is known to be an `Option` or a `Result`; otherwise it may run per element |
 
 A repository future is counted where it is **built**, not where it is awaited,
 so collecting futures in a `.map(…)` and driving them with `join_all` later is
@@ -156,8 +156,8 @@ The analysis follows the handle through every name that holds it:
   `vec![repo]`, `(repo, 1)`, `Some(repo)`, `Ctx { db }`. A parameter of type
   `Vec`, `VecDeque`, `Option`, map, set, tuple, array or slice of a handle
   type also holds handles (`Vec<PgPostRepository>`, `Option<Db>`,
-  `HashMap<i64, PgPostRepository>`). So does a `Result`
-  with such a container on its `Ok` side, or a handle on its `Err` side.
+  `HashMap<i64, PgPostRepository>`). So does a `Result` with a handle or
+  such a container on either side.
   - A name bound to a struct or tuple literal records what each part holds.
     In `let ctx = PageCtx { repo: &repo, user };`, `ctx.repo` is a handle
     and `ctx.user` is not.
