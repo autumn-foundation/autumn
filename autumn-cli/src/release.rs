@@ -3265,6 +3265,7 @@ case "$1 $2" in
     secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"$id\"}"; }
     secrets="$(secret database-url),$(secret signing-secret)"
     [ -n "$STUB_REDIS" ] && secrets="$secrets,$(secret redis-url)"
+    [ -n "$STUB_JOB_NO_SECRETS" ] && secrets=""
     registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
     # An operator-added registry listed before the ACR.
     [ -n "$STUB_JOB_EXTRA_REGISTRY" ] && registries="{\"server\":\"other.example.io\",\"identity\":\"/other-id\"},$registries"
@@ -3332,6 +3333,8 @@ case "$1 $2" in
         printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
         exit 0
       fi
+      # Azure can list no active revision during the handoff.
+      [ -n "$STUB_ACTIVE_EMPTY" ] && exit 0
       [ -f "$STUB_LOG.lag" ] || echo "${STUB_ACTIVE_LAG:-0}" > "$STUB_LOG.lag"
       lag=$(cat "$STUB_LOG.lag")
       if [ "$lag" -gt 0 ]; then
@@ -3374,7 +3377,27 @@ case "$1 $2" in
       echo '[{"name":"api-key","value":"user-value"}]'
     fi
     ;;
-  "containerapp replica") echo "${STUB_REPLICAS:-0}" ;;
+  "containerapp replica")
+    if [ -n "$query" ]; then
+      echo "${STUB_REPLICAS:-0}"
+    elif ! grep -q "revision restart" "$STUB_LOG"; then
+      echo '[{"name":"r-old","properties":{"runningState":"Running","containers":[{"ready":true}]}}]'
+    else
+      # After a restart, the old replica stays for the first
+      # STUB_RESTART_STALE reads. The new one is ready unless
+      # STUB_RESTART_UNREADY is set.
+      [ -f "$STUB_LOG.stale" ] || echo "${STUB_RESTART_STALE:-0}" > "$STUB_LOG.stale"
+      stale=$(cat "$STUB_LOG.stale")
+      if [ "$stale" -gt 0 ]; then
+        echo $((stale - 1)) > "$STUB_LOG.stale"
+        echo '[{"name":"r-old","properties":{"runningState":"Running","containers":[{"ready":true}]}}]'
+      else
+        ready=true
+        [ -n "$STUB_RESTART_UNREADY" ] && ready=false
+        echo "[{\"name\":\"r-new\",\"properties\":{\"runningState\":\"Running\",\"containers\":[{\"ready\":$ready}]}}]"
+      fi
+    fi
+    ;;
   "rest --method")
     if grep -q '"ingress"' <<< "$body"; then
       echo "az ingress-patch external=$(jq -r '.properties.configuration.ingress.external' <<< "$body")" >> "$STUB_LOG"
@@ -3462,6 +3485,10 @@ esac
         command
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
+            .env_remove("STUB_JOB_NO_SECRETS")
+            .env_remove("STUB_ACTIVE_EMPTY")
+            .env_remove("STUB_RESTART_STALE")
+            .env_remove("STUB_RESTART_UNREADY")
             .env_remove("STUB_APP_ENV_FULL")
             .env_remove("STUB_APP_LEGACY")
             .env_remove("STUB_APP_REDIS")
@@ -3701,6 +3728,88 @@ esac
         };
         assert!(status.success(), "{calls}");
         assert!(calls.contains("revision restart"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_needs_the_new_revision_in_the_active_list() {
+        // An empty active list does not show that the new revision serves.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_EMPTY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_the_restarted_revision() {
+        // A restart only starts new replicas. The deploy is done when the
+        // old replicas are gone and a new one is ready.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_RESTART_STALE", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(
+            calls[restart_at..].matches("replica list").count() >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_the_restarted_revision_is_not_ready() {
+        // New secrets that break the start must not turn the deploy green.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_RESTART_UNREADY", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(calls.contains("revision restart"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_checks_the_job_before_it_disables_ingress() {
+        // Without secrets on the job, the cutover cannot run. The script
+        // stops before it changes the ingress.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_JOB_NO_SECRETS", "1"), ("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
     }
 
     #[cfg(unix)]
