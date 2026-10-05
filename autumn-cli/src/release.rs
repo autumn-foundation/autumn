@@ -3201,9 +3201,11 @@ case "$1 $2" in
     ;;
   "containerapp show")
     if [ -z "$query" ]; then
-      echo "{\"id\":\"/subscriptions/s/app\",\"properties\":{\"latestRevisionName\":\"app--old\",\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[{\"name\":\"AUTUMN_PROFILE\",\"value\":\"prod\"}]}]}}}"
+      env='{"name":"AUTUMN_PROFILE","value":"prod"}'
+      [ -n "$STUB_APP_ENV_FULL" ] && env="$env"',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
+      echo "{\"id\":\"/subscriptions/s/app\",\"properties\":{\"latestRevisionName\":\"app--old\",\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
     else
-      tsv Succeeded app--new
+      tsv Succeeded "${STUB_LATEST:-app--new}"
     fi
     ;;
   "containerapp revision") tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
@@ -3224,6 +3226,7 @@ esac
         revision_state: &str,
         redis: bool,
         placeholder_replicas: u32,
+        extra_env: &[(&str, &str)],
     ) -> Option<(std::process::ExitStatus, String, String)> {
         use std::os::unix::fs::PermissionsExt;
         if std::process::Command::new("jq")
@@ -3263,6 +3266,10 @@ esac
             .env("AZURE_MIGRATE_JOB_NAME", "job")
             .env("ACR_LOGIN_SERVER", "acr.azurecr.io")
             .env("IMAGE_TAG", "t1");
+        command
+            .env_remove("STUB_LATEST")
+            .env_remove("STUB_APP_ENV_FULL");
+        command.envs(extra_env.iter().copied());
         if redis {
             command.env("STUB_REDIS", "1");
         } else {
@@ -3281,6 +3288,7 @@ esac
             "Provisioned",
             true,
             0,
+            &[],
         ) else {
             return;
         };
@@ -3307,6 +3315,7 @@ esac
             "\"AUTUMN_PROFILE\"",
             "\"AUTUMN_CACHE__BACKEND\"",
             "\"api-key\"",
+            "\"sidecar\"",
         ] {
             assert!(
                 bodies.contains(field),
@@ -3323,6 +3332,7 @@ esac
             "Failed",
             false,
             0,
+            &[],
         ) else {
             return;
         };
@@ -3360,7 +3370,7 @@ esac
         // The old revision of a later deploy is a real release. It needs
         // its identity and secret refs.
         let Some((status, calls, _)) =
-            run_azure_cutover("acr.azurecr.io/app:t0", "Failed", false, 0)
+            run_azure_cutover("acr.azurecr.io/app:t0", "Failed", false, 0, &[])
         else {
             return;
         };
@@ -3384,6 +3394,7 @@ esac
             "Provisioned",
             false,
             1,
+            &[],
         ) else {
             return;
         };
@@ -3401,7 +3412,7 @@ esac
         // A Redis toggle followed by a redeploy of the same tag must still
         // send the job's secrets and env vars to the app.
         let Some((status, calls, bodies)) =
-            run_azure_cutover("acr.azurecr.io/app:t1", "Provisioned", true, 0)
+            run_azure_cutover("acr.azurecr.io/app:t1", "Provisioned", true, 0, &[])
         else {
             return;
         };
@@ -3416,6 +3427,41 @@ esac
             !calls.contains("az containerapp replica list"),
             "a later deploy has no placeholder to check: {calls}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_a_new_revision_when_same_tag_config_changes() {
+        // The env changes, so Azure makes a new revision. While Azure still
+        // reports the old revision, the cutover must not succeed.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            true,
+            0,
+            &[("STUB_LATEST", "app--old")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("ingress enable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_accepts_the_current_revision_when_nothing_changes() {
+        // Same tag, same env: Azure makes no new revision.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_LATEST", "app--old"), ("STUB_APP_ENV_FULL", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("ingress enable"), "{calls}");
     }
 
     #[test]
