@@ -186,6 +186,10 @@ The analysis follows the handle through every name that holds it:
     `fold`, `find_map`, `then` and `unwrap_or_else`. A `return` in the
     callback counts too. A closure that names a handle holds it, so
     `ids.iter().map(make)` and `make()` keep the handle.
+  - `map_or`, `map_or_else`, `fold` and `try_fold` give only what their
+    default and callback give: `Some(repo).map_or(0, |_| 1)` is plain. A
+    callback on a `Result` parameter gets only its side: in
+    `result.map_err(|e| …)`, `e` is the error, not the handle.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
     `Option<Vec<…>>`, `[ctx]`, `repos.chunks(2)`, or
     `repos.iter().map(|r| Ctx { repo: r })`) keeps that shape for all its

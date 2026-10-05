@@ -252,6 +252,10 @@ const DIRECT_CALLBACKS: &[&str] = &[
     "map_or_else",
 ];
 
+/// Element methods whose result is only what their seed and callback give:
+/// `map_or(0, |_| 1)` is an `i32`, not an element.
+const OUTPUT_CALLBACKS: &[&str] = &["map_or", "map_or_else", "fold", "try_fold"];
+
 /// Methods whose result has the receiver's type.
 const SAME_TYPE_METHODS: &[&str] = &["clone", "to_owned"];
 
@@ -940,6 +944,18 @@ fn result_sides(ty: &Type) -> Option<Vec<(String, Kind)>> {
     let ok = side(args.next());
     let err = side(args.next());
     Some(vec![("Ok".to_string(), ok), ("Err".to_string(), err)])
+}
+
+/// The side of a `Result` that callback `arg` of `method` takes: `map_err`
+/// takes the error, `map` the value. `None` when not known.
+fn callback_side(method: &str, arg: usize, args: usize) -> Option<&'static str> {
+    match method {
+        "map_err" | "or_else" | "unwrap_or_else" | "is_err_and" | "inspect_err" => Some("Err"),
+        "map" | "and_then" | "is_ok_and" | "inspect" | "map_or" => Some("Ok"),
+        // `map_or_else(default, f)`: the default takes the error.
+        "map_or_else" => Some(if arg + 1 == args { "Ok" } else { "Err" }),
+        _ => None,
+    }
 }
 
 /// The shape of the standard container type `name`.
@@ -2869,6 +2885,7 @@ impl Analyzer {
         let mut cost = Cost::ZERO;
         for (i, arg) in method.args.iter().enumerate() {
             let callback = takes_callback && (every || i == last);
+            let param = self.side_param(method, i).unwrap_or(param);
             let next = if runs_once {
                 self.connection_params = is_transaction;
                 self.callback_arg(arg, param, callback)
@@ -3322,8 +3339,9 @@ impl Analyzer {
         let out = mc
             .args
             .iter()
-            .map(|a| match a {
-                Expr::Closure(_) => self.closure_output(a, param),
+            .enumerate()
+            .map(|(i, a)| match a {
+                Expr::Closure(_) => self.closure_output(a, self.side_param(mc, i).unwrap_or(param)),
                 _ => self.value_of(a),
             })
             .max()
@@ -3571,6 +3589,19 @@ impl Analyzer {
             }
     }
 
+    /// What callback `arg` of `mc` takes when the receiver is a named
+    /// `Result` with known sides: `result.map_err(|e| …)` takes the error.
+    fn side_param(&self, mc: &ExprMethodCall, arg: usize) -> Option<Kind> {
+        if self.shape_of(&mc.receiver) != Some(Shape::Res) {
+            return None;
+        }
+        let Expr::Path(path) = &*mc.receiver else {
+            return None;
+        };
+        let side = callback_side(&mc.method.to_string(), arg, mc.args.len())?;
+        self.env.part(&path.path.get_ident()?.to_string(), side)
+    }
+
     /// Is `e` a database connection: a handle with the `Db` shape? A
     /// repository is not one, so a `RunnerRepository::tx` may run its
     /// callback many times. A `LazyDb` is not one either: it has only
@@ -3595,6 +3626,7 @@ impl Analyzer {
         // A method on a carrier that returns a part: `repos.remove(0)`.
         if self.expr_is_carrier(&mc.receiver) {
             return ELEMENT_METHODS.contains(&method.as_str())
+                && !OUTPUT_CALLBACKS.contains(&method.as_str())
                 && !self.gives_option_of_part(mc)
                 && !self
                     .shape_of(&mc.receiver)
@@ -8351,6 +8383,73 @@ mod tests {
                 "then on an unknown receiver",
                 "async fn h(repo: PgPostRepository, s: Stream) -> AutumnResult<usize> { \
                  let _ = s.then(|_| repo.find_all()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn result_callbacks_take_their_side_and_map_or_gives_its_output() {
+        check_handlers(&[
+            (
+                "map_err takes the error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.map_err(|e| { render(&e); e }); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "is_err_and takes the error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.is_err_and(|e| render(&e)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "map_or_else's default takes the error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.map_or_else(|e| render(&e), |_| 0); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "map_or gives what its default and callback give",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let status = Some(repo).map_or(0, |_| 1); render(status); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "fold gives its accumulator",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = repos.into_iter().fold(0, |n, _| n + 1); render(n); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            // Guards: the side that holds the handle is still a handle.
+            (
+                "map takes the value side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.map(|r| render(&r)); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map_err on a Result whose error is a handle",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = result.map_err(|e| render(&e)); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map_or_else's callback takes the value side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.map_or_else(|_| 0, |r| render(&r)); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map_or that gives the element",
+                "async fn h(repo: PgPostRepository, other: PgPostRepository) -> AutumnResult<usize> { \
+                 let r = Some(repo).map_or(other, |r| r); render(&r); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "fold that gives the element",
+                "async fn h(repos: Vec<PgPostRepository>, first: PgPostRepository) -> AutumnResult<usize> { \
+                 let r = repos.into_iter().fold(first, |_, r| r); render(&r); Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
