@@ -2051,7 +2051,8 @@ managed identity, no registry and no secret refs. The scaffolded
 in one write. The identity applies to all revisions, so the first cutover
 disables ingress (also the internal route) and waits until the placeholder
 runs no replica. Then nothing can start the placeholder again. Keep
-`min_replicas = 0` until then. If a replica does not stop, the script sends
+`min_replicas = 0` until then: the script stops if the template or an active
+placeholder revision has a higher value. If a replica does not stop, the script sends
 the saved ingress back and stops. The script treats only a revision that runs
 the bootstrap image as the placeholder. While a placeholder revision is
 active, the first cutover is not done, also when a real revision is active

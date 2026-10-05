@@ -178,6 +178,12 @@ done <<< "$ACTIVE"
 # registries too, so the script selects the entry by server.
 JOB_IDENTITY=$(jq -r --arg acr "$ACR_LOGIN_SERVER" \
   '[.properties.configuration.registries // [] | .[] | select(.server == $acr)][0].identity // ""' <<< "$JOB")
+# The identities that the app needs: the ACR identity, and each identity
+# that a Key Vault job secret uses. "system" is the app's system identity.
+JOB_UIDS=$(jq -c --arg id "$JOB_IDENTITY" '[$id] + [.[] | select(.keyVaultUrl) | .identity // empty
+    | select(ascii_downcase != "system")]
+  | map(select(. != "")) | unique_by(ascii_downcase)' "$JOB_SECRETS")
+NEED_SYSTEM=$(jq -c 'any(.[]; .keyVaultUrl and ((.identity // "") | ascii_downcase) == "system")' "$JOB_SECRETS")
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
 JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$JOB")
@@ -216,19 +222,21 @@ APPLIED='
   | [.properties.configuration.secrets // [] | .[]
      | {name, keyVaultUrl, identity: (.identity // "" | ascii_downcase)}] as $have
   | .properties.provisioningState == "Succeeded"
-    and ($ids | index($lid)) != null
+    and ($uids | all(ascii_downcase as $u | $ids | index($u) != null))
+    and (($sys | not) or (.identity.type // "" | test("SystemAssigned")))
     and any(.properties.configuration.registries // [] | .[];
             .server == $acr and (.identity // "" | ascii_downcase) == $lid)
     and ($want | all(. as $s | $have | index([$s]) != null))'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
 REMOVED="$MANAGED_DEF"'
-  ($id | ascii_downcase) as $lid
+  ($uids | map(ascii_downcase)) as $lids
   | [.identity.userAssignedIdentities // {} | to_entries[]
      | select(.value != null) | .key | ascii_downcase] as $ids
   | .properties.provisioningState == "Succeeded"
-    and ($ids | index($lid)) == null
+    and ($ids | all(IN($lids[]) | not))
+    and (($sys | not) or (.identity.type // "None" | test("SystemAssigned") | not))
     and all(.properties.configuration.registries // [] | .[];
-            (.identity // "" | ascii_downcase) != $lid)
+            (.identity // "" | ascii_downcase) | IN($lids[]) | not)
     and all(.properties.configuration.secrets // [] | .[];
             .name | IN(managed[]) | not)'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
@@ -251,6 +259,7 @@ app_shows() {
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --output json) || return 1
   jq -e --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" \
+    --argjson uids "$JOB_UIDS" --argjson sys "$NEED_SYSTEM" \
     --argjson want "$JOB_SECRET_REFS" "$1" <<< "$now" > /dev/null
 }
 
@@ -486,24 +495,29 @@ remove_credentials() {
     sole_active "$revision" || return 1
   fi
   body=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
-    --arg id "$JOB_IDENTITY" "$SECRET_REF$MANAGED_DEF"'
-    ($id | ascii_downcase) as $lid
+    --argjson uids "$JOB_UIDS" --argjson sys "$NEED_SYSTEM" "$SECRET_REF$MANAGED_DEF"'
+    ($uids | map(ascii_downcase)) as $lids
     | ($app.identity.type // "None") as $type
+    # The cutover turned the system identity on for a job secret; it goes.
+    | (($type | test("SystemAssigned")) and ($sys | not)) as $keep_system
     | ($app.identity.userAssignedIdentities // {}) as $ids
-    | ($ids | with_entries(select(.key | ascii_downcase != $lid)) | map_values({})) as $own
-    # The snapshot can predate the cutover, so it can lack the job identity.
-    # Merge-patch keeps an omitted key, so the body always names it: with
-    # the app spelling if the snapshot has one, else as the job spells it.
-    | ($ids | with_entries(select(.key | ascii_downcase == $lid)) | map_values(null)
-       | if . == {} then {($id): null} else . end) as $drop
+    | ($ids | with_entries(select(.key | ascii_downcase | IN($lids[]) | not)) | map_values({})) as $own
+    # The snapshot can predate the cutover, so it can lack a job identity.
+    # Merge-patch keeps an omitted key, so the body always names each one:
+    # with the app spelling if the snapshot has one, else as the job has it.
+    | ($uids | map(. as $u
+        | ($ids | with_entries(select(.key | ascii_downcase == ($u | ascii_downcase))) | map_values(null))
+        | if . == {} then {($u): null} else . end) | add // {}) as $drop
     | {location: $app.location,
-       identity: (if $own != {} then {type: $type, userAssignedIdentities: ($drop + $own)}
-                  elif ($type | test("SystemAssigned")) then {type: "SystemAssigned", userAssignedIdentities: null}
+       identity: (if $own != {}
+                  then {type: (if $keep_system then "SystemAssigned,UserAssigned" else "UserAssigned" end),
+                        userAssignedIdentities: ($drop + $own)}
+                  elif $keep_system then {type: "SystemAssigned", userAssignedIdentities: null}
                   else {type: "None", userAssignedIdentities: null} end),
        properties: {
          configuration: {
            registries: [($app.properties.configuration.registries // [])[]
-                        | select((.identity // "" | ascii_downcase) != $lid)],
+                        | select((.identity // "" | ascii_downcase) | IN($lids[]) | not)],
            secrets: ($app_secrets[0]
                      | map(select(.name | IN(managed[]) | not)
                            | secret_ref))}}}')
@@ -563,20 +577,30 @@ if [ -z "$RELEASED" ]; then
     # before any write. The template and each active revision must have no
     # such rule: a revision keeps its own rules, and the old revision stays
     # active until a new one is ready.
-    CUSTOM_RULE='[(. // []) | .[] | select(.http == null)] | length > 0'
+    # Azure also keeps min_replicas replicas running without ingress, so
+    # a min_replicas above zero is no different.
+    CUSTOM_RULE='[(.rules // []) | .[] | select(.http == null)] | length > 0'
+    MIN_REPLICAS='(.minReplicas // 0) > 0'
     RULE_AT=""
-    jq -e ".properties.template.scale.rules | $CUSTOM_RULE" <<< "$APP" > /dev/null && RULE_AT="the template"
+    MIN_AT=""
+    jq -e ".properties.template.scale // {} | $CUSTOM_RULE" <<< "$APP" > /dev/null && RULE_AT="the template"
+    jq -e ".properties.template.scale // {} | $MIN_REPLICAS" <<< "$APP" > /dev/null && MIN_AT="the template"
     for revision in $PLACEHOLDER_REVISIONS; do
-      RULES=$(az containerapp revision show \
+      SCALE=$(az containerapp revision show \
         --name "$AZURE_APP_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
         --revision "$revision" \
-        --query properties.template.scale.rules \
-        --output json) || { echo "::error::cannot read the scale rules of revision $revision" >&2; exit 1; }
-      jq -e "$CUSTOM_RULE" <<< "${RULES:-null}" > /dev/null && RULE_AT="revision $revision"
+        --query properties.template.scale \
+        --output json) || { echo "::error::cannot read the scale settings of revision $revision" >&2; exit 1; }
+      jq -e "(. // {}) | $CUSTOM_RULE" <<< "${SCALE:-null}" > /dev/null && RULE_AT="revision $revision"
+      jq -e "(. // {}) | $MIN_REPLICAS" <<< "${SCALE:-null}" > /dev/null && MIN_AT="revision $revision"
     done
     if [ -n "$RULE_AT" ]; then
       echo "::error::$RULE_AT of the placeholder has a scale rule that is not HTTP. It can start the placeholder after the script disables ingress. Remove the rule, wait until no active revision has it, and run the script again." >&2
+      exit 1
+    fi
+    if [ -n "$MIN_AT" ]; then
+      echo "::error::$MIN_AT of the placeholder has min_replicas above zero. Azure then runs the placeholder after the script disables ingress. Set min_replicas = 0, run terraform apply, wait until no active revision has it, and run the script again." >&2
       exit 1
     fi
     # The first cutover. Disable ingress, so no request (internal or
@@ -668,7 +692,7 @@ fi
 # The secrets, registries and identities that you add to the app stay.
 PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slurpfile job_secrets "$JOB_SECRETS" \
   --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" --argjson containers "$CONTAINERS" \
-  "$SECRET_REF"'
+  --argjson uids "$JOB_UIDS" --argjson sys "$NEED_SYSTEM" "$SECRET_REF"'
   ($job_secrets[0] | map(secret_ref)) as $job_secrets
   | if $id == "" or ($job_secrets | length) == 0
     then error("the migration job has no identity or secrets to copy")
@@ -679,9 +703,9 @@ PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slu
      + $job_secrets) as $secrets
   | {location: $app.location,
      identity: {
-       type: (if ($app.identity.type // "None" | test("SystemAssigned"))
+       type: (if ($app.identity.type // "None" | test("SystemAssigned")) or $sys
               then "SystemAssigned,UserAssigned" else "UserAssigned" end),
-       userAssignedIdentities: {($id): {}}},
+       userAssignedIdentities: ($uids | map({(.): {}}) | add)},
      properties: {
        configuration: {
          registries: ([($app.properties.configuration.registries // [])[]

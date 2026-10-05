@@ -3200,8 +3200,8 @@ previous_secrets = []
             .0;
         for field in [
             "type: \"None\"",
-            "if . == {} then {($id): null} else . end) as $drop",
-            "select((.identity // \"\" | ascii_downcase) != $lid)",
+            "if . == {} then {($u): null} else . end) | add // {}) as $drop",
+            "select((.identity // \"\" | ascii_downcase) | IN($lids[]) | not)",
             "IN(managed[]) | not",
             "\"AUTUMN_DATABASE__PRIMARY_URL\", \"AUTUMN_SECURITY__SIGNING_SECRET\"",
             "patch_app",
@@ -4344,7 +4344,9 @@ esac
             .lines()
             .find(|line| line.contains("\"identity\":{"))
             .unwrap_or_else(|| panic!("{bodies}"));
-        assert!(stage2.contains("\"/kv-id-2\":null"), "{stage2}");
+        // No identity stays, so the type goes to None; /kv-id-2 is not kept.
+        assert!(!stage2.contains("\"/kv-id-2\":{}"), "{stage2}");
+        assert!(stage2.contains("\"type\":\"None\""), "{stage2}");
     }
 
     #[cfg(unix)]
