@@ -2722,6 +2722,33 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Resilience: outbound circuit breakers
+
+The HTTP client (per host), durable job enqueue (`job_queue`) and the SMTP
+mailer (`smtp_mailer`) run behind a `CircuitBreaker`. It opens on the failure
+ratio **or** the slow-call ratio (issue #3060):
+
+```toml
+[resilience.circuit_breaker.defaults]
+slow_call_duration_threshold_ms = 60000  # 0 turns slow-call detection off
+slow_call_rate_threshold = 1.0           # open when all calls are slow
+cancelled_call_outcome = "slow"          # or "failure"
+
+[resilience.circuit_breaker.hosts."api.stripe.com"]
+slow_call_duration_threshold_ms = 5000
+slow_call_rate_threshold = 0.5
+```
+
+- A call dropped (for example by a timeout) at or after the threshold counts
+  as slow, or as failed. Dropped earlier, it counts as nothing.
+- Set the threshold below `server.timeouts.request_timeout_ms`, or the timeout
+  cancels a slow call first.
+- Breaker state is per process. Metrics: `autumn_circuit_breaker_slow_calls_total`,
+  `autumn_circuit_breaker_slow_call_ratio` (label `name`).
+- A `CircuitBreakerPolicy` struct literal needs `..CircuitBreakerPolicy::default()`.
+
+See `docs/guide/resilience.md`.
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
