@@ -920,6 +920,9 @@ pub trait ModelPrimaryKey {
 /// lookups with [`M2mConnSource::__autumn_m2m_tenant_scope`] when the target
 /// model carries a `tenant_id` column.
 ///
+/// It also backs the `#[commentable]` helpers. They use
+/// [`M2mConnSource::__autumn_m2m_soft_delete`] for the parent check (#2284).
+///
 /// Not part of the public API; not implemented by hand.
 #[cfg(feature = "db")]
 #[doc(hidden)]
