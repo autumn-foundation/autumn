@@ -1,6 +1,6 @@
 # Portable data capsules (issue #1811)
 
-Status: implemented in the first slice. Language: ASD-STE100.
+Status: done (part 1). Language: ASD-STE100.
 
 ## Goal
 
@@ -45,6 +45,10 @@ import it again with no loss of data.
 | Generated columns fail on insert | Import skips generated columns. |
 | A partial import | Postgres import uses one transaction. |
 | An unknown format version | Import rejects it. |
+| Secrets, such as a password hash, go into the capsule | `CapsuleModel::exclude` keeps a column out. |
+| A link to `/dev/zero` makes verify read without end | Verify lists the files first and rejects links. |
+| Two blob keys share one file | Read takes the bytes by hash, one time. |
+| A write between two table reads breaks a link | Postgres export reads all tables in one snapshot. |
 
 ## Six thinking hats
 
@@ -59,8 +63,9 @@ import it again with no loss of data.
   feature. The tests prove fidelity.
 - **Green (ideas):** The viewer uses the `static_gen` layout. A later slice
   can add public-key signatures and one-file packing.
-- **Blue (process):** Red, green, refactor for each step: registry, manifest,
-  integrity, round trip, viewer, blobs, Postgres, actuator, CLI, docs.
+- **Blue (process):** For each step, write a test that fails. Then write the
+  code. Then clean up. Steps: registry, manifest, integrity, round trip,
+  viewer, blobs, Postgres, actuator, CLI, docs.
 
 ## Names
 

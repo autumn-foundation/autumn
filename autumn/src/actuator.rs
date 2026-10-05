@@ -412,13 +412,13 @@ pub trait ProvideActuatorState {
     ///
     /// # Errors
     ///
-    /// [`CapsuleError`](crate::gdpr::portability::CapsuleError) when the
+    /// [`CapsuleError`](crate::gdpr::portability::DataCapsuleError) when the
     /// service is not configured.
     fn data_capsules(
         &self,
-    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::CapsuleError>
+    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::DataCapsuleError>
     {
-        Err(crate::gdpr::portability::CapsuleError::NotConfigured(
+        Err(crate::gdpr::portability::DataCapsuleError::NotConfigured(
             "this state has no data-capsule service".to_owned(),
         ))
     }
@@ -4282,8 +4282,8 @@ pub(crate) struct CapsuleNameRequest {
     capsule: String,
 }
 
-fn capsule_error(error: &crate::gdpr::portability::CapsuleError) -> axum::response::Response {
-    use crate::gdpr::portability::CapsuleError as E;
+fn capsule_error(error: &crate::gdpr::portability::DataCapsuleError) -> axum::response::Response {
+    use crate::gdpr::portability::DataCapsuleError as E;
     let status = match error {
         E::NotConfigured(_) | E::MissingSigningSecret => StatusCode::NOT_IMPLEMENTED,
         E::InvalidName(_) => StatusCode::BAD_REQUEST,
@@ -4357,7 +4357,7 @@ pub(crate) async fn capsules_verify_endpoint<S: ProvideActuatorState + Send + Sy
         Ok(found) => found,
         Err(response) => return response,
     };
-    match service.verify(&path) {
+    match service.verify(&path).await {
         Ok(report) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "report": report})),
@@ -6112,10 +6112,12 @@ mod tests {
         }
         fn data_capsules(
             &self,
-        ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::CapsuleError>
-        {
+        ) -> Result<
+            crate::gdpr::portability::CapsuleService,
+            crate::gdpr::portability::DataCapsuleError,
+        > {
             self.data_capsules.clone().ok_or_else(|| {
-                crate::gdpr::portability::CapsuleError::NotConfigured("test".to_owned())
+                crate::gdpr::portability::DataCapsuleError::NotConfigured("test".to_owned())
             })
         }
     }
@@ -9878,6 +9880,50 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_import_into_an_empty_store_succeeds() {
+        use crate::gdpr::portability::{
+            CapsuleModel, CapsuleService, CapsuleSigner, FieldSpec, MemoryCapsuleStore,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (_, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        let name = json["capsule"].as_str().unwrap().to_owned();
+
+        let empty = std::sync::Arc::new(MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("email", "text"),
+            ],
+        ));
+        let mut state = test_state();
+        state.data_capsules = Some(
+            CapsuleService::new(
+                vec![CapsuleModel::new("users", "id")],
+                empty.clone(),
+                CapsuleSigner::new(b"actuator-capsule-secret-0123456789"),
+            )
+            .with_dir(dir.path()),
+        );
+        let (status, json) = post_json(
+            state,
+            true,
+            "/actuator/capsules/import",
+            serde_json::json!({"capsule": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["summary"]["records"], 1);
+        assert_eq!(json["summary"]["tables"][0]["table"], "users");
+        assert_eq!(empty.rows("users").len(), 1);
     }
 
     #[tokio::test]

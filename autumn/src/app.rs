@@ -7616,6 +7616,7 @@ impl AppBuilder {
                     .map(|summary| serde_json::json!(summary)),
                 DataCapsuleMode::Verify => service
                     .verify(&path)
+                    .await
                     .map(|report| serde_json::json!(report)),
             },
             Err(error) => Err(error),
@@ -8723,7 +8724,7 @@ fn parse_data_capsule_mode(raw: &str) -> Option<DataCapsuleMode> {
 /// The JSON report line of `autumn data capsule`.
 fn data_capsule_report_line(
     mode: DataCapsuleMode,
-    result: &Result<serde_json::Value, crate::gdpr::portability::CapsuleError>,
+    result: &Result<serde_json::Value, crate::gdpr::portability::DataCapsuleError>,
 ) -> String {
     let body = match result {
         Ok(report) => serde_json::json!({"ok": true, "mode": mode.as_str(), "report": report}),
@@ -8737,7 +8738,7 @@ fn data_capsule_report_line(
 /// Print the report line and exit: `0` on success, else `1`.
 fn emit_data_capsule_report(
     mode: DataCapsuleMode,
-    result: &Result<serde_json::Value, crate::gdpr::portability::CapsuleError>,
+    result: &Result<serde_json::Value, crate::gdpr::portability::DataCapsuleError>,
 ) -> ! {
     println!("{}", data_capsule_report_line(mode, result));
     if let Err(error) = result {
@@ -8782,7 +8783,7 @@ mod data_capsule_mode_tests {
 
         let err = data_capsule_report_line(
             DataCapsuleMode::Verify,
-            &Err(crate::gdpr::portability::CapsuleError::MissingSigningSecret),
+            &Err(crate::gdpr::portability::DataCapsuleError::MissingSigningSecret),
         );
         let json: serde_json::Value =
             serde_json::from_str(err.strip_prefix(DATA_CAPSULE_JSON_PREFIX).unwrap()).unwrap();

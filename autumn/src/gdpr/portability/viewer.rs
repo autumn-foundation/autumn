@@ -43,7 +43,7 @@ pub(super) fn render(
         let rows = records.get(&model.table).map_or(&[][..], Vec::as_slice);
         page(
             format!("/{}", model.table),
-            render_model(manifest, model, rows, &index, records),
+            render_model(manifest, model, rows, &index),
         );
     }
 
@@ -53,13 +53,18 @@ pub(super) fn render(
     files
 }
 
-/// The primary-key values of each table, for links that only point at rows
-/// the capsule has.
-struct KeyIndex(HashMap<String, BTreeSet<String>>);
+/// Lookups that the pages need, made one time.
+struct KeyIndex {
+    /// The primary-key values of each table, for links that only point at
+    /// rows the capsule has.
+    keys: HashMap<String, BTreeSet<String>>,
+    /// For each `(table, key)`, the "Referenced by" list items.
+    back: HashMap<(String, String), Vec<String>>,
+}
 
 impl KeyIndex {
     fn new(manifest: &CapsuleManifest, records: &BTreeMap<String, Vec<Record>>) -> Self {
-        let map = manifest
+        let keys = manifest
             .models
             .iter()
             .map(|m| {
@@ -72,11 +77,49 @@ impl KeyIndex {
                 (m.table.clone(), keys)
             })
             .collect();
-        Self(map)
+        let mut back: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for other in &manifest.models {
+            for rel in &other.relationships {
+                let Some(target) = manifest.model(&rel.target) else {
+                    continue;
+                };
+                if rel.target_column != target.primary_key {
+                    continue;
+                }
+                for row in records.get(&other.table).into_iter().flatten() {
+                    let (Some(key), Some(other_key)) = (
+                        row.get(&rel.column).and_then(value_key),
+                        row.get(&other.primary_key).and_then(value_key),
+                    ) else {
+                        continue;
+                    };
+                    back.entry((rel.target.clone(), key))
+                        .or_default()
+                        .push(format!(
+                            "<li><a href=\"../{}/index.html#{}\">{} {}</a> ({})</li>",
+                            esc(&other.table),
+                            esc(&anchor(&other_key)),
+                            esc(&other.table),
+                            esc(&other_key),
+                            esc(&rel.column)
+                        ));
+                }
+            }
+        }
+        Self { keys, back }
     }
 
     fn has(&self, table: &str, key: &str) -> bool {
-        self.0.get(table).is_some_and(|keys| keys.contains(key))
+        self.keys.get(table).is_some_and(|keys| keys.contains(key))
+    }
+
+    /// The "Referenced by" list of one record, or nothing.
+    fn backlinks(&self, table: &str, key: &str) -> String {
+        self.back
+            .get(&(table.to_owned(), key.to_owned()))
+            .map_or_else(String::new, |links| {
+                format!("<p>Referenced by:</p><ul>{}</ul>", links.concat())
+            })
     }
 }
 
@@ -163,7 +206,6 @@ fn render_model(
     model: &ModelManifest,
     rows: &[Record],
     index: &KeyIndex,
-    records: &BTreeMap<String, Vec<Record>>,
 ) -> String {
     let mut body = format!(
         "<p><a href=\"../index.html\">All models</a></p><h1>{}</h1>",
@@ -193,7 +235,7 @@ fn render_model(
         }
         body.push_str("</table>");
         if let Some(key) = key.as_deref() {
-            body.push_str(&backlinks(manifest, model, key, records));
+            body.push_str(&index.backlinks(&model.table, key));
         }
         body.push_str("</section>");
     }
@@ -211,7 +253,7 @@ fn cell(
         && let Some(blob) = blob_key(value).and_then(|k| manifest.blob(k))
     {
         return format!(
-            "<a href=\"../../{}\">{}</a> ({}, {} bytes)",
+            "<a href=\"../../{}\" download>{}</a> ({}, {} bytes)",
             esc(&blob.file()),
             esc(&blob.key),
             esc(&blob.content_type),
@@ -236,43 +278,6 @@ fn cell(
             display(value)
         ),
         None => display(value),
-    }
-}
-
-/// Links to the records of other models that point at this record.
-fn backlinks(
-    manifest: &CapsuleManifest,
-    model: &ModelManifest,
-    key: &str,
-    records: &BTreeMap<String, Vec<Record>>,
-) -> String {
-    let mut links = Vec::new();
-    for other in &manifest.models {
-        for rel in other
-            .relationships
-            .iter()
-            .filter(|r| r.target == model.table && r.target_column == model.primary_key)
-        {
-            for row in records.get(&other.table).into_iter().flatten() {
-                if row.get(&rel.column).and_then(value_key).as_deref() == Some(key)
-                    && let Some(other_key) = row.get(&other.primary_key).and_then(value_key)
-                {
-                    links.push(format!(
-                        "<li><a href=\"../{}/index.html#{}\">{} {}</a> ({})</li>",
-                        esc(&other.table),
-                        esc(&anchor(&other_key)),
-                        esc(&other.table),
-                        esc(&other_key),
-                        esc(&rel.column)
-                    ));
-                }
-            }
-        }
-    }
-    if links.is_empty() {
-        String::new()
-    } else {
-        format!("<p>Referenced by:</p><ul>{}</ul>", links.concat())
     }
 }
 

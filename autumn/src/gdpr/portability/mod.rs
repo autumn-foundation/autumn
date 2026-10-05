@@ -24,7 +24,7 @@
 //! };
 //!
 //! # async fn demo(store: &MemoryCapsuleStore, target: &MemoryCapsuleStore)
-//! # -> Result<(), autumn_web::gdpr::portability::CapsuleError> {
+//! # -> Result<(), autumn_web::gdpr::portability::DataCapsuleError> {
 //! let registry = GdprRegistry::new()
 //!     .capsule(CapsuleModel::new("users", "id"))
 //!     .capsule(CapsuleModel::new("posts", "author_id").belongs_to("author_id", "users"));
@@ -61,13 +61,13 @@ pub use archive::{CapsuleSigner, VerifyReport, verify_dir};
 #[cfg(feature = "storage")]
 pub use blobs::{collect_blobs, restore_blobs};
 pub use model::{
-    BlobEntry, CapsuleError, CapsuleManifest, CapsuleModel, FORMAT, FORMAT_VERSION, FieldSpec,
-    ModelManifest, Record, Relationship,
+    BlobEntry, CapsuleManifest, CapsuleModel, DATA_CAPSULE_FORMAT, DATA_CAPSULE_FORMAT_VERSION,
+    DataCapsuleError, FieldSpec, ModelManifest, Record, Relationship,
 };
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub use pg::PgCapsuleStore;
 pub use service::{CapsuleDirectory, CapsuleService, ExportReport};
-pub use store::{CapsuleFuture, CapsuleStore, ImportBatch, MemoryCapsuleStore};
+pub use store::{CapsuleFuture, CapsuleStore, ImportBatch, MemoryCapsuleStore, ModelData};
 
 use model::{check_model_names, record_file};
 
@@ -96,12 +96,22 @@ impl DataCapsule {
 #[non_exhaustive]
 pub struct ImportSummary {
     /// Each table and its record count, in import order.
-    pub tables: Vec<(String, u64)>,
+    pub tables: Vec<TableCount>,
     /// The total number of records.
     pub records: u64,
 }
 
-fn check_models(models: &[CapsuleModel]) -> Result<(), CapsuleError> {
+/// The record count of one table.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct TableCount {
+    /// The table name.
+    pub table: String,
+    /// The number of records.
+    pub records: u64,
+}
+
+fn check_models(models: &[CapsuleModel]) -> Result<(), DataCapsuleError> {
     let mut seen = BTreeSet::new();
     for m in models {
         check_model_names(
@@ -111,8 +121,17 @@ fn check_models(models: &[CapsuleModel]) -> Result<(), CapsuleError> {
             &m.relationships,
             &m.blob_columns,
         )?;
+        for column in &m.excluded {
+            model::check_ident(column)?;
+            if *column == m.primary_key || *column == m.subject_column {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "{}.{column}: export cannot leave out the key or subject column",
+                    m.table
+                )));
+            }
+        }
         if !seen.insert(m.table.as_str()) {
-            return Err(CapsuleError::InvalidName(format!(
+            return Err(DataCapsuleError::InvalidInput(format!(
                 "{} is registered two times",
                 m.table
             )));
@@ -128,24 +147,28 @@ fn check_models(models: &[CapsuleModel]) -> Result<(), CapsuleError> {
 ///
 /// # Errors
 ///
-/// [`CapsuleError::InvalidName`] for an empty subject or an unsafe or
-/// duplicate name, or an error from `store`.
+/// [`DataCapsuleError::InvalidInput`] for an empty subject or a duplicate
+/// model, [`DataCapsuleError::InvalidName`] for an unsafe name, or an error
+/// from `store`.
 pub async fn export_subject(
     models: &[CapsuleModel],
     store: &dyn CapsuleStore,
     subject: &str,
-) -> Result<DataCapsule, CapsuleError> {
+) -> Result<DataCapsule, DataCapsuleError> {
     if subject.is_empty() {
-        return Err(CapsuleError::InvalidName(
+        return Err(DataCapsuleError::InvalidInput(
             "the subject id is empty".to_owned(),
         ));
     }
     check_models(models)?;
+    let data = store.fetch_subject(models, subject).await?;
     let mut manifest = CapsuleManifest::new(subject);
     let mut records = BTreeMap::new();
-    for model in models {
-        let fields = store.describe(model).await?;
-        let rows = store.fetch(model, subject).await?;
+    for (model, (mut fields, mut rows)) in models.iter().zip(data) {
+        fields.retain(|f| !model.excluded.contains(&f.name));
+        for row in &mut rows {
+            row.retain(|column, _| !model.excluded.contains(column));
+        }
         manifest.models.push(ModelManifest {
             table: model.table.clone(),
             primary_key: model.primary_key.clone(),
@@ -172,17 +195,19 @@ pub async fn export_subject(
 ///
 /// # Errors
 ///
-/// [`CapsuleError::UnknownTable`], [`CapsuleError::RelationshipCycle`],
-/// [`CapsuleError::UnsupportedFormat`], or an error from `store` (for example
-/// [`CapsuleError::Conflict`]).
+/// [`DataCapsuleError::UnknownTable`], [`DataCapsuleError::RelationshipCycle`],
+/// [`DataCapsuleError::UnsupportedFormat`], or an error from `store` (for example
+/// [`DataCapsuleError::Conflict`]).
 pub async fn import_capsule(
     capsule: &DataCapsule,
     models: &[CapsuleModel],
     store: &dyn CapsuleStore,
-) -> Result<ImportSummary, CapsuleError> {
+) -> Result<ImportSummary, DataCapsuleError> {
     let manifest = &capsule.manifest;
-    if manifest.format != FORMAT || manifest.format_version != FORMAT_VERSION {
-        return Err(CapsuleError::UnsupportedFormat(format!(
+    if manifest.format != DATA_CAPSULE_FORMAT
+        || manifest.format_version != DATA_CAPSULE_FORMAT_VERSION
+    {
+        return Err(DataCapsuleError::UnsupportedFormat(format!(
             "{} version {}",
             manifest.format, manifest.format_version
         )));
@@ -197,23 +222,23 @@ pub async fn import_capsule(
             &model.blob_columns,
         )?;
         if !models.iter().any(|m| m.table == model.table) {
-            return Err(CapsuleError::UnknownTable(model.table.clone()));
+            return Err(DataCapsuleError::UnknownTable(model.table.clone()));
         }
     }
     let order = import_order(&manifest.models)?;
     let batches: Vec<ImportBatch<'_>> = order
         .iter()
-        .map(|model| ImportBatch {
-            model,
-            records: capsule.records(&model.table),
-        })
+        .map(|model| ImportBatch::new(model, capsule.records(&model.table)))
         .collect();
     store.insert_all(&batches).await?;
-    let tables: Vec<(String, u64)> = batches
+    let tables: Vec<TableCount> = batches
         .iter()
-        .map(|b| (b.model.table.clone(), b.records.len() as u64))
+        .map(|b| TableCount {
+            table: b.model.table.clone(),
+            records: b.records.len() as u64,
+        })
         .collect();
-    let records = tables.iter().map(|(_, n)| n).sum();
+    let records = tables.iter().map(|t| t.records).sum();
     Ok(ImportSummary { tables, records })
 }
 
@@ -221,7 +246,7 @@ pub async fn import_capsule(
 ///
 /// Links to tables outside the capsule and links to the same table do not
 /// count. The sort keeps manifest order where it can.
-fn import_order(models: &[ModelManifest]) -> Result<Vec<&ModelManifest>, CapsuleError> {
+fn import_order(models: &[ModelManifest]) -> Result<Vec<&ModelManifest>, DataCapsuleError> {
     let tables: BTreeSet<&str> = models.iter().map(|m| m.table.as_str()).collect();
     let mut placed: BTreeSet<&str> = BTreeSet::new();
     let mut order = Vec::with_capacity(models.len());
@@ -240,7 +265,7 @@ fn import_order(models: &[ModelManifest]) -> Result<Vec<&ModelManifest>, Capsule
                 .map(|m| m.table.as_str())
                 .filter(|t| !placed.contains(t))
                 .collect();
-            return Err(CapsuleError::RelationshipCycle(rest.join(", ")));
+            return Err(DataCapsuleError::RelationshipCycle(rest.join(", ")));
         };
         placed.insert(next.table.as_str());
         order.push(next);
@@ -302,7 +327,7 @@ mod tests {
         ];
         let err = import_order(&models).unwrap_err();
         assert!(
-            matches!(err, CapsuleError::RelationshipCycle(ref t) if t == "a, b"),
+            matches!(err, DataCapsuleError::RelationshipCycle(ref t) if t == "a, b"),
             "{err}"
         );
     }
@@ -312,7 +337,21 @@ mod tests {
         let models = [CapsuleModel::new("a", "id"), CapsuleModel::new("a", "id")];
         assert!(matches!(
             check_models(&models),
-            Err(CapsuleError::InvalidName(_))
+            Err(DataCapsuleError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn the_key_and_subject_columns_cannot_be_excluded() {
+        for column in ["id", "owner_id"] {
+            let models = [CapsuleModel::new("a", "owner_id").exclude(column)];
+            assert!(
+                matches!(
+                    check_models(&models),
+                    Err(DataCapsuleError::InvalidInput(_))
+                ),
+                "{column}"
+            );
+        }
     }
 }

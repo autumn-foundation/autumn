@@ -1,17 +1,17 @@
 //! The Postgres [`CapsuleStore`].
 //!
-//! Export reads each row with `to_jsonb`. Import writes the rows with
-//! `jsonb_populate_recordset` in one transaction. `numeric`, `real`,
-//! `double precision` and `money` travel as text, so no digit is lost in
-//! JSON. All names are checked identifiers, quoted in SQL. The subject id is
-//! a bound parameter.
+//! Export reads all models in one snapshot, with `to_jsonb`. Import writes the
+//! rows with `jsonb_populate_recordset` in one transaction. Export writes
+//! `numeric`, `real`, `double precision` and `money` as text, so JSON loses no
+//! digit. The SQL quotes all names, and each name is a checked identifier. The
+//! subject id is a bound parameter.
 
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _};
 
-use super::model::{CapsuleError, CapsuleModel, FieldSpec, Record, check_ident};
-use super::store::{CapsuleFuture, CapsuleStore, ImportBatch};
+use super::model::{CapsuleModel, DataCapsuleError, FieldSpec, Record, check_ident};
+use super::store::{CapsuleFuture, CapsuleStore, ImportBatch, ModelData};
 
 /// A [`CapsuleStore`] on a Postgres pool.
 #[derive(Clone)]
@@ -34,27 +34,32 @@ impl PgCapsuleStore {
 
     async fn conn(
         &self,
-    ) -> Result<diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>, CapsuleError>
-    {
+    ) -> Result<
+        diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>,
+        DataCapsuleError,
+    > {
         self.pool
             .get()
             .await
-            .map_err(|e| CapsuleError::Store(format!("no database connection: {e}")))
+            .map_err(|e| DataCapsuleError::Store(format!("no database connection: {e}")))
     }
 }
 
 /// Quote a checked identifier.
-fn quote(name: &str) -> Result<String, CapsuleError> {
+fn quote(name: &str) -> Result<String, DataCapsuleError> {
     check_ident(name)?;
     Ok(format!("\"{name}\""))
 }
 
-fn store_error(context: &str, error: &DieselError) -> CapsuleError {
+fn store_error(context: &str, error: &DieselError) -> DataCapsuleError {
     match error {
-        DieselError::DatabaseError(DatabaseErrorKind::UniqueViolation, info) => {
-            CapsuleError::Conflict(format!("{context}: {}", info.message()))
-        }
-        other => CapsuleError::Store(format!("{context}: {other}")),
+        // A missing parent is a conflict with the target data, the same as a
+        // duplicate key. Neither is a server fault.
+        DieselError::DatabaseError(
+            DatabaseErrorKind::UniqueViolation | DatabaseErrorKind::ForeignKeyViolation,
+            info,
+        ) => DataCapsuleError::Conflict(format!("{context}: {}", info.message())),
+        other => DataCapsuleError::Store(format!("{context}: {other}")),
     }
 }
 
@@ -64,11 +69,18 @@ fn travels_as_text(data_type: &str) -> bool {
     base.starts_with("numeric") || base == "real" || base == "double precision" || base == "money"
 }
 
+/// One column, with the type that a domain is based on.
+struct Column {
+    field: FieldSpec,
+    /// The type name, or for a domain the name of its base type.
+    base_type: String,
+}
+
 /// The select expression of one column.
-fn select_expr(field: &FieldSpec) -> Result<String, CapsuleError> {
-    let col = quote(&field.name)?;
-    Ok(if travels_as_text(&field.data_type) {
-        let cast = if field.data_type.ends_with("[]") {
+fn select_expr(column: &Column) -> Result<String, DataCapsuleError> {
+    let col = quote(&column.field.name)?;
+    Ok(if travels_as_text(&column.base_type) {
+        let cast = if column.base_type.ends_with("[]") {
             "text[]"
         } else {
             "text"
@@ -85,6 +97,8 @@ struct ColumnRow {
     name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     data_type: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    base_type: String,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     nullable: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -106,16 +120,19 @@ struct SequenceRow {
 async fn describe_table(
     conn: &mut AsyncPgConnection,
     table: &str,
-) -> Result<Vec<FieldSpec>, CapsuleError> {
+) -> Result<Vec<Column>, DataCapsuleError> {
     let rows: Vec<ColumnRow> = diesel::sql_query(
         // `information_schema.columns.is_generated` exists on every version;
         // `pg_attribute.attgenerated` only from Postgres 12.
         "SELECT a.attname::text AS name, \
                 format_type(a.atttypid, a.atttypmod) AS data_type, \
+                format_type(CASE WHEN t.typtype = 'd' THEN t.typbasetype \
+                                 ELSE a.atttypid END, NULL) AS base_type, \
                 NOT a.attnotnull AS nullable, \
                 COALESCE(c.is_generated = 'ALWAYS', false) AS generated \
          FROM pg_attribute a \
          JOIN pg_class r ON r.oid = a.attrelid \
+         JOIN pg_type t ON t.oid = a.atttypid \
          JOIN pg_namespace n ON n.oid = r.relnamespace \
          LEFT JOIN information_schema.columns c \
            ON c.table_schema = n.nspname AND c.table_name = r.relname \
@@ -128,7 +145,7 @@ async fn describe_table(
     .await
     .map_err(|e| store_error(&format!("describe {table}"), &e))?;
     if rows.is_empty() {
-        return Err(CapsuleError::Store(format!(
+        return Err(DataCapsuleError::Store(format!(
             "table {table:?} does not exist"
         )));
     }
@@ -138,16 +155,67 @@ async fn describe_table(
             let mut field = FieldSpec::new(r.name, r.data_type);
             field.nullable = r.nullable;
             field.generated = r.generated;
-            field
+            Column {
+                field,
+                base_type: r.base_type,
+            }
         })
         .collect())
+}
+
+fn fields(columns: Vec<Column>) -> Vec<FieldSpec> {
+    columns.into_iter().map(|c| c.field).collect()
+}
+
+/// The records of `model` whose subject column is `subject`.
+///
+/// The subject is cast to the column type, so `01` finds `1` in a `bigint`
+/// column and an index on the column can be used.
+async fn fetch_rows(
+    conn: &mut AsyncPgConnection,
+    model: &CapsuleModel,
+    columns: &[Column],
+    subject: &str,
+) -> Result<Vec<Record>, DataCapsuleError> {
+    let subject_type = columns
+        .iter()
+        .find(|c| c.field.name == model.subject_column)
+        .map(|c| c.field.data_type.as_str())
+        .ok_or_else(|| {
+            DataCapsuleError::Store(format!(
+                "{} has no column {:?}",
+                model.table, model.subject_column
+            ))
+        })?;
+    let exprs = columns
+        .iter()
+        .map(select_expr)
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    let pk = quote(&model.primary_key)?;
+    // `subject_type` comes from `format_type`, which quotes as SQL needs.
+    let sql = format!(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.{pk}), '[]'::jsonb)::text AS rows \
+         FROM (SELECT {exprs} FROM {table} WHERE {subject_col} = CAST($1 AS {subject_type})) t",
+        table = quote(&model.table)?,
+        subject_col = quote(&model.subject_column)?,
+    );
+    let row: RowsJson = diesel::sql_query(sql)
+        .bind::<diesel::sql_types::Text, _>(subject)
+        .get_result(conn)
+        .await
+        .map_err(|e| store_error(&format!("fetch {}", model.table), &e))?;
+    serde_json::from_str(&row.rows).map_err(|e| DataCapsuleError::Json {
+        file: model.table.clone(),
+        message: e.to_string(),
+    })
 }
 
 impl CapsuleStore for PgCapsuleStore {
     fn describe<'a>(&'a self, model: &'a CapsuleModel) -> CapsuleFuture<'a, Vec<FieldSpec>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
-            describe_table(&mut conn, &model.table).await
+            describe_table(&mut conn, &model.table).await.map(fields)
         })
     }
 
@@ -158,28 +226,34 @@ impl CapsuleStore for PgCapsuleStore {
     ) -> CapsuleFuture<'a, Vec<Record>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
-            let fields = describe_table(&mut conn, &model.table).await?;
-            let exprs = fields
-                .iter()
-                .map(select_expr)
-                .collect::<Result<Vec<_>, _>>()?
-                .join(", ");
-            let pk = quote(&model.primary_key)?;
-            let sql = format!(
-                "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.{pk}), '[]'::jsonb)::text AS rows \
-                 FROM (SELECT {exprs} FROM {table} WHERE {subject_col}::text = $1) t",
-                table = quote(&model.table)?,
-                subject_col = quote(&model.subject_column)?,
-            );
-            let row: RowsJson = diesel::sql_query(sql)
-                .bind::<diesel::sql_types::Text, _>(subject)
-                .get_result(&mut conn)
-                .await
-                .map_err(|e| store_error(&format!("fetch {}", model.table), &e))?;
-            serde_json::from_str(&row.rows).map_err(|e| CapsuleError::Json {
-                file: model.table.clone(),
-                message: e.to_string(),
+            let columns = describe_table(&mut conn, &model.table).await?;
+            fetch_rows(&mut conn, model, &columns, subject).await
+        })
+    }
+
+    /// Read all models in one `REPEATABLE READ` snapshot, so no record points
+    /// at a parent that a later write added or removed.
+    fn fetch_subject<'a>(
+        &'a self,
+        models: &'a [CapsuleModel],
+        subject: &'a str,
+    ) -> CapsuleFuture<'a, Vec<ModelData>> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            conn.transaction::<Vec<ModelData>, DataCapsuleError, _>(async move |conn| {
+                diesel::sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    .execute(conn)
+                    .await
+                    .map_err(|e| store_error("start snapshot", &e))?;
+                let mut data = Vec::with_capacity(models.len());
+                for model in models {
+                    let columns = describe_table(conn, &model.table).await?;
+                    let rows = fetch_rows(conn, model, &columns, subject).await?;
+                    data.push((fields(columns), rows));
+                }
+                Ok(data)
             })
+            .await
         })
     }
 
@@ -188,15 +262,15 @@ impl CapsuleStore for PgCapsuleStore {
             let mut statements = Vec::new();
             for batch in batches.iter().filter(|b| !b.records.is_empty()) {
                 let rows =
-                    serde_json::to_string(batch.records).map_err(|e| CapsuleError::Json {
+                    serde_json::to_string(batch.records).map_err(|e| DataCapsuleError::Json {
                         file: batch.model.file.clone(),
                         message: e.to_string(),
                     })?;
                 statements.push((insert_sql(batch)?, rows, batch));
             }
             let mut conn = self.conn().await?;
-            let result: Result<(), CapsuleError> = conn
-                .transaction::<(), CapsuleError, _>(async move |conn| {
+            let result: Result<(), DataCapsuleError> = conn
+                .transaction::<(), DataCapsuleError, _>(async move |conn| {
                     for (sql, rows, batch) in &statements {
                         diesel::sql_query(sql.as_str())
                             .bind::<diesel::sql_types::Text, _>(rows)
@@ -216,14 +290,14 @@ impl CapsuleStore for PgCapsuleStore {
     }
 }
 
-impl From<DieselError> for CapsuleError {
+impl From<DieselError> for DataCapsuleError {
     fn from(error: DieselError) -> Self {
         store_error("transaction", &error)
     }
 }
 
 /// The `INSERT` of one batch. Generated columns are skipped.
-fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, CapsuleError> {
+fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
     let columns = batch
         .model
         .fields
@@ -232,7 +306,7 @@ fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, CapsuleError> {
         .map(|f| quote(&f.name))
         .collect::<Result<Vec<_>, _>>()?;
     if columns.is_empty() {
-        return Err(CapsuleError::Store(format!(
+        return Err(DataCapsuleError::Store(format!(
             "manifest of {} has no columns",
             batch.model.table
         )));
@@ -250,7 +324,7 @@ async fn advance_sequence(
     conn: &mut AsyncPgConnection,
     table: &str,
     primary_key: &str,
-) -> Result<(), CapsuleError> {
+) -> Result<(), DataCapsuleError> {
     let quoted_table = quote(table)?;
     let seq: SequenceRow = diesel::sql_query("SELECT pg_get_serial_sequence($1, $2) AS seq")
         .bind::<diesel::sql_types::Text, _>(&quoted_table)
@@ -303,19 +377,20 @@ mod tests {
 
     #[test]
     fn select_expr_casts_only_lossy_types() {
+        let col = |name: &str, base: &str| Column {
+            field: FieldSpec::new(name, "domain_name"),
+            base_type: base.to_owned(),
+        };
         assert_eq!(
-            select_expr(&FieldSpec::new("n", "numeric")).unwrap(),
+            select_expr(&col("n", "numeric")).unwrap(),
             "\"n\"::text AS \"n\""
         );
         assert_eq!(
-            select_expr(&FieldSpec::new("n", "real[]")).unwrap(),
+            select_expr(&col("n", "real[]")).unwrap(),
             "\"n\"::text[] AS \"n\""
         );
-        assert_eq!(
-            select_expr(&FieldSpec::new("id", "bigint")).unwrap(),
-            "\"id\""
-        );
-        assert!(select_expr(&FieldSpec::new("a\"b", "text")).is_err());
+        assert_eq!(select_expr(&col("id", "bigint")).unwrap(), "\"id\"");
+        assert!(select_expr(&col("a\"b", "text")).is_err());
     }
 
     #[test]

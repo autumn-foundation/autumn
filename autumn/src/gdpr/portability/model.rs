@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// The `format` value in every capsule manifest.
-pub const FORMAT: &str = "autumn-data-capsule";
+pub const DATA_CAPSULE_FORMAT: &str = "autumn-data-capsule";
 
 /// The capsule format version that this build writes and reads.
-pub const FORMAT_VERSION: u32 = 1;
+pub const DATA_CAPSULE_FORMAT_VERSION: u32 = 1;
 
 /// One record: a JSON object of column name to value.
 pub type Record = serde_json::Map<String, serde_json::Value>;
@@ -42,6 +42,8 @@ pub struct CapsuleModel {
     pub relationships: Vec<Relationship>,
     /// Columns that hold a `storage::Blob` or a blob key.
     pub blob_columns: Vec<String>,
+    /// Columns that export leaves out, for example a password hash.
+    pub excluded: Vec<String>,
 }
 
 impl CapsuleModel {
@@ -54,6 +56,7 @@ impl CapsuleModel {
             subject_column: subject_column.into(),
             relationships: Vec::new(),
             blob_columns: Vec::new(),
+            excluded: Vec::new(),
         }
     }
 
@@ -90,6 +93,17 @@ impl CapsuleModel {
     #[must_use]
     pub fn blob(mut self, column: impl Into<String>) -> Self {
         self.blob_columns.push(column.into());
+        self
+    }
+
+    /// Leave `column` out of the capsule. Use it for secrets, such as a
+    /// password hash or a token.
+    ///
+    /// Import cannot restore an excluded column. The column must accept
+    /// `NULL` or have a default.
+    #[must_use]
+    pub fn exclude(mut self, column: impl Into<String>) -> Self {
+        self.excluded.push(column.into());
         self
     }
 }
@@ -186,9 +200,9 @@ impl BlobEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CapsuleManifest {
-    /// Always [`FORMAT`].
+    /// Always [`DATA_CAPSULE_FORMAT`].
     pub format: String,
-    /// The format version. Import accepts only [`FORMAT_VERSION`].
+    /// The format version. Import accepts only [`DATA_CAPSULE_FORMAT_VERSION`].
     pub format_version: u32,
     /// The subject id.
     pub subject: String,
@@ -209,8 +223,8 @@ pub struct CapsuleManifest {
 impl CapsuleManifest {
     pub(super) fn new(subject: &str) -> Self {
         Self {
-            format: FORMAT.to_owned(),
-            format_version: FORMAT_VERSION,
+            format: DATA_CAPSULE_FORMAT.to_owned(),
+            format_version: DATA_CAPSULE_FORMAT_VERSION,
             subject: subject.to_owned(),
             generated_at: crate::time::ambient_now().to_rfc3339(),
             framework_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -236,7 +250,7 @@ impl CapsuleManifest {
 /// An error from a capsule operation.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum CapsuleError {
+pub enum DataCapsuleError {
     /// A file operation failed.
     #[error("capsule I/O error at {path}: {source}")]
     Io {
@@ -257,6 +271,9 @@ pub enum CapsuleError {
     /// A table, column, or path name is not safe.
     #[error("name is not safe: {0:?}")]
     InvalidName(String),
+    /// An input value is not valid, for example an empty subject id.
+    #[error("input is not valid: {0}")]
+    InvalidInput(String),
     /// The signature or a file hash does not agree with the content.
     #[error("capsule integrity check failed: {0}")]
     Integrity(String),
@@ -264,7 +281,7 @@ pub enum CapsuleError {
     #[error("unsupported capsule format: {0}")]
     UnsupportedFormat(String),
     /// No signing secret is set.
-    #[error("no signing secret: set [security.signing_secret] secret")]
+    #[error("no signing secret: set AUTUMN_SECURITY__SIGNING_SECRET")]
     MissingSigningSecret,
     /// The app did not register this table for capsules.
     #[error("table is not registered for capsules: {0}")]
@@ -289,7 +306,7 @@ pub enum CapsuleError {
     NotConfigured(String),
 }
 
-impl CapsuleError {
+impl DataCapsuleError {
     pub(super) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
             path: path.into(),
@@ -311,11 +328,11 @@ pub(super) fn is_safe_ident(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-pub(super) fn check_ident(name: &str) -> Result<(), CapsuleError> {
+pub(super) fn check_ident(name: &str) -> Result<(), DataCapsuleError> {
     if is_safe_ident(name) {
         Ok(())
     } else {
-        Err(CapsuleError::InvalidName(name.to_owned()))
+        Err(DataCapsuleError::InvalidName(name.to_owned()))
     }
 }
 
@@ -326,7 +343,7 @@ pub(super) fn check_model_names(
     subject_column: &str,
     relationships: &[Relationship],
     blob_columns: &[String],
-) -> Result<(), CapsuleError> {
+) -> Result<(), DataCapsuleError> {
     check_ident(table)?;
     check_ident(primary_key)?;
     check_ident(subject_column)?;

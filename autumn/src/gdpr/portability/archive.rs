@@ -19,7 +19,8 @@ use sha2::{Digest, Sha256};
 
 use super::DataCapsule;
 use super::model::{
-    CapsuleError, CapsuleManifest, FORMAT, FORMAT_VERSION, Record, check_model_names, record_file,
+    CapsuleManifest, DATA_CAPSULE_FORMAT, DATA_CAPSULE_FORMAT_VERSION, DataCapsuleError, Record,
+    check_model_names, record_file,
 };
 use crate::security::config::{ResolvedSigningKeys, SigningSecretConfig};
 
@@ -59,11 +60,11 @@ impl CapsuleSigner {
     ///
     /// # Errors
     ///
-    /// [`CapsuleError::MissingSigningSecret`] when no secret is set. A random
+    /// [`DataCapsuleError::MissingSigningSecret`] when no secret is set. A random
     /// key would make capsules that no other process can verify.
-    pub fn from_config(config: &SigningSecretConfig) -> Result<Self, CapsuleError> {
+    pub fn from_config(config: &SigningSecretConfig) -> Result<Self, DataCapsuleError> {
         if config.secret.as_deref().is_none_or(str::is_empty) {
-            return Err(CapsuleError::MissingSigningSecret);
+            return Err(DataCapsuleError::MissingSigningSecret);
         }
         Ok(Self {
             keys: crate::security::config::resolve_signing_keys(config),
@@ -100,7 +101,7 @@ pub struct VerifyReport {
     /// The subject id of the capsule.
     pub subject: String,
     /// The number of files whose hash agrees.
-    pub files_checked: usize,
+    pub files_checked: u64,
     /// The number of records in the capsule.
     pub records: u64,
 }
@@ -109,15 +110,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn to_json<T: Serialize + ?Sized>(file: &str, value: &T) -> Result<Vec<u8>, CapsuleError> {
-    serde_json::to_vec_pretty(value).map_err(|e| CapsuleError::Json {
+fn to_json<T: Serialize + ?Sized>(file: &str, value: &T) -> Result<Vec<u8>, DataCapsuleError> {
+    serde_json::to_vec_pretty(value).map_err(|e| DataCapsuleError::Json {
         file: file.to_owned(),
         message: e.to_string(),
     })
 }
 
-fn from_json<T: serde::de::DeserializeOwned>(file: &str, bytes: &[u8]) -> Result<T, CapsuleError> {
-    serde_json::from_slice(bytes).map_err(|e| CapsuleError::Json {
+fn from_json<T: serde::de::DeserializeOwned>(
+    file: &str,
+    bytes: &[u8],
+) -> Result<T, DataCapsuleError> {
+    serde_json::from_slice(bytes).map_err(|e| DataCapsuleError::Json {
         file: file.to_owned(),
         message: e.to_string(),
     })
@@ -144,13 +148,13 @@ fn join(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, s| p.join(s))
 }
 
-fn read_file(root: &Path, rel: &str) -> Result<Vec<u8>, CapsuleError> {
+fn read_file(root: &Path, rel: &str) -> Result<Vec<u8>, DataCapsuleError> {
     let path = join(root, rel);
     std::fs::read(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            CapsuleError::Integrity(format!("file is missing: {rel}"))
+            DataCapsuleError::Integrity(format!("file is missing: {rel}"))
         } else {
-            CapsuleError::io(path, e)
+            DataCapsuleError::io(path, e)
         }
     })
 }
@@ -162,9 +166,9 @@ impl DataCapsule {
     ///
     /// # Errors
     ///
-    /// [`CapsuleError::NotEmpty`] when `dir` has content, an I/O error, or an
+    /// [`DataCapsuleError::NotEmpty`] when `dir` has content, an I/O error, or an
     /// unsafe name in the manifest.
-    pub fn write_dir(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), CapsuleError> {
+    pub fn write_dir(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
         let created = prepare_empty_dir(dir)?;
         let result = self.write_files(dir, signer);
         if result.is_err() {
@@ -178,7 +182,7 @@ impl DataCapsule {
         result
     }
 
-    fn write_files(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), CapsuleError> {
+    fn write_files(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
         let mut manifest = self.manifest.clone();
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         for model in &mut manifest.models {
@@ -195,10 +199,9 @@ impl DataCapsule {
             files.push((model.file.clone(), to_json(&model.file, records)?));
         }
         for blob in &manifest.blobs {
-            let bytes = self
-                .blobs
-                .get(&blob.sha256)
-                .ok_or_else(|| CapsuleError::Blob(format!("no bytes for blob {:?}", blob.key)))?;
+            let bytes = self.blobs.get(&blob.sha256).ok_or_else(|| {
+                DataCapsuleError::Blob(format!("no bytes for blob {:?}", blob.key))
+            })?;
             files.push((blob.file(), bytes.to_vec()));
         }
         files.extend(super::viewer::render(&manifest, &self.records));
@@ -209,13 +212,13 @@ impl DataCapsule {
             .collect();
         for (rel, bytes) in &files {
             if !is_safe_rel_path(rel) {
-                return Err(CapsuleError::InvalidName(rel.clone()));
+                return Err(DataCapsuleError::InvalidName(rel.clone()));
             }
             let path = join(dir, rel);
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| CapsuleError::io(parent, e))?;
+                std::fs::create_dir_all(parent).map_err(|e| DataCapsuleError::io(parent, e))?;
             }
-            std::fs::write(&path, bytes).map_err(|e| CapsuleError::io(path, e))?;
+            std::fs::write(&path, bytes).map_err(|e| DataCapsuleError::io(path, e))?;
         }
 
         let manifest_bytes = to_json(MANIFEST_FILE, &manifest)?;
@@ -225,10 +228,10 @@ impl DataCapsule {
         };
         let manifest_path = dir.join(MANIFEST_FILE);
         std::fs::write(&manifest_path, &manifest_bytes)
-            .map_err(|e| CapsuleError::io(manifest_path, e))?;
+            .map_err(|e| DataCapsuleError::io(manifest_path, e))?;
         let signature_path = dir.join(SIGNATURE_FILE);
         std::fs::write(&signature_path, to_json(SIGNATURE_FILE, &signature)?)
-            .map_err(|e| CapsuleError::io(signature_path, e))
+            .map_err(|e| DataCapsuleError::io(signature_path, e))
     }
 
     /// Verify the capsule in `dir`, then read it.
@@ -236,14 +239,16 @@ impl DataCapsule {
     /// # Errors
     ///
     /// The errors of [`verify_dir`], or a record file that is not valid.
-    pub fn read_dir(dir: &Path, signer: &CapsuleSigner) -> Result<Self, CapsuleError> {
+    pub fn read_dir(dir: &Path, signer: &CapsuleSigner) -> Result<Self, DataCapsuleError> {
         let (manifest, mut contents) = load_verified(dir, signer)?;
         let mut records = BTreeMap::new();
         for model in &manifest.models {
-            let bytes = contents.remove(&model.file).unwrap_or_default();
+            let bytes = contents.remove(&model.file).ok_or_else(|| {
+                DataCapsuleError::Integrity(format!("no record file for {}", model.table))
+            })?;
             let rows: Vec<Record> = from_json(&model.file, &bytes)?;
             if rows.len() as u64 != model.record_count {
-                return Err(CapsuleError::Integrity(format!(
+                return Err(DataCapsuleError::Integrity(format!(
                     "{} has {} records, the manifest says {}",
                     model.file,
                     rows.len(),
@@ -252,14 +257,23 @@ impl DataCapsule {
             }
             records.insert(model.table.clone(), rows);
         }
-        let blobs = manifest
-            .blobs
-            .iter()
-            .map(|b| {
-                let bytes = contents.remove(&b.file()).unwrap_or_default();
-                (b.sha256.clone(), Bytes::from(bytes))
-            })
-            .collect();
+        // Two keys can share one file, so take the bytes by hash, one time.
+        let mut blobs = BTreeMap::new();
+        for blob in &manifest.blobs {
+            if !blobs.contains_key(&blob.sha256) {
+                let bytes = contents.remove(&blob.file()).ok_or_else(|| {
+                    DataCapsuleError::Integrity(format!("no file for blob {:?}", blob.key))
+                })?;
+                blobs.insert(blob.sha256.clone(), Bytes::from(bytes));
+            }
+            let bytes = &blobs[&blob.sha256];
+            if bytes.len() as u64 != blob.byte_size || sha256_hex(bytes) != blob.sha256 {
+                return Err(DataCapsuleError::Integrity(format!(
+                    "blob {:?} does not agree with its file",
+                    blob.key
+                )));
+            }
+        }
         Ok(Self {
             manifest,
             records,
@@ -269,18 +283,18 @@ impl DataCapsule {
 }
 
 /// Make sure `dir` is an empty directory. Give `true` when this call made it.
-fn prepare_empty_dir(dir: &Path) -> Result<bool, CapsuleError> {
+fn prepare_empty_dir(dir: &Path) -> Result<bool, DataCapsuleError> {
     match std::fs::read_dir(dir) {
         Ok(mut entries) => {
             if entries.next().is_some() {
-                return Err(CapsuleError::NotEmpty(dir.to_path_buf()));
+                return Err(DataCapsuleError::NotEmpty(dir.to_path_buf()));
             }
             Ok(false)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir)
             .map(|()| true)
-            .map_err(|e| CapsuleError::io(dir, e)),
-        Err(e) => Err(CapsuleError::io(dir, e)),
+            .map_err(|e| DataCapsuleError::io(dir, e)),
+        Err(e) => Err(DataCapsuleError::io(dir, e)),
     }
 }
 
@@ -290,13 +304,13 @@ fn prepare_empty_dir(dir: &Path) -> Result<bool, CapsuleError> {
 ///
 /// # Errors
 ///
-/// [`CapsuleError::Integrity`] for a check that fails,
-/// [`CapsuleError::UnsupportedFormat`] for an unknown format, or an I/O error.
-pub fn verify_dir(dir: &Path, signer: &CapsuleSigner) -> Result<VerifyReport, CapsuleError> {
+/// [`DataCapsuleError::Integrity`] for a check that fails,
+/// [`DataCapsuleError::UnsupportedFormat`] for an unknown format, or an I/O error.
+pub fn verify_dir(dir: &Path, signer: &CapsuleSigner) -> Result<VerifyReport, DataCapsuleError> {
     let (manifest, _) = load_verified(dir, signer)?;
     Ok(VerifyReport {
         subject: manifest.subject.clone(),
-        files_checked: manifest.files.len(),
+        files_checked: manifest.files.len() as u64,
         records: manifest.models.iter().map(|m| m.record_count).sum(),
     })
 }
@@ -308,23 +322,35 @@ pub fn verify_dir(dir: &Path, signer: &CapsuleSigner) -> Result<VerifyReport, Ca
 fn load_verified(
     dir: &Path,
     signer: &CapsuleSigner,
-) -> Result<(CapsuleManifest, BTreeMap<String, Vec<u8>>), CapsuleError> {
+) -> Result<(CapsuleManifest, BTreeMap<String, Vec<u8>>), DataCapsuleError> {
+    // List the files before any read: a link or a device file fails here,
+    // so no read follows a link to `/dev/zero` or to a file outside.
+    let present = list_regular_files(dir)?;
+    for required in [MANIFEST_FILE, SIGNATURE_FILE] {
+        if !present.contains(required) {
+            return Err(DataCapsuleError::Integrity(format!(
+                "file is missing: {required}"
+            )));
+        }
+    }
     let manifest_bytes = read_file(dir, MANIFEST_FILE)?;
     let signature: SignatureFile = from_json(SIGNATURE_FILE, &read_file(dir, SIGNATURE_FILE)?)?;
     if signature.algorithm != ALGORITHM {
-        return Err(CapsuleError::UnsupportedFormat(format!(
+        return Err(DataCapsuleError::UnsupportedFormat(format!(
             "signature algorithm {:?}",
             signature.algorithm
         )));
     }
     if !signer.verify(&manifest_bytes, &signature.signature) {
-        return Err(CapsuleError::Integrity(
+        return Err(DataCapsuleError::Integrity(
             "the manifest signature does not agree with a known key".to_owned(),
         ));
     }
     let manifest: CapsuleManifest = from_json(MANIFEST_FILE, &manifest_bytes)?;
-    if manifest.format != FORMAT || manifest.format_version != FORMAT_VERSION {
-        return Err(CapsuleError::UnsupportedFormat(format!(
+    if manifest.format != DATA_CAPSULE_FORMAT
+        || manifest.format_version != DATA_CAPSULE_FORMAT_VERSION
+    {
+        return Err(DataCapsuleError::UnsupportedFormat(format!(
             "{} version {}",
             manifest.format, manifest.format_version
         )));
@@ -337,25 +363,40 @@ fn load_verified(
         .map(|m| m.file.clone())
         .chain(manifest.blobs.iter().map(super::model::BlobEntry::file))
         .collect();
+    for rel in manifest.files.keys() {
+        if !is_safe_rel_path(rel) {
+            return Err(DataCapsuleError::InvalidName(rel.clone()));
+        }
+        if !present.contains(rel) {
+            return Err(DataCapsuleError::Integrity(format!(
+                "file is missing: {rel}"
+            )));
+        }
+    }
+    if let Some(extra) = present.iter().find(|rel| {
+        *rel != MANIFEST_FILE && *rel != SIGNATURE_FILE && !manifest.files.contains_key(*rel)
+    }) {
+        return Err(DataCapsuleError::Integrity(format!(
+            "file is not in the manifest: {extra}"
+        )));
+    }
     let mut contents = BTreeMap::new();
     for (rel, expected) in &manifest.files {
-        if !is_safe_rel_path(rel) {
-            return Err(CapsuleError::InvalidName(rel.clone()));
-        }
         let bytes = read_file(dir, rel)?;
         if sha256_hex(&bytes) != *expected {
-            return Err(CapsuleError::Integrity(format!("file is changed: {rel}")));
+            return Err(DataCapsuleError::Integrity(format!(
+                "file is changed: {rel}"
+            )));
         }
         if wanted.contains(rel) {
             contents.insert(rel.clone(), bytes);
         }
     }
-    check_no_extra_files(dir, &manifest)?;
     Ok((manifest, contents))
 }
 
 /// Each model and blob file must be in `files`, with the correct name.
-fn check_manifest_refs(manifest: &CapsuleManifest) -> Result<(), CapsuleError> {
+fn check_manifest_refs(manifest: &CapsuleManifest) -> Result<(), DataCapsuleError> {
     for model in &manifest.models {
         check_model_names(
             &model.table,
@@ -365,7 +406,7 @@ fn check_manifest_refs(manifest: &CapsuleManifest) -> Result<(), CapsuleError> {
             &model.blob_columns,
         )?;
         if model.file != record_file(&model.table) || !manifest.files.contains_key(&model.file) {
-            return Err(CapsuleError::Integrity(format!(
+            return Err(DataCapsuleError::Integrity(format!(
                 "record file of {} is not in the manifest",
                 model.table
             )));
@@ -374,7 +415,7 @@ fn check_manifest_refs(manifest: &CapsuleManifest) -> Result<(), CapsuleError> {
     for blob in &manifest.blobs {
         // The file name is the hash, so the hash check covers the bytes.
         if manifest.files.get(&blob.file()) != Some(&blob.sha256) {
-            return Err(CapsuleError::Integrity(format!(
+            return Err(DataCapsuleError::Integrity(format!(
                 "blob {:?} does not agree with its file",
                 blob.key
             )));
@@ -383,38 +424,41 @@ fn check_manifest_refs(manifest: &CapsuleManifest) -> Result<(), CapsuleError> {
     Ok(())
 }
 
-fn check_no_extra_files(dir: &Path, manifest: &CapsuleManifest) -> Result<(), CapsuleError> {
+/// The relative paths of all files in `dir`.
+///
+/// # Errors
+///
+/// [`DataCapsuleError::Integrity`] for an entry that is not a regular file or a
+/// directory, for example a symbolic link.
+fn list_regular_files(dir: &Path) -> Result<BTreeSet<String>, DataCapsuleError> {
+    let mut files = BTreeSet::new();
     let mut stack = vec![(dir.to_path_buf(), String::new())];
     while let Some((path, prefix)) = stack.pop() {
-        let entries = std::fs::read_dir(&path).map_err(|e| CapsuleError::io(&path, e))?;
+        let entries = std::fs::read_dir(&path).map_err(|e| DataCapsuleError::io(&path, e))?;
         for entry in entries {
-            let entry = entry.map_err(|e| CapsuleError::io(&path, e))?;
+            let entry = entry.map_err(|e| DataCapsuleError::io(&path, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let rel = if prefix.is_empty() {
                 name
             } else {
                 format!("{prefix}/{name}")
             };
+            // `DirEntry::file_type` does not follow links.
             let kind = entry
                 .file_type()
-                .map_err(|e| CapsuleError::io(entry.path(), e))?;
+                .map_err(|e| DataCapsuleError::io(entry.path(), e))?;
             if kind.is_dir() {
                 stack.push((entry.path(), rel));
-            } else if !kind.is_file() {
-                return Err(CapsuleError::Integrity(format!(
+            } else if kind.is_file() {
+                files.insert(rel);
+            } else {
+                return Err(DataCapsuleError::Integrity(format!(
                     "entry is not a regular file: {rel}"
-                )));
-            } else if rel != MANIFEST_FILE
-                && rel != SIGNATURE_FILE
-                && !manifest.files.contains_key(&rel)
-            {
-                return Err(CapsuleError::Integrity(format!(
-                    "file is not in the manifest: {rel}"
                 )));
             }
         }
     }
-    Ok(())
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -471,7 +515,7 @@ mod tests {
         };
         assert!(matches!(
             CapsuleSigner::from_config(&config),
-            Err(CapsuleError::MissingSigningSecret)
+            Err(DataCapsuleError::MissingSigningSecret)
         ));
     }
 }

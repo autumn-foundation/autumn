@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use autumn_web::gdpr::portability::{
-    CapsuleError, CapsuleModel, CapsuleSigner, DataCapsule, FieldSpec, MemoryCapsuleStore,
+    CapsuleModel, CapsuleSigner, DataCapsule, DataCapsuleError, FieldSpec, MemoryCapsuleStore,
     export_subject, import_capsule, verify_dir,
 };
 use autumn_web::gdpr::{GdprRegistry, ModelRegistration};
@@ -160,7 +160,7 @@ async fn export_rejects_an_unsafe_table_name() {
     let err = export_subject(&models, &seeded_store(), "1")
         .await
         .expect_err("unsafe name must fail");
-    assert!(matches!(err, CapsuleError::InvalidName(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::InvalidName(_)), "{err:?}");
 }
 
 // ── Archive layout ──────────────────────────────────────────────────────────
@@ -199,7 +199,7 @@ async fn write_dir_refuses_a_directory_that_is_not_empty() {
     let err = capsule
         .write_dir(dir.path(), &signer())
         .expect_err("non-empty dir");
-    assert!(matches!(err, CapsuleError::NotEmpty(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::NotEmpty(_)), "{err:?}");
     assert_eq!(read(&dir.path().join("keep.txt")), "user data");
 }
 
@@ -210,7 +210,7 @@ async fn write_dir_removes_a_partial_capsule_on_error() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("capsule");
     let err = capsule.write_dir(&root, &signer()).expect_err("bad name");
-    assert!(matches!(err, CapsuleError::InvalidName(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::InvalidName(_)), "{err:?}");
     assert!(
         !root.exists(),
         "a failed write must leave no partial capsule"
@@ -241,7 +241,7 @@ async fn verify_detects_a_changed_record_file() {
     let tampered = read(&path).replace("Hello & welcome", "Hello & goodbye");
     std::fs::write(&path, tampered).unwrap();
     let err = verify_dir(&root, &signer()).expect_err("tamper");
-    assert!(matches!(err, CapsuleError::Integrity(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -254,7 +254,7 @@ async fn verify_detects_a_changed_manifest() {
     )
     .unwrap();
     let err = verify_dir(&root, &signer()).expect_err("tamper");
-    assert!(matches!(err, CapsuleError::Integrity(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -262,7 +262,7 @@ async fn verify_detects_an_added_file() {
     let (_dir, root) = written().await;
     std::fs::write(root.join("viewer/evil.js"), "alert(1)").unwrap();
     let err = verify_dir(&root, &signer()).expect_err("extra file");
-    assert!(matches!(err, CapsuleError::Integrity(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -270,7 +270,7 @@ async fn verify_detects_a_removed_file() {
     let (_dir, root) = written().await;
     std::fs::remove_file(root.join("records/comments.json")).unwrap();
     let err = verify_dir(&root, &signer()).expect_err("missing file");
-    assert!(matches!(err, CapsuleError::Integrity(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -278,21 +278,137 @@ async fn verify_rejects_a_capsule_signed_with_another_key() {
     let (_dir, root) = written().await;
     let other = CapsuleSigner::new(b"another-secret-0123456789abcdefgh");
     let err = verify_dir(&root, &other).expect_err("wrong key");
-    assert!(matches!(err, CapsuleError::Integrity(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
 }
 
 #[tokio::test]
 async fn read_dir_does_not_load_a_tampered_capsule() {
     let (_dir, root) = written().await;
     std::fs::write(root.join("records/users.json"), "[]").unwrap();
-    assert!(DataCapsule::read_dir(&root, &signer()).is_err());
+    let err = DataCapsule::read_dir(&root, &signer()).expect_err("tampered");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn verify_rejects_an_unknown_signature_algorithm() {
+    let (_dir, root) = written().await;
+    let path = root.join("signature.json");
+    std::fs::write(&path, read(&path).replace("HMAC-SHA256", "none")).unwrap();
+    let err = verify_dir(&root, &signer()).expect_err("algorithm");
+    assert!(
+        matches!(err, DataCapsuleError::UnsupportedFormat(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn verify_rejects_a_missing_signature() {
+    let (_dir, root) = written().await;
+    std::fs::remove_file(root.join("signature.json")).unwrap();
+    let err = verify_dir(&root, &signer()).expect_err("no signature");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+}
+
+/// Change the manifest, then sign it again with the correct key.
+fn resign(root: &Path, change: impl FnOnce(&mut Value)) {
+    let mut manifest: Value = serde_json::from_str(&read(&root.join("manifest.json"))).unwrap();
+    change(&mut manifest);
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    let signature = json!({"algorithm": "HMAC-SHA256", "signature": signer().sign(&bytes)});
+    std::fs::write(root.join("manifest.json"), &bytes).unwrap();
+    std::fs::write(root.join("signature.json"), signature.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn read_dir_rejects_a_record_count_that_does_not_agree() {
+    let (_dir, root) = written().await;
+    resign(&root, |m| m["models"][0]["record_count"] = json!(5));
+    let err = DataCapsule::read_dir(&root, &signer()).expect_err("count");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn verify_rejects_a_signed_manifest_with_an_unsafe_path() {
+    for bad in ["../outside.json", "a/b/c/d", "/etc/passwd", ".hidden"] {
+        let (_dir, root) = written().await;
+        resign(&root, |m| m["files"][bad] = json!("00"));
+        let err = verify_dir(&root, &signer()).expect_err(bad);
+        assert!(
+            matches!(err, DataCapsuleError::InvalidName(_)),
+            "{bad}: {err:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn verify_rejects_a_symlink_before_it_reads_a_file() {
+    // A link to /dev/zero would make a read run without end. Verify must
+    // find the link first.
+    let (_dir, root) = written().await;
+    let file = root.join("records/users.json");
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink("/dev/zero", &file).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        verify_dir(&root, &signer())
+    })
+    .await
+    .expect("verify must not read the link");
+    assert!(
+        matches!(result, Err(DataCapsuleError::Integrity(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn excluded_columns_are_not_in_the_capsule() {
+    let models = [CapsuleModel::new("users", "id").exclude("bio")];
+    let capsule = export_subject(&models, &seeded_store(), "1").await.unwrap();
+    assert!(capsule.records("users")[0].get("bio").is_none());
+    let users = capsule.manifest.model("users").unwrap();
+    assert!(users.fields.iter().all(|f| f.name != "bio"));
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("capsule");
+    capsule.write_dir(&root, &signer()).unwrap();
+    assert!(!read(&root.join("viewer/users/index.html")).contains("&lt;b&gt;hi"));
+}
+
+#[tokio::test]
+async fn every_viewer_link_points_at_a_file_and_an_anchor() {
+    let (_dir, root) = written().await;
+    let mut pages = vec![root.join("viewer/index.html")];
+    for table in ["users", "posts", "comments"] {
+        pages.push(root.join("viewer").join(table).join("index.html"));
+    }
+    let mut checked = 0;
+    for page in &pages {
+        let html = read(page);
+        for href in html.split("href=\"").skip(1) {
+            let href = &href[..href.find('"').unwrap()];
+            let (file, anchor) = href.split_once('#').unwrap_or((href, ""));
+            let target = page.parent().unwrap().join(file);
+            assert!(target.is_file(), "{} -> {href}", page.display());
+            if !anchor.is_empty() {
+                assert!(
+                    read(&target).contains(&format!("id=\"{anchor}\"")),
+                    "{} -> {href}",
+                    page.display()
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 10, "only {checked} links");
 }
 
 #[test]
 fn signer_needs_a_configured_secret() {
     let err = CapsuleSigner::from_config(&SigningSecretConfig::default())
         .expect_err("no secret must fail");
-    assert!(matches!(err, CapsuleError::MissingSigningSecret), "{err:?}");
+    assert!(
+        matches!(err, DataCapsuleError::MissingSigningSecret),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -399,7 +515,7 @@ async fn import_writes_parents_before_children() {
     let summary = import_capsule(&capsule, registry().capsule_models(), &target)
         .await
         .expect("import");
-    let order: Vec<&str> = summary.tables.iter().map(|(t, _)| t.as_str()).collect();
+    let order: Vec<&str> = summary.tables.iter().map(|t| t.table.as_str()).collect();
     assert_eq!(order, ["users", "posts", "comments"]);
 }
 
@@ -410,7 +526,7 @@ async fn import_rejects_a_table_the_app_did_not_register() {
     let err = import_capsule(&capsule, &only_users, &empty_store())
         .await
         .expect_err("unregistered table");
-    assert!(matches!(err, CapsuleError::UnknownTable(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::UnknownTable(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -424,7 +540,10 @@ async fn import_rejects_a_relationship_cycle() {
     let err = import_capsule(&capsule, &models, &empty_store())
         .await
         .expect_err("cycle");
-    assert!(matches!(err, CapsuleError::RelationshipCycle(_)), "{err:?}");
+    assert!(
+        matches!(err, DataCapsuleError::RelationshipCycle(_)),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -438,20 +557,23 @@ async fn import_fails_and_writes_nothing_on_a_key_conflict() {
     let err = import_capsule(&capsule, registry().capsule_models(), &target)
         .await
         .expect_err("conflict");
-    assert!(matches!(err, CapsuleError::Conflict(_)), "{err:?}");
+    assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
     assert!(target.rows("users").is_empty(), "import must be atomic");
 }
 
 #[tokio::test]
 async fn read_dir_rejects_an_unknown_format_version() {
     let capsule = export_ada(&seeded_store()).await;
-    let mut future = capsule.clone();
+    let mut future = capsule;
     future.manifest.format_version = 99;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("capsule");
     future.write_dir(&root, &signer()).unwrap();
     let err = DataCapsule::read_dir(&root, &signer()).expect_err("version");
-    assert!(matches!(err, CapsuleError::UnsupportedFormat(_)), "{err:?}");
+    assert!(
+        matches!(err, DataCapsuleError::UnsupportedFormat(_)),
+        "{err:?}"
+    );
 }
 
 // ── Blobs ───────────────────────────────────────────────────────────────────
@@ -552,7 +674,7 @@ mod blobs {
 
         let users = read(&root.join("viewer/users/index.html"));
         assert!(
-            users.contains(&format!("href=\"../../blobs/{sha}\"")),
+            users.contains(&format!("href=\"../../blobs/{sha}\" download")),
             "{users}"
         );
     }
@@ -582,7 +704,7 @@ mod blobs {
         let err = restore_blobs(&capsule, &target_blobs)
             .await
             .expect_err("different bytes under the same key");
-        assert!(matches!(err, CapsuleError::Conflict(_)), "{err:?}");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
         assert_eq!(
             target_blobs.get("avatars/ada.png").await.unwrap(),
             Bytes::from_static(b"other")
@@ -598,6 +720,64 @@ mod blobs {
         .await
         .unwrap();
         assert_eq!(restore_blobs(&capsule, &same).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_keys_with_the_same_bytes_keep_their_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
+            source_blobs
+                .put(key, "image/png", Bytes::from_static(b"same"))
+                .await
+                .unwrap();
+        }
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source_blobs).await.unwrap();
+        assert_eq!(capsule.manifest.blobs.len(), 2);
+        let root = tmp.path().join("capsule");
+        capsule.write_dir(&root, &signer()).unwrap();
+        let loaded = DataCapsule::read_dir(&root, &signer()).unwrap();
+        let target_blobs = blob_store(&tmp.path().join("b"));
+        restore_blobs(&loaded, &target_blobs).await.unwrap();
+        for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
+            assert_eq!(
+                target_blobs.get(key).await.unwrap(),
+                Bytes::from_static(b"same"),
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_without_a_blob_store_rejects_a_capsule_with_blobs() {
+        use std::sync::Arc;
+
+        use autumn_web::gdpr::portability::CapsuleService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        let source = CapsuleService::new(models(), Arc::new(store()), signer())
+            .with_blob_store(Arc::new(source_blobs));
+        let root = tmp.path().join("capsule");
+        let report = source.export_to("1", &root).await.unwrap();
+        assert_eq!(report.blobs, 1);
+
+        let empty = MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("avatar", "jsonb").nullable(),
+                FieldSpec::new("cv_key", "text").nullable(),
+            ],
+        );
+        let target = CapsuleService::new(models(), Arc::new(empty), signer());
+        let err = target.import_from(&root).await.expect_err("no blob store");
+        assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -623,7 +803,7 @@ mod blobs {
         let sha = capsule.manifest.blobs[0].sha256.clone();
         std::fs::write(root.join("blobs").join(sha), b"evil").unwrap();
         let err = verify_dir(&root, &signer()).expect_err("blob tamper");
-        assert!(matches!(err, CapsuleError::Integrity(_)), "{err:?}");
+        assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
     }
 }
 
@@ -658,7 +838,7 @@ mod service {
         assert_eq!(report.blobs, 0);
 
         let target = service(empty_store());
-        assert_eq!(target.verify(&root).expect("verify").records, 4);
+        assert_eq!(target.verify(&root).await.expect("verify").records, 4);
         let summary = target.import_from(&root).await.expect("import");
         assert_eq!(summary.records, 4);
     }
@@ -670,7 +850,7 @@ mod service {
             .export_to("", &dir.path().join("c"))
             .await
             .expect_err("empty subject");
-        assert!(matches!(err, CapsuleError::InvalidName(_)), "{err:?}");
+        assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
     }
 
     #[test]
@@ -680,14 +860,14 @@ mod service {
         assert_eq!(svc.capsule_path("ada-1").unwrap(), dir.path().join("ada-1"));
         for bad in ["../x", "a/b", "", ".hidden", "a\\b"] {
             assert!(
-                matches!(svc.capsule_path(bad), Err(CapsuleError::InvalidName(_))),
+                matches!(svc.capsule_path(bad), Err(DataCapsuleError::InvalidName(_))),
                 "{bad}"
             );
         }
         let no_dir = service(empty_store());
         assert!(matches!(
             no_dir.capsule_path("ada-1"),
-            Err(CapsuleError::NotConfigured(_))
+            Err(DataCapsuleError::NotConfigured(_))
         ));
     }
 
@@ -705,7 +885,7 @@ mod service {
     #[test]
     fn from_state_needs_registered_capsule_models() {
         let err = CapsuleService::from_state(&AppState::for_test()).expect_err("no models");
-        assert!(matches!(err, CapsuleError::NotConfigured(_)), "{err:?}");
+        assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
     }
 
     #[test]

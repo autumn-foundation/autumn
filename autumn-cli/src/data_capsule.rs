@@ -150,6 +150,7 @@ fn clear_competing_one_shot_env(command: &mut Command) {
     for var in [
         "AUTUMN_BUILD_STATIC",
         "AUTUMN_DUMP_ROUTES",
+        "AUTUMN_DUMP_OPENAPI",
         "AUTUMN_DUMP_CACHE_COHERENCE",
         "AUTUMN_DUMP_DATA_FLOW",
         "AUTUMN_DUMP_AGENT_AUTHORITY",
@@ -226,11 +227,26 @@ mod tests {
         }
     }
 
-    fn env_of(command: &Command, var: &str) -> Option<Option<String>> {
-        command
+    /// The state of one env var on a command.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Env {
+        /// Not touched: the child inherits it.
+        Inherited,
+        /// Explicitly removed.
+        Removed,
+        /// Set to a value.
+        Set(String),
+    }
+
+    fn env_of(command: &Command, var: &str) -> Env {
+        match command
             .get_envs()
             .find(|(k, _)| *k == std::ffi::OsStr::new(var))
-            .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        {
+            None => Env::Inherited,
+            Some((_, None)) => Env::Removed,
+            Some((_, Some(v))) => Env::Set(v.to_string_lossy().into_owned()),
+        }
     }
 
     #[test]
@@ -256,19 +272,20 @@ mod tests {
             false,
         );
         let cmd = build_command(Path::new("/bin/true"), &o, Path::new("/tmp/c"));
-        assert_eq!(env_of(&cmd, MODE_ENV), Some(Some("export".into())));
-        assert_eq!(env_of(&cmd, SUBJECT_ENV), Some(Some("42".into())));
-        assert_eq!(env_of(&cmd, PATH_ENV), Some(Some("/tmp/c".into())));
-        assert_eq!(env_of(&cmd, "AUTUMN_DB_RETENTION"), Some(None));
-        assert_eq!(env_of(&cmd, "AUTUMN_RUN_TASK"), Some(None));
+        assert_eq!(env_of(&cmd, MODE_ENV), Env::Set("export".into()));
+        assert_eq!(env_of(&cmd, SUBJECT_ENV), Env::Set("42".into()));
+        assert_eq!(env_of(&cmd, PATH_ENV), Env::Set("/tmp/c".into()));
+        assert_eq!(env_of(&cmd, "AUTUMN_DB_RETENTION"), Env::Removed);
+        assert_eq!(env_of(&cmd, "AUTUMN_RUN_TASK"), Env::Removed);
+        assert_eq!(env_of(&cmd, "AUTUMN_DUMP_OPENAPI"), Env::Removed);
     }
 
     #[test]
     fn import_command_removes_an_inherited_subject() {
         let o = opts(CapsuleAction::Import, "dev", false);
         let cmd = build_command(Path::new("/bin/true"), &o, Path::new("/tmp/c"));
-        assert_eq!(env_of(&cmd, MODE_ENV), Some(Some("import".into())));
-        assert_eq!(env_of(&cmd, SUBJECT_ENV), Some(None));
+        assert_eq!(env_of(&cmd, MODE_ENV), Env::Set("import".into()));
+        assert_eq!(env_of(&cmd, SUBJECT_ENV), Env::Removed);
     }
 
     #[test]
@@ -276,7 +293,7 @@ mod tests {
         let mut cmd = Command::new("/bin/true");
         clear_inherited_one_shot_env(&mut cmd);
         for var in ONE_SHOT_ENV {
-            assert_eq!(env_of(&cmd, var), Some(None), "{var}");
+            assert_eq!(env_of(&cmd, var), Env::Removed, "{var}");
         }
     }
 

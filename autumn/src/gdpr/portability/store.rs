@@ -5,10 +5,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use super::model::{CapsuleError, CapsuleModel, FieldSpec, ModelManifest, Record, value_key};
+use super::model::{CapsuleModel, DataCapsuleError, FieldSpec, ModelManifest, Record, value_key};
 
 /// The future type of [`CapsuleStore`] methods.
-pub type CapsuleFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, CapsuleError>> + Send + 'a>>;
+pub type CapsuleFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, DataCapsuleError>> + Send + 'a>>;
 
 /// The records of one table to import.
 #[derive(Debug, Clone, Copy)]
@@ -20,10 +21,21 @@ pub struct ImportBatch<'a> {
     pub records: &'a [Record],
 }
 
+impl<'a> ImportBatch<'a> {
+    /// Make a batch.
+    #[must_use]
+    pub const fn new(model: &'a ModelManifest, records: &'a [Record]) -> Self {
+        Self { model, records }
+    }
+}
+
+/// The columns and the records of one model.
+pub type ModelData = (Vec<FieldSpec>, Vec<Record>);
+
 /// A data source and target for capsules.
 ///
-/// [`MemoryCapsuleStore`] is for tests. `PgCapsuleStore` (feature `db`) is
-/// for Postgres.
+/// [`MemoryCapsuleStore`] is for tests. `PgCapsuleStore` is for Postgres
+/// (feature `db`, not with `sqlite`).
 pub trait CapsuleStore: Send + Sync {
     /// Give the columns of the table of `model`.
     fn describe<'a>(&'a self, model: &'a CapsuleModel) -> CapsuleFuture<'a, Vec<FieldSpec>>;
@@ -34,6 +46,28 @@ pub trait CapsuleStore: Send + Sync {
         model: &'a CapsuleModel,
         subject: &'a str,
     ) -> CapsuleFuture<'a, Vec<Record>>;
+
+    /// Give the columns and records of each model, in the order of `models`.
+    ///
+    /// The default calls [`describe`](Self::describe) and
+    /// [`fetch`](Self::fetch) for each model. A store with transactions
+    /// overrides it to read all models from one snapshot.
+    fn fetch_subject<'a>(
+        &'a self,
+        models: &'a [CapsuleModel],
+        subject: &'a str,
+    ) -> CapsuleFuture<'a, Vec<ModelData>> {
+        Box::pin(async move {
+            let mut data = Vec::with_capacity(models.len());
+            for model in models {
+                data.push((
+                    self.describe(model).await?,
+                    self.fetch(model, subject).await?,
+                ));
+            }
+            Ok(data)
+        })
+    }
 
     /// Write all batches in the given order, as one atomic unit.
     ///
@@ -105,8 +139,8 @@ impl MemoryCapsuleStore {
     }
 }
 
-fn unknown(table: &str) -> CapsuleError {
-    CapsuleError::Store(format!("unknown table {table:?}"))
+fn unknown(table: &str) -> DataCapsuleError {
+    DataCapsuleError::Store(format!("unknown table {table:?}"))
 }
 
 fn key_of(row: &Record, column: &str) -> Option<String> {
@@ -157,7 +191,7 @@ impl CapsuleStore for MemoryCapsuleStore {
                     if let Some(key) = key_of(record, pk)
                         && !seen.insert(key.clone())
                     {
-                        return Err(CapsuleError::Conflict(format!(
+                        return Err(DataCapsuleError::Conflict(format!(
                             "{}.{pk} = {key} already exists",
                             batch.model.table
                         )));

@@ -1223,7 +1223,7 @@ impl crate::actuator::ProvideActuatorState for AppState {
 
     fn data_capsules(
         &self,
-    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::CapsuleError>
+    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::DataCapsuleError>
     {
         crate::gdpr::portability::CapsuleService::from_state(self)
     }
