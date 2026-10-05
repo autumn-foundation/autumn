@@ -17455,9 +17455,40 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
     } else {
         quote! {}
     };
-    let rows_read = |owner_filter: TokenStream| {
+    // Unlike `list`'s guard, this one also rejects when no shard set is
+    // configured: the read would drop the tenant filter and return one pool's
+    // rows as if they were all of them (#1741).
+    let rows_cross_shard_guard = |method: &str| {
+        if !(config.sharded && config.tenant_scoped) {
+            return quote! {};
+        }
+        let no_shard_set_msg = format!(
+            "cross-shard {method} requires a configured shard set: across_tenants() \
+             cannot read across shards without a shard set (the repository was built \
+             without shard context, e.g. via with_pool_untracked); build it with shard \
+             context instead"
+        );
+        let unsupported_msg = format!(
+            "cross-shard {method} is not supported: use find_all() with \
+             across_tenants() on a sharded repository instead"
+        );
         quote! {
-            #page_cross_shard_guard
+            if self.across_tenants {
+                if self.__autumn_shards.is_none() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                    );
+                }
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(#unsupported_msg)
+                );
+            }
+        }
+    };
+    let rows_read = |method: &str, owner_filter: TokenStream| {
+        let cross_shard_guard = rows_cross_shard_guard(method);
+        quote! {
+            #cross_shard_guard
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
             #[allow(unused_imports)]
@@ -17485,7 +17516,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
         /// Use it for a bulk read, such as an export. To detect more than
         /// `limit` rows, ask for one more row than you keep.
     };
-    let unscoped_rows_read = rows_read(quote! {});
+    let unscoped_rows_read = rows_read("list_rows", quote! {});
     let list_trait_method = quote! {
         #list_trait_method
 
@@ -17515,9 +17546,12 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
     {
         // The owner filter comes before the allowlist, so a request
         // `filter[..]` can only narrow the owner's rows.
-        let scoped_rows_read = rows_read(quote! {
-            let __q = __q.filter(#table_ident::#owner_col.eq(owner_id));
-        });
+        let scoped_rows_read = rows_read(
+            "list_scoped_rows",
+            quote! {
+                let __q = __q.filter(#table_ident::#owner_col.eq(owner_id));
+            },
+        );
         (
             quote! {
                 #list_scoped_trait_method
@@ -23986,9 +24020,44 @@ mod tests {
         .to_string();
         let rows = generated_method_body(&generated, "list_rows");
         assert!(
-            rows.contains("cross-shard pagination is not supported"),
+            rows.contains("cross-shard list_rows is not supported"),
             "list_rows must reject a cross-shard read like list: {rows}"
         );
+    }
+
+    #[test]
+    fn repository_list_rows_rejects_across_tenants_without_a_shard_set() {
+        // A sharded repository built without shard context (e.g.
+        // `with_pool_untracked`) has one pool. An across-tenant read there drops
+        // the tenant filter and reads that one shard: a partial result with no
+        // error. Reject it, as the derived reads do (#1741).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, owner = author_id },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        for method in ["list_rows", "list_scoped_rows"] {
+            let body = generated_method_body(&generated, method);
+            let guard = body
+                .find("if self . across_tenants")
+                .unwrap_or_else(|| panic!("{method} must check across_tenants: {body}"));
+            let no_shards = body
+                .find("if self . __autumn_shards . is_none ()")
+                .unwrap_or_else(|| panic!("{method} must check for a missing shard set: {body}"));
+            let read = body
+                .find("__autumn_acquire_read_conn")
+                .unwrap_or_else(|| panic!("{method} must read through the routed pool: {body}"));
+            assert!(
+                guard < no_shards && no_shards < read,
+                "{method} must reject a shardless across-tenant read before it reads: {body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "cross-shard {method} requires a configured shard set"
+                )),
+                "{method} must name the missing shard set: {body}"
+            );
+        }
     }
 
     #[test]

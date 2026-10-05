@@ -380,6 +380,8 @@ rows.truncate(MAX_ROWS);
 - Use a constant for `limit`. Do not take it from the request.
 - If you set `database.statement_timeout`, the whole read must finish in
   that time.
+- On a **sharded** repository, `across_tenants()` is rejected, as it is for
+  `list()`. Read each shard with `from_shard(...)` instead.
 
 With `#[repository(..., owner = <column>)]`, `list_scoped_rows(owner_id,
 query, limit)` does the same for one owner's rows. The scaffolded CSV export
