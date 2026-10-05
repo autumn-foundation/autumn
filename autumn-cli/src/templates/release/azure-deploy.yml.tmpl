@@ -248,6 +248,8 @@ jobs:
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
           AZURE_MIGRATE_JOB_NAME: ${{ vars.AZURE_MIGRATE_JOB_NAME }}
+          # Optional: set it only if you changed bootstrap_image in Terraform.
+          AZURE_BOOTSTRAP_IMAGE: ${{ vars.AZURE_BOOTSTRAP_IMAGE }}
 
       # ── Supply chain (issue #1615) ──────────────────────────────────────
       # Deliberately the LAST steps in the job. The image is already in the

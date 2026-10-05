@@ -39,6 +39,10 @@
 #   ACR_LOGIN_SERVER, IMAGE_TAG (the tag you pushed to ACR; not used by
 #   --remove-credentials)
 #
+# If you changed bootstrap_image in Terraform, also set
+# AZURE_BOOTSTRAP_IMAGE to that image. The script treats only a revision
+# that runs it as the placeholder.
+#
 # Needs: az (logged in) and jq.
 
 set -euo pipefail
@@ -56,6 +60,8 @@ esac
 : "${AZURE_RESOURCE_GROUP:?set AZURE_RESOURCE_GROUP (terraform output resource_group_name)}"
 : "${AZURE_MIGRATE_JOB_NAME:?set AZURE_MIGRATE_JOB_NAME (terraform output migrate_job_name)}"
 : "${ACR_LOGIN_SERVER:?set ACR_LOGIN_SERVER (terraform output acr_login_server)}"
+# The placeholder image (bootstrap_image in variables.tf).
+BOOTSTRAP_IMAGE="${AZURE_BOOTSTRAP_IMAGE:-mcr.microsoft.com/k8se/quickstart:latest}"
 if [ "$MODE" = cutover ]; then
   : "${IMAGE_TAG:?set IMAGE_TAG (the tag you pushed to ACR)}"
   IMAGE="$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG"
@@ -96,7 +102,8 @@ SAVED_INGRESS=$(jq -c '.properties.configuration.ingress // null | if . then del
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 # The active revisions decide if a real release runs. The template image is
 # not enough: after a canceled first cutover, the template has the real
-# image while the placeholder revision stays active.
+# image while the placeholder revision stays active. Only the bootstrap
+# image is the placeholder; a release from any registry is a real release.
 ACTIVE=$(az containerapp revision list \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -107,7 +114,7 @@ ACTIVE_REVISIONS=""
 while IFS=$'\t' read -r name image; do
   [ -n "$name" ] || continue
   ACTIVE_REVISIONS="$ACTIVE_REVISIONS $name"
-  case "$image" in "$ACR_LOGIN_SERVER"/*) RELEASED=1 ;; esac
+  [ "$image" = "$BOOTSTRAP_IMAGE" ] || RELEASED=1
 done <<< "$ACTIVE"
 # The identity of the job's ACR registry entry. The job can list other
 # registries too, so the script selects the entry by server.
