@@ -120,9 +120,13 @@ impl IdempotencyStore for DbIdempotencyStore {
     fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
+            let now = now_ms();
+            // A record is not replayable while its owner still holds the lock:
+            // the owner may still rewrite it (a session change) or fail.
             let record: Option<Option<Vec<u8>>> = keys::autumn_idempotency_keys
                 .filter(keys::storage_key.eq(key))
-                .filter(keys::expires_at_ms.gt(now_ms()))
+                .filter(keys::expires_at_ms.gt(now))
+                .filter(keys::locked_by.is_null().or(keys::locked_until_ms.le(now)))
                 .select(keys::record)
                 .first(&mut conn)
                 .await
@@ -346,6 +350,8 @@ impl IdempotencyTx {
     ///
     /// - `409` when this request no longer holds the key (its in-flight lock
     ///   expired and another request took it). The transaction must roll back.
+    /// - `500` when `conn` is not a primary database connection (for example,
+    ///   a shard). The key row is only on the primary database.
     /// - `500` when the body is larger than 10 MiB or cannot be read, or the
     ///   write fails.
     pub fn commit<'c>(
@@ -375,17 +381,18 @@ impl IdempotencyTx {
             let record =
                 cacheable_response_record(parts.status.as_u16(), &parts.headers, &bytes, metadata);
             let encoded = StoredEntry::encode(record, claim.body_hash.clone())?;
+            // The lock stays. The middleware releases it after the response
+            // is final; after a crash, the lock TTL frees it. Until then a
+            // retry gets `409`, not this record.
             let written = diesel::update(owned_key(&claim))
                 .set((
                     keys::record.eq(Some(encoded)),
-                    keys::locked_by.eq(None::<String>),
-                    keys::locked_until_ms.eq(0),
                     keys::expires_at_ms.eq(after(claim.ttl)),
                 ))
                 .execute(conn)
                 .await?;
             if written != 1 {
-                return Err(lock_lost());
+                return Err(claim_error(conn, &claim).await);
             }
             AtomicBool::store(&claim.committed, true, Ordering::SeqCst);
             Ok(Response::from_parts(parts, Body::from(bytes)))
@@ -417,7 +424,7 @@ impl IdempotencyTx {
             if written == 1 {
                 Ok(())
             } else {
-                Err(lock_lost())
+                Err(claim_error(conn, &claim).await)
             }
         }
     }
@@ -464,10 +471,28 @@ fn owned_key(claim: &TxClaim) -> HeldKey<'_> {
         .filter(keys::locked_by.eq(claim.owner.as_str()))
 }
 
-fn lock_lost() -> AutumnError {
-    AutumnError::conflict_msg(
-        "the idempotency key is held by another request; this transaction rolls back",
-    )
+/// The error for a write that found no row held by this request.
+///
+/// - The row is on this connection: another request took the key. `409`.
+/// - The row is not on this connection (for example, a shard connection):
+///   the write can never work. `500`.
+async fn claim_error(conn: &mut RuntimeConnection, claim: &TxClaim) -> AutumnError {
+    let found = keys::autumn_idempotency_keys
+        .filter(keys::storage_key.eq(claim.storage_key.as_str()))
+        .select(keys::storage_key)
+        .first::<String>(conn)
+        .await
+        .optional();
+    match found {
+        Ok(Some(_)) => AutumnError::conflict_msg(
+            "the idempotency key is held by another request; this transaction rolls back",
+        ),
+        Ok(None) => AutumnError::internal_server_error_msg(
+            "the idempotency key is not on this database connection; \
+             call IdempotencyTx on a primary `Db` connection, not a shard",
+        ),
+        Err(error) => error.into(),
+    }
 }
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for IdempotencyTx {

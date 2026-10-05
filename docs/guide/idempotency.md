@@ -179,8 +179,11 @@ async fn pay(idem: IdempotencyTx, mut db: Db) -> AutumnResult<axum::response::Re
 
 - The payment row and the stored response commit in one transaction, or
   neither commits.
-- If the process stops after the commit, the retry replays the stored
-  response. The handler does not run again.
+- If the process stops after the commit, a retry gets `409` until the
+  in-flight lock expires. Then it replays the stored response. The handler
+  does not run again.
+- The stored response is not replayed while the request still holds its
+  lock. So a retry never sees a response that is not final.
 - If the in-flight lock expired and another request took the key, `commit`
   returns `409` and the transaction rolls back. Only one request commits its
   database writes.
@@ -191,7 +194,10 @@ async fn pay(idem: IdempotencyTx, mut db: Db) -> AutumnResult<axum::response::Re
   response unchanged. The same handler works with every backend.
 - `commit` reads the whole body. A body larger than 10 MiB gives `500`.
 - If the handler also changes the session, Autumn rewrites the record after
-  the session is saved, so a replay gets the final `Set-Cookie`.
+  the session is saved, so a replay gets the final `Set-Cookie`. If the
+  session save fails, the record becomes replayable when the lock expires.
+- Call `commit` on a primary `Db` connection. The key row is not on a shard,
+  so `commit` on a `ShardedDb` connection gives `500`.
 - Autumn finds the store by its type. A wrapper around `DbIdempotencyStore`
   makes `commit` a no-op.
 

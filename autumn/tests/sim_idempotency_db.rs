@@ -81,7 +81,7 @@ struct CountRow {
 /// path. A `SQLite` query on a multi-thread runtime does not always suspend, so
 /// the number of awaits before the commit varies; a wide window here makes
 /// sure the sweep crashes inside it.
-const AFTER_COMMIT_AWAITS: usize = 16;
+const AFTER_COMMIT_AWAITS: usize = 8;
 
 /// Writes a payment and its response in one transaction.
 #[post("/pay")]

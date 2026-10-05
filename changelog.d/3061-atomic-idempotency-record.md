@@ -20,10 +20,11 @@
   `autumn_idempotency_keys`.
 - **idempotency:** the `IdempotencyTx` extractor. `IdempotencyTx::commit`
   writes the response in the handler's `Db::tx`, so the response commits with
-  the mutation. A crash after the commit no longer re-runs the mutation: the
-  retry replays the committed response. If a request's lock expired and
-  another request took the key, `commit` returns `409` and the transaction
-  rolls back.
+  the mutation. A crash after the commit no longer re-runs the mutation: when
+  the in-flight lock expires, the retry replays the committed response. If a
+  request's lock expired and another request took the key, `commit` returns
+  `409` and the transaction rolls back. Use it on a primary `Db` connection,
+  not a shard.
 - **idempotency:** `IdempotencyTx::set_recovery_point` and
   `IdempotencyTx::recovery_point` let a multi-step handler resume after a
   crash.
