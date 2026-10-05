@@ -1461,6 +1461,11 @@ jobs:
           }
           cargo test -p autumn-web --features repl --lib repl:: | tee "${RUNNER_TEMP}/repl-lib.log"
           assert_ran "${RUNNER_TEMP}/repl-lib.log" "autumn-web repl unit tests"
+          # SQLite cannot stop a running statement, so the prompt sets no call
+          # limit there. Only this build compiles that branch.
+          cargo test -p autumn-web --features "repl,sqlite" --lib repl:: \
+            | tee "${RUNNER_TEMP}/repl-sqlite-lib.log"
+          assert_ran "${RUNNER_TEMP}/repl-sqlite-lib.log" "autumn-web repl unit tests on SQLite"
           cargo test -p autumn-web --features "repl,test-support" --test integration_tests repl_ \
             -- --include-ignored | tee "${RUNNER_TEMP}/repl-integration.log"
           assert_ran "${RUNNER_TEMP}/repl-integration.log" "repl integration tests"

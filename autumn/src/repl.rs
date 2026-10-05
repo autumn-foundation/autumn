@@ -50,6 +50,15 @@ pub const PROMPT: &str = "autumn> ";
 /// at this limit.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The limit a new [`Bridge`] gets. `None` on SQLite: it cannot stop a
+/// running statement, so a limit would return to the prompt while the call
+/// still holds its pooled connection.
+const DEFAULT_LIMIT: Option<Duration> = if cfg!(feature = "sqlite") {
+    None
+} else {
+    Some(DEFAULT_CALL_TIMEOUT)
+};
+
 /// Extra time the prompt waits after the call timeout, so the server error
 /// arrives before the prompt gives up.
 const CLIENT_GRACE: Duration = Duration::from_secs(1);
@@ -152,30 +161,38 @@ pub fn clashing_repository_names() -> Vec<&'static str> {
 
 /// Runs async repository calls from the synchronous Rhai engine.
 ///
-/// Each call blocks on a runtime handle, with a time limit. A failure, a
-/// time-out, or a panic becomes an error message. It never unwinds into the
-/// engine.
+/// Each call blocks on a runtime handle, with a time limit on Postgres. A
+/// failure, a time-out, or a panic becomes an error message. It never unwinds
+/// into the engine.
 pub struct Bridge {
     handle: Handle,
     pool: ReplPool,
-    timeout: Duration,
+    timeout: Option<Duration>,
 }
 
 impl Bridge {
-    /// Makes a bridge with [`DEFAULT_CALL_TIMEOUT`].
+    /// Makes a bridge with [`DEFAULT_CALL_TIMEOUT`] on Postgres and no limit
+    /// on SQLite.
     #[must_use]
     pub const fn new(handle: Handle, pool: ReplPool) -> Self {
         Self {
             handle,
             pool,
-            timeout: DEFAULT_CALL_TIMEOUT,
+            timeout: DEFAULT_LIMIT,
         }
     }
 
     /// Sets the time limit for one call.
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Removes the time limit: each call runs until it finishes.
+    #[must_use]
+    pub const fn without_timeout(mut self) -> Self {
+        self.timeout = None;
         self
     }
 
@@ -185,10 +202,13 @@ impl Bridge {
         &self.pool
     }
 
-    /// The server statement timeout for one call, in milliseconds.
+    /// The server statement timeout for one call, in milliseconds. `0`
+    /// means none.
     #[must_use]
     pub fn statement_timeout_ms(&self) -> u64 {
-        u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX)
+        self.timeout.map_or(0, |timeout| {
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+        })
     }
 
     /// Blocks on `call` and returns its result.
@@ -197,16 +217,24 @@ impl Bridge {
     ///
     /// Returns a message when the call fails, times out, or panics.
     pub fn call<T>(&self, call: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-        let timeout = self.timeout.saturating_add(CLIENT_GRACE);
         // `block_on` panics inside an async context. `catch_unwind` turns that,
         // and a panic in the call, into a message.
         let blocked = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            self.handle
-                .block_on(async move { tokio::time::timeout(timeout, call).await })
+            self.handle.block_on(async move {
+                match self.timeout {
+                    Some(limit) => {
+                        tokio::time::timeout(limit.saturating_add(CLIENT_GRACE), call).await
+                    }
+                    None => Ok(call.await),
+                }
+            })
         }));
         match blocked {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(format!("call timed out after {}", humanize(self.timeout))),
+            Ok(Err(_)) => Err(format!(
+                "call timed out after {}",
+                humanize(self.timeout.unwrap_or_default())
+            )),
             Err(payload) => Err(format!(
                 "call panicked: {}",
                 panic_message(payload.as_ref())
@@ -949,6 +977,36 @@ mod tests {
         });
         assert_eq!(value, Ok(7));
         assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_bridge_without_a_limit_waits_for_the_call_and_sends_no_timeout() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let bridge = Bridge::new(rt.handle().clone(), lazy_pool())
+            .with_timeout(Duration::from_millis(10))
+            .without_timeout();
+        assert_eq!(bridge.statement_timeout_ms(), 0);
+        let value = bridge.call(async {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            Ok(7)
+        });
+        assert_eq!(value, Ok(7), "no client limit, not even the grace period");
+    }
+
+    #[test]
+    fn the_default_limit_follows_what_the_backend_can_cancel() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let bridge = Bridge::new(rt.handle().clone(), lazy_pool());
+        // SQLite cannot stop a running statement, so a client limit would
+        // return to the prompt while the call still holds its connection.
+        let expected = if cfg!(feature = "sqlite") { 0 } else { 30_000 };
+        assert_eq!(bridge.statement_timeout_ms(), expected);
     }
 
     #[test]

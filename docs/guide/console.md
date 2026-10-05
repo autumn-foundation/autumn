@@ -115,6 +115,8 @@ Second
 - Repository methods are `async`. Rhai is synchronous. Each call blocks on the
   runtime handle, with a 30-second limit. The database server stops the
   statement at that limit too.
+- On SQLite there is no limit. SQLite cannot stop a running statement, so the
+  prompt waits for each call to finish.
 - A failed call, a time-out, or a panic is a script error. The prompt stays
   open. A panic also prints the Rust panic message first.
 
