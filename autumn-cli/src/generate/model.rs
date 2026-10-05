@@ -356,10 +356,12 @@ fn plan_model_with_options_impl(
     }
     // The other way round: a `comments` table adopted as the shared one still
     // starts with this model's `CREATE TABLE`. Removing it breaks every other
-    // `#[commentable]` model on a fresh database.
+    // `#[commentable]` model on a fresh database. When a separate migration
+    // creates the shared table, this model's migration is not needed.
     if for_revert
         && table == super::commentable::COMMENTS_TABLE
         && super::commentable::another_model_is_still_commentable(project_root, &snake_name)
+        && !super::commentable::a_migration_creates_the_shared_table(project_root)
     {
         return Err(GenerateError::Config(format!(
             "cannot destroy `{pascal_name}`: other `#[commentable]` models use its \
@@ -7707,5 +7709,37 @@ autumn-web = \"0.3\"\n";
         )
         .expect_err("`Post` still needs the `comments` table");
         assert!(err.to_string().contains("#[commentable]"), "{err}");
+    }
+
+    /// The old behaviour left two migrations: the plain `Comment` one and the
+    /// shared one. The shared one stands alone, so `destroy` of `Comment` is
+    /// the repair and must not be refused.
+    #[test]
+    fn a_comment_model_revert_is_allowed_when_the_shared_migration_stands_alone() {
+        let tmp = project_with_the_shared_comments_table();
+        let plain = tmp.path().join("migrations/20260101000000_create_comments");
+        fs::create_dir_all(&plain).unwrap();
+        fs::write(
+            plain.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+        fs::write(
+            tmp.path().join("src/models/post.rs"),
+            "#[commentable]\npub struct Post {}\n",
+        )
+        .unwrap();
+
+        assert!(
+            plan_model_with_options_for_revert(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into()],
+                "20260101000000",
+                &ModelOptions::default(),
+            )
+            .is_ok()
+        );
     }
 }

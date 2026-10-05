@@ -161,6 +161,19 @@ pub fn already_migrated(project_root: &Path) -> bool {
     matches!(comments_table(project_root), CommentsTable::Shared)
 }
 
+/// Whether one migration, read alone, creates the whole shared table.
+///
+/// False for an adopted table: a plain `CREATE TABLE` plus a later `ALTER`.
+/// Then the plain migration is the foundation, and `destroy` must keep it.
+#[must_use]
+pub fn a_migration_creates_the_shared_table(project_root: &Path) -> bool {
+    migration_up_sql(project_root).into_iter().any(|sql| {
+        replay_migration_history(&[sql])
+            .get(&TableRef::comments())
+            .is_some_and(|table| table.exists && table.missing_columns().is_empty())
+    })
+}
+
 /// The `comments` table the migration history leaves behind.
 #[derive(Debug, PartialEq, Eq)]
 enum CommentsTable {
@@ -182,11 +195,7 @@ fn comments_table(project_root: &Path) -> CommentsTable {
     let tables = replay_migration_history(&migration_up_sql(project_root));
     match tables.get(&TableRef::comments()) {
         Some(table) if table.exists => {
-            let missing: Vec<&'static str> = REQUIRED_COLUMNS
-                .iter()
-                .copied()
-                .filter(|column| !table.columns.contains(column))
-                .collect();
+            let missing = table.missing_columns();
             if missing.is_empty() {
                 CommentsTable::Shared
             } else {
@@ -275,6 +284,17 @@ struct TableState {
     /// The table came from a rename of a table that no migration creates, so
     /// the replay cannot see its columns.
     columns_unknown: bool,
+}
+
+impl TableState {
+    /// The [`REQUIRED_COLUMNS`] this table does not carry.
+    fn missing_columns(&self) -> Vec<&'static str> {
+        REQUIRED_COLUMNS
+            .iter()
+            .copied()
+            .filter(|column| !self.columns.contains(column))
+            .collect()
+    }
 }
 
 /// What one statement does to one table in the replayed history.
