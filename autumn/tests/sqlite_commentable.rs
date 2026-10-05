@@ -15,6 +15,9 @@
 //! This proves the #2275 refusal, and the plain subtree-removal path it
 //! guards, against a real SQLite connection: no Docker, in-memory database.
 //!
+//! It also proves that a copy of a registered spec finds the repository of
+//! its model (issue #2286).
+//!
 //! Only meaningful under `--features sqlite` (same convention as
 //! `sqlite_dependent_destroy.rs`): `cargo test -p autumn-web --features
 //! sqlite --test sqlite_commentable`.
@@ -46,9 +49,18 @@ mod schema {
             comment_count -> Int8,
         }
     }
+
+    autumn_web::reexports::diesel::table! {
+        sqc_audits (id) {
+            id -> Int8,
+            title -> Text,
+            comment_count -> Int8,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
 }
 
-use schema::{sqc_hards, sqc_users};
+use schema::{sqc_audits, sqc_hards, sqc_users};
 
 #[autumn_web::model(table = "sqc_users")]
 pub struct SqcUser {
@@ -73,6 +85,51 @@ pub struct SqcHard {
 
 #[autumn_web::repository(SqcHard, table = "sqc_hards")]
 pub trait SqcHardRepository {}
+
+// Issue #2286: `deleted_at` is audit data here. The repository does not opt
+// into `soft_delete`, so the column must not hide the row.
+#[autumn_web::model(table = "sqc_audits")]
+#[commentable(by = SqcUser, table = sqc_audit_comments)]
+pub struct SqcAudit {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(SqcAudit, table = "sqc_audits")]
+pub trait SqcAuditRepository {}
+
+// Issue #2286: two models with equal specs. A copy cannot tell them apart.
+// Only the registry lookup uses them, so `sqc_twin_comments` has no table.
+mod twins {
+    use super::SqcUser;
+    use super::schema::sqc_audits;
+
+    #[autumn_web::model(table = "sqc_audits")]
+    #[commentable(by = SqcUser, table = sqc_twin_comments)]
+    pub struct SqcTwinA {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        #[default]
+        pub comment_count: i64,
+        pub deleted_at: Option<chrono::NaiveDateTime>,
+    }
+
+    #[autumn_web::model(table = "sqc_audits")]
+    #[commentable(by = SqcUser, table = sqc_twin_comments)]
+    pub struct SqcTwinB {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        #[default]
+        pub comment_count: i64,
+        pub deleted_at: Option<chrono::NaiveDateTime>,
+    }
+}
 
 #[derive(QueryableByName)]
 struct CountRow {
@@ -118,6 +175,22 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
          )",
         "CREATE INDEX idx_sqc_hard_comments_target ON sqc_hard_comments (commentable_type, commentable_id)",
         "CREATE INDEX idx_sqc_hard_comments_parent ON sqc_hard_comments (parent_id)",
+        "CREATE TABLE sqc_audits (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             title TEXT NOT NULL, \
+             comment_count BIGINT NOT NULL DEFAULT 0, \
+             deleted_at TIMESTAMP\
+         )",
+        "CREATE TABLE sqc_audit_comments (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             commentable_type TEXT NOT NULL, \
+             commentable_id BIGINT NOT NULL, \
+             parent_id BIGINT REFERENCES sqc_audit_comments(id), \
+             author_id BIGINT NOT NULL REFERENCES sqc_users(id), \
+             body TEXT NOT NULL, \
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             deleted_at TIMESTAMP\
+         )",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut *conn)
@@ -289,4 +362,95 @@ async fn a_hard_delete_refuses_a_cross_record_graft_on_sqlite() {
     );
     assert_eq!(counter(&pool, mine).await, 0);
     assert_eq!(counter(&pool, other).await, 2);
+}
+
+/// Issue #2286: a copy of the registered spec has a new address. The
+/// registry lookup must still find the model.
+#[test]
+fn a_copied_spec_resolves_to_its_registered_model() {
+    let copy = *SqcAudit::commentable_spec();
+    assert!(
+        !std::ptr::eq(&copy, SqcAudit::commentable_spec()),
+        "the copy must have its own address"
+    );
+    assert_eq!(
+        autumn_web::commentable::commentable_model_for_spec(&copy),
+        Some(std::any::type_name::<SqcAudit>()),
+    );
+}
+
+/// Issue #2286: when two models register equal specs, a copy is ambiguous
+/// and matches no model. Each registered reference still matches its own.
+#[test]
+fn a_copy_of_a_shared_spec_matches_no_model() {
+    use autumn_web::commentable::commentable_model_for_spec;
+    use twins::{SqcTwinA, SqcTwinB};
+
+    let copy = *SqcTwinA::commentable_spec();
+    assert_eq!(&copy, SqcTwinB::commentable_spec());
+    assert_eq!(
+        commentable_model_for_spec(&copy),
+        None,
+        "a copy must not pick one of two models"
+    );
+    assert_eq!(
+        commentable_model_for_spec(SqcTwinA::commentable_spec()),
+        Some(std::any::type_name::<SqcTwinA>()),
+    );
+    assert_eq!(
+        commentable_model_for_spec(SqcTwinB::commentable_spec()),
+        Some(std::any::type_name::<SqcTwinB>()),
+    );
+}
+
+/// Issue #2286: every public helper must accept a copy of the spec. An
+/// audit `deleted_at` must not hide the parent, because the repository does
+/// not opt into `soft_delete`.
+#[tokio::test]
+async fn a_copied_spec_keeps_the_repository_soft_delete_rule_on_sqlite() {
+    use autumn_web::commentable::{
+        add_comment, comment_thread, delete_comment, recompute_comment_count,
+    };
+
+    let pool = boot_pool("sqc_commentable_copied_spec").await;
+    let author = seed_user(&pool, "ada").await;
+    let target = {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO sqc_audits (title, deleted_at) VALUES ('t', CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("seed an audited parent");
+        drop(conn);
+        count(
+            &pool,
+            "SELECT id AS n FROM sqc_audits ORDER BY id DESC LIMIT 1",
+        )
+        .await
+    };
+
+    let spec = *SqcAudit::commentable_spec();
+    let kind = SqcAudit::COMMENTABLE_TYPE;
+    let mut conn = pool.get().await.expect("conn");
+
+    let comment = add_comment(&mut *conn, &spec, kind, target, author, "hi", None, None)
+        .await
+        .expect("add_comment: an audit deleted_at must not hide the parent");
+    let thread = comment_thread(&mut *conn, &spec, kind, target, None)
+        .await
+        .expect("comment_thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(
+        recompute_comment_count(&mut *conn, &spec, kind, target, None)
+            .await
+            .expect("recompute_comment_count"),
+        1
+    );
+    assert_eq!(
+        delete_comment(&mut *conn, &spec, kind, target, comment.id, None)
+            .await
+            .expect("delete_comment"),
+        1
+    );
 }

@@ -608,7 +608,8 @@ pub fn commentable_spec_for(type_name: &str) -> Option<&'static CommentableSpec>
         .map(|descriptor| descriptor.spec)
 }
 
-/// The model type name registered for `spec`, matched by IDENTITY.
+/// The model type name registered for `spec`, matched by identity, then by
+/// value.
 ///
 /// Not by discriminator: two models sharing a `commentable_type` while pointing
 /// at different comment tables is a supported helper-only shape (the router
@@ -616,15 +617,20 @@ pub fn commentable_spec_for(type_name: &str) -> Option<&'static CommentableSpec>
 /// — and with it the other model's repository facts, applying one model's
 /// soft-delete rule to the other's table.
 ///
-/// The registered specs are `&'static`, so address equality is exactly the
-/// question being asked. A hand-built spec matches nothing and the caller falls
-/// back to what the spec itself declares.
+/// The registered reference matches by address first. A copy has a new
+/// address (issue #2286), so the lookup then matches by value. A value that
+/// two models register is ambiguous and matches nothing. A spec that matches
+/// nothing makes the caller use what the spec itself declares.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn commentable_model_for_spec(spec: &CommentableSpec) -> Option<&'static str> {
-    inventory::iter::<CommentableDescriptor>()
-        .find(|descriptor| std::ptr::eq(descriptor.spec, spec))
-        .map(|descriptor| (descriptor.model)())
+    let registry = || inventory::iter::<CommentableDescriptor>();
+    if let Some(descriptor) = registry().find(|descriptor| std::ptr::eq(descriptor.spec, spec)) {
+        return Some((descriptor.model)());
+    }
+    let mut equal = registry().filter(|descriptor| descriptor.spec == spec);
+    let only = equal.next()?;
+    equal.next().is_none().then(|| (only.model)())
 }
 
 /// The model type name registered for `type_name`, or `None` when no
@@ -800,9 +806,7 @@ pub async fn add_comment(
         )));
     }
 
-    // Resolved from THIS `spec` reference, before it is copied below:
-    // `commentable_model_for_spec` (inside `resolve_soft_deletes`) matches the
-    // registry by pointer identity, which an owned copy would not carry.
+    // Resolved once, outside the transaction.
     let soft_deletes = resolve_soft_deletes(spec);
 
     // Owned copies so the transaction closure — which must be `'static`-ish
@@ -886,8 +890,6 @@ pub async fn delete_comment(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    // See `add_comment`'s comment: resolved before the copy below, from the
-    // spec reference the registry actually holds.
     let soft_deletes = resolve_soft_deletes(spec);
     let spec = *spec;
     let parent_type = parent_type.to_owned();
@@ -987,8 +989,6 @@ pub async fn recompute_comment_count(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    // See `add_comment`'s comment: resolved before either branch below copies
-    // or otherwise loses this reference's identity.
     let soft_deletes = resolve_soft_deletes(spec);
     let Some(counter_column) = spec.counter_column else {
         probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
@@ -1272,13 +1272,8 @@ fn build_nodes(
 /// serves deliberately. Only when no repository is registered does the
 /// column get to decide.
 ///
-/// Call this with the spec reference the `#[commentable]` registry actually
-/// holds. `commentable_model_for_spec` matches it by pointer identity
-/// (`std::ptr::eq`); a copy of the `Copy` `CommentableSpec` value lives at a
-/// new address and would never match, silently falling back to the column
-/// alone (issue #2263). Every public entry point in this module resolves
-/// this **before** it copies `spec` for its transaction closure, then passes
-/// the answer down explicitly — never re-derives it after the copy.
+/// A copy of a registered spec also finds its repository (issue #2286). See
+/// [`commentable_model_for_spec`].
 fn resolve_soft_deletes(spec: &CommentableSpec) -> bool {
     commentable_model_for_spec(spec)
         .and_then(model_soft_deletes)
