@@ -10,6 +10,7 @@ mod db_scrub;
 mod dependency_audit;
 mod dependency_dev_loop;
 mod deploy;
+mod destroy_module_import_features;
 mod destroy_provenance;
 mod edge;
 mod generate_json_postgres;
