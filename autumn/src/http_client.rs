@@ -2083,9 +2083,7 @@ impl RequestBuilder {
                         // Dropped unread — see `discard_response_body`.
                         Bytes::new()
                     } else {
-                        resp.bytes()
-                            .await
-                            .map_err(|e| ClientError::Request(e.without_url()))?
+                        resp.bytes().await.map_err(|e| gate.body_error(e))?
                     };
                     // Refund only after the body arrived.
                     gate.finish(last_retry, status.as_u16());
@@ -2830,6 +2828,16 @@ impl RetryGate {
         )
     }
 
+    /// The error of a failed body read: [`ClientError::DeadlineExceeded`] for
+    /// a timeout the request deadline caused, else [`ClientError::Request`].
+    fn body_error(&self, error: reqwest::Error) -> ClientError {
+        if error.is_timeout() && self.expired() {
+            ClientError::DeadlineExceeded
+        } else {
+            ClientError::Request(error.without_url())
+        }
+    }
+
     /// `error`, or [`ClientError::DeadlineExceeded`] when the request deadline
     /// has passed and so is the cause.
     fn classify(&self, error: ClientError) -> ClientError {
@@ -3197,9 +3205,7 @@ async fn send_one(
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
                     Bytes::new()
                 } else {
-                    resp.bytes()
-                        .await
-                        .map_err(|e| ClientError::Request(e.without_url()))?
+                    resp.bytes().await.map_err(|e| gate.body_error(e))?
                 };
                 // Refund only after the body arrived.
                 gate.finish(last_retry, status.as_u16());
@@ -5998,6 +6004,44 @@ mod tests {
                 hits.load(Ordering::SeqCst),
                 1,
                 "no retry after the deadline"
+            );
+        }
+
+        /// A server whose response head arrives at once and whose body never
+        /// ends.
+        async fn stalled_body() -> String {
+            let app = axum::Router::new().route(
+                "/x",
+                axum::routing::get(|| async {
+                    let stream = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+                    axum::response::Response::new(axum::body::Body::from_stream(stream))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://127.0.0.1:{}/x", addr.port())
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn a_body_stalled_past_the_deadline_is_deadline_exceeded() {
+            let _lock = lock();
+            let url = stalled_body().await;
+            let plain =
+                with_deadline(Duration::from_millis(300), Client::new().get(&url).send()).await;
+            assert!(
+                matches!(plain, Err(ClientError::DeadlineExceeded)),
+                "{plain:?}"
+            );
+            let custom = with_deadline(
+                Duration::from_millis(300),
+                Client::new().get(&url).no_redirect().send(),
+            )
+            .await;
+            assert!(
+                matches!(custom, Err(ClientError::DeadlineExceeded)),
+                "{custom:?}"
             );
         }
 
