@@ -2022,7 +2022,7 @@ impl RequestBuilder {
                 req = req.body(body.clone());
             }
 
-            let sent = send_in_span(req, span).await;
+            let sent = send_in_span(req, &span).await;
             match sent {
                 Ok(resp) => {
                     let status = resp.status();
@@ -2030,7 +2030,9 @@ impl RequestBuilder {
                     let url_used = resp.url().clone();
 
                     // 429 → honour Retry-After and retry if attempts remain.
+                    // End the attempt span first: the sleep is not the attempt.
                     if status.as_u16() == 429 && attempt + 1 < max_attempts {
+                        drop(span);
                         tokio::time::sleep(self.retry_after_delay(&headers)).await;
                         continue;
                     }
@@ -2044,7 +2046,7 @@ impl RequestBuilder {
                         // Dropped unread — see `discard_response_body`.
                         Bytes::new()
                     } else {
-                        resp.bytes()
+                        read_body_in_span(resp, &span)
                             .await
                             .map_err(|e| ClientError::Request(e.without_url()))?
                     };
@@ -2134,6 +2136,8 @@ impl RequestBuilder {
     /// Send through the simulated network (issue #2967), with the attempts,
     /// backoff, 429 handling and per-attempt timeout of the real retry loop.
     async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
+        use tracing::Instrument as _;
+
         let url = self.sim_url()?;
         let host = url
             .host_str()
@@ -2146,7 +2150,10 @@ impl RequestBuilder {
                 tokio::time::sleep(Duration::from_millis(100 * (1_u64 << exp))).await;
             }
             let last = attempt + 1 == max_attempts;
-            let exchange = self.sim_attempt(net, &host, &url);
+            // One CLIENT span per attempt, as on the real send paths. The host
+            // router sees this span in its `traceparent`.
+            let span = client_attempt_span(&self.method, url.as_str(), attempt);
+            let exchange = self.sim_attempt(net, &host, &url).instrument(span.clone());
             let outcome = match self.retry_policy.request_timeout {
                 Some(limit) => {
                     tokio::time::timeout(limit, exchange)
@@ -2159,6 +2166,18 @@ impl RequestBuilder {
                 }
                 None => exchange.await,
             };
+            match &outcome {
+                Ok(response) => {
+                    span.record("http.response.status_code", response.status.as_u16());
+                }
+                Err(SimAttemptError::Transient(_)) => {
+                    span.record("error.type", "network");
+                }
+                Err(SimAttemptError::Fatal(_)) => {
+                    span.record("error.type", "request");
+                }
+            }
+            drop(span);
             let response = match outcome {
                 Ok(response) => response,
                 // A drop or a timeout is transient, like a real connect or
@@ -2834,7 +2853,7 @@ async fn send_one(
         if let Some(d) = deadline {
             req = req.timeout(d.saturating_duration_since(crate::time::ambient_instant()));
         }
-        let span = client_attempt_span(method, url, attempt);
+        let mut span = client_attempt_span(method, url, attempt);
         req = span.in_scope(|| inject_trace_context(req, extra_headers));
         for (name, value) in extra_headers {
             req = req.header(name.clone(), value.clone());
@@ -2843,7 +2862,7 @@ async fn send_one(
             req = req.body(body.clone());
         }
 
-        match send_in_span(req, span).await {
+        match send_in_span(req, &span).await {
             Ok(resp) => {
                 let status = resp.status();
                 let headers = resp.headers().clone();
@@ -2860,6 +2879,9 @@ async fn send_one(
                         sleep_delay = sleep_delay
                             .min(d.saturating_duration_since(crate::time::ambient_instant()));
                     }
+                    // End the attempt span first: the sleep is not the attempt.
+                    // A 429 returned after the deadline reads its body unspanned.
+                    span = tracing::Span::none();
                     tokio::time::sleep(sleep_delay).await;
                     if deadline.is_none_or(|d| crate::time::ambient_instant() < d) {
                         continue;
@@ -2881,7 +2903,7 @@ async fn send_one(
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
                     Bytes::new()
                 } else {
-                    resp.bytes()
+                    read_body_in_span(resp, &span)
                         .await
                         .map_err(|e| ClientError::Request(e.without_url()))?
                 };
@@ -3197,14 +3219,29 @@ fn client_attempt_span(method: &Method, url: &str, attempt: u32) -> tracing::Spa
     span
 }
 
+/// Read the response body inside the attempt `span`, so the span covers the
+/// body transfer. A read failure sets `error.type = "body"`.
+async fn read_body_in_span(
+    response: reqwest::Response,
+    span: &tracing::Span,
+) -> Result<Bytes, reqwest::Error> {
+    use tracing::Instrument as _;
+
+    let body = response.bytes().instrument(span.clone()).await;
+    if body.is_err() {
+        span.record("error.type", "body");
+    }
+    body
+}
+
 /// Send `request` inside `span`, then record the status code or the error
 /// class on the span.
 ///
-/// Takes `span` by value: the span closes when this returns, so a
-/// `Retry-After` sleep after a 429 is not part of the attempt.
+/// The caller keeps `span` open through the body read, and ends it before a
+/// `Retry-After` sleep: the sleep is not part of the attempt.
 async fn send_in_span(
     request: reqwest::RequestBuilder,
-    span: tracing::Span,
+    span: &tracing::Span,
 ) -> Result<reqwest::Response, reqwest::Error> {
     use tracing::Instrument as _;
 
@@ -4326,6 +4363,152 @@ mod tests {
                 self.closed.lock().unwrap().push(start.elapsed());
             }
         }
+    }
+
+    /// Install both span capture layers on this thread, warm up the callsite,
+    /// and return them.
+    fn capture_client_spans() -> (
+        ClientSpanCapture,
+        ClientSpanDurations,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let fields = ClientSpanCapture::default();
+        let durations = ClientSpanDurations::default();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(fields.clone())
+                .with(durations.clone()),
+        );
+        drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
+        tracing::callsite::rebuild_interest_cache();
+        fields.spans.lock().unwrap().clear();
+        durations.closed.lock().unwrap().clear();
+        (fields, durations, guard)
+    }
+
+    // The attempt span stays open while the body streams, and records a body
+    // read failure.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn attempt_span_covers_the_response_body() {
+        use axum::{Router, body::Body, routing::get};
+        use futures::StreamExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    let stream = futures::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"late"))
+                    });
+                    Body::from_stream(stream)
+                }),
+            )
+            .route(
+                "/broken",
+                get(|| async {
+                    // Headers and one chunk go out, then the body fails.
+                    let stream = futures::stream::iter([
+                        Ok(Bytes::from_static(b"partial")),
+                        Err(std::io::Error::other("cut")),
+                    ])
+                    .then(|item| async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        item
+                    });
+                    Body::from_stream(stream)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for custom_path in [false, true] {
+            let (fields, durations, _guard) = capture_client_spans();
+            let mut slow = Client::new().get(format!("http://{addr}/slow"));
+            let mut broken = Client::new().get(format!("http://{addr}/broken"));
+            if custom_path {
+                slow = slow.no_redirect();
+                broken = broken.no_redirect();
+            }
+            assert_eq!(slow.send().await.unwrap().text(), "late");
+            let closed = durations.closed.lock().unwrap().clone();
+            assert_eq!(closed.len(), 1, "custom={custom_path}: {closed:?}");
+            assert!(
+                closed[0] >= Duration::from_millis(250),
+                "custom={custom_path}: the span ended before the body: {closed:?}"
+            );
+
+            fields.spans.lock().unwrap().clear();
+            assert!(broken.send().await.is_err());
+            let spans: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+            assert_eq!(spans.len(), 1, "custom={custom_path}: {spans:?}");
+            assert_eq!(
+                spans[0].get("error.type").map(String::as_str),
+                Some("body"),
+                "custom={custom_path}: {spans:?}"
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // A sim attempt opens a CLIENT span too, one per attempt.
+    #[tokio::test]
+    async fn sim_attempts_open_client_spans() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (fields, _durations, _guard) = capture_client_spans();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let payments = Router::new().route(
+            "/charge",
+            get(move || {
+                let calls = std::sync::Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let mut client = Client::new();
+        client.sim_net = Some(Arc::new(
+            crate::sim::SimNet::new().host("payments", payments),
+        ));
+
+        let response = client.get("http://payments/charge").send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+
+        let mut attempts: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+        attempts.sort_by_key(|f| f.get("http.request.resend_count").cloned());
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert_eq!(
+            attempts[0].get("server.address").map(String::as_str),
+            Some("payments")
+        );
+        assert_eq!(
+            attempts[0]
+                .get("http.response.status_code")
+                .map(String::as_str),
+            Some("503")
+        );
+        assert_eq!(
+            attempts[1]
+                .get("http.response.status_code")
+                .map(String::as_str),
+            Some("200")
+        );
     }
 
     // A 429 attempt span ends before the `Retry-After` sleep, so its duration
