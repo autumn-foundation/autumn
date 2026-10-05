@@ -106,8 +106,9 @@ Second
 - Only the modules that the playground declares with `#[path]` are compiled
   in: `schema`, `models`, `repositories` and `policies`. A repository in a
   different module is not at the prompt. Add a `#[path]` line for it.
-- The template line `autumn_web::console_repl!(ctx.pool());` opens the
-  prompt. Without `--repl`, that line does nothing.
+- `--repl` also sets `AUTUMN_CONSOLE_REPL=1`. Then `SeedContext::build()`
+  opens the prompt and ends the process when you exit. The playground code
+  after it never runs. Any playground works, also one from before `--repl`.
 - Repository methods are `async`. Rhai is synchronous. Each call blocks on the
   runtime handle, with a 30-second limit. The database server stops the
   statement at that limit too.
@@ -133,17 +134,6 @@ model uses that model's `Serialize` impl.
 - With `--repl`, `String + &String` in your app code does not compile. Write
   `s + other.as_str()` or use `format!`. (Rhai uses `smartstring`, which adds
   `impl Add<SmartString> for String`.)
-
-### A playground from before `--repl`
-
-An older `src/bin/playground.rs` has no `console_repl!` line. `--repl` stops
-and writes nothing. Add this line after `SeedContext::build()`:
-
-```rust
-autumn_web::console_repl!(ctx.pool());
-```
-
-Or regenerate the file with `autumn console --force`. This replaces your edits.
 
 ## Flags
 

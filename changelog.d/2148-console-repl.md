@@ -6,6 +6,6 @@
   JSON; `#[classified]`, `#[private]` and `#[serde(skip)]` fields do not show.
   `#[model]` and `#[repository]` register through `inventory`, behind the new
   off-by-default `repl` feature of autumn-web. `--repl` turns it on for the
-  run only and does not change `Cargo.toml`. The edit-and-run playground is
-  unchanged. A playground from before this release needs one line,
-  `autumn_web::console_repl!(ctx.pool());`. See `docs/guide/console.md`.
+  run only and does not change `Cargo.toml`. `SeedContext::build()` opens the
+  prompt, so any playground works and its body never runs in REPL mode. The
+  edit-and-run playground is unchanged. See `docs/guide/console.md`.

@@ -3294,8 +3294,9 @@ Two things to know when advising on it:
 - `autumn console --repl` (#2148) opens a Rhai prompt on the same binary. It
   adds `autumn-web/repl` on the command line only; `Cargo.toml` does not
   change. `#[model]` / `#[repository]` register through `inventory`; reads
-  only (`find_all`, `find_by_id`, `count`); rows are JSON. An older playground
-  needs `autumn_web::console_repl!(ctx.pool());` after `SeedContext::build()`.
+  only (`find_all`, `find_by_id`, `count`); rows are JSON. It also sets
+  `AUTUMN_CONSOLE_REPL=1`, so `SeedContext::build()` opens the prompt and
+  exits; the playground body never runs. The template is unchanged.
 
 `autumn i18n check` scans `**/*.rs` for string-literal keys passed to
 `t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via

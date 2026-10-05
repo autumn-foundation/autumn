@@ -96,14 +96,3 @@ fn no_workspace_member_turns_the_repl_on() {
         }
     }
 }
-
-/// Without the feature the playground hook expands to nothing: its argument is
-/// not evaluated and the code after it runs.
-#[cfg(not(feature = "repl"))]
-#[test]
-fn the_playground_hook_is_a_no_op_without_the_feature() {
-    let mut reached = false;
-    autumn_web::console_repl!(panic!("the hook must not evaluate its argument"));
-    reached = !reached;
-    assert!(reached);
-}

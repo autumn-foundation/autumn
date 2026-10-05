@@ -771,43 +771,9 @@ fn console_repl_does_not_change_the_manifest_wiring() {
     );
 }
 
-/// A playground from before #2148 has no hook. `--repl` must not run its
-/// edit-and-run body instead of a prompt, and must not write anything.
-#[test]
-fn console_repl_refuses_a_playground_without_the_hook() {
-    let (_tmp, project) = new_project("console-repl-nohook-app");
-    fs::create_dir_all(project.join("src/bin")).unwrap();
-    let edited = "// MY OLD PLAYGROUND\nfn main() {}\n";
-    fs::write(playground_path(&project), edited).unwrap();
-    let manifest_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
-
-    let out = run_autumn(&project, &["console", "--repl", "--scaffold-only"]);
-    assert!(
-        !out.status.success(),
-        "a hook-less playground must be refused"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("autumn_web::console_repl!(ctx.pool());"),
-        "the error names the line to add:\n{stderr}"
-    );
-    assert_eq!(
-        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
-        manifest_before,
-        "nothing is written on refusal"
-    );
-    assert_eq!(
-        fs::read_to_string(playground_path(&project)).unwrap(),
-        edited
-    );
-
-    // Plain `autumn console` still accepts the same file.
-    run_autumn_ok(&project, &["console", "--scaffold-only"]);
-}
-
 /// The REPL builds against a generated app and answers piped lines. The
 /// database is unreachable, so a repository read must be a script error and
-/// the session must still end cleanly.
+/// the session must still end cleanly. The edit-and-run body never runs.
 ///
 /// Ignored by default; run with:
 /// `cargo test -p autumn-cli --test cli_tests -- --ignored console_repl_runs`
@@ -824,6 +790,20 @@ fn console_repl_runs_and_reports_errors_as_script_errors() {
     );
     run_autumn_ok(&project, &["console", "--scaffold-only"]);
     patch_autumn_web_to_workspace(&project);
+
+    // REPL mode must not depend on the playground source: the body must not
+    // run, whatever it holds.
+    let src = fs::read_to_string(playground_path(&project)).unwrap();
+    let marker = "// ── your code here";
+    assert!(src.contains(marker), "{src}");
+    fs::write(
+        playground_path(&project),
+        src.replace(
+            marker,
+            "eprintln!(\"PLAYGROUND BODY RAN\");\n    // ── your code here",
+        ),
+    )
+    .unwrap();
 
     let mut child = Command::new(autumn_bin())
         .args(["console", "--repl"])
@@ -866,7 +846,7 @@ fn console_repl_runs_and_reports_errors_as_script_errors() {
     );
     assert!(!stderr.contains("panicked"), "never a panic:\n{stderr}");
     assert!(
-        !stderr.contains("autumn console: done."),
+        !stderr.contains("PLAYGROUND BODY RAN") && !stderr.contains("autumn console: done."),
         "the edit-and-run body does not run in REPL mode:\n{stderr}"
     );
 }

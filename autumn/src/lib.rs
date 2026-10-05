@@ -908,37 +908,6 @@ macro_rules! __autumn_register_repl_repository {
     ($($tokens:tt)*) => {};
 }
 
-/// Opens the console REPL and ends the process, or does nothing.
-///
-/// `autumn console` puts this line in `src/bin/playground.rs`.
-/// `autumn console --repl` builds the playground with `autumn-web/repl`: the
-/// line then opens an interactive Rhai prompt on `pool` and exits when the
-/// user stops. Without that feature the line expands to nothing, and the
-/// playground code after it runs.
-///
-/// Use it in an `async fn`.
-///
-/// ```ignore
-/// let ctx = autumn_web::seed::SeedContext::build()?;
-/// autumn_web::console_repl!(ctx.pool());
-/// ```
-#[cfg(feature = "repl")]
-#[macro_export]
-macro_rules! console_repl {
-    ($pool:expr $(,)?) => {
-        $crate::repl::exit_with($crate::repl::run($pool).await)
-    };
-}
-
-/// Opens the console REPL and ends the process, or does nothing.
-///
-/// This build of autumn-web has no `repl` feature, so the line expands to
-/// nothing. See `autumn console --repl`.
-#[cfg(not(feature = "repl"))]
-#[macro_export]
-macro_rules! console_repl {
-    ($($pool:tt)*) => {};
-}
 /// Widget story gallery (issue #1526).
 ///
 /// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget

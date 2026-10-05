@@ -2,7 +2,9 @@
 //!
 //! Enabled by the `repl` feature (off by default). `autumn console --repl`
 //! turns it on for the playground run only, so Rhai never reaches a normal
-//! build.
+//! build. It also sets `AUTUMN_CONSOLE_REPL=1`: then
+//! [`SeedContext::build`](crate::seed::SeedContext::build) opens the prompt
+//! and ends the process. The playground code after it never runs.
 //!
 //! `#[model]` and `#[repository]` register themselves here through
 //! `inventory`. Each repository becomes a Rhai module with three reads:
@@ -51,6 +53,9 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Extra time the prompt waits after the call timeout, so the server error
 /// arrives before the prompt gives up.
 const CLIENT_GRACE: Duration = Duration::from_secs(1);
+
+/// Set to `1` by `autumn console --repl`.
+pub const REPL_ENV: &str = "AUTUMN_CONSOLE_REPL";
 
 /// The history file, relative to the project directory.
 pub const HISTORY_FILE: &str = "target/autumn/repl_history.txt";
@@ -396,8 +401,58 @@ fn run_blocking(bridge: Bridge) -> Result<(), ReplError> {
     result
 }
 
-/// Ends the process with the result of [`run`]. Used by
-/// [`console_repl!`](crate::console_repl).
+/// Whether `autumn console --repl` started this process.
+#[must_use]
+pub fn requested() -> bool {
+    std::env::var_os(REPL_ENV).is_some_and(|value| value == "1")
+}
+
+/// Opens the prompt on `pool` from synchronous code and returns when the user
+/// exits.
+///
+/// Inside a multi-thread runtime, the prompt runs on a scoped thread and
+/// blocks on the runtime handle. With no runtime, it makes a dedicated one.
+///
+/// # Errors
+///
+/// Returns [`ReplError`] in a current-thread runtime (it cannot drive the
+/// calls while this thread waits), or when the prompt fails.
+pub fn run_here(pool: &ReplPool) -> Result<(), ReplError> {
+    use tokio::runtime::RuntimeFlavor;
+
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::CurrentThread => {
+            Err(ReplError::Thread(
+                "the REPL needs a multi-thread runtime; `#[autumn_web::main]` builds one".into(),
+            ))
+        }
+        Ok(handle) => {
+            let bridge = Bridge::new(handle, pool.clone());
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(move || run_blocking(bridge))
+                    .join()
+                    .unwrap_or_else(|payload| {
+                        Err(ReplError::Thread(panic_message(payload.as_ref())))
+                    })
+            })
+        }
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| ReplError::Thread(err.to_string()))?;
+            run_blocking(Bridge::new(runtime.handle().clone(), pool.clone()))
+        }
+    }
+}
+
+/// Opens the prompt (see [`run_here`]) and ends the process.
+pub fn run_in_place(pool: &ReplPool) -> ! {
+    exit_with(run_here(pool))
+}
+
+/// Ends the process with the result of the prompt.
 pub fn exit_with(result: Result<(), ReplError>) -> ! {
     match result {
         Ok(()) => std::process::exit(0),
@@ -916,6 +971,26 @@ mod tests {
             let row: Value = serde_json::from_str(&text).expect("JSON output");
             assert_eq!(row["title"], "Hello");
         });
+    }
+
+    // ── REPL mode is chosen by the environment ─────────────────────────
+    #[test]
+    fn requested_reads_the_console_environment_variable() {
+        temp_env::with_var(REPL_ENV, Some("1"), || assert!(requested()));
+        temp_env::with_var(REPL_ENV, Some("0"), || assert!(!requested()));
+        temp_env::with_var(REPL_ENV, None::<&str>, || assert!(!requested()));
+    }
+
+    #[test]
+    fn run_here_refuses_a_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let pool = lazy_pool();
+        let result = rt.block_on(async { run_here(&pool) });
+        let err = result.expect_err("a current-thread runtime cannot drive the prompt");
+        assert!(err.to_string().contains("multi-thread"), "{err}");
     }
 
     // ── built-ins and control lines ────────────────────────────────────

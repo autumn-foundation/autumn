@@ -139,15 +139,6 @@ pub enum ConsoleError {
          See: docs/guide/console.md"
     )]
     CannotIsolateOnEdition2015,
-
-    #[error(
-        "`{0}` has no `autumn_web::console_repl!(ctx.pool());` line, so `--repl` \
-         cannot open the prompt. Add that line after `SeedContext::build()`, or \
-         run `autumn console --force` to regenerate the file (this replaces \
-         your edits). Autumn changed nothing.\n\
-         See: docs/guide/console.md"
-    )]
-    PlaygroundLacksReplHook(String),
 }
 
 /// What the scaffolder did (or would do) with the playground source file.
@@ -242,11 +233,30 @@ const PLAYGROUND_TEMPLATE: &str = include_str!("templates/playground.rs.tmpl");
 /// It goes on the command line only, so `Cargo.toml` does not change.
 pub const REPL_FEATURE: &str = "autumn-web/repl";
 
-/// The macro that opens the REPL from the playground.
-const REPL_HOOK: &str = "console_repl";
+/// Tells `SeedContext::build()` to open the REPL and not return. autumn-web
+/// reads it only when it has the `repl` feature.
+const REPL_ENV: &str = "AUTUMN_CONSOLE_REPL";
 
-/// The crate the hook macro must come from when the call names a path.
-const REPL_HOOK_CRATE: &str = "autumn_web";
+/// The `cargo run` command for the playground.
+#[must_use]
+pub fn playground_command(
+    project_dir: &Path,
+    package: Option<&str>,
+    profile: &str,
+    repl: bool,
+) -> Command {
+    let mut cmd = Command::new("cargo");
+    cmd.args(playground_cargo_args(package, repl));
+    cmd.env("AUTUMN_ENV", profile);
+    cmd.env("AUTUMN_PROFILE", profile);
+    // Run from the project directory so the playground's `SeedContext` reads
+    // `autumn.toml` from the package root, not the workspace root.
+    cmd.current_dir(project_dir);
+    if repl {
+        cmd.env(REPL_ENV, "1");
+    }
+    cmd
+}
 
 /// The `cargo` arguments that build and run the playground.
 #[must_use]
@@ -267,41 +277,6 @@ pub fn playground_cargo_args(package: Option<&str>, repl: bool) -> Vec<String> {
         args.extend(["--package".to_owned(), pkg.to_owned()]);
     }
     args
-}
-
-/// Whether `source` calls `autumn_web::console_repl!(…)` (or a bare
-/// `console_repl!(…)`) in code, not in a comment or a string.
-///
-/// This catches a stale or renamed hook. It cannot prove that the call is on
-/// the path `main` runs.
-#[must_use]
-pub fn has_repl_hook(source: &str) -> bool {
-    let code = crate::rust_source::mask_non_code(source);
-    code.match_indices(REPL_HOOK)
-        .any(|(at, _)| is_hook_call(&code[..at], &code[at + REPL_HOOK.len()..]))
-}
-
-fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// `before` and `after` surround one `console_repl` match.
-fn is_hook_call(before: &str, after: &str) -> bool {
-    // `console_repl` then `!` then `(`, with optional spaces.
-    let is_call = after
-        .trim_start()
-        .strip_prefix('!')
-        .is_some_and(|rest| rest.trim_start().starts_with('('));
-    if !is_call || before.ends_with(is_ident_char) {
-        return false;
-    }
-    let before = before.trim_end();
-    let Some(path) = before.strip_suffix("::") else {
-        return true;
-    };
-    path.trim_end()
-        .strip_suffix(REPL_HOOK_CRATE)
-        .is_some_and(|rest| !rest.ends_with(is_ident_char))
 }
 
 /// Decide what to do with the playground source file.
@@ -1171,18 +1146,6 @@ fn report_manifest_edits(changes: ManifestChanges) {
 /// no-write-on-failure behaviour intact. A restore that itself fails is
 /// reported explicitly rather than swallowed — the user needs to know the
 /// manifest still carries the edits.
-/// Refuses `--repl` on a kept playground without the hook, before any write.
-/// Without the hook, its edit-and-run body would run instead of the prompt.
-fn require_repl_hook(playground_path: &Path, playground_rel: &str) {
-    let source =
-        std::fs::read_to_string(playground_path).unwrap_or_else(|e| fail_io(playground_path, &e));
-    if !has_repl_hook(&source) {
-        fail(&ConsoleError::PlaygroundLacksReplHook(
-            playground_rel.to_owned(),
-        ));
-    }
-}
-
 fn commit_playground(
     staged: &Path,
     playground_path: &Path,
@@ -1251,10 +1214,6 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     // Only a run that will actually write the file needs a usable destination:
     // an existing playground we are keeping is left alone either way.
     let outcome = scaffold_outcome(exists, force);
-    // A written playground comes from the template, which has the hook.
-    if repl && !outcome.writes_file() {
-        require_repl_hook(&playground_path, &playground_rel);
-    }
     if outcome.writes_file()
         && let Some(problem) = playground_destination_problem(&project_dir, &playground_rel)
     {
@@ -1320,13 +1279,7 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
         eprintln!("\n  Building and running the playground...\n");
     }
 
-    let mut cmd = Command::new("cargo");
-    cmd.args(playground_cargo_args(package, repl));
-    cmd.env("AUTUMN_ENV", profile);
-    cmd.env("AUTUMN_PROFILE", profile);
-    // Run from the project directory so the playground's `SeedContext` reads
-    // `autumn.toml` from the package root, not the workspace root.
-    cmd.current_dir(&project_dir);
+    let mut cmd = playground_command(&project_dir, package, profile, repl);
 
     match cmd.status() {
         Ok(status) if status.success() => {
@@ -1399,70 +1352,27 @@ mod tests {
         );
     }
 
+    fn env_of(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn repl_mode_is_chosen_by_the_environment_not_the_source() {
+        let dir = Path::new("/tmp/app");
+        let repl = playground_command(dir, None, "dev", true);
+        assert_eq!(env_of(&repl, "AUTUMN_CONSOLE_REPL").as_deref(), Some("1"));
+        let plain = playground_command(dir, None, "dev", false);
+        assert_eq!(env_of(&plain, "AUTUMN_CONSOLE_REPL"), None);
+        assert_eq!(env_of(&plain, "AUTUMN_ENV").as_deref(), Some("dev"));
+        assert_eq!(plain.get_current_dir(), Some(dir));
+    }
+
     #[test]
     fn cargo_args_forward_the_package() {
         let args = playground_cargo_args(Some("my-app"), true);
         assert!(args.ends_with(&["--package".to_owned(), "my-app".to_owned()]));
-    }
-
-    #[test]
-    fn playground_template_carries_the_repl_hook_after_the_pool() {
-        let src = render_playground("my-app", "");
-        assert!(has_repl_hook(&src), "{src}");
-        let hook = src
-            .find("autumn_web::console_repl!(ctx.pool());")
-            .expect("hook");
-        let build = src.find("SeedContext::build()").expect("build");
-        let conn = src.find("ctx.conn().await").expect("conn");
-        assert!(
-            build < hook && hook < conn,
-            "hook goes between build and conn"
-        );
-    }
-
-    #[test]
-    fn playground_template_allows_the_code_after_the_hook() {
-        // In REPL mode the hook does not return, so the code after it is
-        // unreachable. That must not warn.
-        let src = render_playground("my-app", "");
-        assert!(src.contains("unreachable_code"), "{src}");
-    }
-
-    #[test]
-    fn repl_hook_detection_ignores_comments() {
-        assert!(has_repl_hook("    autumn_web::console_repl!(ctx.pool());"));
-        assert!(has_repl_hook("console_repl!(pool)"));
-        assert!(!has_repl_hook("// autumn_web::console_repl!(ctx.pool());"));
-        assert!(!has_repl_hook("    //! console_repl! opens the prompt"));
-        assert!(!has_repl_hook("fn main() {}"));
-        assert!(!has_repl_hook(
-            "/* autumn_web::console_repl!(ctx.pool()); */"
-        ));
-        assert!(!has_repl_hook("let s = \"console_repl!(pool)\";"));
-        assert!(has_repl_hook(
-            "let u = \"http://x\"; autumn_web::console_repl!(ctx.pool());"
-        ));
-        assert!(has_repl_hook("::autumn_web::console_repl! (ctx.pool());"));
-    }
-
-    #[test]
-    fn repl_hook_detection_needs_the_real_macro_path() {
-        assert!(!has_repl_hook("my_console_repl!(ctx.pool());"));
-        assert!(!has_repl_hook("other::console_repl!(ctx.pool());"));
-        assert!(!has_repl_hook("autumn_web::console_repl_v2!(ctx.pool());"));
-        assert!(!has_repl_hook("let console_repl = 1;"));
-    }
-
-    #[test]
-    fn missing_repl_hook_error_names_the_line_and_the_fix() {
-        let msg = ConsoleError::PlaygroundLacksReplHook("src/bin/playground.rs".into()).to_string();
-        assert!(msg.contains("src/bin/playground.rs"), "{msg}");
-        assert!(
-            msg.contains("autumn_web::console_repl!(ctx.pool());"),
-            "{msg}"
-        );
-        assert!(msg.contains("--force"), "{msg}");
-        assert!(msg.contains("docs/guide/console.md"), "{msg}");
     }
 
     // ── template contents (AC2, AC4) ───────────────────────────────────────
