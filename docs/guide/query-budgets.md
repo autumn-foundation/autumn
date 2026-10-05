@@ -125,7 +125,7 @@ Both halves are compiled in CI as trybuild fixtures — see
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
 | An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
-| `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported |
+| `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported. The receiver must be a database handle: on another value, the callback may run many times |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
 | An `Option`/`Result` combinator closure (`map`, `and_then`, `unwrap_or_else`, …) | counted **once** when the receiver is known to be an `Option` or a `Result`; otherwise it may run per element |
 

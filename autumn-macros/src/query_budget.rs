@@ -822,6 +822,16 @@ impl Shape {
         self.methods().contains(&method)
     }
 
+    /// Does `method` give a plain value here, where on an `Option` it gives
+    /// the part? `Vec::insert` gives `()`, `HashSet::remove` gives `bool`.
+    fn scalar_result(self, method: &str) -> bool {
+        match method {
+            "insert" => !matches!(self, Self::Opt | Self::Map | Self::SortedMap),
+            "remove" => matches!(self, Self::Set | Self::SortedSet),
+            _ => false,
+        }
+    }
+
     /// Does `method` give an `Option` of a part here, where on a `Vec` it
     /// gives the part? `VecDeque::remove`, `HashMap::insert`.
     fn option_of_part(self, method: &str) -> bool {
@@ -2644,7 +2654,10 @@ impl Analyzer {
     /// closure at most once. Any other closure may run once per element.
     fn method_args(&mut self, method: &ExprMethodCall) -> Cost {
         let name = method.method.to_string();
-        let is_transaction = TRANSACTION_METHODS.contains(&name.as_str());
+        // A user type may have a method with a transaction name that calls
+        // its closure many times, so the receiver must be a handle.
+        let is_transaction = TRANSACTION_METHODS.contains(&name.as_str())
+            && matches!(self.value_of(&method.receiver), Kind::Handle | Kind::LazyDb);
         // Only an `Option` or a `Result` is known to call its closure at most
         // once; a user type's `unwrap_or_else` may call it many times.
         let runs_once = is_transaction
@@ -2715,9 +2728,15 @@ impl Analyzer {
         let name = call_path_name(call);
         // `scoped_transaction` / `savepoint` run their closure once and hand
         // it a connection.
+        // Only with the connection as its first argument: a user function of
+        // the same name may call its closure many times.
         let runs_once = name
             .as_deref()
-            .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n));
+            .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n))
+            && call
+                .args
+                .first()
+                .is_some_and(|a| matches!(self.value_of(a), Kind::Handle | Kind::LazyDb));
 
         // `fill(&mut repos, &repo)`: a `&mut` argument may receive a handle
         // from another argument.
@@ -3291,7 +3310,11 @@ impl Analyzer {
         }
         // A method on a carrier that returns a part: `repos.remove(0)`.
         if self.expr_is_carrier(&mc.receiver) {
-            return ELEMENT_METHODS.contains(&method.as_str()) && !self.gives_option_of_part(mc);
+            return ELEMENT_METHODS.contains(&method.as_str())
+                && !self.gives_option_of_part(mc)
+                && !self
+                    .shape_of(&mc.receiver)
+                    .is_some_and(|shape| shape.scalar_result(&method));
         }
         // `.expect(...)`/`.unwrap()` stand in for `?`
         // (`ctx.conn().await.expect("connection")`, #2546 review round 5).
@@ -7513,6 +7536,52 @@ mod tests {
                 "async fn h(repo: PgPostRepository, ids: Stream) -> AutumnResult<usize> { \
                  let out = ids.then(|_| &repo); let _ = out.map(|r| r.find_all()); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn transactions_need_a_handle_and_insert_results_follow_the_type() {
+        check_handlers(&[
+            (
+                "a transaction name on a user value",
+                "async fn h(repo: PgPostRepository, runner: Runner) -> AutumnResult<usize> { \
+                 runner.tx_immediate(|| repo.find_all()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                // The transaction is 1, and its callback runs once.
+                "a transaction on a handle still runs once",
+                "async fn h(mut db: Db) -> AutumnResult<usize> { \
+                 db.tx_immediate(|c| async move { let _ = c.find_all().await; }).await; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "a transaction function with no connection",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 maybe_immediate_transaction(|| repo.find_all()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "Vec::insert gives a unit",
+                "async fn h(mut repos: Vec<PgPostRepository>, repo: PgPostRepository) \
+                 -> AutumnResult<usize> { let done = repos.insert(0, repo); render(done); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "HashSet::insert and remove give a bool",
+                "async fn h(mut repos: HashSet<PgPostRepository>, repo: PgPostRepository) \
+                 -> AutumnResult<usize> { let a = repos.insert(repo); \
+                 let b = repos.remove(&repo); render(a); render(b); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            // Guard: `Option::insert` gives the part.
+            (
+                "Option::insert gives the part",
+                "async fn h(mut slot: Option<PgPostRepository>, repo: PgPostRepository) \
+                 -> AutumnResult<usize> { let r = slot.insert(repo); \
+                 let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
