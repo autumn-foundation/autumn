@@ -29,8 +29,12 @@ autumn-web = { path = "../../autumn", features = ["edge"] }
 # It is additive and native-only: `cargo build --target wasm32-wasip1` never
 # builds dev-dependencies, so no capsule ever links its own interpreter.
 autumn-edge = { path = "../../autumn-edge", features = ["host"] }
+# The gateway tier drives the origin `Router` as a plain `tower::Service`.
+axum = { workspace = true }
+http = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 
 [[bin]]
 name = "edge-greeting"

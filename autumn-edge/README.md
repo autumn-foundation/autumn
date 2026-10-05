@@ -26,6 +26,7 @@ autumn-web = { version = "0.8.0", features = ["edge"] }
 | `wire` | frame types, header canonicalization, fallthrough reasons |
 | `conformance` | the shared projection + verdict used by the byte-identity test |
 | `host` (feature) | a reference wasmi host with a hand-written WASI shim, for tests |
+| `gateway` (feature `host`) | a reference gateway: the capsule in front of an origin service, fallthrough forwarded |
 
 See `docs/guide/edge.md` in the Autumn repository for the protocol specification, the
 header contract, and the determinism rules.

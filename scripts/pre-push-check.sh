@@ -175,6 +175,12 @@ step "cargo clippy -p autumn-web --features \"plugin-sandbox,test-support\" --li
 # reproduce locally is one you find out about on the PR.
 cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --lib -- -D warnings
 
+step "cargo clippy -p autumn-web --features repl --all-targets -- -D warnings"
+# ci.yml lints the off-by-default console REPL (#2148) in its own lane, so the
+# Rhai build stays out of the gated list. `--all-targets` also compiles the REPL
+# glue that every `#[model]` and `#[repository]` in the test binaries emits.
+cargo clippy -p autumn-web --features repl --all-targets -- -D warnings
+
 # --- 5. Compile every workspace test target (compile-only) -------------------
 # Mirrors ci.yml `test` job (`cargo test --workspace`), but `--no-run` so it
 # compiles — and never executes — every test binary, including the autumn-web
@@ -206,6 +212,11 @@ step "cargo test -p autumn-web --features \"plugin-sandbox,test-support\" --test
 # clippy leg above splits it out — and this is the leg that compiles the
 # sandbox's containment corpus (plugin_sandbox.rs, issue #1609).
 cargo test -p autumn-web --features "plugin-sandbox,test-support" --test integration_tests --no-run
+
+step "cargo test -p autumn-web --features \"repl,test-support\" --test integration_tests --no-run"
+# Mirrors ci.yml's `repl` lane: it compiles `repl_registration.rs`, which no
+# other leg builds.
+cargo test -p autumn-web --features "repl,test-support" --test integration_tests --no-run
 
 # --- 6. Doctests (workspace, doc target only) --------------------------------
 # `--no-run` above skips doctests (they build only in the `--doc` phase), so a
