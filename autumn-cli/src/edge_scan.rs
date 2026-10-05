@@ -169,6 +169,7 @@ const ROUTE_ATTRS: &[&str] = &[
 const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("Db", "a database"),
     ("LazyDb", "a database"),
+    ("IdempotencyTx", "a database"),
     ("Session", "a session"),
     ("Flash", "a session"),
     ("CsrfToken", "a session"),
