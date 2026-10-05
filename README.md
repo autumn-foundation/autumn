@@ -61,6 +61,7 @@ app (see the [data playground guide](docs/guide/console.md)):
 
 ```bash
 autumn console
+autumn console --repl   # interactive Rhai prompt, no compile per query
 ```
 
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
@@ -238,6 +239,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/collab-notes`](examples/collab-notes) | Conflict-free collaborative editing: a `#[collaborative]` text field backed by an in-tree CRDT, live merge and presence over `#[ws]` + channels, and a thin browser replica — no external real-time service (see the [collaboration guide](docs/guide/collaboration.md)) |
 | [`examples/invoice`](examples/invoice) | Renders one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` (see the [PDF downloads guide](docs/guide/pdf-downloads.md)) |
 | [`examples/react-graphql`](examples/react-graphql) | TypeScript React SPA on an Autumn backend, talking GraphQL through a generic `GraphqlPlugin`: resolvers built on a `#[model]` + `#[repository]` with `#[normalize]`, `#[validate]` and `MutationHooks`, generated REST CRUD over the same rows, `Plugin` + `nest` + `declare_plugin_routes`, `PluginContract`, and a committed Vite bundle served under the default CSP |
+| [`examples/escape-hatches`](examples/escape-hatches) | Each escape hatch in one stockroom app, each with a real reason: the convention first (`#[model]`, `#[repository]`, `with_lock`), then `Db::tx` with guarded Diesel writes, `sql_query` for a window function, `#[intercept]`/`.scoped`/`.layer` tower layers, raw Axum routers via `nest` and a `Plugin`, `error_pages`, `exception_filter`, and a custom pool provider |
 
 ## Documentation
 
