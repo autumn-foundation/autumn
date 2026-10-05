@@ -6388,7 +6388,8 @@ fn type_is_plain_std(ty: &Type) -> bool {
         Type::Array(a) => type_is_plain_std(&a.elem),
         Type::Slice(s) => type_is_plain_std(&s.elem),
         Type::Tuple(t) => t.elems.iter().all(type_is_plain_std),
-        Type::Path(path) if path.qself.is_none() => {
+        // `custom::Vec<i64>` may hold anything.
+        Type::Path(path) if path.qself.is_none() && std_prefix(&path.path) => {
             path.path.segments.last().is_some_and(|segment| {
                 PLAIN_STD_TYPES.contains(&segment.ident.to_string().as_str())
                     && match &segment.arguments {
@@ -12616,6 +12617,19 @@ mod tests {
                 "async fn h(res: Result<PgPostRepository, AppError>) -> AutumnResult<usize> { \
                  use custom::Result; \
                  match res { Err(e) => render(e), Ok(_) => () } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a qualified type with a std name is not plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let hidden: custom::Vec<i64> = custom::Vec { inner: repo, value: 0 }; \
+                 hidden.inner.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a std path annotation stays plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let v: std::vec::Vec<i64> = vec![1]; render(v); let _ = repo; Ok(0) }",
                 Expect::Exact(0),
             ),
             (
