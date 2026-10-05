@@ -112,15 +112,26 @@ fn pool_error(error: impl std::fmt::Display) -> LockError {
     LockError::PoolUnavailable(redacted(&error))
 }
 
-/// `true` when the error says that the lease table does not exist (`42P01`).
-fn is_missing_table(error: &diesel::result::Error) -> bool {
-    let message = error.to_string();
-    message.contains(TABLE) && message.contains("does not exist")
+#[derive(diesel::QueryableByName)]
+struct MissingRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    missing: bool,
+}
+
+/// `Some(true)` when the lease table does not exist, `None` when the probe
+/// fails. The probe reads the catalog, not the error text, so it works with
+/// every `lc_messages` locale.
+async fn table_missing(conn: &mut AsyncPgConnection) -> Option<bool> {
+    diesel::sql_query(format!("SELECT to_regclass('{TABLE}') IS NULL AS missing"))
+        .get_result::<MissingRow>(conn)
+        .await
+        .ok()
+        .map(|row| row.missing)
 }
 
 /// Create the table.
 ///
-/// The runtime calls this only after a statement finds no table, so a
+/// The runtime calls this only after an acquire fails on a missing table, so a
 /// database that ran the framework migration never needs `CREATE`. Two
 /// concurrent `CREATE TABLE IF NOT EXISTS` can fail on the catalog, so the
 /// DDL runs under a transaction-scoped advisory lock.
@@ -231,27 +242,34 @@ impl LeaseLock {
     ///
     /// Returns [`LockError`] if no connection is available or a query fails.
     pub async fn try_lock(&self) -> Result<Option<LeaseGuard>, LockError> {
-        let sent = Instant::now();
         let conn = self.checkout().await?;
-        self.try_lock_on(conn, sent).await
+        self.try_lock_on(conn).await
     }
 
-    /// One acquire attempt. `sent` is the time before the checkout. The local
-    /// validity starts there, so it ends before the database expiry.
+    /// One acquire attempt. The local validity starts before the query is
+    /// sent. The database reads `now()` later, so the local deadline ends
+    /// before the database expiry.
     async fn try_lock_on(
         &self,
         mut conn: Object<AsyncPgConnection>,
-        sent: Instant,
     ) -> Result<Option<LeaseGuard>, LockError> {
         let ttl = self.ttl();
+        let mut sent = Instant::now();
         let row = match self.acquire(&mut conn, ttl).await {
-            Err(error) if is_missing_table(&error) => {
-                ensure_table(&mut conn).await?;
-                self.acquire(&mut conn, ttl).await
+            Ok(row) => row,
+            Err(error) => {
+                // The table can be missing, or another process can have
+                // created it since this acquire failed. If the connection
+                // still answers, create a missing table and try once more.
+                match table_missing(&mut conn).await {
+                    Some(true) => ensure_table(&mut conn).await?,
+                    Some(false) => {}
+                    None => return Err(db_error(error)),
+                }
+                sent = Instant::now();
+                self.acquire(&mut conn, ttl).await.map_err(db_error)?
             }
-            other => other,
-        }
-        .map_err(db_error)?;
+        };
         drop(conn);
         let Some(row) = row else {
             return Ok(None);
@@ -316,11 +334,10 @@ impl LeaseLock {
             if remaining.is_zero() {
                 return Err(timed_out());
             }
-            let sent = Instant::now();
             let conn = tokio::time::timeout(remaining, self.checkout())
                 .await
                 .map_err(|_| timed_out())??;
-            if let Some(guard) = self.try_lock_on(conn, sent).await? {
+            if let Some(guard) = self.try_lock_on(conn).await? {
                 return Ok(guard);
             }
             let remaining = timeout.saturating_sub(start.elapsed());
@@ -812,17 +829,5 @@ mod tests {
             .await
             .expect("cancel ends the lease");
         assert!(lease.is_lost());
-    }
-
-    #[test]
-    fn missing_table_error_is_detected() {
-        let error = diesel::result::Error::DatabaseError(
-            diesel::result::DatabaseErrorKind::Unknown,
-            Box::new(String::from(
-                "relation \"autumn_lease_locks\" does not exist",
-            )),
-        );
-        assert!(is_missing_table(&error));
-        assert!(!is_missing_table(&diesel::result::Error::NotFound));
     }
 }

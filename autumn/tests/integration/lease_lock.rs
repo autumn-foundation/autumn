@@ -471,6 +471,38 @@ async fn lock_timeout_expires_while_held() {
     held.release().await.expect("release");
 }
 
+/// A slow pool checkout must not shorten the lease. The local deadline starts
+/// when the acquire query is sent, not when the checkout starts.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn slow_checkout_does_not_shorten_the_lease() {
+    let (url, _container) = start_postgres().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool: PgPool = Pool::builder(manager)
+        .max_size(1)
+        .wait_timeout(Some(Duration::from_secs(10)))
+        .runtime(deadpool::Runtime::Tokio1)
+        .build()
+        .expect("pool");
+    let held = pool.get().await.expect("take the only connection");
+    let lock =
+        LeaseLock::new(pool.clone(), "lease-slow-checkout").with_lease_ttl(Duration::from_secs(3));
+    let acquire = tokio::spawn(async move { lock.try_lock().await });
+    // Hold the pool for longer than two thirds of the TTL.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    drop(held);
+    let guard = acquire
+        .await
+        .expect("task")
+        .expect("acquire")
+        .expect("free");
+    assert!(
+        !guard.is_lost(),
+        "the checkout wait must not count against the lease"
+    );
+    guard.release().await.expect("release");
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn dropped_guard_frees_the_lease() {
