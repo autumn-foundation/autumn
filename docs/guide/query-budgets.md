@@ -142,7 +142,9 @@ The analysis follows the handle through every name that holds it:
   patterns, closure parameters and transaction callback parameters. A type
   annotation also marks a handle: `let r: PgPostRepository = …`. An
   `Arc<PgPostRepository>`, `Box<…>`, `Rc<…>`, `dyn PostRepository` or
-  `impl PostRepository` is a handle too.
+  `impl PostRepository` is a handle too. A type annotation made only of
+  standard and primitive types, such as `let ids: Vec<i64> = …`, marks the
+  binding as plain. rustc checks it, so it cannot hold a handle.
 - **Scopes.** A `let` in a block ends with the block. An assignment to a name
   declared outside the block stays after the block.
 - **Branches.** After an `if`, a `match` or a loop, a name holds a handle when
@@ -161,7 +163,9 @@ The analysis follows the handle through every name that holds it:
   - A known container method is not a query. It gives a handle when it
     returns a part (`repos.remove(0)`, `maybe.unwrap()`), and a container
     when it returns a view (`repos.iter()`, `repos.first()`). Any other
-    method on the container is reported (`repos.refresh_all()`).
+    method on the container is reported (`repos.refresh_all()`). Every
+    method on a user struct that holds a handle (`ctx.clear()` on
+    `Ctx { repo }`) is reported too.
   - A helper handed the container is reported.
 
 When the parts are not known, for example in a parameter or a destructured

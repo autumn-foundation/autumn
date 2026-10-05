@@ -687,11 +687,18 @@ struct Binding {
     /// Each part's name and kind, when the value was a struct or tuple
     /// literal. `None`: every part of a carrier is a handle.
     parts: Option<Vec<(String, Kind)>>,
+    /// The value is a user struct, not a standard container, so none of its
+    /// methods is a known container method.
+    user: bool,
 }
 
 impl Binding {
     const fn of(kind: Kind) -> Self {
-        Self { kind, parts: None }
+        Self {
+            kind,
+            parts: None,
+            user: false,
+        }
     }
 
     /// The binding that holds what `self` or `other` holds.
@@ -715,6 +722,7 @@ impl Binding {
         Self {
             kind: self.kind.max(other.kind),
             parts,
+            user: self.user || other.user,
         }
     }
 }
@@ -934,6 +942,9 @@ impl Analyzer {
                     self.bind_pat(sub, kind);
                 }
             }
+            // rustc checks the annotation. A type made only of standard and
+            // primitive types cannot hold a handle.
+            Pat::Type(p) if type_is_plain_std(&p.ty) => self.bind_pat(&p.pat, Kind::Plain),
             Pat::Type(p) => self.bind_pat(&p.pat, kind.max(type_kind(&p.ty))),
             Pat::Reference(p) => self.bind_pat(&p.pat, kind),
             Pat::Paren(p) => self.bind_pat(&p.pat, kind),
@@ -1024,7 +1035,8 @@ impl Analyzer {
             ),
             _ => None,
         };
-        Binding { kind, parts }
+        let user = kind == Kind::Carrier && matches!(init, Expr::Struct(_));
+        Binding { kind, parts, user }
     }
 
     /// `place = value`. A tuple or array place over a literal of the same
@@ -1668,20 +1680,8 @@ impl Analyzer {
         if matches!(cost, Cost::Unbounded(_)) {
             return cost;
         }
-        // An unknown method on a container of handles (an extension-trait
-        // `repos.refresh_all()`) may query through each of them.
-        if let Some(unknown) = methods.iter().find(|m| {
-            self.expr_is_carrier(&m.receiver) && !is_container_method(&m.method.to_string())
-        }) {
-            return Cost::unbounded(
-                unknown.span(),
-                format!(
-                    "`{}` is called on a container of database handles, and what it does with \
-                     them is another function's business",
-                    unknown.method
-                ),
-                DECLARE_HINT,
-            );
+        if let Some(opaque) = self.opaque_container_method(&methods) {
+            return opaque;
         }
 
         if let Some(from) = handle_from {
@@ -1763,6 +1763,26 @@ impl Analyzer {
             }
         }
         cost
+    }
+
+    /// An unknown method on a container of handles (an extension-trait
+    /// `repos.refresh_all()`), or any method on a user struct that holds one,
+    /// may query through them.
+    fn opaque_container_method(&self, methods: &[&ExprMethodCall]) -> Option<Cost> {
+        let unknown = methods.iter().find(|m| {
+            self.expr_is_carrier(&m.receiver)
+                && (self.expr_is_user_carrier(&m.receiver)
+                    || !is_container_method(&m.method.to_string()))
+        })?;
+        Some(Cost::unbounded(
+            unknown.span(),
+            format!(
+                "`{}` is called on a container of database handles, and what it does with them \
+                 is another function's business",
+                unknown.method
+            ),
+            DECLARE_HINT,
+        ))
     }
 
     /// One method call's arguments. A transaction runs its closure once and
@@ -1954,6 +1974,22 @@ impl Analyzer {
             && !self.method_is_handle(mc)
             && !is_handle_builder(&last)
             && !HANDLE_TRANSITIONS.contains(&last.as_str())
+    }
+
+    /// Is `e` a user struct that holds a handle (`Ctx { repo }`)? Its
+    /// methods are the user's, so none of them is a known container method.
+    fn expr_is_user_carrier(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Struct(_) => self.expr_is_carrier(e),
+            Expr::Path(_) => path_ident(e).is_some_and(|name| {
+                let binding = self.env.binding(&name);
+                binding.kind == Kind::Carrier && binding.user
+            }),
+            Expr::Reference(r) => self.expr_is_user_carrier(&r.expr),
+            Expr::Paren(p) => self.expr_is_user_carrier(&p.expr),
+            Expr::Group(g) => self.expr_is_user_carrier(&g.expr),
+            _ => false,
+        }
     }
 
     /// What `f` holds, when its base is a name bound to a struct or tuple
@@ -2624,6 +2660,43 @@ fn type_is_carrier(ty: &Type) -> bool {
             }
             CARRIER_TYPES.contains(&name.as_str()) && generic_types(segment).any(holds)
         }),
+        _ => false,
+    }
+}
+
+/// Standard and primitive type names that cannot hold a handle unless a
+/// type argument does.
+const PLAIN_STD_TYPES: &[&str] = &[
+    "bool", "char", "str", "String", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16",
+    "u32", "u64", "u128", "usize", "f32", "f64", "Vec", "VecDeque", "Option", "Result", "HashMap",
+    "HashSet", "BTreeMap", "BTreeSet", "Box", "Arc", "Rc",
+];
+
+/// Is `ty` made only of [`PLAIN_STD_TYPES`], with no `_` left to infer?
+fn type_is_plain_std(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(r) => type_is_plain_std(&r.elem),
+        Type::Paren(p) => type_is_plain_std(&p.elem),
+        Type::Group(g) => type_is_plain_std(&g.elem),
+        Type::Array(a) => type_is_plain_std(&a.elem),
+        Type::Slice(s) => type_is_plain_std(&s.elem),
+        Type::Tuple(t) => t.elems.iter().all(type_is_plain_std),
+        Type::Path(path) if path.qself.is_none() => {
+            path.path.segments.last().is_some_and(|segment| {
+                PLAIN_STD_TYPES.contains(&segment.ident.to_string().as_str())
+                    && match &segment.arguments {
+                        syn::PathArguments::None => true,
+                        syn::PathArguments::AngleBracketed(args) => {
+                            args.args.iter().all(|arg| match arg {
+                                syn::GenericArgument::Type(inner) => type_is_plain_std(inner),
+                                syn::GenericArgument::Lifetime(_) => true,
+                                _ => false,
+                            })
+                        }
+                        syn::PathArguments::Parenthesized(_) => false,
+                    }
+            })
+        }
         _ => false,
     }
 }
@@ -5420,6 +5493,31 @@ mod tests {
             ";
         assert_clean("1", handler);
         assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn a_method_on_a_user_struct_holding_a_handle_is_reported() {
+        // `clear` here is the user's method, not `Vec::clear`.
+        let handler = matrix_handler("let ctx = Ctx { repo }; ctx.clear().await;");
+        assert_error_contains("50", &handler, &["clear"]);
+    }
+
+    #[test]
+    fn a_std_type_annotation_marks_a_binding_plain() {
+        // `Vec<i64>` is checked by rustc and cannot hold a handle.
+        let handler = matrix_handler(
+            "let repos = vec![repo]; \
+             let ids: Vec<i64> = repos.iter().map(|r| r.id).collect(); \
+             let _ = render(ids);",
+        );
+        assert_clean("0", &handler);
+        // A `_` leaves the type open, so the container rule still applies.
+        let open = matrix_handler(
+            "let repos = vec![repo]; \
+             let ids: Vec<_> = repos.iter().map(|r| r.id).collect(); \
+             let _ = render(ids);",
+        );
+        assert_error_contains("50", &open, &["render"]);
     }
 
     #[test]
