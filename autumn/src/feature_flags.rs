@@ -488,7 +488,7 @@ pub mod pg {
     /// Add `connect_timeout` to `url` when it sets none, so that a refresh
     /// cannot hang on a connect.
     fn with_connect_timeout(url: &str) -> String {
-        if url.contains("connect_timeout") {
+        if has_connect_timeout(url) {
             url.to_owned()
         } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
             let separator = if url.contains('?') { '&' } else { '?' };
@@ -497,6 +497,26 @@ pub mod pg {
             // A `key=value` connection string.
             format!("{url} connect_timeout={CONNECT_TIMEOUT_SECS}")
         }
+    }
+
+    /// `true` when `url` sets the `connect_timeout` parameter.
+    fn has_connect_timeout(url: &str) -> bool {
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            // Only a query parameter counts, not text in the user or path.
+            let query = url.split_once('?').map_or("", |(_, query)| query);
+            let query = query.split_once('#').map_or(query, |(query, _)| query);
+            return query
+                .split('&')
+                .any(|pair| pair.split('=').next() == Some("connect_timeout"));
+        }
+        // A `key=value` string: the key starts a word, and `=` follows it.
+        url.match_indices("connect_timeout").any(|(at, key)| {
+            let starts_word = url[..at]
+                .chars()
+                .next_back()
+                .is_none_or(char::is_whitespace);
+            starts_word && url[at + key.len()..].trim_start().starts_with('=')
+        })
     }
 
     /// Wait before the next refresh attempt after `failures` failed attempts
@@ -1270,6 +1290,23 @@ pub mod pg {
             );
             // A timeout in the URL stays as it is.
             assert_eq!(DEAD_URL, with_connect_timeout(DEAD_URL));
+            assert_eq!(
+                with_connect_timeout("host=db connect_timeout = 3"),
+                "host=db connect_timeout = 3"
+            );
+            // The text elsewhere is not the parameter.
+            assert_eq!(
+                with_connect_timeout("postgres://u:connect_timeout@h/db"),
+                "postgres://u:connect_timeout@h/db?connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("postgres://h/db?application_name=connect_timeout"),
+                "postgres://h/db?application_name=connect_timeout&connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("host=db application_name=connect_timeout"),
+                "host=db application_name=connect_timeout connect_timeout=5"
+            );
         }
 
         #[test]
@@ -1430,6 +1467,23 @@ impl StoreHealth {
         }
     }
 
+    /// Drop the last-known value for `key` after a write that the store
+    /// cannot read back. After a disable, keep the flag off instead.
+    fn forget(&self, key: &str, disabled: bool) {
+        let mut known = self
+            .last_known
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if disabled {
+            known
+                .entry(key.to_owned())
+                .or_insert_with(|| FlagConfig::new(key))
+                .enabled = false;
+        } else {
+            known.remove(key);
+        }
+    }
+
     /// Count a failed read and return the last-known value for `key`.
     fn recall(&self, key: &str, error: &FlagStoreError) -> Option<FlagConfig> {
         self.errors.fetch_add(1, Ordering::Relaxed);
@@ -1557,13 +1611,26 @@ impl FeatureFlagService {
         false
     }
 
+    /// Update the last-known value of `flag_key` after a successful write.
+    ///
+    /// When the store cannot read the flag back, a disable keeps the flag
+    /// off, and any other write drops the last-known value.
+    fn after_write(&self, flag_key: &str, disabled: bool) {
+        match self.store.get(flag_key) {
+            Ok(flag) => self.health.remember(flag_key, flag.as_ref()),
+            Err(_) => self.health.forget(flag_key, disabled),
+        }
+    }
+
     /// Enable `flag_key` for all actors.
     ///
     /// # Errors
     ///
     /// Propagates [`FlagStoreError`] from the backing store.
     pub fn enable(&self, flag_key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-        self.store.enable(flag_key, actor)
+        self.store.enable(flag_key, actor)?;
+        self.after_write(flag_key, false);
+        Ok(())
     }
 
     /// Disable `flag_key` globally.
@@ -1572,7 +1639,9 @@ impl FeatureFlagService {
     ///
     /// Propagates [`FlagStoreError`] from the backing store.
     pub fn disable(&self, flag_key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-        self.store.disable(flag_key, actor)
+        self.store.disable(flag_key, actor)?;
+        self.after_write(flag_key, true);
+        Ok(())
     }
 
     /// Set the percent-rollout gate for `flag_key` to `pct` (0–100).
@@ -1586,7 +1655,9 @@ impl FeatureFlagService {
         pct: u8,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.set_rollout(flag_key, pct, actor)
+        self.store.set_rollout(flag_key, pct, actor)?;
+        self.after_write(flag_key, false);
+        Ok(())
     }
 
     /// Add `actor_id` to the explicit allowlist for `flag_key`.
@@ -1600,7 +1671,9 @@ impl FeatureFlagService {
         actor_id: &str,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.allow_actor(flag_key, actor_id, actor)
+        self.store.allow_actor(flag_key, actor_id, actor)?;
+        self.after_write(flag_key, false);
+        Ok(())
     }
 
     /// Add `group` to the named-group allowlist for `flag_key`.
@@ -1614,7 +1687,9 @@ impl FeatureFlagService {
         group: &str,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.add_group(flag_key, group, actor)
+        self.store.add_group(flag_key, group, actor)?;
+        self.after_write(flag_key, false);
+        Ok(())
     }
 
     /// Return all known flags, sorted by key.
@@ -2370,6 +2445,29 @@ mod tests {
             "a store error must not turn a known flag off"
         );
         assert_eq!(svc.store_errors(), 1);
+    }
+
+    #[test]
+    fn disable_through_the_service_replaces_the_last_known_value() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone()).with_default("kill", true);
+        svc.enable("kill", None).unwrap();
+        assert!(svc.is_enabled("kill", None));
+
+        // The read after the write fails too.
+        store.fail(true);
+        svc.disable("kill", None).unwrap();
+        assert!(
+            !svc.is_enabled("kill", None),
+            "a successful disable must win over the old last-known value"
+        );
+
+        // The read after the write succeeds.
+        store.fail(false);
+        svc.enable("kill", None).unwrap();
+        svc.disable("kill", None).unwrap();
+        store.fail(true);
+        assert!(!svc.is_enabled("kill", None));
     }
 
     #[test]

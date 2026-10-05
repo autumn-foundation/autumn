@@ -18,6 +18,8 @@
   `FeatureFlagService` uses the last-known value of the flag. Both log a
   warning and count the error: `PgFlagStore::refresh_errors` and
   `FeatureFlagService::store_errors`.
+  A successful write through the service updates the last-known value, so a
+  `disable` holds during a later outage.
 
 ### Added
 
