@@ -151,7 +151,8 @@ The analysis follows the handle through every name that holds it:
 - **Containers.** A value built from a handle holds it: `[repo]`,
   `vec![repo]`, `(repo, 1)`, `Some(repo)`, `Ctx { db }`. A parameter of type
   `Vec`, `VecDeque`, `Option`, tuple, array or slice of a handle type also
-  holds handles (`Vec<PgPostRepository>`, `Option<Db>`).
+  holds handles (`Vec<PgPostRepository>`, `Option<Db>`). So does a `Result`
+  with such a container on its `Ok` side, or a handle on its `Err` side.
   - A name bound to a struct or tuple literal records what each part holds.
     In `let ctx = PageCtx { repo: &repo, user };`, `ctx.repo` is a handle
     and `ctx.user` is not.

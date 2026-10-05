@@ -2615,8 +2615,12 @@ fn type_is_carrier(ty: &Type) -> bool {
         Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
             let name = segment.ident.to_string();
             if name == "Result" {
-                // `Result<(), Db>`: the handle is on the `Err` side.
-                return generic_types(segment).nth(1).is_some_and(holds);
+                // A container on the `Ok` side (`Result<Vec<Repo>, E>`), or a
+                // handle on the `Err` side (`Result<(), Db>`). A handle on the
+                // `Ok` side makes the `Result` a handle instead.
+                let mut sides = generic_types(segment);
+                return sides.next().is_some_and(type_is_carrier)
+                    || sides.next().is_some_and(holds);
             }
             CARRIER_TYPES.contains(&name.as_str()) && generic_types(segment).any(holds)
         }),
@@ -5416,6 +5420,18 @@ mod tests {
             ";
         assert_clean("1", handler);
         assert_error_contains("0", handler, &["1"]);
+    }
+
+    #[test]
+    fn a_result_of_a_container_of_handles_is_a_container() {
+        let handler = r"
+            async fn h(result: Result<Vec<PgPostRepository>, Error>) -> AutumnResult<usize> {
+                let repos = result?;
+                for repo in repos { let _ = repo.find_all().await?; }
+                Ok(0)
+            }
+            ";
+        assert_error_contains("50", handler, &["loop"]);
     }
 
     #[test]
