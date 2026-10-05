@@ -43,7 +43,10 @@ pub fn rename_changes(baseline: &[Table], desired: &ParsedSchema) -> Vec<SchemaC
     let tables = table_renames(baseline, desired, &managed, &mut out);
     for (from, to) in &tables {
         // Tables and indexes share one namespace.
-        if work.iter().any(|t| t.indexes.iter().any(|i| i.name == *to)) {
+        if work
+            .iter()
+            .any(|t| t.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(to)))
+        {
             out.push(SchemaChange::RenameConflict {
                 table: to.clone(),
                 reason: format!("an index named `{to}` already exists"),
@@ -216,11 +219,14 @@ fn index_renames(
             }
             // Index names are global in the schema, so check every table. A
             // name another table owns is refused: an add would collide too.
-            let owner = work
-                .iter()
-                .find(|t| t.indexes.iter().any(|i| i.name == new_name));
+            // Names compare case-insensitively (SQLite resolves them that way).
+            let owner = work.iter().find(|t| {
+                t.indexes
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(&new_name))
+            });
             // Tables and indexes share one namespace.
-            if work.iter().any(|t| t.name == new_name) {
+            if work.iter().any(|t| t.name.eq_ignore_ascii_case(&new_name)) {
                 out.push(SchemaChange::RenameConflict {
                     table: name.to_owned(),
                     reason: format!("a table named `{new_name}` already exists"),
@@ -1373,6 +1379,33 @@ mod tests {
             ),
             "CREATE INDEX \"logs on status\" ON posts (status)"
         );
+    }
+
+    #[test]
+    fn rename_target_checks_ignore_case() {
+        let users = with_unique_email(
+            table("users", Backend::Sqlite, &[("email", ColumnType::Text)]),
+            "email",
+        );
+        let mut other = table("audit", Backend::Sqlite, &[("x", ColumnType::Text)]);
+        other.indexes.push(Index::new(
+            "IDX_USERS_MAIL_UNIQUE",
+            vec!["x".to_owned()],
+            true,
+        ));
+        let base = vec![users, other.clone()];
+        let want = desired(
+            vec![
+                with_unique_email(
+                    table("users", Backend::Sqlite, &[("mail", ColumnType::Text)]),
+                    "mail",
+                ),
+                other,
+            ],
+            vec![col_hint("users", "mail", "email")],
+        );
+        let err = guard_plan(&diff_schema(&base, &want, OPTS), ALLOW).unwrap_err();
+        assert!(matches!(err, DiffError::RenameConflict { .. }), "{err}");
     }
 
     #[test]

@@ -897,36 +897,43 @@ fn relation_clash(
     baseline: &[Table],
     others: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
-    let added: std::collections::BTreeSet<&str> = plan
+    // Names compare case-insensitively: SQLite resolves them that way, and on
+    // Postgres a false match only refuses (the safe side).
+    let key = |name: &str| name.to_ascii_lowercase();
+    let added: std::collections::BTreeSet<String> = plan
         .changes
         .iter()
         .filter_map(|c| match c {
-            SchemaChange::AddIndex { index, .. } => Some(index.name.as_str()),
+            SchemaChange::AddIndex { index, .. } => Some(key(&index.name)),
             _ => None,
         })
         .collect();
-    let freed: std::collections::BTreeSet<&str> = plan
+    let freed: std::collections::BTreeSet<String> = plan
         .changes
         .iter()
         .filter_map(|c| match c {
             SchemaChange::RenameTable { from, .. } | SchemaChange::RenameIndex { from, .. } => {
-                Some(from.as_str())
+                Some(key(from))
             }
-            SchemaChange::DropIndex { index, .. } if added.contains(index.name.as_str()) => {
-                Some(index.name.as_str())
+            SchemaChange::DropIndex { index, .. } if added.contains(&key(&index.name)) => {
+                Some(key(&index.name))
             }
             _ => None,
         })
         .collect();
+    let existing: std::collections::BTreeSet<String> = others
+        .iter()
+        .map(|n| key(n))
+        .chain(baseline.iter().flat_map(|t| {
+            std::iter::once(key(&t.name)).chain(t.indexes.iter().map(|i| key(&i.name)))
+        }))
+        .collect();
     let taken = |name: &str| {
-        !freed.contains(name)
-            && (others.contains(name)
-                || baseline
-                    .iter()
-                    .any(|t| t.name == name || t.indexes.iter().any(|i| i.name == name)))
+        let k = key(name);
+        !freed.contains(&k) && existing.contains(&k)
     };
     // A name that two targets of this plan share collides too.
-    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     plan.changes.iter().find_map(|c| {
         let names: Vec<&String> = match c {
             // A new table brings its own indexes.
@@ -941,7 +948,7 @@ fn relation_clash(
         };
         let name = names
             .into_iter()
-            .find(|n| taken(n) || !seen.insert(n.as_str()))?;
+            .find(|n| taken(n) || !seen.insert(key(n)))?;
         Some(format!(
             "`{name}` is already a table, index, view, sequence or other relation in \
              the schema; choose another name"
@@ -1498,6 +1505,14 @@ mod tests {
             relation_clash(&plan(vec![add("idx_new")]), &baseline, &none),
             None
         );
+        // Names match case-insensitively (SQLite resolves them that way).
+        let mixed: std::collections::BTreeSet<String> = ["Reports".to_owned()].into();
+        let create = plan(vec![SchemaChange::CreateTable(Table::new(
+            "reports",
+            Backend::Sqlite,
+        ))]);
+        assert!(relation_clash(&create, &[], &mixed).is_some());
+        assert!(relation_clash(&plan(vec![add("IDX_REPORTS_SLUG")]), &baseline, &none).is_some());
         // Two targets in one plan cannot share a name either.
         let twice = plan(vec![
             SchemaChange::RenameIndex {
