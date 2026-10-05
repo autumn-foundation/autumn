@@ -352,26 +352,8 @@ impl SqlOutboundWebhookStore {
     }
 
     async fn write_log(&self, log: &WebhookDeliveryLog) -> AutumnResult<()> {
-        let headers = serde_json::to_string(&log.request_headers)
-            .map_err(|error| db_error("headers", &error))?;
-        diesel::sql_query(sql(UPSERT_LOG_SQL))
-            .bind::<Text, _>(&log.id)
-            .bind::<Text, _>(&log.subscription_id)
-            .bind::<Text, _>(&log.topic)
-            .bind::<Text, _>(&log.payload)
-            .bind::<Text, _>(headers)
-            .bind::<Nullable<Integer>, _>(log.response_status.map(i32::from))
-            .bind::<Nullable<Text>, _>(log.response_body.as_deref())
-            .bind::<BigInt, _>(i64::try_from(log.elapsed_ms).unwrap_or(i64::MAX))
-            .bind::<Integer, _>(i32::try_from(log.attempt).unwrap_or(i32::MAX))
-            .bind::<Integer, _>(i32::try_from(log.max_attempts).unwrap_or(i32::MAX))
-            .bind::<Bool, _>(log.is_dlq)
-            .bind::<Nullable<Text>, _>(log.last_error.as_deref())
-            .bind::<BigInt, _>(log.timestamp.timestamp_millis())
-            .execute(&mut self.conn().await?)
-            .await
-            .map_err(|error| db_error("log write", &error))?;
-        Ok(())
+        let mut conn = self.conn().await?;
+        write_log_on(&mut conn, log).await
     }
 
     async fn update_subscription(&self, query: &str, id: &str) -> AutumnResult<()> {
@@ -395,6 +377,75 @@ impl SqlOutboundWebhookStore {
         .map(SubscriptionRow::into_subscription)
         .transpose()
     }
+}
+
+/// Upsert one delivery log on `conn`.
+async fn write_log_on(conn: &mut RuntimeConnection, log: &WebhookDeliveryLog) -> AutumnResult<()> {
+    let headers =
+        serde_json::to_string(&log.request_headers).map_err(|error| db_error("headers", &error))?;
+    diesel::sql_query(sql(UPSERT_LOG_SQL))
+        .bind::<Text, _>(&log.id)
+        .bind::<Text, _>(&log.subscription_id)
+        .bind::<Text, _>(&log.topic)
+        .bind::<Text, _>(&log.payload)
+        .bind::<Text, _>(headers)
+        .bind::<Nullable<Integer>, _>(log.response_status.map(i32::from))
+        .bind::<Nullable<Text>, _>(log.response_body.as_deref())
+        .bind::<BigInt, _>(i64::try_from(log.elapsed_ms).unwrap_or(i64::MAX))
+        .bind::<Integer, _>(i32::try_from(log.attempt).unwrap_or(i32::MAX))
+        .bind::<Integer, _>(i32::try_from(log.max_attempts).unwrap_or(i32::MAX))
+        .bind::<Bool, _>(log.is_dlq)
+        .bind::<Nullable<Text>, _>(log.last_error.as_deref())
+        .bind::<BigInt, _>(log.timestamp.timestamp_millis())
+        .execute(conn)
+        .await
+        .map_err(|error| db_error("log write", &error))?;
+    Ok(())
+}
+
+/// Write `log` and its failure-counter outcome in one transaction, so the
+/// two cannot disagree after a crash. Returns `true` when this log moved the
+/// subscription to `Failed`.
+async fn log_with_outcome(
+    conn: &mut RuntimeConnection,
+    log: &WebhookDeliveryLog,
+) -> AutumnResult<bool> {
+    use scoped_futures::ScopedFutureExt as _;
+    crate::db::scoped_transaction(conn, |conn| {
+        async move {
+            write_log_on(conn, log).await?;
+            let failed_now = match outcome(log) {
+                Outcome::Success => {
+                    diesel::sql_query(sql(SUCCESS_SQL))
+                        .bind::<Text, _>(&log.subscription_id)
+                        .execute(&mut *conn)
+                        .await?;
+                    false
+                }
+                Outcome::Failure => {
+                    let changed = diesel::sql_query(sql(FAILURE_SQL))
+                        .bind::<Integer, _>(FAILURE_LIMIT)
+                        .bind::<Text, _>(&log.subscription_id)
+                        .execute(&mut *conn)
+                        .await?;
+                    changed > 0
+                        && diesel::sql_query(sql(&format!(
+                            "SELECT {SUBSCRIPTION_COLUMNS} FROM autumn_webhook_subscriptions \
+                             WHERE id = $1"
+                        )))
+                        .bind::<Text, _>(&log.subscription_id)
+                        .get_result::<SubscriptionRow>(&mut *conn)
+                        .await
+                        .optional()?
+                        .is_some_and(|row| row.status == "failed")
+                }
+                Outcome::Pending => false,
+            };
+            Ok::<_, AutumnError>(failed_now)
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 type StoreFuture<T> = Pin<Box<dyn Future<Output = AutumnResult<T>> + Send>>;
@@ -425,35 +476,14 @@ impl OutboundWebhookHandler for SqlOutboundWebhookStore {
     fn log_delivery(&self, log: WebhookDeliveryLog) -> StoreFuture<()> {
         let store = self.clone();
         Box::pin(async move {
-            store.write_log(&log).await?;
-            match outcome(&log) {
-                Outcome::Success => {
-                    store
-                        .update_subscription(SUCCESS_SQL, &log.subscription_id)
-                        .await
-                }
-                Outcome::Failure => {
-                    let changed = diesel::sql_query(sql(FAILURE_SQL))
-                        .bind::<Integer, _>(FAILURE_LIMIT)
-                        .bind::<Text, _>(&log.subscription_id)
-                        .execute(&mut store.conn().await?)
-                        .await
-                        .map_err(|error| db_error("subscription update", &error))?;
-                    if changed > 0
-                        && store
-                            .subscription(&log.subscription_id)
-                            .await?
-                            .is_some_and(|sub| sub.status == WebhookSubscriptionStatus::Failed)
-                    {
-                        tracing::warn!(
-                            subscription_id = %log.subscription_id,
-                            "Webhook subscription auto-disabled due to 50 consecutive failures"
-                        );
-                    }
-                    Ok(())
-                }
-                Outcome::Pending => Ok(()),
+            let mut conn = store.conn().await?;
+            if log_with_outcome(&mut conn, &log).await? {
+                tracing::warn!(
+                    subscription_id = %log.subscription_id,
+                    "Webhook subscription auto-disabled due to 50 consecutive failures"
+                );
             }
+            Ok(())
         })
     }
 

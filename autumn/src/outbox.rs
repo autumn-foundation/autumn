@@ -991,9 +991,24 @@ async fn drain_until(
     })?;
     // Each pool gets its own budget, so a busy app pool cannot starve a
     // shard.
+    // A failed pool (a shard that is down) does not stop the others. The
+    // drain fails only when every pool fails.
+    let pools = relay_pools(state)?;
     let mut handled = 0;
-    for pool in &relay_pools(state)? {
-        handled += drain_pool(state, &relay, pool, max, shutdown).await?;
+    let mut failures = Vec::new();
+    for pool in &pools {
+        match drain_pool(state, &relay, pool, max, shutdown).await {
+            Ok(count) => handled += count,
+            Err(error) => {
+                tracing::warn!(%error, "outbox relay could not drain one pool; it goes on with the others");
+                failures.push(error);
+            }
+        }
+    }
+    if failures.len() == pools.len()
+        && let Some(error) = failures.into_iter().next()
+    {
+        return Err(error);
     }
     Ok(handled)
 }
