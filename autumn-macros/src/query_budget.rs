@@ -2179,7 +2179,7 @@ impl Analyzer {
             (Expr::Path(p), _) if p.path.get_ident().is_some() => {
                 let binding = self.binding_of(value);
                 if let Some(ident) = p.path.get_ident() {
-                    self.assign_name(ident.to_string(), binding);
+                    self.assign_name(ident.to_string(), binding, Some(value));
                 }
             }
             _ => {
@@ -2191,8 +2191,17 @@ impl Analyzer {
 
     /// `name = …`. A declared type stays a floor: `repo = make();` on a
     /// `PgPostRepository` binding is still a handle.
-    fn assign_name(&mut self, name: String, mut binding: Binding) {
-        if let Some(declared) = self.env.binding(&name).declared {
+    fn assign_name(&mut self, name: String, mut binding: Binding, value: Option<&Expr>) {
+        let old = self.env.binding(&name);
+        // An assignment keeps the name's type. When the new value is opaque
+        // (`alias = make_repository();`), it may hold what the old one held.
+        // A literal (`active = Vec::new();`) is known, so it clears.
+        if binding.kind < old.kind && value.is_none_or(|v| self.is_opaque_value(v)) {
+            binding.kind = old.kind;
+            binding.parts = None;
+            binding.shape = binding.shape.or(old.shape);
+        }
+        if let Some(declared) = old.declared {
             binding.kind = binding.kind.max(declared.kind);
             binding.shape = declared.shape.or(binding.shape);
             binding.inner = declared.inner.or(binding.inner);
@@ -2204,11 +2213,36 @@ impl Analyzer {
         self.env.assign(name, binding);
     }
 
+    /// Is `e` a value whose contents the analysis cannot see: a call that
+    /// is not a known constructor, a method call, an `.await`, a `?`, or a
+    /// macro other than `vec!`?
+    fn is_opaque_value(&self, e: &Expr) -> bool {
+        match peel_parens(e) {
+            Expr::Call(c) => {
+                !(is_container_constructor(c)
+                    || is_smart_pointer_new(c)
+                    || is_handle_constructor(c)
+                    || self.shape_of(e).is_some())
+            }
+            Expr::MethodCall(_) | Expr::Await(_) | Expr::Try(_) => true,
+            Expr::Macro(m) => vec_elems(&m.mac).is_none(),
+            Expr::If(i) => {
+                block_tail(&i.then_branch).is_none_or(|t| self.is_opaque_value(t))
+                    || i.else_branch
+                        .as_ref()
+                        .is_none_or(|(_, e)| self.is_opaque_value(e))
+            }
+            Expr::Match(m) => m.arms.iter().any(|arm| self.is_opaque_value(&arm.body)),
+            Expr::Block(b) => block_tail(&b.block).is_none_or(|t| self.is_opaque_value(t)),
+            _ => false,
+        }
+    }
+
     fn assign_kind(&mut self, place: &Expr, kind: Kind) {
         match place {
             Expr::Path(p) => {
                 if let Some(ident) = p.path.get_ident() {
-                    self.assign_name(ident.to_string(), Binding::of(kind));
+                    self.assign_name(ident.to_string(), Binding::of(kind), None);
                 }
             }
             Expr::Paren(p) => self.assign_kind(&p.expr, kind),
@@ -9769,6 +9803,18 @@ mod tests {
                 "async fn h(x: i64) -> AutumnResult<usize> { \
                  let mut repo: PgPostRepository = make(x); repo = make(x); let _ = repo.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+            (
+                "an inferred handle keeps its kind when reassigned",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut alias = repo; alias = make_repository(); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "an inferred container keeps its kind when reassigned",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut all = vec![repo]; all = make_repositories(); for r in all { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
             ),
             (
                 "a typed Result keeps its sides when reassigned",
