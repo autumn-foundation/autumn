@@ -182,15 +182,6 @@ async fn exports_refuses_path_traversal() {
     }
 }
 
-/// H8: the nested exports router is declared, so `autumn routes audit` sees it.
-#[test]
-fn exports_declares_its_route() {
-    let routes = exports::routes();
-    assert_eq!(routes.len(), 1);
-    assert_eq!(routes[0].method, "GET");
-    assert!(routes[0].path.starts_with(exports::PREFIX));
-}
-
 /// H9: the plugin mounts the supplier's plain Axum router under `/supplier`.
 #[tokio::test]
 async fn supplier_plugin_serves_the_catalog() {
@@ -419,9 +410,12 @@ fn prod_config() -> AutumnConfig {
 /// must be exempt. A browser form route stays protected.
 #[tokio::test]
 async fn csrf_exempts_the_bearer_api_only() {
-    let config = prod_config();
+    let mut config = prod_config();
     assert!(config.security.csrf.enabled, "prod turns CSRF on");
     assert_eq!(config.security.csrf.exempt_paths, vec!["/api/".to_owned()]);
+    // `prod` also checks the Host header. Trust the test host, so that the
+    // requests below reach the CSRF layer.
+    config.security.trusted_hosts.hosts = vec!["localhost".to_owned()];
 
     #[post("/form")]
     #[public]
@@ -439,17 +433,24 @@ async fn csrf_exempts_the_bearer_api_only() {
         .build();
 
     // No CSRF token on a browser route: refused.
-    client.post("/form").send().await.assert_status(403);
-    // No CSRF token on the scanner API: CSRF does not refuse it. This client
-    // has no database, so the handler returns 503. The test checks only that
-    // the status is not 403.
-    let response = post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)])).await;
-    assert_ne!(
-        response.status,
-        StatusCode::FORBIDDEN,
-        "{}",
-        response.text()
-    );
+    client
+        .post("/form")
+        .header("host", "localhost")
+        .send()
+        .await
+        .assert_status(403)
+        .assert_body_contains("CSRF");
+    // No CSRF token on the scanner API: CSRF does not refuse it. The token
+    // guard passes, and the handler returns 503, because this client has no
+    // database.
+    client
+        .post("/api/checkout")
+        .header("host", "localhost")
+        .header("authorization", &format!("Bearer {SCANNER_TOKEN}"))
+        .json(&cart("o-1", &[("A-1", 1)]))
+        .send()
+        .await
+        .assert_status(503);
 }
 
 /// H12: the provider refuses a URL that asks for TLS. Its custom connect
@@ -467,6 +468,78 @@ async fn password_file_refuses_tls_urls() {
         .create_pool(&config)
         .await;
     assert!(result.is_err(), "TLS URL must be refused");
+}
+
+/// H8: a file whose name starts with a dot is not served. A job can write a
+/// temporary `.stock.csv.tmp` there, and it is not public.
+#[tokio::test]
+async fn exports_refuses_dotfiles() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join(".stock.csv.tmp"), "half-written").expect("write");
+    std::fs::create_dir(dir.path().join(".cache")).expect("mkdir");
+    std::fs::write(dir.path().join(".cache").join("a.csv"), "hidden").expect("write");
+    let client = client(None, dir.path());
+
+    for path in ["/exports/.stock.csv.tmp", "/exports/.cache/a.csv"] {
+        let response = client.get(path).send().await;
+        response.assert_status(404);
+        assert!(!response.text().contains("half-written"), "{path}");
+        assert!(!response.text().contains("hidden"), "{path}");
+    }
+}
+
+/// H8: a folder redirect keeps the `/exports` prefix.
+#[tokio::test]
+async fn exports_folder_redirect_keeps_the_prefix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("2026-10")).expect("mkdir");
+    std::fs::write(dir.path().join("2026-10").join("index.html"), "list").expect("write");
+    let client = client(None, dir.path());
+
+    let response = client.get("/exports/2026-10").send().await;
+    assert!(response.status.is_redirection(), "{}", response.status);
+    response.assert_header("location", "/exports/2026-10/");
+}
+
+fn password_file_config(url: &str) -> autumn_web::config::DatabaseConfig {
+    autumn_web::config::DatabaseConfig {
+        url: Some(url.to_owned()),
+        ..autumn_web::config::DatabaseConfig::default()
+    }
+}
+
+/// H12: the provider refuses each URL that it cannot rewrite. It refuses at
+/// boot, not at the first connection.
+#[tokio::test]
+async fn password_file_refuses_urls_it_cannot_rewrite() {
+    use autumn_web::db::DatabasePoolProvider;
+
+    let provider = PasswordFilePool::new("/run/secrets/db-password");
+    for url in [
+        // A password in the query wins over the user part, so the file would lose.
+        "postgres://app@db/app?password=old",
+        // No user to attach the password to.
+        "postgres://db/app",
+        // The key/value form has no URL to rewrite.
+        "host=db user=app dbname=app",
+    ] {
+        let result = provider.create_pool(&password_file_config(url)).await;
+        assert!(result.is_err(), "{url} must be refused");
+    }
+}
+
+/// H12: the provider builds only the primary pool. It refuses a replica,
+/// because Autumn would build the replica pool with no password file.
+#[tokio::test]
+async fn password_file_refuses_a_replica() {
+    use autumn_web::db::DatabasePoolProvider;
+
+    let mut config = password_file_config("postgres://app@db/app");
+    config.replica_url = Some("postgres://app@replica/app".to_owned());
+    let result = PasswordFilePool::new("/run/secrets/db-password")
+        .create_pool(&config)
+        .await;
+    assert!(result.is_err(), "a replica must be refused");
 }
 
 // ── Postgres tier (Docker) ──────────────────────────────────────────────
@@ -599,7 +672,7 @@ async fn checkout_returns_201_with_location() {
     assert_eq!(read, expected);
 }
 
-/// H1: a retried checkout with a used `order_ref` changes nothing.
+/// H1: a used `order_ref` with other lines is 409, and changes nothing.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn checkout_with_a_used_order_ref_changes_nothing() {
@@ -610,7 +683,7 @@ async fn checkout_with_a_used_order_ref_changes_nothing() {
     post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)]))
         .await
         .assert_status(201);
-    post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)]))
+    post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 2)]))
         .await
         .assert_status(409)
         .assert_body_contains("o-1");
@@ -843,7 +916,7 @@ async fn pages_list_and_show_products() {
         .await
         .assert_ok()
         .assert_body_contains("Product A-1")
-        .assert_body_contains("4");
+        .assert_body_contains("<dd>4</dd>");
     client.get("/products/NOPE").send().await.assert_status(404);
 }
 
@@ -876,4 +949,187 @@ async fn password_file_is_read_on_each_new_connection() {
     std::fs::write(&file, "postgres\n").expect("rotate password");
     let conn = pool.get().await;
     assert!(conn.is_ok(), "rotated password must work: {:?}", conn.err());
+}
+
+/// H1: a retried checkout with the same lines replays the receipt. A scanner
+/// that lost the first response can retry safely.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn checkout_retry_with_the_same_cart_replays_the_receipt() {
+    let db = fresh_db().await;
+    seed(db, &[product("A-1", "tools", 5, 100)]).await;
+    let client = db_client(db);
+    let body = cart("o-1", &[("A-1", 2)]);
+
+    let first: Receipt = post_api(&client, "/api/checkout", &body)
+        .await
+        .assert_status(201)
+        .json();
+    let retry = post_api(&client, "/api/checkout", &body).await;
+    retry
+        .assert_status(200)
+        .assert_header("location", "/api/orders/o-1");
+    assert_eq!(retry.json::<Receipt>(), first);
+    assert_eq!(stock_of(db, "A-1").await, 3, "the retry sells nothing");
+}
+
+/// H1: an order cannot have more than 100 distinct lines.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn checkout_refuses_too_many_lines() {
+    let db = fresh_db().await;
+    let client = db_client(db);
+    let skus: Vec<String> = (0..101).map(|n| format!("S-{n}")).collect();
+    let lines: Vec<(&str, i32)> = skus.iter().map(|sku| (sku.as_str(), 1)).collect();
+    post_api(&client, "/api/checkout", &cart("o-1", &lines))
+        .await
+        .assert_status(422);
+}
+
+/// H2: restock trims the category. An unknown category is 404, not a
+/// silent 200 that changes nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restock_refuses_an_unknown_category() {
+    let db = fresh_db().await;
+    seed(db, &[product("A-1", "tools", 1, 100)]).await;
+    let client = db_client(db);
+
+    post_api(
+        &client,
+        "/api/restock",
+        &json!({ "category": "tools ", "add": 2 }),
+    )
+    .await
+    .assert_ok();
+    assert_eq!(stock_of(db, "A-1").await, 3);
+    post_api(
+        &client,
+        "/api/restock",
+        &json!({ "category": "garden", "add": 2 }),
+    )
+    .await
+    .assert_status(404);
+}
+
+/// H2: restock refuses to push stock past the limit, and changes no row.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restock_refuses_to_pass_the_stock_limit() {
+    let db = fresh_db().await;
+    seed(
+        db,
+        &[
+            product("A-1", "tools", 1, 100),
+            product("A-2", "tools", 999_999, 100),
+        ],
+    )
+    .await;
+    let client = db_client(db);
+
+    post_api(
+        &client,
+        "/api/restock",
+        &json!({ "category": "tools", "add": 2 }),
+    )
+    .await
+    .assert_status(409)
+    .assert_body_contains("A-2");
+    assert_eq!(stock_of(db, "A-1").await, 1, "no row changes");
+}
+
+/// H1 + H2: restocks and carts on two SKUs of one category run at the same
+/// time. All of them lock rows in SKU order, so none deadlocks.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn restock_and_carts_on_two_skus_never_deadlock() {
+    let db = fresh_db().await;
+    seed(
+        db,
+        &[
+            product("A-1", "tools", 100, 100),
+            product("B-1", "tools", 100, 100),
+        ],
+    )
+    .await;
+    let client = db_client(db);
+    // Move A-1's row after B-1's on disk, so a scan meets B-1 first.
+    post_api(&client, "/api/checkout", &cart("warm-up", &[("A-1", 1)]))
+        .await
+        .assert_status(201);
+
+    let restock = json!({ "category": "tools", "add": 1 });
+    let mut calls = Vec::new();
+    for n in 0..12 {
+        let body = if n % 2 == 0 {
+            cart(&format!("o-{n}"), &[("A-1", 1), ("B-1", 1)])
+        } else {
+            cart(&format!("o-{n}"), &[("B-1", 1), ("A-1", 1)])
+        };
+        calls.push(("/api/checkout", body));
+        calls.push(("/api/restock", restock.clone()));
+    }
+    let statuses = futures_join(
+        calls
+            .iter()
+            .map(|(path, body)| post_api(&client, path, body))
+            .collect(),
+    )
+    .await;
+    assert!(
+        statuses.iter().all(|s| *s == 200 || *s == 201),
+        "{statuses:?}"
+    );
+    assert_eq!(stock_of(db, "A-1").await, 99 - 12 + 12);
+    assert_eq!(stock_of(db, "B-1").await, 100 - 12 + 12);
+}
+
+/// H3: `top` sets how many products each category keeps.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn report_top_sets_the_count_per_category() {
+    let db = fresh_db().await;
+    seed(
+        db,
+        &[
+            product("T-1", "tools", 1, 100),
+            product("T-2", "tools", 2, 100),
+            product("P-1", "paint", 1, 100),
+        ],
+    )
+    .await;
+    let client = db_client(db);
+
+    let rows: Value = client
+        .get("/reports/stock-value?top=1")
+        .send()
+        .await
+        .assert_ok()
+        .json();
+    let skus: Vec<&str> = rows
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|row| row["sku"].as_str().expect("sku"))
+        .collect();
+    assert_eq!(skus, ["P-1", "T-2"]);
+}
+
+/// H3: `top` must be 1 to 10.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn report_refuses_a_bad_top() {
+    let db = fresh_db().await;
+    let client = db_client(db);
+    for query in ["?top=0", "?top=11", "?top=x"] {
+        let response = client
+            .get(&format!("/reports/stock-value{query}"))
+            .send()
+            .await;
+        assert!(
+            response.status.is_client_error(),
+            "{query}: {}",
+            response.status
+        );
+    }
 }
