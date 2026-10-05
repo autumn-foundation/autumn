@@ -279,8 +279,8 @@ fn conflicting_table_error(missing: &[&str], columns_unknown: bool) -> GenerateE
 }
 
 /// The first model file under `src/models` (or `src/models.rs`) with a
-/// `#[model]` struct on the `comments` table that lacks a shared column
-/// (#2283).
+/// `#[model]` struct on the `comments` table that cannot insert into the
+/// shared table (#2283).
 ///
 /// The shared table needs `commentable_type`, `commentable_id` and
 /// `author_id` on each insert. A plain `Comment` model sets none of them.
@@ -391,11 +391,17 @@ fn items_map_comments_table(items: &[syn::Item]) -> bool {
     })
 }
 
-/// Whether `item` has a field for each of [`REQUIRED_COLUMNS`]. A field's
-/// column is its `#[diesel(column_name = …)]` when given, else its name.
+/// The shared columns each insert must set: `NOT NULL` with no default.
+/// `id` is generated, `created_at` has a default, and `parent_id` and
+/// `deleted_at` take `NULL`.
+const INSERT_COLUMNS: &[&str] = &["commentable_type", "commentable_id", "author_id", "body"];
+
+/// Whether `item` has a field for each of [`INSERT_COLUMNS`], so its inserts
+/// work on the shared table. A field's column is its
+/// `#[diesel(column_name = …)]` when given, else its name.
 fn declares_every_shared_column(item: &syn::ItemStruct) -> bool {
     let fields: Vec<String> = item.fields.iter().filter_map(field_column).collect();
-    REQUIRED_COLUMNS
+    INSERT_COLUMNS
         .iter()
         .all(|column| fields.iter().any(|field| field == column))
 }
@@ -619,6 +625,9 @@ enum TableEvent {
     Remove(TableRef, &'static str),
     /// `DROP TABLE name`. The flag is `IF EXISTS`: then no table is fine.
     Drop(TableRef, bool),
+    /// Any other `ALTER TABLE name …`: it changes no tracked column, but it
+    /// still needs the table to exist.
+    Touch(TableRef),
     /// `ALTER TABLE old RENAME TO new`: the record moves with the table, so a
     /// rename INTO `comments` carries the source table's columns across.
     Rename { from: TableRef, to: TableRef },
@@ -628,9 +637,10 @@ impl TableEvent {
     /// The table an `ALTER` event changes; `None` for other events.
     const fn altered_table(&self) -> Option<&TableRef> {
         match self {
-            Self::Add(table, _) | Self::Remove(table, _) | Self::Rename { from: table, .. } => {
-                Some(table)
-            }
+            Self::Add(table, _)
+            | Self::Remove(table, _)
+            | Self::Touch(table)
+            | Self::Rename { from: table, .. } => Some(table),
             Self::Create(..) | Self::Drop(..) => None,
         }
     }
@@ -692,6 +702,7 @@ fn file_events(sql: &str) -> Vec<(usize, TableEvent, bool)> {
         // renaming it away. Treating every mention as an add would let
         // `DROP COLUMN commentable_type` read as proof the column is
         // present.
+        events.push((at, TableEvent::Touch(table.clone()), if_exists));
         for column in REQUIRED_COLUMNS.iter().copied() {
             if !mentions_column(statement, column) {
                 continue;
@@ -751,6 +762,11 @@ fn replay(files: &[String]) -> Replay {
                     }
                     if let Some(state) = tables.get_mut(&table) {
                         state.columns.retain(|held| *held != column);
+                    }
+                }
+                TableEvent::Touch(table) => {
+                    if !tables.get(&table).is_some_and(|state| state.exists) {
+                        touched_while_absent.insert(table);
                     }
                 }
                 TableEvent::Drop(table, if_exists) => {
@@ -3812,6 +3828,15 @@ mod tests {
             )),
             None
         );
+        // Nullable and defaulted columns may be left out: inserts still work.
+        assert_eq!(
+            check(
+                "#[autumn_web::model]\npub struct Comment { pub id: i64, \
+                 pub commentable_type: String, pub commentable_id: i64, \
+                 pub author_id: i64, pub body: String }\n",
+            ),
+            None
+        );
         // A Diesel rename names the column, not the Rust field.
         let renamed = fields.replacen(
             "pub id: i64",
@@ -3870,5 +3895,26 @@ mod tests {
         )
         .expect("write");
         assert!(!comments_migration_still_needed(tmp.path(), &dir, &[]));
+    }
+
+    /// Any `ALTER TABLE comments` needs the table, even one on a column the
+    /// shared schema does not track.
+    #[test]
+    fn an_alter_on_an_untracked_column_needs_the_candidate() {
+        let ours = up_sql(DatabaseBackend::Postgres);
+        let tmp = project_with(&[
+            (
+                "0001_create_comments",
+                "CREATE TABLE comments (id BIGINT, body TEXT);\n",
+            ),
+            (
+                "0002_moderate",
+                "ALTER TABLE comments ADD COLUMN moderation_state TEXT;\n",
+            ),
+            ("0003_drop", "DROP TABLE IF EXISTS comments;\n"),
+            ("0004_create_comments", &ours),
+        ]);
+        let plain = tmp.path().join("migrations").join("0001_create_comments");
+        assert!(comments_migration_still_needed(tmp.path(), &plain, &[]));
     }
 }
