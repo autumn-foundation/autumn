@@ -236,7 +236,9 @@ impl LeaseLock {
     ///
     /// Returns `Ok(None)` if another holder has a live lease. If you cancel
     /// this future after the database grants the lease, no holder has the
-    /// lease. It stays taken until it expires (one TTL).
+    /// lease. It stays taken until it expires (one TTL). A very slow acquire
+    /// can return a guard that is already lost: check
+    /// [`LeaseGuard::is_lost`] before you write.
     ///
     /// # Errors
     ///
@@ -404,12 +406,18 @@ where
     F: FnOnce(Lease) -> Fut,
     Fut: Future<Output = T>,
 {
+    // A slow acquire can return a guard that is already lost. Do not start
+    // the section then: `biased` would let a ready `f` win the race below.
     let lease = guard.lease.clone();
-    let lost = lease.lease_lost();
-    let out = tokio::select! {
-        biased;
-        out = f(lease) => Some(out),
-        () = lost => None,
+    let out = if lease.is_lost() {
+        None
+    } else {
+        let lost = lease.lease_lost();
+        tokio::select! {
+            biased;
+            out = f(lease) => Some(out),
+            () = lost => None,
+        }
     };
     if let Some(out) = out {
         if let Err(e) = guard.release().await {
@@ -820,6 +828,35 @@ mod tests {
         assert!(!lost.is_finished(), "a renewed deadline must not fire");
         tokio::time::advance(Duration::from_secs(4)).await;
         lost.await.expect("lease_lost resolves at the new deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn already_lost_guard_does_not_run_the_section() {
+        let guard = LeaseGuard::new(
+            lazy_pool(),
+            Arc::from("x"),
+            FencingToken::try_from(1).expect("token"),
+            Duration::from_secs(3),
+            Instant::now(),
+        );
+        // The acquire took longer than the local validity window.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(guard.is_lost());
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let result = run_guarded(guard, move |_lease| async move {
+            flag.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert!(
+            matches!(result, Err(LockError::LeaseLost { .. })),
+            "expected LeaseLost, got {result:?}"
+        );
+        assert!(
+            !std::sync::atomic::AtomicBool::load(&ran, Ordering::SeqCst),
+            "a lost lease must not run the section"
+        );
     }
 
     #[tokio::test]
