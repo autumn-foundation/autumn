@@ -15,9 +15,14 @@
 //! |---|---|
 //! | [`with_broadcast`](MediaPlugin::with_broadcast) | [`MediaMtxClient`] and [`MediaUrls`] extensions |
 //! | [`with_rooms`](MediaPlugin::with_rooms) | Room routes, [`RoomService`] and the room reaper |
-//! | Either one | [`MediaStorage`], [`MediaWorkflows`], the encode jobs and the retention sweep |
+//! | Either one | [`MediaStorage`], [`MediaWorkflows`] and the encode jobs |
 //!
-//! With neither, the plugin installs nothing and logs a warning.
+//! The retention sweep also starts if you set
+//! [`recordings_root`](MediaPlugin::recordings_root). If the storage config is
+//! not valid, the plugin installs no storage, workflows, jobs or sweep.
+//!
+//! If you enable neither primitive, the plugin installs no routes, extensions or
+//! jobs. It logs a warning.
 //!
 //! Because Autumn resolves config *after* [`Plugin::build`] runs, the plugin
 //! cannot read `[media]` from inside `build`; the application loads a
@@ -251,8 +256,8 @@ impl MediaPlugin {
     /// Enable the broadcast primitive (ingest → fan-out playback → VOD).
     ///
     /// Installs [`MediaMtxClient`] and [`MediaUrls`] extensions, built from
-    /// `config.mediamtx`. They install also when the storage config is not
-    /// valid.
+    /// `config.mediamtx`. The plugin installs them even if the storage config
+    /// is not valid.
     #[must_use]
     pub const fn with_broadcast(mut self) -> Self {
         self.enable_broadcast = true;
@@ -261,7 +266,8 @@ impl MediaPlugin {
 
     /// Enable the rooms primitive (small mesh calls).
     ///
-    /// Mounts the room routes and installs [`RoomService`].
+    /// Mounts the room routes, installs [`RoomService`] and starts the room
+    /// reaper.
     #[must_use]
     pub const fn with_rooms(mut self) -> Self {
         self.enable_rooms = true;
@@ -382,14 +388,14 @@ impl Plugin for MediaPlugin {
 
     /// Applies the plugin to the [`AppBuilder`].
     ///
-    /// Declares the plugin-owned `[media]` top-level config section (via
-    /// [`AppBuilder::config_section`]) so a host app with
-    /// `server.strict_config = true` boots without core rejecting `[media]` as
-    /// an unknown key, then installs the surface of each enabled primitive
+    /// Declares the `[media]` config section (via
+    /// [`AppBuilder::config_section`]). Then `server.strict_config = true` does
+    /// not reject `[media]`. Then installs the parts of each enabled primitive
     /// (see the crate docs).
     // `build` is a long, linear plugin-assembly routine (config validation,
-    // room wiring + reaper, storage/workflow install, retention loop); it reads
-    // best as one top-to-bottom sequence rather than fragmented across helpers.
+    // room wiring + reaper, broadcast transport, storage/workflow install,
+    // retention loop); it reads best as one top-to-bottom sequence rather than
+    // fragmented across helpers.
     #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
@@ -562,9 +568,9 @@ impl Plugin for MediaPlugin {
         }
 
         // Resolve the storage backend up front so a misconfiguration surfaces
-        // as one error line here rather than inside a job. On failure the plugin
-        // keeps the room routes and the broadcast transport, but installs no encode
-        // wiring.
+        // as one error line here rather than inside a job. If storage fails, the
+        // plugin keeps the room routes and broadcast transport. It installs no
+        // storage, workflows, encode jobs or retention sweep.
         let storage = match storage::MediaStorage::from_config(&config.storage) {
             Ok(storage) => storage,
             Err(error) => {
