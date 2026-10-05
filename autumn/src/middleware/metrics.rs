@@ -380,7 +380,7 @@ impl MetricsCollector {
     /// Record a completed request.
     ///
     /// `method` is mapped to a bounded label: an extension method is
-    /// recorded as [`OTHER_METHOD`].
+    /// recorded as `_other`.
     pub fn record(&self, method: &str, route: &str, status: u16, latency_ms: u64) {
         self.record_duration(method, route, status, Duration::from_millis(latency_ms));
     }
