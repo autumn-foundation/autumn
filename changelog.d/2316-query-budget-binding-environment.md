@@ -23,7 +23,9 @@
   parameter of a handle type gives a handle. `Arc<Vec<…>>` is a container,
   and a container of containers keeps its shape. An unknown method on such
   a container, or any method on a user struct that holds a handle, is
-  reported. A type annotation made only of standard and primitive types
+  reported. A container method is known only for the container type that
+  has it. After `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds
+  a handle. A type annotation made only of standard and primitive types
   (`Vec<i64>`) marks a binding as plain (#2316).
 - **query budgets:** a parameter of type `Arc<PgPostRepository>`, `Box<…>`,
   `Rc<…>`, `dyn PostRepository` or `impl PostRepository` is a handle. A

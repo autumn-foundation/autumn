@@ -362,6 +362,10 @@ const CARRIER_METHODS: &[&str] = &[
     "into_values",
     "keys",
     "into_keys",
+    "pop_back",
+    "pop_front",
+    "to_vec",
+    "flatten",
 ];
 
 /// Methods on a carrier that return a part of it, which is a handle.
@@ -386,15 +390,286 @@ const ELEMENT_METHODS: &[&str] = &[
     "min_by",
     "max_by_key",
     "min_by_key",
+    "get_or_insert_with",
 ];
 
-/// Is `method` one of the known methods on a carrier? Any other method on a
-/// carrier may run queries on its parts, so it is reported.
-fn is_container_method(method: &str) -> bool {
-    SCALAR_METHODS.contains(&method)
-        || CARRIER_METHODS.contains(&method)
-        || ELEMENT_METHODS.contains(&method)
+/// The methods of each standard container [`Shape`].
+const SEQ_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "contains",
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "as_slice",
+    "as_ref",
+    "as_mut",
+    "clone",
+    "first",
+    "last",
+    "get",
+    "get_mut",
+    "pop",
+    "push",
+    "push_back",
+    "push_front",
+    "pop_back",
+    "pop_front",
+    "insert",
+    "remove",
+    "swap_remove",
+    "extend",
+    "append",
+    "clear",
+    "truncate",
+    "sort",
+    "sort_by",
+    "sort_by_key",
+    "sort_unstable",
+    "sort_unstable_by",
+    "sort_unstable_by_key",
+    "dedup",
+    "reverse",
+    "retain",
+    "swap",
+    "resize",
+    "reserve",
+    "shrink_to_fit",
+    "drain",
+    "chunks",
+    "windows",
+    "to_vec",
+];
+
+const ITER_METHODS: &[&str] = &[
+    "map",
+    "filter",
+    "filter_map",
+    "flat_map",
+    "flatten",
+    "enumerate",
+    "rev",
+    "skip",
+    "take",
+    "chain",
+    "zip",
+    "peekable",
+    "collect",
+    "by_ref",
+    "next",
+    "nth",
+    "find",
+    "find_map",
+    "inspect",
+    "step_by",
+    "skip_while",
+    "take_while",
+    "count",
+    "any",
+    "all",
+    "position",
+    "for_each",
+    "try_for_each",
+    "fold",
+    "try_fold",
+    "reduce",
+    "max",
+    "min",
+    "max_by",
+    "min_by",
+    "max_by_key",
+    "min_by_key",
+    "last",
+    "cloned",
+    "copied",
+    "clone",
+];
+
+const OPTION_METHODS: &[&str] = &[
+    "is_some",
+    "is_none",
+    "is_some_and",
+    "is_none_or",
+    "unwrap",
+    "expect",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "map",
+    "map_or",
+    "map_or_else",
+    "and_then",
+    "or",
+    "or_else",
+    "filter",
+    "take",
+    "replace",
+    "insert",
+    "get_or_insert_with",
+    "ok_or",
+    "ok_or_else",
+    "as_ref",
+    "as_mut",
+    "as_deref",
+    "as_deref_mut",
+    "iter",
+    "into_iter",
+    "clone",
+    "cloned",
+    "copied",
+];
+
+const RESULT_METHODS: &[&str] = &[
+    "is_ok",
+    "is_err",
+    "is_ok_and",
+    "is_err_and",
+    "ok",
+    "unwrap",
+    "expect",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "map",
+    "map_or",
+    "map_or_else",
+    "and_then",
+    "or_else",
+    "as_ref",
+    "as_mut",
+    "as_deref",
+    "iter",
+    "into_iter",
+    "clone",
+    "cloned",
+    "copied",
+];
+
+const MAP_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "contains_key",
+    "get",
+    "get_mut",
+    "insert",
+    "remove",
+    "keys",
+    "values",
+    "values_mut",
+    "into_keys",
+    "into_values",
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "clear",
+    "retain",
+    "extend",
+    "drain",
+    "clone",
+    "reserve",
+];
+
+const SET_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "contains",
+    "insert",
+    "remove",
+    "iter",
+    "into_iter",
+    "clear",
+    "retain",
+    "extend",
+    "drain",
+    "clone",
+];
+
+const TUPLE_METHODS: &[&str] = &["clone"];
+
+/// The kind of standard container a carrier is. A method is known only if
+/// this container has it: an extension trait may add a method with a standard
+/// name (`ok()` on a `Vec`) that queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// `Vec`, `VecDeque`, an array or a slice.
+    Seq,
+    /// An iterator over parts.
+    Iter,
+    Opt,
+    Res,
+    Map,
+    Set,
+    Tuple,
 }
+
+impl Shape {
+    /// The methods this container has.
+    const fn methods(self) -> &'static [&'static str] {
+        match self {
+            Self::Seq => SEQ_METHODS,
+            Self::Iter => ITER_METHODS,
+            Self::Opt => OPTION_METHODS,
+            Self::Res => RESULT_METHODS,
+            Self::Map => MAP_METHODS,
+            Self::Set => SET_METHODS,
+            Self::Tuple => TUPLE_METHODS,
+        }
+    }
+
+    fn has(self, method: &str) -> bool {
+        self.methods().contains(&method)
+    }
+
+    /// The shape of what `method` returns, when it returns a carrier.
+    fn after(self, method: &str) -> Option<Self> {
+        match method {
+            "iter" | "iter_mut" | "into_iter" | "drain" | "chunks" | "windows" | "keys"
+            | "values" | "values_mut" | "into_keys" | "into_values" => Some(Self::Iter),
+            "first" | "last" | "get" | "get_mut" | "pop" | "pop_back" | "pop_front" | "next"
+            | "nth" | "find" | "find_map" | "ok" => Some(Self::Opt),
+            "ok_or" | "ok_or_else" => Some(Self::Res),
+            "to_vec" => Some(Self::Seq),
+            "collect" => None,
+            _ => Some(self),
+        }
+    }
+}
+
+/// The container shape a type names, when it names one.
+fn type_shape(ty: &Type) -> Option<Shape> {
+    match ty {
+        Type::Reference(r) => type_shape(&r.elem),
+        Type::Paren(p) => type_shape(&p.elem),
+        Type::Group(g) => type_shape(&g.elem),
+        Type::Array(_) | Type::Slice(_) => Some(Shape::Seq),
+        Type::Tuple(_) => Some(Shape::Tuple),
+        Type::Path(path) => {
+            let segment = path.path.segments.last()?;
+            match segment.ident.to_string().as_str() {
+                "Vec" | "VecDeque" | "LinkedList" | "BinaryHeap" => Some(Shape::Seq),
+                "Option" => Some(Shape::Opt),
+                "Result" => Some(Shape::Res),
+                "HashMap" | "BTreeMap" | "IndexMap" => Some(Shape::Map),
+                "HashSet" | "BTreeSet" | "IndexSet" => Some(Shape::Set),
+                name if SMART_POINTERS.contains(&name) => {
+                    generic_types(segment).next().and_then(type_shape)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Methods that store an argument in their receiver as a part.
+const STORE_METHODS: &[&str] = &[
+    "push",
+    "push_back",
+    "push_front",
+    "insert",
+    "extend",
+    "append",
+];
 
 /// Offered when the fix is to stop issuing a query per row.
 const BATCH_HINT: &str = "Batch the per-row lookup into one query with `preload(...)`, or opt the \
@@ -585,54 +860,56 @@ fn worst(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
 struct Flow {
     /// Paths that reach the next statement.
     fall: Option<Cost>,
-    /// Paths that leave by `break` or `continue` with no label.
-    brk: Option<Cost>,
-    /// Paths that leave by `break 'label` or `continue 'label`, by label.
-    labeled: Vec<(String, Cost)>,
+    /// Paths that leave by `break` or `continue`, by target.
+    exits: Vec<(Exit, Cost)>,
     /// Paths that leave by `return`.
     ret: Option<Cost>,
+}
+
+/// Where a `break` or `continue` goes.
+#[derive(Clone, PartialEq, Eq)]
+struct Exit {
+    /// The target label. `None`: the nearest loop.
+    label: Option<String>,
+    /// `break` ends the target. `continue` starts its next pass.
+    breaks: bool,
 }
 
 impl Flow {
     const ZERO: Self = Self::cost(Cost::ZERO);
     const NEVER: Self = Self {
         fall: None,
-        brk: None,
-        labeled: Vec::new(),
+        exits: Vec::new(),
         ret: None,
     };
     const RETURN: Self = Self {
         fall: None,
-        brk: None,
-        labeled: Vec::new(),
+        exits: Vec::new(),
         ret: Some(Cost::ZERO),
     };
 
     const fn cost(cost: Cost) -> Self {
         Self {
             fall: Some(cost),
-            brk: None,
-            labeled: Vec::new(),
+            exits: Vec::new(),
             ret: None,
         }
     }
 
-    /// A `break` or `continue`, to the nearest loop or to `label`.
-    fn exit_to(label: Option<&syn::Lifetime>) -> Self {
-        label.map_or(
-            Self {
-                brk: Some(Cost::ZERO),
-                ..Self::NEVER
-            },
-            |label| Self {
-                labeled: vec![(label.ident.to_string(), Cost::ZERO)],
-                ..Self::NEVER
-            },
-        )
+    /// A `break` or `continue` to the nearest loop or to `label`.
+    fn exit_to(label: Option<&syn::Lifetime>, breaks: bool) -> Self {
+        let exit = Exit {
+            label: label.map(|l| l.ident.to_string()),
+            breaks,
+        };
+        Self {
+            exits: vec![(exit, Cost::ZERO)],
+            ..Self::NEVER
+        }
     }
 
     const fn has_path(&self) -> bool {
-        self.fall.is_some() || self.brk.is_some() || self.ret.is_some() || !self.labeled.is_empty()
+        self.fall.is_some() || self.ret.is_some() || !self.exits.is_empty()
     }
 
     /// `self`, then `next` on the paths that fall through.
@@ -650,14 +927,13 @@ impl Flow {
             };
         }
         let after = |cost: Option<Cost>| cost.map(|c| fall.clone().then(c));
-        let labeled = next
-            .labeled
+        let exits = next
+            .exits
             .into_iter()
-            .map(|(label, cost)| (label, fall.clone().then(cost)))
+            .map(|(exit, cost)| (exit, fall.clone().then(cost)))
             .collect();
         Self {
-            brk: worst(self.brk, after(next.brk)),
-            labeled: merge_labeled(self.labeled, labeled),
+            exits: merge_exits(self.exits, exits),
             ret: worst(self.ret, after(next.ret)),
             fall: after(next.fall),
         }
@@ -667,8 +943,7 @@ impl Flow {
     fn or_worst(self, other: Self) -> Self {
         Self {
             fall: worst(self.fall, other.fall),
-            brk: worst(self.brk, other.brk),
-            labeled: merge_labeled(self.labeled, other.labeled),
+            exits: merge_exits(self.exits, other.exits),
             ret: worst(self.ret, other.ret),
         }
     }
@@ -678,39 +953,50 @@ impl Flow {
         let set = |path: Option<Cost>| path.map(|_| cost.clone());
         Self {
             fall: set(self.fall),
-            brk: set(self.brk),
-            labeled: self
-                .labeled
+            exits: self
+                .exits
                 .into_iter()
-                .map(|(label, _)| (label, cost.clone()))
+                .map(|(exit, _)| (exit, cost.clone()))
                 .collect(),
             ret: set(self.ret),
         }
     }
 
-    /// Remove and return the paths that leave to `label`.
-    fn take_label(&mut self, label: Option<&syn::Label>) -> Option<Cost> {
-        let name = label?.name.ident.to_string();
-        let at = self.labeled.iter().position(|(l, _)| *l == name)?;
-        Some(self.labeled.remove(at).1)
+    /// Remove and return the exits that land on a target: a loop takes its
+    /// unlabeled exits and its own label; a labeled block takes its label.
+    fn take_exits(&mut self, label: Option<&syn::Label>, unlabeled: bool) -> Vec<(Exit, Cost)> {
+        let own = label.map(|l| l.name.ident.to_string());
+        let (taken, kept) = std::mem::take(&mut self.exits)
+            .into_iter()
+            .partition(|(exit, _)| {
+                exit.label
+                    .as_ref()
+                    .map_or(unlabeled, |name| own.as_ref() == Some(name))
+            });
+        self.exits = kept;
+        taken
     }
 
     /// The worst path, wherever it goes.
     fn total(self) -> Cost {
-        let labeled = self
-            .labeled
-            .into_iter()
-            .fold(None, |acc, (_, cost)| worst(acc, Some(cost)));
-        worst(worst(worst(self.fall, self.brk), self.ret), labeled).unwrap_or(Cost::ZERO)
+        let exits = worst_of(self.exits);
+        worst(worst(self.fall, self.ret), exits).unwrap_or(Cost::ZERO)
     }
 }
 
-/// Join two lists of labeled exits, taking the worse cost per label.
-fn merge_labeled(mut into: Vec<(String, Cost)>, from: Vec<(String, Cost)>) -> Vec<(String, Cost)> {
-    for (label, cost) in from {
-        match into.iter_mut().find(|(l, _)| *l == label) {
+/// The worst cost of a list of exits.
+fn worst_of(exits: Vec<(Exit, Cost)>) -> Option<Cost> {
+    exits
+        .into_iter()
+        .fold(None, |acc, (_, cost)| worst(acc, Some(cost)))
+}
+
+/// Join two lists of exits, taking the worse cost per target.
+fn merge_exits(mut into: Vec<(Exit, Cost)>, from: Vec<(Exit, Cost)>) -> Vec<(Exit, Cost)> {
+    for (exit, cost) in from {
+        match into.iter_mut().find(|(e, _)| *e == exit) {
             Some(slot) => slot.1 = slot.1.clone().or_worst(cost),
-            None => into.push((label, cost)),
+            None => into.push((exit, cost)),
         }
     }
     into
@@ -767,11 +1053,17 @@ struct Binding {
     /// Each part's name and kind, when the value was a struct or tuple
     /// literal. `None`: every part of a carrier is a handle.
     parts: Option<Vec<(String, Kind)>>,
+    /// The container shape, for a carrier, when it is known.
+    shape: Option<Shape>,
 }
 
 impl Binding {
     const fn of(kind: Kind) -> Self {
-        Self { kind, parts: None }
+        Self {
+            kind,
+            parts: None,
+            shape: None,
+        }
     }
 
     /// The binding that holds what `self` or `other` holds.
@@ -792,9 +1084,16 @@ impl Binding {
             (Some(mine), None) if other.kind == Kind::Plain => Some(mine.clone()),
             _ => None,
         };
+        let shape = match (self.shape, other.shape) {
+            (a, b) if a == b => a,
+            (None, b) if self.kind == Kind::Plain => b,
+            (a, None) if other.kind == Kind::Plain => a,
+            _ => None,
+        };
         Self {
             kind: self.kind.max(other.kind),
             parts,
+            shape,
         }
     }
 }
@@ -874,6 +1173,14 @@ impl Env {
             .iter()
             .rposition(|scope| scope.contains_key(name))
             .unwrap_or(0)
+    }
+
+    /// Record the container shape of `name`, as a type annotation gives it.
+    fn set_shape(&mut self, name: &str, shape: Option<Shape>) {
+        let at = self.home(name);
+        if let Some(binding) = self.scopes[at].get_mut(name) {
+            binding.shape = shape;
+        }
     }
 
     /// Store into the scope that declared `name`.
@@ -1014,6 +1321,11 @@ impl Analyzer {
         for arg in &input_fn.sig.inputs {
             if let syn::FnArg::Typed(typed) = arg {
                 analyzer.bind_pat(&typed.pat, type_kind(&typed.ty));
+                if let Pat::Ident(id) = &*typed.pat {
+                    analyzer
+                        .env
+                        .set_shape(&id.ident.to_string(), type_shape(&typed.ty));
+                }
             }
         }
         analyzer
@@ -1043,7 +1355,12 @@ impl Analyzer {
             // rustc checks the annotation. A type made only of standard and
             // primitive types cannot hold a handle.
             Pat::Type(p) if type_is_plain_std(&p.ty) => self.bind_pat(&p.pat, Kind::Plain),
-            Pat::Type(p) => self.bind_pat(&p.pat, kind.max(type_kind(&p.ty))),
+            Pat::Type(p) => {
+                self.bind_pat(&p.pat, kind.max(type_kind(&p.ty)));
+                if let Pat::Ident(id) = &*p.pat {
+                    self.env.set_shape(&id.ident.to_string(), type_shape(&p.ty));
+                }
+            }
             Pat::Reference(p) => self.bind_pat(&p.pat, kind),
             Pat::Paren(p) => self.bind_pat(&p.pat, kind),
             Pat::Guard(p) => self.bind_pat(&p.pat, kind),
@@ -1133,7 +1450,11 @@ impl Analyzer {
             ),
             _ => None,
         };
-        Binding { kind, parts }
+        Binding {
+            kind,
+            parts,
+            shape: self.shape_of(init),
+        }
     }
 
     /// `place = value`. A tuple or array place over a literal of the same
@@ -1505,7 +1826,7 @@ impl Analyzer {
             Expr::Block(b) if b.label.is_some() => {
                 // `break 'label` lands after the block.
                 let mut flow = self.framed(Target::Break, |s| s.block(&b.block));
-                let own = flow.take_label(b.label.as_ref());
+                let own = worst_of(flow.take_exits(b.label.as_ref(), false));
                 Flow {
                     fall: worst(flow.fall, own),
                     ..flow
@@ -1542,11 +1863,11 @@ impl Analyzer {
             Expr::Break(b) => {
                 let value = b.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
                 self.exit_loop();
-                value.then(Flow::exit_to(b.label.as_ref()))
+                value.then(Flow::exit_to(b.label.as_ref(), true))
             }
             Expr::Continue(c) => {
                 self.exit_loop();
-                Flow::exit_to(c.label.as_ref())
+                Flow::exit_to(c.label.as_ref(), false)
             }
             Expr::Cast(c) => self.expr(&c.expr),
             Expr::Field(f) => self.expr(&f.base),
@@ -1722,18 +2043,22 @@ impl Analyzer {
     ) -> Flow {
         let before = self.ledger.len();
         let mut flow = self.repeated(|s| s.framed(Target::Break, |s| s.scoped(&mut body)));
-        let own = flow.take_label(shape.label);
-        let ends = shape.ends || flow.brk.is_some() || own.is_some();
-        let outer = std::mem::take(&mut flow.labeled);
-        let outer_cost = outer
-            .iter()
-            .fold(None, |acc, (_, cost)| worst(acc, Some(cost.clone())));
-        let pass = worst(worst(Some(flow.total()), own), outer_cost).unwrap_or(Cost::ZERO);
+        let own = flow.take_exits(shape.label, true);
+        // Only a `break` to this loop ends a `loop`; a `continue` does not.
+        let ends = shape.ends || own.iter().any(|(exit, _)| exit.breaks);
+        let outer = std::mem::take(&mut flow.exits);
+        let pass = worst(
+            worst(Some(flow.total()), worst_of(own)),
+            worst_of(outer.clone()),
+        )
+        .unwrap_or(Cost::ZERO);
         let total = self.bound_loop(pass, shape.bound, shape.span, before);
         Flow {
             fall: ends.then(|| total.clone()),
-            brk: None,
-            labeled: outer.into_iter().map(|(l, _)| (l, total.clone())).collect(),
+            exits: outer
+                .into_iter()
+                .map(|(exit, _)| (exit, total.clone()))
+                .collect(),
             // A `?` or a panic may also leave the loop.
             ret: Some(total),
         }
@@ -1790,6 +2115,11 @@ impl Analyzer {
             }
         };
         methods.reverse();
+
+        for method in &methods {
+            let args: Vec<&Expr> = method.args.iter().collect();
+            self.store_into(&method.receiver, &method.method.to_string(), &args);
+        }
 
         let mut cost = self.cost_of(root);
 
@@ -1869,9 +2199,7 @@ impl Analyzer {
         // Not rooted at a handle: a diesel executor call is the round trip.
         for method in &methods {
             // `repos.push(repo)`: a known container method stores the handle.
-            if self.expr_is_carrier(&method.receiver)
-                && is_container_method(&method.method.to_string())
-            {
+            if self.known_container_method(&method.receiver, &method.method.to_string()) {
                 continue;
             }
             let is_executor = EXECUTORS.contains(&method.method.to_string().as_str());
@@ -1903,9 +2231,7 @@ impl Analyzer {
     fn opaque_container_method(&self, methods: &[&ExprMethodCall]) -> Option<Cost> {
         let unknown = methods.iter().find(|m| {
             self.expr_is_carrier(&m.receiver)
-                && (self.expr_is_holder(&m.receiver)
-                    || self.expr_is_nested(&m.receiver)
-                    || !is_container_method(&m.method.to_string()))
+                && !self.known_container_method(&m.receiver, &m.method.to_string())
         })?;
         Some(Cost::unbounded(
             unknown.span(),
@@ -1990,6 +2316,22 @@ impl Analyzer {
             .as_deref()
             .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n));
 
+        // `fill(&mut repos, &repo)`: a `&mut` argument may receive a handle
+        // from another argument.
+        for (i, arg) in call.args.iter().enumerate() {
+            if let Expr::Reference(r) = arg
+                && r.mutability.is_some()
+            {
+                let others: Vec<&Expr> = call
+                    .args
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, a)| a)
+                    .collect();
+                self.store_into(&r.expr, "", &others);
+            }
+        }
         let mut cost = self.cost_of(&call.func);
         let last = call.args.len().saturating_sub(1);
         for (i, arg) in call.args.iter().enumerate() {
@@ -2120,6 +2462,81 @@ impl Analyzer {
             && !self.method_is_handle(mc)
             && !is_handle_builder(&last)
             && !HANDLE_TRANSITIONS.contains(&last.as_str())
+    }
+
+    /// The container shape of `e`, when it is known.
+    fn shape_of(&self, e: &Expr) -> Option<Shape> {
+        match e {
+            Expr::Path(_) => path_ident(e).and_then(|name| self.env.binding(&name).shape),
+            Expr::Reference(r) => self.shape_of(&r.expr),
+            Expr::Paren(p) => self.shape_of(&p.expr),
+            Expr::Group(g) => self.shape_of(&g.expr),
+            Expr::Array(_) | Expr::Repeat(_) => Some(Shape::Seq),
+            Expr::Tuple(_) => Some(Shape::Tuple),
+            Expr::Macro(m) => vec_elems(&m.mac).map(|_| Shape::Seq),
+            Expr::Call(c) if is_smart_pointer_new(c) => {
+                c.args.first().and_then(|a| self.shape_of(a))
+            }
+            Expr::Call(c) => match call_path_name(c).as_deref() {
+                Some("Some") => Some(Shape::Opt),
+                Some("Ok" | "Err") => Some(Shape::Res),
+                _ => None,
+            },
+            Expr::MethodCall(mc) => {
+                let method = mc.method.to_string();
+                if method == "collect" {
+                    // `collect::<Vec<_>>()` names its shape.
+                    return mc.turbofish.as_ref().and_then(|t| {
+                        t.args.iter().find_map(|arg| match arg {
+                            syn::GenericArgument::Type(ty) => type_shape(ty),
+                            _ => None,
+                        })
+                    });
+                }
+                self.shape_of(&mc.receiver)?.after(&method)
+            }
+            _ => None,
+        }
+    }
+
+    /// Is `method` a known method of the standard container `receiver`? Not
+    /// on a user value or a nested container: their methods are the user's.
+    fn known_container_method(&self, receiver: &Expr, method: &str) -> bool {
+        !self.expr_is_holder(receiver)
+            && !self.expr_is_nested(receiver)
+            && self
+                .shape_of(receiver)
+                .is_some_and(|shape| shape.has(method))
+    }
+
+    /// `receiver.method(arg)` may store `arg` in `receiver`. When an argument
+    /// holds a handle, the name at the root of `receiver` now holds it too.
+    fn store_into(&mut self, receiver: &Expr, method: &str, args: &[&Expr]) {
+        let held = args
+            .iter()
+            .map(|a| self.value_of(a))
+            .max()
+            .unwrap_or(Kind::Plain);
+        if held == Kind::Plain {
+            return;
+        }
+        let Some(root) = place_root(receiver) else {
+            return;
+        };
+        let kind = match held {
+            Kind::Handle | Kind::LazyDb if STORE_METHODS.contains(&method) => Kind::Carrier,
+            Kind::Handle | Kind::LazyDb => Kind::Holder,
+            _ => Kind::Nested,
+        };
+        let mut binding = self.env.binding(&root);
+        if kind > binding.kind {
+            binding.kind = kind;
+            binding.parts = None;
+            if kind != Kind::Carrier {
+                binding.shape = None;
+            }
+            self.env.assign(root, binding);
+        }
     }
 
     /// Does `e` hold handles at an unknown depth ([`Kind::Nested`])? A
@@ -5809,6 +6226,80 @@ mod tests {
                 Expect::Exact(0),
             ),
         ];
+        check_cases(cases);
+    }
+
+    #[test]
+    fn storing_a_handle_makes_the_receiver_hold_it() {
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "exempted push into a plain Vec",
+                r#"let mut repos = Vec::new();
+                   #[query_exempt(reason = "pure container operation")]
+                   repos.push(repo);
+                   for r in repos { let _ = r.find_all(); }"#,
+                Expect::Unbounded,
+            ),
+            (
+                "exempted helper filling a &mut argument",
+                r#"let mut repos = Vec::new();
+                   #[query_exempt(reason = "fills only")]
+                   fill(&mut repos, &repo);
+                   for r in repos { let _ = r.find_all(); }"#,
+                Expect::Unbounded,
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    #[test]
+    fn a_container_method_must_exist_on_that_container() {
+        // `ok` is a `Result` method, not a `Vec` one: here it is an extension
+        // trait method, which may query.
+        let handler = r"
+            async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
+                repos.ok().await;
+                Ok(0)
+            }
+            ";
+        assert_error_contains("50", handler, &["ok"]);
+    }
+
+    #[test]
+    fn every_known_container_method_has_a_result_class() {
+        // A known method whose result is not classed would give a plain
+        // value, and a part taken through it would be lost.
+        let shapes = [
+            Shape::Seq,
+            Shape::Iter,
+            Shape::Opt,
+            Shape::Res,
+            Shape::Map,
+            Shape::Set,
+            Shape::Tuple,
+        ];
+        let unclassed: Vec<&str> = shapes
+            .iter()
+            .flat_map(|shape| shape.methods().iter().copied())
+            .filter(|m| {
+                !SCALAR_METHODS.contains(m)
+                    && !CARRIER_METHODS.contains(m)
+                    && !ELEMENT_METHODS.contains(m)
+            })
+            .collect();
+        assert!(
+            unclassed.is_empty(),
+            "unclassed container methods: {unclassed:?}"
+        );
+    }
+
+    #[test]
+    fn a_continue_does_not_end_a_loop() {
+        let cases: &[(&str, &str, Expect)] = &[(
+            "code after loop { continue; }",
+            "loop { continue; } let _ = repo.find_all();",
+            Expect::Exact(0),
+        )];
         check_cases(cases);
     }
 

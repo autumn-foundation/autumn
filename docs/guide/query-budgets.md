@@ -161,10 +161,14 @@ The analysis follows the handle through every name that holds it:
     and `ctx.user` is not.
   - An index (`repos[0]`), a field (`pair.0`), a pattern (`Some(r)`,
     `for r in repos`) or `?` gives a handle.
-  - A known container method is not a query. It gives a handle when it
-    returns a part (`repos.remove(0)`, `maybe.unwrap()`), and a container
-    when it returns a view (`repos.iter()`, `repos.first()`). Any other
-    method on the container is reported (`repos.refresh_all()`). Every
+  - A method that the container's own type has (a `Vec` method on a `Vec`,
+    an `Option` method on an `Option`) is not a query. It gives a handle
+    when it returns a part (`repos.remove(0)`, `maybe.unwrap()`), and a
+    container when it returns a view (`repos.iter()`, `repos.first()`). Any
+    other method on the container is reported (`repos.refresh_all()`, or an
+    extension-trait `repos.ok()`).
+  - A method or function given a handle may store it: after
+    `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. Every
     method on a user struct that holds a handle (`ctx.clear()` on
     `Ctx { repo }`) is reported too.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
