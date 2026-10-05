@@ -3122,6 +3122,28 @@ previous_secrets = []
     }
 
     #[test]
+    fn azure_cutover_keeps_secret_values_off_the_command_line() {
+        // `secret list --show-values` returns plaintext values. A process
+        // argument is visible in /proc/*/cmdline, so they go through a file.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        assert!(
+            !script.contains("--argjson app_secrets"),
+            "secret values must not be a jq argument: {script}"
+        );
+        assert!(
+            script.contains("--show-values \\\n  --output json > \"$APP_SECRETS\""),
+            "secret values must go to a file: {script}"
+        );
+        assert!(
+            script.contains("--body \"@$BODY\""),
+            "a PATCH body must go to az from a file: {script}"
+        );
+    }
+
+    #[test]
     fn azure_cutover_rolls_back_a_failed_first_cutover() {
         // A failed first cutover leaves the placeholder as the active
         // revision. It must not keep the identity or the secret refs.
@@ -3318,8 +3340,16 @@ esac
         );
         let rollback = bodies.lines().last().unwrap_or_default();
         assert!(
-            rollback.contains("\"type\":\"None\"") && rollback.contains("\"secrets\":[]"),
-            "the rollback must remove the identity and secret refs: {rollback}"
+            rollback.contains("\"type\":\"None\""),
+            "the rollback must remove the job's identity: {rollback}"
+        );
+        assert!(
+            !rollback.contains("signing-secret") && !rollback.contains("database-url"),
+            "the rollback must remove the job's secret refs: {rollback}"
+        );
+        assert!(
+            rollback.contains("\"api-key\""),
+            "the rollback must keep the secrets that the operator added: {rollback}"
         );
     }
 
