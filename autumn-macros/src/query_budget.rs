@@ -2761,6 +2761,17 @@ impl Analyzer {
         frame.target == Target::Try
     }
 
+    /// Join in the bindings at earlier reads. A later part of an expression
+    /// may change a binding that an earlier part already read:
+    /// `f(source.take(), { source = None; })`.
+    fn keep_reads(&mut self, reads: Vec<Env>) {
+        for read in reads {
+            if read != self.env {
+                self.env.join(&read);
+            }
+        }
+    }
+
     /// Run `f` as code that runs zero or one times.
     fn optional<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let entry = self.env.clone();
@@ -3146,8 +3157,12 @@ impl Analyzer {
 
             Expr::Array(a) => self.each(a.elems.iter()),
             Expr::Tuple(t) => self.each(t.elems.iter()),
+            // The value runs before the place.
             Expr::Assign(a) => {
-                let flow = self.expr(&a.left).then(self.expr(&a.right));
+                let value = self.expr(&a.right);
+                let read = self.env.clone();
+                let flow = value.then(self.expr(&a.left));
+                self.keep_reads(vec![read]);
                 self.assign(&a.left, &a.right);
                 flow
             }
@@ -3561,11 +3576,16 @@ impl Analyzer {
         // Arguments run regardless of what the chain does with them. Each
         // store reads its own arguments right after they ran, before a later
         // method's arguments run: `dest.push({ source.push(repo); … })`.
+        let mut reads = Vec::new();
         for method in &methods {
+            if !method.args.is_empty() {
+                reads.push(self.env.clone());
+            }
             cost = cost.then(self.method_args(method));
             let args: Vec<&Expr> = method.args.iter().collect();
             self.store_into(&method.receiver, &method.method.to_string(), &args);
         }
+        self.keep_reads(reads);
         // Where the handle enters the chain: the root itself, or the first
         // method that yields one (`app.db()…`, `slot.unwrap()…`). Methods
         // before it are ordinary; methods after it act on a handle.
@@ -3826,7 +3846,9 @@ impl Analyzer {
 
         let mut cost = self.cost_of(&call.func);
         let last = call.args.len().saturating_sub(1);
+        let mut reads = Vec::new();
         for (i, arg) in call.args.iter().enumerate() {
+            reads.push(self.env.clone());
             let next = if runs_once {
                 self.connection_params = true;
                 self.callback_arg(arg, Kind::Handle, i == last)
@@ -3835,6 +3857,7 @@ impl Analyzer {
             };
             cost = cost.then(next);
         }
+        self.keep_reads(reads);
         // `fill(&mut repos, &repo)` or `fill(slot, &repo)`: a `&mut`
         // argument may receive a handle from another argument, or from a
         // stored closure that captures one. The arguments ran first, so what
@@ -12453,6 +12476,54 @@ mod tests {
                  let mut slot = Some(repo); let refs = (&mut slot, 1); *refs.0 = None; drop(refs); \
                  slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn later_parts_do_not_erase_earlier_reads() {
+        check_handlers(&[
+            (
+                "guard: a later argument does not erase an earlier one",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); \
+                 helper(source.take().unwrap(), { source = None; }).await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a later method argument does not erase an earlier one",
+                "async fn h(repo: PgPostRepository, svc: Service) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); \
+                 svc.helper(source.take().unwrap(), { source = None; }).await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a method argument does not erase its receiver",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); \
+                 source.as_ref().unwrap().find_all_by({ source = None; 1 }).await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an assignment runs its value before its place",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); let mut rows = vec![Vec::new()]; \
+                 rows[{ source = None; 0 }] = source.as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an assignment reads its value before its place runs",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); let mut slots = vec![None]; \
+                 slots[{ source = None; 0 }] = source; \
+                 slots[0].as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a clear in one statement still holds in the next",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); source = None; render(source); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
