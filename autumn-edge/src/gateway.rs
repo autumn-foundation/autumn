@@ -259,12 +259,13 @@ fn edge_request<B>(request: &Request<B>) -> Option<EdgeRequest> {
 }
 
 /// Headers that describe one connection or hop, not the response (RFC 9110
-/// section 7.6.1, plus the legacy `keep-alive` and `proxy-connection`). A
-/// capsule must not set them.
+/// sections 7.6.1 and 11.7, plus the legacy `keep-alive` and
+/// `proxy-connection`). A capsule must not set them.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",
+    "proxy-authentication-info",
     "proxy-authorization",
     "proxy-connection",
     "te",

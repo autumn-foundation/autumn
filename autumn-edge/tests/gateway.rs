@@ -410,6 +410,7 @@ fn a_framing_header_that_does_not_match_the_body_falls_through() {
         ("te", "trailers"),
         ("trailer", "x-checksum"),
         ("proxy-authenticate", "Basic"),
+        ("proxy-authentication-info", "nextnonce=\"x\""),
         ("proxy-connection", "keep-alive"),
     ] {
         let artifact = guest(&GuestFrame::Response(EdgeResponse {
