@@ -506,14 +506,16 @@ pub fn quoted_len(rest: &str, close: char) -> usize {
 /// - A quoted identifier (`"from"`, `` `from` `` or `[from]`) matches too.
 /// - String literals (`'...'`) do not change.
 /// - A function name (a word before `(`), a typed-literal type (a word before
-///   `'`) or a cast type (the name after `::`, maybe schema-qualified) does not
-///   change.
+///   `'`), and the name after `::`, `COLLATE`, `AS` or `USING` (a type, a
+///   collation or a method, maybe schema-qualified) do not change.
 fn replace_word(sql: &str, from: &str, to: &str) -> String {
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
     let mut out = String::with_capacity(sql.len());
     let mut rest = sql;
-    // The type name after `::` (maybe schema-qualified) is not a column.
-    // `expect_name`: after `::` or a `.` in that name; `in_name`: after a part.
+    // The name after `::`, `COLLATE`, `AS` or `USING` (maybe schema-qualified)
+    // is a type, a collation or a method, not a column.
+    // `expect_name`: after one of those or a `.` in that name; `in_name`: after
+    // a part.
     let (mut expect_name, mut in_name) = (false, false);
     while let Some(c) = rest.chars().next() {
         let close = match c {
@@ -550,7 +552,11 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
         } else {
             out.push_str(token);
         }
-        (expect_name, in_name) = if out.ends_with("::") || (in_name && c == '.') {
+        let name_keyword = close.is_none()
+            && ["COLLATE", "AS", "USING"]
+                .iter()
+                .any(|k| token.eq_ignore_ascii_case(k));
+        (expect_name, in_name) = if out.ends_with("::") || name_keyword || (in_name && c == '.') {
             (true, false)
         } else if in_cast {
             (false, true)
@@ -1313,6 +1319,18 @@ mod tests {
                 "published_on"
             ),
             "published_on >= v::pg_catalog.date AND published_on < w:: date"
+        );
+        assert_eq!(
+            replace_word(
+                "name COLLATE nocase <> '' AND nocase <> '' AND CAST(x AS nocase) = \"nocase\"",
+                "nocase",
+                "code"
+            ),
+            "name COLLATE nocase <> '' AND code <> '' AND CAST(x AS nocase) = \"code\""
+        );
+        assert_eq!(
+            replace_word("t COLLATE \"nocase\" > ''", "nocase", "code"),
+            "t COLLATE \"nocase\" > ''"
         );
         assert_eq!(
             replace_word("date >= DATE '2020-01-01'", "date", "published_on"),
