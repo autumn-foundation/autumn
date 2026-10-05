@@ -145,10 +145,41 @@ let info = JobInfo {
 };
 ```
 
-Code that uses `#[job]` or `JobInfo::new` does not change.
+Code that uses `#[job]` or `JobInfo::new` does not change. `JobConfig` also
+has a new `default_timeout_ms` field: see the struct-literal note in the next
+section.
 
 **Automation:** `manual` — add `timeout: None` to each hand-written `JobInfo`
 literal. `#[job]` and `JobInfo::new` set it.
+
+### HTTP client: `retries(n)` no longer retries `POST` and `PATCH`
+
+**Why:** `.retries(n)` also turned on retries for non-idempotent methods. A
+request for more retries could then send a `POST` two times with no
+`Idempotency-Key` (issue #3054).
+
+**Before (`0.8`):**
+
+```rust
+// Retried the POST up to 2 times.
+client.post(url).retries(2).send().await?;
+```
+
+**After (`0.9`):**
+
+```rust
+// Retries the POST up to 2 times. Sends an `Idempotency-Key` header
+// (the same value on each attempt) if the request has none.
+client.post(url).retries(2).retry_non_idempotent().send().await?;
+```
+
+If you build a `RetryPolicy`, `HttpClientConfig` or `JobConfig` with a
+struct literal, add the new fields (`max_backoff`, `max_backoff_ms`, and on
+`JobConfig` also `default_timeout_ms`), or end the literal with
+`..Default::default()`.
+
+**Automation:** `manual` — the fix adds a call only where you want `POST` or
+`PATCH` retried. A codemod cannot know which calls are safe to repeat.
 
 ### Scheduler: the Postgres backend needs the `autumn_scheduler_ticks` table
 
@@ -221,6 +252,8 @@ single most valuable section of the guide — keep it factual and short.
 |---------------------------|------------------|-----|
 | `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
+| `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`, `default_timeout_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
+| `error[E0063]: missing field \`timeout\`` | a `JobInfo` literal | add `timeout: None` |
 
 ## Configuration changes
 
@@ -229,6 +262,14 @@ single most valuable section of the guide — keep it factual and short.
 - Default profile changes.
 
 If nothing changed, delete this section.
+
+- New: `[http.client] max_backoff_ms` (default `20000`). The cap on the
+  HTTP client's retry backoff.
+- New: `[jobs] max_backoff_ms` and `AUTUMN_JOBS__MAX_BACKOFF_MS` (default
+  `3600000`, 1 h). The cap on job retry backoff for every backend.
+- New: `[jobs] default_timeout_ms` and `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS`
+  (default `0`, no limit). The longest one run of a job without
+  `#[job(timeout)]` may take (issue #3051).
 
 ## Behavior changes
 
@@ -249,6 +290,19 @@ If nothing changed, delete this section.
   rolling deploy, an old worker still compares deadlines to its own clock. An
   old worker whose clock runs ahead of Redis can requeue a live job. Keep
   worker clocks in sync (NTP) during the deploy.
+- Retries use full jitter (issue #3054). The delay before retry `n` is a
+  random value in `[0, min(cap, base * 2^n)]`. Before, the HTTP client and the
+  `postgres`, `redis` and `sqlite` job backends used the exact value
+  `base * 2^n`, and the `local` backend used `[base/2, base]`. A test that
+  expects an exact retry time must allow the range.
+- The HTTP client now obeys `Retry-After` on a `503`, as on a `429`. The wait
+  is `backoff + min(hint, 5 s)`. Before, a `429` waited the full hint (up to
+  `max_retry_after`, default 10 s) plus the backoff. A `429` with
+  `Retry-After: 10` now retries after about 5 s. Against a strict rate
+  limiter, raise `max_retries` or handle the `429` yourself.
+- A `POST` or `PATCH` with `.retries(n)` and no `.retry_non_idempotent()`
+  now makes one attempt. This compiles with no warning, so search your code
+  for `.post(` and `.patch(` calls that use `.retries(`.
 
 ## Deprecations retained from `{X.Y}`
 

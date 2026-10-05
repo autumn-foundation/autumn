@@ -726,3 +726,241 @@ async fn works_through_arc_dyn_cache_raw_bytes_backend() {
     .unwrap();
     assert_eq!(v, "hello");
 }
+
+// ── stale-if-error (#3056) ─────────────────────────────────────────────
+
+/// A clock that moves only when the test moves it, so freshness is exact.
+fn ticking_clock() -> autumn_web::time::TickingClock {
+    use chrono::TimeZone as _;
+    autumn_web::time::TickingClock::starting_at(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid instant"),
+    )
+}
+
+fn stale_if_error_options(clock: &autumn_web::time::TickingClock) -> GetOrComputeOptions {
+    GetOrComputeOptions::new()
+        .ttl(Duration::from_secs(10))
+        .stale_if_error(Duration::from_secs(60))
+        .with_clock(Arc::new(clock.clone()))
+}
+
+async fn fill_ok(
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    opts: GetOrComputeOptions,
+    value: &str,
+) -> String {
+    let value = value.to_owned();
+    get_or_compute_with(cache, key, opts, move || async move {
+        Ok::<String, String>(value)
+    })
+    .await
+    .expect("fill succeeds")
+}
+
+async fn fill_err(
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    opts: GetOrComputeOptions,
+) -> Result<String, CacheFillError<String>> {
+    get_or_compute_with(cache, key, opts, || async {
+        Err::<String, String>("database down".to_owned())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn stale_if_error_serves_the_previous_value_when_a_fill_fails() {
+    let _guard = METRICS_LOCK.lock().await;
+    let cache = fresh_cache();
+    let key = unique_key("stale_if_error_serves_previous");
+    let clock = ticking_clock();
+    let opts = stale_if_error_options(&clock);
+
+    assert_eq!(fill_ok(&cache, &key, opts.clone(), "v1").await, "v1");
+
+    // Past the TTL, inside the stale-if-error window.
+    clock.advance(Duration::from_secs(11));
+    let before = read_through_metrics().stale_if_error_serves();
+    let served = fill_err(&cache, &key, opts.clone())
+        .await
+        .expect("a failed fill must serve the last known value inside the window");
+    assert_eq!(served, "v1");
+    assert_eq!(
+        read_through_metrics().stale_if_error_serves(),
+        before + 1,
+        "each stale-if-error serve is counted"
+    );
+}
+
+#[tokio::test]
+async fn stale_if_error_does_not_serve_past_its_window() {
+    let _guard = METRICS_LOCK.lock().await;
+    let cache = fresh_cache();
+    let key = unique_key("stale_if_error_window");
+    let clock = ticking_clock();
+    let opts = stale_if_error_options(&clock);
+
+    fill_ok(&cache, &key, opts.clone(), "v1").await;
+
+    // TTL (10 s) plus the window (60 s) has passed.
+    clock.advance(Duration::from_secs(71));
+    let result = fill_err(&cache, &key, opts).await;
+    assert!(
+        matches!(result, Err(CacheFillError::Fill(ref e)) if e == "database down"),
+        "past ttl + window the fill error must surface: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_if_error_refreshes_when_the_fill_succeeds() {
+    let _guard = METRICS_LOCK.lock().await;
+    let cache = fresh_cache();
+    let key = unique_key("stale_if_error_refresh");
+    let clock = ticking_clock();
+    let opts = stale_if_error_options(&clock);
+
+    fill_ok(&cache, &key, opts.clone(), "v1").await;
+    clock.advance(Duration::from_secs(11));
+    assert_eq!(
+        fill_ok(&cache, &key, opts.clone(), "v2").await,
+        "v2",
+        "a stale value is a fallback, not a substitute for a good fill"
+    );
+    // v2 is fresh now, so the next read is a hit.
+    assert_eq!(fill_ok(&cache, &key, opts, "v3").await, "v2");
+}
+
+#[tokio::test]
+async fn stale_if_error_with_no_previous_value_returns_the_error() {
+    let _guard = METRICS_LOCK.lock().await;
+    let cache = fresh_cache();
+    let key = unique_key("stale_if_error_cold");
+    let clock = ticking_clock();
+
+    let result = fill_err(&cache, &key, stale_if_error_options(&clock)).await;
+    assert!(matches!(result, Err(CacheFillError::Fill(_))), "{result:?}");
+}
+
+#[tokio::test]
+async fn stale_if_error_is_off_by_default() {
+    let _guard = METRICS_LOCK.lock().await;
+    let cache = fresh_cache();
+    let key = unique_key("stale_if_error_off");
+    let clock = ticking_clock();
+    let opts = GetOrComputeOptions::new()
+        .ttl(Duration::from_secs(10))
+        .stale_while_revalidate(Duration::from_secs(1))
+        .with_clock(Arc::new(clock.clone()));
+
+    fill_ok(&cache, &key, opts.clone(), "v1").await;
+    clock.advance(Duration::from_secs(12));
+    let result = fill_err(&cache, &key, opts).await;
+    assert!(
+        matches!(result, Err(CacheFillError::Fill(_))),
+        "without stale_if_error a failed fill is an error: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_if_error_also_covers_coalesced_waiters() {
+    let _guard = METRICS_LOCK.lock().await;
+    let cache = fresh_cache();
+    let key = unique_key("stale_if_error_waiters");
+    let clock = ticking_clock();
+    let opts = stale_if_error_options(&clock);
+
+    fill_ok(&cache, &key, opts.clone(), "v1").await;
+    clock.advance(Duration::from_secs(11));
+
+    // The leader holds its fill open until every caller has started, so the
+    // others coalesce onto it and see its failure.
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let (cache, key, opts, release) =
+            (cache.clone(), key.clone(), opts.clone(), release.clone());
+        handles.push(tokio::spawn(async move {
+            get_or_compute_with(&cache, &key, opts, move || async move {
+                release.acquire().await.expect("open").forget();
+                Err::<String, String>("database down".to_owned())
+            })
+            .await
+        }));
+    }
+    let before = read_through_metrics().stale_if_error_serves();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    release.add_permits(16);
+
+    for handle in handles {
+        let served = handle
+            .await
+            .expect("task")
+            .expect("every caller gets the stale value");
+        assert_eq!(served, "v1");
+    }
+    assert_eq!(
+        read_through_metrics().stale_if_error_serves(),
+        before + 4,
+        "the leader and each waiter serve the stale value"
+    );
+}
+
+/// Records the TTL of each serialized insert, so a test can see what the
+/// backend is told to keep.
+struct TtlRecordingCache {
+    inner: MokaCache,
+    ttls: std::sync::Mutex<Vec<Option<Duration>>>,
+}
+
+impl Cache for TtlRecordingCache {
+    fn get_value(&self, key: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.inner.get_value(key)
+    }
+    fn insert_value(&self, key: &str, value: Arc<dyn std::any::Any + Send + Sync>) {
+        self.inner.insert_value(key, value);
+    }
+    fn insert_raw_bytes(&self, _key: &str, _bytes: Vec<u8>, ttl: Option<Duration>) {
+        self.ttls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(ttl);
+    }
+    fn invalidate(&self, key: &str) {
+        self.inner.invalidate(key);
+    }
+    fn clear(&self) {
+        self.inner.clear();
+    }
+}
+
+#[tokio::test]
+async fn stale_if_error_keeps_the_value_for_ttl_plus_the_window() {
+    let _guard = METRICS_LOCK.lock().await;
+    let recording = Arc::new(TtlRecordingCache {
+        inner: MokaCache::new(10, None),
+        ttls: std::sync::Mutex::new(Vec::new()),
+    });
+    let cache: Arc<dyn Cache> = recording.clone();
+    let clock = ticking_clock();
+
+    fill_ok(
+        &cache,
+        &unique_key("stale_if_error_physical_ttl"),
+        stale_if_error_options(&clock),
+        "v1",
+    )
+    .await;
+
+    assert_eq!(
+        *recording
+            .ttls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        vec![Some(Duration::from_secs(70))],
+        "a backend with native expiry must keep the value until the window ends"
+    );
+}

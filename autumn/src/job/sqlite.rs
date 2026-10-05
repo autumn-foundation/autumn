@@ -63,9 +63,9 @@ use super::{
     JobAdminStatus, JobClient, JobInfo, JobUniquenessWindow, PgLifecycleRecord, QueueSchedule,
     QueueSlots, ResolvedJobConstraints, build_per_job_settings, collect_declared_queues,
     format_job_admin_time, install_job_client, is_final_attempt, job_admin_backend,
-    job_payload_identity, job_unique_key, normalize_queue_name, pg_retry_delay_ms,
-    record_pg_cancel_after_ack, record_pg_lifecycle_ack_result, run_job_handler,
-    should_warn_pin_coverage, validate_unique_job_names, warn_pinned_uncovered_queues,
+    job_payload_identity, job_unique_key, normalize_queue_name, record_pg_cancel_after_ack,
+    record_pg_lifecycle_ack_result, run_job_handler, should_warn_pin_coverage,
+    sql_row_retry_delay_ms, validate_unique_job_names, warn_pinned_uncovered_queues,
 };
 use crate::db::RuntimeConnection;
 use crate::state::AppState;
@@ -675,8 +675,12 @@ async fn ack_success(
     })
 }
 
-/// Retry a failed job with exponential backoff, or dead-letter it on the final
+/// Retry a failed job after `retry_delay_ms`, or dead-letter it on the final
 /// attempt. Returns whether this worker still held the claim.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one private call shape, two callers"
+)]
 async fn nack_failure(
     pool: &SqlitePool,
     now: i64,
@@ -685,6 +689,7 @@ async fn nack_failure(
     error: &str,
     row: &SqliteJobRow,
     pending_unique_key: Option<&str>,
+    retry_delay_ms: u64,
 ) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
@@ -696,7 +701,7 @@ async fn nack_failure(
         return dead_letter_on(&mut conn, now, job_id, worker_id, error).await;
     }
 
-    let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
+    let delay_ms = i64::try_from(retry_delay_ms).unwrap_or(i64::MAX);
     // Restore a pending-window unique key in the same UPDATE that re-enqueues
     // the row, so there is no window where the row is claimable with no key and
     // a concurrent enqueue slips past the dedup index.
@@ -810,7 +815,10 @@ async fn recover_stale_claims(
          SET status = CASE WHEN attempt < max_attempts THEN '{STATUS_ENQUEUED}' \
                            ELSE '{STATUS_FAILED}' END, \
              attempt = CASE WHEN attempt < max_attempts THEN attempt + 1 ELSE attempt END, \
-             run_at = CASE WHEN attempt < max_attempts THEN ? ELSE run_at END, \
+             run_at = CASE WHEN attempt < max_attempts THEN ? + \
+               ((random() & 9223372036854775807) % (MIN(?, \
+                 initial_backoff_ms * (1 << MIN(MAX(attempt - 1, 0), 62))) + 1)) \
+               ELSE run_at END, \
              started_at = NULL, \
              finished_at = CASE WHEN attempt >= max_attempts THEN ? ELSE NULL END, \
              claimed_by = NULL, \
@@ -837,8 +845,12 @@ async fn recover_stale_claims(
            LIMIT {STALE_RECOVERY_BATCH}) \
          RETURNING id, name, status, payload"
     );
+    // A per-row jitter, so claims that expire together do not all run again
+    // at once (issue #3054). See `stale_requeue_cap_ms`.
+    let cap_ms = super::stale_requeue_cap_ms(state);
     let recovered = diesel::sql_query(sql)
         .bind::<diesel::sql_types::BigInt, _>(now)
+        .bind::<diesel::sql_types::BigInt, _>(cap_ms)
         .bind::<diesel::sql_types::BigInt, _>(now)
         .bind::<diesel::sql_types::BigInt, _>(cutoff)
         .load::<RecoveredRow>(&mut *conn)
@@ -1214,6 +1226,7 @@ async fn execute_job(
             "canceled by operator",
             &row,
             None,
+            sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt),
         )
         .await;
         record_pg_cancel_after_ack(ack, &row.name, &row.id, state);
@@ -1332,17 +1345,18 @@ async fn settle_outcome(
             );
         }
         JobExecutionOutcome::Failed(error) => {
+            // One draw for the gauge and the retry UPDATE, so both agree.
+            let delay_ms = sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt);
             let lifecycle = if final_attempt {
                 PgLifecycleRecord::Failure { error: &error }
             } else {
                 // Mirror the `run_at = now + backoff` the retry UPDATE applies,
                 // so the local gauge tracks the retry as scheduled until it is
                 // claimable. A zero backoff is due now.
-                let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
                 let ready_at_ms = (delay_ms > 0).then(|| {
                     u64::try_from(now_ms(state))
                         .unwrap_or(0)
-                        .saturating_add(u64::try_from(delay_ms).unwrap_or(0))
+                        .saturating_add(delay_ms)
                 });
                 PgLifecycleRecord::Retry {
                     error: &error,
@@ -1358,6 +1372,7 @@ async fn settle_outcome(
                 &error,
                 row,
                 pending_unique_key,
+                delay_ms,
             )
             .await;
             record_pg_lifecycle_ack_result(

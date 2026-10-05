@@ -19,7 +19,8 @@ narrative is `docs/guide/edge.md`, the design record is
 | `EdgeCache` | `src/handlers.rs` | One extractor, two implementations — the app's cache at the origin, a host round trip at the edge |
 | `AppBuilder::with_edge_kv` | `src/main.rs` | Puts a store behind that seam at the origin |
 | Origin-only code | `src/origin.rs` | A `POST` route the edge declines and the origin answers, with no glue |
-| Conformance | `tests/conformance.rs` | Runs one request corpus through the native lane, a real wasm artifact, and the full origin app |
+| Conformance | `tests/conformance.rs` | Runs one request corpus through the native lane, a real wasm artifact, the full origin app, and a gateway |
+| `EdgeGateway` | `tests/conformance.rs` | The capsule in front of the origin: a declined request goes to the origin unchanged |
 
 The module split is the whole trick:
 
@@ -105,6 +106,11 @@ sources and compares it against both the native edge lane and the full origin
 app over a shared request corpus — percent-encoding, `%2F` inside a segment,
 trailing slashes, repeated query keys, float and integer rendering, a stripped
 credential, and each of the four ways the edge can decline.
+
+Two more tiers follow. The gateway tier puts the capsule in front of the
+origin and checks that the client gets the origin's bytes from either lane.
+The generated tier sends 10,000 seeded requests through every lane and
+requires zero divergence.
 
 ```bash
 cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture

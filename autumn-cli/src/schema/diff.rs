@@ -30,9 +30,9 @@
 //! [`SchemaDiagnostic`](crate::schema::parse::SchemaDiagnostic)) is likewise not
 //! dropped. The **accepted trade-off** is that the diff is intentionally
 //! conservative and will *miss* a genuine removal of one of those facets; that is
-//! preferable to ever destroying parser-invisible or hand-written state, and the
-//! genuine-removal case is recovered by later slices (`#[renamed_from]`, richer
-//! parsing, a shadow-DB oracle).
+//! preferable to ever destroying parser-invisible or hand-written state. A
+//! rename is not a removal: `#[renamed_from]` turns it into a `Rename*` change
+//! (see [`crate::schema::rename`]).
 //!
 //! # Invisible `#[belongs_to(...)]` association foreign keys (offline limitation)
 //!
@@ -67,8 +67,8 @@
 //!    `Column.references` and no diagnostic, so it cannot be detected offline —
 //!    the resulting `DROP TABLE` (already `--allow-destructive`-gated) may fail to
 //!    apply because the real `<retained>_<col>_fkey` constraint still depends on
-//!    the dropped table. A precise guard is impossible without schema introspection
-//!    (a future slice's shadow-DB / `--dev-url` oracle); a blanket "refuse every
+//!    the dropped table. A precise guard needs schema introspection (the
+//!    `--dev-url` replay gives a baseline that has these FKs); a blanket "refuse every
 //!    table drop" would make the common case useless and is deliberately **not**
 //!    done. Instead every emitted `DROP TABLE` carries an advisory
 //!    `-- autumn-safety:` comment naming this exact gap so the operator verifies
@@ -128,7 +128,7 @@
 //! check, so all three always agree on the emitted name. A short FK name (the
 //! common case) is returned unchanged, so Postgres output is byte-stable.
 //!
-//! Parser-provided index names (`idx_<table>_<field>`) are **not** renamed — the
+//! Parser-provided index names (`idx_<table>_<field>`) are **not** truncated — the
 //! app spells them elsewhere — so [`guard_plan`] still refuses (no override — the
 //! SQL is unappliable, not merely lossy) any Postgres plan that generates an index
 //! identifier **longer than 63 bytes**, plus (defensively) any pair of generated
@@ -192,6 +192,41 @@ impl MigrationPlan {
 /// not an oversight (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaChange {
+    // ---- renames (`#[renamed_from]`, see [`crate::schema::rename`]) ----
+    /// A managed table renamed by a `#[renamed_from]` hint. Not destructive.
+    RenameTable {
+        /// The old table name.
+        from: String,
+        /// The new table name.
+        to: String,
+    },
+    /// A column renamed by a `#[renamed_from]` hint. Not destructive.
+    RenameColumn {
+        /// The table name (after any table rename).
+        table: String,
+        /// The old column name.
+        from: String,
+        /// The new column name.
+        to: String,
+    },
+    /// A convention-named index renamed to follow a table or column rename.
+    RenameIndex {
+        /// The table name (after any table rename).
+        table: String,
+        /// The old index name.
+        from: String,
+        /// The index with its new name (`SQLite` recreates it from this shape).
+        index: Index,
+    },
+    /// A `#[renamed_from]` hint that the engine cannot apply safely. A
+    /// non-emittable marker: [`guard_plan`] refuses it, with no override.
+    RenameConflict {
+        /// The table the hint is on.
+        table: String,
+        /// Why the hint cannot apply.
+        reason: String,
+    },
+
     // ---- table level ----
     /// A managed table present in the desired state but not the baseline.
     CreateTable(Table),
@@ -475,10 +510,20 @@ pub enum DiffError {
         ops: Vec<DestructiveOp>,
     },
 
+    /// A `#[renamed_from]` hint cannot apply (no override).
+    #[error("cannot apply #[renamed_from] on table `{table}`: {reason}")]
+    RenameConflict {
+        /// The table the hint is on.
+        table: String,
+        /// Why the hint cannot apply.
+        reason: String,
+    },
+
     /// A single table both dropped and added column(s) — possibly a rename.
     #[error(
         "ambiguous change on table `{table}`: column(s) [{}] disappeared and [{}] appeared. \
-         If this is a rename, use #[renamed_from] (not yet supported — slice 5+); \
+         If this is a rename, put #[renamed_from] on the new field \
+         (for example #[renamed_from(\"old_name\")]); \
          refusing to emit a drop+add. Re-run with --allow-destructive to treat them \
          as independent drop/add.",
         .dropped.join(", "),
@@ -801,7 +846,11 @@ pub enum EmitError {
 #[must_use]
 pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions) -> MigrationPlan {
     let backend = plan_backend(baseline, desired);
-    let mut changes = Vec::new();
+    // `#[renamed_from]` hints: emit the renames first, then diff the renamed
+    // baseline so a renamed table or column is not a drop + add.
+    let mut changes = crate::schema::rename::rename_changes(baseline, desired);
+    let renamed = crate::schema::rename::renamed_baseline(baseline, &changes);
+    let baseline = renamed.as_slice();
 
     let baseline_by_name: BTreeMap<&str, &Table> =
         baseline.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -1722,6 +1771,9 @@ fn plan_backend(baseline: &[Table], desired: &ParsedSchema) -> Backend {
 /// Returns a [`DiffError`] describing the first refusal; `Ok(())` for an
 /// emittable plan (including the empty no-op plan).
 pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffError> {
+    // 0. An unsafe `#[renamed_from]` hint — no override.
+    find_rename_conflict(plan).map_or(Ok(()), Err)?;
+
     // 1. Primary-key change — no override.
     if let Some(table) = plan.changes.iter().find_map(|c| match c {
         SchemaChange::PrimaryKeyChange { table } => Some(table.clone()),
@@ -1902,6 +1954,18 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
     Ok(())
 }
 
+/// The [`DiffError::RenameConflict`] refusal for the first
+/// [`SchemaChange::RenameConflict`] marker in `plan`, if any.
+fn find_rename_conflict(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::RenameConflict { table, reason } => Some(DiffError::RenameConflict {
+            table: table.clone(),
+            reason: reason.clone(),
+        }),
+        _ => None,
+    })
+}
+
 /// The [`DiffError::IdentityChange`] refusal for the first
 /// [`SchemaChange::IdentityChange`] marker in `plan`, if any.
 fn find_identity_change_block(plan: &MigrationPlan) -> Option<DiffError> {
@@ -2011,7 +2075,9 @@ fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
                 // over-limit one is truncate+hashed — so this never trips the guard.
                 names.push(bounded_pg_identifier(&format!("{table}_{column}_fkey")));
             }
-            SchemaChange::AddIndex { index, .. } => names.push(index.name.clone()),
+            SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
+                names.push(index.name.clone());
+            }
             SchemaChange::CreateTable(table) => {
                 names.extend(table.indexes.iter().map(|i| i.name.clone()));
             }
@@ -2094,6 +2160,17 @@ fn bounded_pg_identifier(raw: &str) -> String {
 fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
     if plan.backend != Backend::Postgres {
         return None;
+    }
+    // A rename target comes from the models, so it has no length limit there.
+    if let Some(name) = plan.changes.iter().find_map(|c| match c {
+        SchemaChange::RenameTable { to, .. } | SchemaChange::RenameColumn { to, .. }
+            if to.len() > PG_MAX_IDENTIFIER_BYTES =>
+        {
+            Some(to.clone())
+        }
+        _ => None,
+    }) {
+        return Some(DiffError::GeneratedIdentifierTooLong { name });
     }
     let mut by_truncated: BTreeMap<String, String> = BTreeMap::new();
     for name in generated_identifiers(plan) {
@@ -2342,11 +2419,18 @@ fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String,
     // gathered so a multi-column retained index is recreated only after ALL its
     // dependent dropped columns are back.
     let mut dropped_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // The reversed renames run last, after the retained-index recreations below:
+    // those use the new (renamed) names.
+    let mut renames = Vec::new();
     for change in ordered {
         let sql = emit_change_down(change, plan.backend)?;
         let sql = sql.trim_end();
         if !sql.is_empty() {
-            groups.push(sql.to_owned());
+            if is_rename(change) {
+                renames.push(sql.to_owned());
+            } else {
+                groups.push(sql.to_owned());
+            }
         }
         if let SchemaChange::DropColumn { table, column } = change {
             dropped_by_table
@@ -2364,6 +2448,7 @@ fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String,
             groups.push(index_sql(table, idx).trim_end().to_owned());
         }
     }
+    groups.extend(renames);
     Ok(join_groups(&groups))
 }
 
@@ -2434,7 +2519,11 @@ fn fk_type_change_columns(changes: &[&SchemaChange], table: &str) -> Vec<String>
 const fn change_table_name(change: &SchemaChange) -> &str {
     match change {
         SchemaChange::CreateTable(t) | SchemaChange::DropTable(t) => t.name.as_str(),
-        SchemaChange::AddColumn { table, .. }
+        SchemaChange::RenameTable { to, .. } => to.as_str(),
+        SchemaChange::RenameColumn { table, .. }
+        | SchemaChange::RenameIndex { table, .. }
+        | SchemaChange::RenameConflict { table, .. }
+        | SchemaChange::AddColumn { table, .. }
         | SchemaChange::DropColumn { table, .. }
         | SchemaChange::AlterColumnType { table, .. }
         | SchemaChange::SetNotNull { table, .. }
@@ -2466,7 +2555,9 @@ fn emit_up_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<Strin
     let mut groups = Vec::new();
     for change in &ordered {
         let table = change_table_name(change);
-        if rebuild.contains(table) {
+        // A rename runs as its own statement, before (up) or after (down) any
+        // rebuild: the rebuild copies columns by their new names.
+        if rebuild.contains(table) && !is_rename(change) {
             if emitted.insert(table.to_owned()) {
                 let block = emit_sqlite_rebuild(table, ctx, &ordered, RebuildLeg::Up)?;
                 let block = block.trim_end();
@@ -2495,7 +2586,9 @@ fn emit_down_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<Str
     let mut groups = Vec::new();
     for change in &ordered {
         let table = change_table_name(change);
-        if rebuild.contains(table) {
+        // A rename runs as its own statement, before (up) or after (down) any
+        // rebuild: the rebuild copies columns by their new names.
+        if rebuild.contains(table) && !is_rename(change) {
             if emitted.insert(table.to_owned()) {
                 let block = emit_sqlite_rebuild(table, ctx, &ordered, RebuildLeg::Down)?;
                 let block = block.trim_end();
@@ -2870,6 +2963,10 @@ fn join_groups(groups: &[String]) -> String {
 fn up_ordered(changes: &[SchemaChange]) -> Result<Vec<&SchemaChange>, EmitError> {
     let replaced = replaced_index_names(changes);
 
+    // Renames go before everything, in plan order (tables, then columns, then
+    // indexes). The down leg reverses the plan, so it undoes them last.
+    let renames: Vec<&SchemaChange> = changes.iter().filter(|c| is_rename(c)).collect();
+
     // `CreateTable`s are the first bucket; order them topologically so referenced
     // tables precede their referencers.
     let mut creates: Vec<&SchemaChange> = changes
@@ -2893,14 +2990,27 @@ fn up_ordered(changes: &[SchemaChange]) -> Result<Vec<&SchemaChange>, EmitError>
     // through so a replaced index drops before its re-add.
     let mut rest: Vec<&SchemaChange> = changes
         .iter()
-        .filter(|c| !matches!(c, SchemaChange::CreateTable(_) | SchemaChange::DropTable(_)))
+        .filter(|c| {
+            !is_rename(c) && !matches!(c, SchemaChange::CreateTable(_) | SchemaChange::DropTable(_))
+        })
         .collect();
     rest.sort_by_key(|c| up_sort_key(c, &replaced));
 
-    let mut ordered = creates;
+    let mut ordered = renames;
+    ordered.extend(creates);
     ordered.extend(rest);
     ordered.extend(drops);
     Ok(ordered)
+}
+
+/// Whether `change` is an emittable rename (table, column or index).
+const fn is_rename(change: &SchemaChange) -> bool {
+    matches!(
+        change,
+        SchemaChange::RenameTable { .. }
+            | SchemaChange::RenameColumn { .. }
+            | SchemaChange::RenameIndex { .. }
+    )
 }
 
 /// The set of index names that appear in **both** an `AddIndex` and a `DropIndex`
@@ -3074,7 +3184,11 @@ fn topo_sort_drops(drops: &mut [&SchemaChange]) -> Result<(), EmitError> {
 /// The canonical up-order bucket for a change (lower = earlier).
 const fn up_bucket(change: &SchemaChange) -> u8 {
     match change {
-        SchemaChange::CreateTable(_) => 0,
+        // Renames never reach here: `up_ordered` puts them first.
+        SchemaChange::RenameTable { .. }
+        | SchemaChange::RenameColumn { .. }
+        | SchemaChange::RenameIndex { .. }
+        | SchemaChange::CreateTable(_) => 0,
         SchemaChange::AddColumn { .. } => 1,
         SchemaChange::AlterColumnType { .. }
         | SchemaChange::SetNotNull { .. }
@@ -3086,7 +3200,8 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         SchemaChange::DropColumn { .. } => 6,
         SchemaChange::DropTable(_) => 7,
         // Non-emittable markers; the guard refuses them before emission is reached.
-        SchemaChange::PrimaryKeyChange { .. }
+        SchemaChange::RenameConflict { .. }
+        | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -3099,6 +3214,15 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
 /// Render a single change's forward SQL.
 fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, EmitError> {
     match change {
+        SchemaChange::RenameTable { from, to } => {
+            Ok(format!("ALTER TABLE {from} RENAME TO {to};\n"))
+        }
+        SchemaChange::RenameColumn { table, from, to } => Ok(format!(
+            "ALTER TABLE {table} RENAME COLUMN {from} TO {to};\n"
+        )),
+        SchemaChange::RenameIndex { table, from, index } => {
+            Ok(emit_rename_index(table, from, index, backend))
+        }
         SchemaChange::CreateTable(table) => Ok(emit_create_table(table, backend)),
         SchemaChange::DropTable(table) => Ok(format!(
             "-- autumn-safety: this DROP TABLE is not checked against generated \
@@ -3173,7 +3297,8 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
         }
         // Non-emittable markers: the guard refuses them, so they never reach here
         // in the command flow. Render nothing defensively rather than panicking.
-        SchemaChange::PrimaryKeyChange { .. }
+        SchemaChange::RenameConflict { .. }
+        | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -3187,6 +3312,20 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
 /// marker where the round-trip is not clean.
 fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, EmitError> {
     match change {
+        SchemaChange::RenameTable { from, to } => {
+            Ok(format!("ALTER TABLE {to} RENAME TO {from};\n"))
+        }
+        SchemaChange::RenameColumn { table, from, to } => Ok(format!(
+            "ALTER TABLE {table} RENAME COLUMN {to} TO {from};\n"
+        )),
+        SchemaChange::RenameIndex { table, from, index } => {
+            let old = crate::schema::rename::renamed_index(index, from).unwrap_or_else(|| {
+                let mut old = index.clone();
+                old.name.clone_from(from);
+                old
+            });
+            Ok(emit_rename_index(table, &index.name, &old, backend))
+        }
         SchemaChange::CreateTable(table) => Ok(format!("DROP TABLE {};\n", table.name)),
         SchemaChange::DropTable(table) => {
             let recreate = emit_create_table(table, backend);
@@ -3261,7 +3400,8 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
                 "ALTER TABLE {table} DROP CONSTRAINT {constraint};\n"
             ))
         }
-        SchemaChange::PrimaryKeyChange { .. }
+        SchemaChange::RenameConflict { .. }
+        | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -3277,6 +3417,16 @@ const fn require_pg(backend: Backend, kind: &'static str) -> Result<(), EmitErro
     match backend {
         Backend::Postgres => Ok(()),
         Backend::Sqlite => Err(EmitError::UnsupportedOnBackend { kind, backend }),
+    }
+}
+
+/// Rename index `from` to `index.name`. Postgres uses `ALTER INDEX`. `SQLite`
+/// has no index rename, so it drops the index and creates it again. The data
+/// already satisfies the index, so this is safe.
+fn emit_rename_index(table: &str, from: &str, index: &Index, backend: Backend) -> String {
+    match backend {
+        Backend::Postgres => format!("ALTER INDEX {from} RENAME TO {};\n", index.name),
+        Backend::Sqlite => format!("DROP INDEX {from};\n{}\n", index_sql(table, index)),
     }
 }
 
@@ -3612,6 +3762,16 @@ pub fn describe_plan(plan: &MigrationPlan) -> String {
 /// A one-line description of a single change.
 fn describe_change(change: &SchemaChange) -> String {
     match change {
+        SchemaChange::RenameTable { from, to } => format!("~ RENAME TABLE {from} TO {to}"),
+        SchemaChange::RenameColumn { table, from, to } => {
+            format!("~ RENAME COLUMN {table}.{from} TO {to}")
+        }
+        SchemaChange::RenameIndex { table, from, index } => {
+            format!("~ RENAME INDEX {from} TO {} ON {table}", index.name)
+        }
+        SchemaChange::RenameConflict { table, reason } => {
+            format!("! RENAME on {table}: {reason} (refused)")
+        }
         SchemaChange::CreateTable(t) => format!("+ CREATE TABLE {}", t.name),
         SchemaChange::DropTable(t) => format!("- DROP TABLE {}", t.name),
         SchemaChange::AddColumn { table, column } => {
@@ -3726,6 +3886,7 @@ mod tests {
         ParsedSchema {
             tables,
             diagnostics,
+            renames: Vec::new(),
         }
     }
 
