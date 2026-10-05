@@ -1787,6 +1787,18 @@ impl Analyzer {
                     self.bind_pat(&field.pat, kind);
                 }
             }
+            // A tuple pattern over a name with recorded parts, with no `..`.
+            (Pat::Tuple(p), _)
+                if path_ident(init).is_some()
+                    && !p.elems.iter().any(|e| matches!(e, Pat::Rest(_))) =>
+            {
+                let name = path_ident(init).unwrap_or_default();
+                let rest = self.value_of(init).element();
+                for (i, elem) in p.elems.iter().enumerate() {
+                    let kind = self.env.part(&name, &i.to_string()).unwrap_or(rest);
+                    self.bind_pat(elem, kind);
+                }
+            }
             (Pat::Paren(p), _) => self.bind_init(&p.pat, init),
             (_, Expr::Paren(e)) => self.bind_init(pat, &e.expr),
             (Pat::Ident(p), _) if p.subpat.is_none() => {
@@ -2176,16 +2188,30 @@ impl Analyzer {
             // The condition runs on every pass, so a query in it
             // (`while let Some(job) = repo.next_pending().await?`) is
             // loop-resident.
+            // A `while` ends when its condition is false: that path leaves
+            // like a `break`, and pays for the condition.
             Expr::While(w) => {
                 let shape = LoopShape {
                     bound: None,
                     span: w.span(),
                     label: w.label.as_ref(),
-                    ends: true,
+                    ends: false,
                 };
                 self.loop_flow(&shape, |s| {
                     let cond = s.cost_of(&w.cond);
-                    Flow::cost(cond).then(s.block(&w.body))
+                    s.exit_loop(None);
+                    let stop = Flow {
+                        fall: None,
+                        exits: vec![(
+                            Exit {
+                                label: None,
+                                breaks: true,
+                            },
+                            Cost::ZERO,
+                        )],
+                        ret: None,
+                    };
+                    Flow::cost(cond).then(stop.or_worst(s.block(&w.body)))
                 })
             }
             // A `loop` ends only by an exit.
@@ -2994,6 +3020,8 @@ impl Analyzer {
                     Kind::Plain
                 }
                 Expr::Closure(_) => self.closure_output(a, Kind::Plain),
+                // A query future was paid for where it was built.
+                _ if self.is_counted_query_future(a) => Kind::Plain,
                 _ => self.value_of(a),
             })
             .max()
@@ -7737,6 +7765,45 @@ mod tests {
                 "async fn h(rows: Vec<Row>) -> AutumnResult<usize> { \
                  let ids: Vec<i64> = rows.iter().map(|row| row.id).collect(); render(ids); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn while_conditions_tuple_parts_and_stored_futures() {
+        check_handlers(&[
+            (
+                "the condition-false path of a while",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 while repo.ready().await? { return Ok(0); } let _ = repo.load().await?; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "a tuple bound to a name keeps its parts",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pair = (repo, 7); let (_, id) = pair; render(id); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a stored query future is not a handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut futures = Vec::new(); futures.push(repo.find_all()); \
+                 join_all(futures).await; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            // Guards: the tuple's handle part is still a handle, and a
+            // while whose body goes on is unbounded.
+            (
+                "the handle part of a tuple bound to a name",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pair = (repo, 7); let (r, _) = pair; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a while whose body goes on",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 while repo.ready().await? { let _ = repo.load().await?; } Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
