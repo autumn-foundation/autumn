@@ -472,7 +472,14 @@ fn a_scaffolded_comment_resource_blocks_the_shared_table() {
     // Retarget the model at the renamed table.
     let model = project.join("src/models/comment.rs");
     let source = fs::read_to_string(&model).expect("model");
-    fs::write(&model, source.replace("schema::comments", "schema::notes")).expect("write");
+    fs::write(
+        &model,
+        source.replace("schema::comments", "schema::notes").replace(
+            "#[autumn_web::model]",
+            "#[autumn_web::model(table = \"notes\")]",
+        ),
+    )
+    .expect("write");
     let (ok, output) = run_autumn(&project, &post_scaffold);
     assert!(ok, "the remedy must unblock generation:\n{output}");
     assert_eq!(

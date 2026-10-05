@@ -278,9 +278,8 @@ fn conflicting_table_error(missing: &[&str], columns_unknown: bool) -> GenerateE
     GenerateError::Config(message)
 }
 
-/// The first model file under `src/models` (or `src/models.rs`) that still
-/// uses the `comments` table, as a generated model does with
-/// `use crate::schema::comments;` (#2283).
+/// The first model file under `src/models` (or `src/models.rs`) with a
+/// `#[model]` struct on the `comments` table (#2283).
 ///
 /// The shared table needs `commentable_type`, `commentable_id` and
 /// `author_id` on each insert. A plain `Comment` model sets none of them.
@@ -301,10 +300,57 @@ fn model_using_comments_table(project_root: &Path) -> Option<std::path::PathBuf>
         }
     }
     files.sort();
-    files.into_iter().find(|file| {
-        std::fs::read_to_string(file)
-            .is_ok_and(|source| binds_comments_table(&strip_rust_comments_and_literals(&source)))
+    files
+        .into_iter()
+        .find(|file| std::fs::read_to_string(file).is_ok_and(|source| maps_comments_table(&source)))
+}
+
+/// Whether `source` has a `#[model]` struct on the `comments` table.
+///
+/// The macro decides the table: `#[model(table = "…")]`, or the name it infers
+/// from the struct. Imports only bring diesel's table into scope, so they are
+/// not the binding. A file that does not parse falls back to a text scan.
+fn maps_comments_table(source: &str) -> bool {
+    syn::parse_file(source).map_or_else(
+        |_| binds_comments_table(&strip_rust_comments_and_literals(source)),
+        |file| items_map_comments_table(&file.items),
+    )
+}
+
+/// [`maps_comments_table`] over `items`, inline modules included.
+fn items_map_comments_table(items: &[syn::Item]) -> bool {
+    items.iter().any(|item| match item {
+        syn::Item::Struct(item) => model_table(item).is_some_and(|table| table == COMMENTS_TABLE),
+        syn::Item::Mod(item) => item
+            .content
+            .as_ref()
+            .is_some_and(|(_, items)| items_map_comments_table(items)),
+        _ => false,
     })
+}
+
+/// The table of a `#[model]` struct, as the macro decides it. `None` when the
+/// struct has no `#[model]` attribute.
+fn model_table(item: &syn::ItemStruct) -> Option<String> {
+    let attr = item.attrs.iter().find(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "model")
+    })?;
+    let mut table = None;
+    if matches!(attr.meta, syn::Meta::List(_)) {
+        // `managed` takes no value; anything else unknown ends the scan.
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("table") {
+                table = Some(meta.value()?.parse::<syn::LitStr>()?.value());
+            }
+            Ok(())
+        });
+    }
+    Some(table.unwrap_or_else(|| {
+        super::naming::pluralize(&super::naming::snake(&item.ident.to_string()))
+    }))
 }
 
 /// Whether `code` binds the `comments` table: `schema::comments` that ends
@@ -3537,7 +3583,7 @@ mod tests {
         // Retargeted at the renamed table, the model is no longer in the way.
         std::fs::write(
             models.join("comment.rs"),
-            "use crate::schema::notes;\n\n#[autumn_web::model]\npub struct Comment {}\n",
+            "use crate::schema::notes;\n\n#[autumn_web::model(table = \"notes\")]\npub struct Comment {}\n",
         )
         .expect("write");
         let mut plan = Plan::new(tmp.path());
@@ -3550,37 +3596,6 @@ mod tests {
                 false,
             )
             .expect("no model uses `comments` now")
-        );
-    }
-
-    /// Only a live binding counts. A comment, a string, or a path that goes on
-    /// (`schema::comments::table`, a join from another model) does not bind a
-    /// model to the table. `examples/reddit-clone/src/models.rs` has such a
-    /// comment.
-    #[test]
-    fn only_a_live_binding_marks_a_model_as_using_comments() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let src = tmp.path().join("src");
-        std::fs::create_dir_all(src.join("models")).expect("mkdir");
-        std::fs::write(
-            src.join("models.rs"),
-            "// `crate::schema::comments` is kept, but no `#[model]` maps it.\n\
-             /* crate::schema::comments; */\n\
-             const NOTE: &str = \"crate::schema::comments;\";\n\
-             const QUOTE: char = '\"';\n\
-             fn count() { crate::schema::comments::table; }\n",
-        )
-        .expect("write");
-        assert_eq!(model_using_comments_table(tmp.path()), None);
-
-        std::fs::write(
-            src.join("models").join("comment.rs"),
-            "use crate::schema::comments;\n",
-        )
-        .expect("write");
-        assert_eq!(
-            model_using_comments_table(tmp.path()),
-            Some(src.join("models").join("comment.rs"))
         );
     }
 
@@ -3609,28 +3624,52 @@ mod tests {
         assert!(!comments_migration_still_needed(tmp.path(), &plain, &[]));
     }
 
-    /// A grouped import binds the table too, as in the single-file layout.
+    /// The `#[model]` struct binds the table, not the import: `table = "…"`,
+    /// or the name the macro infers from the struct. Imports, comments,
+    /// strings and reads do not count. `examples/reddit-clone/src/models.rs`
+    /// mentions `schema::comments` and maps no model to it.
     #[test]
-    fn a_grouped_schema_import_marks_a_model_as_using_comments() {
+    fn only_a_model_struct_on_the_comments_table_counts() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).expect("mkdir");
-        std::fs::write(
-            src.join("models.rs"),
-            "use crate::schema::{posts, comments as c};\n",
-        )
-        .expect("write");
-        assert_eq!(
-            model_using_comments_table(tmp.path()),
-            Some(src.join("models.rs"))
-        );
+        let models = src.join("models.rs");
+        let check = |source: &str| {
+            std::fs::write(&models, source).expect("write");
+            model_using_comments_table(tmp.path())
+        };
 
-        // A grouped read path is not a binding.
-        std::fs::write(
-            src.join("models.rs"),
-            "use crate::schema::{posts, comments::dsl};\n",
-        )
-        .expect("write");
-        assert_eq!(model_using_comments_table(tmp.path()), None);
+        assert_eq!(
+            check(
+                "// `crate::schema::comments` is kept, but no `#[model]` maps it.\n\
+                 use crate::schema::{comments, posts};\n\
+                 const NOTE: &str = \"crate::schema::comments;\";\n\
+                 fn count() { crate::schema::comments::table; }\n\
+                 #[autumn_web::model]\npub struct Post { pub id: i64 }\n",
+            ),
+            None
+        );
+        // A glob import and the inferred name.
+        assert_eq!(
+            check(
+                "use crate::schema::*;\n#[autumn_web::model]\npub struct Comment { pub id: i64 }\n"
+            ),
+            Some(models.clone())
+        );
+        // An explicit table under another name.
+        assert_eq!(
+            check("#[model(table = \"comments\")]\npub struct Remark { pub id: i64 }\n"),
+            Some(models.clone())
+        );
+        // A `Comment` model moved to another table.
+        assert_eq!(
+            check("#[autumn_web::model(table = \"notes\")]\npub struct Comment { pub id: i64 }\n"),
+            None
+        );
+        // Inside an inline module too.
+        assert_eq!(
+            check("mod inner {\n#[autumn_web::model]\npub struct Comment { pub id: i64 }\n}\n"),
+            Some(models.clone())
+        );
     }
 }
