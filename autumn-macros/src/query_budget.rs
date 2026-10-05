@@ -2243,9 +2243,31 @@ impl Analyzer {
             Expr::Path(_) => path_ident(init)
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
+            Expr::Cast(c) => self.referents_of(&c.expr),
+            // `left.get_mut(0).unwrap()`, `left.as_mut()`: a part of the
+            // receiver.
+            Expr::MethodCall(mc) => {
+                let method = mc.method.to_string();
+                if matches!(method.as_str(), "unwrap" | "expect") {
+                    self.referents_of(&mc.receiver)
+                } else if method == "as_mut" || method.ends_with("_mut") {
+                    place_root(&mc.receiver)
+                        .map(|root| {
+                            let through = self.env.binding(&root).referents;
+                            if through.is_empty() {
+                                vec![root]
+                            } else {
+                                through
+                            }
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
             // `if flag { &mut left } else { &mut right }`: every tail, and
             // every `break` value of a loop or labeled block.
-            Expr::If(_) | Expr::Match(_) | Expr::Block(_) | Expr::Loop(_) => {
+            Expr::If(_) | Expr::Match(_) | Expr::Block(_) | Expr::Loop(_) | Expr::Unsafe(_) => {
                 let mut all: Vec<String> = value_tails(init)
                     .into_iter()
                     .flat_map(|tail| self.referents_of(tail))
@@ -2420,10 +2442,26 @@ impl Analyzer {
                 if kind == Kind::Plain {
                     return;
                 }
-                let deref = matches!(place, Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)));
-                if let Some(root) = place_root(place) {
-                    let held = if deref { kind } else { Kind::Holder };
-                    self.raise(root, held);
+                // `*target = repo`: `target` holds it. Each place `target`
+                // borrows whole holds it too. A place it borrows a part of
+                // (`&mut repos[0]`) holds it inside.
+                let alias = match place {
+                    Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+                        path_ident(peel_parens(&u.expr))
+                    }
+                    _ => None,
+                };
+                if let Some(alias) = alias {
+                    let owner = if self.env.binding(&alias).whole {
+                        kind
+                    } else {
+                        Kind::Holder
+                    };
+                    for (i, name) in self.alias_targets(alias).into_iter().enumerate() {
+                        self.raise_one(name, if i == 0 { kind } else { owner });
+                    }
+                } else if let Some(root) = place_root(place) {
+                    self.raise(root, Kind::Holder);
                 }
             }
         }
@@ -3881,15 +3919,20 @@ impl Analyzer {
     /// is a store into `repos` too.
     fn raise(&mut self, root: String, kind: Kind) {
         for root in self.alias_targets(root) {
-            let mut binding = self.env.binding(&root);
-            if kind > binding.kind {
-                binding.kind = kind;
-                binding.parts = None;
-                if kind != Kind::Carrier {
-                    binding.shape = None;
-                }
-                self.env.assign(root, binding);
+            self.raise_one(root, kind);
+        }
+    }
+
+    /// Raise `name` alone to hold at least `kind`.
+    fn raise_one(&mut self, name: String, kind: Kind) {
+        let mut binding = self.env.binding(&name);
+        if kind > binding.kind {
+            binding.kind = kind;
+            binding.parts = None;
+            if kind != Kind::Carrier {
+                binding.shape = None;
             }
+            self.env.assign(name, binding);
         }
     }
 
@@ -5528,6 +5571,7 @@ fn constructor_type(e: &Expr) -> Option<Type> {
 /// and every `break` value that leaves a loop or a labeled block.
 fn value_tails(e: &Expr) -> Vec<&Expr> {
     match peel_parens(e) {
+        Expr::Unsafe(u) => block_tail(&u.block).into_iter().collect(),
         Expr::Loop(l) => break_values(&l.body, l.label.as_ref(), true),
         Expr::Block(b) => {
             let mut tails: Vec<&Expr> = block_tail(&b.block).into_iter().collect();
@@ -11179,6 +11223,41 @@ mod tests {
                 "guard: an opaque value through an alias keeps the handle",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = Some(repo); { let target = &mut slot; *target = make(); } render(slot); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn part_alias_writes_unsafe_and_method_aliases() {
+        check_handlers(&[
+            (
+                "guard: a write through a part alias keeps the owner a container",
+                "async fn h(first: PgPostRepository, second: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = vec![first]; { let target = &mut repos[0]; *target = second; } \
+                 repos.refresh_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a write through a whole alias stores the value",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; { let target = &mut slot; *target = Some(repo); } \
+                 let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an alias from an unsafe block aliases its place",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); \
+                 { let target: &mut Vec<PgPostRepository> = unsafe { &mut left }; target.push(repo); } \
+                 let _ = left[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an alias from a mut method aliases its receiver",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut left = vec![make()]; { let target = left.get_mut(0).unwrap(); *target = repo; } \
+                 let _ = left[0].find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
