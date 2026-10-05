@@ -2028,7 +2028,8 @@ impl Analyzer {
                     .map(|(i, e)| (i.to_string(), self.value_of(e)))
                     .collect(),
             ),
-            _ => None,
+            // `let alias = result;` keeps the recorded parts.
+            other => path_ident(peel_refs(other)).and_then(|name| self.env.binding(&name).parts),
         };
         Binding {
             kind,
@@ -2900,7 +2901,12 @@ impl Analyzer {
             // `LazyDb::checkout` hands over a connection and costs nothing,
             // awaited or not. Only on a known `LazyDb`: a repository's own
             // `checkout` may be a real query (Codex review, PR #2762).
-            if HANDLE_TRANSITIONS.contains(&last.as_str()) && self.expr_is_lazy_db(root) {
+            // Only `checkout` called on the `LazyDb` itself: `lazy.wrap()` may
+            // give a user type with its own `checkout`.
+            let receiver = on_handle.last().map(|m| &*m.receiver);
+            if HANDLE_TRANSITIONS.contains(&last.as_str())
+                && receiver.is_some_and(|r| self.expr_is_lazy_db(r))
+            {
                 return cost;
             }
             // A builder name refines the *next* query rather than issuing one —
@@ -9222,6 +9228,36 @@ mod tests {
                 "guard: map after as_ref takes the handle side",
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
                  let _ = result.as_ref().map(|r| render(r)); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn checkout_needs_a_direct_lazy_db_and_aliases_keep_sides() {
+        check_handlers(&[
+            (
+                "checkout through another method is not free",
+                "async fn h(lazy: LazyDb) -> AutumnResult<usize> { \
+                 let _ = lazy.wrap().checkout().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: checkout directly on a LazyDb is free",
+                "async fn h(lazy: LazyDb) -> AutumnResult<usize> { \
+                 let _ = lazy.checkout().await?; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "an alias of a Result keeps its sides",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let alias = result; let _ = alias.map_err(|e| render(e)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: an alias of a Result keeps its handle side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let alias = result; let _ = alias.map(|r| render(r)); Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
