@@ -51,9 +51,11 @@ into `_other`:
 
 - an id longer than 64 bytes,
 - the reserved ids `_none` and `_other`,
-- a new id when the accountant already has `max_tenants` keys.
+- a new id when the accountant already has `max_tenants` tenant keys.
 
-The accountant does not remove a key until the app restarts.
+`_none` and `_other` do not count toward `max_tenants`, so requests with no
+tenant always go to `_none`. The accountant does not remove a key until the app
+restarts.
 
 ---
 

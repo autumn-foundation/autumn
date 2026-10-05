@@ -209,7 +209,9 @@ impl CostAccountant {
     /// Make an accountant that keeps at most `max_tenants` tenant keys.
     ///
     /// When the accountant has `max_tenants` keys, it adds a new tenant to
-    /// [`OVERFLOW_TENANT`]. This keeps memory and metric labels bounded.
+    /// [`OVERFLOW_TENANT`]. This keeps memory and metric labels bounded. The
+    /// two reserved keys, [`UNATTRIBUTED_TENANT`] and [`OVERFLOW_TENANT`], do
+    /// not count toward the limit.
     #[must_use]
     pub fn new(max_tenants: usize) -> Self {
         Self::build(max_tenants, None, true)
@@ -300,7 +302,15 @@ impl CostAccountant {
             entry.add(micros, allocated_bytes, db_queries);
             return;
         }
-        let key = if totals.tenants.len() < self.inner.max_tenants {
+        // The reserved keys do not count toward the limit, so requests with
+        // no tenant keep their own key.
+        let reserved = [UNATTRIBUTED_TENANT, OVERFLOW_TENANT]
+            .iter()
+            .filter(|reserved| totals.tenants.contains_key(**reserved))
+            .count();
+        let key = if key == UNATTRIBUTED_TENANT
+            || totals.tenants.len() - reserved < self.inner.max_tenants
+        {
             key
         } else {
             OVERFLOW_TENANT
@@ -941,6 +951,22 @@ mod tests {
         assert_eq!(snapshot.tenants["a"].requests, 2);
         assert_eq!(snapshot.tenants[OVERFLOW_TENANT].requests, 2);
         assert_eq!(snapshot.total.requests, 5);
+    }
+
+    /// Requests with no tenant keep `_none` after the limit (#1720).
+    #[test]
+    fn unattributed_requests_keep_their_key_past_the_limit() {
+        let accountant = CostAccountant::new(2);
+        for tenant in ["a", "b", "c"] {
+            accountant.record(&cost(1, 0, 0).with_tenant(tenant));
+        }
+        accountant.record(&cost(1, 0, 0));
+        accountant.record(&cost(1, 0, 0).with_tenant("d"));
+
+        let snapshot = accountant.snapshot();
+        assert_eq!(snapshot.tenants[UNATTRIBUTED_TENANT].requests, 1);
+        assert_eq!(snapshot.tenants[OVERFLOW_TENANT].requests, 2);
+        assert_eq!(snapshot.tenants.len(), 4, "{:?}", snapshot.tenants);
     }
 
     #[test]
