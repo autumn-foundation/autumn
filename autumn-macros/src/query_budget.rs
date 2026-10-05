@@ -31,13 +31,16 @@
 //!
 //! See `docs/guide/query-budgets.md` for the user-facing guide.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::{ToTokens as _, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
+use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 use syn::{Attribute, Block, Expr, ExprCall, ExprMethodCall, ItemFn, Local, Pat, Stmt, Type};
 
@@ -1264,15 +1267,31 @@ impl Binding {
 }
 
 /// Lexical scopes, innermost last. Each scope maps a name to its [`Binding`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct Env {
     scopes: Vec<HashMap<String, Binding>>,
+    /// The bindings of the scopes that closed during each statement being
+    /// read, outermost first. A value is often read after its scope closes:
+    /// `let alias = { let moved = repo; moved };` reads `moved` after the
+    /// block. A lookup joins these bindings in. A shadowed name may then
+    /// hold more than it does, never less. Every copy shares them, so a
+    /// branch that restores a copy keeps them.
+    closed: Rc<RefCell<Vec<HashMap<String, Binding>>>>,
 }
+
+impl PartialEq for Env {
+    fn eq(&self, other: &Self) -> bool {
+        self.scopes == other.scopes
+    }
+}
+
+impl Eq for Env {}
 
 impl Env {
     fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
+            closed: Rc::default(),
         }
     }
 
@@ -1280,16 +1299,46 @@ impl Env {
         self.scopes.push(HashMap::new());
     }
 
+    /// Close the innermost scope, and keep its bindings for the statement.
     fn pop(&mut self) {
-        self.scopes.pop();
+        let Some(scope) = self.scopes.pop() else {
+            return;
+        };
+        if let Some(record) = self.closed.borrow_mut().last_mut() {
+            for (name, binding) in scope {
+                let joined = record
+                    .get(&name)
+                    .map_or_else(|| binding.clone(), |b| b.join(&binding));
+                record.insert(name, joined);
+            }
+        }
+    }
+
+    /// Start or end a statement's record of closed scopes.
+    fn open_statement(&self) {
+        self.closed.borrow_mut().push(HashMap::new());
+    }
+
+    fn close_statement(&self) {
+        self.closed.borrow_mut().pop();
     }
 
     const fn depth(&self) -> usize {
         self.scopes.len()
     }
 
-    /// The binding of `name`, looking from scope `top` outwards.
+    /// The binding of `name`, looking from scope `top` outwards, joined
+    /// with its bindings in the closed scopes.
     fn binding_from(&self, top: usize, name: &str) -> Binding {
+        self.closed
+            .borrow()
+            .iter()
+            .filter_map(|record| record.get(name))
+            .fold(self.open_binding_from(top, name), |b, c| b.join(c))
+    }
+
+    /// [`Self::binding_from`] in the open scopes only.
+    fn open_binding_from(&self, top: usize, name: &str) -> Binding {
         self.scopes[..=top]
             .iter()
             .rev()
@@ -1304,11 +1353,7 @@ impl Env {
 
     /// What `name` holds here.
     fn get(&self, name: &str) -> Kind {
-        self.scopes
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name).map(|b| b.kind))
-            .unwrap_or(Kind::Plain)
+        self.binding(name).kind
     }
 
     /// What part `member` of `name` holds, when the parts are known.
@@ -1400,8 +1445,8 @@ impl Env {
                 .collect();
             for name in names {
                 let joined = self
-                    .binding_from(depth, &name)
-                    .join(&other.binding_from(depth, &name));
+                    .open_binding_from(depth, &name)
+                    .join(&other.open_binding_from(depth, &name));
                 self.scopes[depth].insert(name, joined);
             }
         }
@@ -1459,6 +1504,7 @@ impl ExitFrame {
     fn record(&mut self, env: &Env) {
         let env = Env {
             scopes: env.scopes[..self.depth].to_vec(),
+            closed: Rc::clone(&env.closed),
         };
         match &mut self.env {
             Some(joined) => joined.join(&env),
@@ -1858,7 +1904,10 @@ impl Analyzer {
             // here. A call to it is analysed at the call site instead.
             Stmt::Item(_) => return Flow::ZERO,
         };
-        self.annotated(attrs, |s| s.stmt_unannotated(stmt))
+        self.env.open_statement();
+        let flow = self.annotated(attrs, |s| s.stmt_unannotated(stmt));
+        self.env.close_statement();
+        flow
     }
 
     fn stmt_unannotated(&mut self, stmt: &Stmt) -> Flow {
@@ -2745,6 +2794,10 @@ impl Analyzer {
     /// `receiver.method(arg)` may store `arg` in `receiver`. When an argument
     /// holds a handle, the name at the root of `receiver` now holds it too.
     fn store_into(&mut self, receiver: &Expr, method: &str, args: &[&Expr]) {
+        // An executor uses the connection for one query and gives it back.
+        if EXECUTORS.contains(&method) {
+            return;
+        }
         let held = args
             .iter()
             .map(|a| self.value_of(a))
@@ -2828,6 +2881,9 @@ impl Analyzer {
                         .is_some_and(|(_, e)| self.expr_is_nested(e))
             }
             Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_nested(&arm.body)),
+            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+                break_results(e).into_iter().any(|v| self.expr_is_nested(v))
+            }
             Expr::Block(b) => block_tail(&b.block).is_some_and(|e| self.expr_is_nested(e)),
             _ => false,
         }
@@ -2840,8 +2896,12 @@ impl Analyzer {
         let Expr::Closure(closure) = f else {
             return false;
         };
+        // Its own record of closed scopes: its handle parameters must not
+        // reach the real one.
+        let mut env = self.env.clone();
+        env.closed = Rc::default();
         let mut probe = Self {
-            env: self.env.clone(),
+            env,
             exits: Vec::new(),
             ledger: Vec::new(),
             errors: Vec::new(),
@@ -2895,6 +2955,9 @@ impl Analyzer {
                     && !is_container_constructor(c)
                     && !is_handle_constructor(c)
                     && c.args.iter().any(|a| self.holds(a))
+            }
+            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+                break_results(e).into_iter().any(|v| self.expr_is_holder(v))
             }
             Expr::Reference(r) => self.expr_is_holder(&r.expr),
             Expr::Paren(p) => self.expr_is_holder(&p.expr),
@@ -2970,6 +3033,11 @@ impl Analyzer {
                         .is_some_and(|(_, e)| self.expr_is_handle(e))
             }
             Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_handle(&arm.body)),
+            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+                break_results(expr)
+                    .into_iter()
+                    .any(|v| self.expr_is_handle(v))
+            }
             Expr::Block(b) => self.block_tail_is_handle(&b.block),
             Expr::Unsafe(u) => self.block_tail_is_handle(&u.block),
             _ => false,
@@ -3066,6 +3134,11 @@ impl Analyzer {
                         .is_some_and(|(_, e)| self.expr_is_lazy_db(e))
             }
             Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_lazy_db(&arm.body)),
+            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+                break_results(expr)
+                    .into_iter()
+                    .any(|v| self.expr_is_lazy_db(v))
+            }
             Expr::Block(b) => self.block_tail_is_lazy_db(&b.block),
             Expr::Unsafe(u) => self.block_tail_is_lazy_db(&u.block),
             _ => false,
@@ -3122,6 +3195,11 @@ impl Analyzer {
                         .is_some_and(|(_, e)| self.expr_is_carrier(e))
             }
             Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_carrier(&arm.body)),
+            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+                break_results(expr)
+                    .into_iter()
+                    .any(|v| self.expr_is_carrier(v))
+            }
             Expr::Block(b) => block_tail(&b.block).is_some_and(|e| self.expr_is_carrier(e)),
             Expr::Unsafe(u) => block_tail(&u.block).is_some_and(|e| self.expr_is_carrier(e)),
             _ => false,
@@ -3338,6 +3416,64 @@ fn stmt_expr_attrs(expr: &Expr) -> &[Attribute] {
         Expr::Cast(c) => stmt_expr_attrs(&c.expr),
         _ => &[],
     }
+}
+
+/// What a `loop` or a labeled block gives: the block's tail, and the value
+/// of each `break` that lands on it. Empty for any other expression.
+fn break_results(expr: &Expr) -> Vec<&Expr> {
+    /// Collects the `break` values that land on one target.
+    struct Breaks<'a> {
+        label: Option<String>,
+        /// An unlabeled `break` lands here: the target is a loop, and no
+        /// inner loop is open.
+        unlabeled: bool,
+        values: Vec<&'a Expr>,
+    }
+    impl<'a> Visit<'a> for Breaks<'a> {
+        fn visit_expr_break(&mut self, b: &'a syn::ExprBreak) {
+            let lands = b.label.as_ref().map_or(self.unlabeled, |l| {
+                self.label.as_deref() == Some(l.ident.to_string().as_str())
+            });
+            if lands && let Some(value) = &b.expr {
+                self.values.push(value);
+            }
+            syn::visit::visit_expr_break(self, b);
+        }
+        fn visit_expr_loop(&mut self, l: &'a syn::ExprLoop) {
+            let unlabeled = std::mem::replace(&mut self.unlabeled, false);
+            syn::visit::visit_expr_loop(self, l);
+            self.unlabeled = unlabeled;
+        }
+        fn visit_expr_while(&mut self, w: &'a syn::ExprWhile) {
+            let unlabeled = std::mem::replace(&mut self.unlabeled, false);
+            syn::visit::visit_expr_while(self, w);
+            self.unlabeled = unlabeled;
+        }
+        fn visit_expr_for_loop(&mut self, f: &'a syn::ExprForLoop) {
+            let unlabeled = std::mem::replace(&mut self.unlabeled, false);
+            syn::visit::visit_expr_for_loop(self, f);
+            self.unlabeled = unlabeled;
+        }
+        // A `break` cannot leave a closure, an async block or an item.
+        fn visit_expr_closure(&mut self, _: &'a syn::ExprClosure) {}
+        fn visit_expr_async(&mut self, _: &'a syn::ExprAsync) {}
+        fn visit_item(&mut self, _: &'a syn::Item) {}
+    }
+    let (block, label, unlabeled) = match expr {
+        Expr::Loop(l) => (&l.body, &l.label, true),
+        Expr::Block(b) if b.label.is_some() => (&b.block, &b.label, false),
+        _ => return Vec::new(),
+    };
+    let mut breaks = Breaks {
+        label: label.as_ref().map(|l| l.name.ident.to_string()),
+        unlabeled,
+        values: Vec::new(),
+    };
+    breaks.visit_block(block);
+    if !unlabeled {
+        breaks.values.extend(block_tail(block));
+    }
+    breaks.values
 }
 
 /// The tail expression of a block, when the block has one.
@@ -6557,6 +6693,177 @@ mod tests {
             }
             ";
         assert_error_contains("50", handler, &["ok"]);
+    }
+
+    #[test]
+    fn a_value_from_a_closed_scope_keeps_its_handle() {
+        // Each initializer gives the handle through a name that its own
+        // scope declares, or through a `break` value.
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "block local",
+                "let alias = { let moved = repo; moved }; let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "unsafe block local",
+                "let alias = unsafe { let moved = &repo; moved }; let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "if arm local",
+                "let alias = if flag { let m = &repo; m } else { let n = &repo; n }; \
+                 let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "match arm binding",
+                "let alias = match Some(&repo) { Some(r) => r, None => return Ok(0) }; \
+                 let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "assignment from a block local",
+                "let other = 1; let mut alias = &other; alias = { let m = &repo; m }; \
+                 let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "nested block locals",
+                "let alias = { let b = { let m = &repo; m }; b }; let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "labeled block break value",
+                "let alias = 'pick: { let m = &repo; if flag { break 'pick m; } m }; \
+                 let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "loop break value",
+                "let alias = loop { let m = &repo; break m; }; let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "loop break value of a container",
+                "let list = loop { break vec![&repo]; }; let _ = list[0].find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "labeled block whose break alone gives the handle",
+                "let other = 1; let alias = 'pick: { if flag { break 'pick &repo; } &other }; \
+                 let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "labeled break out of an inner loop",
+                "let alias = 'outer: loop { for _id in &ids { break 'outer &repo; } }; \
+                 let _ = alias.find_all().await?;",
+                Expect::Exact(1),
+            ),
+            // A shadowed name joins both bindings: the safe side.
+            (
+                "plain block value",
+                "let n = { let m = 1; m }; let _ = n + 1;",
+                Expect::Exact(0),
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    /// The `#[query_budget]` functions in a file, with the attribute
+    /// arguments taken off.
+    fn budgeted_fns(path: &std::path::Path) -> Vec<(TokenStream, ItemFn)> {
+        let src = std::fs::read_to_string(path).expect("fixture reads");
+        let file: syn::File = syn::parse_str(&src).expect("fixture parses");
+        file.items
+            .into_iter()
+            .filter_map(|item| {
+                let syn::Item::Fn(mut func) = item else {
+                    return None;
+                };
+                let at = func
+                    .attrs
+                    .iter()
+                    .position(|a| a.path().is_ident("query_budget"))?;
+                let args = match func.attrs.remove(at).meta {
+                    syn::Meta::List(list) => list.tokens,
+                    _ => TokenStream::new(),
+                };
+                Some((args, func))
+            })
+            .collect()
+    }
+
+    /// A fast copy of the trybuild check for the budget fixtures: a
+    /// compile-pass fixture and the example expand clean, and each
+    /// compile-fail diagnostic is in its `.stderr` file. Trybuild takes about
+    /// twenty minutes, so this finds a regression first.
+    #[test]
+    fn every_budget_fixture_expands_as_trybuild_expects() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let tests = root.join("autumn/tests");
+        if !tests.is_dir() {
+            // A packaged crate has no workspace.
+            return;
+        }
+        let fixtures = |dir: &str| -> Vec<std::path::PathBuf> {
+            let mut paths: Vec<_> = std::fs::read_dir(tests.join(dir))
+                .expect("fixture dir reads")
+                .map(|e| e.expect("entry reads").path())
+                .filter(|p| {
+                    p.extension().is_some_and(|x| x == "rs")
+                        && p.to_string_lossy().contains("query_budget")
+                })
+                .collect();
+            paths.sort();
+            paths
+        };
+        let mut pass = fixtures("compile-pass");
+        pass.push(root.join("examples/bookmarks/src/routes/bookmarks.rs"));
+        let fail = fixtures("compile-fail");
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for (path, must_pass) in pass
+            .iter()
+            .map(|p| (p, true))
+            .chain(fail.iter().map(|p| (p, false)))
+        {
+            let stderr = std::fs::read_to_string(path.with_extension("stderr")).unwrap_or_default();
+            for (args, func) in budgeted_fns(path) {
+                checked += 1;
+                let mut messages = Vec::new();
+                collect_compile_errors(
+                    &query_budget_macro(args, func.to_token_stream()),
+                    &mut messages,
+                );
+                let name = format!("{}::{}", path.display(), func.sig.ident);
+                if must_pass && !messages.is_empty() {
+                    failures.push(format!("{name}: expected clean, got {messages:?}"));
+                }
+                let missing: Vec<&str> = messages
+                    .iter()
+                    .flat_map(|m| m.lines())
+                    .filter(|line| !must_pass && !stderr.contains(line))
+                    .collect();
+                if !missing.is_empty() {
+                    failures.push(format!("{name}: not in .stderr: {missing:?}"));
+                }
+            }
+        }
+        assert!(checked > 20, "only {checked} budget fixtures found");
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn an_executor_call_does_not_store_its_connection() {
+        // `execute` uses the connection and gives it back. It is one query,
+        // and `Query` does not hold the connection after it.
+        let handler = "async fn h(lazy_db: LazyDb) -> Result<(), ()> { \
+                       let mut db = lazy_db.checkout().await?; \
+                       Query.execute(&mut db).await?; \
+                       let q = Query; q.execute(&mut db).await?; q.execute(&mut db).await }";
+        assert_eq!(check(handler, Expect::Exact(3)), None);
     }
 
     #[test]

@@ -146,7 +146,9 @@ The analysis follows the handle through every name that holds it:
   standard and primitive types, such as `let ids: Vec<i64> = …`, marks the
   binding as plain. rustc checks it, so it cannot hold a handle.
 - **Scopes.** A `let` in a block ends with the block. An assignment to a name
-  declared outside the block stays after the block.
+  declared outside the block stays after the block. A value that a block, an
+  arm or a `break` gives keeps what it holds:
+  `let alias = { let moved = repo; moved };` makes `alias` a handle.
 - **Branches.** After an `if`, a `match` or a loop, a name holds a handle when
   it holds one on any path. The bindings at a `return`, `break` or `continue`
   apply where that exit lands.

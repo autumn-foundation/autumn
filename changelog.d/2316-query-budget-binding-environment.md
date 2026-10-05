@@ -16,7 +16,8 @@
   `let`, `let`-`else`, assignment, `if let`, `while let`, `match` arms, `for`
   patterns, closure and transaction parameters, and annotated statements.
   After a branch, a name holds a handle if it holds one on any path. An
-  assignment inside a block stays after the block. Before, some of these
+  assignment inside a block stays after the block. A value that a block, a
+  `match` arm or a `break` gives keeps its handle. Before, some of these
   forms lost the handle, and a query through it was not counted (#2316).
 - **query budgets:** a handle kept in a container is tracked. An index, a
   field, a pattern, `?` or an element method (`remove`, `unwrap`) on
