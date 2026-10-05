@@ -3286,7 +3286,9 @@ fi
   # The snapshot that an interrupted first cutover saved in the app's tags.
   tags='{"team":"web"}'
   if [ -n "$STUB_SAVED_INGRESS_TAGS" ]; then
-    tags=$(jq -cn '{external: false, targetPort: 3000, transport: "http",
+    saved_external=false
+    [ "$STUB_SAVED_INGRESS_TAGS" = external ] && saved_external=true
+    tags=$(jq -cn --argjson ext "$saved_external" '{external: $ext, targetPort: 3000, transport: "http",
                     customDomains: [{name: "www.example.com"}]}
       | tojson | @base64 | . as $b
       | [range(0; length; 256) as $i | $b[$i:$i + 256]]
@@ -4231,6 +4233,33 @@ esac
             .rfind(|line| line.starts_with("az tags-patch "))
             .unwrap_or_default();
         assert!(last.contains("\"autumn-ingress-0\":null"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_opens_a_missing_ingress_on_a_released_app() {
+        // A first cutover stopped after the real revision took over, before
+        // ingress came back. The snapshot in the tags says external, but the
+        // live app has no ingress: the retry must open it.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_NONE", "1"),
+                ("STUB_SAVED_INGRESS_TAGS", "external"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("az ingress-patch external=true"), "{calls}");
+        let open = bodies
+            .lines()
+            .find(|line| line.contains("\"external\":true"))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(open.contains("www.example.com"), "{open}");
     }
 
     #[cfg(unix)]
