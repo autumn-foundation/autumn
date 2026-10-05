@@ -2272,14 +2272,17 @@ pub struct HttpClientConfig {
     pub send_deadline_header: bool,
 
     /// Retry budget (`[http.client.retry_budget]`). See
-    /// [`crate::retry_budget`].
+    /// [`RetryBudgetConfig`].
     #[serde(default)]
     pub retry_budget: RetryBudgetConfig,
 }
 
 /// Retry budget settings (`[http.client.retry_budget]`, issue #3058).
 ///
-/// A token bucket for each upstream host. See [`crate::retry_budget`].
+/// The outbound client keeps a token bucket for each upstream host. A retry
+/// takes tokens. Each first attempt adds `retry_ratio x transient_cost`
+/// tokens. A first attempt never waits for tokens. See the
+/// [timeouts and budgets guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/timeouts-and-budgets.md).
 ///
 /// ```toml
 /// [http.client.retry_budget]
@@ -2339,6 +2342,32 @@ const fn default_retry_budget_throttling_cost() -> u32 {
 #[cfg(feature = "http-client")]
 const fn default_retry_budget_retry_ratio() -> f64 {
     0.1
+}
+
+#[cfg(feature = "http-client")]
+impl RetryBudgetConfig {
+    /// Reject a ratio outside `0.0..=1.0` and a cost of zero, which would
+    /// allow unlimited retries.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] that names the bad key.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(0.0..=1.0).contains(&self.retry_ratio) {
+            return Err(ConfigError::Validation(format!(
+                "http.client.retry_budget.retry_ratio must be in 0.0..=1.0, got {}",
+                self.retry_ratio
+            )));
+        }
+        if self.transient_cost == 0 || self.throttling_cost == 0 {
+            return Err(ConfigError::Validation(
+                "http.client.retry_budget costs must be 1 or more; set enabled = false \
+                 to turn the budget off"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "http-client")]
@@ -5077,6 +5106,8 @@ impl AutumnConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
         self.cors.validate()?;
+        #[cfg(feature = "http-client")]
+        self.http.client.retry_budget.validate()?;
         self.scheduler.validate()?;
         // #1605: reject an unparseable or zero retention window at boot rather
         // than silently skipping the dataset it names — a policy an operator
@@ -5243,7 +5274,6 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__PORT` → `server.port` (u16)
     /// - `AUTUMN_SERVER__HOST` → `server.host` (String)
     /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
-    /// - `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER` → `server.timeouts.accept_deadline_header` (bool)
     /// - `AUTUMN_SERVER__PRESTOP_GRACE_SECS` → `server.prestop_grace_secs` (u64)
     /// - `AUTUMN_SERVER__UPGRADE__ENABLED` → `server.upgrade.enabled` (bool)
     /// - `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` →
@@ -10423,9 +10453,10 @@ fn default_startup_path() -> String {
 pub const DRAIN_MARGIN_SECS: u64 = 5;
 
 impl ServerConfig {
-    /// A warning when `shutdown_timeout_secs` is not longer than the request
-    /// timeout plus [`DRAIN_MARGIN_SECS`]. `None` when the drain window is
-    /// safe or no request timeout is set.
+    /// A warning when `shutdown_timeout_secs` is shorter than the global
+    /// request timeout plus [`DRAIN_MARGIN_SECS`]. `None` when the drain
+    /// window is safe or no global request timeout is set. A per-route
+    /// `timeout_ms` is not checked.
     #[must_use]
     pub fn drain_window_warning(&self) -> Option<String> {
         let timeout_ms = self.timeouts.request_timeout_ms.filter(|ms| *ms > 0)?;
@@ -19203,6 +19234,11 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         server.shutdown_timeout_secs = 35;
         assert!(server.drain_window_warning().is_none());
 
+        server.timeouts.request_timeout_ms = Some(30_001);
+        assert!(server.drain_window_warning().is_some(), "rounds up to 36 s");
+        server.shutdown_timeout_secs = 36;
+        assert!(server.drain_window_warning().is_none());
+
         server.timeouts.request_timeout_ms = None;
         server.shutdown_timeout_secs = 1;
         assert!(
@@ -19235,6 +19271,20 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert_eq!(budget.transient_cost, 14);
         assert_eq!(budget.throttling_cost, 5);
         assert!((budget.retry_ratio - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn http_client_retry_budget_rejects_bad_values() {
+        let mut config = AutumnConfig::default();
+        assert!(config.validate().is_ok());
+        config.http.client.retry_budget.retry_ratio = 1.5;
+        assert!(config.validate().is_err());
+        config.http.client.retry_budget.retry_ratio = f64::NAN;
+        assert!(config.validate().is_err());
+        config.http.client.retry_budget.retry_ratio = 0.1;
+        config.http.client.retry_budget.transient_cost = 0;
+        assert!(config.validate().is_err());
     }
 
     #[cfg(feature = "http-client")]

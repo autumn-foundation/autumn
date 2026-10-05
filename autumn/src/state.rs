@@ -971,8 +971,8 @@ impl AppState {
 
     /// Returns a child cancellation token for the server shutdown signal.
     ///
-    /// WebSocket handlers should select on this to clean up when the
-    /// server is shutting down.
+    /// WebSocket handlers and the [`crate::extract::ShutdownToken`] extractor
+    /// use it. Select on it to clean up when the server stops.
     #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.child_token()

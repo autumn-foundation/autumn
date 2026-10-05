@@ -1153,10 +1153,8 @@ pub struct Client {
     /// When present (a sim with a `SimNet`), calls go through the simulated
     /// network instead of the real one.
     sim_net: Option<Arc<crate::sim::SimNet>>,
-    /// Retry budgets, one for each host. `None` when the budget is off.
-    retry_budgets: Option<Arc<RetryBudgets>>,
-    /// Send [`DEADLINE_HEADER`] when a request deadline is set.
-    send_deadline_header: bool,
+    /// Retry budgets and deadline header settings (issue #3058).
+    retry: RetrySettings,
 }
 
 impl Client {
@@ -1193,8 +1191,7 @@ impl Client {
             mock: None,
             resilience_config: None,
             sim_net: None,
-            retry_budgets: Some(Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()))),
-            send_deadline_header: true,
+            retry: RetrySettings::standalone(),
         }
     }
 
@@ -1237,8 +1234,10 @@ impl Client {
             resilience_config: None,
             sim_net: None,
             // `from_config` and `from_state` set the budgets.
-            retry_budgets: None,
-            send_deadline_header: config.send_deadline_header,
+            retry: RetrySettings {
+                budgets: None,
+                send_deadline_header: config.send_deadline_header,
+            },
         }
     }
 
@@ -1256,8 +1255,10 @@ impl Client {
             resilience_config: None,
             sim_net: None,
             // `from_state` sets the budgets.
-            retry_budgets: None,
-            send_deadline_header: true,
+            retry: RetrySettings {
+                budgets: None,
+                send_deadline_header: true,
+            },
         }
     }
 
@@ -1270,7 +1271,7 @@ impl Client {
     #[must_use]
     pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
         let mut client = Self::from_config_with_inner(Self::build_inner(config), config);
-        client.retry_budgets = config
+        client.retry.budgets = config
             .retry_budget
             .enabled
             .then(|| Arc::new(RetryBudgets::new(&config.retry_budget)));
@@ -1331,7 +1332,7 @@ impl Client {
 
         // The extractor builds a new client for each request, so the budgets
         // live in the app state. Thus all requests of one app share them.
-        client.retry_budgets = budget_config.enabled.then(|| {
+        client.retry.budgets = budget_config.enabled.then(|| {
             let budgets = state.extension_or_insert_with(|| {
                 SharedRetryBudgets(Arc::new(RetryBudgets::new(&budget_config)))
             });
@@ -1370,8 +1371,7 @@ impl Client {
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
-            retry_budgets: self.retry_budgets.clone(),
-            send_deadline_header: self.send_deadline_header,
+            retry: self.retry.clone(),
         }
     }
 
@@ -1387,8 +1387,7 @@ impl Client {
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
-            retry_budgets: self.retry_budgets.clone(),
-            send_deadline_header: self.send_deadline_header,
+            retry: self.retry.clone(),
         }
     }
 
@@ -1423,8 +1422,7 @@ impl Client {
             discard_response_body: false,
             breaker_scoped: false,
             sim_net: self.sim_net.clone(),
-            retry_budgets: self.retry_budgets.clone(),
-            send_deadline_header: self.send_deadline_header,
+            retry: self.retry.clone(),
         }
     }
 
@@ -1586,10 +1584,8 @@ pub struct RequestBuilder {
     breaker_scoped: bool,
     /// The simulated network, when the client came from a sim app state.
     sim_net: Option<Arc<crate::sim::SimNet>>,
-    /// Retry budgets, one for each host. `None` when the budget is off.
-    retry_budgets: Option<Arc<RetryBudgets>>,
-    /// Send [`DEADLINE_HEADER`] when a request deadline is set.
-    send_deadline_header: bool,
+    /// Retry budgets and deadline header settings (issue #3058).
+    retry: RetrySettings,
 }
 
 impl RequestBuilder {
@@ -1975,6 +1971,9 @@ impl RequestBuilder {
                     guard.failure();
                 }
             }
+            // The caller ran out of time, not the upstream: the guard drops
+            // with no record (issue #3058).
+            Err(ClientError::DeadlineExceeded) => drop(guard),
             Err(_) => {
                 guard.failure();
             }
@@ -2007,6 +2006,8 @@ impl RequestBuilder {
         let res = self.send_custom(is_half_open).await;
         match &res {
             Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
+            // The caller ran out of time, not the upstream (issue #3058).
+            Err(ClientError::DeadlineExceeded) => drop(guard),
             _ => guard.failure(),
         }
         res
@@ -2104,6 +2105,10 @@ impl RequestBuilder {
                         url: Some(url_used),
                     });
                 }
+                // The request deadline stopped the attempt.
+                Err(e) if e.is_timeout() && gate.expired() => {
+                    return Err(ClientError::DeadlineExceeded);
+                }
                 // Only retry transient connect/timeout errors; non-transient errors
                 // (e.g. malformed URL) fail immediately.
                 Err(e)
@@ -2124,9 +2129,9 @@ impl RequestBuilder {
     /// The deadline and retry budget for one send to `host`.
     fn retry_gate(&self, host: Option<&str>) -> RetryGate {
         RetryGate::start(
-            self.retry_budgets.as_deref(),
+            self.retry.budgets.as_deref(),
             host,
-            self.send_deadline_header,
+            self.retry.send_deadline_header,
         )
     }
 
@@ -2227,6 +2232,9 @@ impl RequestBuilder {
                 {
                     last_retry = Some(RetryKind::Transient);
                     continue;
+                }
+                Err(SimAttemptError::Transient(_)) if gate.expired() => {
+                    return Err(ClientError::DeadlineExceeded);
                 }
                 Err(SimAttemptError::Transient(message)) => {
                     return Err(ClientError::SimNetwork(message));
@@ -2715,12 +2723,40 @@ fn retry_backoff(attempt: u32) -> Duration {
     Duration::from_millis(100 * (1_u64 << exp))
 }
 
-/// The host of `url`, if it is an absolute URL.
+/// The retry budget key of `url`: its host, and its port when the URL names
+/// one. `None` for a relative URL.
 fn url_host(url: &str) -> Option<String> {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(
+        parsed
+            .port()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")),
+    )
 }
+
+/// Retry budgets and deadline header settings of a [`Client`].
+#[derive(Clone)]
+struct RetrySettings {
+    /// Retry budgets, one for each host. `None` when the budget is off.
+    budgets: Option<Arc<RetryBudgets>>,
+    /// Send [`DEADLINE_HEADER`] when a request deadline is set.
+    send_deadline_header: bool,
+}
+
+impl RetrySettings {
+    /// Settings for a client made outside an app: its own default budgets.
+    fn standalone() -> Self {
+        Self {
+            budgets: Some(Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()))),
+            send_deadline_header: true,
+        }
+    }
+}
+
+/// The shortest time left for which a retry starts. A shorter attempt cannot
+/// get an answer, and tokio timers round up to whole milliseconds.
+const MIN_ATTEMPT: Duration = Duration::from_millis(10);
 
 /// The app's retry budgets, stored in `AppState`.
 pub(crate) struct SharedRetryBudgets(pub(crate) Arc<RetryBudgets>);
@@ -2753,14 +2789,14 @@ impl RetryGate {
 
     /// An error when no time is left to start an attempt.
     fn check(&self) -> Result<(), ClientError> {
-        if self.deadline.is_some_and(Deadline::is_expired) {
+        if self.expired() {
             return Err(ClientError::DeadlineExceeded);
         }
         Ok(())
     }
 
-    /// The timeout of the next attempt: `per_try`, made shorter to the time
-    /// left.
+    /// The timeout of the next attempt: `per_try`, or the time left if that is
+    /// shorter.
     fn attempt_timeout(&self, per_try: Option<Duration>) -> Option<Duration> {
         match (per_try, self.deadline) {
             (Some(limit), Some(deadline)) => Some(deadline.clamp(limit)),
@@ -2769,12 +2805,18 @@ impl RetryGate {
         }
     }
 
-    /// `true` when a retry of `kind` can start after `wait`. It must have time
-    /// left after the wait, and it takes tokens from the budget.
+    /// `true` when the request deadline has passed.
+    fn expired(&self) -> bool {
+        self.deadline.is_some_and(Deadline::is_expired)
+    }
+
+    /// `true` when a retry of `kind` can start after `wait`. It must have at
+    /// least [`MIN_ATTEMPT`] left after the wait, and it takes tokens from the
+    /// budget.
     fn allow(&self, kind: RetryKind, wait: Duration) -> bool {
         if self
             .deadline
-            .is_some_and(|deadline| deadline.remaining() <= wait)
+            .is_some_and(|deadline| deadline.remaining() <= wait + MIN_ATTEMPT)
         {
             return false;
         }
@@ -2783,12 +2825,18 @@ impl RetryGate {
             .is_none_or(|budget| budget.try_acquire(kind))
     }
 
+    /// Give back the tokens of a retry of `kind` that did not start.
+    fn refund(&self, kind: RetryKind) {
+        if let Some(budget) = &self.budget {
+            budget.release(kind);
+        }
+    }
+
     /// Give back the tokens of the last retry when the final `status` is a
-    /// success.
+    /// success (below 400).
     fn finish(&self, last_retry: Option<RetryKind>, status: u16) {
         if let (Some(budget), Some(kind)) = (&self.budget, last_retry)
-            && status != 429
-            && !is_retryable_status(status)
+            && status < 400
         {
             budget.release(kind);
         }
@@ -2861,7 +2909,9 @@ async fn serve_sim_host(
     let http_request = builder
         .body(axum::body::Body::from(body))
         .map_err(|error| ClientError::SimNetwork(error.to_string()))?;
-    let response = tower::ServiceExt::oneshot(router, http_request)
+    // The host is another process: it must not see the caller's task-local
+    // deadline. Only the deadline header goes to it.
+    let response = crate::deadline::unscoped(tower::ServiceExt::oneshot(router, http_request))
         .await
         .unwrap_or_else(|never| match never {});
     let status = response.status();
@@ -2963,6 +3013,10 @@ fn build_oneshot_client(
               splitting the request-shape fields into their own struct would still leave the \
               retry/discard/deadline/half-open knobs alongside it, for no reduction in what a \
               caller reasons about"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one retry loop; the deadline and budget checks (#3058) sit at each decision"
 )]
 async fn send_one(
     client: &reqwest::Client,
@@ -3069,6 +3123,8 @@ async fn send_one(
                             last_retry = Some(RetryKind::Throttling);
                             continue;
                         }
+                        // No retry after all: give the tokens back.
+                        gate.refund(RetryKind::Throttling);
                     }
                     // Deadline exceeded during (or because of) the
                     // Retry-After wait — fall through and return this 429
@@ -5715,5 +5771,191 @@ mod tests {
             !touched.load(Ordering::SeqCst),
             "the 300 Location target must never be requested"
         );
+    }
+
+    // ── Issue #3058: deadline and retry budget on the real send paths ────────
+    #[allow(clippy::large_futures, reason = "test futures, awaited once")]
+    mod deadline_and_budget {
+        use super::super::*;
+        use std::sync::atomic::AtomicU32;
+
+        /// A server that counts hits on `/x`. It answers with `status` and
+        /// `headers`, or never when `status` is `None`.
+        async fn counting(
+            status: Option<u16>,
+            headers: &'static [(&'static str, &'static str)],
+        ) -> (String, Arc<AtomicU32>) {
+            let hits = Arc::new(AtomicU32::new(0));
+            let counter = Arc::clone(&hits);
+            let app = axum::Router::new().route(
+                "/x",
+                axum::routing::get(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let Some(code) = status else {
+                            return std::future::pending().await;
+                        };
+                        let mut response = axum::response::Response::builder().status(code);
+                        for (name, value) in headers {
+                            response = response.header(*name, *value);
+                        }
+                        response.body(axum::body::Body::empty()).unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (format!("http://127.0.0.1:{}/x", addr.port()), hits)
+        }
+
+        /// A client whose budget allows one transient retry and never refills.
+        fn one_retry_client() -> Client {
+            let mut config = crate::config::HttpClientConfig::default();
+            config.retry_budget.capacity = 14;
+            config.retry_budget.retry_ratio = 0.0;
+            Client::from_config(&config)
+        }
+
+        /// Run `send` under a deadline `after` from now, with a 5 s safety
+        /// limit.
+        async fn with_deadline(
+            after: Duration,
+            send: impl std::future::Future<Output = Result<Response, ClientError>>,
+        ) -> Result<Response, ClientError> {
+            tokio::time::timeout(Duration::from_secs(5), Deadline::after(after).scope(send))
+                .await
+                .expect("the deadline must stop the call")
+        }
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            let guard = crate::circuit_breaker::TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::circuit_breaker::global_registry().clear();
+            guard
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn plain_path_stops_a_hanging_call_at_the_deadline() {
+            let _lock = lock();
+            let (url, hits) = counting(None, &[]).await;
+            let result =
+                with_deadline(Duration::from_millis(300), Client::new().get(&url).send()).await;
+            assert!(
+                matches!(result, Err(ClientError::DeadlineExceeded)),
+                "{result:?}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "no retry after the deadline"
+            );
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn plain_path_does_not_start_a_retry_that_cannot_fit() {
+            let _lock = lock();
+            let (url, hits) = counting(Some(503), &[]).await;
+            // Backoffs are 100, 200, 400 ms. The third backoff does not fit.
+            let response =
+                with_deadline(Duration::from_millis(700), Client::new().get(&url).send())
+                    .await
+                    .unwrap();
+            assert_eq!(response.status().as_u16(), 503);
+            assert_eq!(hits.load(Ordering::SeqCst), 3);
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn plain_path_skips_a_retry_after_wait_past_the_deadline() {
+            let _lock = lock();
+            let (url, hits) = counting(Some(429), &[("retry-after", "10")]).await;
+            let response = with_deadline(Duration::from_secs(2), Client::new().get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status().as_u16(),
+                429,
+                "the 429 comes back at once"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn plain_path_obeys_the_retry_budget() {
+            let _lock = lock();
+            let (url, hits) = counting(Some(503), &[]).await;
+            let client = one_retry_client();
+            let first = client.get(&url).send().await.unwrap();
+            assert_eq!(first.status().as_u16(), 503);
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "one retry from the budget");
+            let second = client.get(&url).send().await.unwrap();
+            assert_eq!(second.status().as_u16(), 503);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                3,
+                "the empty budget blocks retries"
+            );
+        }
+
+        #[tokio::test]
+        async fn custom_path_obeys_the_deadline_and_the_budget() {
+            let (url, hits) = counting(Some(503), &[]).await;
+            let response = with_deadline(
+                Duration::from_millis(700),
+                Client::new().get(&url).no_redirect().send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 503);
+            assert_eq!(hits.load(Ordering::SeqCst), 3, "deadline");
+
+            let client = one_retry_client();
+            client.get(&url).no_redirect().send().await.unwrap();
+            assert_eq!(hits.load(Ordering::SeqCst), 5, "one retry from the budget");
+            client.get(&url).no_redirect().send().await.unwrap();
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                6,
+                "the empty budget blocks retries"
+            );
+        }
+
+        #[tokio::test]
+        async fn ssrf_safe_path_fails_at_once_when_the_deadline_has_passed() {
+            let result = Deadline::at(tokio::time::Instant::now())
+                .scope(Client::new().get_ssrf_safe("https://example.com/").send())
+                .await;
+            assert!(
+                matches!(result, Err(ClientError::DeadlineExceeded)),
+                "{result:?}"
+            );
+        }
+
+        #[test]
+        fn budget_keys_keep_the_port() {
+            assert_eq!(url_host("http://svc:8001/a").as_deref(), Some("svc:8001"));
+            assert_eq!(url_host("https://svc/a").as_deref(), Some("svc"));
+            assert_eq!(url_host("/relative"), None);
+        }
+
+        #[test]
+        fn a_retry_ending_in_a_client_or_server_error_keeps_its_tokens_spent() {
+            let budget = Arc::new(RetryBudget::new(&RetryBudgetConfig::default()));
+            let gate = RetryGate {
+                deadline: None,
+                budget: Some(Arc::clone(&budget)),
+                send_header: true,
+            };
+            assert!(gate.allow(RetryKind::Transient, Duration::ZERO));
+            gate.finish(Some(RetryKind::Transient), 500);
+            assert!((budget.available() - 486.0).abs() < f64::EPSILON);
+            gate.finish(Some(RetryKind::Transient), 200);
+            assert!((budget.available() - 500.0).abs() < f64::EPSILON);
+        }
     }
 }

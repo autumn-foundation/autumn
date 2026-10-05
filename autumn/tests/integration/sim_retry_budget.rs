@@ -18,8 +18,8 @@ const REQUESTS: u64 = 1_000;
 /// Requests to skip before the measurement. The default bucket (500 tokens,
 /// 14 per transient retry) is empty well before this.
 const WARM_UP: u64 = 100;
-/// The upper limit for the retry share after the bucket is empty.
-const MAX_RETRY_SHARE: f64 = 0.20;
+/// The retry share after the bucket is empty: about 10 %, at most 20 %.
+const RETRY_SHARE: std::ops::RangeInclusive<f64> = 0.08..=0.12;
 
 /// An upstream that counts attempts and fails each one with a `503`.
 fn always_failing(attempts: Arc<AtomicU64>) -> axum::Router {
@@ -69,10 +69,9 @@ async fn sim_retry_budget_caps_retries_when_the_upstream_always_fails(mut sim: S
     #[allow(clippy::cast_precision_loss)]
     let share = retries as f64 / measured as f64;
     assert!(
-        share <= MAX_RETRY_SHARE,
-        "retry share {share:.3} is above {MAX_RETRY_SHARE}"
+        RETRY_SHARE.contains(&share),
+        "retry share {share:.3} is not in {RETRY_SHARE:?}"
     );
-    assert!(retries > 0, "an empty bucket still refills: {retries}");
 }
 
 #[sim_test]
@@ -86,4 +85,62 @@ async fn sim_retry_budget_is_per_app(mut sim: Sim) {
     sim.build(TestApp::new().routes(routes![call]));
     let made = send(&sim, &attempts, 1).await;
     assert_eq!(made, 4, "a full bucket allows all 3 retries");
+}
+
+/// An upstream that fails each odd attempt and succeeds each even one.
+fn flapping(attempts: Arc<AtomicU64>) -> axum::Router {
+    axum::Router::new().route(
+        "/work",
+        axum::routing::get(move || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt % 2 == 0 {
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    axum::http::StatusCode::OK
+                }
+            }
+        }),
+    )
+}
+
+#[sim_test]
+async fn sim_retry_budget_gives_back_the_tokens_of_a_retry_that_succeeds(mut sim: Sim) {
+    // Each request fails once, then its retry succeeds. With no refund the
+    // bucket (500 / 14) would be empty after about 40 requests.
+    let attempts = Arc::new(AtomicU64::new(0));
+    sim.net(SimNet::new().host("upstream", flapping(attempts.clone())));
+    sim.build(TestApp::new().routes(routes![call]));
+    for index in 0..200 {
+        let body = sim.client().get("/call").send().await.text();
+        assert_eq!(body, "200", "request {index}");
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 400);
+}
+
+#[sim_test]
+async fn sim_retry_budget_can_be_turned_off(mut sim: Sim) {
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.http.client.retry_budget.enabled = false;
+    let attempts = Arc::new(AtomicU64::new(0));
+    sim.net(SimNet::new().host("upstream", always_failing(attempts.clone())));
+    sim.build(TestApp::new().routes(routes![call]).config(config));
+    let made = send(&sim, &attempts, WARM_UP).await;
+    assert_eq!(made, WARM_UP * 4, "every request makes all 4 attempts");
+}
+
+#[sim_test]
+async fn sim_retry_budget_limits_retries_after_network_errors(mut sim: Sim) {
+    let net = SimNet::new().host("upstream", always_failing(Arc::default()));
+    net.partition("upstream");
+    sim.net(net.clone());
+    sim.build(TestApp::new().routes(routes![call]));
+    for _ in 0..REQUESTS {
+        let body = sim.client().get("/call").send().await.text();
+        assert!(body.starts_with("error:"), "{body}");
+    }
+    let attempts = net.events().len() as u64;
+    let retries = attempts - REQUESTS;
+    // A full bucket gives about 35 retries, then about 10 % of requests.
+    assert!(retries < 35 + REQUESTS / 5, "too many retries: {retries}");
 }

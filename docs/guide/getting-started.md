@@ -1225,7 +1225,7 @@ Autumn resolves configuration in five layers, each overriding the last:
 [server]
 host = "127.0.0.1"           # default
 port = 3000                  # default
-shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
+shutdown_timeout_secs = 30   # default (prod: 35), seconds to drain in-flight requests
 # max_concurrent_requests = 256 # unset by default; sheds excess with a 503
 
 [server.timeouts]

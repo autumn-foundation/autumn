@@ -266,3 +266,24 @@ async fn shutdown_token_extractor_sees_the_shutdown_signal() {
         "stopping"
     );
 }
+
+#[autumn_web::get("/wait-for-shutdown")]
+async fn wait_for_shutdown(token: autumn_web::extract::ShutdownToken) -> &'static str {
+    token.cancelled().await;
+    "stopping"
+}
+
+#[tokio::test]
+async fn shutdown_token_wakes_a_handler_that_waits() {
+    let client = autumn_web::test::TestApp::new()
+        .routes(autumn_web::routes![wait_for_shutdown])
+        .build();
+    let waiting = tokio::spawn(client.get("/wait-for-shutdown").send());
+    tokio::task::yield_now().await;
+    client.state().trigger_shutdown_for_test();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("the handler wakes at shutdown")
+        .expect("no panic");
+    assert_eq!(response.text(), "stopping");
+}

@@ -3410,6 +3410,10 @@ impl Db {
     /// shard-routed checkouts: span creation, checkout interceptors,
     /// `SET statement_timeout`, and the metrics captured for the
     /// slow-query warning on `Drop`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one checkout sequence; the deadline wait (#3058) is one more step"
+    )]
     pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> Result<Self, AutumnError> {
         // `SET statement_timeout` (and its i32-cap arithmetic below) is a
         // Postgres session GUC. Under the `sqlite` feature the runtime backend
@@ -3477,10 +3481,10 @@ impl Db {
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
 
-        // The request deadline (issue #3058) limits the wait for a connection
-        // and the statement timeout.
-        let request_deadline = crate::deadline::Deadline::current();
-        let mut conn = match request_deadline {
+        // The request deadline (issue #3058) limits the wait for a connection.
+        // It does not change `statement_timeout`: that is a session setting,
+        // so it would stay on the pooled connection for the next user.
+        let mut conn = match crate::deadline::Deadline::current() {
             Some(deadline) => tokio::time::timeout_at(
                 deadline.instant(),
                 checkout_future.instrument(span.clone()),
@@ -3493,22 +3497,18 @@ impl Db {
             })??,
             None => checkout_future.instrument(span.clone()).await?,
         };
-        let statement_timeout = deadline_statement_timeout(
-            params.statement_timeout,
-            request_deadline.map(crate::deadline::Deadline::remaining),
-        );
 
         // `statement_timeout` is a Postgres session GUC; it is intentionally
         // unused on the SQLite backend (see the gating note below), so consume
         // it here to keep the shared `DbCheckoutParams` field from reading as
         // dead code under `--features sqlite`.
         #[cfg(feature = "sqlite")]
-        let _ = statement_timeout;
+        let _ = params.statement_timeout;
 
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
         #[cfg(not(feature = "sqlite"))]
-        let timeout_ms = statement_timeout.map_or(0u64, |d| {
+        let timeout_ms = params.statement_timeout.map_or(0u64, |d| {
             u64::try_from(d.as_millis())
                 .unwrap_or(PG_TIMEOUT_MAX_MS)
                 .min(PG_TIMEOUT_MAX_MS)
@@ -4006,43 +4006,8 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
     }
 }
 
-/// The statement timeout for a request with `remaining` time left (issue
-/// #3058): the shorter of `configured` and `remaining`.
-///
-/// Postgres reads `0` as "no limit", so a deadline that has passed gives
-/// 1 ms, not 0.
-fn deadline_statement_timeout(
-    configured: Option<std::time::Duration>,
-    remaining: Option<std::time::Duration>,
-) -> Option<std::time::Duration> {
-    let remaining = remaining.map(|left| left.max(std::time::Duration::from_millis(1)));
-    match (configured.filter(|limit| !limit.is_zero()), remaining) {
-        (Some(limit), Some(left)) => Some(limit.min(left)),
-        (limit, None) => limit,
-        (None, left) => left,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_request_deadline_shortens_the_statement_timeout() {
-        use super::deadline_statement_timeout as cap;
-        use std::time::Duration;
-        let secs = Duration::from_secs;
-        assert_eq!(cap(Some(secs(30)), Some(secs(5))), Some(secs(5)));
-        assert_eq!(cap(Some(secs(2)), Some(secs(5))), Some(secs(2)));
-        assert_eq!(cap(None, Some(secs(5))), Some(secs(5)));
-        assert_eq!(cap(Some(Duration::ZERO), Some(secs(5))), Some(secs(5)));
-        assert_eq!(cap(Some(secs(30)), None), Some(secs(30)));
-        assert_eq!(cap(None, None), None);
-        assert_eq!(
-            cap(None, Some(Duration::ZERO)),
-            Some(Duration::from_millis(1)),
-            "0 means no limit to Postgres"
-        );
-    }
-
     #[test]
     fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
         // Continuous replication (#1628) needs the replicator to be the only

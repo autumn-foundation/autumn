@@ -6,7 +6,7 @@
 //! - The outbound HTTP client limits each attempt to the time left. It does
 //!   not start a retry that has no time left.
 //! - The client sends the time left downstream in [`DEADLINE_HEADER`].
-//! - `Db` limits the connection wait and `statement_timeout` to the time left.
+//! - `Db` limits the connection wait to the time left.
 //!
 //! A task that you start with `tokio::spawn` does not get the deadline. Use
 //! [`Deadline::scope`] to give it one. Use [`bounded`] to limit other calls,
@@ -41,7 +41,7 @@ use tokio::time::Instant;
 pub const DEADLINE_HEADER: &str = "x-autumn-deadline-ms";
 
 tokio::task_local! {
-    static CURRENT: Deadline;
+    static CURRENT: Option<Deadline>;
 }
 
 /// A point in time after which the request has no value.
@@ -71,7 +71,7 @@ impl Deadline {
     /// The deadline of the current task, if one is set.
     #[must_use]
     pub fn current() -> Option<Self> {
-        CURRENT.try_with(|deadline| *deadline).ok()
+        CURRENT.try_with(|deadline| *deadline).ok().flatten()
     }
 
     /// The instant of the deadline.
@@ -92,13 +92,7 @@ impl Deadline {
         self.remaining().is_zero()
     }
 
-    /// The earlier of `self` and `other`.
-    #[must_use]
-    pub fn min(self, other: Self) -> Self {
-        std::cmp::min(self, other)
-    }
-
-    /// `limit`, made shorter to the time left.
+    /// `limit`, or the time left if that is shorter.
     #[must_use]
     pub fn clamp(self, limit: Duration) -> Duration {
         limit.min(self.remaining())
@@ -114,33 +108,40 @@ impl Deadline {
 
     /// Like [`scope`](Self::scope), but returns a named future type.
     pub fn scope_future<F: Future>(self, future: F) -> DeadlineScope<F> {
-        CURRENT.scope(self.nested(), future)
+        CURRENT.scope(Some(self.nested()), future)
     }
 
     /// Like [`scope`](Self::scope), for code that is not async.
     pub fn sync_scope<R>(self, f: impl FnOnce() -> R) -> R {
-        CURRENT.sync_scope(self.nested(), f)
+        CURRENT.sync_scope(Some(self.nested()), f)
     }
 
     /// This deadline, or the current one when that is earlier.
     fn nested(self) -> Self {
         Self::current().map_or(self, |current| current.min(self))
     }
+}
 
-    /// Parse a [`DEADLINE_HEADER`] value. `None` when it is not a whole number
-    /// of milliseconds.
-    #[must_use]
-    pub fn parse_header(value: &http::HeaderValue) -> Option<Duration> {
-        let text = value.to_str().ok()?.trim();
-        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-            return None;
-        }
-        text.parse().ok().map(Duration::from_millis)
+/// Parse a [`DEADLINE_HEADER`] value. `None` when it is not a whole number
+/// of milliseconds.
+#[must_use]
+pub fn parse_header(value: &http::HeaderValue) -> Option<Duration> {
+    let text = value.to_str().ok()?.trim();
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
+    text.parse().ok().map(Duration::from_millis)
 }
 
 /// The future of [`Deadline::scope_future`].
-pub type DeadlineScope<F> = tokio::task::futures::TaskLocalFuture<Deadline, F>;
+pub type DeadlineScope<F> = tokio::task::futures::TaskLocalFuture<Option<Deadline>, F>;
+
+/// Run `future` with no deadline, as a separate process would. A simulated
+/// host uses it: only the [`DEADLINE_HEADER`] carries the deadline to it.
+#[cfg(feature = "http-client")]
+pub(crate) async fn unscoped<F: Future>(future: F) -> F::Output {
+    CURRENT.scope(None, future).await
+}
 
 /// The error of [`bounded`]: the deadline passed first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -237,9 +238,18 @@ mod tests {
         assert_eq!(bounded(async { 7 }).await, Ok(7), "no deadline, no limit");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn unscoped_clears_the_deadline() {
+        let deadline = Deadline::after(Duration::from_secs(1));
+        let seen = deadline
+            .scope(unscoped(async { Deadline::current() }))
+            .await;
+        assert_eq!(seen, None);
+    }
+
     #[test]
     fn header_values_parse_as_whole_milliseconds() {
-        let parse = |raw: &str| Deadline::parse_header(&http::HeaderValue::from_str(raw).unwrap());
+        let parse = |raw: &str| parse_header(&http::HeaderValue::from_str(raw).unwrap());
         assert_eq!(parse("1500"), Some(Duration::from_millis(1500)));
         assert_eq!(parse("0"), Some(Duration::ZERO));
         assert_eq!(parse(" 20 "), Some(Duration::from_millis(20)));

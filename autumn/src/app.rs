@@ -5013,7 +5013,11 @@ impl AppBuilder {
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         if let Some(warning) = config.server.drain_window_warning() {
-            tracing::warn!(target: "autumn::shutdown", "{warning}");
+            tracing::warn!(
+                shutdown_timeout_secs = shutdown_timeout,
+                request_timeout_ms = config.server.timeouts.request_timeout_ms,
+                "{warning}"
+            );
         }
         let prestop_grace = config.server.prestop_grace_secs;
 

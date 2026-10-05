@@ -225,13 +225,21 @@ where
             ) {
                 status = StatusCode::SERVICE_UNAVAILABLE;
             }
-            // The request deadline passed before the upstream call (#3058).
+            // The request deadline stopped the upstream call (#3058).
             if matches!(
                 any_err.downcast_ref::<crate::http_client::ClientError>(),
                 Some(crate::http_client::ClientError::DeadlineExceeded)
             ) {
                 status = StatusCode::GATEWAY_TIMEOUT;
             }
+        }
+
+        // `deadline::bounded` stopped a call at the request deadline (#3058).
+        if any_err
+            .downcast_ref::<crate::deadline::DeadlineExceeded>()
+            .is_some()
+        {
+            status = StatusCode::GATEWAY_TIMEOUT;
         }
 
         // A failed service-to-service call (#1755) is a dependency fault, not
@@ -1458,6 +1466,19 @@ impl IntoResponse for AutumnError {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn an_outbound_deadline_exceeded_is_a_504() {
+        let error = AutumnError::from(crate::http_client::ClientError::DeadlineExceeded);
+        assert_eq!(error.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn a_bounded_call_past_its_deadline_is_a_504() {
+        let error = AutumnError::from(crate::deadline::DeadlineExceeded);
+        assert_eq!(error.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
 
     #[derive(Debug)]
     struct TestError(String);

@@ -4497,7 +4497,7 @@ impl<S> RequestTimeoutService<S> {
             .accept_deadline_header
             .then(|| req.headers().get(crate::deadline::DEADLINE_HEADER))
             .flatten()
-            .and_then(crate::deadline::Deadline::parse_header);
+            .and_then(crate::deadline::parse_header);
         Some(caller_deadline.map_or(route_deadline, |caller| caller.min(route_deadline)))
     }
 }

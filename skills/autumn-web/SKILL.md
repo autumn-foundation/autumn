@@ -2712,6 +2712,31 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Resilience: deadlines and retry budgets (#3058)
+
+The request timeout sets a deadline for the handler task. Read it with
+`autumn_web::deadline::Deadline::current()`. The outbound `Client` uses it:
+each attempt gets `min(timeout_secs, time left)`, and no retry or
+`Retry-After` wait starts that the time left cannot hold. When the deadline
+stops a call, the client returns `ClientError::DeadlineExceeded` (`504`).
+`tokio::spawn` drops the deadline; carry it with `Deadline::scope`. Stop other
+calls with `deadline::bounded(fut)`.
+
+```toml
+[http.client.retry_budget]   # per-host token bucket, on by default
+capacity = 500
+transient_cost = 14          # 5xx, connect error, timeout
+throttling_cost = 5          # 429
+retry_ratio = 0.1            # retry share when the bucket is empty
+
+[server.timeouts]
+accept_deadline_header = false   # true: x-autumn-deadline-ms can shorten the deadline
+```
+
+A timeout `503` has `Retry-After: 1..=3`. The `prod` drain window is 35 s
+(request timeout + 5 s). `autumn_web::extract::ShutdownToken` is cancelled at
+shutdown. See `docs/guide/timeouts-and-budgets.md`.
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a

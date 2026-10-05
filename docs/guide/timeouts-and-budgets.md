@@ -48,8 +48,8 @@ These framework calls use the deadline:
 
 | Call | What it does with the time left |
 |---|---|
-| Outbound `Client` | Each attempt uses `min(timeout_secs, time left)`. It does not start a retry, a backoff or a `Retry-After` wait that the time left cannot hold. When no time is left before an attempt, it returns `ClientError::DeadlineExceeded` (`504` through `?`). |
-| `Db` extractor | The wait for a pool connection stops at the deadline (`503`). Postgres `statement_timeout` is `min(statement_timeout, time left)`. |
+| Outbound `Client` | Each attempt uses `min(timeout_secs, time left)`. It does not start a retry, a backoff or a `Retry-After` wait that the time left cannot hold. When the deadline stops the call, it returns `ClientError::DeadlineExceeded` (`504` through `?`). The circuit breaker does not count this as an upstream failure. |
+| `Db` extractor | The wait for a pool connection stops at the deadline (`503`). `statement_timeout` does not change, because it stays on the pooled connection. |
 
 A task that you start with `tokio::spawn` does not get the deadline. Give it
 one with `Deadline::scope`. To stop any other call at the deadline, for
@@ -76,7 +76,7 @@ A route with `timeout = "off"` has no deadline.
 The outbound `Client` sends the time left in the `x-autumn-deadline-ms`
 header. The value is in milliseconds, relative to now. It is not a timestamp,
 so clock skew between hosts has no effect. The client sends it only when a
-deadline is set.
+deadline is set, and it sends it to every host, third-party APIs too.
 
 The server can read the header from its callers. This is off by default:
 
@@ -114,6 +114,8 @@ requests of one app share the buckets.
 
 When the bucket is empty, about `retry_ratio` of requests can retry. The other
 requests return their first failure at once.
+
+An app keeps buckets for 1,024 hosts. A host past this limit has no budget.
 
 ```toml
 [http.client.retry_budget]

@@ -23,9 +23,10 @@ use crate::config::RetryBudgetConfig;
 /// Tokens are kept in thousandths, so a fractional refill is exact.
 const SCALE: u64 = 1_000;
 
-/// The maximum number of hosts with their own bucket. More hosts share one
-/// overflow bucket, so a client that calls many hosts uses bounded memory.
-pub(crate) const MAX_HOSTS: usize = 1_024;
+/// The maximum number of hosts with a stored bucket. A host past this limit
+/// gets a new full bucket on each call, so it has no budget. Thus memory stays
+/// bounded, and one failing host cannot empty the bucket of another.
+pub const MAX_HOSTS: usize = 1_024;
 
 /// Why a retry is necessary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,11 +93,11 @@ impl RetryBudget {
     }
 
     /// The tokens in the bucket now.
+    #[cfg(test)]
     #[must_use]
+    #[allow(clippy::cast_precision_loss, reason = "a display value")]
     pub fn available(&self) -> f64 {
-        #[allow(clippy::cast_precision_loss, reason = "a display value")]
-        let tokens = self.milli_tokens.load(Ordering::Acquire) as f64;
-        tokens / SCALE as f64
+        self.milli_tokens.load(Ordering::Acquire) as f64 / SCALE as f64
     }
 
     const fn cost(&self, kind: RetryKind) -> u64 {
@@ -120,7 +121,6 @@ impl RetryBudget {
 pub struct RetryBudgets {
     config: RetryBudgetConfig,
     hosts: Mutex<HashMap<String, Arc<RetryBudget>>>,
-    overflow: Arc<RetryBudget>,
 }
 
 impl RetryBudgets {
@@ -130,7 +130,6 @@ impl RetryBudgets {
         Self {
             config: config.clone(),
             hosts: Mutex::new(HashMap::new()),
-            overflow: Arc::new(RetryBudget::new(config)),
         }
     }
 
@@ -142,11 +141,10 @@ impl RetryBudgets {
         if let Some(budget) = hosts.get(&key) {
             return Arc::clone(budget);
         }
-        if hosts.len() >= MAX_HOSTS {
-            return Arc::clone(&self.overflow);
-        }
         let budget = Arc::new(RetryBudget::new(&self.config));
-        hosts.insert(key, Arc::clone(&budget));
+        if hosts.len() < MAX_HOSTS {
+            hosts.insert(key, Arc::clone(&budget));
+        }
         budget
     }
 }
@@ -221,14 +219,17 @@ mod tests {
     }
 
     #[test]
-    fn hosts_past_the_limit_share_one_bucket() {
+    fn hosts_past_the_limit_get_a_full_unstored_bucket() {
         let budgets = RetryBudgets::new(&config());
         for index in 0..MAX_HOSTS {
             let _ = budgets.for_host(&format!("h{index}"));
         }
-        let first = budgets.for_host("late-1");
-        let second = budgets.for_host("late-2");
-        assert!(Arc::ptr_eq(&first, &second));
+        let late = budgets.for_host("late");
+        drain(&late, RetryKind::Transient);
+        let again = budgets.for_host("late");
+        assert!(!Arc::ptr_eq(&late, &again), "not stored");
+        assert!(again.try_acquire(RetryKind::Transient), "a full bucket");
+        assert!(budgets.for_host("other").try_acquire(RetryKind::Transient));
         assert_eq!(budgets.hosts.lock().unwrap().len(), MAX_HOSTS);
     }
 }

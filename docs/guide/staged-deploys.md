@@ -44,7 +44,8 @@ Concretely, on SIGTERM:
 2. `prestop_grace_secs` (default 5 s) — time for the load balancer to drain its
    connection pool to this replica.
 3. The TCP listener closes.
-4. In-flight requests complete (up to `shutdown_timeout_secs`, default 30 s).
+4. In-flight requests complete (up to `shutdown_timeout_secs`: default 30 s,
+   35 s in the `prod` profile).
 5. App hooks, telemetry flush, DB pool close, process exits.
 
 A new replica is only promoted to live after `/ready` returns 200 — which
@@ -57,7 +58,7 @@ have passed.
 # autumn.toml
 [server]
 prestop_grace_secs   = 5    # wait for LB to drain before closing listener
-shutdown_timeout_secs = 30  # max time for in-flight requests to complete
+shutdown_timeout_secs = 35  # request timeout (30 s) + 5 s; see timeouts-and-budgets.md
 ```
 
 For Fly.io, `kill_timeout` in `fly.toml` must be at least
@@ -66,7 +67,7 @@ For Fly.io, `kill_timeout` in `fly.toml` must be at least
 ```toml
 # fly.toml
 [deploy]
-  kill_timeout = 45   # 5 + 30 + 10 s buffer
+  kill_timeout = 50   # 5 + 35 + 10 s buffer
 ```
 
 ### Migration safety

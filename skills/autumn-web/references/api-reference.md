@@ -1336,6 +1336,17 @@ even inside a `#[sim_test]`. For a deadline whose counterparty is
 | `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
 | `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
 
+## Deadlines and retry budgets (#3058)
+
+| API | Purpose |
+|---|---|
+| `deadline::Deadline::current()` | The request deadline of the current task, set by the request timeout. `remaining()`, `is_expired()`, `clamp(limit)` |
+| `Deadline::scope(fut)` / `Deadline::after(d)` | Run `fut` with a deadline (the earlier one wins). Use it to carry the deadline into `tokio::spawn` |
+| `deadline::bounded(fut)` | Stop `fut` at the current deadline; `Err(DeadlineExceeded)` maps to `504` |
+| `deadline::DEADLINE_HEADER` | `x-autumn-deadline-ms`: time left in ms, sent by the outbound `Client` |
+| `http_client::ClientError::DeadlineExceeded` | The deadline stopped an outbound call. `504`; not a circuit-breaker failure |
+| `extract::ShutdownToken` | Extractor; cancelled when the server stops accepting connections |
+
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 
 The authored lane beside the probabilistic `sim::Chaos` builder: name the exact
