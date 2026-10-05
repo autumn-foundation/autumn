@@ -230,15 +230,16 @@ open_ingress() {
 # ready: Azure keeps the old revision active until the new one scales and
 # passes its probes. The script checks 30 times, 10 seconds apart.
 sole_active() {
-  local list others=unknown
+  local list
   for _ in $(seq 1 30); do
     list=$(az containerapp revision list \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
       --query "[?properties.active].[name, properties.template.containers[0].image]" \
       --output tsv) || return 1
-    others=$(cut -f1 <<< "$list" | grep -vxF -- "$1" || true)
-    [ -z "$others" ] && return 0
+    # The list must name only this revision. An empty list (during the
+    # handoff) does not show that it serves.
+    [ "$(cut -f1 <<< "$list" | sed '/^$/d')" = "$1" ] && return 0
     sleep 10
   done
   return 1
@@ -422,6 +423,14 @@ fail() {
   exit 1
 }
 
+# The cutover copies the job's identity and secrets. Without them, the
+# script stops before it changes anything.
+if [ -z "$JOB_IDENTITY" ] \
+  || ! jq -e '(.properties.configuration.secrets // []) | length > 0' <<< "$JOB" > /dev/null; then
+  echo "::error::the migration job has no identity or secrets to copy. Run terraform apply first." >&2
+  exit 1
+fi
+
 if [ -z "$RELEASED" ]; then
     # Without ingress, only a scale rule that is not HTTP can start the
     # placeholder again. Then zero replicas is no proof, so the script stops
@@ -491,7 +500,7 @@ CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAG
           "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL",
           "AUTUMN_CREDENTIAL_CLEANUP", "AUTUMN_FORCE_REVISION") | not)] + $env))]
     + .[1:]
-')
+') || fail "cannot build the new containers"
 
 # A changed template makes a new revision, so the script waits for it. If
 # nothing changes (a re-run with the same tag and config), Azure makes no
@@ -539,7 +548,7 @@ PATCH=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets
                        | select(.server != $acr)] + [{server: $acr, identity: $id}]),
          secrets: $secrets},
        template: {containers: $containers}}}
-')
+') || fail "cannot build the cutover PATCH"
 patch_app "$PATCH" || fail "the cutover PATCH failed"
 
 # Wait for the new revision. The script checks 60 times, 10 seconds apart.
@@ -597,12 +606,38 @@ sole_active "$REVISION" || fail "revision $REVISION did not become the only acti
 
 # No new revision: secrets are application-scope, and the running revision
 # reads them only when it starts.
+# A restart replaces the replicas. The deploy is done when no replica from
+# before the restart stays, and a new replica is ready. If no replica ran
+# before (scaled to zero), the next one starts with the new secrets.
 if [ -n "$RESTART" ]; then
+  replicas() {
+    az containerapp replica list \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --revision "$REVISION" \
+      --output json
+  }
+  BEFORE=$(replicas | jq -c 'map(.name)') || fail "cannot list the replicas of revision $REVISION"
   az containerapp revision restart \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --revision "$REVISION" \
     --output none || fail "cannot restart revision $REVISION"
+  STARTED=""
+  for _ in $(seq 1 30); do
+    sleep 10
+    NOW=$(replicas) || fail "cannot list the replicas of revision $REVISION"
+    if jq -e --argjson before "$BEFORE" '
+      (map(.name) | any(IN($before[])) | not)
+      and (($before | length) == 0
+           or any(.[]; .properties.runningState == "Running"
+                       and ((.properties.containers // []) | length > 0 and all(.ready == true))))
+    ' <<< "$NOW" > /dev/null; then
+      STARTED=1
+      break
+    fi
+  done
+  [ -n "$STARTED" ] || fail "revision $REVISION has no ready replica after the restart"
 fi
 
 # The new revision runs the real image. Open external ingress now.

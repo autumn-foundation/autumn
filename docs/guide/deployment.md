@@ -2146,7 +2146,9 @@ identity, registry, secrets and env vars, which the cutover owns. Terraform
 sets env vars at create time only: change one later with `az containerapp
 update --set-env-vars`. The cutover keeps the env vars that it does not set.
 If a cutover keeps the current revision (the same image and env), it restarts
-that revision, so it reads changed secret refs.
+that revision, so it reads changed secret refs. Then it waits until a new
+replica is ready. If the revision does not start with the new secrets, the
+cutover fails.
 
 **Upgrading an app made by an older template.** An older `main.tf` gave the
 placeholder app the identity, registry and secret refs. `terraform apply`
