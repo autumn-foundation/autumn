@@ -4207,6 +4207,34 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_reports_a_later_deploy_only_when_it_serves() {
+        // Provisioned is not ready. Until the new revision is the only active
+        // one, the old image still serves, so the deploy is not done yet.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_LAG", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        let ingress_at = calls
+            .find("az containerapp ingress enable")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            calls[patch_at..ingress_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 3,
+            "a later deploy must wait until the new revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_retries_a_canceled_first_cutover_as_a_first_cutover() {
         let Some((status, calls, _)) = run_azure_cutover(
             "acr.azurecr.io/app:t0",
