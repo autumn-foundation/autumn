@@ -83,7 +83,8 @@ JOB_IDENTITY=$(jq -r '.properties.configuration.registries[0].identity // ""' <<
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
 JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$JOB")
-JOB_SECRET_REFS=$(jq -c '[.properties.configuration.secrets // [] | .[] | {name, keyVaultUrl}]' <<< "$JOB")
+JOB_SECRET_REFS=$(jq -c '[.properties.configuration.secrets // [] | .[]
+  | {name, keyVaultUrl, identity: (.identity // "" | ascii_downcase)}]' <<< "$JOB")
 # Redis is off now, but the app still has the redis-url secret. The old
 # revision refers to it, so the script removes it only after that revision
 # stops.
@@ -101,7 +102,8 @@ APPLIED='
   ($id | ascii_downcase) as $lid
   | [.identity.userAssignedIdentities // {} | to_entries[]
      | select(.value != null) | .key | ascii_downcase] as $ids
-  | [.properties.configuration.secrets // [] | .[] | {name, keyVaultUrl}] as $have
+  | [.properties.configuration.secrets // [] | .[]
+     | {name, keyVaultUrl, identity: (.identity // "" | ascii_downcase)}] as $have
   | .properties.provisioningState == "Succeeded"
     and ($ids | index($lid)) != null
     and any(.properties.configuration.registries // [] | .[];
@@ -142,9 +144,69 @@ patch_app() {
 # Removes the job's credentials from the app: its identity, the registry
 # entry that uses that identity, the three secrets and the four env vars
 # that this script sets. Other identities, registries, secrets, env vars and
-# containers stay. Then waits for the update.
+# containers stay.
+#
+# Azure deletes a secret only when no active revision refers to it. So if
+# the current template refers to one, stage 1 deploys the snapshot
+# containers without the four env vars, and waits until that revision is
+# provisioned and the old one is inactive. Stage 2 then removes the
+# identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local body
+  local live status state latest revision active body
+  live=$(az containerapp show \
+    --name "$AZURE_APP_NAME" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --output json) || return 1
+  if jq -e '[.properties.template.containers[]?.env[]? | .secretRef // empty]
+            | any(IN("database-url", "signing-secret", "redis-url"))' <<< "$live" > /dev/null; then
+    status=$(az containerapp show \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --query "[[properties.provisioningState, properties.latestRevisionName]]" \
+      --output tsv) || return 1
+    read -r _ latest <<< "$status"
+    body=$(jq -cn --argjson app "$APP" '
+      {location: $app.location,
+       properties: {template: {containers: ($app.properties.template.containers
+         | .[0].env = [(.[0].env // [])[] | select(.name | IN(
+             "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
+             "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)])}}}')
+    patch_app "$body" || return 1
+    revision=""
+    for _ in $(seq 1 30); do
+      sleep 10
+      status=$(az containerapp show \
+        --name "$AZURE_APP_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --query "[[properties.provisioningState, properties.latestRevisionName]]" \
+        --output tsv) || return 1
+      read -r state revision <<< "$status"
+      [ "$state" = Succeeded ] && [ -n "$revision" ] && [ "$revision" != "$latest" ] || continue
+      state=$(az containerapp revision show \
+        --name "$AZURE_APP_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --revision "$revision" \
+        --query properties.provisioningState \
+        --output tsv) || return 1
+      case "$state" in
+        Provisioned) break ;;
+        Failed) return 1 ;;
+      esac
+    done
+    [ "$state" = Provisioned ] || return 1
+    active=true
+    for _ in $(seq 1 30); do
+      active=$(az containerapp revision show \
+        --name "$AZURE_APP_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --revision "$latest" \
+        --query properties.active \
+        --output tsv) || return 1
+      [ "$active" = false ] && break
+      sleep 10
+    done
+    [ "$active" = false ] || return 1
+  fi
   body=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
     --arg id "$JOB_IDENTITY" "$SECRET_REF"'
     ($id | ascii_downcase) as $lid
@@ -166,11 +228,7 @@ remove_credentials() {
                         | select((.identity // "" | ascii_downcase) != $lid)],
            secrets: ($app_secrets[0]
                      | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not)
-                           | secret_ref))},
-         template: {containers: ($app.properties.template.containers
-           | .[0].env = [(.[0].env // [])[] | select(.name | IN(
-               "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
-               "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)])}}}')
+                           | secret_ref))}}}')
   patch_app "$body" || return 1
   for _ in $(seq 1 30); do
     sleep 10

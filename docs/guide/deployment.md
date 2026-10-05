@@ -2153,7 +2153,10 @@ AZURE_MIGRATE_JOB_NAME="$MIGRATE_JOB" ACR_LOGIN_SERVER="$ACR" \
 ```
 
 The script stops with an error if the app runs a real release, because that
-release needs its credentials.
+release needs its credentials. It works in two stages, because Azure deletes
+a secret only when no active revision uses it. First it deploys the
+placeholder without the secret env vars and waits until the old revision is
+inactive. Then it removes the identity, registry and secrets.
 
 **Secret changes reach the app without a deploy.** The app refers to the
 latest version of each Key Vault secret. Container Apps gets a new version

@@ -3126,8 +3126,9 @@ previous_secrets = []
         let patch_at = script
             .find("patch_app \"$PATCH\"")
             .expect("the script must send the cutover PATCH");
+        // The cutover's wait is the last one; remove_credentials() has its own.
         let provisioned_at = script
-            .find("Provisioned)")
+            .rfind("Provisioned)")
             .expect("the script must wait for the new revision");
         let ready_at = script
             .find("[ -n \"$READY\" ] || fail")
