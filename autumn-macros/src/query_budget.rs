@@ -396,8 +396,9 @@ const ELEMENT_METHODS: &[&str] = &[
     "get_or_insert_with",
 ];
 
-/// The methods of each standard container [`Shape`].
-const SEQ_METHODS: &[&str] = &[
+/// The methods of each standard container [`Shape`]. Each list holds only
+/// the methods that container type has (#2316).
+const VEC_METHODS: &[&str] = &[
     "len",
     "is_empty",
     "contains",
@@ -414,10 +415,6 @@ const SEQ_METHODS: &[&str] = &[
     "get_mut",
     "pop",
     "push",
-    "push_back",
-    "push_front",
-    "pop_back",
-    "pop_front",
     "insert",
     "remove",
     "swap_remove",
@@ -442,6 +439,96 @@ const SEQ_METHODS: &[&str] = &[
     "chunks",
     "windows",
     "to_vec",
+];
+
+/// An array or a slice.
+const SLICE_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "contains",
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "as_ref",
+    "as_mut",
+    "clone",
+    "first",
+    "last",
+    "get",
+    "get_mut",
+    "sort",
+    "sort_by",
+    "sort_by_key",
+    "sort_unstable",
+    "sort_unstable_by",
+    "sort_unstable_by_key",
+    "reverse",
+    "swap",
+    "chunks",
+    "windows",
+    "to_vec",
+];
+
+const DEQUE_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "contains",
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "clone",
+    "get",
+    "get_mut",
+    "push_back",
+    "push_front",
+    "pop_back",
+    "pop_front",
+    "insert",
+    "remove",
+    "extend",
+    "append",
+    "clear",
+    "truncate",
+    "retain",
+    "swap",
+    "resize",
+    "reserve",
+    "shrink_to_fit",
+    "drain",
+];
+
+const LIST_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "contains",
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "clone",
+    "push_back",
+    "push_front",
+    "pop_back",
+    "pop_front",
+    "extend",
+    "append",
+    "clear",
+];
+
+const HEAP_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "iter",
+    "into_iter",
+    "clone",
+    "push",
+    "pop",
+    "extend",
+    "append",
+    "clear",
+    "retain",
+    "reserve",
+    "shrink_to_fit",
+    "drain",
 ];
 
 const ITER_METHODS: &[&str] = &[
@@ -572,6 +659,29 @@ const MAP_METHODS: &[&str] = &[
     "reserve",
 ];
 
+/// `BTreeMap`: no `drain` and no `reserve`.
+const SORTED_MAP_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "contains_key",
+    "get",
+    "get_mut",
+    "insert",
+    "remove",
+    "keys",
+    "values",
+    "values_mut",
+    "into_keys",
+    "into_values",
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "clear",
+    "retain",
+    "extend",
+    "clone",
+];
+
 const SET_METHODS: &[&str] = &[
     "len",
     "is_empty",
@@ -587,6 +697,21 @@ const SET_METHODS: &[&str] = &[
     "clone",
 ];
 
+/// `BTreeSet`: no `drain`.
+const SORTED_SET_METHODS: &[&str] = &[
+    "len",
+    "is_empty",
+    "contains",
+    "insert",
+    "remove",
+    "iter",
+    "into_iter",
+    "clear",
+    "retain",
+    "extend",
+    "clone",
+];
+
 const TUPLE_METHODS: &[&str] = &["clone"];
 
 /// The kind of standard container a carrier is. A method is known only if
@@ -594,14 +719,27 @@ const TUPLE_METHODS: &[&str] = &["clone"];
 /// name (`ok()` on a `Vec`) that queries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
-    /// `Vec`, `VecDeque`, an array or a slice.
-    Seq,
+    Vec,
+    /// An array or a slice.
+    Slice,
+    /// `VecDeque`.
+    Deque,
+    /// `LinkedList`.
+    List,
+    /// `BinaryHeap`.
+    Heap,
     /// An iterator over parts.
     Iter,
     Opt,
     Res,
+    /// `HashMap` or `IndexMap`.
     Map,
+    /// `BTreeMap`.
+    SortedMap,
+    /// `HashSet` or `IndexSet`.
     Set,
+    /// `BTreeSet`.
+    SortedSet,
     Tuple,
 }
 
@@ -609,18 +747,34 @@ impl Shape {
     /// The methods this container has.
     const fn methods(self) -> &'static [&'static str] {
         match self {
-            Self::Seq => SEQ_METHODS,
+            Self::Vec => VEC_METHODS,
+            Self::Slice => SLICE_METHODS,
+            Self::Deque => DEQUE_METHODS,
+            Self::List => LIST_METHODS,
+            Self::Heap => HEAP_METHODS,
             Self::Iter => ITER_METHODS,
             Self::Opt => OPTION_METHODS,
             Self::Res => RESULT_METHODS,
             Self::Map => MAP_METHODS,
+            Self::SortedMap => SORTED_MAP_METHODS,
             Self::Set => SET_METHODS,
+            Self::SortedSet => SORTED_SET_METHODS,
             Self::Tuple => TUPLE_METHODS,
         }
     }
 
     fn has(self, method: &str) -> bool {
         self.methods().contains(&method)
+    }
+
+    /// Does `method` give an `Option` of a part here, where on a `Vec` it
+    /// gives the part? `VecDeque::remove`, `HashMap::insert`.
+    fn option_of_part(self, method: &str) -> bool {
+        match method {
+            "remove" => matches!(self, Self::Deque | Self::Map | Self::SortedMap),
+            "insert" => matches!(self, Self::Map | Self::SortedMap),
+            _ => false,
+        }
     }
 
     /// The shape of what `method` returns, when it returns a carrier.
@@ -631,7 +785,9 @@ impl Shape {
             "first" | "last" | "get" | "get_mut" | "pop" | "pop_back" | "pop_front" | "next"
             | "nth" | "find" | "find_map" | "ok" => Some(Self::Opt),
             "ok_or" | "ok_or_else" => Some(Self::Res),
-            "to_vec" => Some(Self::Seq),
+            _ if self.option_of_part(method) => Some(Self::Opt),
+            "to_vec" => Some(Self::Vec),
+            "as_slice" => Some(Self::Slice),
             "collect" => None,
             _ => Some(self),
         }
@@ -644,16 +800,21 @@ fn type_shape(ty: &Type) -> Option<Shape> {
         Type::Reference(r) => type_shape(&r.elem),
         Type::Paren(p) => type_shape(&p.elem),
         Type::Group(g) => type_shape(&g.elem),
-        Type::Array(_) | Type::Slice(_) => Some(Shape::Seq),
+        Type::Array(_) | Type::Slice(_) => Some(Shape::Slice),
         Type::Tuple(_) => Some(Shape::Tuple),
         Type::Path(path) => {
             let segment = path.path.segments.last()?;
             match segment.ident.to_string().as_str() {
-                "Vec" | "VecDeque" | "LinkedList" | "BinaryHeap" => Some(Shape::Seq),
+                "Vec" => Some(Shape::Vec),
+                "VecDeque" => Some(Shape::Deque),
+                "LinkedList" => Some(Shape::List),
+                "BinaryHeap" => Some(Shape::Heap),
                 "Option" => Some(Shape::Opt),
                 "Result" => Some(Shape::Res),
-                "HashMap" | "BTreeMap" | "IndexMap" => Some(Shape::Map),
-                "HashSet" | "BTreeSet" | "IndexSet" => Some(Shape::Set),
+                "HashMap" | "IndexMap" => Some(Shape::Map),
+                "BTreeMap" => Some(Shape::SortedMap),
+                "HashSet" | "IndexSet" => Some(Shape::Set),
+                "BTreeSet" => Some(Shape::SortedSet),
                 name if SMART_POINTERS.contains(&name) => {
                     generic_types(segment).next().and_then(type_shape)
                 }
@@ -1263,6 +1424,14 @@ enum Target {
     Loop,
     /// A labeled block. A `break` with its label lands here.
     Block,
+}
+
+/// The cost of one loop pass, split by where it goes next. `None`: no path.
+struct Pass {
+    /// Paths that start the next pass.
+    again: Option<Cost>,
+    /// Paths that leave the loop.
+    leave: Option<Cost>,
 }
 
 /// What a loop is, for [`Analyzer::loop_flow`].
@@ -2094,15 +2263,17 @@ impl Analyzer {
         let before = self.ledger.len();
         let mut flow =
             self.repeated(|s| s.framed(Target::Loop, shape.label, |s| s.scoped(&mut body)));
-        let own = flow.take_exits(shape.label, true);
+        let (breaks, continues): (Vec<_>, Vec<_>) = flow
+            .take_exits(shape.label, true)
+            .into_iter()
+            .partition(|(exit, _)| exit.breaks);
         // Only a `break` to this loop ends a `loop`; a `continue` does not.
-        let ends = shape.ends || own.iter().any(|(exit, _)| exit.breaks);
+        let ends = shape.ends || !breaks.is_empty();
         let outer = std::mem::take(&mut flow.exits);
-        let pass = worst(
-            worst(Some(flow.total()), worst_of(own)),
-            worst_of(outer.clone()),
-        )
-        .unwrap_or(Cost::ZERO);
+        let pass = Pass {
+            again: worst(flow.fall, worst_of(continues)),
+            leave: worst(worst(flow.ret, worst_of(breaks)), worst_of(outer.clone())),
+        };
         let total = self.bound_loop(pass, shape.bound, shape.span, before);
         Flow {
             fall: ends.then(|| total.clone()),
@@ -2115,19 +2286,23 @@ impl Analyzer {
         }
     }
 
-    /// Turn a loop body's cost into the loop's cost.
+    /// Turn a loop pass's cost into the loop's cost. Each pass but the last
+    /// goes `again`; the last pass may also `leave`. A path that leaves is
+    /// paid once, not once per pass.
     fn bound_loop(
         &mut self,
-        body: Cost,
+        pass: Pass,
         bound: Option<u32>,
         span: Span,
         ledger_before: usize,
     ) -> Cost {
-        if body.is_zero() {
+        let again = pass.again.unwrap_or(Cost::ZERO);
+        let last = again.clone().or_worst(pass.leave.unwrap_or(Cost::ZERO));
+        if bound == Some(0) {
             return Cost::ZERO;
         }
-        if let Cost::Unbounded(_) = body {
-            return body;
+        if again.is_zero() || matches!(last, Cost::Unbounded(_)) {
+            return last;
         }
         if let Some(times) = bound {
             if times > 1 {
@@ -2135,7 +2310,7 @@ impl Analyzer {
                     write!(entry, " ×{times}").expect("writing to a String cannot fail");
                 }
             }
-            return body.repeated(times);
+            return again.repeated(times - 1).then(last);
         }
         let culprit = self.ledger.get(ledger_before).map_or_else(
             || "a declared query cost".to_string(),
@@ -2529,9 +2704,9 @@ impl Analyzer {
             Expr::Reference(r) => self.shape_of(&r.expr),
             Expr::Paren(p) => self.shape_of(&p.expr),
             Expr::Group(g) => self.shape_of(&g.expr),
-            Expr::Array(_) | Expr::Repeat(_) => Some(Shape::Seq),
+            Expr::Array(_) | Expr::Repeat(_) => Some(Shape::Slice),
             Expr::Tuple(_) => Some(Shape::Tuple),
-            Expr::Macro(m) => vec_elems(&m.mac).map(|_| Shape::Seq),
+            Expr::Macro(m) => vec_elems(&m.mac).map(|_| Shape::Vec),
             Expr::Call(c) if is_smart_pointer_new(c) => {
                 c.args.first().and_then(|a| self.shape_of(a))
             }
@@ -2801,6 +2976,13 @@ impl Analyzer {
         }
     }
 
+    /// Does this call give an `Option` of a part (`deque.remove(0)`)?
+    fn gives_option_of_part(&self, mc: &ExprMethodCall) -> bool {
+        let method = mc.method.to_string();
+        self.shape_of(&mc.receiver)
+            .is_some_and(|shape| shape.option_of_part(&method))
+    }
+
     /// Does this method call evaluate to a handle?
     fn method_is_handle(&self, mc: &ExprMethodCall) -> bool {
         let method = mc.method.to_string();
@@ -2809,7 +2991,7 @@ impl Analyzer {
         }
         // A method on a carrier that returns a part: `repos.remove(0)`.
         if self.expr_is_carrier(&mc.receiver) {
-            return ELEMENT_METHODS.contains(&method.as_str());
+            return ELEMENT_METHODS.contains(&method.as_str()) && !self.gives_option_of_part(mc);
         }
         // `.expect(...)`/`.unwrap()` stand in for `?`
         // (`ctx.conn().await.expect("connection")`, #2546 review round 5).
@@ -2929,7 +3111,8 @@ impl Analyzer {
             Expr::Field(f) => matches!(self.part_kind(f), Some(Kind::Carrier | Kind::Holder)),
             Expr::Macro(m) => vec_elems(&m.mac).is_some_and(|elems| elems.iter().any(holds)),
             Expr::MethodCall(mc) => {
-                CARRIER_METHODS.contains(&mc.method.to_string().as_str())
+                (CARRIER_METHODS.contains(&mc.method.to_string().as_str())
+                    || self.gives_option_of_part(mc))
                     && self.expr_is_carrier(&mc.receiver)
             }
             Expr::If(i) => {
@@ -5960,9 +6143,10 @@ mod tests {
                 Expect::Exact(3),
             ),
             (
+                // The `return` leaves on the pass that takes it.
                 "return in a bounded loop",
                 "for _ in 0..2 { if flag { return Ok(repo.a().await?.len()); } }",
-                Expect::Exact(2),
+                Expect::Exact(1),
             ),
             (
                 "annotated return keeps its exit",
@@ -6376,16 +6560,86 @@ mod tests {
     }
 
     #[test]
+    fn each_container_type_has_its_own_methods() {
+        // `(parameter type, call)`: the type has no such method, so an
+        // extension trait gives it, and it may query.
+        let missing = [
+            ("VecDeque<PgPostRepository>", "repos.sort()"),
+            ("LinkedList<PgPostRepository>", "repos.get(0)"),
+            ("BinaryHeap<PgPostRepository>", "repos.insert(0)"),
+            ("Vec<PgPostRepository>", "repos.push_back()"),
+            ("[PgPostRepository; 2]", "repos.push()"),
+            ("&[PgPostRepository]", "repos.clear()"),
+            ("BTreeMap<i64, PgPostRepository>", "repos.reserve(1)"),
+            ("BTreeSet<PgPostRepository>", "repos.drain()"),
+        ];
+        // The type has the method, so it issues nothing.
+        let present = [
+            ("Vec<PgPostRepository>", "repos.sort()"),
+            ("VecDeque<PgPostRepository>", "repos.push_back(other)"),
+            ("[PgPostRepository; 2]", "repos.reverse()"),
+            (
+                "BTreeMap<i64, PgPostRepository>",
+                "repos.retain(|_, _| true)",
+            ),
+            ("HashSet<PgPostRepository>", "repos.drain()"),
+        ];
+        let handler = |ty: &str, call: &str| {
+            format!(
+                "async fn h(mut repos: {ty}, other: PgPostRepository) -> AutumnResult<usize> \
+                 {{ let _ = {call}.await; Ok(0) }}"
+            )
+        };
+        // `VecDeque::remove` gives an `Option` of the handle.
+        let deque = "async fn h(mut repos: VecDeque<PgPostRepository>) -> AutumnResult<usize> { \
+                     let repo = repos.pop_front().unwrap(); let _ = repo.find_all().await?; \
+                     let other = repos.remove(0).unwrap(); let _ = other.find_all().await?; \
+                     Ok(0) }";
+        let mut failures = Vec::new();
+        for (ty, call) in missing {
+            if check(&handler(ty, call), Expect::Unbounded).is_some() {
+                failures.push(format!("{ty}: `{call}` is not reported"));
+            }
+        }
+        for (ty, call) in present {
+            if let Some(why) = check(&handler(ty, call), Expect::Exact(0)) {
+                failures.push(format!("{ty}: `{call}`: {why}"));
+            }
+        }
+        if let Some(why) = check(deque, Expect::Exact(2)) {
+            failures.push(format!("VecDeque element: {why}"));
+        }
+        let map = "async fn h(mut repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> \
+                   { let repo = repos.remove(&1).unwrap(); let _ = repo.find_all().await?; Ok(0) }";
+        if let Some(why) = check(map, Expect::Exact(1)) {
+            failures.push(format!("HashMap element: {why}"));
+        }
+        // `refresh_all` is not an `Option` method.
+        let unknown = "async fn h(mut repos: VecDeque<PgPostRepository>) -> AutumnResult<usize> \
+                       { let _ = repos.remove(0).refresh_all().await; Ok(0) }";
+        if check(unknown, Expect::Unbounded).is_some() {
+            failures.push("VecDeque: `remove(0).refresh_all()` is not reported".to_string());
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
     fn every_known_container_method_has_a_result_class() {
         // A known method whose result is not classed would give a plain
         // value, and a part taken through it would be lost.
         let shapes = [
-            Shape::Seq,
+            Shape::Vec,
+            Shape::Slice,
+            Shape::Deque,
+            Shape::List,
+            Shape::Heap,
             Shape::Iter,
             Shape::Opt,
             Shape::Res,
             Shape::Map,
+            Shape::SortedMap,
             Shape::Set,
+            Shape::SortedSet,
             Shape::Tuple,
         ];
         let unclassed: Vec<&str> = shapes
@@ -6475,6 +6729,53 @@ mod tests {
             "loop { continue; } let _ = repo.find_all();",
             Expect::Exact(0),
         )];
+        check_cases(cases);
+    }
+
+    #[test]
+    fn a_pass_that_leaves_the_loop_is_paid_once() {
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "bounded loop that breaks on its first pass",
+                "for _ in 0..3 { let _ = repo.find_all().await?; break; }",
+                Expect::Exact(1),
+            ),
+            (
+                "bounded loop that returns on its first pass",
+                "for _ in 0..3 { let _ = repo.find_all().await?; return Ok(1); }",
+                Expect::Exact(1),
+            ),
+            (
+                "loop over rows that breaks after the query",
+                "for _id in &ids { let _ = repo.find_all().await?; break; }",
+                Expect::Exact(1),
+            ),
+            (
+                "loop over rows with a query only on the exit path",
+                "for _id in &ids { if flag { let _ = repo.find_all().await?; break; } }",
+                Expect::Exact(1),
+            ),
+            (
+                "bounded loop with a query before a conditional break",
+                "for _ in 0..3 { let _ = repo.find_all().await?; if flag { break; } }",
+                Expect::Exact(3),
+            ),
+            (
+                "bounded loop with a query after a conditional continue",
+                "for _ in 0..3 { if flag { continue; } let _ = repo.find_all().await?; }",
+                Expect::Exact(3),
+            ),
+            (
+                "loop over rows with a query before a conditional break",
+                "for _id in &ids { let _ = repo.find_all().await?; if flag { break; } }",
+                Expect::Unbounded,
+            ),
+            (
+                "loop over rows with a query on the continue path",
+                "for _id in &ids { if flag { let _ = repo.find_all().await?; continue; } break; }",
+                Expect::Unbounded,
+            ),
+        ];
         check_cases(cases);
     }
 

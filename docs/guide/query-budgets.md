@@ -118,8 +118,8 @@ Both halves are compiled in CI as trybuild fixtures — see
 | Straight-line statements | **sum** |
 | `if` / `match` arms | **maximum** — only one arm runs, so the bound is the worst one |
 | `return`, `break`, `continue` | the early path does not include the cost of the code it skips. `if cached { return repo.find_cached().await; } repo.find_fresh().await` is **1**. A `return` inside a loop still counts as reaching the code after the loop |
-| A loop whose body issues a query | **unbounded** (rejected under a finite budget) |
-| A loop with a literal bound (`for _ in 0..3`) | body cost **× 3** |
+| A loop whose body issues a query on a path that starts another pass | **unbounded** (rejected under a finite budget) |
+| A loop with a literal bound (`for _ in 0..3`) | **× 3** for a path that starts another pass. A path that leaves the loop (`break`, `return`) is paid once: `for _ in 0..3 { repo.a().await?; break; }` is **1** |
 | A loop whose body issues nothing | **0** — loops are free until they query |
 | A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, `limit()`, …) it carries — splitting the chain across `let` bindings does not change the count |
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
@@ -162,10 +162,12 @@ The analysis follows the handle through every name that holds it:
   - An index (`repos[0]`), a field (`pair.0`), a pattern (`Some(r)`,
     `for r in repos`) or `?` gives a handle.
   - A method that the container's own type has (a `Vec` method on a `Vec`,
-    an `Option` method on an `Option`) is not a query. It gives a handle
-    when it returns a part (`repos.remove(0)`, `maybe.unwrap()`), and a
-    container when it returns a view (`repos.iter()`, `repos.first()`). Any
-    other method on the container is reported (`repos.refresh_all()`, or an
+    an `Option` method on an `Option`) is not a query. Each type has its own
+    list: `sort` is a `Vec` method, not a `VecDeque` one. The method gives a
+    handle when it returns a part (`repos.remove(0)`, `maybe.unwrap()`), and
+    a container when it returns a view or an `Option` of a part
+    (`repos.iter()`, `repos.first()`, `deque.remove(0)`). Any other method
+    on the container is reported (`repos.refresh_all()`, or an
     extension-trait `repos.ok()`).
   - A method or function given a handle may store it: after
     `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. Every

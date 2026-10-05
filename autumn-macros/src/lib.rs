@@ -1070,7 +1070,7 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   **maximum** (the worst reachable path).
 /// * A loop whose body issues a query is **unbounded**, unless the iterable
 ///   has a literal compile-time bound (`for _ in 0..3`), in which case the
-///   body cost is multiplied.
+///   body cost is multiplied. A path that leaves the loop is paid once.
 /// * A method chain rooted at a `Db` / repository handle is **one** query,
 ///   however many builder methods (`on_primary()`, `scoped()`, …) it carries.
 /// * `.preload(rows, Post::preload().author().tags())` costs **one query per

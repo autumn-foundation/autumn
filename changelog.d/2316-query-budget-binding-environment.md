@@ -10,7 +10,8 @@
 
 - **query budgets:** an early `return`, `break` or `continue` no longer adds
   its cost to the code it skips. `if cached { return repo.find_cached().await; }
-  repo.find_fresh().await` now costs 1 query, not 2 (#2316).
+  repo.find_fresh().await` now costs 1 query, not 2. In a loop, a path that
+  leaves the loop is paid once, not once per pass (#2316).
 - **query budgets:** the analysis tracks a handle through every binding form:
   `let`, `let`-`else`, assignment, `if let`, `while let`, `match` arms, `for`
   patterns, closure and transaction parameters, and annotated statements.
@@ -24,7 +25,7 @@
   and a container of containers keeps its shape. An unknown method on such
   a container, or any method on a user struct that holds a handle, is
   reported. A container method is known only for the container type that
-  has it. After `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds
+  has it: `sort` on a `VecDeque` is reported. After `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds
   a handle. A type annotation made only of standard and primitive types
   (`Vec<i64>`) marks a binding as plain (#2316).
 - **query budgets:** a parameter of type `Arc<PgPostRepository>`, `Box<…>`,
