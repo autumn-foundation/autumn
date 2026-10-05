@@ -117,7 +117,7 @@ tower-http = { version = "0.7", features = ["cors", "fs", "trace", "compression-
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.33.0"
-opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
+opentelemetry = { version = "0.33.0", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "grpc-tonic", "tls-aws-lc", "tls-roots", "http-proto", "reqwest-client", "reqwest-rustls"] }
 # tokio-rustls-comp (not tokio-native-tls-comp): the workspace already
