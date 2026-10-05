@@ -11774,9 +11774,13 @@ pub fn check_edge_routes_impl(
 
 /// Whether every `#[edge]` route uses only what the edge can provide.
 ///
-/// Fails on an unknown `needs(...)` capability, a write method, an
-/// origin-only extractor, or an undeclared `EdgeIdentity`. Each one also
-/// stops the build in rustc; doctor names it before the build starts.
+/// Flags an unknown `needs(...)` capability, a write method, an origin-only
+/// extractor, or an undeclared `EdgeIdentity`. Each one also stops the build
+/// in rustc; doctor names it before the build starts.
+///
+/// Fails for a route that `edge_routes![]` registers: the capsule needs it,
+/// so the build stops. Only warns for an unregistered one: the scan reads
+/// every file under `src/`, also a file that no `mod` declares.
 pub fn check_edge_capabilities_impl(scan: &crate::edge_scan::EdgeScan) -> CheckResult {
     const NAME: &str = "edge_capabilities";
     if scan.is_empty() {
@@ -11799,9 +11803,15 @@ pub fn check_edge_capabilities_impl(scan: &crate::edge_scan::EdgeScan) -> CheckR
             hint: None,
         };
     }
+    let registered = scan.registered_fns();
+    let status = if unsupported.iter().any(|f| registered.contains(f)) {
+        CheckStatus::Fail
+    } else {
+        CheckStatus::Warn
+    };
     CheckResult {
         name: NAME,
-        status: CheckStatus::Fail,
+        status,
         detail: Some(crate::edge_scan::format_unsupported(&unsupported)),
         hint: Some(crate::edge_scan::EDGE_UNSUPPORTED_HINT),
     }
@@ -11922,7 +11932,9 @@ mod tests {
 
     #[test]
     fn edge_capabilities_fails_on_a_capability_the_edge_cannot_provide() {
-        let scan = edge_scan_of("#[get(\"/d\")]\n#[edge(needs(db))]\nfn dash(db: Db) {}");
+        let scan = edge_scan_of(
+            "#[get(\"/d\")]\n#[edge(needs(db))]\nfn dash(db: Db) {}\nfn wire() { edge_routes![dash]; }",
+        );
         let r = check_edge_capabilities_impl(&scan);
         assert_eq!(r.status, CheckStatus::Fail);
         let detail = r.detail.unwrap();
@@ -11932,6 +11944,18 @@ mod tests {
         let hint = r.hint.unwrap();
         assert!(hint.contains("needs(kv)"), "{hint}");
         assert!(hint.contains("Remove #[edge]"), "{hint}");
+    }
+
+    /// An unregistered route may sit in a file that no `mod` declares. The
+    /// scan cannot tell, so doctor warns instead of failing a valid app.
+    #[test]
+    fn edge_capabilities_only_warns_for_an_unregistered_route() {
+        let scan = edge_scan_of("#[get(\"/d\")]\n#[edge]\nfn dash(db: Db) {}");
+        let r = check_edge_capabilities_impl(&scan);
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
+        assert!(detail.contains("`Db`"), "{detail}");
     }
 
     #[test]
