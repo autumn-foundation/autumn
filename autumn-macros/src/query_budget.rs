@@ -2549,11 +2549,12 @@ impl Analyzer {
             || (CALLBACK_METHODS.contains(&name.as_str())
                 && self.value_of(&method.receiver) != Kind::Plain);
         // The callback is the last argument: `db.tx_with(opts, |conn| …)`,
-        // `opt.map_or(default, f)`.
+        // `opt.map_or(default, f)`. Every argument of `map_or_else` is one.
         let last = method.args.len().saturating_sub(1);
+        let every = name == "map_or_else";
         let mut cost = Cost::ZERO;
         for (i, arg) in method.args.iter().enumerate() {
-            let callback = takes_callback && i == last;
+            let callback = takes_callback && (every || i == last);
             let next = if runs_once {
                 self.callback_arg(arg, param, callback)
             } else {
@@ -2809,8 +2810,19 @@ impl Analyzer {
         let Some(root) = place_root(receiver) else {
             return;
         };
+        // `append` and `extend` add the parts of a sequence, an `Option` or a
+        // set, not the container. A map's parts are tuples.
+        let flat = matches!(method, "append" | "extend")
+            && args.iter().all(|a| {
+                self.value_of(a) != Kind::Carrier
+                    || !matches!(
+                        self.shape_of(a),
+                        None | Some(Shape::Map | Shape::SortedMap | Shape::Tuple)
+                    )
+            });
         let kind = match held {
             Kind::Handle | Kind::LazyDb if STORE_METHODS.contains(&method) => Kind::Carrier,
+            Kind::Carrier if flat => Kind::Carrier,
             Kind::Handle | Kind::LazyDb => Kind::Holder,
             _ => Kind::Nested,
         };
@@ -2856,6 +2868,9 @@ impl Analyzer {
                 let method = mc.method.to_string();
                 !SCALAR_METHODS.contains(&method.as_str())
                     && (self.expr_is_nested(&mc.receiver)
+                        // `repos.chunks(2)` yields slices of handles.
+                        || (matches!(method.as_str(), "chunks" | "windows")
+                            && self.expr_is_carrier(&mc.receiver))
                         || (self.expr_is_holder(&mc.receiver)
                             && !SAME_TYPE_METHODS.contains(&method.as_str())
                             && !HANDLE_ACCESSORS.contains(&method.as_str()))
@@ -3699,7 +3714,7 @@ fn type_kind(ty: &Type) -> Kind {
 /// How deep handles sit in a container type: 1 for `Vec<PgPostRepository>`,
 /// 2 or more for `Vec<Vec<PgPostRepository>>`, 0 for no container of
 /// handles. A smart pointer adds no depth. A `Result` with a handle on its
-/// `Ok` side is a handle, not a container (see [`type_is_handle`]).
+/// `Ok` side only is a handle, not a container (see [`type_is_handle`]).
 fn type_depth(ty: &Type) -> u8 {
     let part = |inner: &Type| {
         if type_is_handle_part(inner) {
@@ -3726,10 +3741,13 @@ fn type_depth(ty: &Type) -> u8 {
             }
             if name == "Result" {
                 let ok = args.next();
+                let err = args.next().map_or(0, part);
+                // A handle on the `Ok` side alone makes a handle. A handle
+                // on the `Err` side too makes a container of both.
                 if ok.is_some_and(type_is_handle_part) {
-                    return 0;
+                    return err;
                 }
-                return ok.map_or(0, part).max(args.next().map_or(0, part));
+                return ok.map_or(0, part).max(err);
             }
             if CARRIER_TYPES.contains(&name.as_str()) {
                 return args.map(part).max().unwrap_or(0);
@@ -6864,6 +6882,75 @@ mod tests {
                        Query.execute(&mut db).await?; \
                        let q = Query; q.execute(&mut db).await?; q.execute(&mut db).await }";
         assert_eq!(check(handler, Expect::Exact(3)), None);
+    }
+
+    /// Check each `(name, handler, expect)`.
+    fn check_handlers(cases: &[(&str, &str, Expect)]) {
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|(name, handler, expect)| {
+                check(handler, *expect).map(|why| format!("{name}: {why}\n  {handler}"))
+            })
+            .collect();
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_container_layer_is_kept_through_results_and_slices() {
+        check_handlers(&[
+            (
+                "Err side of a Result with a handle on both sides",
+                "async fn h(result: Result<PgPostRepository, PgPostRepository>) \
+                 -> AutumnResult<usize> { \
+                 if let Err(repo) = result { let _ = repo.find_all().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "Ok side of a Result with a handle on both sides",
+                "async fn h(result: Result<PgPostRepository, PgPostRepository>) \
+                 -> AutumnResult<usize> { let repo = result?; let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a chunk of a container of handles is a container",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let chunk = repos.chunks(repos.len()).next().unwrap(); \
+                 chunk.refresh_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a window of a container of handles is a container",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 for w in repos.windows(2) { w.refresh_all().await?; break; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "both map_or_else arguments are callbacks",
+                "async fn h(result: Result<(), PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = result.map_or_else(query_error, |_| 0); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "append of a Vec of handles keeps a flat Vec",
+                "async fn h(mut left: Vec<PgPostRepository>, mut right: Vec<PgPostRepository>) \
+                 -> AutumnResult<usize> { left.append(&mut right); left.append(&mut right); \
+                 let _ = left[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "extend with an Option of a handle keeps a flat Vec",
+                "async fn h(mut left: Vec<PgPostRepository>, extra: Option<PgPostRepository>) \
+                 -> AutumnResult<usize> { left.extend(extra); left.extend(None); \
+                 let _ = left[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "extend with a map of handles gives tuples",
+                "async fn h(mut left: Vec<PgPostRepository>, extra: HashMap<i64, PgPostRepository>) \
+                 -> AutumnResult<usize> { left.extend(extra); left[0].refresh_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
     }
 
     #[test]
