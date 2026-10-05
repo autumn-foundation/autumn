@@ -3359,6 +3359,15 @@ case "$1 $2" in
         fi
         ;;
       properties.active) echo false ;;
+      # The scale rules of an active revision. An operator can remove a
+      # custom rule from the template while the old revision stays active.
+      properties.template.scale.rules)
+        if [ -n "$STUB_ACTIVE_SCALE_RULE" ]; then
+          echo '[{"name":"q","custom":{"type":"azure-queue"}}]'
+        else
+          echo null
+        fi
+        ;;
       # The placeholder image provisions, except a revision that the test
       # names as failed.
       properties.provisioningState)
@@ -3489,6 +3498,7 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_ACTIVE_SCALE_RULE")
             .env_remove("STUB_JOB_NO_SECRETS")
             .env_remove("STUB_ACTIVE_EMPTY")
             .env_remove("STUB_RESTART_STALE")
@@ -4140,6 +4150,29 @@ esac
             return;
         };
         assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_checks_the_scale_rules_of_the_active_revision() {
+        // The template has only the HTTP rule now, but the active placeholder
+        // revision still has the custom rule. That rule can start it again.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_SCALE_RULE", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(
+            calls.contains("--revision app--old --query properties.template.scale.rules"),
+            "{calls}"
+        );
         assert!(!calls.contains("az rest --method patch"), "{calls}");
         assert!(!calls.contains("ingress disable"), "{calls}");
     }
