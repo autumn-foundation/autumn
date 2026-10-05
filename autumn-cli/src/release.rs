@@ -2942,8 +2942,14 @@ previous_secrets = []
         // pins the order.
         let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
         assert!(
-            script.contains("az containerapp ingress enable"),
+            script.contains("open_ingress"),
             "the cutover must enable external ingress: {script}"
+        );
+        // `ingress enable` builds a new ingress object, which drops custom
+        // domains, IP restrictions and CORS.
+        assert!(
+            !script.contains("az containerapp ingress enable"),
+            "the cutover must restore the saved ingress, not rebuild it: {script}"
         );
     }
 
@@ -3134,10 +3140,10 @@ previous_secrets = []
             .find("[ -n \"$READY\" ] || fail")
             .expect("a timeout must fail the cutover");
         let enable_at = script
-            .find("az containerapp ingress enable")
+            .rfind("\nopen_ingress")
             .expect("the script must open external ingress");
         assert!(patch_at < provisioned_at && provisioned_at < ready_at && ready_at < enable_at);
-        assert!(script.contains("--type external"));
+        assert!(script.contains(".external = true"));
         assert!(
             script.contains("\"$REVISION_IMAGE\" = \"$IMAGE\""),
             "ingress must open only when the new revision runs the real image: {script}"
@@ -3246,7 +3252,12 @@ done
   [ -n "$STUB_SIDECAR_REDIS_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_REDIS","secretRef":"redis-url"}]}'
   scale=""
   [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"'"$STUB_SCALE_SECRET_REF"'","triggerParameter":"connection"}]}}]}'
-  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
+  # A placeholder has closed ingress; a real release has open ingress. Both
+  # have a custom domain that the cutover must keep.
+  external=false
+  case "$STUB_OLD_IMAGE" in acr.azurecr.io/*) external=true ;; esac
+  ingress="{\"external\":$external,\"targetPort\":3000,\"transport\":\"http\",\"fqdn\":\"app.example.internal\",\"customDomains\":[{\"name\":\"www.example.com\"}]}"
+  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
 case "$1 $2" in
   "containerapp job")
     secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"$id\"}"; }
@@ -3311,7 +3322,7 @@ case "$1 $2" in
         echo $((lag - 1)) > "$STUB_LOG.lag"
         printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
       fi
-      printf 'app--new%s\t%s\n' "$n" "$STUB_OLD_IMAGE"
+      printf '%s\t%s\n' "${STUB_LATEST:-app--new$n}" "$STUB_OLD_IMAGE"
       exit 0
     fi
     case "$query" in
@@ -3349,6 +3360,9 @@ case "$1 $2" in
     ;;
   "containerapp replica") echo "${STUB_REPLICAS:-0}" ;;
   "rest --method")
+    if grep -q '"ingress"' <<< "$body"; then
+      echo "az ingress-patch external=$(jq -r '.properties.configuration.ingress.external' <<< "$body")" >> "$STUB_LOG"
+    fi
     echo "$body" >> "$STUB_LOG.bodies"
     echo "$body" > "$STUB_LOG.unapplied"
     echo "${STUB_PATCH_PENDING:-0}" > "$STUB_LOG.pending"
@@ -3483,7 +3497,7 @@ esac
         );
         let patch_at = calls.find("az rest --method patch").unwrap();
         let ingress_at = calls
-            .find("az containerapp ingress enable")
+            .find("az ingress-patch external=true")
             .unwrap_or_else(|| panic!("the cutover must open ingress: {calls}"));
         assert!(replicas_at < patch_at && patch_at < ingress_at, "{calls}");
         // Without ingress, nothing can start the placeholder again between
@@ -3532,17 +3546,17 @@ esac
             "a failed revision must fail the cutover: {calls}"
         );
         // The cutover, then the rollback: a template without the secret
-        // refs, then the credential removal.
+        // refs, the credential removal, then the saved ingress.
         assert_eq!(
             calls.matches("az rest --method patch").count(),
-            3,
+            4,
             "{calls}"
         );
         assert!(
-            !calls.contains("ingress enable"),
+            !calls.contains("ingress-patch external=true"),
             "ingress must stay closed: {calls}"
         );
-        let rollback = bodies.lines().last().unwrap_or_default();
+        let rollback = credentials_body(&bodies);
         assert!(
             rollback.contains("\"type\":\"None\""),
             "the rollback must remove the job's identity: {rollback}"
@@ -3573,7 +3587,7 @@ esac
             1,
             "{calls}"
         );
-        assert!(!calls.contains("ingress enable"), "{calls}");
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
     }
 
     #[cfg(unix)]
@@ -3596,7 +3610,7 @@ esac
             !calls.contains("az rest --method patch"),
             "no credentials while the placeholder runs: {calls}"
         );
-        assert!(!calls.contains("ingress enable"), "{calls}");
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
     }
 
     #[cfg(unix)]
@@ -3667,7 +3681,7 @@ esac
             return;
         };
         assert!(!status.success(), "{calls}");
-        assert!(!calls.contains("ingress enable"), "{calls}");
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
     }
 
     #[cfg(unix)]
@@ -3693,7 +3707,7 @@ esac
             calls[restart_at..].contains("--revision app--old"),
             "{calls}"
         );
-        let ingress_at = calls.find("ingress enable").unwrap();
+        let ingress_at = calls.find("ingress-patch external=true").unwrap();
         assert!(restart_at < ingress_at, "{calls}");
     }
 
@@ -3727,7 +3741,7 @@ esac
             calls[first_patch..second_patch].contains("az containerapp revision list"),
             "the old revision must stop first: {calls}"
         );
-        assert!(!calls.contains("ingress enable"), "{calls}");
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
         assert!(bodies.contains("\"type\":\"None\""), "{bodies}");
         assert!(bodies.contains("\"registries\":[]"), "{bodies}");
         for kept in [
@@ -3752,6 +3766,111 @@ esac
                 "the PATCH must remove {removed}: {bodies}"
             );
         }
+    }
+
+    /// The PATCH body that removes the credentials: the last one that sets
+    /// an identity.
+    #[cfg(unix)]
+    fn credentials_body(bodies: &str) -> &str {
+        bodies
+            .lines()
+            .rfind(|body| body.contains("\"identity\""))
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_the_ingress_settings_on_the_first_cutover() {
+        // `az containerapp ingress enable` builds a new ingress object and
+        // drops custom domains. The script sends the saved ingress back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let ingress = bodies
+            .lines()
+            .find(|body| body.contains("\"ingress\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(ingress.contains("\"www.example.com\""), "{ingress}");
+        assert!(ingress.contains("\"external\":true"), "{ingress}");
+        assert!(!ingress.contains("fqdn"), "fqdn is read-only: {ingress}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_leaves_open_ingress_alone_on_a_later_deploy() {
+        let Some((status, calls, bodies)) =
+            run_azure_cutover("acr.azurecr.io/app:t0", "Provisioned", false, 0, &[])
+        else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(!bodies.contains("\"ingress\""), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_the_ingress_after_a_failed_first_cutover() {
+        // The first cutover disabled ingress. After the rollback removed the
+        // credentials, the saved ingress (still closed) comes back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let last = bodies.lines().last().unwrap_or_default();
+        assert!(last.contains("\"ingress\""), "{bodies}");
+        assert!(last.contains("\"external\":false"), "{last}");
+        assert!(last.contains("\"www.example.com\""), "{last}");
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_activation_on_an_interrupted_retry() {
+        // An earlier first cutover made the real revision but was cut off
+        // before it became active. The same-tag retry must still wait until
+        // it is the only active one before ingress opens.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_ENV_FULL", "1"),
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+                ("STUB_LATEST", "app--real"),
+                ("STUB_ACTIVE_LAG", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        let ingress_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            calls[patch_at..ingress_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 2,
+            "the retry must wait until the real revision is the only active one: {calls}"
+        );
     }
 
     /// The `az` calls after the first PATCH that read the full app.
@@ -4163,7 +4282,7 @@ esac
         assert!(status.success(), "{calls}");
         let patch_at = calls.find("az rest --method patch").unwrap();
         let ingress_at = calls
-            .find("az containerapp ingress enable")
+            .find("az ingress-patch external=true")
             .unwrap_or_else(|| panic!("{calls}"));
         assert!(
             calls[patch_at..ingress_at]
@@ -4222,7 +4341,7 @@ esac
         assert!(status.success(), "{calls}");
         let patch_at = calls.find("az rest --method patch").unwrap();
         let ingress_at = calls
-            .find("az containerapp ingress enable")
+            .find("az ingress-patch external=true")
             .unwrap_or_else(|| panic!("{calls}"));
         assert!(
             calls[patch_at..ingress_at]
@@ -4289,7 +4408,7 @@ esac
             return;
         };
         assert!(!status.success(), "{calls}");
-        let rollback = bodies.lines().last().unwrap_or_default();
+        let rollback = credentials_body(&bodies);
         assert!(
             rollback.contains(
                 "\"/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id\":null"
@@ -4317,7 +4436,7 @@ esac
             return;
         };
         assert!(!status.success(), "{calls}");
-        let rollback = bodies.lines().last().unwrap_or_default();
+        let rollback = credentials_body(&bodies);
         assert!(rollback.contains("\"type\":\"None\""), "{rollback}");
         assert!(
             !rollback.contains("signing-secret")
