@@ -1444,6 +1444,8 @@ impl Kind {
 
 /// What a name holds, and, for a struct or tuple literal, what each part
 /// holds.
+// Each flag is a separate fact about the value, and each joins its own way.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Binding {
     kind: Kind,
@@ -1456,6 +1458,9 @@ struct Binding {
     /// = &mut repos;` points to `repos`. After a branch it may point to more
     /// than one.
     referents: Vec<String>,
+    /// The plain result of a known container method on handles. No std
+    /// method of this kind gives a future, so `.await` on it is reported.
+    container_result: bool,
     /// Each referent is borrowed whole (`&mut slot`, not `&mut slot.0`),
     /// so a write through the binding replaces it.
     whole: bool,
@@ -1484,6 +1489,7 @@ impl Binding {
             parts: None,
             shape: None,
             referents: Vec::new(),
+            container_result: false,
             whole: false,
             future: false,
             output: None,
@@ -1535,6 +1541,7 @@ impl Binding {
                 all.dedup();
                 all
             },
+            container_result: self.container_result || other.container_result,
             whole: self.whole && other.whole,
             future: self.future && other.future,
             output: self.output.max(other.output),
@@ -2156,6 +2163,7 @@ impl Analyzer {
             parts,
             shape: self.shape_of(init),
             referents: self.referents_of(init),
+            container_result: self.is_container_result(init),
             whole: self.borrows_whole(init),
             future: self.is_known_future(init),
             pending_query: self.is_pending_query(init),
@@ -2741,6 +2749,20 @@ impl Analyzer {
                 {
                     let query = self.count("deferred builder awaited");
                     return flow.then(Flow::cost(query));
+                }
+                // No std container method gives a future. `repos.push(repo)
+                // .await` is an application method of that name, which may
+                // query through the handles.
+                if !matches!(flow.fall, Some(Cost::Unbounded(_)))
+                    && self.is_container_result(&e.base)
+                {
+                    return flow.then(Flow::cost(Cost::unbounded(
+                        e.span(),
+                        "this awaits a method with a standard container name on handles, so it \
+                         is an application method, and what it runs is another function's \
+                         business",
+                        DECLARE_HINT,
+                    )));
                 }
                 // `.await` on a value that holds a handle and is not a known
                 // future: `PgPostRepository::new(&mut db)` stored, then
@@ -3860,6 +3882,20 @@ impl Analyzer {
     /// standard container `receiver`? Not on a user value or a nested
     /// container: their methods are the user's. Not with an argument count
     /// the standard method does not take: `repos.push()` is a trait method.
+    /// Is `e` the plain result of a known container method on a receiver
+    /// that holds handles (`repos.push(repo)`, `repos.len()`), or a name
+    /// bound to one? A std method of this kind gives no future.
+    fn is_container_result(&self, e: &Expr) -> bool {
+        match peel_parens(e) {
+            Expr::MethodCall(mc) => {
+                self.known_container_method(&mc.receiver, &mc.method.to_string(), mc.args.len())
+                    && self.value_of(&mc.receiver) != Kind::Plain
+                    && self.value_of(e) == Kind::Plain
+            }
+            other => path_ident(other).is_some_and(|name| self.env.binding(&name).container_result),
+        }
+    }
+
     fn known_container_method(&self, receiver: &Expr, method: &str, args: usize) -> bool {
         !self.expr_is_holder(receiver)
             && !self.expr_is_nested(receiver)
@@ -11452,6 +11488,42 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  std::mem::drop(repo); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn awaited_container_methods_are_application_methods() {
+        check_handlers(&[
+            (
+                "guard: an awaited container method is an application method",
+                "async fn h(mut repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 repos.push(repo).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a stored container method result that is awaited",
+                "async fn h(mut repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = repos.push(repo); pending.await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an awaited len on handles is an application method",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = repos.len().await; Ok(n) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a container method that is not awaited stays free",
+                "async fn h(mut repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 repos.push(repo); let n = repos.len(); render(n); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a future taken out of an Option is still a future",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = Some(repo.find_all()); let _ = slot.take().unwrap().await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }

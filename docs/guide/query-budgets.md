@@ -419,8 +419,9 @@ callbacks. These things sit outside it, by construction:
   `Vec<PgPostRepository>` runs in place of `Vec::len`. The macro has no type
   information and assumes that no such trait is in scope. It does see a call
   with an argument count that the standard method does not take
-  (`repos.push()`), and reports it. Do not give a trait on a container of
-  handles a standard method name.
+  (`repos.push()`), and reports it. No standard container method gives a
+  future, so it also reports an `.await` on one (`repos.push(repo).await`).
+  Do not give a trait on a container of handles a standard method name.
 - **An application item that takes a standard name.** The macro trusts a
   standard name that is bare or under a `std` path: the type `Vec`, `vec!`,
   `format!`, `drop`. It does not trust one under another path
