@@ -291,6 +291,56 @@ async fn slow_header_client_cannot_hold_a_graceful_drain_open() {
         .unwrap();
 }
 
+fn h2_frame(kind: u8, flags: u8, stream: u8, payload: &[u8]) -> Vec<u8> {
+    let len = u8::try_from(payload.len()).unwrap();
+    let mut out = vec![0, 0, len, kind, flags, 0, 0, 0, stream];
+    out.extend_from_slice(payload);
+    out
+}
+
+#[tokio::test]
+async fn http2_partial_header_block_after_a_request_hits_the_header_timeout() {
+    let addr = spawn_server(HttpLimits {
+        header_read_timeout: ms(500),
+        keep_alive_timeout: ms(10_000),
+        ..HttpLimits::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    bytes.extend(h2_frame(0x4, 0, 0, &[])); // SETTINGS
+    // GET / (HPACK static 2, 6, 4) with END_HEADERS | END_STREAM.
+    bytes.extend(h2_frame(0x1, 0x5, 1, &[0x82, 0x86, 0x84]));
+    stream.write_all(&bytes).await.unwrap();
+    // Read frames until the response HEADERS for stream 1 arrive.
+    loop {
+        let mut header = [0_u8; 9];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut header))
+            .await
+            .expect("response in time")
+            .expect("connection open");
+        let len =
+            usize::from(header[0]) << 16 | usize::from(header[1]) << 8 | usize::from(header[2]);
+        let mut payload = vec![0_u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_ne!(header[3], 0x7, "server sent GOAWAY: {payload:?}");
+        if header[3] == 0x1 && header[8] == 1 {
+            break;
+        }
+    }
+    // A second request whose header block never ends.
+    stream
+        .write_all(&h2_frame(0x1, 0x1, 3, &[0x82]))
+        .await
+        .unwrap();
+    let closed_after = time_until_closed(&mut stream, Duration::from_secs(5)).await;
+    assert!(
+        closed_after >= Duration::from_millis(300) && closed_after < Duration::from_secs(3),
+        "a partial head must close after the 500 ms head timeout, not the 10 s \
+         keep-alive: {closed_after:?}"
+    );
+}
+
 #[tokio::test]
 async fn default_limits_keep_a_slow_header_connection_open() {
     let addr = spawn_server(HttpLimits::default()).await;

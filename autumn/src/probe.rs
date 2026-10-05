@@ -139,12 +139,11 @@ impl ReplicaDependency {
             .map_or(std::time::Duration::ZERO, |at| at.elapsed())
     }
 
-    /// The lag is known and inside the limit, or no limit is set. The sample
-    /// age counts as lag.
+    /// The lag is known, fresh and inside the limit, or no limit is set.
     fn lag_ok(&self) -> bool {
         self.max_lag.is_none_or(|max| {
             self.lag
-                .is_some_and(|lag| lag.saturating_add(self.lag_age()) <= max)
+                .is_some_and(|lag| lag <= max && self.lag_age() <= sample_max_age(max))
         })
     }
 
@@ -155,8 +154,9 @@ impl ReplicaDependency {
         let max = self.max_lag.map_or(0, duration_ms);
         Some(match (self.lag, &self.lag_detail) {
             (Some(lag), _) if lag <= self.max_lag.unwrap_or_default() => format!(
-                "replica lag sample is {}ms old; database.replica_max_lag_ms is {max}ms",
-                duration_ms(self.lag_age())
+                "replica lag sample is {}ms old; the limit is {}ms",
+                duration_ms(self.lag_age()),
+                duration_ms(sample_max_age(self.max_lag.unwrap_or_default()))
             ),
             (Some(lag), _) => format!(
                 "replica lag {}ms exceeds database.replica_max_lag_ms {max}ms",
@@ -166,6 +166,17 @@ impl ReplicaDependency {
             (None, None) => "replica lag is not measured yet".to_owned(),
         })
     }
+}
+
+/// A lag sample older than this counts as unknown: twice the lag limit, and
+/// at least 1 s. The monitor samples every half limit (250 ms to 5 s), so a
+/// working monitor stays inside it. A stopped monitor (a hung query, a full
+/// pool) does not.
+#[cfg(feature = "db")]
+fn sample_max_age(max_lag: std::time::Duration) -> std::time::Duration {
+    max_lag
+        .saturating_mul(2)
+        .max(std::time::Duration::from_secs(1))
 }
 
 #[cfg(feature = "db")]
@@ -997,14 +1008,31 @@ mod tests {
         probes.record_replica_lag(std::time::Duration::from_millis(100));
         assert!(probes.should_route_reads_to_replica());
 
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        // Inside the sample window (2 x 1 s): still fresh, no flapping.
+        tokio::time::advance(std::time::Duration::from_millis(1500)).await;
+        assert!(probes.should_route_reads_to_replica());
+
+        tokio::time::advance(std::time::Duration::from_millis(1000)).await;
         assert!(
             !probes.should_route_reads_to_replica(),
-            "no new sample for 2s, so freshness is unknown"
+            "no new sample for 2.5s, so freshness is unknown"
         );
         assert!(probes.should_fallback_reads_to_primary());
         let detail = probes.replica_status().unwrap().detail.unwrap();
         assert!(detail.contains("old"), "{detail}");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn a_small_lag_limit_does_not_flap_between_samples() {
+        let probes = ProbeState::default();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_millis(100)));
+        probes.record_replica_lag(std::time::Duration::ZERO);
+        // The monitor's floor interval is 250 ms, above the 100 ms limit.
+        tokio::time::advance(std::time::Duration::from_millis(300)).await;
+        assert!(probes.should_route_reads_to_replica());
     }
 
     #[cfg(feature = "db")]

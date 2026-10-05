@@ -17,8 +17,10 @@
 //!   request timeout layer limits handlers.
 //! - **Idle**: no request in flight. `keep_alive_timeout` applies.
 //!
-//! HTTP/2 frames between requests (for example `PING`) do not start a head
-//! timer. The timers also run during a graceful drain.
+//! On HTTP/2, control frames between requests (for example `PING`) do not
+//! start a head timer. An open header block does: a `HEADERS` frame without
+//! `END_HEADERS` starts `header_read_timeout`, in any phase, until a frame
+//! with `END_HEADERS` arrives. The timers also run during a graceful drain.
 
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -295,7 +297,91 @@ enum Expiry {
 #[derive(Debug)]
 struct PhaseState {
     phase: Phase,
-    http2: bool,
+    scan: Scan,
+    /// Set while an HTTP/2 header block is open.
+    header_block_since: Option<Instant>,
+}
+
+/// The HTTP/2 client preface.
+const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const H2_FRAME_HEADERS: u8 = 0x1;
+const H2_FRAME_CONTINUATION: u8 = 0x9;
+const H2_FLAG_END_HEADERS: u8 = 0x4;
+
+/// A scan of the bytes the client sends: HTTP/1, or HTTP/2 frame headers.
+#[derive(Debug)]
+enum Scan {
+    /// Comparing the first bytes with the HTTP/2 preface.
+    Preface {
+        matched: usize,
+    },
+    Http1,
+    /// Between HTTP/2 frames: `have` bytes of the 9-byte frame header, then
+    /// `skip` payload bytes.
+    Frames {
+        header: [u8; 9],
+        have: usize,
+        skip: usize,
+    },
+}
+
+impl PhaseState {
+    const fn http2(&self) -> bool {
+        matches!(self.scan, Scan::Frames { .. })
+    }
+
+    /// Advance the scan over `bytes`. Opens or closes the HTTP/2 header block.
+    fn scan(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            match &mut self.scan {
+                Scan::Http1 => return,
+                Scan::Preface { matched } => {
+                    let rest = &H2_PREFACE[*matched..];
+                    let n = rest.len().min(bytes.len());
+                    if bytes[..n] != rest[..n] {
+                        self.scan = Scan::Http1;
+                        return;
+                    }
+                    *matched += n;
+                    bytes = &bytes[n..];
+                    if *matched == H2_PREFACE.len() {
+                        self.scan = Scan::Frames {
+                            header: [0; 9],
+                            have: 0,
+                            skip: 0,
+                        };
+                    }
+                }
+                Scan::Frames { header, have, skip } => {
+                    if *skip > 0 {
+                        let n = (*skip).min(bytes.len());
+                        *skip -= n;
+                        bytes = &bytes[n..];
+                        continue;
+                    }
+                    let n = (9 - *have).min(bytes.len());
+                    header[*have..*have + n].copy_from_slice(&bytes[..n]);
+                    *have += n;
+                    bytes = &bytes[n..];
+                    if *have < 9 {
+                        return;
+                    }
+                    *have = 0;
+                    *skip = usize::from(header[0]) << 16
+                        | usize::from(header[1]) << 8
+                        | usize::from(header[2]);
+                    let (kind, flags) = (header[3], header[4]);
+                    if kind == H2_FRAME_HEADERS || kind == H2_FRAME_CONTINUATION {
+                        if flags & H2_FLAG_END_HEADERS == 0 {
+                            self.header_block_since.get_or_insert_with(Instant::now);
+                        } else {
+                            self.header_block_since = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -313,7 +399,8 @@ impl ConnTimers {
                 phase: Phase::Head {
                     since: Instant::now(),
                 },
-                http2: false,
+                scan: Scan::Preface { matched: 0 },
+                header_block_since: None,
             }),
             changed: Notify::new(),
             header_read_timeout: limits.header_read_timeout,
@@ -332,27 +419,30 @@ impl ConnTimers {
         self.changed.notify_one();
     }
 
-    /// Bytes arrived. The first byte after an idle period starts the head
-    /// timer.
-    fn on_read(&self) {
+    /// Bytes arrived. On HTTP/1, the first byte after an idle period starts
+    /// the head timer. On HTTP/2, an open header block starts it.
+    fn on_read(&self, bytes: &[u8]) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Phase::Idle { .. } = state.phase
-            && !state.http2
-        {
+        let block_before = state.header_block_since.is_some();
+        state.scan(bytes);
+        let head_starts = matches!(state.phase, Phase::Idle { .. }) && !state.http2();
+        if head_starts {
             state.phase = Phase::Head {
                 since: Instant::now(),
             };
-            drop(state);
+        }
+        let changed = head_starts || block_before != state.header_block_since.is_some();
+        drop(state);
+        if changed {
             self.changed.notify_one();
         }
     }
 
-    fn request_started(&self, http2: bool) {
+    fn request_started(&self) {
         self.update(|state| {
-            state.http2 |= http2;
             state.phase = match state.phase {
                 Phase::Busy { in_flight } => Phase::Busy {
                     in_flight: in_flight + 1,
@@ -383,7 +473,7 @@ impl ConnTimers {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match state.phase {
+        let phase = match state.phase {
             // With no head timeout, the idle timeout bounds the wait.
             Phase::Head { since } => self
                 .header_read_timeout
@@ -393,6 +483,15 @@ impl ConnTimers {
                 .keep_alive_timeout
                 .map(|timeout| (since + timeout, Expiry::Idle)),
             Phase::Busy { .. } => None,
+        };
+        // An open HTTP/2 header block, also next to other streams in flight.
+        let block = state
+            .header_block_since
+            .zip(self.header_read_timeout)
+            .map(|(since, timeout)| (since + timeout, Expiry::Head));
+        match (phase, block) {
+            (Some(a), Some(b)) => Some(if b.0 < a.0 { b } else { a }),
+            (a, b) => a.or(b),
         }
     }
 
@@ -423,7 +522,7 @@ impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {
         if buf.filled().len() > before
             && let Some(timers) = &self.timers
         {
-            timers.on_read();
+            timers.on_read(&buf.filled()[before..]);
         }
         result
     }
@@ -496,7 +595,7 @@ where
         // life, so the idle timer cannot close the tunnel.
         let tunnel = req.method() == axum::http::Method::CONNECT;
         let guard = self.timers.as_ref().and_then(|timers| {
-            timers.request_started(req.version() == axum::http::Version::HTTP_2);
+            timers.request_started();
             (!tunnel).then(|| InFlight(Arc::clone(timers)))
         });
         TrackedFuture {
@@ -560,5 +659,55 @@ impl http_body::Body for TrackedBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> PhaseState {
+        PhaseState {
+            phase: Phase::Busy { in_flight: 0 },
+            scan: Scan::Preface { matched: 0 },
+            header_block_since: None,
+        }
+    }
+
+    fn frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let len = u8::try_from(payload.len()).expect("small test payload");
+        let mut out = vec![0, 0, len, kind, flags, 0, 0, 0, 1];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn http1_bytes_end_the_scan() {
+        let mut state = state();
+        state.scan(b"GET / HTTP/1.1\r\n");
+        assert!(matches!(state.scan, Scan::Http1));
+        assert!(!state.http2());
+    }
+
+    #[tokio::test]
+    async fn open_header_block_is_tracked_across_split_reads() {
+        let mut state = state();
+        let mut bytes = H2_PREFACE.to_vec();
+        bytes.extend(frame(0x4, 0, &[0; 6])); // SETTINGS with a payload
+        bytes.extend(frame(H2_FRAME_HEADERS, 0, &[0x82, 0x86])); // no END_HEADERS
+        for chunk in bytes.chunks(5) {
+            state.scan(chunk);
+        }
+        assert!(state.http2());
+        assert!(state.header_block_since.is_some(), "block is open");
+
+        state.scan(&frame(H2_FRAME_CONTINUATION, H2_FLAG_END_HEADERS, &[0x84]));
+        assert!(state.header_block_since.is_none(), "END_HEADERS closes it");
+
+        state.scan(&frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS | 0x1, &[0x82]));
+        assert!(
+            state.header_block_since.is_none(),
+            "a full block never opens"
+        );
     }
 }

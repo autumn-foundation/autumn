@@ -639,8 +639,8 @@ With a limit set:
 
 - The app measures the lag on the replica, in the background and on each
   `/ready` call. The interval is half the limit, between 250 ms and 5 s.
-- The age of the last sample counts as lag. When the checks stop (a hung
-  query, a full pool), the sample ages out and reads go to the primary.
+- A sample older than twice the limit (at least 1 s) counts as unknown. When
+  the checks stop (a hung query, a full pool), reads go to the primary.
 - While the lag is over the limit, reads go to the primary. This is true for
   both `replica_fallback` values: a lagging replica is stale, not down. With
   `fail_readiness`, this puts the read load of every pod on the primary.
@@ -651,14 +651,15 @@ With a limit set:
 - With `[health] detailed = true`, `/ready` reports the replica:
   `{"replica": {"ready": false, "lag_ms": 30000, "max_lag_ms": 5000, "detail": "..."}}`.
 
-The lag query returns `0` when the WAL receiver runs and all received WAL is
-replayed. If not, it returns the time since the last replayed transaction.
+The lag query returns `0` when the WAL receiver runs, it got a message from
+the primary in the last 60 s, and all received WAL is replayed. If not, it returns the time since the last replayed transaction.
 This is a simplified form of the query:
 
 ```sql
 SELECT CASE
   WHEN NOT pg_is_in_recovery() THEN 0
-  WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver)
+  WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver
+               WHERE last_msg_receipt_time > clock_timestamp() - INTERVAL '60 seconds')
        AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0
   ELSE clock_timestamp() - pg_last_xact_replay_timestamp()  -- in ms
 END
@@ -671,6 +672,10 @@ Know these limits of the query:
 - A replica that restores WAL from an archive (no WAL receiver) shows the
   time since its last replayed transaction.
 - Clock skew between the primary and the replica adds to the value.
+- The 60 s receiver check needs a role with `pg_read_all_stats` (for example
+  through `pg_monitor`). Without it, Postgres hides
+  `last_msg_receipt_time`, and a stalled receiver is found only when its
+  connection breaks.
 
 The limit applies only to `database.replica_url`. Shard replicas do not use
 it yet. Without `replica_url`, the app ignores the limit
