@@ -3571,21 +3571,7 @@ impl Analyzer {
         };
         methods.reverse();
 
-        let mut cost = self.cost_of(root);
-
-        // Arguments run regardless of what the chain does with them. Each
-        // store reads its own arguments right after they ran, before a later
-        // method's arguments run: `dest.push({ source.push(repo); … })`.
-        let mut reads = Vec::new();
-        for method in &methods {
-            if !method.args.is_empty() {
-                reads.push(self.env.clone());
-            }
-            cost = cost.then(self.method_args(method));
-            let args: Vec<&Expr> = method.args.iter().collect();
-            self.store_into(&method.receiver, &method.method.to_string(), &args);
-        }
-        self.keep_reads(reads);
+        let mut cost = self.cost_of(root).then(self.chain_args(&methods));
         // Where the handle enters the chain: the root itself, or the first
         // method that yields one (`app.db()…`, `slot.unwrap()…`). Methods
         // before it are ordinary; methods after it act on a handle.
@@ -3722,6 +3708,25 @@ impl Analyzer {
     /// One method call's arguments. A transaction runs its closure once and
     /// hands it a connection. An `Option`/`Result` combinator runs its
     /// closure at most once. Any other closure may run once per element.
+    /// Run the arguments of each method in a chain. They run regardless of
+    /// what the chain does with them. Each store reads its own arguments
+    /// right after they ran, before a later method's arguments run:
+    /// `dest.push({ source.push(repo); … })`.
+    fn chain_args(&mut self, methods: &[&ExprMethodCall]) -> Cost {
+        let mut cost = Cost::ZERO;
+        let mut reads = Vec::new();
+        for method in methods {
+            if !method.args.is_empty() {
+                reads.push(self.env.clone());
+            }
+            cost = cost.then(self.method_args(method));
+            let args: Vec<&Expr> = method.args.iter().collect();
+            self.store_into(&method.receiver, &method.method.to_string(), &args);
+        }
+        self.keep_reads(reads);
+        cost
+    }
+
     fn method_args(&mut self, method: &ExprMethodCall) -> Cost {
         let name = method.method.to_string();
         // A user type may have a method with a transaction name that calls
