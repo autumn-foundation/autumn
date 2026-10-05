@@ -61,6 +61,7 @@ app (see the [data playground guide](docs/guide/console.md)):
 
 ```bash
 autumn console
+autumn console --repl   # interactive Rhai prompt, no compile per query
 ```
 
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
