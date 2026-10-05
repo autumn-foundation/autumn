@@ -2962,6 +2962,129 @@ previous_secrets = []
         );
     }
 
+    /// The `azurerm_container_app.this` block of a generated main.tf.
+    fn azure_app_block(main_tf: &str) -> &str {
+        main_tf
+            .split("resource \"azurerm_container_app\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\nresource").next())
+            .expect("main.tf must declare azurerm_container_app.this")
+    }
+
+    #[test]
+    fn azure_bootstrap_app_has_no_production_secrets_or_identity() {
+        // #2314: the public bootstrap image must not get the secret refs or
+        // the Key Vault-capable identity. Ingress and replica count are not
+        // a guarantee.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let app = azure_app_block(&content);
+        for forbidden in [
+            "identity {",
+            "registry {",
+            "secret {",
+            "\"secret\"",
+            "secret_name",
+            "azurerm_user_assigned_identity",
+            "azurerm_key_vault",
+        ] {
+            assert!(
+                !app.contains(forbidden),
+                "the bootstrap app must not contain `{forbidden}`: {app}"
+            );
+        }
+
+        // The cutover attaches these out of band. A later `terraform apply`
+        // must not strip them from the live app.
+        let lifecycle = app
+            .split("ignore_changes = [")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("the app must declare lifecycle.ignore_changes");
+        for ignored in [
+            "identity",
+            "registry",
+            "secret",
+            "template[0].container[0].env",
+        ] {
+            assert!(
+                lifecycle.contains(ignored),
+                "the app lifecycle must ignore `{ignored}`: {lifecycle}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_migrate_job_carries_the_full_app_secret_set() {
+        // The deploy copies the job's secret refs onto the app. A job with
+        // only the database URL would deploy an app with no signing secret.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        let job = content
+            .split("resource \"azurerm_container_app_job\" \"migrate\"")
+            .nth(1)
+            .expect("main.tf must declare the migration job");
+        for secret in [
+            "azurerm_key_vault_secret.database_url.id",
+            "azurerm_key_vault_secret.signing_secret.id",
+            "azurerm_key_vault_secret.redis_url[0].id",
+        ] {
+            assert!(job.contains(secret), "the migration job must reference {secret}: {job}");
+        }
+        assert!(
+            job.contains("manual_trigger_config"),
+            "the job must run only when CI starts it: {job}"
+        );
+    }
+
+    #[test]
+    fn azure_deploy_attaches_identity_and_secrets_only_at_cutover() {
+        // #2314: the workflow attaches the identity, registry and secret refs
+        // in the deploy step, after migrations, before the image swap.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+
+        let order = [
+            "az containerapp job start",
+            "az containerapp job show",
+            "az containerapp identity assign",
+            "az containerapp registry set",
+            "az containerapp secret set",
+            "az containerapp update \\",
+            "az containerapp ingress enable",
+        ];
+        let positions: Vec<usize> = order
+            .iter()
+            .map(|step| {
+                workflow
+                    .find(step)
+                    .unwrap_or_else(|| panic!("workflow must run `{step}`: {workflow}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "the cutover must run in this order: {order:?}: {workflow}"
+        );
+        for env in [
+            "AUTUMN_DATABASE__PRIMARY_URL=secretref:database-url",
+            "AUTUMN_SECURITY__SIGNING_SECRET=secretref:signing-secret",
+            "AUTUMN_CACHE__REDIS__URL=secretref:redis-url",
+            "--remove-env-vars AUTUMN_CACHE__BACKEND AUTUMN_CACHE__REDIS__URL",
+        ] {
+            assert!(workflow.contains(env), "the cutover must handle `{env}`: {workflow}");
+        }
+        assert!(
+            workflow.contains("keyvaultref:") && workflow.contains("identityref:"),
+            "secrets must stay Key Vault references, never plain values: {workflow}"
+        );
+    }
+
     #[test]
     fn variables_tf_marks_secret_inputs_sensitive_with_no_default() {
         let tmp = TempDir::new().unwrap();

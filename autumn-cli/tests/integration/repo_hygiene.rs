@@ -1803,6 +1803,45 @@ fn deployment_guide_references_build_and_boot_gate() {
     );
 }
 
+#[test]
+fn azure_walkthrough_attaches_secrets_only_at_cutover() {
+    // #2314: the manual Azure cutover must attach the identity and secret
+    // refs that main.tf keeps off the bootstrap app, before the image swap.
+    let doc_path = workspace_root().join("docs/guide/deployment.md");
+    let doc = std::fs::read_to_string(&doc_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", doc_path.display()));
+    let azure = doc
+        .split("## Deploy to Azure Container Apps")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("deployment.md must have an Azure Container Apps section");
+
+    let order = [
+        "az containerapp job show",
+        "az containerapp identity assign",
+        "az containerapp registry set",
+        "az containerapp secret set",
+        "az containerapp update \\",
+        "az containerapp ingress enable",
+    ];
+    let positions: Vec<usize> = order
+        .iter()
+        .map(|step| {
+            azure
+                .find(step)
+                .unwrap_or_else(|| panic!("the Azure walkthrough must run `{step}`"))
+        })
+        .collect();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "the Azure walkthrough must run these in order: {order:?}"
+    );
+    assert!(
+        azure.contains("AUTUMN_SECURITY__SIGNING_SECRET=secretref:signing-secret"),
+        "the Azure walkthrough must wire the signing secret at cutover"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Migration guide coverage gate (issue #1588)
 //
