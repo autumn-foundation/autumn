@@ -946,7 +946,13 @@ fn result_sides(ty: &Type) -> Option<Vec<(String, Kind)>> {
         return None;
     };
     let segment = path.path.segments.last()?;
-    if segment.ident != "Result" {
+    // `custom::Result<T, E>` may define its own variants. A `Result<T>`
+    // alias hides its error type.
+    if segment.ident != "Result"
+        || path.qself.is_some()
+        || !std_prefix(&path.path)
+        || generic_types(segment).count() != 2
+    {
         return None;
     }
     let side = |t: Option<&Type>| match t {
@@ -2212,7 +2218,9 @@ impl Analyzer {
             // A loop or labeled block gives its `break` values too. Unlike an
             // `if`, it cannot charge a builder on its own path, so a mix of
             // builders and other futures is not known.
-            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+            Expr::Loop(_)
+            | Expr::Unsafe(_)
+            | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
                 let tails = value_tails(e);
                 let pending = tails.iter().filter(|t| self.is_pending_query(t)).count();
                 (pending == 0 || pending == tails.len())
@@ -2233,7 +2241,9 @@ impl Analyzer {
             Expr::MethodCall(mc) => {
                 is_handle_builder(&mc.method.to_string()) && self.chain_root_is_handle(e)
             }
-            Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
+            Expr::Loop(_)
+            | Expr::Unsafe(_)
+            | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
                 let tails = value_tails(e);
                 !tails.is_empty() && tails.iter().all(|t| self.is_pending_query(t))
             }
@@ -11870,6 +11880,30 @@ mod tests {
                  let mut slot: Option<PgPostRepository> = Some(repo); slot = custom::None; \
                  render(slot); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn only_std_result_has_sides_and_unsafe_builders() {
+        check_handlers(&[
+            (
+                "guard: a user Result type has no known sides",
+                "async fn h(result: custom::Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 if let custom::Result::Ok(repo) = result { let _ = repo.find_all().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a std Result keeps its sides",
+                "async fn h(result: std::result::Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 if let Ok(n) = result { render(n); } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "an unsafe block of a builder costs one when awaited",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = unsafe { repo.scoped() }; pending.await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
