@@ -125,7 +125,7 @@ Both halves are compiled in CI as trybuild fixtures — see
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
 | An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
-| `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported. The receiver must be a database connection (`Db`, `PgConnection`, `state.db()`, the callback's `conn`): on a repository or another value, the callback may run many times |
+| `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported. The receiver must be a database connection (`Db`, `PgConnection`, `state.db()`, `maybe.unwrap()` on an `Option<Db>`, the callback's `conn`): on a repository or another value, the callback may run many times, and its `conn` is a handle |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
 | An `Option`/`Result` combinator closure (`map`, `and_then`, `unwrap_or_else`, …) | counted **once** when the receiver is known to be an `Option` or a `Result`, and `then` on a `bool`; otherwise it may run per element |
 
@@ -176,6 +176,9 @@ The analysis follows the handle through every name that holds it:
     a `Vec` or an array (`repos.iter()`, `repos.first()`, `repos.sort()`) is
     reported, and so is `clone` on any container. Call the slice method on
     `repos.as_slice()` instead.
+  - A handle in an `Option` or a `Result` has only their methods. So
+    `lazy.checkout()` on a `Result<LazyDb, E>` is reported. Call
+    `lazy.expect("…").checkout()` instead.
   - A method or function given a handle may store it: after
     `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. A
     store through a `&mut` alias (`let slot = &mut list; slot.push(repo);`)
@@ -190,7 +193,8 @@ The analysis follows the handle through every name that holds it:
   - `map_or`, `map_or_else`, `fold` and `try_fold` give only what their
     default and callback give: `Some(repo).map_or(0, |_| 1)` is plain. A
     callback on a `Result` parameter gets only its side: in
-    `result.map_err(|e| …)`, `e` is the error, not the handle.
+    `result.map_err(|e| …)`, `e` is the error, not the handle. `result.ok()`
+    and `result.err()` also give only their side.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
     `Option<Vec<…>>`, `[ctx]`, `repos.chunks(2)`, or
     `repos.iter().map(|r| Ctx { repo: r })`) keeps that shape for all its

@@ -928,6 +928,8 @@ impl Shape {
             }
             "ok_or" | "ok_or_else" => Some(Self::Res),
             _ if self.option_of_part(method) => Some(Self::Opt),
+            // A part has its own shape: `slot.insert(repo)`, `maybe.unwrap()`.
+            _ if ELEMENT_METHODS.contains(&method) => None,
             "to_vec" => Some(Self::Vec),
             "as_slice" | "as_mut_slice" => Some(Self::Slice),
             "collect" => None,
@@ -1013,6 +1015,35 @@ fn type_shape(ty: &Type) -> Option<Shape> {
         _ => None,
     }
 }
+
+/// The shape of a part of the wrapper type `ty`: `Db` for `Option<Db>`.
+fn type_inner_shape(ty: &Type) -> Option<Shape> {
+    match ty {
+        Type::Reference(r) => type_inner_shape(&r.elem),
+        Type::Paren(p) => type_inner_shape(&p.elem),
+        Type::Group(g) => type_inner_shape(&g.elem),
+        Type::Path(path) => {
+            let segment = path.path.segments.last()?;
+            let first = generic_types(segment).next()?;
+            if SMART_POINTERS.contains(&segment.ident.to_string().as_str()) {
+                type_inner_shape(first)
+            } else {
+                type_shape(first)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Methods on an `Option` or a `Result` that give its part.
+const UNWRAP_METHODS: &[&str] = &[
+    "unwrap",
+    "expect",
+    "unwrap_unchecked",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+];
 
 /// Methods that store an argument in their receiver as a part.
 const STORE_METHODS: &[&str] = &[
@@ -1423,6 +1454,8 @@ struct Binding {
     /// pending = PgPostRepository::new(&mut db);`. An `async fn new` can run
     /// queries, so `pending.await` is reported.
     deferred: bool,
+    /// The shape of a part, when known: a part of an `Option<Db>` is a `Db`.
+    inner: Option<Shape>,
 }
 
 impl Binding {
@@ -1433,6 +1466,7 @@ impl Binding {
             shape: None,
             referent: None,
             deferred: false,
+            inner: None,
         }
     }
 
@@ -1473,6 +1507,11 @@ impl Binding {
             shape,
             referent: self.referent.clone().or_else(|| other.referent.clone()),
             deferred: self.deferred || other.deferred,
+            inner: if self.inner == other.inner {
+                self.inner
+            } else {
+                None
+            },
         }
     }
 }
@@ -1787,6 +1826,9 @@ impl Analyzer {
                 if let Pat::Ident(id) = &*typed.pat {
                     let name = id.ident.to_string();
                     analyzer.env.set_shape(&name, type_shape(&typed.ty));
+                    let mut binding = analyzer.env.binding(&name);
+                    binding.inner = type_inner_shape(&typed.ty);
+                    analyzer.env.declare(name.clone(), binding);
                     // A `Result` records each side: `Err(e)` on a
                     // `Result<Repo, Error>` is not a handle.
                     if let Some(sides) = result_sides(&typed.ty) {
@@ -1989,6 +2031,7 @@ impl Analyzer {
             shape: self.shape_of(init),
             referent: self.referent_of(init),
             deferred: self.is_deferred(init),
+            inner: path_ident(peel_parens(init)).and_then(|name| self.env.binding(&name).inner),
         }
     }
 
@@ -2869,8 +2912,15 @@ impl Analyzer {
     /// `repos.refresh_all()`), or any method on a user struct that holds one,
     /// may query through them.
     fn opaque_container_method(&self, methods: &[&ExprMethodCall]) -> Option<Cost> {
+        // A handle in an `Option` or a `Result` (`Result<LazyDb, E>`) has only
+        // their methods: any other comes from an extension trait.
         let unknown = methods.iter().find(|m| {
-            self.expr_is_carrier(&m.receiver)
+            (self.expr_is_carrier(&m.receiver)
+                || (self.expr_is_handle(&m.receiver)
+                    && matches!(
+                        self.shape_of(&m.receiver),
+                        Some(Shape::Opt | Shape::OptRef | Shape::Res)
+                    )))
                 && !self.known_container_method(&m.receiver, &m.method.to_string())
         })?;
         Some(Cost::unbounded(
@@ -2910,6 +2960,12 @@ impl Analyzer {
         } else if self.expr_is_nested(&method.receiver) || self.expr_is_holder(&method.receiver) {
             Kind::Nested
         } else if self.expr_is_carrier(&method.receiver) {
+            Kind::Handle
+        } else if TRANSACTION_METHODS.contains(&name.as_str())
+            && self.expr_is_handle(&method.receiver)
+        {
+            // `repo.tx(|conn| …)` on a repository may hand its callback a
+            // connection, maybe many times.
             Kind::Handle
         } else {
             Kind::Plain
@@ -3157,7 +3213,11 @@ impl Analyzer {
             // `self.db`, `state.conn`: a connection accessor.
             Expr::Field(f) if member_is_db_accessor(&f.member) => Some(Shape::Db),
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.shape_of(&u.expr),
-            Expr::Try(t) => self.shape_of(&t.expr).filter(|s| *s == Shape::Db),
+            // `res?` on a `Result<Db, E>` gives a `Db`.
+            Expr::Try(t) => self
+                .shape_of(&t.expr)
+                .filter(|s| *s == Shape::Db)
+                .or_else(|| self.inner_shape(&t.expr)),
             Expr::Await(a) => self.shape_of(&a.base).filter(|s| *s == Shape::Db),
             Expr::Reference(r) => self.shape_of(&r.expr),
             Expr::Paren(p) => self.shape_of(&p.expr),
@@ -3214,6 +3274,15 @@ impl Analyzer {
                 {
                     return Some(Shape::Db);
                 }
+                // `maybe.unwrap()` on an `Option<Db>` gives a `Db`.
+                if UNWRAP_METHODS.contains(&method.as_str())
+                    && matches!(
+                        self.shape_of(&mc.receiver),
+                        Some(Shape::Opt | Shape::OptRef | Shape::Res)
+                    )
+                {
+                    return self.inner_shape(&mc.receiver);
+                }
                 if method == "collect" {
                     // `collect::<Vec<_>>()` names its shape.
                     return mc.turbofish.as_ref().and_then(|t| {
@@ -3227,6 +3296,11 @@ impl Analyzer {
             }
             _ => None,
         }
+    }
+
+    /// The shape of a part of the named wrapper `e`, when it is known.
+    fn inner_shape(&self, e: &Expr) -> Option<Shape> {
+        self.env.binding(&path_ident(peel_parens(e))?).inner
     }
 
     /// Is `method` a known method of the standard container `receiver`? Not
@@ -3458,6 +3532,22 @@ impl Analyzer {
             Expr::Paren(p) => self.produced(&p.expr),
             Expr::Group(g) => self.produced(&g.expr),
             Expr::Call(call) => self.invoked(call, false),
+            // `result.err()` on a `Result` with known sides: an `Option` of
+            // that side.
+            Expr::MethodCall(mc)
+                if matches!(mc.method.to_string().as_str(), "ok" | "err")
+                    && self.shape_of(&mc.receiver) == Some(Shape::Res) =>
+            {
+                let side = if mc.method == "ok" { "Ok" } else { "Err" };
+                let kind = self
+                    .env
+                    .part(&path_ident(peel_parens(&mc.receiver))?, side)?;
+                Some(match kind {
+                    Kind::Plain => Kind::Plain,
+                    Kind::Handle | Kind::LazyDb => Kind::Carrier,
+                    Kind::Carrier | Kind::Holder | Kind::Nested => Kind::Nested,
+                })
+            }
             Expr::Await(a) => match peel_parens(&a.base) {
                 // `pending.await` on `let pending = Repo::new(&mut db);`.
                 base @ Expr::Path(_) if self.is_deferred(base) => Some(Kind::Handle),
@@ -8727,6 +8817,60 @@ mod tests {
                 "guard: a constructor that is not awaited is free",
                 "async fn h(db: Db) -> AutumnResult<usize> { \
                  let repo = PgPostRepository::new(db); let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn wrapped_connections_and_result_sides() {
+        check_handlers(&[
+            (
+                "checkout on a Result of LazyDb is opaque",
+                "async fn h(lazy: Result<LazyDb, Error>) -> AutumnResult<usize> { \
+                 let c = lazy.checkout().await; let _ = c; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "checkout on an Option of LazyDb is opaque",
+                "async fn h(lazy: Option<LazyDb>) -> AutumnResult<usize> { \
+                 let c = lazy.checkout().await; let _ = c; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: checkout after expect is free",
+                "async fn h(lazy: Result<LazyDb, Error>) -> AutumnResult<usize> { \
+                 let db = lazy.expect(\"db\").checkout().await?; let _ = db; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a Db unwrapped from an Option is a connection",
+                "async fn h(maybe: Option<Db>) -> AutumnResult<usize> { \
+                 let db = maybe.unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "a Db taken from a Result with ? is a connection",
+                "async fn h(res: Result<Db, Error>) -> AutumnResult<usize> { \
+                 let db = res?; let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "tx on a repository may hand its callback a connection",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let _ = repo.tx(|conn| conn.find_all()).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "err takes the error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let e = result.err().unwrap(); render(&e); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: ok takes the value side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.ok().unwrap().find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
