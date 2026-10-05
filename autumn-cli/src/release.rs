@@ -3271,6 +3271,19 @@ case "$1 $2" in
     secrets="$(secret database-url),$(secret signing-secret)"
     [ -n "$STUB_REDIS" ] && secrets="$secrets,$(secret redis-url)"
     [ -n "$STUB_JOB_NO_SECRETS" ] && secrets=""
+    # An inline secret that the operator added: job show omits its value,
+    # and `job secret list --show-values` returns it.
+    if [ -n "$STUB_JOB_INLINE_SECRET" ]; then
+      if [ "$3" = secret ]; then
+        secrets="$secrets,{\"name\":\"api-token\",\"value\":\"tok\"}"
+      else
+        secrets="$secrets,{\"name\":\"api-token\"}"
+      fi
+    fi
+    if [ "$3" = secret ]; then
+      echo "[$secrets]"
+      exit 0
+    fi
     registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
     # An operator-added registry listed before the ACR.
     [ -n "$STUB_JOB_EXTRA_REGISTRY" ] && registries="{\"server\":\"other.example.io\",\"identity\":\"/other-id\"},$registries"
@@ -3530,6 +3543,7 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_JOB_INLINE_SECRET")
             .env_remove("STUB_ACTIVE_SCALE_REF")
             .env_remove("STUB_ACTIVE_BOTH")
             .env_remove("STUB_INGRESS_NONE")
@@ -3940,6 +3954,53 @@ esac
             .unwrap_or_else(|| panic!("the script must open ingress: {calls}"));
         let curl_at = calls.find("curl ").expect("a wake request");
         assert!(open_at < curl_at, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_the_value_of_an_inline_job_secret() {
+        // `job show` omits secret values. The PATCH replaces the secrets
+        // array, so an inline job secret must keep its value.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_JOB_INLINE_SECRET", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("az containerapp job secret list"), "{calls}");
+        assert!(
+            bodies.contains(r#"{"name":"api-token","value":"tok"}"#),
+            "{bodies}"
+        );
+        // The value never goes on a command line.
+        assert!(!calls.contains("tok\""), "{calls}");
+    }
+
+    #[test]
+    fn azure_sidecars_in_main_tf_do_not_refer_to_managed_secrets() {
+        // Terraform does not manage the app's secrets, and --without-redis
+        // removes redis-url. A sidecar env var in main.tf that refers to one
+        // would come back on the next terraform apply.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            main_tf.contains("A sidecar in this file must not refer to"),
+            "{main_tf}"
+        );
+        let docs = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/guide/deployment.md"),
+        )
+        .unwrap();
+        assert!(
+            docs.contains("remove that env var from `main.tf` first"),
+            "the Redis off steps must cover a sidecar ref in main.tf"
+        );
     }
 
     #[cfg(unix)]
