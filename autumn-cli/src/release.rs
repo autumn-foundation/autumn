@@ -3239,6 +3239,8 @@ case "$1 $2" in
       # A placeholder app made by the old template has the job's credentials.
       legacy=""
       [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
+      # An identity that the operator added to the placeholder.
+      [ -n "$STUB_APP_OWN_IDENTITY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"/other\":{\"principalId\":\"o\"}}},"
       registries=""
       [ -n "$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_NO_REGISTRY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
       secrets=""
@@ -3363,6 +3365,7 @@ esac
             .env_remove("STUB_APP_LEGACY")
             .env_remove("STUB_APP_REDIS")
             .env_remove("STUB_APP_NO_REGISTRY")
+            .env_remove("STUB_APP_OWN_IDENTITY")
             .env_remove("STUB_PATCH_PENDING");
         if !args.is_empty() {
             command.env_remove("IMAGE_TAG");
@@ -3778,6 +3781,34 @@ esac
         };
         assert!(!status.success(), "{calls}");
         assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rollback_removes_the_job_identity_next_to_an_own_one() {
+        // The pre-cutover app has only its own identity. Merge-patch keeps
+        // an omitted key, so the rollback must set the job identity to null.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[("STUB_APP_OWN_IDENTITY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let rollback = bodies.lines().last().unwrap_or_default();
+        assert!(
+            rollback.contains(
+                "\"/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id\":null"
+            ),
+            "the rollback must remove the job identity: {rollback}"
+        );
+        assert!(
+            rollback.contains("\"/other\":{}"),
+            "the rollback must keep the own identity: {rollback}"
+        );
     }
 
     #[cfg(unix)]
