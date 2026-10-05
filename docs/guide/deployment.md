@@ -1673,9 +1673,10 @@ The command emits three files at the project root:
 > recompile what changed), installs `libpq`, `tini`, and `ca-certificates` in the
 > slim runtime, copies compiled Tailwind assets from `static/`, leaves
 > migrations to an explicit primary-role job, and wires the `/live` liveness
-> probe as the container `HEALTHCHECK`. An orchestrator that acts on health
-> status (Docker Swarm, for example) replaces an unhealthy container, so the
-> check uses `/live`, not `/ready`.
+> probe as the container `HEALTHCHECK`. Plain Docker and Compose only mark a
+> failed container `unhealthy`. An orchestrator that acts on health status
+> (Docker Swarm, for example) replaces it, so the check uses `/live`, not
+> `/ready`.
 
 ---
 
