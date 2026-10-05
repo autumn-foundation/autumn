@@ -118,6 +118,15 @@ if jq -e 'any(.[]; .name == "redis-url")' "$APP_SECRETS" > /dev/null \
   && ! jq -e 'index("redis-url")' <<< "$JOB_SECRET_NAMES" > /dev/null; then
   STALE_REDIS=1
 fi
+# The cutover removes redis-url from every env var. A scale rule or a volume
+# can also refer to it, and the script cannot remove that ref without
+# changing what the app does, so it stops before any write.
+if [ "$MODE" = cutover ] && [ -n "$STALE_REDIS" ] \
+  && jq -e '.properties.template | (.containers |= map(del(.env)))
+            | [.. | objects | .secretRef? // empty] | index("redis-url")' <<< "$APP" > /dev/null; then
+  echo "::error::a scale rule or volume of $AZURE_APP_NAME uses redis-url. Remove that reference, then run the script again." >&2
+  exit 1
+fi
 
 # A PATCH can return 202 Accepted, and a GET can still show the old state.
 # So the script reads the app until it shows the change. These checks use
@@ -215,26 +224,40 @@ remove_credentials() {
     echo "::error::a scale rule or volume of $AZURE_APP_NAME uses a managed secret. Remove that reference, then run the script again." >&2
     return 1
   fi
-  if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null; then
+  # Stage 1 runs when the desired template or the active revision refers to
+  # a managed secret. If only the active revision does, an earlier run sent
+  # the stage 1 PATCH already: the script waits for that revision instead.
+  if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null \
+    || jq -e '[.. | objects | .secretRef? // empty]
+              | any(IN("database-url", "signing-secret", "redis-url"))' <<< "$source" > /dev/null; then
     status=$(az containerapp show \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
       --query "[[properties.provisioningState, properties.latestRevisionName]]" \
       --output tsv) || return 1
     read -r _ latest <<< "$status"
-    body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" '
-      {location: $app.location, properties: {template: {containers: $containers}}}')
-    patch_app "$body" || return 1
-    revision=""
+    revision="$latest"
+    if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null; then
+      body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" '
+        {location: $app.location, properties: {template: {containers: $containers}}}')
+      patch_app "$body" || return 1
+      revision=""
+    fi
+    state=""
     for _ in $(seq 1 30); do
-      sleep 10
-      status=$(az containerapp show \
-        --name "$AZURE_APP_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" \
-        --query "[[properties.provisioningState, properties.latestRevisionName]]" \
-        --output tsv) || return 1
-      read -r state revision <<< "$status"
-      [ "$state" = Succeeded ] && [ -n "$revision" ] && [ "$revision" != "$latest" ] || continue
+      if [ -z "$revision" ]; then
+        sleep 10
+        status=$(az containerapp show \
+          --name "$AZURE_APP_NAME" \
+          --resource-group "$AZURE_RESOURCE_GROUP" \
+          --query "[[properties.provisioningState, properties.latestRevisionName]]" \
+          --output tsv) || return 1
+        read -r state revision <<< "$status"
+        if [ "$state" != Succeeded ] || [ -z "$revision" ] || [ "$revision" = "$latest" ]; then
+          revision=""
+          continue
+        fi
+      fi
       state=$(az containerapp revision show \
         --name "$AZURE_APP_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -245,6 +268,7 @@ remove_credentials() {
         Provisioned) break ;;
         Failed) return 1 ;;
       esac
+      sleep 10
     done
     [ "$state" = Provisioned ] || return 1
     # Wait until no other revision is active. The latest revision before
@@ -356,13 +380,18 @@ fi
 # env keeps the variables that this script does not set, and replaces the
 # four that it sets. This JSON has no secret values.
 CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAGE" '
-  ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
-    {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
-   + if any(($job.properties.configuration.secrets // [])[]; .name == "redis-url")
-     then [{name: "AUTUMN_CACHE__BACKEND", value: "redis"},
-           {name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}]
-     else [] end) as $env
+  any(($job.properties.configuration.secrets // [])[]; .name == "redis-url") as $redis
+  | ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
+      {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
+     + if $redis
+       then [{name: "AUTUMN_CACHE__BACKEND", value: "redis"},
+             {name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}]
+       else [] end) as $env
   | $app.properties.template.containers
+  # Without Redis, no env var in any container may refer to redis-url.
+  | (if $redis then . else
+       map(if .env then .env = [.env[] | select(.secretRef != "redis-url")] else . end)
+     end)
   | [(.[0]
       | .image = $image
       | .env = ([(.env // [])[] | select(.name | IN(
