@@ -301,16 +301,26 @@ fn model_using_comments_table(project_root: &Path) -> Option<std::path::PathBuf>
         }
     }
     files.sort();
-    let needle = format!("schema::{COMMENTS_TABLE}");
     files.into_iter().find(|file| {
-        std::fs::read_to_string(file).is_ok_and(|source| {
-            let code = strip_rust_comments_and_literals(&source);
-            // A binding ends the path: `use crate::schema::comments;`. A path
-            // that goes on (`schema::comments::table`) only reads the table.
-            code.match_indices(&needle).any(|(at, _)| {
-                let rest = &code[at + needle.len()..];
-                !rest.starts_with(is_ident_char) && !rest.trim_start().starts_with("::")
-            })
+        std::fs::read_to_string(file)
+            .is_ok_and(|source| binds_comments_table(&strip_rust_comments_and_literals(&source)))
+    })
+}
+
+/// Whether `code` binds the `comments` table: `schema::comments` that ends
+/// the path, or a `comments` entry of a grouped `schema::{…}` import. A path
+/// that goes on (`schema::comments::table`) only reads the table.
+fn binds_comments_table(code: &str) -> bool {
+    code.match_indices("schema::").any(|(at, prefix)| {
+        let after = &code[at + prefix.len()..];
+        if let Some(group) = after.strip_prefix('{') {
+            let group = group.split('}').next().unwrap_or_default();
+            return group
+                .split(',')
+                .any(|entry| entry.split_whitespace().next() == Some(COMMENTS_TABLE));
+        }
+        after.strip_prefix(COMMENTS_TABLE).is_some_and(|rest| {
+            !rest.starts_with(is_ident_char) && !rest.trim_start().starts_with("::")
         })
     })
 }
@@ -461,8 +471,8 @@ enum TableEvent {
     Add(TableRef, &'static str),
     /// `ALTER TABLE name DROP COLUMN <column>` (or a rename away).
     Remove(TableRef, &'static str),
-    /// `DROP TABLE name`.
-    Drop(TableRef),
+    /// `DROP TABLE name`. The flag is `IF EXISTS`: then no table is fine.
+    Drop(TableRef, bool),
     /// `ALTER TABLE old RENAME TO new`: the record moves with the table, so a
     /// rename INTO `comments` carries the source table's columns across.
     Rename { from: TableRef, to: TableRef },
@@ -491,8 +501,9 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
 /// The end state of a replay.
 struct Replay {
     tables: HashMap<TableRef, TableState>,
-    /// Tables that an `ALTER` or a rename touched while they did not exist. A
-    /// real `migrate` stops on that statement (#2283).
+    /// Tables that an `ALTER`, a rename, or a `DROP` without `IF EXISTS`
+    /// touched while they did not exist. A real `migrate` stops on that
+    /// statement (#2283).
     touched_while_absent: std::collections::HashSet<TableRef>,
 }
 
@@ -510,9 +521,9 @@ fn replay(files: &[String]) -> Replay {
                 .collect();
             events.push((at, TableEvent::Create(table, columns, if_not_exists)));
         }
-        for (at, dropped) in drop_tables(sql) {
+        for (at, dropped, if_exists) in drop_tables(sql) {
             for table in dropped {
-                events.push((at, TableEvent::Drop(table)));
+                events.push((at, TableEvent::Drop(table, if_exists)));
             }
         }
         for (at, table, statement) in alter_tables(sql) {
@@ -570,7 +581,10 @@ fn replay(files: &[String]) -> Replay {
                         state.columns.retain(|held| *held != column);
                     }
                 }
-                TableEvent::Drop(table) => {
+                TableEvent::Drop(table, if_exists) => {
+                    if !if_exists && !tables.get(&table).is_some_and(|state| state.exists) {
+                        touched_while_absent.insert(table.clone());
+                    }
                     let state = tables.entry(table).or_default();
                     state.exists = false;
                     state.columns.clear();
@@ -797,7 +811,7 @@ fn create_table_body(sql: &str, from: usize) -> Option<&str> {
 /// kept a table the database no longer has, the next scaffold skipped creating
 /// it, and every generated helper queried a missing relation — silently, until
 /// the first request.
-fn drop_tables(sql: &str) -> Vec<(usize, Vec<TableRef>)> {
+fn drop_tables(sql: &str) -> Vec<(usize, Vec<TableRef>, bool)> {
     let mut found = Vec::new();
     let mut base = 0usize;
     while let Some(at) = sql[base..].find("drop table") {
@@ -822,7 +836,9 @@ fn drop_tables(sql: &str) -> Vec<(usize, Vec<TableRef>)> {
             })
             .collect();
         if !tables.is_empty() {
-            found.push((start, tables));
+            // The pipeline lowercases unquoted SQL, so one spelling matches.
+            let if_exists = statement.trim_start().starts_with("if exists");
+            found.push((start, tables, if_exists));
         }
     }
     found
@@ -3566,5 +3582,55 @@ mod tests {
             model_using_comments_table(tmp.path()),
             Some(src.join("models").join("comment.rs"))
         );
+    }
+
+    /// Without the candidate, a later plain `DROP TABLE comments` runs on no
+    /// table and a fresh `migrate` stops there.
+    #[test]
+    fn a_migration_a_later_drop_needs_is_still_needed() {
+        let ours = up_sql(DatabaseBackend::Postgres);
+        let migrations = |drop: &str| {
+            project_with(&[
+                (
+                    "0001_create_comments",
+                    "CREATE TABLE comments (id BIGINT, body TEXT);\n",
+                ),
+                ("0002_drop", drop),
+                ("0003_create_comments", &ours),
+            ])
+        };
+        let tmp = migrations("DROP TABLE comments;\n");
+        let plain = tmp.path().join("migrations").join("0001_create_comments");
+        assert!(comments_migration_still_needed(tmp.path(), &plain, &[]));
+
+        // `IF EXISTS` runs fine on no table, so the candidate is not needed.
+        let tmp = migrations("DROP TABLE IF EXISTS comments;\n");
+        let plain = tmp.path().join("migrations").join("0001_create_comments");
+        assert!(!comments_migration_still_needed(tmp.path(), &plain, &[]));
+    }
+
+    /// A grouped import binds the table too, as in the single-file layout.
+    #[test]
+    fn a_grouped_schema_import_marks_a_model_as_using_comments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        std::fs::write(
+            src.join("models.rs"),
+            "use crate::schema::{posts, comments as c};\n",
+        )
+        .expect("write");
+        assert_eq!(
+            model_using_comments_table(tmp.path()),
+            Some(src.join("models.rs"))
+        );
+
+        // A grouped read path is not a binding.
+        std::fs::write(
+            src.join("models.rs"),
+            "use crate::schema::{posts, comments::dsl};\n",
+        )
+        .expect("write");
+        assert_eq!(model_using_comments_table(tmp.path()), None);
     }
 }
