@@ -31,7 +31,7 @@ use testcontainers_modules::postgres::Postgres;
 
 /// The migration Autumn ships, applied as is.
 const IDEMPOTENCY_UP: &str =
-    include_str!("../../migrations/20261005000000_create_idempotency_keys/up.sql");
+    include_str!("../../migrations/20261005200000_create_idempotency_keys/up.sql");
 
 const PAYMENTS_UP: &str =
     "CREATE TABLE idem_payments (id BIGSERIAL PRIMARY KEY, amount BIGINT NOT NULL)";
