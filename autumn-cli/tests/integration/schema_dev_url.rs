@@ -134,6 +134,24 @@ async fn start_postgres() -> (
     (container, url)
 }
 
+/// The scratch databases left on the server (there must be none).
+fn scratch_databases(url: &str) -> Vec<String> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+    let mut conn = PgConnection::establish(url).expect("connect");
+    diesel::sql_query(
+        "SELECT datname AS name FROM pg_database WHERE datname LIKE 'autumn\\_replay\\_%'",
+    )
+    .load::<Row>(&mut conn)
+    .expect("list databases")
+    .into_iter()
+    .map(|r| r.name)
+    .collect()
+}
+
 fn public_tables(url: &str) -> Vec<String> {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -154,8 +172,13 @@ fn public_tables(url: &str) -> Vec<String> {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn schema_dev_url_diffs_against_the_replay_and_leaves_the_database_empty() {
+async fn schema_dev_url_diffs_against_the_replay_and_leaves_the_database_alone() {
     let (_container, url) = start_postgres().await;
+    // A table already in the dev database: the replay neither sees nor changes it.
+    let mut conn = PgConnection::establish(&url).expect("connect");
+    diesel::sql_query("CREATE TABLE sentinel (id BIGINT PRIMARY KEY)")
+        .execute(&mut conn)
+        .expect("create");
     let root = project_with_initial_migration();
     let dir = root.path();
     // A tool-made project: the replay matches the snapshot, so no warning.
@@ -175,7 +198,11 @@ async fn schema_dev_url_diffs_against_the_replay_and_leaves_the_database_empty()
     );
     assert!(out.contains("1 change(s)"), "{out}");
     assert!(out.contains("ADD COLUMN posts.body"), "{out}");
-    assert!(public_tables(&url).is_empty(), "the replay must roll back");
+    assert_eq!(public_tables(&url), vec!["sentinel".to_owned()]);
+    assert!(
+        scratch_databases(&url).is_empty(),
+        "the scratch database is dropped"
+    );
 
     // --write-migration writes the delta and creates the snapshot.
     run_ok(
@@ -203,31 +230,42 @@ async fn schema_dev_url_diffs_against_the_replay_and_leaves_the_database_empty()
         &["schema", "diff", "--backend", "pg", "--dev-url", &url],
     );
     assert!(out.contains("No schema changes"), "{out}");
-    assert!(public_tables(&url).is_empty(), "the replay must roll back");
+    assert_eq!(public_tables(&url), vec!["sentinel".to_owned()]);
+    assert!(
+        scratch_databases(&url).is_empty(),
+        "the scratch database is dropped"
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn schema_dev_url_refuses_a_database_that_is_not_empty() {
+async fn schema_dev_url_replays_migrations_that_need_no_transaction() {
     let (_container, url) = start_postgres().await;
-    let mut conn = PgConnection::establish(&url).expect("connect");
-    // A table outside `public` counts too.
-    for sql in [
-        "CREATE SCHEMA app",
-        "CREATE TABLE app.leftover (id BIGINT PRIMARY KEY)",
-    ] {
-        diesel::sql_query(sql).execute(&mut conn).expect("create");
-    }
     let root = project_with_initial_migration();
+    let dir = root.path();
+    let raw = dir.join("migrations/2099-01-01-000000_concurrent");
+    std::fs::create_dir_all(&raw).expect("mkdir");
+    std::fs::write(
+        raw.join("up.sql"),
+        "CREATE INDEX CONCURRENTLY idx_posts_title_c ON posts (title);\n",
+    )
+    .expect("up.sql");
+    std::fs::write(raw.join("down.sql"), "DROP INDEX idx_posts_title_c;\n").expect("down.sql");
+    std::fs::write(raw.join("metadata.toml"), "run_in_transaction = false\n").expect("metadata");
 
-    let (_, err, code) = run_autumn(
-        root.path(),
+    // The replay applies it like a real migrate and sees the index.
+    let (out, _) = run_ok(
+        dir,
         &["schema", "diff", "--backend", "pg", "--dev-url", &url],
     );
-    assert_ne!(code, Some(0));
+    assert!(out.contains("DROP INDEX idx_posts_title_c"), "{out}");
     assert!(
-        err.contains("not empty") && err.contains("app.leftover"),
-        "{err}"
+        public_tables(&url).is_empty(),
+        "the dev database is not changed"
+    );
+    assert!(
+        scratch_databases(&url).is_empty(),
+        "the scratch database is dropped"
     );
 }
 

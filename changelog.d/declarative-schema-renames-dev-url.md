@@ -5,9 +5,11 @@
   of a drop plus an add, so the data stays. Convention-named indexes follow
   the rename. An ambiguous hint is refused.
 - **schema:** `autumn schema diff --dev-url <URL>` (issue #1975). The command
-  applies the migrations to an empty dev database in one transaction, reads
-  the schema back, rolls back, and diffs the models against that schema. The
-  snapshot becomes optional. `AUTUMN_DEV_URL` can hold the URL.
+  applies the migrations to a scratch database (Postgres: created on the
+  server of the URL and dropped after; SQLite: in memory), reads the schema
+  back, and diffs the models against that schema. The database in the URL
+  does not change. The snapshot becomes optional. `AUTUMN_DEV_URL` can hold
+  the URL.
 
 ### Fixed
 

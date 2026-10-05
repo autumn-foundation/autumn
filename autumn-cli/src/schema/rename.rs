@@ -445,13 +445,9 @@ fn split_index_target(def: &str) -> Option<(&str, &str, &str)> {
     let mut start = if upper.starts_with("ALTER TABLE ") {
         "ALTER TABLE ".len()
     } else {
-        // The first `ON` keyword with whitespace on both sides.
-        let bytes = upper.as_bytes();
-        (1..upper.len().saturating_sub(2)).find(|&i| {
-            &upper[i..i + 2] == "ON"
-                && bytes[i - 1].is_ascii_whitespace()
-                && bytes[i + 2].is_ascii_whitespace()
-        })? + 3
+        // The first `ON` keyword with whitespace on both sides, outside any
+        // quoted name (`"logs on status"`).
+        find_on_keyword(def)? + 3
     };
     start += def[start..].len() - def[start..].trim_start().len();
     if upper[start..].starts_with("ONLY ") {
@@ -461,6 +457,35 @@ fn split_index_target(def: &str) -> Option<(&str, &str, &str)> {
         .find(|c: char| c.is_whitespace() || c == '(')
         .unwrap_or(def.len() - start);
     Some((&def[..start], &def[start..start + len], &def[start + len..]))
+}
+
+/// The byte offset of the first `ON` keyword (whitespace on both sides) in
+/// `def` that is not inside a quoted name or a string.
+fn find_on_keyword(def: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < def.len() {
+        let rest = &def[i..];
+        let c = rest.chars().next()?;
+        let close = match c {
+            '\'' | '"' | '`' => Some(c),
+            '[' => Some(']'),
+            _ => None,
+        };
+        if let Some(close) = close {
+            i += quoted_len(rest, close);
+            continue;
+        }
+        let before = def[..i].chars().next_back();
+        let after = rest.get(2..).and_then(|r| r.chars().next());
+        if rest.get(..2).is_some_and(|w| w.eq_ignore_ascii_case("ON"))
+            && before.is_some_and(char::is_whitespace)
+            && after.is_some_and(char::is_whitespace)
+        {
+            return Some(i);
+        }
+        i += c.len_utf8();
+    }
+    None
 }
 
 /// Rename the table in an index definition's `ON` target. The schema prefix
@@ -1336,6 +1361,18 @@ mod tests {
         let err = guard_plan(&diff_schema(&base, &want, OPTS), ALLOW).unwrap_err();
         assert!(matches!(err, DiffError::RenameConflict { .. }), "{err}");
         assert!(err.to_string().contains("articles"), "{err}");
+    }
+
+    #[test]
+    fn on_inside_a_quoted_index_name_is_not_the_target() {
+        assert_eq!(
+            rename_index_target(
+                "CREATE INDEX \"logs on status\" ON articles (status)",
+                "articles",
+                "posts"
+            ),
+            "CREATE INDEX \"logs on status\" ON posts (status)"
+        );
     }
 
     #[test]

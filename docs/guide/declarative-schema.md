@@ -180,15 +180,17 @@ also set the URL in `AUTUMN_DEV_URL`, which keeps the password out of the
 process list.
 
 ```sh
-AUTUMN_DEV_URL=postgres://localhost/myapp_shadow autumn schema diff
+AUTUMN_DEV_URL=postgres://localhost/postgres autumn schema diff
 ```
 
-1. The dev database must be empty. If it has a table or a view in a user
-   schema, the command stops.
-2. The command applies every migration in `migrations/` to it, in one
-   transaction. On Postgres, the migrations write to the `public` schema.
-3. It reads the schema back, and then rolls the transaction back. The dev
-   database stays empty.
+1. On Postgres, the command creates a scratch database on the server of the
+   URL. The role in the URL needs the `CREATEDB` privilege. On SQLite, the
+   command uses an in-memory database; the URL only selects SQLite.
+2. It applies every migration in `migrations/` to the scratch database, as
+   `autumn schema migrate` does. On Postgres, the migrations write to the
+   `public` schema.
+3. It reads the schema back and drops the scratch database. The database in
+   the URL does not change.
 4. It diffs the models against that schema.
 
 Use it when the snapshot cannot see the full schema, for example after a
@@ -202,13 +204,13 @@ hand-written migration or with a `#[belongs_to]` foreign key.
   table.
 - `--write-migration` writes the migration and the snapshot, as usual.
 - The command refuses a new or renamed table or index whose name is already a
-  view, a sequence or another relation in the migrated schema.
+  table, an index, a view, a sequence or another relation in the migrated
+  schema.
 - The URL backend must match the schema backend. A `sqlite:` URL needs a CLI
-  built with `--features sqlite`, and the file must exist.
+  built with `--features sqlite`.
 - The replay applies your migrations only, not the framework migrations.
-- The command refuses a migration with `run_in_transaction = false` or with
-  its own `BEGIN`, `COMMIT`, `END` or `ROLLBACK`. Such a migration can end the
-  replay transaction.
+- A migration with `run_in_transaction = false` (for example
+  `CREATE INDEX CONCURRENTLY`) replays as it applies.
 - Like `schema pull`, the command connects to Postgres without TLS.
 - Errors never show the password. A connection error shows only the host and
   port.

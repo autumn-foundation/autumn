@@ -195,7 +195,7 @@ my-app/
 > and the snapshot. To rename, put `#[renamed_from("old_name")]` on the field,
 > or on the model after `#[model]`. The diff then emits `ALTER TABLE ...
 > RENAME`, not a drop plus an add. To diff against what the migrations really
-> make, pass `--dev-url <empty dev DB>` (or set `AUTUMN_DEV_URL`). See
+> make, pass `--dev-url <dev server URL>` (or set `AUTUMN_DEV_URL`). See
 > `docs/guide/declarative-schema.md`.
 
 ## Cargo.toml

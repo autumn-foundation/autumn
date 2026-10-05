@@ -113,10 +113,11 @@ pub enum SchemaAction {
         /// Permit destructive drops / an independent drop+add (tier-2 guard).
         #[arg(long)]
         allow_destructive: bool,
-        /// Use an empty dev database as the baseline. The command applies the
-        /// migrations to it in one transaction, reads the schema, and rolls
-        /// back. The snapshot becomes optional. Also read from `AUTUMN_DEV_URL`,
-        /// which keeps the password out of the process list.
+        /// Use the migrations, replayed on a scratch database, as the baseline.
+        /// On Postgres the command creates the scratch database on the server
+        /// of URL (the role needs CREATEDB) and drops it after; the database in
+        /// URL does not change. The snapshot becomes optional. Also read from
+        /// `AUTUMN_DEV_URL`, which keeps the password out of the process list.
         #[arg(
             long,
             value_name = "URL",
@@ -889,7 +890,8 @@ fn replay_baseline(
 /// share one namespace, so the migration would fail. Taken names are the
 /// baseline's tables and indexes plus `others` (the non-table relations of a
 /// `--dev-url` replay), less the names the plan frees first: the old name of a
-/// renamed table or index, and an index dropped just before its re-add.
+/// renamed table or index, and an index dropped just before its re-add. Two
+/// targets in the plan with one name collide as well.
 fn relation_clash(
     plan: &MigrationPlan,
     baseline: &[Table],
@@ -923,6 +925,8 @@ fn relation_clash(
                     .iter()
                     .any(|t| t.name == name || t.indexes.iter().any(|i| i.name == name)))
     };
+    // A name that two targets of this plan share collides too.
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     plan.changes.iter().find_map(|c| {
         let names: Vec<&String> = match c {
             // A new table brings its own indexes.
@@ -935,7 +939,9 @@ fn relation_clash(
             }
             _ => return None,
         };
-        let name = names.into_iter().find(|n| taken(n))?;
+        let name = names
+            .into_iter()
+            .find(|n| taken(n) || !seen.insert(n.as_str()))?;
         Some(format!(
             "`{name}` is already a table, index, view, sequence or other relation in \
              the schema; choose another name"
@@ -1491,6 +1497,18 @@ mod tests {
         assert_eq!(
             relation_clash(&plan(vec![add("idx_new")]), &baseline, &none),
             None
+        );
+        // Two targets in one plan cannot share a name either.
+        let twice = plan(vec![
+            SchemaChange::RenameIndex {
+                table: "reports".to_owned(),
+                from: "idx_old".to_owned(),
+                index: Index::new("idx_users_mails", vec!["x".to_owned()], false),
+            },
+            SchemaChange::CreateTable(Table::new("idx_users_mails", Backend::Postgres)),
+        ]);
+        assert!(
+            relation_clash(&twice, &baseline, &none).is_some_and(|e| e.contains("idx_users_mails"))
         );
     }
 
