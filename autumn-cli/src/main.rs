@@ -27,6 +27,7 @@ mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
+mod edge;
 mod edge_scan;
 mod experiments;
 mod export;
@@ -989,6 +990,106 @@ pub enum CapsuleCommands {
     },
 }
 
+/// `autumn edge` subcommands.
+#[derive(Subcommand)]
+pub enum EdgeCommands {
+    /// Run an edge node: the capsule in front of a remote origin.
+    ///
+    /// The node serves each request the capsule can serve. It sends every
+    /// other request (writes, declines, capsule errors) to the origin and
+    /// returns the origin's response. Run it near your users. Keep the
+    /// origin where it is. You write no glue code.
+    ///
+    /// At start, the node copies the origin's static security and CSP
+    /// headers from `GET <probe-path>`, so both lanes send the same headers.
+    /// Set a CORS policy that is the same for every route with
+    /// `--response-header`.
+    /// It stops on Ctrl-C or SIGTERM.
+    ///
+    /// # Examples
+    ///
+    ///   autumn edge serve --origin https://origin.example.com
+    ///   autumn edge serve --origin http://10.0.0.5:3000 --listen 0.0.0.0:8787 --kv kv.json
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Serve {
+        /// The capsule that `autumn build` wrote.
+        #[arg(
+            long,
+            value_name = "WASM",
+            default_value = "target/wasm32-wasip1/release/edge-capsule.wasm"
+        )]
+        capsule: String,
+        /// The origin base URL, for example `https://origin.example.com`.
+        #[arg(long, value_name = "URL")]
+        origin: String,
+        /// The address to listen on.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8787")]
+        listen: String,
+        /// A JSON file with one object of string values. It gives the `kv`
+        /// capability. Without it, a `needs(kv)` route goes to the origin.
+        #[arg(long, value_name = "FILE")]
+        kv: Option<String>,
+        /// The origin path for the header requests at start.
+        #[arg(long, value_name = "PATH", default_value = "/")]
+        probe_path: String,
+        /// Do not send the header requests at start.
+        #[arg(long)]
+        no_probe: bool,
+        /// Also set this header on each edge response. Repeat it.
+        #[arg(long = "response-header", value_name = "NAME: VALUE")]
+        response_headers: Vec<String>,
+        /// Keep the `x-forwarded-*` headers from this peer (an address or a
+        /// CIDR range), for example your TLS terminator. Repeat it.
+        #[arg(long = "trusted-proxy", value_name = "IP|CIDR")]
+        trusted_proxies: Vec<String>,
+        /// Do not write a line for each request.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Measure time to first byte at the edge node and at the origin.
+    ///
+    /// Sends the same GETs to both, compares the bytes of each pair, and
+    /// reports the median and p90 TTFB of each side. Run it from a client
+    /// far from the origin.
+    ///
+    /// Exit codes: 0 pass, 1 a divergence or a reduction below
+    /// `--min-reduction`, 2 an error.
+    ///
+    /// # Examples
+    ///
+    ///   autumn edge ttfb --edge https://edge.example.com --origin https://origin.example.com --path /greet/ada
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Ttfb {
+        /// The edge node base URL.
+        #[arg(long, value_name = "URL")]
+        edge: String,
+        /// The origin base URL.
+        #[arg(long, value_name = "URL")]
+        origin: String,
+        /// A path to request, with a leading `/`. Repeat it.
+        #[arg(long = "path", value_name = "PATH", required = true)]
+        paths: Vec<String>,
+        /// How many times to request each path.
+        #[arg(long, value_name = "N", default_value_t = 100)]
+        rounds: usize,
+        /// The lowest median TTFB reduction, in percent, that passes.
+        #[arg(
+            long,
+            value_name = "PERCENT",
+            default_value_t = 50.0,
+            allow_negative_numbers = true,
+            value_parser = edge::parse_percent
+        )]
+        min_reduction: f64,
+        /// Check the bytes only. Do not fail on the TTFB reduction. Use it
+        /// when the client is near the origin, for example in CI.
+        #[arg(long)]
+        divergence_only: bool,
+    },
+}
+
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
@@ -1535,6 +1636,22 @@ enum Commands {
     Capsule {
         #[command(subcommand)]
         command: CapsuleCommands,
+    },
+    /// Run and measure the edge capsule.
+    ///
+    /// `serve` runs an edge node: the capsule from `autumn build` in front of
+    /// your origin. `ttfb` measures time to first byte at the node and at the
+    /// origin, and checks that both send the same bytes.
+    ///
+    /// # Examples
+    ///
+    ///   autumn edge serve --origin https://origin.example.com
+    ///   autumn edge ttfb --edge http://127.0.0.1:8787 --origin https://origin.example.com --path /
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Edge {
+        #[command(subcommand)]
+        command: EdgeCommands,
     },
     /// Replay a recorded failure capsule against the application.
     ///
@@ -5085,6 +5202,44 @@ fn run_command(command: Commands) {
             model.as_deref(),
             yes_i_mean_prod,
         ),
+        Commands::Edge { command } => match command {
+            EdgeCommands::Serve {
+                capsule,
+                origin,
+                listen,
+                kv,
+                probe_path,
+                no_probe,
+                response_headers,
+                trusted_proxies,
+                quiet,
+            } => edge::serve(&edge::ServeOptions {
+                capsule: &capsule,
+                origin: &origin,
+                listen: &listen,
+                kv: kv.as_deref(),
+                probe_path: &probe_path,
+                no_probe,
+                response_headers: &response_headers,
+                trusted_proxies: &trusted_proxies,
+                quiet,
+            }),
+            EdgeCommands::Ttfb {
+                edge: edge_url,
+                origin,
+                paths,
+                rounds,
+                min_reduction,
+                divergence_only,
+            } => edge::ttfb(&edge::TtfbOptions {
+                edge: &edge_url,
+                origin: &origin,
+                paths: &paths,
+                rounds,
+                min_reduction,
+                divergence_only,
+            }),
+        },
         Commands::Capsule { command } => match command {
             CapsuleCommands::Test {
                 capsule: path,
@@ -7351,6 +7506,136 @@ mod tests {
                 features: None,
                 edge: false,
                 auditable: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_edge_serve() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "edge",
+            "serve",
+            "--origin",
+            "https://origin.example.com",
+            "--response-header",
+            "x-a: 1",
+            "--response-header",
+            "x-b: 2",
+            "--trusted-proxy",
+            "10.0.0.0/8",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Edge {
+                command:
+                    EdgeCommands::Serve {
+                        capsule,
+                        origin,
+                        listen,
+                        kv,
+                        probe_path,
+                        no_probe,
+                        response_headers,
+                        trusted_proxies,
+                        quiet,
+                    },
+            } => {
+                assert_eq!(trusted_proxies, ["10.0.0.0/8"]);
+                assert_eq!(capsule, "target/wasm32-wasip1/release/edge-capsule.wasm");
+                assert_eq!(origin, "https://origin.example.com");
+                assert_eq!(listen, "127.0.0.1:8787");
+                assert_eq!(kv, None);
+                assert_eq!(probe_path, "/");
+                assert!(!no_probe && !quiet);
+                assert_eq!(response_headers, ["x-a: 1", "x-b: 2"]);
+            }
+            _ => panic!("expected edge serve"),
+        }
+    }
+
+    #[test]
+    fn parse_edge_serve_needs_an_origin() {
+        assert!(Cli::try_parse_from(["autumn", "edge", "serve"]).is_err());
+    }
+
+    #[test]
+    fn parse_edge_ttfb() {
+        let cli = Cli::try_parse_from([
+            "autumn", "edge", "ttfb", "--edge", "http://e", "--origin", "http://o", "--path", "/a",
+            "--path", "/b", "--rounds", "7",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Edge {
+                command:
+                    EdgeCommands::Ttfb {
+                        edge,
+                        origin,
+                        paths,
+                        rounds,
+                        min_reduction,
+                        divergence_only,
+                    },
+            } => {
+                assert!(!divergence_only);
+                assert_eq!((edge.as_str(), origin.as_str()), ("http://e", "http://o"));
+                assert_eq!(paths, ["/a", "/b"]);
+                assert_eq!(rounds, 7);
+                assert!((min_reduction - 50.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected edge ttfb"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "edge", "ttfb", "--edge", "e", "--origin", "o"])
+                .is_err(),
+            "--path is required"
+        );
+    }
+
+    #[test]
+    fn parse_edge_ttfb_min_reduction_takes_a_finite_number() {
+        let base = [
+            "autumn", "edge", "ttfb", "--edge", "e", "--origin", "o", "--path", "/a",
+        ];
+        let parse = |value: &str| {
+            let mut args = base.to_vec();
+            args.extend(["--min-reduction", value]);
+            Cli::try_parse_from(args)
+        };
+        match parse("-10").unwrap().command {
+            Commands::Edge {
+                command: EdgeCommands::Ttfb { min_reduction, .. },
+            } => assert!((min_reduction + 10.0).abs() < f64::EPSILON),
+            _ => panic!("expected edge ttfb"),
+        }
+        for bad in ["NaN", "inf", "x"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_edge_ttfb_divergence_only() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "edge",
+            "ttfb",
+            "--edge",
+            "http://e",
+            "--origin",
+            "http://o",
+            "--path",
+            "/a",
+            "--divergence-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Edge {
+                command: EdgeCommands::Ttfb {
+                    divergence_only: true,
+                    ..
+                }
             }
         ));
     }

@@ -6,7 +6,8 @@ into a portable `wasm32-wasip1` artifact and run at a CDN edge, with the origin 
 staying the authority and the fallback.
 
 This crate is deliberately tiny and dependency-light — it is the only Autumn crate that
-compiles for **both** `x86_64` and `wasm32-wasip1`. It never links tokio, hyper, or mio.
+compiles for **both** `x86_64` and `wasm32-wasip1`. A capsule never links tokio, hyper, or
+mio. Only the native `node` feature uses them.
 
 ```toml
 [dependencies]
@@ -27,6 +28,7 @@ autumn-web = { version = "0.8.0", features = ["edge"] }
 | `conformance` | the shared projection + verdict used by the byte-identity test |
 | `host` (feature) | a reference wasmi host with a hand-written WASI shim, for tests |
 | `gateway` (feature `host`) | a reference gateway: the capsule in front of an origin service, fallthrough forwarded |
+| `node` (feature `node`) | the edge node behind `autumn edge serve`: the gateway over HTTP, a remote origin, and a TTFB probe |
 
 See `docs/guide/edge.md` in the Autumn repository for the protocol specification, the
 header contract, and the determinism rules.
