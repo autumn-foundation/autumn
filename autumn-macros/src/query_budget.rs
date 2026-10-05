@@ -1888,11 +1888,27 @@ impl Analyzer {
         self.scoped(|s| {
             let mut flow = Flow::ZERO;
             for stmt in &block.stmts {
+                if flow.fall.is_none() {
+                    // No path reaches this statement. Read it for its
+                    // diagnostics only.
+                    s.unreachable(|s| s.stmt(stmt));
+                    continue;
+                }
                 let next = s.stmt(stmt);
                 flow = flow.then(next);
             }
             flow
         })
+    }
+
+    /// Run `f` on code that never runs: keep its errors, and drop its
+    /// bindings and its ledger entries.
+    fn unreachable<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let (env, ledger) = (self.env.clone(), self.ledger.len());
+        let out = f(self);
+        self.env = env;
+        self.ledger.truncate(ledger);
+        out
     }
 
     fn stmt(&mut self, stmt: &Stmt) -> Flow {
@@ -2309,6 +2325,11 @@ impl Analyzer {
         shape: &LoopShape<'_>,
         mut body: impl FnMut(&mut Self) -> Flow,
     ) -> Flow {
+        if shape.bound == Some(0) {
+            // The body never runs.
+            self.unreachable(|s| s.framed(Target::Loop, shape.label, |s| s.scoped(&mut body)));
+            return Flow::ZERO;
+        }
         let before = self.ledger.len();
         let mut flow =
             self.repeated(|s| s.framed(Target::Loop, shape.label, |s| s.scoped(&mut body)));
@@ -2347,9 +2368,6 @@ impl Analyzer {
     ) -> Cost {
         let again = pass.again.unwrap_or(Cost::ZERO);
         let last = again.clone().or_worst(pass.leave.unwrap_or(Cost::ZERO));
-        if bound == Some(0) {
-            return Cost::ZERO;
-        }
         if again.is_zero() || matches!(last, Cost::Unbounded(_)) {
             return last;
         }
@@ -2359,7 +2377,7 @@ impl Analyzer {
                     write!(entry, " ×{times}").expect("writing to a String cannot fail");
                 }
             }
-            return again.repeated(times - 1).then(last);
+            return again.repeated(times.saturating_sub(1)).then(last);
         }
         let culprit = self.ledger.get(ledger_before).map_or_else(
             || "a declared query cost".to_string(),
@@ -6951,6 +6969,40 @@ mod tests {
                 Expect::Unbounded,
             ),
         ]);
+    }
+
+    #[test]
+    fn code_that_never_runs_binds_nothing() {
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "a loop with a zero literal bound",
+                "let mut slot = None; for _ in 0..0 { slot = Some(&repo); } render(slot);",
+                Expect::Exact(0),
+            ),
+            (
+                "a statement after an unconditional break",
+                "let mut slot = None; for _id in &ids { break; slot = Some(&repo); } render(slot);",
+                Expect::Exact(0),
+            ),
+            (
+                "a statement after a return",
+                "let mut slot = None; if flag { return Ok(0); slot = Some(&repo); } render(slot);",
+                Expect::Exact(0),
+            ),
+            // Guards: code that may run still binds.
+            (
+                "a statement before a conditional break",
+                "let mut slot = None; for _id in &ids { slot = Some(&repo); if flag { break; } } \
+                 render(slot);",
+                Expect::Unbounded,
+            ),
+            (
+                "a loop with a literal bound of one",
+                "let mut slot = None; for _ in 0..1 { slot = Some(&repo); } render(slot);",
+                Expect::Unbounded,
+            ),
+        ];
+        check_cases(cases);
     }
 
     #[test]
