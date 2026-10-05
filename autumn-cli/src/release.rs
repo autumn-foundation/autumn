@@ -3468,7 +3468,15 @@ case "$1 $2" in
     esac
     ;;
   "containerapp secret")
-    if [ -n "$STUB_APP_REDIS" ]; then
+    # An operator secret on the app that uses the job's identity.
+    if [ -n "$STUB_APP_SHARED_SECRET" ]; then
+      shared=",{\"name\":\"ops-key\",\"keyVaultUrl\":\"https://kv/secrets/ops-key\",\"identity\":\"$id\"}"
+      if [ -n "$STUB_APP_LEGACY" ]; then
+        echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}$shared]"
+      else
+        echo "[{\"name\":\"api-key\",\"value\":\"user-value\"}$shared]"
+      fi
+    elif [ -n "$STUB_APP_REDIS" ]; then
       echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"redis-url\",\"keyVaultUrl\":\"https://kv/secrets/redis-url\",\"identity\":\"$id\"}]"
     elif [ -n "$STUB_APP_LEGACY" ]; then
       custom=""
@@ -3545,6 +3553,7 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_APP_SHARED_SECRET",
         "STUB_LATEST",
         "STUB_STATUS_SEQ",
         "STUB_SIDECAR_FIRST",
@@ -4482,6 +4491,35 @@ esac
         assert!(!calls.contains("ingress disable"), "{calls}");
         assert!(!calls.contains("az rest --method patch"), "{calls}");
         assert!(!calls.contains("az tags-patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_an_operator_secret_shares_the_job_identity() {
+        // An operator secret on the app uses the job's identity. Removal
+        // would drop that identity and break the secret, and keeping the
+        // identity would keep vault access on the placeholder. So both a
+        // first cutover (its rollback) and --remove-credentials stop before
+        // any write.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_SHARED_SECRET", "1"), ("STUB_APP_LEGACY", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+        }
     }
 
     #[cfg(unix)]
