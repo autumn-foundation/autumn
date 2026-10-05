@@ -225,7 +225,7 @@ const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Ext
 
 /// Methods whose result is a container of what their callback returns:
 /// `ids.iter().map(|_| &repo)`, `flag.then(|| &repo)`.
-const WRAPPING_CALLBACKS: &[&str] = &["map", "map_err", "then", "then_some"];
+const WRAPPING_CALLBACKS: &[&str] = &["map", "map_err", "then", "then_some", "ok_or", "ok_or_else"];
 
 /// Methods whose result is what their callback returns, or what their other
 /// arguments hold: `fold(init, f)`, `unwrap_or_else(f)`, `find_map(f)`.
@@ -924,6 +924,26 @@ impl Shape {
             _ => Some(self),
         }
     }
+}
+
+/// What each side of a `Result` type holds, as the parts `Ok` and `Err`.
+fn result_sides(ty: &Type) -> Option<Vec<(String, Kind)>> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Result" {
+        return None;
+    }
+    let side = |t: Option<&Type>| match t {
+        Some(t) if type_is_handle_part(t) => Kind::Handle,
+        Some(t) => type_kind(t),
+        None => Kind::Plain,
+    };
+    let mut args = generic_types(segment);
+    let ok = side(args.next());
+    let err = side(args.next());
+    Some(vec![("Ok".to_string(), ok), ("Err".to_string(), err)])
 }
 
 /// The shape of the standard container type `name`.
@@ -1718,9 +1738,15 @@ impl Analyzer {
             if let syn::FnArg::Typed(typed) = arg {
                 analyzer.bind_pat(&typed.pat, type_kind(&typed.ty));
                 if let Pat::Ident(id) = &*typed.pat {
-                    analyzer
-                        .env
-                        .set_shape(&id.ident.to_string(), type_shape(&typed.ty));
+                    let name = id.ident.to_string();
+                    analyzer.env.set_shape(&name, type_shape(&typed.ty));
+                    // A `Result` records each side: `Err(e)` on a
+                    // `Result<Repo, Error>` is not a handle.
+                    if let Some(sides) = result_sides(&typed.ty) {
+                        let mut binding = analyzer.env.binding(&name);
+                        binding.parts = Some(sides);
+                        analyzer.env.declare(name, binding);
+                    }
                 }
             }
         }
@@ -1843,6 +1869,27 @@ impl Analyzer {
                         .part(&name, &member_name(&field.member))
                         .unwrap_or(rest);
                     self.bind_pat(&field.pat, kind);
+                }
+            }
+            // `Ok(x)` / `Err(e)` over a `Result` with recorded sides.
+            (Pat::TupleStruct(p), _)
+                if path_ident(peel_refs(init)).is_some_and(|name| {
+                    p.path
+                        .segments
+                        .last()
+                        .is_some_and(|s| self.env.part(&name, &s.ident.to_string()).is_some())
+                }) =>
+            {
+                let name = path_ident(peel_refs(init)).unwrap_or_default();
+                let side = p
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let kind = self.env.part(&name, &side).unwrap_or(Kind::Nested);
+                for elem in &p.elems {
+                    self.bind_pat(elem, kind);
                 }
             }
             // A tuple pattern over a name with recorded parts, with no `..`.
@@ -2773,6 +2820,26 @@ impl Analyzer {
             Kind::Handle
         } else {
             Kind::Plain
+        };
+        // A fold's closure also gets its accumulator: the seed, then what the
+        // closure returns.
+        let param = if matches!(
+            name.as_str(),
+            "fold" | "try_fold" | "rfold" | "try_rfold" | "scan"
+        ) {
+            let seed = method
+                .args
+                .iter()
+                .filter(|a| !matches!(a, Expr::Closure(_)))
+                .map(|a| self.value_of(a))
+                .fold(param, Kind::max);
+            let acc = method
+                .args
+                .last()
+                .map_or(Kind::Plain, |f| self.closure_output(f, seed));
+            seed.max(acc)
+        } else {
+            param
         };
         // A function given by path where a closure would run is opaque.
         let takes_callback = is_transaction
@@ -4094,6 +4161,16 @@ fn call_path_name(call: &ExprCall) -> Option<String> {
     match &*call.func {
         Expr::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
         _ => None,
+    }
+}
+
+/// `e` without the `&`, `&mut` and parentheses around it.
+fn peel_refs(e: &Expr) -> &Expr {
+    match e {
+        Expr::Reference(r) => peel_refs(&r.expr),
+        Expr::Paren(p) => peel_refs(&p.expr),
+        Expr::Group(g) => peel_refs(&g.expr),
+        other => other,
     }
 }
 
@@ -7956,6 +8033,59 @@ mod tests {
                 "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
                  let mapped = result.map(|_| 1); render(mapped); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn fold_accumulators_result_sides_and_ok_or() {
+        check_handlers(&[
+            (
+                "a fold accumulator seeded with a handle",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let _ = ids.iter().fold(repo, |repo, _| { drive(&repo); repo }); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a fold accumulator that gains a handle in its callback",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let _ = ids.iter().fold(Vec::new(), |mut v, _| { drive(&v); v.push(&repo); v }); \
+                 Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "Err of a Result with a handle on the Ok side only, in if let",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 if let Err(e) = result { render(e); } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "Err of a Result with a handle on the Ok side only, in match",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 match result { Ok(r) => { let _ = r.find_all().await?; } Err(e) => render(e) } \
+                 Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "ok_or puts a handle on the Err side",
+                "async fn h(repo: PgPostRepository, maybe: Option<i64>) -> AutumnResult<usize> { \
+                 let result = maybe.ok_or(&repo); let r = result.unwrap_err(); \
+                 let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "ok_or_else puts its callback output on the Err side",
+                "async fn h(repo: PgPostRepository, maybe: Option<i64>) -> AutumnResult<usize> { \
+                 let result = maybe.ok_or_else(|| &repo); let r = result.unwrap_err(); \
+                 let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            // Guard: `Ok(r)` on such a Result is still the handle.
+            (
+                "Ok of a Result with a handle on the Ok side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 if let Ok(r) = result { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
