@@ -1888,6 +1888,34 @@ impl Analyzer {
         self.env.declare(name, binding);
     }
 
+    /// Bind `pat`, declared as `ty`, to a value that holds `kind`. A tuple
+    /// pattern pairs each part with its own type: in `let (db, n): (Db,
+    /// i64)`, `n` is plain.
+    fn bind_typed(&mut self, pat: &Pat, ty: &Type, kind: Kind) {
+        if let (Pat::Tuple(p), Type::Tuple(t)) = (pat, ty)
+            && p.elems.len() == t.elems.len()
+            && !p.elems.iter().any(|e| matches!(e, Pat::Rest(_)))
+        {
+            for (part, part_ty) in p.elems.iter().zip(&t.elems) {
+                self.bind_typed(part, part_ty, kind.element());
+            }
+            return;
+        }
+        // rustc checks the annotation. A type made only of standard and
+        // primitive types cannot hold a handle.
+        if type_is_plain_std(ty) {
+            self.bind_pat(pat, Kind::Plain);
+            if let Pat::Ident(id) = pat {
+                self.env.set_shape(&id.ident.to_string(), type_shape(ty));
+            }
+            return;
+        }
+        self.bind_pat(pat, kind.max(type_kind(ty)));
+        if let Pat::Ident(id) = pat {
+            self.record_type(id.ident.to_string(), ty);
+        }
+    }
+
     /// Bind the names in `pat` to the parts of a value that holds `kind`.
     fn bind_pat(&mut self, pat: &Pat, kind: Kind) {
         match pat {
@@ -1899,18 +1927,7 @@ impl Analyzer {
             }
             // rustc checks the annotation. A type made only of standard and
             // primitive types cannot hold a handle.
-            Pat::Type(p) if type_is_plain_std(&p.ty) => {
-                self.bind_pat(&p.pat, Kind::Plain);
-                if let Pat::Ident(id) = &*p.pat {
-                    self.env.set_shape(&id.ident.to_string(), type_shape(&p.ty));
-                }
-            }
-            Pat::Type(p) => {
-                self.bind_pat(&p.pat, kind.max(type_kind(&p.ty)));
-                if let Pat::Ident(id) = &*p.pat {
-                    self.record_type(id.ident.to_string(), &p.ty);
-                }
-            }
+            Pat::Type(p) => self.bind_typed(&p.pat, &p.ty, kind),
             Pat::Reference(p) => self.bind_pat(&p.pat, kind),
             Pat::Paren(p) => self.bind_pat(&p.pat, kind),
             Pat::Guard(p) => self.bind_pat(&p.pat, kind),
@@ -4141,7 +4158,53 @@ impl Analyzer {
                 let (ok, err) = self.sides_of(&mc.receiver)?;
                 Some((ok, callback(err)?))
             }
+            // The callback gives a `Result`: `and_then` keeps the old error
+            // side too, `or_else` the old value side.
+            "and_then" => {
+                let (ok, err) = self.sides_of(&mc.receiver)?;
+                let (new_ok, new_err) = self.callback_sides(mc.args.last()?, ok)?;
+                Some((new_ok, err.max(new_err)))
+            }
+            "or_else" => {
+                let (ok, err) = self.sides_of(&mc.receiver)?;
+                let (new_ok, new_err) = self.callback_sides(mc.args.last()?, err)?;
+                Some((ok.max(new_ok), new_err))
+            }
             _ => None,
+        }
+    }
+
+    /// The sides of the `Result` a callback gives when its parameter holds
+    /// `param`: its tail is `Ok(x)`, `Err(x)` or a `Result` with known
+    /// sides. `None` for a body with statements or a `return`.
+    fn callback_sides(&self, f: &Expr, param: Kind) -> Option<(Kind, Kind)> {
+        let Expr::Closure(closure) = f else {
+            return None;
+        };
+        let tail = match &*closure.body {
+            Expr::Block(b) if b.block.stmts.len() == 1 => block_tail(&b.block)?,
+            Expr::Block(_) => return None,
+            body => body,
+        };
+        let mut probe = self.probe();
+        probe.env.push();
+        for input in &closure.inputs {
+            probe.bind_pat(input, param);
+        }
+        let _ = probe.expr(tail);
+        if probe.returned != Kind::Plain {
+            return None;
+        }
+        match peel_parens(tail) {
+            Expr::Call(c) if is_container_constructor(c) => {
+                let held = c.args.first().map_or(Kind::Plain, |a| probe.value_of(a));
+                match call_path_name(c).as_deref() {
+                    Some("Ok") => Some((held, Kind::Plain)),
+                    Some("Err") => Some((Kind::Plain, held)),
+                    _ => None,
+                }
+            }
+            other => probe.sides_of(other),
         }
     }
 
@@ -9988,6 +10051,42 @@ mod tests {
                 "async fn h(x: i64) -> AutumnResult<usize> { \
                  let mut n = 0; n += x; render(n); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn typed_tuple_patterns_and_result_chains() {
+        check_handlers(&[
+            (
+                "a typed tuple pattern gives each part its own type",
+                "async fn h(x: i64) -> AutumnResult<usize> { \
+                 let (db, n): (Db, i64) = make(x); render(n); let _ = db; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a typed tuple pattern keeps the handle part",
+                "async fn h(x: i64) -> AutumnResult<usize> { \
+                 let (db, n): (Db, i64) = make(x); let _ = n; let _ = db.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "and_then keeps a plain error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let mapped = result.and_then(|r| Ok::<_, Error>(r)); let _ = mapped.map_err(|e| render(e)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "or_else keeps the value side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let mapped = result.or_else(|e| Err::<PgPostRepository, _>(e)); let _ = mapped.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: and_then that returns the handle as an error",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let mapped = result.and_then(|r| Err::<i64, _>(r)); let _ = mapped.map_err(|e| render(e)); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
