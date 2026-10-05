@@ -271,6 +271,9 @@ pub enum EdgeUnsupported {
         name: String,
         /// What it needs.
         capability: &'static str,
+        /// Written with another crate's path (`autumn_web::Db`), so a local
+        /// type of the same name cannot be meant.
+        external: bool,
     },
     /// An `EdgeIdentity` parameter without `needs(identity)`.
     UndeclaredIdentity,
@@ -305,7 +308,9 @@ impl std::fmt::Display for EdgeUnsupported {
                 )
             }
             Self::Refused(name) => write!(f, "#[{name}] cannot be an edge route"),
-            Self::Extractor { name, capability } => {
+            Self::Extractor {
+                name, capability, ..
+            } => {
                 write!(f, "takes `{name}`, which needs {capability}")
             }
             Self::UndeclaredIdentity => {
@@ -2171,8 +2176,9 @@ fn scan_items(
                 ) {
                     // A name this module defines is not the framework's
                     // extractor of that name: `type Request = HeaderMap;`.
+                    // A path into another crate (`autumn_web::Db`) still is.
                     found.unsupported.retain(|reason| {
-                        !matches!(reason, EdgeUnsupported::Extractor { name, .. }
+                        !matches!(reason, EdgeUnsupported::Extractor { name, external: false, .. }
                             if local_types.contains(name))
                     });
                     scan.functions.push(found);
@@ -3023,7 +3029,7 @@ fn unsupported_capabilities(
             extractor_names(&pat_type.ty, &mut extractors);
         }
     }
-    for name in extractors {
+    for (name, external) in extractors {
         if name == "EdgeIdentity" {
             // Unknown needs (`None`) add no reason: the macro reports those.
             if needs
@@ -3036,7 +3042,11 @@ fn unsupported_capabilities(
             .iter()
             .find(|(known, _)| *known == name)
         {
-            found.push(EdgeUnsupported::Extractor { name, capability });
+            found.push(EdgeUnsupported::Extractor {
+                name,
+                capability,
+                external,
+            });
         }
     }
     found
@@ -3179,14 +3189,22 @@ fn local_type_names(items: &[syn::Item]) -> BTreeSet<String> {
     names
 }
 
-/// The extractor type names in one parameter type: its last path segment, the
+/// The extractor type names in one parameter type, each with whether it is a
+/// path into another crate: its last path segment, the
 /// elements of a tuple, and the inner type of `Option`/`Result`.
-fn extractor_names(ty: &syn::Type, out: &mut Vec<String>) {
+fn extractor_names(ty: &syn::Type, out: &mut Vec<(String, bool)>) {
     match ty {
         syn::Type::Path(path) => {
             let Some(last) = path.path.segments.last() else {
                 return;
             };
+            // `autumn_web::Db` names another crate; `Db` or `crate::Db` may
+            // name a local type.
+            let external = path.path.segments.len() > 1
+                && (path.path.leading_colon.is_some()
+                    || path.path.segments.first().is_some_and(|first| {
+                        !matches!(first.ident.to_string().as_str(), "crate" | "self" | "super")
+                    }));
             let name = last.ident.to_string();
             if name == "Option" || name == "Result" {
                 if let syn::PathArguments::AngleBracketed(args) = &last.arguments
@@ -3195,7 +3213,7 @@ fn extractor_names(ty: &syn::Type, out: &mut Vec<String>) {
                     extractor_names(inner, out);
                 }
             } else {
-                out.push(name);
+                out.push((name, external));
             }
         }
         syn::Type::Tuple(tuple) => {
@@ -10101,6 +10119,24 @@ mod tests {
                 scan.functions
             );
         }
+    }
+
+    #[test]
+    fn a_qualified_framework_extractor_is_flagged_despite_a_local_name() {
+        let scan = scan_one(
+            "struct Db;\n#[get(\"/x\")]\n#[edge]\nasync fn f(db: autumn_web::Db, mine: crate::Db) {}",
+        );
+        let found: Vec<String> = scan.functions[0]
+            .unsupported
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "only `autumn_web::Db` is the framework's: {found:?}"
+        );
+        assert!(found[0].contains("`Db`"), "{found:?}");
     }
 
     /// Every extractor `autumn-web` defines is on the denylist, so a new one

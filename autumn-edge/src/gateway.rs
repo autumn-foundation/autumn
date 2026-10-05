@@ -267,7 +267,7 @@ const NO_BODY_STATUSES: &[u16] = &[204, 205, 304];
 /// would refuse it, or when it would break on the wire: a status outside
 /// 200-599, an invalid header, `set-cookie`, the fallthrough sentinel, a
 /// hop-by-hop header, a body on 204/205/304, or a `content-length` that does
-/// not match the body. A
+/// not fit the status or conflicts with another `content-length`. A
 /// `HEAD` answer has no body and keeps the length of the `GET` body. A
 /// capsule that Autumn did not build can send any of these, so the gateway
 /// checks again.
@@ -277,6 +277,7 @@ fn into_http(response: EdgeResponse, head: bool) -> Option<Response<Body>> {
         return None;
     }
     let body_len = response.body.len();
+    let mut content_length: Option<usize> = None;
     let mut http = Response::new(Body::from(response.body));
     *http.status_mut() = StatusCode::from_u16(response.status).ok()?;
     for (name, value) in response.headers {
@@ -289,9 +290,13 @@ fn into_http(response: EdgeResponse, head: bool) -> Option<Response<Body>> {
         }
         if name == http::header::CONTENT_LENGTH {
             let declared: usize = value.trim().parse().ok()?;
-            if !content_length_fits(response.status, head, declared, body_len) {
+            // Two different values make the framing ambiguous.
+            if !content_length_fits(response.status, head, declared, body_len)
+                || content_length.is_some_and(|first| first != declared)
+            {
                 return None;
             }
+            content_length = Some(declared);
         }
         http.headers_mut()
             .append(name, HeaderValue::from_str(&value).ok()?);

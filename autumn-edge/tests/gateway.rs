@@ -502,3 +502,25 @@ fn content_length_is_checked_by_status() {
     assert_eq!(run(205, "0"), Lane::Edge);
     assert_eq!(run(205, "13"), declined);
 }
+
+/// Two different `content-length` values make the framing ambiguous.
+#[test]
+fn conflicting_content_lengths_fall_through() {
+    let artifact = guest(&GuestFrame::Response(EdgeResponse {
+        status: 304,
+        headers: vec![
+            ("content-length".into(), "1".into()),
+            ("content-length".into(), "999".into()),
+        ],
+        body: Vec::new(),
+    }));
+    let seen = Seen::default();
+    let gateway = EdgeGateway::new(artifact, origin(&seen));
+
+    let response = block_on(gateway.handle(Request::get("/x").body(Body::empty()).unwrap()));
+
+    assert_eq!(
+        lane(&response),
+        Lane::Fallthrough(FallthroughReason::CapsuleError)
+    );
+}
