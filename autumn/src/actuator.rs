@@ -404,17 +404,15 @@ pub trait ProvideActuatorState {
         None
     }
 
-    /// Returns the cost signal and the cost accountant (issue #1720).
-    ///
-    /// The default returns `(None, None)`. `{prefix}/cost` then reports
-    /// `"enabled": false`.
-    fn cost_plane(
-        &self,
-    ) -> (
-        Option<crate::cost::CostSignal>,
-        Option<crate::cost::CostAccountant>,
-    ) {
-        (None, None)
+    /// Returns the cost signal (issue #1720). The default returns `None`.
+    fn cost_signal(&self) -> Option<crate::cost::CostSignal> {
+        None
+    }
+
+    /// Returns the cost accountant (issue #1720). The default returns `None`,
+    /// and `{prefix}/cost` then reports `"enabled": false`.
+    fn cost_accountant(&self) -> Option<crate::cost::CostAccountant> {
+        None
     }
 }
 
@@ -4250,7 +4248,8 @@ fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
 pub(crate) async fn cost_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
-    let (signal, accountant) = state.cost_plane();
+    let signal = state.cost_signal();
+    let accountant = state.cost_accountant();
     let snapshot = accountant
         .as_ref()
         .map(crate::cost::CostAccountant::snapshot)

@@ -373,9 +373,10 @@ as every other durable backend.
 ## Cost-aware deferral
 
 Mark a job `#[job(deferrable)]` to let it wait while the cost signal is above
-`[cost] defer_threshold`. The job runs when the signal falls. It is never
-dropped and uses no attempt while it waits. Only the `local` backend defers
-jobs. See [Request Cost and Carbon-Aware Deferral](cost.md).
+`[cost] defer_threshold`. The job runs when the signal falls. The runtime never
+drops it. It uses no attempt while it waits. Only the `local` backend defers
+jobs. Other backends run the job and log a warning at boot. See
+[Request Cost and Carbon-Aware Deferral](cost.md).
 
 ## Job priorities
 

@@ -29,7 +29,7 @@ struct JobAttrs {
 }
 
 /// Parse a bare flag (`deferrable`) or an explicit `flag = true|false`.
-pub(crate) fn parse_flag(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<bool> {
+pub fn parse_flag(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<bool> {
     if meta.input.peek(syn::Token![=]) {
         let value: LitBool = meta.value()?.parse()?;
         Ok(value.value())
@@ -555,8 +555,16 @@ mod tests {
     fn parses_deferrable_flag() {
         assert!(!parse(quote! { name = "j" }).expect("parse").deferrable);
         assert!(parse(quote! { deferrable }).expect("parse").deferrable);
-        assert!(parse(quote! { deferrable = true }).expect("parse").deferrable);
-        assert!(!parse(quote! { deferrable = false }).expect("parse").deferrable);
+        assert!(
+            parse(quote! { deferrable = true })
+                .expect("parse")
+                .deferrable
+        );
+        assert!(
+            !parse(quote! { deferrable = false })
+                .expect("parse")
+                .deferrable
+        );
         assert!(parse(quote! { deferrable = 1 }).is_err());
     }
 

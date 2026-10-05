@@ -192,8 +192,8 @@ mod tests {
         assert!(!attrs.deferrable);
         let attrs = parse_scheduled_args(quote! { every = "1m", deferrable }).expect("parse");
         assert!(attrs.deferrable);
-        let attrs =
-            parse_scheduled_args(quote! { cron = "0 * * * * *", deferrable = false }).expect("parse");
+        let attrs = parse_scheduled_args(quote! { cron = "0 * * * * *", deferrable = false })
+            .expect("parse");
         assert!(!attrs.deferrable);
     }
 

@@ -23,6 +23,8 @@ static DEFERRABLE_RUNS: AtomicUsize = AtomicUsize::new(0);
 static URGENT_RUNS: AtomicUsize = AtomicUsize::new(0);
 static DEFERRABLE_TICKS: AtomicUsize = AtomicUsize::new(0);
 static URGENT_TICKS: AtomicUsize = AtomicUsize::new(0);
+static CRON_TICKS: AtomicUsize = AtomicUsize::new(0);
+static CANCELED_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Args;
@@ -48,6 +50,18 @@ async fn sim_cost_compact(_state: AppState) -> AutumnResult<()> {
 #[scheduled(every = "1m", name = "sim_cost_heartbeat")]
 async fn sim_cost_heartbeat(_state: AppState) -> AutumnResult<()> {
     URGENT_TICKS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+#[scheduled(cron = "0 * * * * *", name = "sim_cost_cron_rollup", deferrable)]
+async fn sim_cost_cron_rollup(_state: AppState) -> AutumnResult<()> {
+    CRON_TICKS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+#[job(name = "sim_cost_cancel_me", deferrable)]
+async fn sim_cost_cancel_me(_state: AppState, _args: Args) -> AutumnResult<()> {
+    CANCELED_RUNS.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }
 
@@ -101,21 +115,39 @@ async fn sim_deferrable_jobs_wait_for_the_window_then_all_run(mut sim: Sim) {
     // The window opens.
     signal.set(520.0);
     for _ in 0..3 {
-        SimCostRebuildIndexJob::enqueue(Args).await.expect("enqueue");
+        SimCostRebuildIndexJob::enqueue(Args)
+            .await
+            .expect("enqueue");
     }
     SimCostSendReceiptJob::enqueue(Args).await.expect("enqueue");
     sim.run_to_idle().await;
 
-    assert_eq!(URGENT_RUNS.load(Ordering::SeqCst), 1, "urgent work runs now");
-    assert_eq!(DEFERRABLE_RUNS.load(Ordering::SeqCst), 0, "deferrable work waits");
+    assert_eq!(
+        URGENT_RUNS.load(Ordering::SeqCst),
+        1,
+        "urgent work runs now"
+    );
+    assert_eq!(
+        DEFERRABLE_RUNS.load(Ordering::SeqCst),
+        0,
+        "deferrable work waits"
+    );
 
     // Ten minutes of high signal: nothing deferrable runs. Requests do.
     for _ in 0..10 {
         advance_minutes(&sim, 1).await;
         sim.client().get("/ping").send().await.assert_ok();
     }
-    assert_eq!(DEFERRABLE_RUNS.load(Ordering::SeqCst), 0, "no run in the window");
-    assert!(signal.snapshot().deferrals >= 3, "{:?}", signal.snapshot());
+    assert_eq!(
+        DEFERRABLE_RUNS.load(Ordering::SeqCst),
+        0,
+        "no run in the window"
+    );
+    assert_eq!(
+        signal.snapshot().deferrals,
+        3,
+        "each job counts one time, however long it waits"
+    );
 
     // The window closes. Every deferred job runs at the next recheck.
     signal.set(120.0);
@@ -160,7 +192,11 @@ async fn sim_deferrable_tasks_wait_for_the_window_then_resume(mut sim: Sim) {
     signal.set(THRESHOLD - 1.0);
     sim.advance(Duration::from_secs(RECHECK_SECS)).await;
     sim.run_to_idle().await;
-    assert_eq!(DEFERRABLE_TICKS.load(Ordering::SeqCst), 3, "the tick resumes");
+    assert_eq!(
+        DEFERRABLE_TICKS.load(Ordering::SeqCst),
+        3,
+        "the tick resumes"
+    );
 
     advance_minutes(&sim, 2).await;
     assert_eq!(DEFERRABLE_TICKS.load(Ordering::SeqCst), 5);
@@ -176,7 +212,127 @@ async fn sim_deferrable_work_runs_when_no_threshold_is_set(mut sim: Sim) {
     sim.build(TestApp::new().jobs(jobs![sim_cost_rebuild_index]));
     signal(&sim).set(1.0e6);
 
-    SimCostRebuildIndexJob::enqueue(Args).await.expect("enqueue");
+    SimCostRebuildIndexJob::enqueue(Args)
+        .await
+        .expect("enqueue");
     sim.run_to_idle().await;
     assert_eq!(DEFERRABLE_RUNS.load(Ordering::SeqCst), 1);
+}
+
+#[sim_test]
+async fn sim_deferrable_cron_ticks_fold_into_one_run(mut sim: Sim) {
+    CRON_TICKS.store(0, Ordering::SeqCst);
+
+    // The sim clock starts on a whole minute, so the cron ticks fall on each
+    // minute step below.
+    sim.build(
+        TestApp::new()
+            .config(config())
+            .tasks(tasks![sim_cost_cron_rollup]),
+    );
+    let signal = signal(&sim);
+
+    advance_minutes(&sim, 2).await;
+    assert_eq!(CRON_TICKS.load(Ordering::SeqCst), 2);
+
+    // Five minutes of high signal: the 3:00 tick waits, the later ticks fold
+    // into it.
+    signal.set(THRESHOLD + 1.0);
+    advance_minutes(&sim, 5).await;
+    assert_eq!(
+        CRON_TICKS.load(Ordering::SeqCst),
+        2,
+        "no tick runs in the window"
+    );
+    assert_eq!(signal.snapshot().deferrals, 1, "one tick waits");
+
+    // The signal falls: the waiting tick runs one time at the next recheck.
+    signal.set(THRESHOLD - 1.0);
+    sim.advance(Duration::from_secs(RECHECK_SECS)).await;
+    sim.run_to_idle().await;
+    assert_eq!(
+        CRON_TICKS.load(Ordering::SeqCst),
+        3,
+        "the folded ticks run one time"
+    );
+
+    advance_minutes(&sim, 2).await;
+    assert_eq!(
+        CRON_TICKS.load(Ordering::SeqCst),
+        5,
+        "the task ticks as before"
+    );
+}
+
+#[sim_test]
+async fn sim_an_operator_can_cancel_a_deferred_job(mut sim: Sim) {
+    use autumn_web::job::{JobAdminQuery, job_admin_backend};
+
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+    CANCELED_RUNS.store(0, Ordering::SeqCst);
+
+    let mut config = config();
+    config.actuator.sensitive = true;
+    sim.build(
+        TestApp::new()
+            .config(config)
+            .jobs(jobs![sim_cost_cancel_me]),
+    );
+    let signal = signal(&sim);
+    signal.set(THRESHOLD + 1.0);
+
+    SimCostCancelMeJob::enqueue(Args).await.expect("enqueue");
+    sim.run_to_idle().await;
+
+    let backend = job_admin_backend(sim.client().state()).expect("job admin backend");
+    let snapshot = backend
+        .snapshot(JobAdminQuery::default())
+        .await
+        .expect("snapshot");
+    let id = snapshot
+        .enqueued
+        .records
+        .iter()
+        .find(|r| r.name == "sim_cost_cancel_me")
+        .map(|r| r.id.clone())
+        .expect("the deferred job is still enqueued");
+    backend.cancel(&id).await.expect("cancel the deferred job");
+
+    // The waiter sees the cancel at its next check and settles the job,
+    // while the signal is still high.
+    sim.advance(Duration::from_secs(RECHECK_SECS)).await;
+    sim.run_to_idle().await;
+    let jobs: serde_json::Value = sim.client().get("/actuator/jobs").send().await.json();
+    assert_eq!(
+        jobs["jobs"]["sim_cost_cancel_me"]["queued"], 0,
+        "the cancel settles in the window: {jobs}"
+    );
+
+    // The window closes. The canceled job does not run.
+    signal.set(THRESHOLD - 1.0);
+    advance_minutes(&sim, 2).await;
+    assert_eq!(
+        CANCELED_RUNS.load(Ordering::SeqCst),
+        0,
+        "a canceled job does not run"
+    );
+
+    let snapshot = backend
+        .snapshot(JobAdminQuery::default())
+        .await
+        .expect("snapshot");
+    let listed = [
+        &snapshot.enqueued,
+        &snapshot.running,
+        &snapshot.completed,
+        &snapshot.failed,
+    ]
+    .iter()
+    .flat_map(|page| page.records.iter())
+    .any(|r| r.id == id);
+    assert!(
+        !listed,
+        "the canceled job left the queue and did not run: {snapshot:?}"
+    );
 }

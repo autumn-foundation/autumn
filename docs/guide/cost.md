@@ -14,10 +14,13 @@ For each request, the `CostLayer` records:
 
 | Value | How it is measured |
 |---|---|
-| CPU time | The thread CPU clock, read before and after each poll of the request. Linux and macOS use `CLOCK_THREAD_CPUTIME_ID`. Other targets use the wall time of the poll. |
+| CPU time | The thread CPU clock, read before and after each poll of the request. Linux, Android, macOS, iOS and FreeBSD use `CLOCK_THREAD_CPUTIME_ID`. Other targets use the wall time of the poll. |
 | Allocated bytes | An `AllocationProbe` that you supply. Without a probe, the value is `0`. |
 | DB queries | The same query count as the `Server-Timing` `db` metric. |
 | Tenant | The tenant that the tenancy middleware resolved. A request with no tenant goes to `_none`. |
+
+A request that the server drops before it completes (the client went away)
+is recorded with the cost that the layer measured until then.
 
 The layer does not count:
 
@@ -27,7 +30,7 @@ The layer does not count:
 
 ---
 
-## Turn on metering
+## Turn on cost measurement
 
 ```toml
 [cost]
@@ -37,8 +40,20 @@ max_tenants = 1000   # more tenants go into "_other"
 
 Or set `AUTUMN_COST__ENABLED=true`.
 
-Metering is off by default. When it is on, each request reads the thread CPU
-clock two times per poll.
+Cost measurement is off by default. When it is on, each request reads the
+thread CPU clock two times per poll.
+
+### Tenant keys
+
+The tenant key is the tenant id. With `[tenancy] source = "header"` or
+`"subdomain"`, the client chooses the id. To keep memory bounded, these ids go
+into `_other`:
+
+- an id longer than 64 bytes,
+- the reserved ids `_none` and `_other`,
+- a new id when the accountant already has `max_tenants` keys.
+
+The accountant does not remove a key until the app restarts.
 
 ---
 
@@ -52,19 +67,24 @@ When `[observability] server_timing` is on, each response gets these metrics:
 Server-Timing: cost-cpu;dur=1.234, cost-db;desc="3 queries"
 ```
 
-`cost-alloc;desc="4096 bytes"` is added when a probe is set. The header follows
-the `server_timing` setting, so cost data does not go to clients in production
-unless you turn that setting on.
+The layer adds `cost-alloc;desc="4096 bytes"` when a probe is set. The header
+follows the `server_timing` setting, so cost data does not go to clients in
+production unless you turn that setting on. `cost-cpu` is a precise timing
+signal. Do not show it to anonymous clients.
 
 ### Metrics
 
 The accountant is the `autumn.cost` metrics source. `/actuator/prometheus` and
-`/actuator/metrics` show these counters, with a `tenant` label:
+`/actuator/metrics` show these counters:
 
 - `autumn_cost_requests_total`
 - `autumn_cost_cpu_seconds_total`
 - `autumn_cost_allocated_bytes_total`
 - `autumn_cost_db_queries_total`
+
+These two endpoints are public. With `[actuator] sensitive = false`, each
+counter has one sample: the total. With `sensitive = true`, each counter has
+one sample for each tenant, with a `tenant` label.
 
 ### `GET /actuator/cost`
 
@@ -74,7 +94,7 @@ This endpoint shows the signal and the total for each tenant. It needs
 ```json
 {
   "enabled": true,
-  "signal": { "value": 520.0, "threshold": 400.0, "high": true, "deferrals": 3 },
+  "signal": { "value": 520.0, "threshold": 400.0, "high": true, "deferrals": 2 },
   "total":  { "requests": 3, "cpu_micros": 9120, "allocated_bytes": 0, "db_queries": 6 },
   "tenants": {
     "acme":   { "requests": 2, "cpu_micros": 6080, "allocated_bytes": 0, "db_queries": 4 },
@@ -92,6 +112,9 @@ if let Some(accountant) = state.extension::<CostAccountant>() {
     let acme = accountant.tenant("acme");
 }
 ```
+
+The accountant keeps the totals in memory, for each process. It does not
+remove them.
 
 ---
 
@@ -202,12 +225,17 @@ defer_recheck_secs = 30
 
 While the signal is high:
 
-- A deferrable job does not start. It goes back on the queue and the runtime
-  checks again after `defer_recheck_secs`. It holds no worker slot and uses no
-  attempt. It is never dropped.
-- A deferrable task waits before it takes its tick lease. When the signal
-  falls, the tick runs. Ticks in the window fold into that one run.
+- A deferrable job does not start. It holds no worker slot and uses no
+  attempt. The runtime checks the signal again every `defer_recheck_secs`.
+  When the signal falls, the job goes back on the queue. The runtime never
+  drops it. An operator can cancel it while it waits.
+- A deferrable task takes its tick lease, then waits. Only the replica that
+  holds the tick waits, so the tick runs one time. When the signal falls, the
+  tick runs. Later ticks on that replica fold into that one run.
 - Request handlers and work that is not deferrable run as usual.
+
+`signal.deferrals` in `/actuator/cost` counts each job or tick that started to
+wait.
 
 For a `JobInfo` or `TaskInfo` that you make by hand, call
 `autumn_web::cost::mark_deferrable(WorkKind::Job, "name")`.
@@ -215,10 +243,14 @@ For a `JobInfo` or `TaskInfo` that you make by hand, call
 ### Limits
 
 - Only the `local` jobs backend defers jobs. On `postgres`, `redis` and
-  `sqlite`, a deferrable job runs as usual and the app logs a warning at boot.
-  Scheduled tasks defer on every backend.
+  `sqlite`, a deferrable job runs as usual. The app logs a warning at boot
+  when `defer_threshold` is set. Scheduled tasks defer on every backend.
 - On the `local` backend, a deferred job is in memory. A restart loses it, as
   it loses any other queued local job.
+- A task that waits holds its tick lease. On the `postgres` scheduler, this
+  keeps one pooled connection for each task that waits.
+- With more than one replica, each replica can hold one waiting tick of a
+  task. So after the window, the task can run one time on each replica.
 - With metering on, the DB lane installs the query timer on each checked-out
   connection, as `Server-Timing` does. This replaces a diesel default
   instrumentation that your app set.
@@ -230,7 +262,7 @@ For a `JobInfo` or `TaskInfo` that you make by hand, call
 | Key | Env | Default | Meaning |
 |---|---|---|---|
 | `cost.enabled` | `AUTUMN_COST__ENABLED` | `false` | Meter each request. |
-| `cost.defer_threshold` | `AUTUMN_COST__DEFER_THRESHOLD` | unset | Deferrable work waits while the signal is above this value. |
-| `cost.defer_recheck_secs` | `AUTUMN_COST__DEFER_RECHECK_SECS` | `30` | Seconds between two checks while work waits. |
+| `cost.defer_threshold` | `AUTUMN_COST__DEFER_THRESHOLD` | unset | Deferrable work waits while the signal is above this value. Must be `>= 0`. |
+| `cost.defer_recheck_secs` | `AUTUMN_COST__DEFER_RECHECK_SECS` | `30` | Seconds between two checks while work waits. Must be at least `1`. |
 | `cost.max_tenants` | `AUTUMN_COST__MAX_TENANTS` | `1000` | Most tenant keys. More go into `_other`. |
-| `cost.signal_refresh_secs` | `AUTUMN_COST__SIGNAL_REFRESH_SECS` | `5` | Seconds between two reads of `autumn_cost_signal`. |
+| `cost.signal_refresh_secs` | `AUTUMN_COST__SIGNAL_REFRESH_SECS` | `5` | Seconds between two reads of `autumn_cost_signal`. Must be at least `1`. |

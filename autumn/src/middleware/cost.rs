@@ -1,10 +1,12 @@
-//! Per-request cost metering layer (issue #1720).
+//! Layer that measures the cost of each request (issue #1720).
 //!
 //! [`CostLayer`] measures each request and adds it to a
-//! [`CostAccountant`]. For each poll of the request future it reads the
+//! [`CostAccountant`]. For each poll of the request future, it reads the
 //! thread CPU clock (and the [`AllocationProbe`], if set) before and after
 //! the poll. It counts DB queries through a task-local lane. When the request
-//! completes, it reads the tenant from the request log context.
+//! completes, it reads the tenant from the request log context. When the
+//! server drops the request before it completes (the client went away), the
+//! layer records the cost that it measured until then.
 //!
 //! When `emit_header` is `true`, the layer appends these `Server-Timing`
 //! metrics:
@@ -15,7 +17,9 @@
 //!
 //! `cost-alloc` is present only when a probe is set. The router sets
 //! `emit_header` from the `[observability] server_timing` setting, so cost data
-//! does not go to clients when that header is off.
+//! does not go to clients when that header is off. `cost-cpu` is a precise
+//! timing signal. Do not turn the header on for anonymous clients in
+//! production.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -87,25 +91,20 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let cell = Arc::new(RequestCostCell::default());
-        // Measure the call too: some services do their work here.
-        let mut inner = None;
-        let mut cpu = std::time::Duration::ZERO;
-        let mut allocated = 0;
-        let probe = self.accountant.allocation_probe().cloned();
-        measure(probe.as_deref(), &mut cpu, &mut allocated, || {
-            inner = Some(crate::cost::scope_request(
-                Arc::clone(&cell),
-                self.inner.call(req),
-            ));
-        });
+        // Measure the CPU time of the call too: some services do their work
+        // here. The probe measures only the polls.
+        let mark = crate::cost::cpu_mark();
+        let inner = crate::cost::scope_request(Arc::clone(&cell), self.inner.call(req));
+        let cpu = crate::cost::cpu_since(mark);
         CostFuture {
-            inner: inner.expect("measure runs the closure"),
+            inner,
             cell,
-            probe,
+            probe: self.accountant.allocation_probe().cloned(),
             cpu,
-            allocated,
+            allocated: 0,
             accountant: self.accountant.clone(),
             emit_header: self.emit_header,
+            recorded: false,
         }
     }
 }
@@ -119,20 +118,17 @@ fn measure(
 ) {
     let mut f = Some(f);
     let mark = crate::cost::cpu_mark();
-    match probe {
-        Some(probe) => {
-            let bytes = probe.measure(&mut || {
-                if let Some(f) = f.take() {
-                    f();
-                }
-            });
-            *allocated = allocated.saturating_add(bytes);
-        }
-        None => {
+    if let Some(probe) = probe {
+        let bytes = probe.measure(&mut || {
             if let Some(f) = f.take() {
                 f();
             }
-        }
+        });
+        *allocated = allocated.saturating_add(bytes);
+    }
+    // No probe, or a probe that did not call `poll`: run it here.
+    if let Some(f) = f.take() {
+        f();
     }
     *cpu = cpu.saturating_add(crate::cost::cpu_since(mark));
 }
@@ -148,7 +144,31 @@ pin_project! {
         allocated: u64,
         accountant: CostAccountant,
         emit_header: bool,
+        // `true` after the cost is in the accountant.
+        recorded: bool,
     }
+
+    impl<F> PinnedDrop for CostFuture<F> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            // A request dropped before it completed still used CPU.
+            if !*this.recorded {
+                record(this.accountant, *this.cpu, *this.allocated, this.cell);
+            }
+        }
+    }
+}
+
+/// Add one request to `accountant`, with the tenant of the log context.
+fn record(
+    accountant: &CostAccountant,
+    cpu: std::time::Duration,
+    allocated: u64,
+    cell: &RequestCostCell,
+) {
+    crate::log::context::with_tenant_id(|tenant| {
+        accountant.record_parts(cpu, allocated, cell.db_queries(), tenant);
+    });
 }
 
 impl<F, ResBody, E> Future for CostFuture<F>
@@ -160,16 +180,16 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let mut inner = this.inner;
-        let mut out = None;
+        let mut out = Poll::Pending;
         measure(this.probe.as_deref(), this.cpu, this.allocated, || {
-            out = Some(inner.as_mut().poll(cx));
+            out = inner.as_mut().poll(cx);
         });
-        match out.expect("measure runs the closure") {
+        match out {
             Poll::Ready(Ok(mut response)) => {
-                let mut cost = RequestCost::new(*this.cpu, *this.allocated, this.cell.db_queries());
-                cost.tenant = crate::log::context::current_tenant_id();
-                this.accountant.record(&cost);
+                *this.recorded = true;
+                record(this.accountant, *this.cpu, *this.allocated, this.cell);
                 if *this.emit_header {
+                    let cost = RequestCost::new(*this.cpu, *this.allocated, this.cell.db_queries());
                     let value = build_header_value(&cost, this.probe.is_some());
                     if let Ok(value) = HeaderValue::from_str(&value) {
                         response.headers_mut().append(SERVER_TIMING.clone(), value);
@@ -177,7 +197,12 @@ where
                 }
                 Poll::Ready(Ok(response))
             }
-            other => other,
+            Poll::Ready(Err(error)) => {
+                *this.recorded = true;
+                record(this.accountant, *this.cpu, *this.allocated, this.cell);
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -249,7 +274,7 @@ mod tests {
     async fn layer_records_each_request_with_probe_bytes() {
         use tower::ServiceExt as _;
 
-        let accountant = CostAccountant::with_allocation_probe(4, Arc::new(FixedProbe(10)));
+        let accountant = CostAccountant::new(4).with_allocation_probe(Arc::new(FixedProbe(10)));
         let service = CostLayer::new(accountant.clone(), true).layer(tower::service_fn(
             |_req: Request<()>| async {
                 // Yield one time so the future is polled two times.
@@ -258,10 +283,7 @@ mod tests {
             },
         ));
 
-        let response = service
-            .oneshot(Request::new(()))
-            .await
-            .expect("infallible");
+        let response = service.oneshot(Request::new(())).await.expect("infallible");
         let header = response
             .headers()
             .get("server-timing")
@@ -272,7 +294,46 @@ mod tests {
 
         let total = accountant.snapshot().total;
         assert_eq!(total.requests, 1);
-        // One call and at least two polls, each counted by the probe.
-        assert!(total.allocated_bytes >= 30, "{total:?}");
+        // At least two polls, each counted by the probe.
+        assert!(total.allocated_bytes >= 20, "{total:?}");
+    }
+
+    /// A probe that does not call `poll`.
+    struct LazyProbe;
+
+    impl AllocationProbe for LazyProbe {
+        fn measure(&self, _poll: &mut dyn FnMut()) -> u64 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_skips_poll_does_not_break_the_request() {
+        use tower::ServiceExt as _;
+
+        let accountant = CostAccountant::new(4).with_allocation_probe(Arc::new(LazyProbe));
+        let service = CostLayer::new(accountant.clone(), false).layer(tower::service_fn(
+            |_req: Request<()>| async { Ok::<_, std::convert::Infallible>(Response::new(())) },
+        ));
+        service.oneshot(Request::new(())).await.expect("infallible");
+        assert_eq!(accountant.snapshot().total.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_is_recorded_once() {
+        let accountant = CostAccountant::new(4);
+        let mut service = CostLayer::new(accountant.clone(), false).layer(tower::service_fn(
+            |_req: Request<()>| async {
+                std::future::pending::<()>().await;
+                Ok::<_, std::convert::Infallible>(Response::new(()))
+            },
+        ));
+        let mut future = Box::pin(service.call(Request::new(())));
+        // Poll one time, then drop it: the client went away.
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        drop(future);
+        assert_eq!(accountant.snapshot().total.requests, 1);
     }
 }

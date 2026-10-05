@@ -289,7 +289,9 @@ pub(crate) fn request_query_capture_active() -> bool {
 /// query capture, or cost metering (issue #1720).
 #[cfg(feature = "db")]
 fn request_db_lane_active() -> bool {
-    request_db_timing_active() || request_query_capture_active() || crate::cost::request_cost_active()
+    request_db_timing_active()
+        || request_query_capture_active()
+        || crate::cost::request_cost_active()
 }
 
 /// diesel-async [`Instrumentation`](diesel::connection::Instrumentation)

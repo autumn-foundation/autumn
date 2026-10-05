@@ -224,7 +224,9 @@ async fn signal_follows_runtime_config_without_redeploy() {
     service
         .set(COST_SIGNAL_KEY, "650", Some("ops"))
         .expect("set the signal");
-    for _ in 0..50 {
+    // Real time: the refresher reads the store on a blocking thread every
+    // second. Give a loaded CI runner a wide margin; the loop ends early.
+    for _ in 0..300 {
         if signal.is_high() {
             break;
         }

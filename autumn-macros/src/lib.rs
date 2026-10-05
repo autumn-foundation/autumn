@@ -590,8 +590,9 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
 /// ```
 ///
 /// Add `deferrable` to let a task wait while the cost signal is high
-/// (`[cost] defer_threshold`). The tick runs when the signal falls. Ticks in
-/// the window fold into one run. See `docs/guide/cost.md`.
+/// (`[cost] defer_threshold`). The tick takes its lease, then waits. It runs
+/// when the signal falls. Later ticks fold into that run. See
+/// `docs/guide/cost.md`.
 ///
 /// ```ignore
 /// #[scheduled(every = "15m", deferrable)]
@@ -646,9 +647,10 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 ///
 /// Add `deferrable` to let a job wait while the cost signal is high
-/// (`[cost] defer_threshold`). The job runs when the signal falls. It is never
-/// dropped and uses no attempt while it waits. The `local` backend supports
-/// it. See `docs/guide/cost.md`.
+/// (`[cost] defer_threshold`). The job runs when the signal falls. The runtime
+/// never drops it. It uses no attempt while it waits. Only the `local` jobs
+/// backend defers jobs. Other backends run the job and log a warning at boot.
+/// See `docs/guide/cost.md`.
 ///
 /// ```ignore
 /// #[job(deferrable)]

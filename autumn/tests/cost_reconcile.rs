@@ -5,6 +5,11 @@
 //! agree with the CPU time that the process used, within 10%. The allocated
 //! bytes come from an `allocation-counter` probe.
 //!
+//! The layers outside the `CostLayer` and the test client also use CPU. The
+//! test measures that cost on a route that does nothing, and takes it out of
+//! the process CPU. Then a slow (debug or coverage) build does not move the
+//! ratio.
+//!
 //! This is its own binary for two reasons. It reads process-wide CPU time, so
 //! no other test can run in the same process. And `allocation-counter`
 //! installs a counting global allocator. See CLAUDE.md, isolated tests.
@@ -48,8 +53,7 @@ fn process_cpu() -> Duration {
     let user = usage.user_time();
     let system = usage.system_time();
     let micros = |t: nix::sys::time::TimeVal| {
-        u64::try_from(t.tv_sec()).unwrap_or(0) * 1_000_000
-            + u64::try_from(t.tv_usec()).unwrap_or(0)
+        u64::try_from(t.tv_sec()).unwrap_or(0) * 1_000_000 + u64::try_from(t.tv_usec()).unwrap_or(0)
     };
     Duration::from_micros(micros(user) + micros(system))
 }
@@ -69,13 +73,21 @@ fn burn(millis: u64) -> usize {
 
 #[get("/heavy")]
 async fn heavy() -> String {
-    burn(30).to_string()
+    burn(60).to_string()
 }
 
 #[get("/light")]
 async fn light() -> String {
-    burn(10).to_string()
+    burn(20).to_string()
 }
+
+#[get("/noop")]
+async fn noop() -> &'static str {
+    "ok"
+}
+
+/// Requests that each tenant sends.
+const ROUNDS: u32 = 10;
 
 #[tokio::test(flavor = "current_thread")]
 async fn per_tenant_cost_reconciles_with_process_cpu() {
@@ -87,7 +99,7 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
 
     let client = TestApp::new()
         .config(config)
-        .routes(routes![heavy, light])
+        .routes(routes![heavy, light, noop])
         .state_initializer(|state| {
             let probe: Arc<dyn AllocationProbe> = Arc::new(CountingProbe);
             state.insert_extension(probe);
@@ -100,24 +112,61 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
         .expect("cost.enabled installs an accountant");
 
     // Warm up: the first request pays one-time setup that no tenant caused.
-    client.get("/light").header("x-tenant-id", "warmup").send().await.assert_ok();
-    let warmup_cpu = accountant.snapshot().total.cpu_micros;
+    client
+        .get("/light")
+        .header("x-tenant-id", "warmup")
+        .send()
+        .await
+        .assert_ok();
 
+    // The CPU that a request uses outside the layer: process CPU minus
+    // metered CPU, on a route that does nothing.
+    let metered_before = accountant.snapshot().total.cpu_micros;
     let before = process_cpu();
-    for _ in 0..10 {
-        client.get("/heavy").header("x-tenant-id", "acme").send().await.assert_ok();
-        client.get("/light").header("x-tenant-id", "globex").send().await.assert_ok();
+    for _ in 0..2 * ROUNDS {
+        client
+            .get("/noop")
+            .header("x-tenant-id", "baseline")
+            .send()
+            .await
+            .assert_ok();
     }
-    let process = process_cpu().saturating_sub(before);
+    let noop_process = process_cpu().saturating_sub(before);
+    let noop_metered =
+        Duration::from_micros(accountant.snapshot().total.cpu_micros - metered_before);
+    let outside_layer = noop_process.saturating_sub(noop_metered);
+
+    let metered_before = accountant.snapshot().total.cpu_micros;
+    let before = process_cpu();
+    for _ in 0..ROUNDS {
+        client
+            .get("/heavy")
+            .header("x-tenant-id", "acme")
+            .send()
+            .await
+            .assert_ok();
+        client
+            .get("/light")
+            .header("x-tenant-id", "globex")
+            .send()
+            .await
+            .assert_ok();
+    }
+    let process = process_cpu()
+        .saturating_sub(before)
+        .saturating_sub(outside_layer);
 
     let snapshot = accountant.snapshot();
     let acme = snapshot.tenants["acme"];
     let globex = snapshot.tenants["globex"];
-    let metered = Duration::from_micros(snapshot.total.cpu_micros - warmup_cpu);
+    let metered = Duration::from_micros(snapshot.total.cpu_micros - metered_before);
 
     #[allow(clippy::cast_precision_loss)]
     let ratio = metered.as_secs_f64() / process.as_secs_f64();
-    println!("metered {metered:?}, process {process:?}, ratio {ratio:.3}");
+    println!(
+        "metered {metered:?}, process {process:?} (outside the layer: {outside_layer:?}), \
+         ratio {ratio:.3}"
+    );
     assert!(
         (1.0 - TOLERANCE..=1.0 + TOLERANCE).contains(&ratio),
         "metered CPU {metered:?} must be within 10% of process CPU {process:?} (ratio {ratio:.3})"
@@ -131,10 +180,13 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
     // acme does three times the work of globex.
     #[allow(clippy::cast_precision_loss)]
     let share = acme.cpu_micros as f64 / globex.cpu_micros as f64;
-    assert!((2.5..=3.5).contains(&share), "acme/globex CPU share {share:.2}");
+    assert!(
+        (2.5..=3.5).contains(&share),
+        "acme/globex CPU share {share:.2}"
+    );
 
     // Each request allocates its buffer, and the probe sees it.
-    let floor = 10 * ALLOC_BYTES as u64;
+    let floor = u64::from(ROUNDS) * ALLOC_BYTES as u64;
     assert!(acme.allocated_bytes >= floor, "{acme:?}");
     assert!(globex.allocated_bytes >= floor, "{globex:?}");
 }

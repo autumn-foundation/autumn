@@ -1933,6 +1933,7 @@ impl DeployConfig {
 /// signal_refresh_secs = 5
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct CostConfig {
     /// Meter CPU time, allocated bytes and DB queries for each request.
     /// Default: `false`.
@@ -1954,6 +1955,30 @@ pub struct CostConfig {
     /// key. Default: `5`.
     #[serde(default = "default_cost_signal_refresh_secs")]
     pub signal_refresh_secs: u64,
+}
+
+impl CostConfig {
+    /// Check the values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message that names the bad key.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.defer_recheck_secs == 0 {
+            return Err("cost.defer_recheck_secs must be at least 1".to_owned());
+        }
+        if self.signal_refresh_secs == 0 {
+            return Err("cost.signal_refresh_secs must be at least 1".to_owned());
+        }
+        if let Some(threshold) = self.defer_threshold
+            && !(threshold.is_finite() && threshold >= 0.0)
+        {
+            return Err(format!(
+                "cost.defer_threshold must be a finite number >= 0, got {threshold}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for CostConfig {
@@ -5084,6 +5109,9 @@ impl AutumnConfig {
         // at apply time, so `autumn check` names the key. A cap of 0 would
         // silently drop every labeled sample the app records.
         self.metrics.validate()?;
+        // A zero recheck would spin; a negative threshold keeps deferrable work
+        // waiting for ever, because the runtime-config signal is never below 0.
+        self.cost.validate().map_err(ConfigError::Validation)?;
         // A `[replication]` block that is switched on but cannot ship (no
         // destination, both destinations, no credential indirection) must fail
         // here — so `autumn check` and `autumn doctor` see it too — rather than
@@ -15356,7 +15384,35 @@ path = "/healthz"
             toml::from_str("[cost]\nenabled = true\ndefer_threshold = 400.5\n").expect("parse");
         assert!(config.cost.enabled);
         assert_eq!(config.cost.defer_threshold, Some(400.5));
-        assert_eq!(config.cost.defer_recheck_secs, 30, "unset keys keep defaults");
+        assert_eq!(
+            config.cost.defer_recheck_secs, 30,
+            "unset keys keep defaults"
+        );
+    }
+
+    #[test]
+    fn cost_validation_names_the_bad_key() {
+        assert!(CostConfig::default().validate().is_ok());
+        let cost = CostConfig {
+            defer_recheck_secs: 0,
+            ..CostConfig::default()
+        };
+        assert!(cost.validate().unwrap_err().contains("defer_recheck_secs"));
+        let cost = CostConfig {
+            signal_refresh_secs: 0,
+            ..CostConfig::default()
+        };
+        assert!(cost.validate().unwrap_err().contains("signal_refresh_secs"));
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let cost = CostConfig {
+                defer_threshold: Some(bad),
+                ..CostConfig::default()
+            };
+            assert!(cost.validate().unwrap_err().contains("defer_threshold"));
+        }
+        let mut config = AutumnConfig::default();
+        config.cost.defer_recheck_secs = 0;
+        assert!(config.validate().is_err(), "AutumnConfig::validate runs it");
     }
 
     #[test]

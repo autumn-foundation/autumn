@@ -725,12 +725,16 @@ impl ConfigRegistry {
     /// [`RegistryError::DuplicateKey`] when the key is already declared.
     pub fn define_cost_signal(&mut self) -> Result<(), RegistryError> {
         self.define(
-            ConfigKeySchema::new(COST_SIGNAL_KEY, ConfigValueType::Float, ConfigValue::Float(0.0))
-                .description("Live cost signal: carbon g/kWh or price per unit (issue #1720)")
-                .validator(ConfigValidator::FloatRange {
-                    min: Some(0.0),
-                    max: None,
-                }),
+            ConfigKeySchema::new(
+                COST_SIGNAL_KEY,
+                ConfigValueType::Float,
+                ConfigValue::Float(0.0),
+            )
+            .description("Live cost signal: carbon g/kWh or price per unit (issue #1720)")
+            .validator(ConfigValidator::FloatRange {
+                min: Some(0.0),
+                max: None,
+            }),
         )
     }
 }
@@ -1409,6 +1413,11 @@ impl RuntimeConfigService {
     #[must_use]
     pub fn new(registry: Arc<ConfigRegistry>, store: Arc<dyn ConfigStore>) -> Self {
         Self { registry, store }
+    }
+
+    /// The registry of declared keys.
+    pub(crate) fn registry(&self) -> &ConfigRegistry {
+        &self.registry
     }
 
     /// Read the current value for `key`, falling back to the schema default.

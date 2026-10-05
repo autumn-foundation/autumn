@@ -1221,18 +1221,14 @@ impl crate::actuator::ProvideActuatorState for AppState {
             .map(|handle| (*handle).clone())
     }
 
-    fn cost_plane(
-        &self,
-    ) -> (
-        Option<crate::cost::CostSignal>,
-        Option<crate::cost::CostAccountant>,
-    ) {
-        (
-            self.extension::<crate::cost::CostSignal>()
-                .map(|signal| (*signal).clone()),
-            self.extension::<crate::cost::CostAccountant>()
-                .map(|accountant| (*accountant).clone()),
-        )
+    fn cost_signal(&self) -> Option<crate::cost::CostSignal> {
+        self.extension::<crate::cost::CostSignal>()
+            .map(|signal| (*signal).clone())
+    }
+
+    fn cost_accountant(&self) -> Option<crate::cost::CostAccountant> {
+        self.extension::<crate::cost::CostAccountant>()
+            .map(|accountant| (*accountant).clone())
     }
 
     fn deploy_version(&self) -> String {

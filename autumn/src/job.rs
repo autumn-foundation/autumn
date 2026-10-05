@@ -1240,6 +1240,16 @@ impl JobAdminMemoryBackend {
         }
     }
 
+    /// `true` when an operator canceled the job `id`.
+    fn is_canceled(&self, id: &str) -> bool {
+        self.inner.read().is_ok_and(|inner| {
+            inner
+                .records
+                .get(id)
+                .is_some_and(|record| record.status == JobAdminStatus::Canceled)
+        })
+    }
+
     fn record_success(&self, id: &str) {
         let Ok(mut inner) = self.inner.write() else {
             return;
@@ -4785,7 +4795,9 @@ pub fn start_runtime(
     })?;
 
     crate::job_tracking::ensure_tracking_store_installed_from_config(state, config);
-    warn_deferrable_jobs_not_deferred(&jobs, &config.backend);
+    if run_workers {
+        warn_deferrable_jobs_not_deferred(state, &jobs, &config.backend);
+    }
 
     match config.backend.as_str() {
         "local" => {
@@ -5324,8 +5336,11 @@ pub(crate) fn start_local_runtime_inner(
 /// Only the `local` backend defers jobs in this slice (issue #1720). On the
 /// durable backends the job runs as usual, so say so at boot rather than fail
 /// silently.
-fn warn_deferrable_jobs_not_deferred(jobs: &[JobInfo], backend: &str) {
-    if backend == "local" {
+fn warn_deferrable_jobs_not_deferred(state: &AppState, jobs: &[JobInfo], backend: &str) {
+    let deferral_on = state
+        .extension::<crate::cost::CostSignal>()
+        .is_some_and(|signal| signal.threshold().is_some());
+    if backend == "local" || !deferral_on {
         return;
     }
     for job in jobs {
@@ -5648,17 +5663,23 @@ async fn execute_local_job(
     };
 
     // Cost gate (issue #1720): a deferrable job waits while the cost signal is
-    // high. It has not started, so it holds no slot and uses no attempt. It
-    // goes back on the queue after the recheck interval, so it is never
-    // dropped. Its queued gauge stays as it is until it starts.
-    if let Some(signal) = crate::cost::deferral_signal(state, crate::cost::WorkKind::Job, &job.name)
+    // high. It has not started, so it holds no slot and uses no attempt, and
+    // its queued gauge does not change. One task waits for it and puts it back
+    // on the queue when the signal falls. A canceled job goes back at once, so
+    // the cancel branch below settles it. A canceled job does not wait.
+    if !job_admin.is_canceled(&job.id)
+        && let Some(signal) =
+            crate::cost::deferral_signal(state, crate::cost::WorkKind::Job, &job.name)
     {
         crate::cost::note_deferral(&signal);
-        tracing::debug!(job = %job.name, value = signal.value(), "cost signal is high; job deferred");
+        tracing::info!(job = %job.name, value = signal.value(), "cost signal is high; job waits");
         let sender = tx.clone();
-        let recheck = signal.recheck();
+        let job_admin = job_admin.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(recheck).await;
+            while signal.is_high() && !job_admin.is_canceled(&job.id) {
+                tokio::time::sleep(signal.recheck()).await;
+            }
+            tracing::info!(job = %job.name, "job goes back on the queue");
             let _ = sender.send(job).await;
         });
         return;

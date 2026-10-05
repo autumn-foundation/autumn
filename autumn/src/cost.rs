@@ -1,4 +1,4 @@
-//! Per-request cost accounting and a live cost signal (issue #1720).
+//! Per-request cost records and a live cost signal (issue #1720).
 //!
 //! This module has three parts:
 //!
@@ -10,18 +10,20 @@
 //!   [`COST_SIGNAL_KEY`](crate::runtime_config::COST_SIGNAL_KEY).
 //! - Deferral. Work marked `deferrable` (`#[job(deferrable)]`,
 //!   `#[scheduled(..., deferrable)]`) waits while the signal is above the
-//!   threshold. The work runs when the signal falls. It is never dropped.
-//!   Request handlers do not wait.
+//!   threshold. The work runs when the signal falls. The runtime never drops
+//!   the work. Request handlers do not wait. Scheduled tasks wait on all
+//!   backends. Only the `local` jobs backend makes jobs wait.
 //!
-//! Enable metering with `[cost] enabled = true`. See `docs/guide/cost.md`.
+//! Set `[cost] enabled = true` to measure requests. See `docs/guide/cost.md`.
 //!
 //! # How the CPU time is measured
 //!
 //! The layer reads the thread CPU clock before and after each poll of the
-//! request future. On Linux and macOS this is `CLOCK_THREAD_CPUTIME_ID`. On
-//! other targets it is the wall time of the poll. Work that the handler moves
-//! to another task (`tokio::spawn`, `spawn_blocking`) is not counted. Time
-//! spent to stream the response body is not counted.
+//! request future. On Linux, Android, macOS, iOS and FreeBSD this is
+//! `CLOCK_THREAD_CPUTIME_ID`. On other targets it is the wall time of the
+//! poll. The layer does not count work that the handler moves to another task
+//! (`tokio::spawn`, `spawn_blocking`). The layer does not count the time to
+//! stream the response body.
 //!
 //! # How the allocated bytes are measured
 //!
@@ -38,7 +40,7 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -57,6 +59,13 @@ pub const METRICS_SOURCE_NAME: &str = "autumn.cost";
 
 /// The default time between two checks while work waits, in milliseconds.
 const DEFAULT_RECHECK_MS: u64 = 30_000;
+
+/// The shortest time between two checks while work waits, in milliseconds.
+const MIN_RECHECK_MS: u64 = 1_000;
+
+/// The longest tenant id that gets its own key. A longer id goes into
+/// [`OVERFLOW_TENANT`], so a client cannot make large keys.
+pub const MAX_TENANT_KEY_BYTES: usize = 64;
 
 // ── Request cost ────────────────────────────────────────────────────
 
@@ -116,12 +125,11 @@ impl TenantCost {
         self.cpu_micros as f64 / 1_000_000.0
     }
 
-    fn add(&mut self, cost: &RequestCost) {
-        let micros = u64::try_from(cost.cpu.as_micros()).unwrap_or(u64::MAX);
+    const fn add(&mut self, cpu_micros: u64, allocated_bytes: u64, db_queries: u64) {
         self.requests = self.requests.saturating_add(1);
-        self.cpu_micros = self.cpu_micros.saturating_add(micros);
-        self.allocated_bytes = self.allocated_bytes.saturating_add(cost.allocated_bytes);
-        self.db_queries = self.db_queries.saturating_add(cost.db_queries);
+        self.cpu_micros = self.cpu_micros.saturating_add(cpu_micros);
+        self.allocated_bytes = self.allocated_bytes.saturating_add(allocated_bytes);
+        self.db_queries = self.db_queries.saturating_add(db_queries);
     }
 }
 
@@ -163,8 +171,12 @@ pub trait AllocationProbe: Send + Sync + 'static {
 /// Records request costs and keeps a total for each tenant.
 ///
 /// Clones share the same totals. The framework puts one in the app state
-/// when `[cost] enabled = true`, and registers it as the
+/// when `[cost] enabled = true`. It registers it as the
 /// [`METRICS_SOURCE_NAME`] metrics source.
+///
+/// The tenant key is the tenant id. These ids go into [`OVERFLOW_TENANT`]:
+/// an id longer than [`MAX_TENANT_KEY_BYTES`], an id equal to a reserved key,
+/// and a new id when the accountant has `max_tenants` keys.
 #[derive(Clone)]
 pub struct CostAccountant {
     inner: Arc<AccountantInner>,
@@ -173,6 +185,7 @@ pub struct CostAccountant {
 struct AccountantInner {
     max_tenants: usize,
     probe: Option<Arc<dyn AllocationProbe>>,
+    tenant_labels: bool,
     totals: Mutex<Totals>,
 }
 
@@ -187,6 +200,7 @@ impl std::fmt::Debug for CostAccountant {
         f.debug_struct("CostAccountant")
             .field("max_tenants", &self.inner.max_tenants)
             .field("probe", &self.inner.probe.is_some())
+            .field("tenant_labels", &self.inner.tenant_labels)
             .finish_non_exhaustive()
     }
 }
@@ -194,24 +208,50 @@ impl std::fmt::Debug for CostAccountant {
 impl CostAccountant {
     /// Make an accountant that keeps at most `max_tenants` tenant keys.
     ///
-    /// When the limit is reached, a new tenant goes into [`OVERFLOW_TENANT`].
-    /// This keeps memory and metric labels bounded.
+    /// When the accountant has `max_tenants` keys, it adds a new tenant to
+    /// [`OVERFLOW_TENANT`]. This keeps memory and metric labels bounded.
     #[must_use]
     pub fn new(max_tenants: usize) -> Self {
-        Self::build(max_tenants, None)
+        Self::build(max_tenants, None, true)
     }
 
-    /// Make an accountant that uses `probe` to count allocated bytes.
+    /// Use `probe` to count allocated bytes.
+    ///
+    /// Call this before you use the accountant: it starts with empty totals.
     #[must_use]
-    pub fn with_allocation_probe(max_tenants: usize, probe: Arc<dyn AllocationProbe>) -> Self {
-        Self::build(max_tenants, Some(probe))
+    pub fn with_allocation_probe(self, probe: Arc<dyn AllocationProbe>) -> Self {
+        Self::build(
+            self.inner.max_tenants,
+            Some(probe),
+            self.inner.tenant_labels,
+        )
     }
 
-    fn build(max_tenants: usize, probe: Option<Arc<dyn AllocationProbe>>) -> Self {
+    /// Set whether the metrics source shows one sample for each tenant.
+    ///
+    /// With `false`, each metric has one sample: the total. The framework sets
+    /// `false` when `[actuator] sensitive` is off, because `/actuator/metrics`
+    /// and `/actuator/prometheus` are public. Call this before you use the
+    /// accountant: it starts with empty totals.
+    #[must_use]
+    pub fn with_tenant_labels(self, tenant_labels: bool) -> Self {
+        Self::build(
+            self.inner.max_tenants,
+            self.inner.probe.clone(),
+            tenant_labels,
+        )
+    }
+
+    fn build(
+        max_tenants: usize,
+        probe: Option<Arc<dyn AllocationProbe>>,
+        tenant_labels: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(AccountantInner {
                 max_tenants,
                 probe,
+                tenant_labels,
                 totals: Mutex::new(Totals::default()),
             }),
         }
@@ -225,25 +265,51 @@ impl CostAccountant {
 
     /// Add one request to the totals.
     pub fn record(&self, cost: &RequestCost) {
-        let key = cost.tenant.as_deref().unwrap_or(UNATTRIBUTED_TENANT);
+        self.record_parts(
+            cost.cpu,
+            cost.allocated_bytes,
+            cost.db_queries,
+            cost.tenant.as_deref(),
+        );
+    }
+
+    /// Add one request to the totals, with a borrowed tenant id.
+    pub(crate) fn record_parts(
+        &self,
+        cpu: Duration,
+        allocated_bytes: u64,
+        db_queries: u64,
+        tenant: Option<&str>,
+    ) {
+        let micros = u64::try_from(cpu.as_micros()).unwrap_or(u64::MAX);
+        let key = match tenant {
+            None => UNATTRIBUTED_TENANT,
+            Some(id)
+                if id.len() > MAX_TENANT_KEY_BYTES
+                    || id == UNATTRIBUTED_TENANT
+                    || id == OVERFLOW_TENANT =>
+            {
+                OVERFLOW_TENANT
+            }
+            Some(id) => id,
+        };
         let mut totals = self.lock();
-        totals.total.add(cost);
-        let key = if totals.tenants.contains_key(key) || totals.tenants.len() < self.inner.max_tenants
-        {
+        totals.total.add(micros, allocated_bytes, db_queries);
+        // `get_mut` first: a known tenant does not allocate a key.
+        if let Some(entry) = totals.tenants.get_mut(key) {
+            entry.add(micros, allocated_bytes, db_queries);
+            return;
+        }
+        let key = if totals.tenants.len() < self.inner.max_tenants {
             key
         } else {
             OVERFLOW_TENANT
         };
-        // `get_mut` first: a known tenant does not allocate a key.
-        if let Some(entry) = totals.tenants.get_mut(key) {
-            entry.add(cost);
-        } else {
-            totals
-                .tenants
-                .entry(key.to_owned())
-                .or_default()
-                .add(cost);
-        }
+        totals
+            .tenants
+            .entry(key.to_owned())
+            .or_default()
+            .add(micros, allocated_bytes, db_queries);
     }
 
     /// Copy the current totals.
@@ -278,38 +344,44 @@ impl MetricsSource for CostAccountant {
     #[allow(clippy::cast_precision_loss)]
     fn collect(&self) -> Vec<MetricFamily> {
         let snapshot = self.snapshot();
+        let tenant_labels = self.inner.tenant_labels;
         let family = |name: &str, help: &str, value: fn(&TenantCost) -> f64| MetricFamily {
             name: name.to_owned(),
             help: help.to_owned(),
             kind: MetricKind::Counter,
-            samples: snapshot
-                .tenants
-                .iter()
-                .map(|(tenant, cost)| MetricSample {
-                    labels: vec![("tenant".to_owned(), tenant.clone())],
-                    value: value(cost),
-                })
-                .collect(),
+            samples: if tenant_labels {
+                snapshot
+                    .tenants
+                    .iter()
+                    .map(|(tenant, cost)| MetricSample {
+                        labels: vec![("tenant".to_owned(), tenant.clone())],
+                        value: value(cost),
+                    })
+                    .collect()
+            } else {
+                vec![MetricSample {
+                    labels: Vec::new(),
+                    value: value(&snapshot.total),
+                }]
+            },
         };
         vec![
-            family(
-                "autumn_cost_requests_total",
-                "Metered requests, by tenant.",
-                |c| c.requests as f64,
-            ),
+            family("autumn_cost_requests_total", "Measured requests.", |c| {
+                c.requests as f64
+            }),
             family(
                 "autumn_cost_cpu_seconds_total",
-                "CPU seconds that requests used, by tenant.",
+                "CPU seconds that requests used.",
                 TenantCost::cpu_seconds,
             ),
             family(
                 "autumn_cost_allocated_bytes_total",
-                "Bytes that requests allocated, by tenant. Zero without a probe.",
+                "Bytes that requests allocated. Zero without a probe.",
                 |c| c.allocated_bytes as f64,
             ),
             family(
                 "autumn_cost_db_queries_total",
-                "DB queries that requests ran, by tenant.",
+                "DB queries that requests ran.",
                 |c| c.db_queries as f64,
             ),
         ]
@@ -359,7 +431,8 @@ pub struct CostSignalSnapshot {
     pub threshold: Option<f64>,
     /// `true` when the value is above the threshold.
     pub high: bool,
-    /// How many times deferrable work waited.
+    /// How many times work started to wait. A job or a task tick that waits
+    /// adds one, however long it waits.
     pub deferrals: u64,
 }
 
@@ -387,7 +460,7 @@ impl CostSignal {
         signal
     }
 
-    /// Set the value. A value that is not finite is ignored.
+    /// Set the value. This function ignores a value that is not finite.
     pub fn set(&self, value: f64) {
         if value.is_finite() {
             self.inner.value.store(value.to_bits(), Ordering::Relaxed);
@@ -420,7 +493,8 @@ impl CostSignal {
     /// `true` when the value is above the threshold.
     #[must_use]
     pub fn is_high(&self) -> bool {
-        self.threshold().is_some_and(|threshold| self.value() > threshold)
+        self.threshold()
+            .is_some_and(|threshold| self.value() > threshold)
     }
 
     /// Copy the current state.
@@ -460,11 +534,13 @@ impl CostSignal {
 
     /// The time between two checks while work waits.
     pub(crate) fn recheck(&self) -> Duration {
-        Duration::from_millis(self.inner.recheck_ms.load(Ordering::Relaxed).max(1))
+        Duration::from_millis(self.inner.recheck_ms.load(Ordering::Relaxed))
     }
 
     fn set_recheck(&self, every: Duration) {
-        let ms = u64::try_from(every.as_millis()).unwrap_or(u64::MAX).max(1);
+        let ms = u64::try_from(every.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(MIN_RECHECK_MS);
         self.inner.recheck_ms.store(ms, Ordering::Relaxed);
     }
 
@@ -536,8 +612,9 @@ pub(crate) fn cpu_mark() -> CpuMark {
 /// move between threads, so this is true for the `CostLayer`.
 pub(crate) fn cpu_since(mark: CpuMark) -> Duration {
     match mark {
-        CpuMark::Thread(start) => thread_cpu_time()
-            .map_or(Duration::ZERO, |now| now.saturating_sub(start)),
+        CpuMark::Thread(start) => {
+            thread_cpu_time().map_or(Duration::ZERO, |now| now.saturating_sub(start))
+        }
         CpuMark::Wall(start) => start.elapsed(),
     }
 }
@@ -588,38 +665,61 @@ pub enum WorkKind {
     Task,
 }
 
-fn deferrable_names() -> &'static RwLock<HashSet<(WorkKind, String)>> {
-    static NAMES: OnceLock<RwLock<HashSet<(WorkKind, String)>>> = OnceLock::new();
-    NAMES.get_or_init(|| RwLock::new(HashSet::new()))
+/// The deferrable job and task names.
+#[derive(Default)]
+struct Deferrable {
+    /// `true` once any name is marked. The check is then one atomic load for
+    /// an app that marks nothing.
+    any: AtomicBool,
+    jobs: RwLock<HashSet<String>>,
+    tasks: RwLock<HashSet<String>>,
+}
+
+impl Deferrable {
+    const fn set(&self, kind: WorkKind) -> &RwLock<HashSet<String>> {
+        match kind {
+            WorkKind::Job => &self.jobs,
+            WorkKind::Task => &self.tasks,
+        }
+    }
+}
+
+fn deferrable() -> &'static Deferrable {
+    static NAMES: OnceLock<Deferrable> = OnceLock::new();
+    NAMES.get_or_init(Deferrable::default)
 }
 
 /// Mark the job or task `name` as deferrable.
 ///
 /// `#[job(deferrable)]` and `#[scheduled(..., deferrable)]` call this. Call it
 /// yourself for a `JobInfo` or `TaskInfo` that you make by hand. The mark is
-/// process-wide and cannot be removed.
+/// process-wide. You cannot remove it.
 pub fn mark_deferrable(kind: WorkKind, name: &str) {
     if is_deferrable(kind, name) {
         return;
     }
-    deferrable_names()
+    let names = deferrable();
+    names
+        .set(kind)
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert((kind, name.to_owned()));
+        .insert(name.to_owned());
+    names.any.store(true, Ordering::Release);
 }
 
 /// `true` when the job or task `name` is deferrable.
 #[must_use]
 pub fn is_deferrable(kind: WorkKind, name: &str) -> bool {
-    deferrable_names()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .any(|(k, n)| *k == kind && n == name)
+    let names = deferrable();
+    names.any.load(Ordering::Acquire)
+        && names
+            .set(kind)
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(name)
 }
 
-/// The app signal, when `name` must wait now: it is deferrable and the
-/// signal is high.
+/// Return the app signal when `name` is deferrable and the signal is high.
 pub(crate) fn deferral_signal(
     state: &crate::AppState,
     kind: WorkKind,
@@ -628,35 +728,55 @@ pub(crate) fn deferral_signal(
     if !is_deferrable(kind, name) {
         return None;
     }
-    state.extension::<CostSignal>().filter(|signal| signal.is_high())
+    state
+        .extension::<CostSignal>()
+        .filter(|signal| signal.is_high())
 }
 
 /// Wait while `name` must defer. Return `false` when `shutdown` fires first.
 ///
-/// The scheduler calls this before it takes the tick lease, so a waiting
-/// task holds no lease.
+/// The scheduler calls this after it takes the tick lease. Only the replica
+/// that holds the tick waits, so the tick runs one time. `waiting` is `true`
+/// during the wait.
 pub(crate) async fn wait_while_deferred(
     state: &crate::AppState,
     kind: WorkKind,
     name: &str,
     shutdown: &tokio_util::sync::CancellationToken,
+    waiting: Option<&AtomicBool>,
 ) -> bool {
     let Some(signal) = deferral_signal(state, kind, name) else {
         return true;
     };
     signal.note_deferral();
-    tracing::info!(task = name, value = signal.value(), "cost signal is high; deferring");
+    tracing::info!(
+        task = name,
+        value = signal.value(),
+        "cost signal is high; task waits"
+    );
+    if let Some(flag) = waiting {
+        flag.store(true, Ordering::Release);
+    }
+    let mut resumed = true;
     while signal.is_high() {
         tokio::select! {
-            () = shutdown.cancelled() => return false,
+            () = shutdown.cancelled() => {
+                resumed = false;
+                break;
+            }
             () = tokio::time::sleep(signal.recheck()) => {}
         }
     }
-    tracing::info!(task = name, "cost signal is low; resuming");
-    true
+    if let Some(flag) = waiting {
+        flag.store(false, Ordering::Release);
+    }
+    if resumed {
+        tracing::info!(task = name, "cost signal is low; task resumes");
+    }
+    resumed
 }
 
-/// Note one deferral on the app signal, if any.
+/// Note one deferral on the app signal.
 pub(crate) fn note_deferral(signal: &CostSignal) {
     signal.note_deferral();
 }
@@ -670,21 +790,22 @@ pub(crate) fn note_deferral(signal: &CostSignal) {
 ///   `[cost] defer_threshold`.
 /// - With `[cost] enabled`, a [`CostAccountant`] is present and registered as
 ///   the [`METRICS_SOURCE_NAME`] metrics source. It uses an
-///   `Arc<dyn AllocationProbe>` extension when the app inserted one.
+///   `Arc<dyn AllocationProbe>` extension when the app inserted one. Its
+///   metrics show tenant labels only when `[actuator] sensitive` is on.
 /// - With an `Arc<RuntimeConfigService>` extension that declares
 ///   [`COST_SIGNAL_KEY`](crate::runtime_config::COST_SIGNAL_KEY), a task
 ///   copies the key into the signal every `signal_refresh_secs`.
-pub(crate) fn install(state: &crate::AppState, config: &crate::config::CostConfig) {
-    let signal = state.extension_or_insert_with(|| CostSignal::new(config.defer_threshold));
-    signal.set_recheck(Duration::from_secs(config.defer_recheck_secs));
+pub(crate) fn install(state: &crate::AppState, config: &crate::config::AutumnConfig) {
+    let cost = &config.cost;
+    let signal = state.extension_or_insert_with(|| CostSignal::new(cost.defer_threshold));
+    signal.set_recheck(Duration::from_secs(cost.defer_recheck_secs));
 
-    if config.enabled && state.extension::<CostAccountant>().is_none() {
-        let accountant = state
-            .extension::<Arc<dyn AllocationProbe>>()
-            .map_or_else(
-                || CostAccountant::new(config.max_tenants),
-                |probe| CostAccountant::with_allocation_probe(config.max_tenants, (*probe).clone()),
-            );
+    if cost.enabled && state.extension::<CostAccountant>().is_none() {
+        let mut accountant =
+            CostAccountant::new(cost.max_tenants).with_tenant_labels(config.actuator.sensitive);
+        if let Some(probe) = state.extension::<Arc<dyn AllocationProbe>>() {
+            accountant = accountant.with_allocation_probe((*probe).clone());
+        }
         let registry = state.metrics_source_registry();
         if !registry.contains(METRICS_SOURCE_NAME)
             && let Err(error) = registry.register(METRICS_SOURCE_NAME, Arc::new(accountant.clone()))
@@ -694,41 +815,41 @@ pub(crate) fn install(state: &crate::AppState, config: &crate::config::CostConfi
         state.insert_extension(accountant);
     }
 
-    if let Some(service) = state.extension::<Arc<crate::runtime_config::RuntimeConfigService>>() {
+    if let Some(service) = state.extension::<Arc<crate::runtime_config::RuntimeConfigService>>()
+        && service
+            .registry()
+            .get(crate::runtime_config::COST_SIGNAL_KEY)
+            .is_some()
+    {
         spawn_signal_refresh(
             &signal,
-            Arc::clone(&service),
-            Duration::from_secs(config.signal_refresh_secs.max(1)),
+            Arc::clone(&*service),
+            Duration::from_secs(cost.signal_refresh_secs.max(1)),
         );
     }
 }
 
 /// Copy the runtime-config signal into `signal` until the signal is dropped.
+///
+/// The first read is in the task too: a Postgres store can block, and boot
+/// must not wait for it.
 fn spawn_signal_refresh(
     signal: &CostSignal,
-    service: Arc<Arc<crate::runtime_config::RuntimeConfigService>>,
+    service: Arc<crate::runtime_config::RuntimeConfigService>,
     every: Duration,
 ) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!("no tokio runtime; the cost signal does not follow runtime config");
         return;
     };
-    // An app that did not declare the key does not get a task.
-    match signal.sync_from(&service) {
-        Err(crate::runtime_config::ConfigError::UnknownKey(_)) => return,
-        Err(error) => tracing::warn!(%error, "cannot read the cost signal from runtime config"),
-        Ok(()) => {}
-    }
     let weak = Arc::downgrade(&signal.inner);
     handle.spawn(async move {
         loop {
-            tokio::time::sleep(every).await;
             let Some(inner) = weak.upgrade() else { return };
             let signal = CostSignal { inner };
             let service = Arc::clone(&service);
             // The store can block (Postgres), so read it off the reactor.
-            let result =
-                crate::time::spawn_blocking(move || signal.sync_from(&service)).await;
+            let result = crate::time::spawn_blocking(move || signal.sync_from(&service)).await;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -736,6 +857,7 @@ fn spawn_signal_refresh(
                 }
                 Err(error) => tracing::warn!(%error, "cost signal refresh task failed"),
             }
+            tokio::time::sleep(every).await;
         }
     });
 }
@@ -791,6 +913,36 @@ mod tests {
         assert_eq!(snapshot.tenants["a"].requests, 2);
         assert_eq!(snapshot.tenants[OVERFLOW_TENANT].requests, 2);
         assert_eq!(snapshot.total.requests, 5);
+    }
+
+    #[test]
+    fn long_and_reserved_tenant_ids_go_to_overflow() {
+        let accountant = CostAccountant::new(10);
+        let long = "x".repeat(MAX_TENANT_KEY_BYTES + 1);
+        accountant.record(&cost(1, 0, 0).with_tenant(long.as_str()));
+        accountant.record(&cost(1, 0, 0).with_tenant(UNATTRIBUTED_TENANT));
+        accountant.record(&cost(1, 0, 0).with_tenant(OVERFLOW_TENANT));
+        accountant.record(&cost(1, 0, 0).with_tenant("x".repeat(MAX_TENANT_KEY_BYTES)));
+
+        let snapshot = accountant.snapshot();
+        assert_eq!(snapshot.tenants[OVERFLOW_TENANT].requests, 3);
+        assert!(!snapshot.tenants.contains_key(UNATTRIBUTED_TENANT));
+        assert!(!snapshot.tenants.contains_key(long.as_str()));
+        assert_eq!(snapshot.tenants.len(), 2, "{:?}", snapshot.tenants.keys());
+    }
+
+    #[test]
+    fn metrics_without_tenant_labels_show_only_the_total() {
+        let accountant = CostAccountant::new(10).with_tenant_labels(false);
+        accountant.record(&cost(1_000_000, 0, 2).with_tenant("acme"));
+        accountant.record(&cost(1_000_000, 0, 1).with_tenant("globex"));
+
+        for family in accountant.collect() {
+            assert_eq!(family.samples.len(), 1, "{}", family.name);
+            assert!(family.samples[0].labels.is_empty(), "{}", family.name);
+        }
+        let db = &accountant.collect()[3];
+        assert!((db.samples[0].value - 3.0).abs() < f64::EPSILON);
     }
 
     #[test]
