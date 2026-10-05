@@ -3240,6 +3240,8 @@ done
   refs=',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
   [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_TEMPLATE_CLEAN" ] && env="$env$refs"
   [ -n "$STUB_APP_REDIS" ] && env="$env"',{"name":"AUTUMN_CACHE__BACKEND","value":"redis"},{"name":"AUTUMN_CACHE__REDIS__URL","secretRef":"redis-url"}'
+  # A secret that the operator added to the job, and an env var that uses it.
+  [ -n "$STUB_JOB_CUSTOM_KV" ] && [ -n "$STUB_APP_LEGACY" ] && env="$env"',{"name":"QUEUE_KEY","secretRef":"queue-key"}'
   # A placeholder app made by the old template has the job's credentials.
   legacy=""
   [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
@@ -3251,6 +3253,7 @@ done
   sid="$id"
   [ -n "$STUB_APP_STALE_SECRET_IDENTITY" ] && sid=/old-id
   [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$sid\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$sid\"}"
+  [ -n "$STUB_APP_LEGACY" ] && [ -n "$STUB_JOB_CUSTOM_KV" ] && secrets="$secrets,{\"name\":\"queue-key\",\"keyVaultUrl\":\"https://kv/secrets/queue-key\",\"identity\":\"$sid\"}"
   sidecar='{"name":"sidecar","image":"busybox"}'
   [ -n "$STUB_SIDECAR_SECRET_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_DB","secretRef":"database-url"}]}'
   [ -n "$STUB_SIDECAR_REDIS_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_REDIS","secretRef":"redis-url"}]}'
@@ -3275,6 +3278,7 @@ case "$1 $2" in
     secrets="$(secret database-url),$(secret signing-secret)"
     [ -n "$STUB_REDIS" ] && secrets="$secrets,$(secret redis-url)"
     [ -n "$STUB_JOB_NO_SECRETS" ] && secrets=""
+    [ -n "$STUB_JOB_CUSTOM_KV" ] && secrets="$secrets,$(secret queue-key)"
     # An inline secret that the operator added: job show omits its value,
     # and `job secret list --show-values` returns it.
     if [ -n "$STUB_JOB_INLINE_SECRET" ]; then
@@ -3433,7 +3437,9 @@ case "$1 $2" in
     if [ -n "$STUB_APP_REDIS" ]; then
       echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"redis-url\",\"keyVaultUrl\":\"https://kv/secrets/redis-url\",\"identity\":\"$id\"}]"
     elif [ -n "$STUB_APP_LEGACY" ]; then
-      echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}]"
+      custom=""
+      [ -n "$STUB_JOB_CUSTOM_KV" ] && custom=",{\"name\":\"queue-key\",\"keyVaultUrl\":\"https://kv/secrets/queue-key\",\"identity\":\"$id\"}"
+      echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}$custom]"
     else
       echo '[{"name":"api-key","value":"user-value"}]'
     fi
@@ -3562,6 +3568,7 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_JOB_CUSTOM_KV")
             .env_remove("STUB_ACTIVE_EMPTY_FIRST")
             .env_remove("STUB_TMP_MODES")
             .env_remove("STUB_JOB_INLINE_SECRET")
@@ -4106,6 +4113,39 @@ esac
         for line in modes {
             assert!(line.starts_with("mode -rw-------"), "{line}\n{calls}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_every_job_secret_from_the_placeholder() {
+        // The operator added queue-key to the migration job, so the cutover
+        // copied it to the app. --remove-credentials must remove it and the
+        // env var that uses it, like the three generated secrets.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_JOB_CUSTOM_KV", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage1 = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("a stage 1 PATCH: {bodies}"));
+        assert!(!stage1.contains("queue-key"), "{stage1}");
+        let stage2 = bodies
+            .lines()
+            .find(|line| line.contains("\"secrets\""))
+            .unwrap_or_else(|| panic!("a stage 2 PATCH: {bodies}"));
+        assert!(!stage2.contains("queue-key"), "{stage2}");
+        assert!(
+            stage2.contains("api-key"),
+            "the app's own secret stays: {stage2}"
+        );
     }
 
     #[cfg(unix)]
