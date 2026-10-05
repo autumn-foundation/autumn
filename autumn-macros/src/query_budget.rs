@@ -1453,6 +1453,9 @@ struct Binding {
     /// = &mut repos;` points to `repos`. After a branch it may point to more
     /// than one.
     referents: Vec<String>,
+    /// Each referent is borrowed whole (`&mut slot`, not `&mut slot.0`),
+    /// so a write through the binding replaces it.
+    whole: bool,
     /// A known future: `.await` on it runs what it names. A name bound to
     /// anything else that holds a handle (`PgPostRepository::new(&mut db)`,
     /// an `async fn new`) is reported when it is awaited.
@@ -1478,6 +1481,7 @@ impl Binding {
             parts: None,
             shape: None,
             referents: Vec::new(),
+            whole: false,
             future: false,
             output: None,
             pending_query: false,
@@ -1528,6 +1532,7 @@ impl Binding {
                 all.dedup();
                 all
             },
+            whole: self.whole && other.whole,
             future: self.future && other.future,
             output: self.output.max(other.output),
             pending_query: self.pending_query || other.pending_query,
@@ -2144,6 +2149,7 @@ impl Analyzer {
             parts,
             shape: self.shape_of(init),
             referents: self.referents_of(init),
+            whole: self.borrows_whole(init),
             future: self.is_known_future(init),
             pending_query: self.is_pending_query(init),
             output: match peel_parens(init) {
@@ -2252,6 +2258,19 @@ impl Analyzer {
         }
     }
 
+    /// Does `init` borrow a whole name (`&mut slot`), or name a binding that
+    /// does?
+    fn borrows_whole(&self, init: &Expr) -> bool {
+        match peel_parens(init) {
+            Expr::Reference(r) if r.mutability.is_some() => path_ident(peel_parens(&r.expr))
+                .is_some_and(|name| {
+                    let binding = self.env.binding(&name);
+                    binding.referents.is_empty() || binding.whole
+                }),
+            other => path_ident(other).is_some_and(|name| self.env.binding(&name).whole),
+        }
+    }
+
     /// `root` and every name it may point to through `&mut` bindings.
     fn alias_targets(&self, root: String) -> Vec<String> {
         let mut targets = vec![root];
@@ -2282,6 +2301,22 @@ impl Analyzer {
                 }
             }
             (Expr::Paren(p), _) => self.assign(&p.expr, value),
+            // `*target = None;` through an alias of one whole place writes
+            // that place. With more places, only one is written, so none
+            // clears. An alias of a part (`&mut slot.0`) writes only the part.
+            (Expr::Unary(u), _)
+                if matches!(u.op, syn::UnOp::Deref(_))
+                    && !self.is_opaque_value(value)
+                    && path_ident(&u.expr).is_some_and(|alias| {
+                        let binding = self.env.binding(&alias);
+                        binding.whole && binding.referents.len() == 1
+                    }) =>
+            {
+                let alias = path_ident(&u.expr).unwrap_or_default();
+                let target = self.env.binding(&alias).referents.remove(0);
+                let binding = self.binding_of(value);
+                self.assign_name(target, binding, Some(value));
+            }
             (Expr::Path(p), _) if p.path.get_ident().is_some() => {
                 let binding = self.binding_of(value);
                 if let Some(ident) = p.path.get_ident() {
@@ -2920,15 +2955,21 @@ impl Analyzer {
     /// every guard on the path can run: guards sum.
     fn match_expr(&mut self, m: &syn::ExprMatch, whole: &Expr) -> Flow {
         let scrutinee = self.expr(&m.expr);
-        let mut entry = self.env.clone();
-        // The guards tried so far, with their patterns: an arm's body runs
-        // after every guard before it whose pattern can match its value.
-        let mut tried: Vec<(&Pat, Cost)> = Vec::new();
+        let entry = self.env.clone();
+        // The guards tried so far, with their patterns and the bindings
+        // after them: an arm runs after every guard before it whose pattern
+        // can match its value.
+        let mut tried: Vec<(&Pat, Cost, Env)> = Vec::new();
         let mut bodies = Vec::new();
         let mut joined: Option<Env> = None;
         for arm in &m.arms {
-            self.env = entry.clone();
             let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
+            self.env = entry.clone();
+            for (earlier, _, after) in &tried {
+                if !patterns_disjoint(earlier, pat) {
+                    self.env.join(after);
+                }
+            }
             let depth = self.env.depth();
             let (guard, after_guard, body) = self.scoped(|s| {
                 s.bind_init(pat, &m.expr);
@@ -2945,18 +2986,17 @@ impl Analyzer {
             let guard_falls = guard.fall.clone();
             let prefix = tried
                 .iter()
-                .filter(|(earlier, _)| !patterns_disjoint(earlier, pat))
-                .fold(Cost::ZERO, |sum, (_, cost)| sum.then(cost.clone()));
+                .filter(|(earlier, _, _)| !patterns_disjoint(earlier, pat))
+                .fold(Cost::ZERO, |sum, (_, cost, _)| sum.then(cost.clone()));
             let body = Flow::cost(prefix).then(guard).then(body);
             // A later arm runs after this guard falls through, or after
             // this pattern fails (and the guard does not run).
             if let Some(cost) = guard_falls.clone() {
-                tried.push((pat, cost));
                 // A failing guard falls through to the next arm with its
                 // bindings.
                 let mut after_guard = after_guard;
                 after_guard.scopes.truncate(depth);
-                entry.join(&after_guard);
+                tried.push((pat, cost, after_guard));
             }
             // `_ if { return …; } => …`: no later arm can run.
             let ends = guard_falls.is_none() && pattern_always_matches(pat);
@@ -2975,7 +3015,13 @@ impl Analyzer {
                 break;
             }
         }
-        self.env = joined.unwrap_or(entry);
+        self.env = joined.unwrap_or_else(|| {
+            let mut all = entry;
+            for (_, _, after) in &tried {
+                all.join(after);
+            }
+            all
+        });
         let mixed = self.picks_mixed_deferred(whole);
         let mut flow = Flow::NEVER;
         for (body, value) in bodies {
@@ -11089,6 +11135,51 @@ mod tests {
                 "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
                  let _ = match x { E::V(_) if repo.a().await? => plain(), E::W(_) => repo.b().await?, _ => plain() }; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn disjoint_guard_bindings_and_clears_through_aliases() {
+        check_handlers(&[
+            (
+                "a guard binding does not reach a disjoint arm",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let mut slot = None; \
+                 match x { Some(_) if { slot = Some(&repo); false } => (), None => render(slot), Some(_) => () } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a guard binding reaches an overlapping arm",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let mut slot = None; \
+                 match x { Some(_) if { slot = Some(&repo); false } => (), _ => render(slot) } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a known value clears through a single alias",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = Some(repo); { let target = &mut slot; *target = None; } render(slot); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: an alias of two places does not clear either",
+                "async fn h(repo: PgPostRepository, other: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut left = Some(repo); let mut right = Some(other); \
+                 { let target = if flag { &mut left } else { &mut right }; *target = None; } render(left); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an alias of a part does not clear the whole",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut pair = (Some(repo), None); { let target = &mut pair.1; *target = None; } render(pair); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an opaque value through an alias keeps the handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = Some(repo); { let target = &mut slot; *target = make(); } render(slot); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
