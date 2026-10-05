@@ -494,8 +494,9 @@ What it does:
 - When the capsule declines, it sends the **original** request (body and
   credentials included) to the origin and returns the origin's response
   unchanged. The fallthrough detail does not reach the client.
-- It sends a write, or a request with a header value that is not UTF-8, to
-  the origin. It does not ask the capsule.
+- It sends a write, an `upgrade` handshake (WebSocket), or a request with a
+  header value that is not UTF-8, to the origin. It does not ask the
+  capsule.
 - It does not trust the capsule. A status outside 200-599, `set-cookie`, the
   fallthrough header, a hop-by-hop header, a body on 204/205/304, or a
   `content-length` that does not match the body is a `capsule_error`
@@ -557,8 +558,9 @@ Rules:
 - It does not follow redirects. It does not use `HTTP_PROXY` or
   `HTTPS_PROXY`.
 - It removes hop-by-hop headers in both directions.
-- It sends an `upgrade` request (WebSocket) to the origin. When the origin
-  answers `101`, the node copies bytes both ways until one side closes.
+- It sends an `upgrade` request (WebSocket) to the origin, never to the
+  capsule. When the origin answers `101`, the node copies bytes both ways
+  until one side closes.
 - It sets the forwarded headers before the capsule and the origin get the
   request, so both lanes see the same values. It removes `forwarded`.
   - From a `--trusted-proxy` peer, it keeps `x-forwarded-host`, keeps an

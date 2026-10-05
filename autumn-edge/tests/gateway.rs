@@ -561,3 +561,24 @@ fn the_response_header_check_refuses_framing_session_and_hop_headers() {
         assert!(err.contains(refused), "{err}");
     }
 }
+
+#[test]
+fn an_upgrade_request_skips_the_capsule() {
+    let seen = Seen::default();
+    let gateway = EdgeGateway::new(serving_guest(), origin(&seen));
+
+    let request = Request::get("/greet")
+        .header("connection", "keep-alive, Upgrade")
+        .header("upgrade", "websocket")
+        .body(Body::empty())
+        .unwrap();
+    let response = block_on(gateway.handle(request));
+
+    assert_eq!(lane(&response), Lane::OriginOnly);
+    assert_eq!(body_text(response), "origin");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the origin gets the handshake"
+    );
+}

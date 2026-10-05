@@ -21,7 +21,8 @@
 //! - **Writes skip the capsule.** A method other than `GET`/`HEAD` goes
 //!   directly to the origin, with the same reason the capsule would give.
 //! - **A request the wire cannot carry skips the capsule.** A header value
-//!   that is not UTF-8 goes to the origin as [`Lane::OriginOnly`].
+//!   that is not UTF-8, or an `upgrade` handshake (WebSocket), goes to the
+//!   origin as [`Lane::OriginOnly`].
 //! - **The gateway does not trust the capsule.** A status outside 200-599, an
 //!   invalid header, `set-cookie`, [`FALLTHROUGH_SENTINEL`], a hop-by-hop
 //!   header, a body on 204/205/304, or a `content-length` that does not match
@@ -60,8 +61,8 @@ pub enum Lane {
     Edge,
     /// The capsule declined, for this reason. The origin served the response.
     Fallthrough(FallthroughReason),
-    /// The request cannot cross the wire. The origin served it and the
-    /// capsule was not asked.
+    /// The request cannot cross the wire, or is an `upgrade` handshake. The
+    /// origin served it and the capsule was not asked.
     OriginOnly,
 }
 
@@ -161,7 +162,9 @@ where
         &self,
         request: Request<Body>,
     ) -> impl Future<Output = Response<Body>> + Send + 'static + use<O> {
-        let lane = if is_edge_method(request.method().as_str()) {
+        let lane = if is_upgrade(&request) {
+            Err(Lane::OriginOnly)
+        } else if is_edge_method(request.method().as_str()) {
             edge_request(&request).map_or(Err(Lane::OriginOnly), |edge| {
                 self.ask_capsule(&edge).map_err(Lane::Fallthrough)
             })
@@ -228,6 +231,18 @@ where
         let response = self.handle(request);
         Box::pin(async move { Ok(response.await) })
     }
+}
+
+/// An `upgrade` handshake (WebSocket): only the origin can answer it.
+fn is_upgrade<B>(request: &Request<B>) -> bool {
+    request.headers().contains_key(http::header::UPGRADE)
+        && request
+            .headers()
+            .get_all(http::header::CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
 }
 
 /// The same rule as the capsule's own method check.
