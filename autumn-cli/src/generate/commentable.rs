@@ -179,7 +179,34 @@ enum CommentsTable {
 
 /// Replay the history once and classify the `comments` table.
 fn comments_table(project_root: &Path) -> CommentsTable {
-    let tables = replay_migration_history(&migration_up_sql(project_root));
+    classify(&migration_up_sql(project_root))
+}
+
+/// Whether the shared table survives a `destroy` of the model whose own table
+/// is `comments` (#2283).
+///
+/// The replay leaves out every `*_create_comments` migration except the
+/// generator's byte-identical shared one, as if `destroy` removed it. The
+/// shared table must still come out whole.
+#[must_use]
+pub fn shared_table_survives_comment_model_destroy(
+    project_root: &Path,
+    backend: autumn_web::config::DatabaseBackend,
+) -> bool {
+    let ours = up_sql(backend);
+    let kept = migration_up_sql_where(project_root, |dir, sql| {
+        let named_like_ours = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(MIGRATION_SUFFIX));
+        !named_like_ours || sql == ours
+    });
+    classify(&kept) == CommentsTable::Shared
+}
+
+/// Classify the `comments` table that `files`, replayed in order, leave.
+fn classify(files: &[String]) -> CommentsTable {
+    let tables = replay_migration_history(files);
     match tables.get(&TableRef::comments()) {
         Some(table) if table.exists => {
             let missing = table.missing_columns();
@@ -932,6 +959,11 @@ pub fn parent_cleanup_down_sql(
 
 /// Every migration's `up.sql`, lowercased with SQL comments stripped.
 fn migration_up_sql(project_root: &Path) -> Vec<String> {
+    migration_up_sql_where(project_root, |_, _| true)
+}
+
+/// [`migration_up_sql`], keeping only the migrations `keep(dir, raw_sql)` accepts.
+fn migration_up_sql_where(project_root: &Path, keep: impl Fn(&Path, &str) -> bool) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(project_root.join("migrations")) else {
         return Vec::new();
     };
@@ -945,7 +977,10 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
         .collect();
     dirs.sort();
     dirs.into_iter()
-        .filter_map(|dir| std::fs::read_to_string(dir.join("up.sql")).ok())
+        .filter_map(|dir| {
+            let sql = std::fs::read_to_string(dir.join("up.sql")).ok()?;
+            keep(&dir, &sql).then_some(sql)
+        })
         .map(|sql| strip_sql_comments(&sql))
         .collect()
 }
@@ -1255,11 +1290,8 @@ fn commentable_declared_below(dir: &Path, destroying_path: &Path) -> bool {
 
 /// Whether some migration's `up.sql` is byte-identical to what [`up_sql`]
 /// emits for `backend` — i.e. this generator wrote it.
-///
-/// `destroy` of a `Comment` model also asks this (#2283): only such a
-/// migration is sure to be a separate one that creates the shared table.
 #[must_use]
-pub fn generator_owned_comments_migration(
+fn generator_owned_comments_migration(
     project_root: &Path,
     backend: autumn_web::config::DatabaseBackend,
 ) -> bool {

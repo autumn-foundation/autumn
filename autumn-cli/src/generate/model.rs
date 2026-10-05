@@ -356,12 +356,12 @@ fn plan_model_with_options_impl(
     }
     // The other way round: a `comments` table adopted as the shared one still
     // starts with this model's `CREATE TABLE`. Removing it breaks every other
-    // `#[commentable]` model on a fresh database. When the generator wrote a
-    // separate shared migration, this model's migration is not needed.
+    // `#[commentable]` model on a fresh database. Allow it only when the shared
+    // table survives without this model's migration.
     if for_revert
         && table == super::commentable::COMMENTS_TABLE
         && super::commentable::another_model_is_still_commentable(project_root, &snake_name)
-        && !super::commentable::generator_owned_comments_migration(project_root, backend)
+        && !super::commentable::shared_table_survives_comment_model_destroy(project_root, backend)
     {
         return Err(GenerateError::Config(format!(
             "cannot destroy `{pascal_name}`: other `#[commentable]` models use its \
@@ -7774,6 +7774,53 @@ autumn-web = \"0.3\"\n";
             )
             .is_err(),
             "the migration `destroy` removes is the only shared table"
+        );
+    }
+
+    /// The generator's shared migration exists, but a later migration renames
+    /// its table away. The adopted `Comment` table is then the live one, so
+    /// `destroy` must still refuse.
+    #[test]
+    fn a_comment_model_revert_is_refused_when_the_generated_table_was_renamed_away() {
+        let tmp = project_with_the_shared_comments_table();
+        let migrations = tmp.path().join("migrations");
+        for (dir, sql) in [
+            (
+                "202604270000003_retire_comments",
+                "ALTER TABLE comments RENAME TO legacy_comments;\n",
+            ),
+            (
+                "202604280000000_create_comments",
+                "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, \
+                 created_at TIMESTAMP NOT NULL);\n",
+            ),
+            (
+                "202604290000000_adopt_comments",
+                "ALTER TABLE comments ADD COLUMN commentable_type TEXT, \
+                 ADD COLUMN commentable_id BIGINT, ADD COLUMN parent_id BIGINT, \
+                 ADD COLUMN author_id BIGINT, ADD COLUMN deleted_at TIMESTAMP;\n",
+            ),
+        ] {
+            fs::create_dir_all(migrations.join(dir)).unwrap();
+            fs::write(migrations.join(dir).join("up.sql"), sql).unwrap();
+        }
+        fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+        fs::write(
+            tmp.path().join("src/models/post.rs"),
+            "#[commentable]\npub struct Post {}\n",
+        )
+        .unwrap();
+
+        assert!(
+            plan_model_with_options_for_revert(
+                tmp.path(),
+                "Comment",
+                &["body:Text".into()],
+                "20260101000000",
+                &ModelOptions::default(),
+            )
+            .is_err(),
+            "the live shared table starts with the `Comment` migration"
         );
     }
 }

@@ -7,7 +7,7 @@
   stopped on "already exists". The error names the missing columns and the
   steps to correct it. The generator writes no files. A `Comment` model
   generated after the shared table exists is refused for the same reason.
-  `autumn destroy` refuses to remove a `Comment` model while another model is
-  `#[commentable]`, unless the generator wrote a separate shared migration.
+  `autumn destroy` refuses to remove a `Comment` model whose migration the
+  shared table of another `#[commentable]` model needs.
 - **cli:** `autumn generate scaffold … comments:commentable` now plans the
   shared `comments` migration once and prints its notes once.
