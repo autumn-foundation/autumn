@@ -172,7 +172,8 @@ The analysis follows the handle through every name that holds it:
     method on a user struct that holds a handle (`ctx.clear()` on
     `Ctx { repo }`) is reported too.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
-    `Option<Vec<…>>`, `[ctx]`) keeps that shape for all its parts. Every
+    `Option<Vec<…>>`, `[ctx]`, or `repos.iter().map(|r| Ctx { repo: r })`)
+    keeps that shape for all its parts. Every
     method on it or on a part of it is reported. `Arc<Vec<…>>` is a plain
     container: a smart pointer adds no depth.
   - A helper handed the container is reported.

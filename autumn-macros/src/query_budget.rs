@@ -208,6 +208,9 @@ const HANDLE_TYPES: &[&str] = &[
 /// `checkout()` (Codex review, PR #2762, round 7).
 const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Extension", "State"];
 
+/// Container methods whose result holds what their closure returns.
+const MAPPING_ADAPTERS: &[&str] = &["map", "filter_map", "flat_map", "and_then", "scan"];
+
 /// Methods whose result has the receiver's type.
 const SAME_TYPE_METHODS: &[&str] = &["clone", "to_owned"];
 
@@ -1254,8 +1257,11 @@ enum Target {
     /// A function, closure or async body. `return` and `?` land here, and
     /// `break` does not cross it.
     Body,
-    /// A loop or a labeled block. `break` and `continue` land here.
-    Break,
+    /// A loop. An unlabeled `break` or `continue`, or one with its label,
+    /// lands here.
+    Loop,
+    /// A labeled block. A `break` with its label lands here.
+    Block,
 }
 
 /// What a loop is, for [`Analyzer::loop_flow`].
@@ -1271,6 +1277,8 @@ struct LoopShape<'a> {
 /// Where an exit lands, and the bindings at the exits that land there.
 struct ExitFrame {
     target: Target,
+    /// The frame's label, without the `'`.
+    label: Option<String>,
     /// The scope depth when the frame opened.
     depth: usize,
     /// The join of the bindings at every exit that landed here.
@@ -1333,7 +1341,7 @@ impl Analyzer {
 
     /// The cost of the handler's body.
     fn function_body(&mut self, block: &Block) -> Cost {
-        self.framed(Target::Body, |s| s.block(block).total())
+        self.framed(Target::Body, None, |s| s.block(block).total())
     }
 
     fn count(&mut self, what: &str) -> Cost {
@@ -1537,9 +1545,15 @@ impl Analyzer {
 
     /// Run `f` in an exit frame, then join the bindings of every exit that
     /// landed in it.
-    fn framed<T>(&mut self, target: Target, f: impl FnOnce(&mut Self) -> T) -> T {
+    fn framed<T>(
+        &mut self,
+        target: Target,
+        label: Option<&syn::Label>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         self.exits.push(ExitFrame {
             target,
+            label: label.map(|l| l.name.ident.to_string()),
             depth: self.env.depth(),
             env: None,
         });
@@ -1552,15 +1566,22 @@ impl Analyzer {
         out
     }
 
-    /// Record the bindings at a `break` or `continue`. Labels are not
-    /// resolved, so every loop and labeled block up to the enclosing body
-    /// gets them.
-    fn exit_loop(&mut self) {
+    /// Record the bindings at a `break` or `continue` in the frame it
+    /// targets: the nearest loop, or the frame with its label.
+    fn exit_loop(&mut self, label: Option<&syn::Lifetime>) {
+        let label = label.map(|l| l.ident.to_string());
         for frame in self.exits.iter_mut().rev() {
             if frame.target == Target::Body {
                 break;
             }
-            frame.record(&self.env);
+            let hit = match &label {
+                None => frame.target == Target::Loop,
+                Some(name) => frame.label.as_ref() == Some(name),
+            };
+            if hit {
+                frame.record(&self.env);
+                return;
+            }
         }
     }
 
@@ -1825,7 +1846,7 @@ impl Analyzer {
 
             Expr::Block(b) if b.label.is_some() => {
                 // `break 'label` lands after the block.
-                let mut flow = self.framed(Target::Break, |s| s.block(&b.block));
+                let mut flow = self.framed(Target::Block, b.label.as_ref(), |s| s.block(&b.block));
                 let own = worst_of(flow.take_exits(b.label.as_ref(), false));
                 Flow {
                     fall: worst(flow.fall, own),
@@ -1837,9 +1858,9 @@ impl Analyzer {
             | Expr::TryBlock(syn::ExprTryBlock { block, .. }) => self.block(block),
             // An async block may never be polled. A `return` or `?` in it
             // leaves the block only.
-            Expr::Async(a) => {
-                Flow::cost(self.optional(|s| s.framed(Target::Body, |s| s.block(&a.block).total())))
-            }
+            Expr::Async(a) => Flow::cost(
+                self.optional(|s| s.framed(Target::Body, None, |s| s.block(&a.block).total())),
+            ),
             Expr::Const(c) => Flow::cost(self.block(&c.block).total()),
 
             Expr::Array(a) => self.each(a.elems.iter()),
@@ -1852,7 +1873,7 @@ impl Analyzer {
             // The right side of `&&` / `||` may not run.
             Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) => {
                 let left = self.expr(&b.left);
-                left.then(self.optional(|s| s.expr(&b.right)))
+                left.then(Flow::ZERO.or_worst(self.optional(|s| s.expr(&b.right))))
             }
             Expr::Binary(b) => self.expr(&b.left).then(self.expr(&b.right)),
             Expr::Return(r) => {
@@ -1862,11 +1883,11 @@ impl Analyzer {
             }
             Expr::Break(b) => {
                 let value = b.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
-                self.exit_loop();
+                self.exit_loop(b.label.as_ref());
                 value.then(Flow::exit_to(b.label.as_ref(), true))
             }
             Expr::Continue(c) => {
-                self.exit_loop();
+                self.exit_loop(c.label.as_ref());
                 Flow::exit_to(c.label.as_ref(), false)
             }
             Expr::Cast(c) => self.expr(&c.expr),
@@ -1974,7 +1995,7 @@ impl Analyzer {
     /// A closure's body, with parameter `i` bound to `params[i]`, or to
     /// `rest` past the end. A `return` inside leaves the closure only.
     fn closure_body(&mut self, closure: &syn::ExprClosure, params: &[Kind], rest: Kind) -> Cost {
-        self.framed(Target::Body, |s| {
+        self.framed(Target::Body, None, |s| {
             s.scoped(|s| {
                 for (i, input) in closure.inputs.iter().enumerate() {
                     s.bind_pat(input, params.get(i).copied().unwrap_or(rest));
@@ -2042,7 +2063,8 @@ impl Analyzer {
         mut body: impl FnMut(&mut Self) -> Flow,
     ) -> Flow {
         let before = self.ledger.len();
-        let mut flow = self.repeated(|s| s.framed(Target::Break, |s| s.scoped(&mut body)));
+        let mut flow =
+            self.repeated(|s| s.framed(Target::Loop, shape.label, |s| s.scoped(&mut body)));
         let own = flow.take_exits(shape.label, true);
         // Only a `break` to this loop ends a `loop`; a `continue` does not.
         let ends = shape.ends || own.iter().any(|(exit, _)| exit.breaks);
@@ -2560,15 +2582,22 @@ impl Analyzer {
                 .map_or_else(|| self.expr_is_nested(&f.base), |k| k == Kind::Nested),
             Expr::Index(i) => self.expr_is_nested(&i.expr),
             Expr::Try(t) => self.expr_is_nested(&t.expr),
-            // Any part of a nested value, or the result of a user method on a
-            // holder: its shape is not known.
+            // Any part of a nested value, the result of a user method on a
+            // holder, or a mapping whose closure gives containers or user
+            // values (`map(|r| Ctx { repo: r })`): its shape is not known.
             Expr::MethodCall(mc) => {
                 let method = mc.method.to_string();
                 !SCALAR_METHODS.contains(&method.as_str())
                     && (self.expr_is_nested(&mc.receiver)
                         || (self.expr_is_holder(&mc.receiver)
                             && !SAME_TYPE_METHODS.contains(&method.as_str())
-                            && !HANDLE_ACCESSORS.contains(&method.as_str())))
+                            && !HANDLE_ACCESSORS.contains(&method.as_str()))
+                        || (MAPPING_ADAPTERS.contains(&method.as_str())
+                            && self.expr_is_carrier(&mc.receiver)
+                            && mc
+                                .args
+                                .last()
+                                .is_some_and(|f| self.closure_gives_container(f))))
             }
             Expr::Array(a) => a.elems.iter().any(container),
             Expr::Tuple(t) => t.elems.iter().any(container),
@@ -2588,6 +2617,29 @@ impl Analyzer {
             Expr::Block(b) => block_tail(&b.block).is_some_and(|e| self.expr_is_nested(e)),
             _ => false,
         }
+    }
+
+    /// Does the closure `f`, given a handle, return a container or a user
+    /// value? It is read in a copy of the bindings, with its parameters bound
+    /// to handles.
+    fn closure_gives_container(&self, f: &Expr) -> bool {
+        let Expr::Closure(closure) = f else {
+            return false;
+        };
+        let mut probe = Self {
+            env: self.env.clone(),
+            exits: Vec::new(),
+            ledger: Vec::new(),
+            errors: Vec::new(),
+        };
+        probe.env.push();
+        for input in &closure.inputs {
+            probe.bind_pat(input, Kind::Handle);
+        }
+        matches!(
+            probe.value_of(&closure.body),
+            Kind::Carrier | Kind::Holder | Kind::Nested
+        )
     }
 
     /// Is `e` a user value that holds a handle (`Ctx { repo }`)? Its methods
@@ -6291,6 +6343,37 @@ mod tests {
             unclassed.is_empty(),
             "unclassed container methods: {unclassed:?}"
         );
+    }
+
+    #[test]
+    fn a_short_circuit_and_a_labeled_exit_keep_their_paths() {
+        let cases: &[(&str, &str, Expect)] = &[
+            // When `flag` is true the right side is skipped and the query runs.
+            (
+                "short-circuit right side that returns",
+                "let _ = flag || { return Ok(0); }; let _ = repo.find_all();",
+                Expect::Exact(1),
+            ),
+            // `continue 'outer` lands at the outer loop's head, not after the
+            // inner loop, so `slot` there is still plain.
+            (
+                "labeled continue skips the code after the inner loop",
+                "'outer: for _id in &ids { \
+                     let mut slot = None; \
+                     loop { if flag { slot = Some(&repo); continue 'outer; } break; } \
+                     let _ = render(slot); \
+                 }",
+                Expect::Exact(0),
+            ),
+            // The closure turns each handle into a user value.
+            (
+                "map closure producing user values",
+                "let contexts = vec![repo].into_iter().map(|r| Ctx { repo: r }).collect::<Vec<_>>(); \
+                 let _ = contexts[0].clear();",
+                Expect::Unbounded,
+            ),
+        ];
+        check_cases(cases);
     }
 
     #[test]
