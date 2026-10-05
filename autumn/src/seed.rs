@@ -120,6 +120,9 @@ impl SeedContext {
     /// 4. `database.primary_url` in `autumn.toml`
     /// 5. `database.url` in `autumn.toml`
     ///
+    /// With the `repl` feature and `AUTUMN_CONSOLE_REPL=1` (set by
+    /// `autumn console --repl`), this opens the REPL and ends the process.
+    ///
     /// # Errors
     ///
     /// Returns [`SeedContextError::NoDatabaseUrl`] if no database URL is
@@ -135,6 +138,13 @@ impl SeedContext {
         };
 
         let pool = create_pool(&config)?.ok_or(SeedContextError::NoDatabaseUrl)?;
+
+        // `autumn console --repl` (issue #2148): open the prompt here and end
+        // the process, so no playground code after `build()` runs.
+        #[cfg(feature = "repl")]
+        if crate::repl::requested() {
+            crate::repl::run_in_place(&pool);
+        }
 
         Ok(Self { pool, profile })
     }

@@ -1447,9 +1447,13 @@ enum Commands {
     /// An existing playground is never overwritten; pass `--force` to
     /// regenerate it from the template.
     ///
+    /// `--repl` opens an interactive Rhai prompt on the same playground
+    /// instead: no compile per query, reads only.
+    ///
     /// # Examples
     ///
     ///   autumn console
+    ///   autumn console --repl
     ///   autumn console --profile demo
     ///   autumn console --force
     #[command(visible_alias = "c", verbatim_doc_comment)]
@@ -1468,6 +1472,12 @@ enum Commands {
         /// running it.
         #[arg(long)]
         scaffold_only: bool,
+        /// Open an interactive Rhai prompt instead of running the playground
+        /// code. Builds once with `autumn-web/repl`; `Cargo.toml` does not
+        /// change. Reads only: `<Repository>::find_all()`, `find_by_id(id)`,
+        /// `count()`.
+        #[arg(long)]
+        repl: bool,
     },
 
     /// Run the project's seed binary to populate the database with representative data.
@@ -5061,7 +5071,8 @@ fn run_command(command: Commands) {
             package,
             force,
             scaffold_only,
-        } => console::run(&profile, package.as_deref(), force, scaffold_only),
+            repl,
+        } => console::run(&profile, package.as_deref(), force, scaffold_only, repl),
         Commands::Seed {
             profile,
             package,
@@ -8566,12 +8577,23 @@ mod tests {
                 package,
                 force,
                 scaffold_only,
+                repl,
             } => {
                 assert_eq!(profile, "dev");
                 assert!(package.is_none());
                 assert!(!force);
                 assert!(!scaffold_only);
+                assert!(!repl, "the REPL is opt-in");
             }
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_repl() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--repl"]).unwrap();
+        match cli.command {
+            Commands::Console { repl, .. } => assert!(repl),
             _ => panic!("expected Console command"),
         }
     }

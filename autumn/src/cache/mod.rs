@@ -107,6 +107,63 @@ pub fn clear_global_cache() {
     *GLOBAL_CACHE.write().expect("global cache lock poisoned") = None;
 }
 
+/// A boxed future returned by the async [`Cache`] methods.
+///
+/// Boxed so that `Cache` stays usable as `dyn Cache`.
+pub type CacheFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// An invalidation that did not complete. Stale data can still be served.
+///
+/// Returned by [`Cache::invalidate_async`] and
+/// [`Cache::invalidate_namespace_async`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("cache invalidation failed after {attempts} attempt(s): {reason}")]
+pub struct InvalidationError {
+    attempts: u32,
+    reason: String,
+}
+
+impl InvalidationError {
+    /// Make an error for an invalidation that failed after `attempts` tries.
+    pub fn new(attempts: u32, reason: impl Into<String>) -> Self {
+        Self {
+            attempts,
+            reason: reason.into(),
+        }
+    }
+
+    /// How many times the backend tried.
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// The last backend error, as text.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// Invalidations that failed after all retries, in this process.
+static INVALIDATION_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one invalidation that failed after all retries.
+///
+/// Shown as `autumn_cache_invalidation_failures_total`. Call it only where you
+/// drop the error. Do not call it where you return the error. Then each
+/// failure counts one time. A custom backend calls it from a sync method that
+/// cannot return the error.
+pub fn record_invalidation_failure() {
+    INVALIDATION_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Total of [`record_invalidation_failure`] calls in this process.
+#[must_use]
+pub fn invalidation_failures_total() -> u64 {
+    INVALIDATION_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Serializes same-process test code that mutates [`GLOBAL_CACHE`] via
 /// [`set_global_cache`]/[`clear_global_cache`].
 ///
@@ -157,6 +214,10 @@ pub trait Cache: Send + Sync + 'static {
     fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>);
 
     /// Remove a specific key.
+    ///
+    /// This method cannot report a failure. A backend that can fail must log
+    /// the failure and call [`record_invalidation_failure`]. Prefer
+    /// [`invalidate_async`](Cache::invalidate_async).
     fn invalidate(&self, key: &str);
 
     /// Remove all entries.
@@ -211,6 +272,50 @@ pub trait Cache: Send + Sync + 'static {
     ///
     /// [`try_acquire_fill_lock`]: Cache::try_acquire_fill_lock
     fn release_fill_lock(&self, _key: &str, _token: &str) {}
+
+    /// Remove a specific key, and return a failure.
+    ///
+    /// The default calls [`invalidate`](Cache::invalidate) and returns `Ok`.
+    /// A backend that does I/O (for example Redis) overrides it with a real
+    /// async call that does not block a runtime worker, and returns the error.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidationError`] when the key could not be removed. The old value
+    /// can still be served.
+    fn invalidate_async<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> CacheFuture<'a, Result<(), InvalidationError>> {
+        Box::pin(async move {
+            self.invalidate(key);
+            Ok(())
+        })
+    }
+
+    /// Async form of [`invalidate_namespace`](Cache::invalidate_namespace).
+    ///
+    /// The default calls the sync method and maps `false` to an error.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidationError`] when the backend cannot drop a namespace, or its
+    /// sweep failed. Entries of the namespace can still be served.
+    fn invalidate_namespace_async<'a>(
+        &'a self,
+        namespace: &'a str,
+    ) -> CacheFuture<'a, Result<(), InvalidationError>> {
+        Box::pin(async move {
+            if self.invalidate_namespace(namespace) {
+                Ok(())
+            } else {
+                Err(InvalidationError::new(
+                    1,
+                    "the backend cannot drop a namespace, or its sweep failed",
+                ))
+            }
+        })
+    }
 }
 
 /// Outcome of [`Cache::try_acquire_fill_lock`].
@@ -578,6 +683,75 @@ mod tests {
         let cache = MokaCache::new(10, None);
         let val: Option<String> = get_cached(&cache, "missing");
         assert!(val.is_none());
+    }
+
+    /// A backend that keeps only the required methods, to test the defaults.
+    struct MinimalBackend {
+        invalidated: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Cache for MinimalBackend {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+        fn invalidate(&self, key: &str) {
+            self.invalidated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key.to_owned());
+        }
+        fn clear(&self) {}
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn default_invalidate_async_calls_the_sync_method() {
+        let backend = MinimalBackend {
+            invalidated: std::sync::Mutex::new(Vec::new()),
+        };
+        block_on(backend.invalidate_async("k")).expect("the default cannot fail");
+        assert_eq!(
+            *backend
+                .invalidated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["k".to_owned()]
+        );
+    }
+
+    #[test]
+    fn default_invalidate_namespace_async_reports_an_unsupported_backend() {
+        let backend = MinimalBackend {
+            invalidated: std::sync::Mutex::new(Vec::new()),
+        };
+        let err = block_on(backend.invalidate_namespace_async("ns"))
+            .expect_err("a backend that cannot sweep must say so");
+        assert_eq!(err.attempts(), 1);
+    }
+
+    #[test]
+    fn invalidation_error_reports_attempts_and_reason() {
+        let err = InvalidationError::new(3, "READONLY");
+        assert_eq!(err.attempts(), 3);
+        assert_eq!(err.reason(), "READONLY");
+        assert_eq!(
+            err.to_string(),
+            "cache invalidation failed after 3 attempt(s): READONLY"
+        );
+    }
+
+    #[test]
+    fn invalidation_failures_counter_is_monotonic() {
+        let before = invalidation_failures_total();
+        record_invalidation_failure();
+        assert!(invalidation_failures_total() > before);
     }
 
     #[test]

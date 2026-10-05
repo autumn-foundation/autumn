@@ -11,6 +11,19 @@ verus verification/tenant_arena.rs
 The runtime correspondence and boundary are recorded in ADR 0012; executable
 tests remain authoritative for unmodeled allocator, HTTP, and concurrency glue.
 
+## Lease-lock fencing
+
+`lease_fencing.rs` models the `autumn_lease_locks` statements in
+`autumn/src/lock/lease.rs` (issue #3053, ADR 0015). Verify it with:
+
+```sh
+verus verification/lease_fencing.rs
+```
+
+It proves that tokens are unique and strictly increasing per lock name, and
+that a stale write is rejected. It does not prove that holders never overlap;
+the fencing token makes overlap safe.
+
 ## Billing plan gate
 
 `billing_gate.rs` models the plan gate selection in
