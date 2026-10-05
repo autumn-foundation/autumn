@@ -224,7 +224,7 @@ const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Ext
 
 /// Methods whose result is a container of what their callback returns:
 /// `ids.iter().map(|_| &repo)`, `flag.then(|| &repo)`.
-const WRAPPING_CALLBACKS: &[&str] = &["map", "then"];
+const WRAPPING_CALLBACKS: &[&str] = &["map", "then", "then_some"];
 
 /// Methods whose result is what their callback returns, or what their other
 /// arguments hold: `fold(init, f)`, `unwrap_or_else(f)`, `find_map(f)`.
@@ -361,6 +361,8 @@ const SCALAR_METHODS: &[&str] = &[
 /// Methods on a carrier that return a carrier: a view, an iterator, or an
 /// `Option` of a part.
 const CARRIER_METHODS: &[&str] = &[
+    "then",
+    "then_some",
     "iter",
     "iter_mut",
     "into_iter",
@@ -446,6 +448,8 @@ const ELEMENT_METHODS: &[&str] = &[
 
 /// The methods of each standard container [`Shape`]. Each list holds only
 /// the methods that container type has (#2316).
+const BOOL_METHODS: &[&str] = &["then", "then_some"];
+
 const VEC_METHODS: &[&str] = &[
     "len",
     "is_empty",
@@ -767,6 +771,8 @@ const TUPLE_METHODS: &[&str] = &["clone"];
 /// name (`ok()` on a `Vec`) that queries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
+    /// A `bool`: `then` gives an `Option`.
+    Bool,
     Vec,
     /// An array or a slice.
     Slice,
@@ -795,6 +801,7 @@ impl Shape {
     /// The methods this container has.
     const fn methods(self) -> &'static [&'static str] {
         match self {
+            Self::Bool => BOOL_METHODS,
             Self::Vec => VEC_METHODS,
             Self::Slice => SLICE_METHODS,
             Self::Deque => DEQUE_METHODS,
@@ -827,6 +834,9 @@ impl Shape {
 
     /// The shape of what `method` returns, when it returns a carrier.
     fn after(self, method: &str) -> Option<Self> {
+        if self == Self::Bool {
+            return matches!(method, "then" | "then_some").then_some(Self::Opt);
+        }
         match method {
             "iter" | "iter_mut" | "into_iter" | "drain" | "chunks" | "windows" | "keys"
             | "values" | "values_mut" | "into_keys" | "into_values" => Some(Self::Iter),
@@ -845,6 +855,7 @@ impl Shape {
 /// The shape of the standard container type `name`.
 fn shape_named(name: &str) -> Option<Shape> {
     match name {
+        "bool" => Some(Shape::Bool),
         "Vec" => Some(Shape::Vec),
         "VecDeque" => Some(Shape::Deque),
         "LinkedList" => Some(Shape::List),
@@ -2865,6 +2876,24 @@ impl Analyzer {
             Expr::Group(g) => self.shape_of(&g.expr),
             Expr::Array(_) | Expr::Repeat(_) => Some(Shape::Slice),
             Expr::Tuple(_) => Some(Shape::Tuple),
+            // A comparison, `&&`, `||`, `!` or a `bool` literal.
+            Expr::Binary(b)
+                if matches!(
+                    b.op,
+                    syn::BinOp::Eq(_)
+                        | syn::BinOp::Ne(_)
+                        | syn::BinOp::Lt(_)
+                        | syn::BinOp::Le(_)
+                        | syn::BinOp::Gt(_)
+                        | syn::BinOp::Ge(_)
+                        | syn::BinOp::And(_)
+                        | syn::BinOp::Or(_)
+                ) =>
+            {
+                Some(Shape::Bool)
+            }
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => Some(Shape::Bool),
+            Expr::Lit(l) if matches!(l.lit, syn::Lit::Bool(_)) => Some(Shape::Bool),
             Expr::Macro(m) => vec_elems(&m.mac).map(|_| Shape::Vec),
             Expr::Call(c) if is_smart_pointer_new(c) => {
                 c.args.first().and_then(|a| self.shape_of(a))
@@ -2999,7 +3028,10 @@ impl Analyzer {
             // values (`map(|r| Ctx { repo: r })`): its shape is not known.
             Expr::MethodCall(mc) => {
                 let method = mc.method.to_string();
-                !SCALAR_METHODS.contains(&method.as_str())
+                // A scalar name gives a plain value only on a std container:
+                // a user's `ctx.clear()` may return anything.
+                !(SCALAR_METHODS.contains(&method.as_str())
+                    && self.known_container_method(&mc.receiver, &method))
                     && (self.expr_is_nested(&mc.receiver)
                         // `repos.chunks(2)` yields slices of handles.
                         || (matches!(method.as_str(), "chunks" | "windows")
@@ -3017,8 +3049,10 @@ impl Analyzer {
             Expr::Tuple(t) => t.elems.iter().any(container),
             Expr::Repeat(r) => container(&r.expr),
             Expr::Call(c) => {
-                (is_container_constructor(c) || is_smart_pointer_new(c))
-                    && c.args.iter().any(container)
+                ((is_container_constructor(c) || is_smart_pointer_new(c))
+                    && c.args.iter().any(container))
+                    // `make()`, where `make` is a closure that holds a handle.
+                    || path_ident(&c.func).is_some_and(|name| self.env.get(&name) != Kind::Plain)
             }
             Expr::Macro(m) => vec_elems(&m.mac).is_some_and(|elems| elems.iter().any(container)),
             Expr::If(i) => {
@@ -3152,6 +3186,10 @@ impl Analyzer {
             }
             Expr::Loop(_) | Expr::Block(syn::ExprBlock { label: Some(_), .. }) => {
                 break_results(e).into_iter().any(|v| self.expr_is_holder(v))
+            }
+            // A closure that names a handle holds it, like a user value.
+            Expr::Closure(c) => {
+                tokens_mention_any(&c.body.to_token_stream(), &|name| self.env.is_tracked(name))
             }
             Expr::Reference(r) => self.expr_is_holder(&r.expr),
             Expr::Paren(p) => self.expr_is_holder(&p.expr),
@@ -7318,11 +7356,10 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                // `unwrap` on a container of unknown shape is reported.
                 "bool::then",
                 "let maybe = flag.then(|| &repo); let _ = maybe.unwrap().find_all().await?;"
                     .to_string(),
-                Expect::Unbounded,
+                Expect::Exact(1),
             ),
             (
                 "unwrap_or_else on a plain Option",
@@ -7435,6 +7472,52 @@ mod tests {
     }
 
     #[test]
+    fn closures_by_name_user_methods_and_bool_then_keep_their_kind() {
+        check_handlers(&[
+            (
+                "a closure bound to a name and mapped",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let make = |_| repo.clone(); let repos = ids.into_iter().map(make) \
+                 .collect::<Vec<_>>(); for r in &repos { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a closure bound to a name and called",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let make = || repo.clone(); let r = make(); r.refresh().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a user method with a std scalar name on a holder",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let ctx = Ctx { repo }; \
+                 #[query_exempt(reason = \"pure builder\")] let alias = ctx.clear(); \
+                 alias.refresh().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "bool::then on a bool parameter",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let maybe = flag.then(|| &repo); let _ = maybe.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "bool::then on a comparison",
+                "async fn h(repo: PgPostRepository, n: i64) -> AutumnResult<usize> { \
+                 let maybe = (n > 3).then(|| &repo); let _ = maybe.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            // Guard: `then` on an unknown receiver gives no `Option` shape.
+            (
+                "then on an unknown receiver",
+                "async fn h(repo: PgPostRepository, ids: Stream) -> AutumnResult<usize> { \
+                 let out = ids.then(|_| &repo); let _ = out.map(|r| r.find_all()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
     fn each_container_type_has_its_own_methods() {
         // `(parameter type, call)`: the type has no such method, so an
         // extension trait gives it, and it may query.
@@ -7503,6 +7586,7 @@ mod tests {
         // A known method whose result is not classed would give a plain
         // value, and a part taken through it would be lost.
         let shapes = [
+            Shape::Bool,
             Shape::Vec,
             Shape::Slice,
             Shape::Deque,

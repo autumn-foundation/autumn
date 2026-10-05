@@ -179,7 +179,8 @@ The analysis follows the handle through every name that holds it:
   - A callback's result holds what the callback returns, whatever the
     receiver holds: `ids.iter().map(|_| &repo)` gives handles, and so do
     `fold`, `find_map`, `then` and `unwrap_or_else`. A `return` in the
-    callback counts too.
+    callback counts too. A closure that names a handle holds it, so
+    `ids.iter().map(make)` and `make()` keep the handle.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
     `Option<Vec<…>>`, `[ctx]`, `repos.chunks(2)`, or
     `repos.iter().map(|r| Ctx { repo: r })`) keeps that shape for all its
