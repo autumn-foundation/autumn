@@ -1973,6 +1973,28 @@ impl Analyzer {
     /// part by part: `let (conn, key) = (db, id);`. A name bound to a struct
     /// or tuple literal records what each part holds.
     fn bind_init(&mut self, pat: &Pat, init: &Expr) {
+        self.bind_init_parts(pat, init);
+        // `let Holder(ref mut bucket) = holder;`: a store into `bucket` is a
+        // store into `holder`.
+        let names = ref_mut_names(pat);
+        if names.is_empty() {
+            return;
+        }
+        let borrow: Expr = syn::parse_quote!(&mut #init);
+        let targets = self.referents_of(&borrow);
+        for name in names {
+            let mut binding = self.env.binding(&name);
+            for target in &targets {
+                if !binding.referents.contains(target) {
+                    binding.referents.push(target.clone());
+                }
+            }
+            binding.referents.sort();
+            self.env.declare(name, binding);
+        }
+    }
+
+    fn bind_init_parts(&mut self, pat: &Pat, init: &Expr) {
         let pairs = match (pat, init) {
             (Pat::Tuple(p), Expr::Tuple(t)) => pair_parts(&p.elems, &t.elems),
             (Pat::Slice(p), Expr::Array(a)) => pair_parts(&p.elems, &a.elems),
@@ -2048,6 +2070,16 @@ impl Analyzer {
                 let borrow: Expr = syn::parse_quote!(&mut #init);
                 let binding = self.binding_of(&borrow);
                 self.env.declare(p.ident.to_string(), binding);
+            }
+            // `Ok::<(), PgPostRepository>(())` is typed like a `let` with
+            // `Result<(), PgPostRepository>`.
+            (Pat::Ident(p), Expr::Call(c))
+                if p.subpat.is_none() && constructor_type(c).is_some() =>
+            {
+                if let Some(ty) = constructor_type(c) {
+                    let kind = self.value_of(init);
+                    self.bind_typed(pat, &ty, kind);
+                }
             }
             (Pat::Ident(p), _) if p.subpat.is_none() => {
                 let binding = self.binding_of(init);
@@ -2142,7 +2174,7 @@ impl Analyzer {
                 is_handle_builder(&mc.method.to_string()) && self.chain_root_is_handle(e)
             }
             Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
-                branch_tails(e).is_some_and(|tails| tails.iter().any(|t| self.is_pending_query(t)))
+                branch_tails(e).is_some_and(|tails| tails.iter().all(|t| self.is_pending_query(t)))
             }
             other => path_ident(other).is_some_and(|name| self.env.binding(&name).pending_query),
         }
@@ -2558,7 +2590,10 @@ impl Analyzer {
                 let flow = self.expr_in(&e.base, true);
                 // `pending.await` on `let pending = repo.scoped();`: the
                 // terminal call runs here.
-                if matches!(peel_parens(&e.base), Expr::Path(_)) && self.is_pending_query(&e.base) {
+                // A chain awaited in place already counted its query.
+                if !matches!(peel_parens(&e.base), Expr::MethodCall(_))
+                    && self.is_pending_query(&e.base)
+                {
                     let query = self.count("deferred builder awaited");
                     return flow.then(Flow::cost(query));
                 }
@@ -2686,9 +2721,18 @@ impl Analyzer {
                     (true, false) => self.env = then_env,
                     (false, _) => {}
                 }
+                let (then, els) = if self.picks_mixed_deferred(expr) {
+                    let els_value = i.else_branch.as_ref().map(|(_, e)| &**e);
+                    (
+                        self.charge_deferred(then, block_tail(&i.then_branch)),
+                        self.charge_deferred(els, els_value),
+                    )
+                } else {
+                    (then, els)
+                };
                 cond.then(then.or_worst(els))
             }
-            Expr::Match(m) => self.match_expr(m),
+            Expr::Match(m) => self.match_expr(m, expr),
 
             Expr::Block(b) if b.label.is_some() => {
                 // `break 'label` lands after the block.
@@ -2806,13 +2850,13 @@ impl Analyzer {
     /// the bindings of the arms that fall through join afterwards. Exactly one body runs, so bodies
     /// take the worst arm. A failing guard falls through to the next arm, so
     /// every guard on the path can run: guards sum.
-    fn match_expr(&mut self, m: &syn::ExprMatch) -> Flow {
+    fn match_expr(&mut self, m: &syn::ExprMatch, whole: &Expr) -> Flow {
         let scrutinee = self.expr(&m.expr);
         let mut entry = self.env.clone();
         // The guards tried so far: an arm's body runs after every guard
         // before it, and its own.
         let mut guards = Cost::ZERO;
-        let mut bodies = Flow::NEVER;
+        let mut bodies = Vec::new();
         let mut joined: Option<Env> = None;
         for arm in &m.arms {
             self.env = entry.clone();
@@ -2845,7 +2889,7 @@ impl Analyzer {
             // `_ if { return …; } => …`: no later arm can run.
             let ends = guard_falls.is_none() && pattern_always_matches(pat);
             let falls = body.fall.is_some();
-            bodies = bodies.or_worst(body);
+            bodies.push((body, &*arm.body));
             if falls {
                 let arm_env = std::mem::replace(&mut self.env, Env::new());
                 match &mut joined {
@@ -2860,7 +2904,37 @@ impl Analyzer {
             }
         }
         self.env = joined.unwrap_or(entry);
-        scrutinee.then(bodies)
+        let mixed = self.picks_mixed_deferred(whole);
+        let mut flow = Flow::NEVER;
+        for (body, value) in bodies {
+            let body = if mixed {
+                self.charge_deferred(body, Some(value))
+            } else {
+                body
+            };
+            flow = flow.or_worst(body);
+        }
+        scrutinee.then(flow)
+    }
+
+    /// Does the `if` or `match` `e` pick between known futures, some of
+    /// them builder chains and some not? An `.await` cannot tell which
+    /// one it runs, so each builder chain pays its query where it is built.
+    fn picks_mixed_deferred(&self, e: &Expr) -> bool {
+        branch_tails(e).is_some_and(|tails| {
+            let pending = tails.iter().filter(|t| self.is_pending_query(t)).count();
+            pending > 0 && pending < tails.len() && tails.iter().all(|t| self.is_known_future(t))
+        })
+    }
+
+    /// `flow`, plus the query of a builder chain that `value` gives.
+    fn charge_deferred(&mut self, flow: Flow, value: Option<&Expr>) -> Flow {
+        if value.is_some_and(|v| self.is_pending_query(v)) {
+            let query = self.count("deferred builder awaited");
+            flow.then(Flow::cost(query))
+        } else {
+            flow
+        }
     }
 
     fn each<'a>(&mut self, exprs: impl Iterator<Item = &'a Expr>) -> Flow {
@@ -5158,6 +5232,70 @@ impl<'a> Visit<'a> for FreeNames<'_> {
     fn visit_expr_closure(&mut self, c: &'a syn::ExprClosure) {
         let names = c.inputs.iter().flat_map(bound_names).collect();
         self.scoped(names, |s| s.visit_expr(&c.body));
+    }
+}
+
+/// The names a pattern binds by `ref mut`.
+fn ref_mut_names(pat: &Pat) -> Vec<String> {
+    struct Names(Vec<String>);
+    impl<'a> Visit<'a> for Names {
+        fn visit_pat_ident(&mut self, p: &'a syn::PatIdent) {
+            if p.by_ref.is_some() && p.mutability.is_some() {
+                self.0.push(p.ident.to_string());
+            }
+            syn::visit::visit_pat_ident(self, p);
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+    let mut names = Names(Vec::new());
+    names.visit_pat(pat);
+    names.0
+}
+
+/// The type a turbofish gives a std constructor: `Result<T, E>` for
+/// `Ok::<T, E>(x)`, `Option<T>` for `Some::<T>(x)`. `None` when a type is
+/// left to inference (`_`).
+fn constructor_type(call: &ExprCall) -> Option<Type> {
+    struct Infers(bool);
+    impl<'a> Visit<'a> for Infers {
+        fn visit_type_infer(&mut self, _: &'a syn::TypeInfer) {
+            self.0 = true;
+        }
+    }
+    if !is_container_constructor(call) {
+        return None;
+    }
+    let Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    let args = path
+        .path
+        .segments
+        .iter()
+        .rev()
+        .find_map(|s| match &s.arguments {
+            syn::PathArguments::AngleBracketed(a) => Some(a),
+            _ => None,
+        })?;
+    let types: Vec<&Type> = args
+        .args
+        .iter()
+        .filter_map(|a| match a {
+            syn::GenericArgument::Type(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    let mut infers = Infers(false);
+    for ty in &types {
+        infers.visit_type(ty);
+    }
+    if infers.0 {
+        return None;
+    }
+    match (call_path_name(call).as_deref(), types.as_slice()) {
+        (Some("Some"), [t]) => Some(syn::parse_quote!(Option<#t>)),
+        (Some("Ok" | "Err"), [t, e]) => Some(syn::parse_quote!(Result<#t, #e>)),
+        _ => None,
     }
 }
 
@@ -10416,6 +10554,63 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = Some(&repo); slot = None; render(slot); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn nested_ref_mut_turbofish_sides_and_mixed_deferred_queries() {
+        check_handlers(&[
+            (
+                "guard: a nested ref mut binding aliases its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut holder = Holder::default(); let Holder(ref mut bucket) = holder; \
+                 *bucket += repo; let _ = holder.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a nested ref mut in an if let aliases its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = Some(Holder::default()); if let Some(ref mut inner) = slot { *inner += repo; } \
+                 let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a turbofish constructor keeps its side types",
+                "async fn h() -> AutumnResult<usize> { \
+                 let mut r = Ok::<(), PgPostRepository>(()); r = make_result(); \
+                 let repo = r.unwrap_err(); let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a turbofish constructor keeps a plain side plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let r = Ok::<PgPostRepository, Error>(repo); let _ = r.map_err(|e| render(e)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a mixed builder and query pick costs one",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let pending = if flag { repo.scoped() } else { repo.find(1) }; pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a mixed match pick costs one",
+                "async fn h(repo: PgPostRepository, n: i64) -> AutumnResult<usize> { \
+                 let pending = match n { 0 => repo.scoped(), _ => repo.find(1) }; pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a directly awaited if of builder chains costs one",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let _ = (if flag { repo.scoped() } else { repo.scoped() }).await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a directly awaited mixed if costs one",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let _ = (if flag { repo.scoped() } else { repo.find(1) }).await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }

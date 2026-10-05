@@ -121,7 +121,7 @@ Both halves are compiled in CI as trybuild fixtures — see
 | A loop whose body issues a query on a path that starts another pass | **unbounded** (rejected under a finite budget) |
 | A loop with a literal bound (`for _ in 0..3`) | **× 3** for a path that starts another pass. A path that leaves the loop (`break`, `return`) is paid once: `for _ in 0..3 { repo.a().await?; break; }` is **1** |
 | A loop whose body issues nothing | **0** — loops are free until they query |
-| A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, `limit()`, …) it carries — splitting the chain across `let` bindings does not change the count |
+| A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, `limit()`, …) it carries — splitting the chain across `let` bindings, or picking it with `if` / `match`, does not change the count |
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
 | An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
