@@ -2136,10 +2136,15 @@ impl Analyzer {
                     self.assign_kind(part, kind.element());
                 }
             }
-            // `deps.0 = repo`: store into that part.
+            // `deps.0 = repo`: store into that part. Through `slot = &mut
+            // saved`, `slot.value = repo` stores into `saved.value` too.
             Expr::Field(f) if path_ident(&f.base).is_some() => {
-                if let Some(base) = path_ident(&f.base) {
-                    self.env.assign_part(&base, &member_name(&f.member), kind);
+                let member = member_name(&f.member);
+                let mut next = path_ident(&f.base);
+                for _ in 0..8 {
+                    let Some(name) = next.take() else { break };
+                    next = self.env.binding(&name).referent.filter(|r| *r != name);
+                    self.env.assign_part(&name, &member, kind);
                 }
             }
             // `a.b.c = repo`, `repos[0] = repo`, `*slot = repo`: the name at
@@ -8869,6 +8874,20 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let r = (|| async { &repo })().await; let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+            // As with `saved.value = Some(repo);`: the field's shape is not known,
+            // so `unwrap` on it is reported.
+            (
+                "a field assignment through a mutable alias",
+                "async fn h(repo: PgPostRepository, mut saved: Saved) -> AutumnResult<usize> { \
+                 let slot = &mut saved; slot.value = Some(repo); let _ = saved.value.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a field assignment through a chain of mutable aliases",
+                "async fn h(repo: PgPostRepository, mut saved: Saved) -> AutumnResult<usize> { \
+                 let a = &mut saved; let b = a; b.value = Some(repo); let _ = saved.value.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
             (
                 "guard: a plain store through a mutable alias is free",
