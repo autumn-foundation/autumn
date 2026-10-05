@@ -40,6 +40,10 @@
   and `maybe_immediate_transaction` count their callback like `db.tx(…)`.
   A query future built inside `vec![…]` is counted. A function passed by
   name as a transaction or iterator callback is reported (#2316).
+- **query budgets:** `tx` on a value that is not a database connection,
+  such as a repository, may run its callback many times and hand it a
+  connection. The callback's `conn` is now a handle. Before, a query through
+  it was not counted (#2316).
 - **query budgets:** `#[query_cost]` and `#[query_exempt]` on an assignment
   or compound-assignment statement (`=`, `+=`) now apply, as in
   `#[query_cost(2)] links = load_links(&mut db).await?;`. Before, they were
