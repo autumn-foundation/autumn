@@ -303,7 +303,17 @@ pub fn run(
         MigrateAction::Run => {
             // Resolve the effective startup wait (--wait flag > config > 0).
             let wait = resolve_startup_wait(wait_override, config_table.as_ref());
-            run_all_targets(&targets, &migrations_dir, with_maintenance, wait);
+            let lock_policy = resolve_migration_lock_policy_from_sources(
+                |key| std::env::var(key),
+                config_table.as_ref(),
+            );
+            run_all_targets(
+                &targets,
+                &migrations_dir,
+                with_maintenance,
+                wait,
+                lock_policy,
+            );
         }
         MigrateAction::Status => {
             // `show_status` shells out to `diesel migration list`, and the
@@ -545,6 +555,7 @@ fn run_all_targets(
     migrations_dir: &str,
     with_maintenance: bool,
     wait: std::time::Duration,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
 ) {
     let mut completed: Vec<&str> = Vec::new();
     for (label, url) in targets {
@@ -553,7 +564,7 @@ fn run_all_targets(
         // the shard-required framework migrations (version history + commit
         // hook queue), not the full control-plane schema.
         let is_shard = label.starts_with("shard:");
-        if run_single_target(url, migrations_dir, is_shard, wait) {
+        if run_single_target(url, migrations_dir, is_shard, wait, lock_policy) {
             completed.push(label);
             eprintln!();
         } else {
@@ -634,6 +645,7 @@ fn run_single_target(
     migrations_dir: &str,
     is_shard: bool,
     wait: std::time::Duration,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
 ) -> bool {
     use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock, wait_for_database};
 
@@ -724,17 +736,29 @@ fn run_single_target(
     }
 
     eprintln!("  Running pending migrations...\n");
-    let status = Command::new("diesel")
-        .args(["migration", "run", "--migration-dir"])
-        .arg(dir)
-        .env("DATABASE_URL", database_url)
-        .status();
+    // `lock_timeout` makes a DDL statement that waits on a long transaction
+    // fail fast, then the jittered retry runs it again (#3057).
+    let pgoptions = diesel_pgoptions(
+        std::env::var("PGOPTIONS").ok().as_deref(),
+        lock_policy.lock_timeout,
+    );
+    let outcome = autumn_web::migrate::retry_on_lock_timeout(
+        lock_policy,
+        |delay| {
+            eprintln!(
+                "  A migration timed out waiting for a table lock; retrying in {}ms\u{2026}",
+                delay.as_millis()
+            );
+            std::thread::sleep(delay);
+        },
+        || run_diesel_migrations_once(database_url, dir, pgoptions.as_deref()),
+    );
 
-    match status {
-        Ok(s) if s.success() => {
+    match outcome {
+        Ok(()) => {
             eprintln!("\n\u{2713} Migrations applied successfully.");
         }
-        Ok(_) => {
+        Err(MigrationError::Migration(_)) => {
             eprintln!(
                 "\n\u{274C} Migration failed in {}. Check the error output above.",
                 dir.display()
@@ -742,7 +766,7 @@ fn run_single_target(
             return false;
         }
         Err(e) => {
-            eprintln!("\u{274C} Failed to run diesel migration run: {e}");
+            eprintln!("\u{274C} {e}");
             return false;
         }
     }
@@ -764,7 +788,7 @@ fn run_single_target(
     let framework_ok = if is_shard {
         run_shard_framework_migrations(database_url)
     } else {
-        run_framework_migrations(database_url)
+        run_framework_migrations(database_url, lock_policy)
     };
     if !framework_ok {
         return false;
@@ -1593,6 +1617,124 @@ where
         })
 }
 
+/// Resolve the migration lock policy (#3057): env, then `autumn.toml`, then
+/// the `[database]` defaults. An invalid value warns and is ignored.
+pub fn resolve_migration_lock_policy_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> autumn_web::migrate::MigrationLockPolicy
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let mut policy = autumn_web::migrate::MigrationLockPolicy::default();
+    let db = table
+        .and_then(|t| t.get("database"))
+        .and_then(toml::Value::as_table);
+
+    let toml_timeout = db
+        .and_then(|db| db.get("migration_lock_timeout"))
+        .and_then(|v| match v {
+            toml::Value::String(text) => autumn_web::config::parse_duration_str(text).ok(),
+            toml::Value::Integer(ms) => u64::try_from(*ms)
+                .ok()
+                .map(std::time::Duration::from_millis),
+            _ => None,
+        });
+    let env_timeout = env_var("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT")
+        .ok()
+        .and_then(|text| {
+            let parsed = autumn_web::config::parse_duration_str(text.trim()).ok();
+            if parsed.is_none() {
+                eprintln!(
+                    "  Warning: AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT={text:?} is not a valid \
+                     duration; ignoring it."
+                );
+            }
+            parsed
+        });
+    if let Some(timeout) = env_timeout.or(toml_timeout) {
+        policy.lock_timeout = timeout;
+    }
+
+    let toml_retries = db
+        .and_then(|db| db.get("migration_lock_retries"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|n| u32::try_from(n).ok());
+    let env_retries = env_var("AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES")
+        .ok()
+        .and_then(|text| {
+            let parsed = text.trim().parse::<u32>().ok();
+            if parsed.is_none() {
+                eprintln!(
+                    "  Warning: AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES={text:?} is not a valid \
+                     count; ignoring it."
+                );
+            }
+            parsed
+        });
+    if let Some(retries) = env_retries.or(toml_retries) {
+        policy.retries = retries;
+    }
+    policy
+}
+
+/// The `PGOPTIONS` value for the `diesel` subprocess: `existing` plus
+/// `-c lock_timeout=<ms>`. `None` when `lock_timeout` is zero, so the
+/// environment stays as it is.
+fn diesel_pgoptions(existing: Option<&str>, lock_timeout: std::time::Duration) -> Option<String> {
+    if lock_timeout.is_zero() {
+        return None;
+    }
+    let ms = u64::try_from(lock_timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(i32::MAX.unsigned_abs().into());
+    let option = format!("-c lock_timeout={ms}");
+    Some(match existing.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(existing) => format!("{existing} {option}"),
+        None => option,
+    })
+}
+
+/// Run `diesel migration run` once. Its stderr goes to this process's stderr
+/// and is also kept, so the caller can tell a lock timeout from other errors.
+fn run_diesel_migrations_once(
+    database_url: &str,
+    dir: &Path,
+    pgoptions: Option<&str>,
+) -> Result<(), MigrationError> {
+    use std::io::{BufRead as _, Write as _};
+    let mut command = Command::new("diesel");
+    command
+        .args(["migration", "run", "--migration-dir"])
+        .arg(dir)
+        .env("DATABASE_URL", database_url)
+        .stderr(std::process::Stdio::piped());
+    if let Some(options) = pgoptions {
+        command.env("PGOPTIONS", options);
+    }
+    let mut child = command.spawn().map_err(|e| {
+        MigrationError::Connection(format!("failed to run diesel migration run: {e}"))
+    })?;
+    let mut captured = String::new();
+    if let Some(stderr) = child.stderr.take() {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = writeln!(std::io::stderr(), "{line}");
+            captured.push_str(&line);
+            captured.push('\n');
+        }
+    }
+    match child.wait() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(MigrationError::Migration(captured)),
+        Err(e) => Err(MigrationError::Connection(format!(
+            "failed to wait for diesel migration run: {e}"
+        ))),
+    }
+}
+
 /// Resolve the effective startup wait: the `--wait` CLI flag (if given) wins;
 /// otherwise fall back to the merged config table (env > toml > 0).
 ///
@@ -1636,10 +1778,15 @@ fn check_diesel_cli() {
     }
 }
 
-fn run_framework_migrations(database_url: &str) -> bool {
+fn run_framework_migrations(
+    database_url: &str,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> bool {
     eprintln!("  Running pending Autumn framework migrations...\n");
 
-    match run_framework_migrations_inner(database_url, autumn_web::migrate::run_pending) {
+    match run_framework_migrations_inner(database_url, |url, migrations| {
+        autumn_web::migrate::run_pending_with_policy(url, migrations, lock_policy)
+    }) {
         Ok(result) if result.applied.is_empty() => {
             eprintln!("\n\u{2713} Framework migrations are up to date.");
             true
@@ -4262,6 +4409,74 @@ primary_url = "postgres://prod-s0:5432/app"
             Some(&table),
         );
         assert_eq!(secs, 30, "bad env value should fall back to toml");
+    }
+
+    // ── migration lock policy (#3057) ────────────────────────────────────────
+
+    fn db_table(entries: &[(&str, toml::Value)]) -> toml::Table {
+        let mut db = toml::Table::new();
+        for (key, value) in entries {
+            db.insert((*key).to_owned(), value.clone());
+        }
+        let mut table = toml::Table::new();
+        table.insert("database".to_owned(), toml::Value::Table(db));
+        table
+    }
+
+    #[test]
+    fn migration_lock_policy_defaults() {
+        assert_eq!(
+            resolve_migration_lock_policy_from_sources(no_env, None),
+            autumn_web::migrate::MigrationLockPolicy::default()
+        );
+    }
+
+    #[test]
+    fn migration_lock_policy_from_toml() {
+        let table = db_table(&[
+            ("migration_lock_timeout", toml::Value::String("2s".into())),
+            ("migration_lock_retries", toml::Value::Integer(1)),
+        ]);
+        let policy = resolve_migration_lock_policy_from_sources(no_env, Some(&table));
+        assert_eq!(policy.lock_timeout, std::time::Duration::from_secs(2));
+        assert_eq!(policy.retries, 1);
+        // A bare integer is milliseconds, as in `autumn.toml` elsewhere.
+        let table = db_table(&[("migration_lock_timeout", toml::Value::Integer(750))]);
+        let policy = resolve_migration_lock_policy_from_sources(no_env, Some(&table));
+        assert_eq!(policy.lock_timeout, std::time::Duration::from_millis(750));
+    }
+
+    #[test]
+    fn migration_lock_policy_env_overrides_toml() {
+        let table = db_table(&[
+            ("migration_lock_timeout", toml::Value::String("2s".into())),
+            ("migration_lock_retries", toml::Value::Integer(1)),
+        ]);
+        let policy = resolve_migration_lock_policy_from_sources(
+            |key| match key {
+                "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT" => Ok("0".to_owned()),
+                "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES" => Ok("0".to_owned()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+            Some(&table),
+        );
+        assert_eq!(policy.lock_timeout, std::time::Duration::ZERO);
+        assert_eq!(policy.retries, 0);
+    }
+
+    #[test]
+    fn diesel_pgoptions_adds_lock_timeout() {
+        let five = std::time::Duration::from_secs(5);
+        assert_eq!(
+            diesel_pgoptions(None, five).as_deref(),
+            Some("-c lock_timeout=5000")
+        );
+        assert_eq!(
+            diesel_pgoptions(Some("-c search_path=app"), five).as_deref(),
+            Some("-c search_path=app -c lock_timeout=5000")
+        );
+        // `0` leaves the environment as it is.
+        assert_eq!(diesel_pgoptions(None, std::time::Duration::ZERO), None);
     }
 
     #[test]

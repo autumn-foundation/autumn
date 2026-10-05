@@ -292,11 +292,13 @@ Precedence, and the reasoning behind it:
    number by hand outranks a file committed months ago.
 2. Otherwise the contract, **but only** when it was measured on this host class
    and records a non-zero limit.
-3. Otherwise unlimited — today's default, unchanged.
+3. Otherwise the profile default: primary pool size × 32 under `prod`
+   (#3057), unlimited under every other profile.
 
 Every failure along the contract path — missing file, malformed document, a
 newer schema version, a contract from a different host class — degrades to
-**unlimited with a warning**, never to a ceiling. Failing closed here would mean
+**the profile default with a warning** (unlimited outside `prod`), never to a
+lower ceiling. Failing closed here would mean
 a typo'd path or a stale lockfile sheds every request on the way up, turning a
 capacity feature into an outage. The same reasoning covers a recorded limit of
 `0`: it is read as "no limit was proven", never as "shed everything".

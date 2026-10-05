@@ -558,11 +558,32 @@ pub fn resolve_configured_admission_limit(
     explicit: Option<usize>,
     contract_path: Option<&str>,
 ) -> AdmissionLimit {
+    resolve_configured_admission_limit_with_default(explicit, contract_path, None)
+}
+
+/// [`resolve_configured_admission_limit`] with a profile default ceiling
+/// (#3057). See [`resolve_admission_limit_with_default`] for the precedence.
+#[must_use]
+pub fn resolve_configured_admission_limit_with_default(
+    explicit: Option<usize>,
+    contract_path: Option<&str>,
+    profile_default: Option<usize>,
+) -> AdmissionLimit {
     let path = contract_path.filter(|p| !p.is_empty());
     if explicit.is_some() || path.is_none() {
-        return resolve_admission_limit(explicit, None, &HostProfile::EMPTY);
+        return resolve_admission_limit_with_default(
+            explicit,
+            None,
+            &HostProfile::EMPTY,
+            profile_default,
+        );
     }
-    resolve_admission_limit(explicit, path.map(Path::new), &HostProfile::detect())
+    resolve_admission_limit_with_default(
+        explicit,
+        path.map(Path::new),
+        &HostProfile::detect(),
+        profile_default,
+    )
 }
 
 /// Digest of a route graph's *capacity-relevant* shape.
@@ -610,6 +631,9 @@ pub enum AdmissionLimit {
     /// Derived from the committed capacity contract — the binary admitting
     /// against its own proven envelope.
     Contract(usize),
+    /// The profile's default ceiling, used when nothing above applies or the
+    /// contract cannot be used. Only `prod` supplies one (#3057).
+    ProfileDefault(usize),
     /// No ceiling: load shedding stays off, exactly as it is today when
     /// nothing is configured.
     Unlimited,
@@ -620,7 +644,7 @@ impl AdmissionLimit {
     #[must_use]
     pub const fn limit(self) -> Option<usize> {
         match self {
-            Self::Configured(n) | Self::Contract(n) => Some(n),
+            Self::Configured(n) | Self::Contract(n) | Self::ProfileDefault(n) => Some(n),
             Self::Unlimited => None,
         }
     }
@@ -631,6 +655,7 @@ impl AdmissionLimit {
         match self {
             Self::Configured(_) => "server.max_concurrent_requests",
             Self::Contract(_) => "capacity contract",
+            Self::ProfileDefault(_) => "profile default",
             Self::Unlimited => "unset",
         }
     }
@@ -659,6 +684,24 @@ pub fn resolve_admission_limit(
     contract_path: Option<&Path>,
     host: &HostProfile,
 ) -> AdmissionLimit {
+    resolve_admission_limit_with_default(explicit, contract_path, host, None)
+}
+
+/// [`resolve_admission_limit`] with a profile default ceiling (#3057).
+///
+/// The precedence is explicit, then contract, then `profile_default`. When the
+/// contract cannot be used, the result is `profile_default`, not unlimited.
+/// A `None` or `0` default gives [`AdmissionLimit::Unlimited`].
+#[must_use]
+pub fn resolve_admission_limit_with_default(
+    explicit: Option<usize>,
+    contract_path: Option<&Path>,
+    host: &HostProfile,
+    profile_default: Option<usize>,
+) -> AdmissionLimit {
+    let fallback = profile_default
+        .filter(|n| *n > 0)
+        .map_or(AdmissionLimit::Unlimited, AdmissionLimit::ProfileDefault);
     if let Some(configured) = explicit {
         return if configured > 0 {
             AdmissionLimit::Configured(configured)
@@ -668,7 +711,7 @@ pub fn resolve_admission_limit(
     }
 
     let Some(path) = contract_path else {
-        return AdmissionLimit::Unlimited;
+        return fallback;
     };
 
     let contract = match CapacityContract::load(path) {
@@ -677,9 +720,10 @@ pub fn resolve_admission_limit(
             tracing::warn!(
                 path = %path.display(),
                 %error,
-                "capacity contract could not be read; leaving admission control unlimited"
+                fallback = fallback.source(),
+                "capacity contract could not be read; using the fallback admission limit"
             );
-            return AdmissionLimit::Unlimited;
+            return fallback;
         }
     };
 
@@ -691,10 +735,11 @@ pub fn resolve_admission_limit(
             contract_host = %contract.host.summary(),
             running_host = %host.summary(),
             admission_limit = contract.envelope.admission_limit,
+            fallback = fallback.source(),
             "capacity contract licenses no admission limit here (different host \
-             class, or no limit recorded); leaving admission control unlimited"
+             class, or no limit recorded); using the fallback admission limit"
         );
-        AdmissionLimit::Unlimited
+        fallback
     }
 }
 
@@ -1015,6 +1060,92 @@ mod tests {
         assert_eq!(
             resolve_admission_limit(Some(32), None, &HostProfile::detect()),
             AdmissionLimit::Configured(32)
+        );
+    }
+
+    // ── profile default ceiling (#3057) ─────────────────────────────────
+
+    #[test]
+    fn the_profile_default_applies_when_nothing_else_is_set() {
+        let resolved =
+            resolve_admission_limit_with_default(None, None, &HostProfile::detect(), Some(320));
+        assert_eq!(resolved, AdmissionLimit::ProfileDefault(320));
+        assert_eq!(resolved.limit(), Some(320));
+        assert_eq!(resolved.source(), "profile default");
+    }
+
+    #[test]
+    fn explicit_settings_win_over_the_profile_default() {
+        let host = HostProfile::detect();
+        assert_eq!(
+            resolve_admission_limit_with_default(Some(16), None, &host, Some(320)),
+            AdmissionLimit::Configured(16)
+        );
+        // An explicit `0` still turns shedding off.
+        assert_eq!(
+            resolve_admission_limit_with_default(Some(0), None, &host, Some(320)),
+            AdmissionLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn the_contract_wins_over_the_profile_default() {
+        let mut contract = sample_contract();
+        contract.host = HostProfile::detect();
+        let (_dir, path) = write_contract(&contract);
+        assert_eq!(
+            resolve_admission_limit_with_default(
+                None,
+                Some(&path),
+                &HostProfile::detect(),
+                Some(320)
+            ),
+            AdmissionLimit::Contract(64)
+        );
+    }
+
+    #[test]
+    fn contract_failures_fall_back_to_the_profile_default() {
+        let host = HostProfile::detect();
+        let missing = std::path::Path::new("/nonexistent/capacity.lock");
+        assert_eq!(
+            resolve_admission_limit_with_default(None, Some(missing), &host, Some(320)),
+            AdmissionLimit::ProfileDefault(320)
+        );
+
+        let mut contract = sample_contract();
+        contract.host = HostProfile {
+            logical_cpus: host.logical_cpus.saturating_add(7),
+            ..host.clone()
+        };
+        let (_dir, path) = write_contract(&contract);
+        assert_eq!(
+            resolve_admission_limit_with_default(None, Some(&path), &host, Some(320)),
+            AdmissionLimit::ProfileDefault(320)
+        );
+    }
+
+    #[test]
+    fn a_zero_profile_default_never_sheds_everything() {
+        assert_eq!(
+            resolve_admission_limit_with_default(None, None, &HostProfile::detect(), Some(0)),
+            AdmissionLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn the_configured_wrapper_threads_the_profile_default() {
+        assert_eq!(
+            resolve_configured_admission_limit_with_default(None, None, Some(320)),
+            AdmissionLimit::ProfileDefault(320)
+        );
+        assert_eq!(
+            resolve_configured_admission_limit_with_default(None, Some(""), Some(320)),
+            AdmissionLimit::ProfileDefault(320)
+        );
+        assert_eq!(
+            resolve_configured_admission_limit_with_default(Some(0), None, Some(320)),
+            AdmissionLimit::Unlimited
         );
     }
 }

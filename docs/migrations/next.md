@@ -151,6 +151,48 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Config: the `prod` profile enables `strict_config` and new protections
+
+**Why:** The `prod` profile shipped with its protections off. A misspelled
+timeout key took the default in silence, and a slow database caused readiness
+to flap across the fleet instead of an early `503` (issue #3057).
+
+**Before (`{X.Y}`):** with `AUTUMN_PROFILE=prod`, this booted, and
+`statement_timeout` stayed unset:
+
+```toml
+[database]
+statment_timeout = "5s"   # misspelled
+```
+
+**After (`{(X+1).0}`):** the same file stops the boot with an "unknown
+configuration key" error. Correct the key, or turn the check off:
+
+```toml
+[server]
+strict_config = false     # or AUTUMN_SERVER__STRICT_CONFIG=false
+```
+
+The `prod` profile also changes these defaults. Each has a one-line opt-out:
+
+| Default in `prod` | Opt-out |
+| --- | --- |
+| Load shedding at primary pool size × 32 | `server.max_concurrent_requests = 0` |
+| `database.statement_timeout = "30s"` | `statement_timeout = "0s"` |
+| `database.idle_in_transaction_timeout = "60s"` | `idle_in_transaction_timeout = "0s"` |
+
+Every profile also gets a migration `lock_timeout` of `5s` with `5` jittered
+retries. Opt out with `database.migration_lock_timeout = "0s"`. The `autumn
+migrate` CLI passes the timeout to `diesel` in `PGOPTIONS`. `PgBouncer` refuses
+that startup option, so run migrations against Postgres directly, or set the
+timeout to `"0s"`.
+
+A long job or report query that runs inside a request now stops at `30s`. Give
+that route a `StatementTimeout` extension, or raise the global value.
+
+**Automation:** `manual` — this is a configuration and behaviour change, and no
+code rewrite applies.
+
 ---
 
 ## Plugin authors

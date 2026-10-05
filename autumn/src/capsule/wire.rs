@@ -608,6 +608,9 @@ pub fn marker_set_sql(id: &str) -> Option<String> {
 /// housekeeping — there is nothing there to be the framework's own — so a
 /// caller cannot pass a blank string and have arbitrary handling applied.
 pub fn is_session_housekeeping(sql: &str) -> bool {
+    if is_framework_tx_timeouts(sql) {
+        return true;
+    }
     let mut saw_statement = false;
     for statement in split_statements(sql) {
         let statement = statement.trim();
@@ -620,6 +623,37 @@ pub fn is_session_housekeeping(sql: &str) -> bool {
         }
     }
     saw_statement
+}
+
+/// Whether `sql` is the `SET LOCAL` pair a framework transaction opens with
+/// (`crate::db::TxTimeouts::set_local_sql`, #3057): exactly
+/// `statement_timeout` then `idle_in_transaction_session_timeout`, with
+/// integer values.
+///
+/// Only that exact pair counts. A single `SET LOCAL statement_timeout` stays
+/// the application's (#2202). The values depend on the config, so a tape
+/// recorded in `prod` must still replay where the config is different.
+fn is_framework_tx_timeouts(sql: &str) -> bool {
+    let statements: Vec<&str> = split_statements(sql)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let [statement, idle] = statements.as_slice() else {
+        return false;
+    };
+    let is_local_int_setting = |statement: &str, name: &str| {
+        strip_keyword(statement, "SET")
+            .and_then(|rest| strip_keyword(rest, "LOCAL"))
+            .and_then(|rest| strip_keyword_exact(rest, name))
+            .and_then(|rest| rest.strip_prefix('='))
+            .is_some_and(|value| {
+                let value = value.trim();
+                !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+            })
+    };
+    is_local_int_setting(statement, "statement_timeout")
+        && is_local_int_setting(idle, "idle_in_transaction_session_timeout")
 }
 
 /// Whether one statement is a session setting replay reproduces on its own.
@@ -636,11 +670,12 @@ fn is_housekeeping_statement(statement: &str) -> bool {
         return false;
     };
     let setting = setting.trim_start();
-    // `SET LOCAL ...` is never the framework's: `Db::checkout` issues a plain
-    // session-level `SET statement_timeout`. A transaction-scoped setting is
-    // application code, and an application's settings belong on the ordered
-    // tape so that changing or removing one shows up as a divergence rather
-    // than being synthesized away.
+    // A single `SET LOCAL ...` is application code: `Db::checkout` issues a
+    // plain session-level `SET statement_timeout`, and the framework's own
+    // `SET LOCAL` pair is matched whole by `is_framework_tx_timeouts`. An
+    // application's settings belong on the ordered tape so that changing or
+    // removing one shows up as a divergence rather than being synthesized
+    // away.
     if strip_keyword(setting, "LOCAL").is_some() {
         return false;
     }

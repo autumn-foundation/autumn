@@ -1803,6 +1803,32 @@ mod tests {
         );
         assert!(!is_session_housekeeping("set local TIME ZONE 'UTC'"));
         assert!(!is_session_housekeeping(""));
+        // The framework's own transaction `SET LOCAL` pair (#3057) depends on
+        // the config, so replay answers it rather than the tape.
+        assert!(is_session_housekeeping(
+            "SET LOCAL statement_timeout = 30000; \
+             SET LOCAL idle_in_transaction_session_timeout = 60000"
+        ));
+        assert!(
+            !is_session_housekeeping(
+                "SET LOCAL statement_timeout = 30000; \
+                 SET LOCAL idle_in_transaction_session_timeout = 60000; SELECT 1"
+            ),
+            "a batch that also does real work is the request's"
+        );
+        assert!(
+            !is_session_housekeeping(
+                "SET LOCAL statement_timeout = 30000; SET LOCAL search_path TO app"
+            ),
+            "only the exact framework pair is housekeeping"
+        );
+        assert!(
+            !is_session_housekeeping(
+                "SET LOCAL statement_timeout = '30s'; \
+                 SET LOCAL idle_in_transaction_session_timeout = 60000"
+            ),
+            "the framework sends integer milliseconds only"
+        );
     }
 
     #[test]

@@ -1121,6 +1121,10 @@ impl DbState for AppState {
         self.extension::<crate::config::AutumnConfig>()
             .and_then(|cfg| cfg.database.statement_timeout)
     }
+    fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
+        self.extension::<crate::config::AutumnConfig>()
+            .and_then(|cfg| cfg.database.idle_in_transaction_timeout)
+    }
 
     fn slow_query_threshold(&self) -> std::time::Duration {
         self.extension::<crate::config::AutumnConfig>().map_or_else(

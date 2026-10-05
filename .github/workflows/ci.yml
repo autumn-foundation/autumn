@@ -1643,6 +1643,19 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
             || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
+          # The migration lock_timeout + retry suite (#3057) is `--lib`: it
+          # drives the migrator's private retry policy. Named by full path,
+          # with a pass count, for the same reason as the suites above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              migrate::tests::migration_blocked_by_a_held_lock_fails_fast_after_retries \
+              migrate::tests::migration_retry_applies_after_the_lock_is_released \
+              | tee "${RUNNER_TEMP}/migration-lock-timeout.log"
+          )
+          grep -qE 'test result: ok\. 2 passed' "${RUNNER_TEMP}/migration-lock-timeout.log" \
+            || { echo "::error::the migration lock_timeout tests did not both run — the ci.yml filters no longer match"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           # Issue #2108: the same AdminModel cover as token_admin_db, for the
           # two models that read a `timestamptz` column. Both assert the audit

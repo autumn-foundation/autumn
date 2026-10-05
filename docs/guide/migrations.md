@@ -142,6 +142,54 @@ For the `autumn migrate` CLI the timeout is always the default.
 
 ---
 
+## Table lock timeout and retry
+
+A DDL statement such as `ALTER TABLE` needs a strong table lock. If a long
+transaction holds a lock on that table, the DDL waits. Every new query on the
+table then waits behind the DDL, and the app stalls (issue #3057).
+
+To prevent this, the migrator sets `lock_timeout` on its session. A migration
+that waits longer fails, its transaction rolls back, and the migrator tries
+again after a jittered, exponential delay (`500ms`, then `1s`, `2s`, … up to
+`10s`, each scaled by a random 50–100%). The retries happen under the advisory
+lock.
+
+```toml
+[database]
+migration_lock_timeout = "5s"   # default; "0s" = no limit
+migration_lock_retries = 5      # default; 0 = no retry
+```
+
+The env vars are `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` and
+`AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES`. When every attempt times out, the
+run fails with `MigrationError::LockContention`. Find the blocking session:
+
+```sql
+SELECT pid, state, xact_start, query
+FROM pg_stat_activity
+WHERE pid IN (SELECT pid FROM pg_locks WHERE relation = 'users'::regclass);
+```
+
+Only a lock timeout is retried. A migration with `run_in_transaction = false`
+(for example `CREATE INDEX CONCURRENTLY`) can leave work behind when it fails.
+Check it before the next run.
+
+The Rust API takes the policy explicitly:
+
+```rust
+use autumn_web::migrate::{run_pending_locked_with_policy, MigrationLockPolicy};
+use std::time::Duration;
+
+let policy = MigrationLockPolicy { lock_timeout: Duration::from_secs(2), retries: 3 };
+run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
+```
+
+`autumn migrate` passes the timeout to its `diesel` subprocess as
+`PGOPTIONS=-c lock_timeout=<ms>`. `PgBouncer` refuses that startup option, so
+run migrations against Postgres directly, or set the timeout to `"0s"`.
+
+---
+
 ## Wrapping an external migration process
 
 If you invoke an external migration tool (e.g. a raw `diesel` subprocess) and

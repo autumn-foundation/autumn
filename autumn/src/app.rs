@@ -7068,6 +7068,7 @@ impl AppBuilder {
 
         // Writable targets only: the control primary, then each shard primary.
         let control_url = config.database.effective_primary_url().map(str::to_owned);
+        let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
         let shard_targets: Vec<(String, String)> = config
             .database
             .shards
@@ -7166,6 +7167,7 @@ impl AppBuilder {
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                             "control",
+                            lock_policy,
                         );
                     }
                 }
@@ -7183,6 +7185,7 @@ impl AppBuilder {
                         url,
                         crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                         label,
+                        lock_policy,
                     );
                 }
             }
@@ -11985,8 +11988,14 @@ fn apply_pending_or_exit(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     target: &str,
+    lock_policy: crate::migrate::MigrationLockPolicy,
 ) -> usize {
-    match crate::migrate::run_pending_locked(database_url, migrations, None) {
+    match crate::migrate::run_pending_locked_with_policy(
+        database_url,
+        migrations,
+        None,
+        lock_policy,
+    ) {
         Ok(result) => result.applied.len(),
         Err(error) => {
             let reason = match error {
@@ -11994,6 +12003,9 @@ fn apply_pending_or_exit(
                     "could not connect to the database"
                 }
                 crate::migrate::MigrationError::Migration(_) => "a migration failed to apply",
+                crate::migrate::MigrationError::LockContention { .. } => {
+                    "a migration timed out on a table lock on every attempt"
+                }
                 _ => "migration error",
             };
             eprintln!("autumn migrate: {reason} (target {target})");
@@ -12351,6 +12363,7 @@ async fn run_startup_migrations(
     let profile = config.profile.clone();
     let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
+    let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
     // Computed once, on the FINAL registered set (after `setup_database`'s own
     // fold added any shard-required sets), so a version collision between ANY
     // two registered sources is resolved automatically rather than causing
@@ -12415,6 +12428,7 @@ async fn run_startup_migrations(
                     auto_in_prod,
                     crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     "control",
+                    lock_policy,
                 );
             }
             // The shard directory table lives on the control plane only, so it
@@ -12430,6 +12444,7 @@ async fn run_startup_migrations(
                         &disambiguated,
                     ),
                     "control",
+                    lock_policy,
                 );
             }
             // The shard-map guard table also lives on the control plane only. It
@@ -12450,6 +12465,7 @@ async fn run_startup_migrations(
                         &disambiguated,
                     ),
                     "control",
+                    lock_policy,
                 );
             }
         }
@@ -12471,6 +12487,7 @@ async fn run_startup_migrations(
                     auto_in_prod,
                     crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     target,
+                    lock_policy,
                 );
             }
         }
@@ -16201,15 +16218,18 @@ mod tests {
             "the migrate one-shot must not start the server"
         );
 
-        // The per-target applier reuses `run_pending_locked` (the exact engine
-        // `auto_migrate` drives — no duplicated migration logic) and exits
+        // The per-target applier reuses `run_pending_locked_with_policy` (the
+        // exact engine `auto_migrate` drives — no duplicated migration logic) and exits
         // non-zero on failure so a bad migration aborts before cutover (AC-3).
         let helper_start = source
             .find("fn apply_pending_or_exit(")
             .expect("apply_pending_or_exit exists");
-        let helper = &source[helper_start..helper_start + 1200];
+        let helper_end = source[helper_start..]
+            .find("\n}\n")
+            .map_or(source.len(), |end| helper_start + end);
+        let helper = &source[helper_start..helper_end];
         assert!(
-            helper.contains("crate::migrate::run_pending_locked("),
+            helper.contains("crate::migrate::run_pending_locked_with_policy("),
             "must reuse the shared locked applier, not duplicate migration logic"
         );
         assert!(

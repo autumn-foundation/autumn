@@ -162,6 +162,23 @@ attributes):
   want to serialize writers explicitly with `SELECT … FOR UPDATE` and avoid
   wasted retry work.
 
+## Timeouts inside a transaction
+
+When `database.statement_timeout` or `database.idle_in_transaction_timeout` is
+set, each outermost framework transaction starts with:
+
+```sql
+SET LOCAL statement_timeout = 30000;
+SET LOCAL idle_in_transaction_session_timeout = 60000
+```
+
+This covers `db.tx`, `db.tx_with`, `db.tx_immediate`, and repository writes in
+a request. A savepoint keeps the outer values. A transaction pooler
+(`PgBouncer` in transaction mode) keeps a `SET LOCAL`, but drops a session
+`SET`. The `prod` profile sets `30s` and `60s` (#3057). A route's
+`StatementTimeout` extension applies to `db.tx`. When neither value is set, no
+extra statement is sent.
+
 ## Nesting policy
 
 Nested `Db::tx` / `Db::tx_with` calls are **rejected at runtime**:

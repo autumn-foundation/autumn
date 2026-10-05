@@ -9,11 +9,11 @@
 //! probe paths always pass through uncounted, so platform load balancers
 //! keep every replica in rotation regardless of load (see #1006).
 //!
-//! Disabled entirely when no ceiling is configured
-//! (`server.max_concurrent_requests` unset or `0`) — see
+//! Disabled entirely when no ceiling resolves (`server.max_concurrent_requests
+//! = 0`, or unset outside the `prod` profile with no capacity contract) — see
 //! `build_load_shed_layer` (in `router.rs`, private to the crate), which
 //! returns `None` in that case so this layer is never applied and there is
-//! no overhead.
+//! no overhead. The `prod` profile sets a default ceiling (#3057).
 //!
 //! The ceiling itself no longer has to be a hand-tuned guess: with
 //! `[server] capacity_contract` pointing at a committed `capacity.lock`, it is
@@ -21,8 +21,8 @@
 //! host class, so the layer sheds at a measured edge rather than an assumed
 //! one (issue #1733, `docs/guide/capacity-contracts.md`). An explicit
 //! `max_concurrent_requests` still wins, and every contract problem degrades
-//! to *unlimited* rather than to a ceiling — see
-//! [`crate::capacity::resolve_admission_limit`].
+//! to the profile default (unlimited outside `prod`) — see
+//! [`crate::capacity::resolve_admission_limit_with_default`].
 //!
 //! The admission gauge is a dedicated counter, independent of
 //! [`crate::middleware::MetricsCollector`]'s `requests_active` and the

@@ -992,6 +992,42 @@ autumn_web::app()
     .await;
 ```
 
+## Production Protections
+
+The `prod` profile turns on these protections (issue #3057). Each has a
+one-line opt-out.
+
+| Protection | `prod` default | Opt-out |
+| --- | --- | --- |
+| Load shedding | primary pool size × 32 in-flight requests, then `503` | `server.max_concurrent_requests = 0` |
+| Statement timeout | `database.statement_timeout = "30s"` | `"0s"` |
+| Idle in transaction | `database.idle_in_transaction_timeout = "60s"` | `"0s"` |
+| Strict config | `server.strict_config = true` | `false` |
+| Migration lock wait | `database.migration_lock_timeout = "5s"`, `5` retries (all profiles) | `"0s"` |
+| Rate limiting | off | turn it on, see below |
+
+Notes:
+
+- **Load shedding.** An explicit `server.max_concurrent_requests` wins. A
+  [capacity contract](capacity-contracts.md) wins over the profile default.
+  When the contract cannot be used, the profile default applies. Probe and
+  actuator routes are never shed. Watch `autumn_requests_shed_total`.
+- **Timeouts.** Each framework transaction starts with `SET LOCAL
+  statement_timeout` and `SET LOCAL idle_in_transaction_session_timeout`. A
+  transaction pooler (`PgBouncer` in transaction mode) keeps these. It drops
+  the session `SET` that applies outside a transaction. To bound those
+  statements too, set the timeout on the database role:
+  `ALTER ROLE app SET statement_timeout = '30s'`. SQLite builds do not get
+  these defaults.
+- **Migrations.** A DDL statement that waits more than `5s` for a table lock
+  fails. The migrator retries it after a jittered delay. Run migrations against
+  Postgres directly, not through `PgBouncer`.
+- **Rate limiting.** `prod` does not turn it on. A shared limit can block
+  clients behind one proxy address. Configure
+  [`security.rate_limit`](rate-limiting.md) and
+  [`security.trusted_proxies`](middleware.md#forwarded-header-client-identity-plugin-author-guidance)
+  for your traffic, then turn it on.
+
 ## Minimal Deployment Checklist
 
 Before calling an Autumn app "cloud ready", verify:
@@ -1013,3 +1049,7 @@ Before calling an Autumn app "cloud ready", verify:
 - `server.prestop_grace_secs` is tuned to match your load balancer's deregistration propagation time
 - `terminationGracePeriodSeconds` (Kubernetes) or equivalent is set to `preStop_hook_secs + prestop_grace_secs + shutdown_timeout_secs + buffer` (`shutdown_timeout_secs` covers drain **and** hooks combined)
 - `autumn_shutdown_aborted_requests_total` is monitored and alerts on any non-zero value after a rolling deploy
+- the [production protections](#production-protections) are on, or each opt-out is deliberate
+- `autumn_requests_shed_total` is monitored, and the shedding ceiling is tuned or comes from a capacity contract
+- `autumn.toml` boots under `strict_config` (the `prod` default)
+- rate limiting is configured for your traffic, or you have a documented reason to leave it off

@@ -102,6 +102,168 @@ pub enum MigrationError {
         /// Configured wait timeout in seconds.
         timeout_secs: u64,
     },
+
+    /// A migration waited longer than `database.migration_lock_timeout` for a
+    /// table lock on every attempt (#3057). Another session holds a lock on
+    /// the table. Nothing from the failed migration was applied.
+    #[error(
+        "migration blocked by a table lock after {attempts} attempts: {message}. \
+         Find the blocking session in pg_locks and pg_stat_activity"
+    )]
+    LockContention {
+        /// Attempts made, the first one included.
+        attempts: u32,
+        /// The last database error.
+        message: String,
+    },
+}
+
+/// How a migration session handles table-lock waits (#3057).
+///
+/// The migrator sets `lock_timeout` on its session. A DDL statement that
+/// waits longer for a lock fails, the migration rolls back, and the migrator
+/// tries again after a jittered delay. This stops one long transaction from
+/// queueing every request behind an `ALTER TABLE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationLockPolicy {
+    /// Postgres `lock_timeout` for the migration session. `ZERO` is no limit.
+    pub lock_timeout: std::time::Duration,
+    /// Retries after a lock timeout. `0` is one attempt only.
+    pub retries: u32,
+}
+
+impl Default for MigrationLockPolicy {
+    /// `5s` and `5` retries, the `[database]` defaults.
+    fn default() -> Self {
+        Self::from_config(&crate::config::DatabaseConfig::default())
+    }
+}
+
+impl MigrationLockPolicy {
+    /// The policy from `database.migration_lock_timeout` and
+    /// `database.migration_lock_retries`.
+    #[must_use]
+    pub const fn from_config(config: &crate::config::DatabaseConfig) -> Self {
+        Self {
+            lock_timeout: config.migration_lock_timeout,
+            retries: config.migration_lock_retries,
+        }
+    }
+}
+
+/// First retry delay before jitter. Each retry doubles it.
+const LOCK_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Upper limit of a retry delay before jitter.
+const LOCK_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The `SET lock_timeout` statement for `timeout`, in milliseconds, capped at
+/// the Postgres maximum (`i32::MAX`).
+fn lock_timeout_statement(timeout: std::time::Duration) -> String {
+    let ms = u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(i32::MAX.unsigned_abs().into());
+    format!("SET lock_timeout = {ms}")
+}
+
+/// Whether `error` is a Postgres lock timeout (`55P03 lock_not_available`).
+/// Diesel gives the migration error as text only, so this reads the message.
+fn is_lock_timeout_error(error: &MigrationError) -> bool {
+    match error {
+        MigrationError::Migration(message) => {
+            message.contains("canceling statement due to lock timeout")
+                || message.contains("could not obtain lock on")
+        }
+        _ => false,
+    }
+}
+
+/// The delay before retry number `attempt + 1`: `500ms × 2^attempt`, capped at
+/// `10s`, then scaled into `[50%, 100%]` by `unit` (a value in `0.0..=1.0`).
+/// The jitter keeps replicas that failed together from retrying together.
+fn lock_retry_delay(attempt: u32, unit: f64) -> std::time::Duration {
+    let full = LOCK_RETRY_BASE_DELAY
+        .saturating_mul(1 << attempt.min(16))
+        .min(LOCK_RETRY_MAX_DELAY);
+    full.mul_f64(0.5 + 0.5 * unit.clamp(0.0, 1.0))
+}
+
+/// Run `op`, and run it again after `sleep(delay)` each time it fails with a
+/// lock timeout, up to `policy.retries` times. Other errors return at once.
+///
+/// A lock timeout is a [`MigrationError::Migration`] whose text holds the
+/// Postgres `lock_timeout` message. The `autumn migrate` CLI uses this for
+/// its `diesel` subprocess.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::LockContention`] when every attempt timed out on
+/// a lock, or the first other error from `op`.
+pub fn retry_on_lock_timeout<T>(
+    policy: MigrationLockPolicy,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut op: impl FnMut() -> Result<T, MigrationError>,
+) -> Result<T, MigrationError> {
+    let attempts = policy.retries.saturating_add(1);
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Err(error) if is_lock_timeout_error(&error) => {
+                if attempt >= attempts {
+                    return Err(MigrationError::LockContention {
+                        attempts: attempt,
+                        message: error.to_string(),
+                    });
+                }
+                sleep(lock_retry_delay(attempt - 1, rand::random::<f64>()));
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// A [`MigrationSource`] that borrows another one, so a retry can read the
+/// same migrations again.
+struct BorrowedSource<'a, S>(&'a S);
+
+impl<S: MigrationSource<Pg>> MigrationSource<Pg> for BorrowedSource<'_, S> {
+    fn migrations(&self) -> diesel::migration::Result<Vec<Box<dyn Migration<Pg>>>> {
+        self.0.migrations()
+    }
+}
+
+/// Set `lock_timeout` on the migration session, then run the pending
+/// migrations with [`retry_on_lock_timeout`].
+fn apply_pending_with_policy<C>(
+    conn: &mut C,
+    migrations: impl MigrationSource<Pg>,
+    policy: MigrationLockPolicy,
+) -> Result<Vec<String>, MigrationError>
+where
+    C: MigrationHarness<Pg> + diesel::connection::SimpleConnection + 'static,
+{
+    conn.batch_execute(&lock_timeout_statement(policy.lock_timeout))
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    retry_on_lock_timeout(
+        policy,
+        |delay| {
+            tracing::warn!(
+                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                lock_timeout_ms =
+                    u64::try_from(policy.lock_timeout.as_millis()).unwrap_or(u64::MAX),
+                "migration timed out waiting for a table lock; retrying"
+            );
+            std::thread::sleep(delay);
+        },
+        || {
+            let mut harness = HarnessWithOutput::write_to_stdout(&mut *conn);
+            harness
+                .run_pending_migrations(BorrowedSource(&migrations))
+                .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
+                .map_err(|e| MigrationError::Migration(e.to_string()))
+        },
+    )
 }
 
 /// Run `$body` with a `&mut` connection to `$url` that honors the
@@ -285,16 +447,23 @@ pub fn run_pending(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
 ) -> Result<MigrationResult, MigrationError> {
+    run_pending_with_policy(database_url, migrations, MigrationLockPolicy::default())
+}
+
+/// [`run_pending`] with an explicit [`MigrationLockPolicy`] (#3057).
+///
+/// # Errors
+///
+/// As [`run_pending`], plus [`MigrationError::LockContention`] when every
+/// attempt timed out on a table lock.
+pub fn run_pending_with_policy(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
+    policy: MigrationLockPolicy,
+) -> Result<MigrationResult, MigrationError> {
     with_migration_connection!(database_url, |conn| {
-        let mut harness = HarnessWithOutput::write_to_stdout(conn);
-
-        let applied = harness
-            .run_pending_migrations(migrations)
-            .map_err(|e| MigrationError::Migration(e.to_string()))?;
-
-        Ok(MigrationResult {
-            applied: applied.iter().map(|m| format!("{m}")).collect(),
-        })
+        let applied = apply_pending_with_policy(conn, migrations, policy)?;
+        Ok(MigrationResult { applied })
     })
 }
 
@@ -2821,7 +2990,28 @@ pub fn run_pending_locked(
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     wait_timeout: Option<std::time::Duration>,
 ) -> Result<MigrationResult, MigrationError> {
-    run_pending_locked_inner(database_url, migrations, wait_timeout, None)
+    run_pending_locked_with_policy(
+        database_url,
+        migrations,
+        wait_timeout,
+        MigrationLockPolicy::default(),
+    )
+}
+
+/// [`run_pending_locked`] with an explicit [`MigrationLockPolicy`] (#3057).
+/// The retries happen under the advisory lock.
+///
+/// # Errors
+///
+/// As [`run_pending_locked`], plus [`MigrationError::LockContention`] when
+/// every attempt timed out on a table lock.
+pub fn run_pending_locked_with_policy(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
+    wait_timeout: Option<std::time::Duration>,
+    policy: MigrationLockPolicy,
+) -> Result<MigrationResult, MigrationError> {
+    run_pending_locked_inner(database_url, migrations, wait_timeout, None, policy)
 }
 
 /// Shared engine for [`run_pending_locked`] that additionally performs
@@ -2868,6 +3058,7 @@ fn run_pending_locked_inner(
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     wait_timeout: Option<std::time::Duration>,
     up_sql_by_version: Option<&HashMap<String, String>>,
+    policy: MigrationLockPolicy,
 ) -> Result<MigrationResult, MigrationError> {
     let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
 
@@ -2888,15 +3079,10 @@ fn run_pending_locked_inner(
                 validate_checksums(&applied, up, &recorded)?;
             }
 
-            // (3) Apply pending migrations. Collect names eagerly so the harness
-            //     borrow on `conn` is dropped before the checksum steps reuse it.
-            let applied: Vec<String> = {
-                let mut harness = HarnessWithOutput::write_to_stdout(&mut *conn);
-                harness
-                    .run_pending_migrations(migrations)
-                    .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
-                    .map_err(|e| MigrationError::Migration(e.to_string()))?
-            };
+            // (3) Apply pending migrations, with `lock_timeout` and a jittered
+            //     retry (#3057). Collect names eagerly so the harness borrow on
+            //     `conn` is dropped before the checksum steps reuse it.
+            let applied: Vec<String> = apply_pending_with_policy(&mut *conn, migrations, policy)?;
 
             // (5) Post-apply re-validation — still under the lock, on the same
             //     session. It deliberately does not record checksums for the
@@ -3499,6 +3685,7 @@ pub(crate) fn auto_migrate(
     auto_migrate_in_production: bool,
     migrations: impl MigrationSource<Pg> + Send,
     target: &str,
+    policy: MigrationLockPolicy,
 ) {
     let profile_name = profile.unwrap_or("none");
     let is_dev = matches!(profile_name, "dev" | "development");
@@ -3559,7 +3746,13 @@ pub(crate) fn auto_migrate(
             None
         };
 
-        match run_pending_locked_inner(database_url, migrations, None, up_by_version.as_ref()) {
+        match run_pending_locked_inner(
+            database_url,
+            migrations,
+            None,
+            up_by_version.as_ref(),
+            policy,
+        ) {
             Ok(result) if result.applied.is_empty() => {
                 tracing::info!(target = %target, "No pending migrations");
             }
@@ -4813,6 +5006,340 @@ mod tests {
         );
     }
 
+    // ── #3057: migration lock_timeout + jittered retry ────────────────────
+
+    fn lock_timeout_error() -> MigrationError {
+        MigrationError::Migration(
+            "Failed to run 2026-10-05-000000_alter_lock_probe with: \
+             canceling statement due to lock timeout"
+                .to_owned(),
+        )
+    }
+
+    #[test]
+    fn lock_policy_default_is_five_seconds_and_five_retries() {
+        let policy = MigrationLockPolicy::default();
+        assert_eq!(policy.lock_timeout, std::time::Duration::from_secs(5));
+        assert_eq!(policy.retries, 5);
+    }
+
+    #[test]
+    fn lock_policy_reads_the_database_config() {
+        let config = crate::config::DatabaseConfig {
+            migration_lock_timeout: std::time::Duration::from_millis(1500),
+            migration_lock_retries: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            MigrationLockPolicy::from_config(&config),
+            MigrationLockPolicy {
+                lock_timeout: std::time::Duration::from_millis(1500),
+                retries: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn lock_timeout_statement_is_in_milliseconds() {
+        assert_eq!(
+            lock_timeout_statement(std::time::Duration::from_secs(5)),
+            "SET lock_timeout = 5000"
+        );
+        // `0` turns the Postgres limit off.
+        assert_eq!(
+            lock_timeout_statement(std::time::Duration::ZERO),
+            "SET lock_timeout = 0"
+        );
+        // Postgres stores the value as a 32-bit integer.
+        assert_eq!(
+            lock_timeout_statement(std::time::Duration::from_secs(u64::MAX)),
+            format!("SET lock_timeout = {}", i32::MAX)
+        );
+    }
+
+    #[test]
+    fn only_lock_timeouts_are_classified_as_lock_contention() {
+        assert!(is_lock_timeout_error(&lock_timeout_error()));
+        assert!(is_lock_timeout_error(&MigrationError::Migration(
+            "could not obtain lock on relation \"users\"".to_owned()
+        )));
+        assert!(!is_lock_timeout_error(&MigrationError::Migration(
+            "canceling statement due to statement timeout".to_owned()
+        )));
+        assert!(!is_lock_timeout_error(&MigrationError::Migration(
+            "relation \"users\" does not exist".to_owned()
+        )));
+        assert!(!is_lock_timeout_error(&MigrationError::LockTimeout {
+            timeout_secs: 60
+        }));
+    }
+
+    #[test]
+    fn lock_retry_delay_is_jittered_and_capped() {
+        for attempt in 0..12 {
+            let full = LOCK_RETRY_BASE_DELAY
+                .saturating_mul(1 << attempt.min(16))
+                .min(LOCK_RETRY_MAX_DELAY);
+            for unit in [0.0, 0.25, 0.5, 0.999, 1.0] {
+                let delay = lock_retry_delay(attempt, unit);
+                assert!(
+                    delay >= full / 2,
+                    "attempt {attempt}, unit {unit}: {delay:?}"
+                );
+                assert!(delay <= full, "attempt {attempt}, unit {unit}: {delay:?}");
+            }
+        }
+        assert!(lock_retry_delay(1, 0.0) < lock_retry_delay(1, 1.0));
+        // Out-of-range jitter input is clamped.
+        assert_eq!(lock_retry_delay(1, -3.0), lock_retry_delay(1, 0.0));
+        assert_eq!(lock_retry_delay(1, 7.0), lock_retry_delay(1, 1.0));
+    }
+
+    #[test]
+    fn lock_retry_loop_retries_lock_timeouts_then_succeeds() {
+        let policy = MigrationLockPolicy {
+            lock_timeout: std::time::Duration::from_secs(5),
+            retries: 5,
+        };
+        let mut calls = 0u32;
+        let mut sleeps = Vec::new();
+        let result = retry_on_lock_timeout(
+            policy,
+            |delay| sleeps.push(delay),
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(lock_timeout_error())
+                } else {
+                    Ok(7)
+                }
+            },
+        );
+        assert_eq!(result.expect("third attempt succeeds"), 7);
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps.len(), 2);
+        assert!(sleeps.iter().all(|d| *d <= LOCK_RETRY_MAX_DELAY));
+    }
+
+    #[test]
+    fn lock_retry_loop_gives_up_with_lock_contention() {
+        let policy = MigrationLockPolicy {
+            lock_timeout: std::time::Duration::from_secs(5),
+            retries: 2,
+        };
+        let mut calls = 0u32;
+        let err = retry_on_lock_timeout(
+            policy,
+            |_| {},
+            || -> Result<(), MigrationError> {
+                calls += 1;
+                Err(lock_timeout_error())
+            },
+        )
+        .expect_err("all attempts time out");
+        assert_eq!(calls, 3);
+        match err {
+            MigrationError::LockContention { attempts, message } => {
+                assert_eq!(attempts, 3);
+                assert!(message.contains("lock timeout"), "{message}");
+            }
+            other => panic!("expected LockContention, got {other:?}"),
+        }
+        let text = MigrationError::LockContention {
+            attempts: 3,
+            message: "x".to_owned(),
+        }
+        .to_string();
+        assert!(text.contains("3 attempts"), "{text}");
+        assert!(text.contains("pg_locks"), "{text}");
+    }
+
+    #[test]
+    fn lock_retry_loop_does_not_retry_other_errors() {
+        let mut calls = 0u32;
+        let err = retry_on_lock_timeout(
+            MigrationLockPolicy::default(),
+            |_| panic!("must not sleep"),
+            || -> Result<(), MigrationError> {
+                calls += 1;
+                Err(MigrationError::Migration("syntax error".to_owned()))
+            },
+        )
+        .expect_err("fails");
+        assert_eq!(calls, 1);
+        assert!(matches!(err, MigrationError::Migration(_)));
+    }
+
+    #[test]
+    fn zero_retries_means_one_attempt() {
+        let policy = MigrationLockPolicy {
+            lock_timeout: std::time::Duration::from_secs(5),
+            retries: 0,
+        };
+        let mut calls = 0u32;
+        let err = retry_on_lock_timeout(
+            policy,
+            |_| panic!("must not sleep"),
+            || -> Result<(), MigrationError> {
+                calls += 1;
+                Err(lock_timeout_error())
+            },
+        )
+        .expect_err("fails");
+        assert_eq!(calls, 1);
+        assert!(matches!(
+            err,
+            MigrationError::LockContention { attempts: 1, .. }
+        ));
+    }
+
+    /// Migrations that `ALTER` the `autumn_lock_probe` table.
+    #[cfg(feature = "test-support")]
+    const LOCK_PROBE_MIGRATIONS: EmbeddedMigrations =
+        diesel_migrations::embed_migrations!("tests/fixtures/lock_timeout_migrations");
+
+    /// A fresh database with an `autumn_lock_probe` table. `AUTUMN_TEST_PG_URL`
+    /// selects an existing server; otherwise a container starts.
+    #[cfg(feature = "test-support")]
+    async fn lock_probe_database() -> (
+        Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
+        String,
+    ) {
+        use diesel::{Connection as _, connection::SimpleConnection as _};
+        use testcontainers::runners::AsyncRunner as _;
+
+        let (container, base) = if let Ok(url) = std::env::var("AUTUMN_TEST_PG_URL") {
+            (None, url)
+        } else {
+            let container = testcontainers_modules::postgres::Postgres::default()
+                .start()
+                .await
+                .expect("start Postgres container");
+            let host = container.get_host().await.expect("host");
+            let port = container.get_host_port_ipv4(5432).await.expect("port");
+            let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+            (Some(container), url)
+        };
+        let name = format!(
+            "autumn_lock_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        let url = crate::time::spawn_blocking(move || {
+            let mut admin = diesel::PgConnection::establish(&base).expect("connect");
+            admin
+                .batch_execute(&format!("CREATE DATABASE {name}"))
+                .expect("create database");
+            let (prefix, _) = base.rsplit_once('/').expect("url has a database path");
+            let url = format!("{prefix}/{name}");
+            diesel::PgConnection::establish(&url)
+                .expect("connect to new database")
+                .batch_execute("CREATE TABLE autumn_lock_probe (id INT)")
+                .expect("create probe table");
+            url
+        })
+        .await
+        .expect("join");
+        (container, url)
+    }
+
+    /// Hold `ACCESS SHARE` on the probe table (a long read transaction) until
+    /// `release` fires. Returns once the lock is held.
+    #[cfg(feature = "test-support")]
+    fn hold_probe_lock(
+        url: String,
+        release: std::sync::mpsc::Receiver<()>,
+    ) -> std::thread::JoinHandle<()> {
+        use diesel::{Connection as _, connection::SimpleConnection as _};
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut conn = diesel::PgConnection::establish(&url).expect("connect holder");
+            conn.batch_execute("BEGIN").expect("begin");
+            conn.batch_execute("LOCK TABLE autumn_lock_probe IN ACCESS SHARE MODE")
+                .expect("lock");
+            held_tx.send(()).expect("signal held");
+            let _ = release.recv();
+            conn.batch_execute("COMMIT").expect("commit");
+        });
+        held_rx.recv().expect("lock held");
+        handle
+    }
+
+    /// AC: a migration blocked by a long-held lock fails fast and retries, and
+    /// does not block forever.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn migration_blocked_by_a_held_lock_fails_fast_after_retries() {
+        let (_container, url) = lock_probe_database().await;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = hold_probe_lock(url.clone(), release_rx);
+
+        let policy = MigrationLockPolicy {
+            lock_timeout: std::time::Duration::from_millis(200),
+            retries: 2,
+        };
+        let started = std::time::Instant::now();
+        let run_url = url.clone();
+        let result = crate::time::spawn_blocking(move || {
+            run_pending_locked_with_policy(&run_url, LOCK_PROBE_MIGRATIONS, None, policy)
+        })
+        .await
+        .expect("join");
+        let elapsed = started.elapsed();
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+
+        match result {
+            Err(MigrationError::LockContention { attempts, message }) => {
+                assert_eq!(attempts, 3);
+                assert!(message.contains("lock timeout"), "{message}");
+            }
+            other => panic!("expected LockContention, got {other:?}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "must fail fast, took {elapsed:?}"
+        );
+        // Nothing was applied, so a later run can still apply it.
+        let pending =
+            crate::time::spawn_blocking(move || pending_migrations(&url, LOCK_PROBE_MIGRATIONS))
+                .await
+                .expect("join")
+                .expect("pending");
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// AC: once the blocking transaction ends, a retry applies the migration.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn migration_retry_applies_after_the_lock_is_released() {
+        let (_container, url) = lock_probe_database().await;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = hold_probe_lock(url.clone(), release_rx);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            release_tx.send(()).expect("release");
+        });
+
+        let policy = MigrationLockPolicy {
+            lock_timeout: std::time::Duration::from_millis(200),
+            retries: 10,
+        };
+        let result = crate::time::spawn_blocking(move || {
+            run_pending_locked_with_policy(&url, LOCK_PROBE_MIGRATIONS, None, policy)
+        })
+        .await
+        .expect("join")
+        .expect("migration applies after the lock is released");
+        releaser.join().expect("releaser");
+        holder.join().expect("holder");
+        assert_eq!(result.applied.len(), 1);
+    }
+
     #[test]
     fn migration_advisory_lock_key_is_positive_and_stable() {
         const { assert!(MIGRATION_ADVISORY_LOCK_KEY > 0) };
@@ -4852,7 +5379,13 @@ mod tests {
         let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db";
         let mut up_by_version: HashMap<String, String> = HashMap::new();
         up_by_version.insert("20260101000000".to_string(), "SELECT 1;".to_string());
-        let result = run_pending_locked_inner(url, MIGRATIONS, None, Some(&up_by_version));
+        let result = run_pending_locked_inner(
+            url,
+            MIGRATIONS,
+            None,
+            Some(&up_by_version),
+            MigrationLockPolicy::default(),
+        );
         assert!(
             matches!(result.unwrap_err(), MigrationError::Connection(_)),
             "unreachable host must produce Connection error even with a checksum map"
@@ -5155,8 +5688,14 @@ mod tests {
             actual_hash,
             "sanity: original up.sql must not match the re-baselined checksum"
         );
-        let drift = run_pending_locked_inner(url, FRAMEWORK_MIGRATIONS, None, Some(&up_by_version))
-            .expect_err("under-lock validation must reject an applied migration that drifted");
+        let drift = run_pending_locked_inner(
+            url,
+            FRAMEWORK_MIGRATIONS,
+            None,
+            Some(&up_by_version),
+            MigrationLockPolicy::default(),
+        )
+        .expect_err("under-lock validation must reject an applied migration that drifted");
         assert!(
             matches!(&drift, MigrationError::Migration(m) if m.contains("checksum mismatch") && m.contains(&version)),
             "run_pending_locked_inner must validate checksums inside the locked section: {drift:?}"
@@ -5237,8 +5776,14 @@ mod tests {
         );
         // FRAMEWORK_MIGRATIONS are all applied, so nothing pending; the map is
         // used for validation only. Unrecorded → Ok, so this must succeed.
-        run_pending_locked_inner(url, FRAMEWORK_MIGRATIONS, None, Some(&startup_by_version))
-            .expect("startup path validates an Unrecorded version as Ok");
+        run_pending_locked_inner(
+            url,
+            FRAMEWORK_MIGRATIONS,
+            None,
+            Some(&startup_by_version),
+            MigrationLockPolicy::default(),
+        )
+        .expect("startup path validates an Unrecorded version as Ok");
         assert!(
             !recorded_checksums(&mut conn)
                 .expect("read recorded checksums")
