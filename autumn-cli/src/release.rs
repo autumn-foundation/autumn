@@ -3225,6 +3225,26 @@ for arg in "$@"; do
   [ "$prev" = "--body" ] && body="$(cat "${arg#@}")"
   prev="$arg"
 done
+# The app as the GET shows it before any PATCH.
+  env='{"name":"AUTUMN_PROFILE","value":"prod"}'
+  [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && env="$env"',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
+  [ -n "$STUB_APP_REDIS" ] && env="$env"',{"name":"AUTUMN_CACHE__BACKEND","value":"redis"},{"name":"AUTUMN_CACHE__REDIS__URL","secretRef":"redis-url"}'
+  # A placeholder app made by the old template has the job's credentials.
+  legacy=""
+  [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
+  # An identity that the operator added to the placeholder.
+  [ -n "$STUB_APP_OWN_IDENTITY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"/other\":{\"principalId\":\"o\"}}},"
+  registries=""
+  [ -n "$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_NO_REGISTRY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
+  secrets=""
+  sid="$id"
+  [ -n "$STUB_APP_STALE_SECRET_IDENTITY" ] && sid=/old-id
+  [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$sid\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$sid\"}"
+  sidecar='{"name":"sidecar","image":"busybox"}'
+  [ -n "$STUB_SIDECAR_SECRET_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_DB","secretRef":"database-url"}]}'
+  scale=""
+  [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"database-url","triggerParameter":"connection"}]}}]}'
+  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
 case "$1 $2" in
   "containerapp job")
     secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"$id\"}"; }
@@ -3234,25 +3254,6 @@ case "$1 $2" in
     ;;
   "containerapp show")
     if [ -z "$query" ]; then
-      env='{"name":"AUTUMN_PROFILE","value":"prod"}'
-      [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && env="$env"',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
-      [ -n "$STUB_APP_REDIS" ] && env="$env"',{"name":"AUTUMN_CACHE__BACKEND","value":"redis"},{"name":"AUTUMN_CACHE__REDIS__URL","secretRef":"redis-url"}'
-      # A placeholder app made by the old template has the job's credentials.
-      legacy=""
-      [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
-      # An identity that the operator added to the placeholder.
-      [ -n "$STUB_APP_OWN_IDENTITY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"/other\":{\"principalId\":\"o\"}}},"
-      registries=""
-      [ -n "$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_NO_REGISTRY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
-      secrets=""
-      sid="$id"
-      [ -n "$STUB_APP_STALE_SECRET_IDENTITY" ] && sid=/old-id
-      [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$sid\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$sid\"}"
-      sidecar='{"name":"sidecar","image":"busybox"}'
-      [ -n "$STUB_SIDECAR_SECRET_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_DB","secretRef":"database-url"}]}'
-      scale=""
-      [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"database-url","triggerParameter":"connection"}]}}]}'
-      app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
       # A GET shows the app state with each PATCH merged in. Like ARM after
       # a 202, the first STUB_PATCH_PENDING reads after a PATCH still show
       # the state before it.
@@ -3298,6 +3299,11 @@ case "$1 $2" in
       exit 0
     fi
     case "$query" in
+      # The template of the active (old) revision runs the active image.
+      properties.template.containers)
+        jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" \
+          '.properties.template.containers | .[0].image = $image' <<< "$app"
+        ;;
       properties.active) echo false ;;
       # The placeholder image always provisions.
       properties.provisioningState) echo Provisioned ;;
@@ -3968,6 +3974,38 @@ esac
                 >= 3,
             "stage 2 must wait until the old revision is inactive: {calls}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_cleans_up_from_the_active_placeholder_template() {
+        // After a canceled first cutover, the app template has the real
+        // image, but the active revision runs the placeholder. Stage 1 must
+        // deploy the placeholder: the real image cannot start without its
+        // signing secret.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage1 = bodies.lines().next().unwrap_or_default();
+        assert!(
+            stage1.contains("\"mcr.microsoft.com/k8se/quickstart:latest\""),
+            "{stage1}"
+        );
+        assert!(!stage1.contains("acr.azurecr.io/app:t1"), "{stage1}");
     }
 
     #[cfg(unix)]
