@@ -3259,6 +3259,8 @@ fi
   [ -n "$STUB_JOB_CUSTOM_KV" ] && [ -n "$STUB_APP_LEGACY" ] && env="$env"',{"name":"QUEUE_KEY","secretRef":"queue-key"}'
   # A placeholder app made by the old template has the job's credentials.
   legacy=""
+  # The app's own system identity, from before any cutover.
+  [ -n "$STUB_APP_SYSTEM_IDENTITY" ] && legacy="\"identity\":{\"type\":\"SystemAssigned\",\"principalId\":\"s\"},"
   [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
   # The cutover of an older run also attached the identity of a custom job
   # secret.
@@ -3455,7 +3457,7 @@ case "$1 $2" in
       # names as failed.
       properties.provisioningState)
         if [ -n "$STUB_LATEST_FAILED" ] && [[ " $* " == *" --revision $STUB_LATEST_FAILED "* ]]; then
-          echo Failed
+          echo "${STUB_LATEST_STATE:-Failed}"
         else
           echo Provisioned
         fi
@@ -3598,6 +3600,8 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_LATEST_STATE")
+            .env_remove("STUB_APP_SYSTEM_IDENTITY")
             .env_remove("STUB_MIN_REPLICAS")
             .env_remove("STUB_ACTIVE_MIN_REPLICAS")
             .env_remove("STUB_JOB_CUSTOM_KV_IDENTITY")
@@ -4347,6 +4351,88 @@ esac
         // No identity stays, so the type goes to None; /kv-id-2 is not kept.
         assert!(!stage2.contains("\"/kv-id-2\":{}"), "{stage2}");
         assert!(stage2.contains("\"type\":\"None\""), "{stage2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_forces_a_fresh_revision_after_a_canceled_one() {
+        // A canceled revision never provisions, like a failed one. A retry
+        // with the same tag must make a fresh revision.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_LATEST_FAILED", "app--old"),
+                ("STUB_LATEST_STATE", "Canceled"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(bodies.contains("AUTUMN_FORCE_REVISION"), "{bodies}");
+        assert!(!calls.contains("revision restart"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_rollback_keeps_a_system_identity_that_was_there() {
+        // A job secret uses the system identity, but the app had its own
+        // system identity before the cutover. The rollback keeps it.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "system"),
+                ("STUB_APP_SYSTEM_IDENTITY", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let removal = bodies
+            .lines()
+            .rfind(|line| line.contains("\"identity\":{") && !line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(removal.contains("SystemAssigned"), "{removal}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_rollback_drops_a_system_identity_that_it_turned_on() {
+        // The cutover turned the system identity on for a job secret, and
+        // marks that with a tag. The rollback turns it off again.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "system"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let cutover = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(
+            cutover.contains("\"autumn-system-identity\":\"cutover\""),
+            "{cutover}"
+        );
+        let removal = bodies
+            .lines()
+            .rfind(|line| line.contains("\"identity\":{") && !line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(!removal.contains("SystemAssigned"), "{removal}");
     }
 
     #[cfg(unix)]
