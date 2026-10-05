@@ -2080,11 +2080,10 @@ impl Analyzer {
                 self.env.declare(p.ident.to_string(), binding);
             }
             // `Ok::<(), PgPostRepository>(())` is typed like a `let` with
-            // `Result<(), PgPostRepository>`.
-            (Pat::Ident(p), Expr::Call(c))
-                if p.subpat.is_none() && constructor_type(c).is_some() =>
-            {
-                if let Some(ty) = constructor_type(c) {
+            // `Result<(), PgPostRepository>`, and `Vec::<Db>::new()` like one
+            // with `Vec<Db>`.
+            (Pat::Ident(p), _) if p.subpat.is_none() && constructor_type(init).is_some() => {
+                if let Some(ty) = constructor_type(init) {
                     let kind = self.value_of(init);
                     self.bind_typed(pat, &ty, kind);
                 }
@@ -5299,26 +5298,30 @@ fn ref_mut_names(pat: &Pat) -> Vec<String> {
 }
 
 /// The type a turbofish gives a std constructor: `Result<T, E>` for
-/// `Ok::<T, E>(x)`, `Option<T>` for `Some::<T>(x)`. `None` when a type is
-/// left to inference (`_`).
-fn constructor_type(call: &ExprCall) -> Option<Type> {
+/// `Ok::<T, E>(x)`, `Option<T>` for `Some::<T>(x)` and `None::<T>`, and
+/// `Vec<T>` for `Vec::<T>::new()`. `None` when a type is left to inference
+/// (`_`).
+fn constructor_type(e: &Expr) -> Option<Type> {
     struct Infers(bool);
     impl<'a> Visit<'a> for Infers {
         fn visit_type_infer(&mut self, _: &'a syn::TypeInfer) {
             self.0 = true;
         }
     }
-    if !is_container_constructor(call) {
-        return None;
-    }
-    let Expr::Path(path) = &*call.func else {
-        return None;
+    let (path, called) = match peel_parens(e) {
+        Expr::Call(call) => match &*call.func {
+            Expr::Path(p) => (&p.path, true),
+            _ => return None,
+        },
+        Expr::Path(p) => (&p.path, false),
+        _ => return None,
     };
-    let args = path
-        .path
-        .segments
-        .iter()
-        .rev()
+    let mut segments = path.segments.iter().rev();
+    let last = segments.next()?;
+    let owner = segments.next();
+    let args = [Some(last), owner]
+        .into_iter()
+        .flatten()
         .find_map(|s| match &s.arguments {
             syn::PathArguments::AngleBracketed(a) => Some(a),
             _ => None,
@@ -5338,9 +5341,17 @@ fn constructor_type(call: &ExprCall) -> Option<Type> {
     if infers.0 {
         return None;
     }
-    match (call_path_name(call).as_deref(), types.as_slice()) {
-        (Some("Some"), [t]) => Some(syn::parse_quote!(Option<#t>)),
-        (Some("Ok" | "Err"), [t, e]) => Some(syn::parse_quote!(Result<#t, #e>)),
+    let name = last.ident.to_string();
+    match (name.as_str(), called, types.as_slice()) {
+        ("Some", true, [t]) | ("None", false, [t]) => Some(syn::parse_quote!(Option<#t>)),
+        ("Ok" | "Err", true, [t, e]) => Some(syn::parse_quote!(Result<#t, #e>)),
+        ("new" | "with_capacity" | "default" | "from" | "from_iter", true, [_, ..]) => {
+            let owner = owner?;
+            let collection = &owner.ident;
+            CARRIER_TYPES
+                .contains(&collection.to_string().as_str())
+                .then(|| syn::parse_quote!(#collection<#(#types),*>))
+        }
         _ => None,
     }
 }
@@ -10706,6 +10717,39 @@ mod tests {
                 "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
                  let mut slot = None; while { slot = Some(&repo); flag } {} render(slot); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn turbofish_container_constructors_keep_their_type() {
+        check_handlers(&[
+            (
+                "guard: a turbofish Vec keeps its element type",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = Vec::<PgPostRepository>::new(); repos = repo + (); \
+                 let _ = repos[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a turbofish map keeps its value type",
+                "async fn h() -> AutumnResult<usize> { \
+                 let mut repos = HashMap::<i64, PgPostRepository>::with_capacity(4); repos = make(); \
+                 let _ = repos[&1].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a turbofish None keeps its type",
+                "async fn h() -> AutumnResult<usize> { \
+                 let mut slot = None::<PgPostRepository>; slot = make(); \
+                 let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a turbofish Vec of plain values stays plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut ids = Vec::<i64>::new(); ids = make(); render(ids); let _ = repo; Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
