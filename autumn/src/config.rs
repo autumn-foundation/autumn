@@ -127,6 +127,7 @@
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` | `usize` (`0` = unbounded) |
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
@@ -3866,6 +3867,12 @@ pub struct JobRedisConfig {
     /// Duration before an in-flight job claim is considered stale.
     #[serde(default = "default_jobs_redis_visibility_timeout_ms")]
     pub visibility_timeout_ms: u64,
+    /// Maximum number of entries in the dead-letter list. The worker removes
+    /// the oldest entries above this limit, logs a warning and increments
+    /// `autumn_jobs_dead_letter_trimmed_total`. `0` keeps all entries.
+    /// Default: 10 000.
+    #[serde(default = "default_jobs_redis_dead_letter_limit")]
+    pub dead_letter_limit: usize,
 }
 
 impl Default for JobRedisConfig {
@@ -3874,6 +3881,7 @@ impl Default for JobRedisConfig {
             url: None,
             key_prefix: default_jobs_redis_prefix(),
             visibility_timeout_ms: default_jobs_redis_visibility_timeout_ms(),
+            dead_letter_limit: default_jobs_redis_dead_letter_limit(),
         }
     }
 }
@@ -3984,6 +3992,10 @@ const fn default_job_backoff_ms() -> u64 {
 
 fn default_jobs_redis_prefix() -> String {
     "autumn:jobs".to_owned()
+}
+
+const fn default_jobs_redis_dead_letter_limit() -> usize {
+    10_000
 }
 
 const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
@@ -5185,6 +5197,7 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
+    /// - `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` → `jobs.redis.dead_letter_limit` (`usize`, `0` = unbounded)
     /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
     /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
     ///
@@ -6130,6 +6143,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.redis.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT",
+            &mut self.jobs.redis.dead_letter_limit,
         );
         parse_env(
             env,
@@ -14751,6 +14769,27 @@ path = "/healthz"
         );
         assert_eq!(config.jobs.redis.key_prefix, "demo:jobs");
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 15_000);
+    }
+
+    /// Issue #3055: the dead-letter cap is configurable, and `0` is unbounded.
+    #[test]
+    fn jobs_redis_dead_letter_limit_defaults_parses_and_overrides() {
+        // The default is not smaller than the old hard-coded 1,000.
+        let defaults = JobRedisConfig::default();
+        assert_eq!(defaults.dead_letter_limit, 10_000);
+        assert_eq!(AutumnConfig::default().jobs.redis.dead_letter_limit, 10_000);
+
+        let config: AutumnConfig =
+            toml::from_str("[jobs.redis]\ndead_letter_limit = 0\n").expect("dead_letter_limit");
+        assert_eq!(config.jobs.redis.dead_letter_limit, 0);
+
+        let config: AutumnConfig = toml::from_str("[jobs.redis]\nkey_prefix = \"x\"\n").unwrap();
+        assert_eq!(config.jobs.redis.dead_letter_limit, 10_000);
+
+        let env = MockEnv::new().with("AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT", "250");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.jobs.redis.dead_letter_limit, 250);
     }
 
     #[test]

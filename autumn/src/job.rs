@@ -2063,6 +2063,9 @@ struct RedisWorkerConfig {
     default_attempts: u32,
     default_backoff: u64,
     retry_promotion_interval: std::time::Duration,
+    /// `jobs.redis.dead_letter_limit`: maximum dead-letter list length.
+    /// `0` is unbounded.
+    dead_letter_limit: usize,
     /// The app's injected clock. Redis job records carry absolute
     /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
     /// deadlines), so they must be minted from the same clock the rest of the
@@ -7547,7 +7550,11 @@ fn expected_claim_args(record: &RedisJobRecord) -> Option<(&str, u64)> {
 
 #[cfg(feature = "redis")]
 const CLAIMED_REDIS_TRANSITION_SCRIPT: &str = r"
+-- Returns the number of removed entries. A limit of 0 keeps all entries.
 local function trim_dead_history(dead_key, dead_record_prefix, limit)
+  if limit == nil or limit <= 0 then
+    return 0
+  end
   local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
   for _, encoded in ipairs(trimmed_records) do
     local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
@@ -7556,21 +7563,24 @@ local function trim_dead_history(dead_key, dead_record_prefix, limit)
     end
   end
   redis.call('LTRIM', dead_key, 0, limit - 1)
+  return #trimmed_records
 end
+-- Every return is {status, number of trimmed dead letters}.
+local trimmed = 0
 local key = KEYS[2] .. ARGV[1]
 local body = redis.call('GET', key)
 if not body then
-  return 0
+  return {0, 0}
 end
 local ok, record = pcall(cjson.decode, body)
 if not ok then
-  return 0
+  return {0, 0}
 end
 if record['claimed_by'] ~= ARGV[2] then
-  return 0
+  return {0, 0}
 end
 if record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
-  return 0
+  return {0, 0}
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
 if ARGV[9] == '1' then
@@ -7592,7 +7602,7 @@ elseif ARGV[4] == 'retry' then
   if ARGV[10] == 'pending' then
     if not redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11])) then
       redis.call('DEL', key)
-      return 2
+      return {2, 0}
     end
   end
   redis.call('SET', key, ARGV[5])
@@ -7603,13 +7613,23 @@ elseif ARGV[4] == 'retry' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[6] .. ARGV[1], ARGV[5])
-  trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[7]))
+  trimmed = trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]))
   redis.call('DEL', key)
 else
-  return 0
+  return {0, 0}
 end
-return 1
+return {1, trimmed}
 ";
+
+/// Result of a claim-checked Redis transition script.
+#[cfg(feature = "redis")]
+#[derive(Debug, Clone, Copy, Default)]
+struct RedisTransitionOutcome {
+    /// Script status: `0` no-op, `1` applied, `2` retry dropped for a duplicate.
+    status: i64,
+    /// Dead letters the script removed to obey the dead-letter limit.
+    dead_letters_trimmed: u64,
+}
 
 #[cfg(feature = "redis")]
 async fn apply_claimed_redis_transition(
@@ -7619,9 +7639,9 @@ async fn apply_claimed_redis_transition(
     mode: &str,
     encoded_record: Option<String>,
     due_at_ms: Option<u64>,
-) -> Result<i64, redis::RedisError> {
+) -> Result<RedisTransitionOutcome, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
-        return Ok(0);
+        return Ok(RedisTransitionOutcome::default());
     };
 
     // The concurrency slot frees on every settle (success, retry backoff,
@@ -7637,7 +7657,7 @@ async fn apply_claimed_redis_transition(
     } else {
         "0"
     };
-    let applied: i64 = redis::cmd("EVAL")
+    let (status, dead_letters_trimmed): (i64, u64) = redis::cmd("EVAL")
         .arg(CLAIMED_REDIS_TRANSITION_SCRIPT)
         .arg(8)
         .arg(&worker_config.processing_key)
@@ -7663,10 +7683,14 @@ async fn apply_claimed_redis_transition(
             ""
         })
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(worker_config.dead_letter_limit)
         .query_async(connection)
         .await?;
 
-    Ok(applied)
+    Ok(RedisTransitionOutcome {
+        status,
+        dead_letters_trimmed,
+    })
 }
 
 #[cfg(feature = "redis")]
@@ -7692,7 +7716,7 @@ async fn ack_redis_success(
         None,
     )
     .await?;
-    Ok(applied == 1)
+    Ok(applied.status == 1)
 }
 
 /// Outcome of [`schedule_redis_retry`], distinguishing an ordinary applied
@@ -7733,17 +7757,39 @@ async fn schedule_redis_retry(
         Some(schedule.due_at_ms),
     )
     .await?;
-    Ok(match applied {
+    Ok(match applied.status {
         1 => RedisRetryOutcome::Applied,
         2 => RedisRetryOutcome::DroppedByDuplicate,
         _ => RedisRetryOutcome::ClaimChanged,
     })
 }
 
+/// Make a dead-letter trim visible: log at warn level and count it.
+#[cfg(feature = "redis")]
+fn report_redis_dead_letter_trim(
+    registry: &crate::actuator::JobRegistry,
+    dead_key: &str,
+    limit: usize,
+    trimmed: u64,
+) {
+    if trimmed == 0 {
+        return;
+    }
+    tracing::warn!(
+        trimmed,
+        dead_letter_limit = limit,
+        dead_key,
+        "redis dead-letter list is longer than jobs.redis.dead_letter_limit; \
+         deleted the oldest dead jobs and their metadata"
+    );
+    registry.record_dead_letter_trimmed(trimmed);
+}
+
 #[cfg(feature = "redis")]
 async fn dead_letter_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
+    registry: &crate::actuator::JobRegistry,
     expected: &RedisJobRecord,
     record: &RedisJobRecord,
 ) -> Result<bool, redis::RedisError> {
@@ -7760,12 +7806,22 @@ async fn dead_letter_redis_job(
         None,
     )
     .await?;
-    Ok(applied == 1)
+    report_redis_dead_letter_trim(
+        registry,
+        &worker_config.dead_key,
+        worker_config.dead_letter_limit,
+        applied.dead_letters_trimmed,
+    );
+    Ok(applied.status == 1)
 }
 
 #[cfg(feature = "redis")]
 const STALE_REDIS_RECOVERY_SCRIPT: &str = r"
+-- Returns the number of removed entries. A limit of 0 keeps all entries.
 local function trim_dead_history(dead_key, dead_record_prefix, limit)
+  if limit == nil or limit <= 0 then
+    return 0
+  end
   local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
   for _, encoded in ipairs(trimmed_records) do
     local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
@@ -7774,23 +7830,26 @@ local function trim_dead_history(dead_key, dead_record_prefix, limit)
     end
   end
   redis.call('LTRIM', dead_key, 0, limit - 1)
+  return #trimmed_records
 end
+-- Every return is {status, number of trimmed dead letters}.
+local trimmed = 0
 local key = KEYS[2] .. ARGV[1]
 local body = redis.call('GET', key)
 if not body then
   redis.call('ZREM', KEYS[1], ARGV[1])
-  return 0
+  return {0, 0}
 end
 local ok, record = pcall(cjson.decode, body)
 if not ok then
   redis.call('ZREM', KEYS[1], ARGV[1])
-  return 0
+  return {0, 0}
 end
 if record['claimed_by'] ~= ARGV[2] then
-  return 0
+  return {0, 0}
 end
 if record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
-  return 0
+  return {0, 0}
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
 if ARGV[8] == '1' then
@@ -7808,7 +7867,7 @@ if ARGV[4] == 'requeue' then
   if ARGV[9] == 'pending' then
     if not redis.call('SET', KEYS[6], ARGV[1], 'NX', 'PX', tonumber(ARGV[10])) then
       redis.call('DEL', key)
-      return 1
+      return {1, 0}
     end
   end
   redis.call('SET', key, ARGV[5])
@@ -7819,18 +7878,19 @@ if ARGV[4] == 'requeue' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[5] .. ARGV[1], ARGV[5])
-  trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))
+  trimmed = trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))
   redis.call('DEL', key)
 else
-  return 0
+  return {0, 0}
 end
-return 1
+return {1, trimmed}
 ";
 
 #[cfg(feature = "redis")]
 async fn apply_stale_redis_recovery(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
+    registry: &crate::actuator::JobRegistry,
     expected: &RedisJobRecord,
     action: &RedisStaleRecovery,
 ) -> Result<bool, redis::RedisError> {
@@ -7861,7 +7921,7 @@ async fn apply_stale_redis_recovery(
     };
     // A requeued stale job returns to its own named queue, not the default one.
     let requeue_key = redis_queue_key(&worker_config.key_prefix, &record.queue);
-    let applied: usize = redis::cmd("EVAL")
+    let (status, trimmed): (i64, u64) = redis::cmd("EVAL")
         .arg(STALE_REDIS_RECOVERY_SCRIPT)
         .arg(7)
         .arg(&worker_config.processing_key)
@@ -7876,7 +7936,7 @@ async fn apply_stale_redis_recovery(
         .arg(claimed_at_ms)
         .arg(mode)
         .arg(encoded)
-        .arg(DEFAULT_JOB_ADMIN_HISTORY_LIMIT)
+        .arg(worker_config.dead_letter_limit)
         .arg(release_unique)
         .arg(decrement_slot)
         .arg(if mode == "requeue" {
@@ -7888,7 +7948,13 @@ async fn apply_stale_redis_recovery(
         .query_async(connection)
         .await?;
 
-    Ok(applied == 1)
+    report_redis_dead_letter_trim(
+        registry,
+        &worker_config.dead_key,
+        worker_config.dead_letter_limit,
+        trimmed,
+    );
+    Ok(status == 1)
 }
 
 #[cfg(feature = "redis")]
@@ -7946,7 +8012,15 @@ async fn recover_stale_redis_jobs(
             continue;
         };
 
-        if apply_stale_redis_recovery(connection, worker_config, &record, &action).await? {
+        if apply_stale_redis_recovery(
+            connection,
+            worker_config,
+            &state.job_registry,
+            &record,
+            &action,
+        )
+        .await?
+        {
             match &action {
                 RedisStaleRecovery::Requeue(requeued) => {
                     if let Some(error) = requeued.last_error.as_deref() {
@@ -8203,7 +8277,15 @@ async fn settle_failed_redis_job(
             }
         }
         RedisFailureAction::DeadLetter(dead) => {
-            match dead_letter_redis_job(connection, worker_config, record, &dead).await {
+            match dead_letter_redis_job(
+                connection,
+                worker_config,
+                &state.job_registry,
+                record,
+                &dead,
+            )
+            .await
+            {
                 Ok(true) => {
                     state
                         .job_registry
@@ -8243,7 +8325,15 @@ async fn dead_letter_panicked_redis_job(
         error.clone(),
         now_unix_ms(worker_config.clock.as_ref()),
     );
-    match dead_letter_redis_job(connection, worker_config, record, &dead).await {
+    match dead_letter_redis_job(
+        connection,
+        worker_config,
+        &state.job_registry,
+        record,
+        &dead,
+    )
+    .await
+    {
         Ok(true) => {
             state
                 .job_registry
@@ -8282,7 +8372,16 @@ async fn dead_letter_invalid_redis_job(
     // (`Ok(false)`), the job was NOT dead-lettered, so alerting here would be a
     // false page — mirror the sibling redis dead-letter paths that gate all of
     // this on the confirmed `Ok(true)` result.
-    if dead_letter_redis_job(connection, worker_config, record, &dead).await == Ok(true) {
+    if dead_letter_redis_job(
+        connection,
+        worker_config,
+        &state.job_registry,
+        record,
+        &dead,
+    )
+    .await
+        == Ok(true)
+    {
         state
             .job_registry
             .record_failure(&record.name, error.to_owned(), true);
@@ -8646,6 +8745,7 @@ fn start_redis_runtime(
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
                 retry_promotion_interval,
+                dead_letter_limit: config.redis.dead_letter_limit,
                 clock: state.clock_arc(),
             },
         )?;
@@ -13307,7 +13407,7 @@ mod tests {
     fn redis_dead_letter_scripts_delete_trimmed_dead_record_metadata() {
         assert!(
             CLAIMED_REDIS_TRANSITION_SCRIPT
-                .contains("trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[7]))"),
+                .contains("trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]))"),
             "claimed-job dead-letter trim should delete metadata for records beyond the history limit"
         );
         assert!(
@@ -13328,6 +13428,54 @@ mod tests {
                 .count()
                 >= 1,
             "stale-recovery dead-letter script should remove trimmed per-id metadata"
+        );
+    }
+
+    /// Issue #3055: a limit of `0` (or less) must keep every dead record.
+    /// Without the guard, `LRANGE key 0 -1` selects the whole list and the
+    /// trim deletes the metadata of every dead job.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_dead_letter_scripts_treat_zero_limit_as_unbounded() {
+        for script in [CLAIMED_REDIS_TRANSITION_SCRIPT, STALE_REDIS_RECOVERY_SCRIPT] {
+            assert!(
+                script.contains("if limit == nil or limit <= 0 then\n    return 0\n  end"),
+                "the dead-letter trim must stop before LRANGE when the limit is 0"
+            );
+            assert!(
+                script.contains("return #trimmed_records"),
+                "the dead-letter trim must report how many entries it removed"
+            );
+        }
+    }
+
+    /// Issue #3055: a trim logs at warn level and adds to the counter.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_dead_letter_trim_report_warns_and_counts() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let logs =
+            crate::log::capture::LogBuffer::new(16, crate::log::filter::ParameterFilter::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::log::capture::LogCaptureLayer::new(logs.clone()));
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let registry = crate::actuator::JobRegistry::new();
+        report_redis_dead_letter_trim(&registry, "app:jobs:dead", 3, 0);
+        assert_eq!(registry.dead_letter_trimmed_total(), 0);
+        assert!(logs.snapshot(Some(tracing::Level::WARN), None).is_empty());
+
+        report_redis_dead_letter_trim(&registry, "app:jobs:dead", 3, 2);
+        assert_eq!(registry.dead_letter_trimmed_total(), 2);
+        let warns = logs.snapshot(Some(tracing::Level::WARN), None);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert_eq!(warns[0].level, "WARN");
+        assert_eq!(warns[0].fields["trimmed"], serde_json::json!(2));
+        assert_eq!(warns[0].fields["dead_letter_limit"], serde_json::json!(3));
+        assert_eq!(
+            warns[0].fields["dead_key"],
+            serde_json::json!("app:jobs:dead")
         );
     }
 
@@ -13356,6 +13504,7 @@ mod tests {
             default_attempts: 3,
             default_backoff: 1,
             retry_promotion_interval: Duration::from_millis(1),
+            dead_letter_limit: 10_000,
             clock: std::sync::Arc::new(crate::time::SystemClock),
         }
     }
@@ -13997,7 +14146,7 @@ mod tests {
 
         let (_container, client) = redis_test_client().await;
         let worker_a = redis_test_worker_config("autumn:test:stale", "worker-a", 1);
-        let worker_b = redis_test_worker_config("autumn:test:stale", "worker-b", 30_000);
+        let worker_b = redis_test_worker_config("autumn:test:stale", "worker-b", 1);
         redis_enqueue_test_job(&client, &worker_a, 3).await;
 
         let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
@@ -14048,7 +14197,7 @@ mod tests {
 
         let (_container, client) = redis_test_client().await;
         let worker_a = redis_test_worker_config("autumn:test:stale-dead", "worker-a", 1);
-        let worker_b = redis_test_worker_config("autumn:test:stale-dead", "worker-b", 30_000);
+        let worker_b = redis_test_worker_config("autumn:test:stale-dead", "worker-b", 1);
         redis_enqueue_test_job(&client, &worker_a, 1).await;
 
         let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
@@ -14093,6 +14242,195 @@ mod tests {
         assert_eq!(queued_count, 1);
         assert_eq!(dead_count, 0);
         assert!(!dead_record_exists);
+    }
+
+    /// Enqueue, claim and fail `count` single-attempt jobs one at a time.
+    /// Returns the job ids, oldest dead letter first.
+    #[cfg(feature = "redis")]
+    async fn redis_dead_letter_test_jobs(
+        client: &redis::Client,
+        worker_config: &RedisWorkerConfig,
+        state: &AppState,
+        count: usize,
+    ) -> Vec<String> {
+        let mut connection = new_redis_connection_manager(client, "test redis worker").unwrap();
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        let jobs = redis_jobs_by_name(redis_counting_failure_handler, 1);
+        state.job_registry().register("send_email");
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            redis_enqueue_test_job(client, worker_config, 1).await;
+            let record = claim_next_redis_job(
+                &mut connection,
+                worker_config,
+                std::slice::from_ref(&worker_config.queue_key),
+            )
+            .await
+            .unwrap()
+            .expect("the single-attempt job should be claimed");
+            ids.push(record.id.clone());
+            process_redis_job_record(
+                &mut connection,
+                record,
+                &jobs,
+                state,
+                &job_admin,
+                worker_config,
+            )
+            .await;
+        }
+        ids
+    }
+
+    /// Ids held by the dead-letter list, newest first.
+    #[cfg(feature = "redis")]
+    async fn redis_dead_letter_ids(
+        connection: &mut redis::aio::ConnectionManager,
+        worker_config: &RedisWorkerConfig,
+    ) -> Vec<String> {
+        use redis::AsyncCommands as _;
+
+        let bodies: Vec<String> = connection
+            .lrange(&worker_config.dead_key, 0, -1)
+            .await
+            .unwrap();
+        bodies
+            .iter()
+            .map(|body| serde_json::from_str::<RedisJobRecord>(body).unwrap().id)
+            .collect()
+    }
+
+    /// Issue #3055 AC1: dead-lettering `limit + N` jobs keeps the newest
+    /// `limit`, deletes the metadata of the `N` oldest, warns, and counts.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dead_letter_limit_trims_beyond_limit_with_warning_and_metric() {
+        use redis::AsyncCommands as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let logs =
+            crate::log::capture::LogBuffer::new(64, crate::log::filter::ParameterFilter::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::log::capture::LogCaptureLayer::new(logs.clone()));
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let (_container, client) = redis_test_client().await;
+        let mut worker_config =
+            redis_test_worker_config("autumn:test:dead-limit", "worker-a", 30_000);
+        worker_config.dead_letter_limit = 3;
+        let state = AppState::for_test().with_profile("dev");
+
+        let ids = redis_dead_letter_test_jobs(&client, &worker_config, &state, 5).await;
+
+        let mut connection = new_redis_connection_manager(&client, "test redis check").unwrap();
+        let kept = redis_dead_letter_ids(&mut connection, &worker_config).await;
+        let newest: Vec<String> = ids.iter().rev().take(3).cloned().collect();
+        assert_eq!(kept, newest, "the newest `limit` dead letters stay");
+        for (index, id) in ids.iter().enumerate() {
+            let key = format!("{}{id}", worker_config.dead_record_prefix);
+            let exists: bool = connection.exists(&key).await.unwrap();
+            assert_eq!(exists, index >= 2, "dead-record metadata for job {index}");
+        }
+
+        assert_eq!(state.job_registry().dead_letter_trimmed_total(), 2);
+        assert_eq!(
+            state.job_registry().snapshot()["send_email"].dead_letters,
+            5
+        );
+        let warns: Vec<_> = logs
+            .snapshot(Some(tracing::Level::WARN), None)
+            .into_iter()
+            .filter(|entry| entry.fields.get("dead_letter_limit").is_some())
+            .collect();
+        assert_eq!(warns.len(), 2, "one warning per trim: {warns:?}");
+        for warn in &warns {
+            assert_eq!(warn.fields["trimmed"], serde_json::json!(1));
+            assert_eq!(warn.fields["dead_letter_limit"], serde_json::json!(3));
+        }
+    }
+
+    /// Issue #3055 AC2: `dead_letter_limit = 0` never trims, even past the
+    /// old hard-coded cap of 1,000.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dead_letter_limit_zero_never_trims() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let mut worker_config =
+            redis_test_worker_config("autumn:test:dead-unbounded", "worker-a", 30_000);
+        worker_config.dead_letter_limit = 0;
+        let state = AppState::for_test().with_profile("dev");
+        let mut connection = new_redis_connection_manager(&client, "test redis seed").unwrap();
+
+        // Seed exactly the old cap of dead letters, each with its metadata.
+        let seeded = DEFAULT_JOB_ADMIN_HISTORY_LIMIT;
+        let mut pipe = redis::pipe();
+        for index in 0..seeded {
+            let id = format!("seeded-{index}");
+            let body = serde_json::json!({ "id": id, "name": "send_email" }).to_string();
+            pipe.lpush(&worker_config.dead_key, &body).ignore();
+            pipe.set(format!("{}{id}", worker_config.dead_record_prefix), &body)
+                .ignore();
+        }
+        pipe.query_async::<()>(&mut connection).await.unwrap();
+
+        let ids = redis_dead_letter_test_jobs(&client, &worker_config, &state, 5).await;
+
+        let dead_len: usize = connection.llen(&worker_config.dead_key).await.unwrap();
+        assert_eq!(dead_len, seeded + 5);
+        let oldest_key = format!("{}seeded-0", worker_config.dead_record_prefix);
+        let oldest_kept: bool = connection.exists(&oldest_key).await.unwrap();
+        assert!(oldest_kept, "the oldest dead record keeps its metadata");
+        for id in &ids {
+            let key = format!("{}{id}", worker_config.dead_record_prefix);
+            let exists: bool = connection.exists(&key).await.unwrap();
+            assert!(exists, "dead-record metadata for {id}");
+        }
+        assert_eq!(state.job_registry().dead_letter_trimmed_total(), 0);
+    }
+
+    /// Issue #3055: stale-claim recovery obeys the same limit and counter.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dead_letter_limit_applies_to_stale_recovery() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let worker_a = redis_test_worker_config("autumn:test:dead-stale", "worker-a", 1);
+        // Recovery uses the timeout of the worker that recovers, so keep it short.
+        let mut worker_b = redis_test_worker_config("autumn:test:dead-stale", "worker-b", 1);
+        worker_b.dead_letter_limit = 1;
+        let state = AppState::for_test().with_profile("dev");
+
+        // One dead letter already fills the list.
+        let first = redis_dead_letter_test_jobs(&client, &worker_b, &state, 1).await;
+
+        redis_enqueue_test_job(&client, &worker_a, 1).await;
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_a,
+            std::slice::from_ref(&worker_a.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("the final attempt should be claimed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        recover_stale_redis_jobs(&mut connection, &worker_b, &state, &job_admin)
+            .await
+            .unwrap();
+
+        let kept = redis_dead_letter_ids(&mut connection, &worker_b).await;
+        assert_eq!(kept, vec![claimed.id.clone()]);
+        let trimmed_key = format!("{}{}", worker_b.dead_record_prefix, first[0]);
+        let trimmed_exists: bool = connection.exists(&trimmed_key).await.unwrap();
+        assert!(!trimmed_exists, "the trimmed record loses its metadata");
+        assert_eq!(state.job_registry().dead_letter_trimmed_total(), 1);
     }
 
     #[cfg(feature = "redis")]

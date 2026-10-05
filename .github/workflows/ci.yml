@@ -1557,6 +1557,7 @@ jobs:
           # the whole set on is its own change. #1186 added
           # `redis_admin_enqueued_page_merges_concurrency_parked_jobs` here,
           # which asserts the enqueued tab lists concurrency-parked jobs.
+          # #3055 added the `redis_dead_letter_limit_` dead-letter trim suite.
           #
           # Same feature set as the `integration_tests` sweep below so both
           # share one autumn-web build. The pass-count check is there because
@@ -1576,6 +1577,7 @@ jobs:
               --ignored --test-threads=1 \
               job::tests::redis_admin_ \
               job::tests::redis_job_admin_ \
+              job::tests::redis_dead_letter_limit_ \
               | tee "${RUNNER_TEMP}/redis-job-admin.log"
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-job-admin.log" \

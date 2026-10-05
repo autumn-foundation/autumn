@@ -132,6 +132,7 @@ visibility_timeout_ms = 30000   # default: 30 000 ms
 url = "redis://127.0.0.1/"
 key_prefix = "autumn:jobs"
 visibility_timeout_ms = 30000
+dead_letter_limit = 10000       # default: 10 000; 0 = unbounded
 
 [jobs.sqlite]
 # Reuses the configured [database] pool. No extra URL needed.
@@ -328,6 +329,39 @@ Because Redis uses at-least-once delivery, handlers must be idempotent. A worker
 that is slow beyond the visibility timeout can overlap with a recovered retry,
 so external side effects should use natural idempotency keys such as the job id,
 domain aggregate id, or provider idempotency token.
+
+### Redis dead-letter retention
+
+The Redis backend keeps dead letters in a list, newest first. Each entry also
+has a per-id record that the dashboard uses to retry or discard the job.
+
+`jobs.redis.dead_letter_limit` sets the maximum length of that list. The
+default is 10 000. When a new dead letter makes the list longer than the
+limit, the worker removes the oldest entries and their per-id records. Set the
+limit to `0` to keep all dead letters. Then you must remove old entries
+yourself, because Redis memory increases with each dead letter.
+
+A trim is never silent:
+
+- The worker logs a `warn` event with `trimmed`, `dead_letter_limit` and
+  `dead_key`.
+- The worker adds the count to `autumn_jobs_dead_letter_trimmed_total` on
+  `/actuator/prometheus`. The counter is per process.
+
+Alert on `increase(autumn_jobs_dead_letter_trimmed_total[1h]) > 0`. A trim
+means that you lost the data to replay a failed job.
+
+The dashboard shows the newest 1 000 dead letters. Older entries stay in
+Redis, and you can retry or discard them by id.
+
+### Dead-letter retention by backend
+
+| Backend | Retention of dead letters |
+|---|---|
+| `redis` | The newest `jobs.redis.dead_letter_limit` entries (default 10 000; `0` = all). |
+| `postgres` | All `failed` rows, until `retention.job_history` deletes them by age. No count limit. |
+| `sqlite` | All `failed` rows, until `retention.job_history` deletes them by age. No count limit. |
+| `local` | In memory only. The process loses them at restart. The dashboard keeps the newest 1 000 finished jobs. |
 
 ## SQLite delivery semantics
 

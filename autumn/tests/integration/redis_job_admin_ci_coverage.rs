@@ -83,3 +83,26 @@ fn ignored_redis_job_admin_tests_are_named_in_ci() {
          \"Run Docker-dependent tests\" step."
     );
 }
+
+/// Issue #3055: the dead-letter limit Docker tests are `--lib` tests too.
+#[test]
+fn ignored_redis_dead_letter_limit_tests_are_named_in_ci() {
+    const FILTER: &str = "job::tests::redis_dead_letter_limit_";
+    let root = workspace_root();
+    // A Windows checkout can have CRLF line ends.
+    let source = std::fs::read_to_string(root.join("autumn/src/job.rs"))
+        .expect("read job.rs")
+        .replace("\r\n", "\n");
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read ci.yml");
+
+    assert!(
+        ci.contains(FILTER),
+        "ci.yml no longer passes the `{FILTER}` libtest filter"
+    );
+    let marker =
+        "#[ignore = \"requires Docker (testcontainers)\"]\n    async fn redis_dead_letter_limit_";
+    assert!(
+        source.matches(marker).count() >= 3,
+        "expected 3 ignored `redis_dead_letter_limit_` Docker tests in job.rs"
+    );
+}
