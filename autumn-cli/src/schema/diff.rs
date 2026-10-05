@@ -3319,8 +3319,11 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
             "ALTER TABLE {table} RENAME COLUMN {to} TO {from};\n"
         )),
         SchemaChange::RenameIndex { table, from, index } => {
-            let mut old = index.clone();
-            old.name.clone_from(from);
+            let old = crate::schema::rename::renamed_index(index, from).unwrap_or_else(|| {
+                let mut old = index.clone();
+                old.name.clone_from(from);
+                old
+            });
             Ok(emit_rename_index(table, &index.name, &old, backend))
         }
         SchemaChange::CreateTable(table) => Ok(format!("DROP TABLE {};\n", table.name)),

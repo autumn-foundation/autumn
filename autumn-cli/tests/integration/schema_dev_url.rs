@@ -350,4 +350,21 @@ async fn schema_dev_url_refuses_a_new_table_named_like_a_replayed_view() {
     );
     assert_ne!(code, Some(0), "{err}");
     assert!(err.contains("`report_rows` is already a"), "{err}");
+
+    // An index on a materialized view shares the namespace too.
+    std::fs::write(
+        raw.join("up.sql"),
+        "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS id;\nCREATE INDEX audit_rows ON mv (id);\n",
+    )
+    .expect("up.sql");
+    let models = format!(
+        "{MODELS_V1}\n#[autumn_web::model(managed)]\npub struct AuditRow {{\n    #[id]\n    pub id: i64,\n}}\n"
+    );
+    std::fs::write(dir.join("src/models.rs"), models).expect("models");
+    let (_, err, code) = run_autumn(
+        dir,
+        &["schema", "diff", "--backend", "pg", "--dev-url", &url],
+    );
+    assert_ne!(code, Some(0), "{err}");
+    assert!(err.contains("`audit_rows` is already a"), "{err}");
 }

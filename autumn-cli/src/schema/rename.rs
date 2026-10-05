@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use autumn_schema_core::Table;
+use autumn_schema_core::{Index, Table};
 
 use crate::schema::diff::SchemaChange;
 use crate::schema::parse::{ParsedSchema, RenameHint};
@@ -204,19 +204,30 @@ fn index_renames(
         };
         let old = old_table.get(name).copied().unwrap_or(name);
         let cols = columns.get(name).map_or(&[][..], Vec::as_slice);
-        for idx in base.indexes.iter().filter(|i| i.definition.is_none()) {
+        for idx in &base.indexes {
             let Some(new_name) = convention_index_name(&idx.name, old, name, cols) else {
                 continue;
             };
-            let declared = want.indexes.iter().any(|i| {
-                i.name == new_name
-                    && i.columns == idx.columns
-                    && i.unique == idx.unique
-                    && i.definition.is_none()
-            });
+            // A definition-backed index matches on its key columns.
+            let keys = if idx.definition.is_none() {
+                &idx.columns
+            } else {
+                &idx.key_columns
+            };
+            let declared = !keys.is_empty()
+                && !idx.is_partial
+                && want.indexes.iter().any(|i| {
+                    i.name == new_name
+                        && i.columns == *keys
+                        && i.unique == idx.unique
+                        && i.definition.is_none()
+                });
             if new_name == idx.name || !declared {
                 continue;
             }
+            let Some(index) = renamed_index(idx, &new_name) else {
+                continue;
+            };
             // Index names are global in the schema, so check every table. A
             // name another table owns is refused: an add would collide too.
             // Names compare case-insensitively (SQLite resolves them that way).
@@ -240,8 +251,6 @@ fn index_renames(
                     reason: format!("index `{new_name}` already exists on table `{}`", t.name),
                 }),
                 None => {
-                    let mut index = idx.clone();
-                    index.name = new_name;
                     out.push(SchemaChange::RenameIndex {
                         table: name.to_owned(),
                         from: idx.name.clone(),
@@ -440,6 +449,26 @@ pub fn is_plain_identifier(name: &str) -> bool {
         .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         && name.len() <= 63
+}
+
+/// `idx` under the name `to`. Its definition, if any, gets the new name too.
+/// `None` when the definition does not name the index before `ON`.
+#[must_use]
+pub fn renamed_index(idx: &Index, to: &str) -> Option<Index> {
+    let mut index = idx.clone();
+    to.clone_into(&mut index.name);
+    if let Some(def) = &idx.definition {
+        let head = def[..find_on_keyword(def)?].trim_end();
+        let start = head.rfind(char::is_whitespace)? + 1;
+        let token = &head[start..];
+        let bare = token.rsplit('.').next().unwrap_or(token);
+        let bare = bare.trim_matches(|c| matches!(c, '"' | '`' | '[' | ']'));
+        if !bare.eq_ignore_ascii_case(&idx.name) {
+            return None;
+        }
+        index.definition = Some(format!("{}{to}{}", &def[..start], &def[head.len()..]));
+    }
+    Some(index)
 }
 
 /// Split an index or constraint definition at its table target:
@@ -1406,6 +1435,67 @@ mod tests {
         );
         let err = guard_plan(&diff_schema(&base, &want, OPTS), ALLOW).unwrap_err();
         assert!(matches!(err, DiffError::RenameConflict { .. }), "{err}");
+    }
+
+    #[test]
+    fn renamed_index_rewrites_the_name_in_its_definition() {
+        let mut idx = Index::new("idx_a".to_owned(), vec!["a".to_owned()], false);
+        idx.definition = Some("CREATE INDEX IF NOT EXISTS \"idx_a\" ON t (a DESC)".to_owned());
+        let out = renamed_index(&idx, "idx_b").expect("renamed");
+        assert_eq!(out.name, "idx_b");
+        assert_eq!(
+            out.definition.as_deref(),
+            Some("CREATE INDEX IF NOT EXISTS idx_b ON t (a DESC)")
+        );
+        // A definition that names another index is not changed.
+        idx.definition = Some("CREATE INDEX other ON t (a DESC)".to_owned());
+        assert!(renamed_index(&idx, "idx_b").is_none());
+    }
+
+    #[test]
+    fn a_collated_convention_index_follows_a_rename_with_its_definition() {
+        let collated = |table: &str, col: &str| {
+            let name = format!("idx_{table}_{col}_unique");
+            let mut idx = Index::new(name.clone(), vec![col.to_owned()], true);
+            idx.definition = Some(format!(
+                "CREATE UNIQUE INDEX {name} ON {table} ({col} COLLATE NOCASE)"
+            ));
+            idx.key_columns = vec![col.to_owned()];
+            idx
+        };
+        let mut base_t = table("users", Backend::Sqlite, &[("email", ColumnType::Text)]);
+        base_t.indexes.push(collated("users", "email"));
+        let want = desired(
+            vec![with_unique_email(
+                table("users", Backend::Sqlite, &[("mail", ColumnType::Text)]),
+                "mail",
+            )],
+            vec![col_hint("users", "mail", "email")],
+        );
+        let (plan, up, down) = render(&[base_t], &want);
+        assert!(
+            plan.changes
+                .iter()
+                .any(|c| matches!(c, SchemaChange::RenameIndex { .. })),
+            "{:?}",
+            plan.changes
+        );
+        assert!(up.contains("DROP INDEX idx_users_email_unique;"), "{up}");
+        assert!(
+            up.contains("CREATE UNIQUE INDEX idx_users_mail_unique ON users (mail COLLATE NOCASE)"),
+            "{up}"
+        );
+        assert!(
+            down.contains(
+                "CREATE UNIQUE INDEX idx_users_email_unique ON users (mail COLLATE NOCASE)"
+            ),
+            "{down}"
+        );
+        assert!(
+            pos(&down, "idx_users_email_unique ON users")
+                < pos(&down, "RENAME COLUMN mail TO email"),
+            "{down}"
+        );
     }
 
     #[test]

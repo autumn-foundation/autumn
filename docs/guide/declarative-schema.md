@@ -150,7 +150,7 @@ ALTER TABLE posts RENAME COLUMN title TO headline;
 - The diff also renames each index that has a convention name
   (`idx_<table>_<field>` or `idx_<table>_<field>_unique`) and the same shape.
   Postgres uses `ALTER INDEX ... RENAME`. SQLite drops the index and creates
-  it again.
+  it again. An index with `COLLATE` or `DESC` keeps its SQL.
 - The diff uses a hint only when the old name is in the baseline and the new
   name is not. After the migration, the hint has no effect. You can keep it or
   remove it.

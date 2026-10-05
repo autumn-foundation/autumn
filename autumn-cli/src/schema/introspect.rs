@@ -2274,13 +2274,20 @@ mod sqlite {
             // its CREATE INDEX SQL (when present); a plain index is representable by
             // its columns.
             let definition = if simple { None } else { row.index_sql.clone() };
+            // A definition-backed index with only real key columns records them,
+            // so the diff can match it to a model `#[unique]`.
+            let key_cols = if definition.is_some() && !has_expression {
+                key_columns.clone()
+            } else {
+                Vec::new()
+            };
             indexes.push(Index {
                 name: row.index_name.clone(),
                 columns: key_columns,
                 unique: is_unique,
                 definition,
                 is_partial,
-                key_columns: Vec::new(),
+                key_columns: key_cols,
             });
         }
         (indexes, unique_columns)
@@ -2677,6 +2684,8 @@ mod sqlite {
             );
             let (indexes, unique_cols) = collapse_indexes("users", &rows, &index_columns);
             assert_eq!(indexes[0].definition.as_deref(), Some(sql));
+            // Its keys are real columns, so a model `#[unique]` can match it.
+            assert_eq!(indexes[0].key_columns, vec!["email".to_owned()]);
             assert!(!unique_cols.contains("email"), "not a plain unique column");
         }
 
