@@ -175,7 +175,8 @@ The analysis follows the handle through every name that holds it:
     through `Deref` or only under a trait bound. So a slice method called on
     a `Vec` or an array (`repos.iter()`, `repos.first()`, `repos.sort()`) is
     reported, and so is `clone` on any container. Call the slice method on
-    `repos.as_slice()` instead.
+    `repos.as_slice()` instead. `extend` comes from the `Extend` trait, so it
+    is reported on a container of handles and when it is given a handle.
   - A handle in an `Option` or a `Result` has only their methods. So
     `lazy.checkout()` on a `Result<LazyDb, E>` is reported. Call
     `lazy.expect("…").checkout()` instead.
@@ -407,6 +408,12 @@ callbacks. Two things sit outside it, by construction:
   database without any handle in the handler's signature, so no static
   attribution is possible; they are the same class as the background-job work
   listed under Scope above.
+- **An application trait that takes over a standard method name.** Rust looks
+  for a `self` method before a `&self` method, and for a `&self` method before
+  a `&mut self` method. So an application trait method `len(self)` on
+  `Vec<PgPostRepository>` runs in place of `Vec::len`. The macro has no type
+  information and assumes that no such trait is in scope. Do not give a trait
+  on a container of handles a standard method name.
 
 ### `proven_max` is not `query_count()`
 

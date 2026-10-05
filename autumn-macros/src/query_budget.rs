@@ -483,6 +483,8 @@ const ELEMENT_METHODS: &[&str] = &[
 ///   a trait method on `Vec<T>` is found first;
 /// * not `clone`: `Clone` for a container needs `T: Clone`, and when it does
 ///   not hold, a trait method of that name runs.
+/// * not `extend`: it comes from the `Extend` trait and takes `&mut self`, so
+///   a user trait method `extend(&self)` is found first.
 const BOOL_METHODS: &[&str] = &["then", "then_some"];
 
 const VEC_METHODS: &[&str] = &[
@@ -498,7 +500,6 @@ const VEC_METHODS: &[&str] = &[
     "insert",
     "remove",
     "swap_remove",
-    "extend",
     "append",
     "clear",
     "truncate",
@@ -556,7 +557,6 @@ const DEQUE_METHODS: &[&str] = &[
     "pop_front",
     "insert",
     "remove",
-    "extend",
     "append",
     "clear",
     "truncate",
@@ -579,7 +579,6 @@ const LIST_METHODS: &[&str] = &[
     "push_front",
     "pop_back",
     "pop_front",
-    "extend",
     "append",
     "clear",
 ];
@@ -591,7 +590,6 @@ const HEAP_METHODS: &[&str] = &[
     "into_iter",
     "push",
     "pop",
-    "extend",
     "append",
     "clear",
     "retain",
@@ -756,7 +754,6 @@ const MAP_METHODS: &[&str] = &[
     "into_iter",
     "clear",
     "retain",
-    "extend",
     "drain",
     "reserve",
 ];
@@ -780,7 +777,6 @@ const SORTED_MAP_METHODS: &[&str] = &[
     "into_iter",
     "clear",
     "retain",
-    "extend",
 ];
 
 const SET_METHODS: &[&str] = &[
@@ -793,7 +789,6 @@ const SET_METHODS: &[&str] = &[
     "into_iter",
     "clear",
     "retain",
-    "extend",
     "drain",
 ];
 
@@ -808,7 +803,6 @@ const SORTED_SET_METHODS: &[&str] = &[
     "into_iter",
     "clear",
     "retain",
-    "extend",
 ];
 
 const TUPLE_METHODS: &[&str] = &[];
@@ -7841,12 +7835,14 @@ mod tests {
                  let _ = left[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
+            // `extend` is a trait method that a user trait can take over: handed
+            // a handle, it is opaque.
             (
-                "extend with an Option of a handle keeps a flat Vec",
-                "async fn h(mut left: Vec<PgPostRepository>, extra: Option<PgPostRepository>) \
-                 -> AutumnResult<usize> { left.extend(extra); left.extend(None); \
+                "extend handed an Option of a handle is opaque",
+                "async fn h(extra: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); left.extend(extra); \
                  let _ = left[0].find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
                 "extend with a map of handles gives tuples",
@@ -9092,6 +9088,30 @@ mod tests {
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
                  let _ = result.unwrap().find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn extend_is_a_trait_method_and_opaque() {
+        check_handlers(&[
+            (
+                "extend on a Vec of handles is opaque",
+                "async fn h(mut repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 repos.extend().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "extend on a map of handles is opaque",
+                "async fn h(mut repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 repos.extend().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: extend on a plain Vec is free",
+                "async fn h(ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mut all = Vec::new(); all.extend(ids); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
