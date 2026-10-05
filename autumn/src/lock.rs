@@ -95,8 +95,8 @@ use sha2::{Digest as _, Sha256};
 /// Domain-separation prefix for application distributed-lock keys.
 ///
 /// String lock names are hashed together with this prefix so the app lock
-/// keyspace cannot collide with the keyspaces the scheduler
-/// (`autumn:scheduler`), migrations ([`crate::migrate::MIGRATION_ADVISORY_LOCK_KEY`]),
+/// keyspace cannot collide with the keyspaces the scheduler tick-table DDL
+/// lock, migrations ([`crate::migrate::MIGRATION_ADVISORY_LOCK_KEY`]),
 /// ISR revalidation (`isr`), or repository upserts (`repository_upsert`)
 /// already use.
 pub const DISTRIBUTED_LOCK_DOMAIN: &str = "autumn:lock:v1";
@@ -1410,6 +1410,9 @@ mod tests {
         );
         // The fixed migration lock key is a compile-time constant.
         assert_ne!(app, crate::migrate::MIGRATION_ADVISORY_LOCK_KEY);
+        // So is the scheduler tick-table DDL lock key (issue #3052).
+        #[cfg(feature = "db")]
+        assert_ne!(app, crate::scheduler::PG_TICK_DDL_LOCK_KEY);
     }
 
     #[test]

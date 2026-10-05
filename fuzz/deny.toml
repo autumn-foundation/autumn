@@ -34,9 +34,9 @@ ignore = [
     # autumn-web JWT surface the main workspace does). No patched rsa release
     # exists; Autumn exposes no network-reachable attacker-timed RSA
     # private-key decryption oracle. None of the fuzz targets exercise the
-    # JWT sign/verify path specifically. Review-by: 2026-10-01, matching the
+    # JWT sign/verify path specifically. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), matching the
     # root policy's own review-by for this same advisory.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken, same as root deny.toml; not exercised by any fuzz target; review-by 2026-10-01" },
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken, same as root deny.toml; not exercised by any fuzz target; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
 ]
 
 [sources]

@@ -211,23 +211,41 @@ pub fn introspect_postgres(url: &str) -> Result<Vec<Table>, IntrospectError> {
     // `PgConnection::establish` accepts both URL and libpq key-value DSNs; defer
     // URL parsing to the error path so a valid key-value string still connects
     // (host/port are only needed for a credential-safe message). Mirrors db_pull.
-    let mut conn = PgConnection::establish(url).map_err(|_| {
+    let mut conn = connect_postgres(url)?;
+    introspect_postgres_conn(&mut conn)
+}
+
+/// Open a Postgres connection. The error carries only the host and port.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Connection`] if the database is unreachable.
+pub fn connect_postgres(url: &str) -> Result<PgConnection, IntrospectError> {
+    PgConnection::establish(url).map_err(|_| {
         let (host, port) = parse_host_port(url).unwrap_or_else(|| ("localhost".to_owned(), 5432));
         IntrospectError::Connection { host, port }
-    })?;
+    })
+}
 
-    let table_names = list_tables(&mut conn)?;
+/// [`introspect_postgres`] on an open connection (for example one inside the
+/// `--dev-url` replay transaction).
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Query`] if a catalog query fails.
+pub fn introspect_postgres_conn(conn: &mut PgConnection) -> Result<Vec<Table>, IntrospectError> {
+    let table_names = list_tables(conn)?;
     if table_names.is_empty() {
         return Ok(Vec::new());
     }
 
     // Batched catalog reads — a constant number of queries regardless of table
     // count (never one query per table).
-    let columns_by_table = fetch_columns(&mut conn, &table_names)?;
-    let pks_by_table = fetch_primary_keys(&mut conn, &table_names)?;
-    let indexes_by_table = fetch_indexes(&mut conn, &table_names)?;
-    let fks_by_table = fetch_foreign_keys(&mut conn, &table_names)?;
-    let checks_by_table = fetch_checks(&mut conn, &table_names)?;
+    let columns_by_table = fetch_columns(conn, &table_names)?;
+    let pks_by_table = fetch_primary_keys(conn, &table_names)?;
+    let indexes_by_table = fetch_indexes(conn, &table_names)?;
+    let fks_by_table = fetch_foreign_keys(conn, &table_names)?;
+    let checks_by_table = fetch_checks(conn, &table_names)?;
 
     let mut tables = Vec::with_capacity(table_names.len());
     for name in &table_names {
@@ -1441,7 +1459,7 @@ fn serial_kind_for(
 /// own `normalize_sqlite_target` (kept in lock-step so the pull connects to the same
 /// file `schema migrate` does). An empty or `:memory:` target stays `:memory:`.
 #[cfg(feature = "sqlite")]
-fn sqlite_target(url: &str) -> String {
+pub fn sqlite_target(url: &str) -> String {
     if url.starts_with("file:") {
         return url.to_owned();
     }
@@ -1469,7 +1487,7 @@ fn sqlite_target(url: &str) -> String {
 /// separator honored, and the path percent-decoded — then existence-checked like a
 /// bare path.
 #[cfg(feature = "sqlite")]
-fn sqlite_existence_check_path(target: &str) -> Option<String> {
+pub fn sqlite_existence_check_path(target: &str) -> Option<String> {
     if target.is_empty() || target == ":memory:" {
         return None;
     }
@@ -1584,6 +1602,19 @@ pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
     sqlite::introspect(&mut conn)
 }
 
+/// [`introspect_sqlite`] on an open connection (for example one inside the
+/// `--dev-url` replay transaction).
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Query`] if a catalog query or PRAGMA fails.
+#[cfg(feature = "sqlite")]
+pub fn introspect_sqlite_conn(
+    conn: &mut diesel::SqliteConnection,
+) -> Result<Vec<Table>, IntrospectError> {
+    sqlite::introspect(conn)
+}
+
 /// `SQLite` catalog probes + IR assembly. All row DTOs and helpers live here so the
 /// default (Postgres) build never compiles a `SqliteConnection` reference.
 #[cfg(feature = "sqlite")]
@@ -1671,6 +1702,10 @@ mod sqlite {
         /// The indexed column name, or `NULL` for an expression key.
         #[diesel(sql_type = Nullable<Text>)]
         column_name: Option<String>,
+        /// `1` when the key has a modifier the IR column list cannot hold: a
+        /// non-`BINARY` collation or `DESC` (`pragma_index_xinfo`).
+        #[diesel(sql_type = Integer)]
+        modified: i32,
     }
 
     #[derive(QueryableByName)]
@@ -1840,17 +1875,20 @@ mod sqlite {
         Ok(group_by(rows, |r| r.table_name.clone()))
     }
 
-    /// Fetch the columns of every index in one batched `pragma_index_info` join,
-    /// grouped by `(table, index)` in key order.
+    /// Fetch the key columns of every index in one batched `pragma_index_xinfo`
+    /// join, grouped by `(table, index)` in key order. `xinfo` (not `info`) also
+    /// gives each key's collation and sort order, so a key with a modifier the IR
+    /// cannot hold is flagged.
     fn fetch_index_columns(
         conn: &mut SqliteConnection,
     ) -> Result<BTreeMap<IndexKey, Vec<IndexColumnRow>>, IntrospectError> {
         let mut rows: Vec<IndexColumnRow> = sql_query(
             "SELECT m.name AS table_name, il.name AS index_name, ii.seqno AS seqno, \
-             ii.name AS column_name \
+             ii.name AS column_name, \
+             ((ii.coll IS NOT NULL AND ii.coll <> 'BINARY') OR ii.\"desc\" <> 0) AS modified \
              FROM sqlite_master m JOIN pragma_index_list(m.name) il \
-             JOIN pragma_index_info(il.name) ii \
-             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             JOIN pragma_index_xinfo(il.name) ii \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND ii.key = 1 \
              ORDER BY m.name, il.name, ii.seqno",
         )
         .load(conn)
@@ -2221,25 +2259,35 @@ mod sqlite {
                 .get(&(table_name.to_owned(), row.index_name.clone()))
                 .map_or(&[][..], Vec::as_slice);
             let has_expression = cols.iter().any(|c| c.column_name.is_none());
+            // A collated or `DESC` key cannot be rebuilt from the column list.
+            let has_modifier = cols.iter().any(|c| c.modified != 0);
             let key_columns: Vec<String> =
                 cols.iter().filter_map(|c| c.column_name.clone()).collect();
             let is_unique = row.is_unique != 0;
             let is_partial = row.partial != 0;
 
-            let simple = !is_partial && !has_expression;
+            let simple = !is_partial && !has_expression && !has_modifier;
             if simple && is_unique && key_columns.len() == 1 {
                 unique_columns.insert(key_columns[0].clone());
             }
-            // A partial or expression index is retained verbatim via its CREATE INDEX
-            // SQL (when present); a plain index is representable by its columns.
+            // A partial, expression or collated/`DESC` index is retained verbatim via
+            // its CREATE INDEX SQL (when present); a plain index is representable by
+            // its columns.
             let definition = if simple { None } else { row.index_sql.clone() };
+            // A definition-backed index with only real key columns records them,
+            // so the diff can match it to a model `#[unique]`.
+            let key_cols = if definition.is_some() && !has_expression {
+                key_columns.clone()
+            } else {
+                Vec::new()
+            };
             indexes.push(Index {
                 name: row.index_name.clone(),
                 columns: key_columns,
                 unique: is_unique,
                 definition,
                 is_partial,
-                key_columns: Vec::new(),
+                key_columns: key_cols,
             });
         }
         (indexes, unique_columns)
@@ -2598,6 +2646,7 @@ mod sqlite {
                     index_name: "idx_authors_email_unique".to_owned(),
                     seqno: 0,
                     column_name: Some("email".to_owned()),
+                    modified: 0,
                 }],
             );
             let (indexes, unique_cols) = collapse_indexes("authors", &rows, &index_columns);
@@ -2609,6 +2658,56 @@ mod sqlite {
                 "a simple index carries no definition"
             );
             assert!(unique_cols.contains("email"));
+        }
+
+        #[test]
+        fn collapse_indexes_collated_or_desc_index_keeps_its_sql() {
+            let sql = "CREATE UNIQUE INDEX idx_users_email_unique ON users (email COLLATE NOCASE)";
+            let rows = vec![IndexRow {
+                table_name: "users".to_owned(),
+                index_name: "idx_users_email_unique".to_owned(),
+                is_unique: 1,
+                origin: "c".to_owned(),
+                partial: 0,
+                index_sql: Some(sql.to_owned()),
+            }];
+            let mut index_columns = BTreeMap::new();
+            index_columns.insert(
+                ("users".to_owned(), "idx_users_email_unique".to_owned()),
+                vec![IndexColumnRow {
+                    table_name: "users".to_owned(),
+                    index_name: "idx_users_email_unique".to_owned(),
+                    seqno: 0,
+                    column_name: Some("email".to_owned()),
+                    modified: 1,
+                }],
+            );
+            let (indexes, unique_cols) = collapse_indexes("users", &rows, &index_columns);
+            assert_eq!(indexes[0].definition.as_deref(), Some(sql));
+            // Its keys are real columns, so a model `#[unique]` can match it.
+            assert_eq!(indexes[0].key_columns, vec!["email".to_owned()]);
+            assert!(!unique_cols.contains("email"), "not a plain unique column");
+        }
+
+        #[test]
+        fn introspection_keeps_a_collated_index_verbatim() {
+            use diesel::{Connection as _, RunQueryDsl as _};
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("pull.db");
+            let mut conn = SqliteConnection::establish(&db.display().to_string()).expect("open");
+            for sql in [
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL, name TEXT)",
+                "CREATE UNIQUE INDEX idx_users_email_unique ON users (email COLLATE NOCASE)",
+                "CREATE INDEX idx_users_name ON users (name DESC)",
+            ] {
+                diesel::sql_query(sql).execute(&mut conn).expect("ddl");
+            }
+            let tables = introspect(&mut conn).expect("introspect");
+            let users = tables.iter().find(|t| t.name == "users").expect("users");
+            for name in ["idx_users_email_unique", "idx_users_name"] {
+                let idx = users.indexes.iter().find(|i| i.name == name).expect(name);
+                assert!(idx.definition.is_some(), "{name} keeps its SQL: {idx:?}");
+            }
         }
 
         #[test]
@@ -2642,6 +2741,7 @@ mod sqlite {
                     index_name: "t_active_idx".to_owned(),
                     seqno: 0,
                     column_name: Some("email".to_owned()),
+                    modified: 0,
                 }],
             );
             let (indexes, _unique) = collapse_indexes("t", &rows, &index_columns);
@@ -2678,6 +2778,7 @@ mod sqlite {
                             index_name: "sqlite_autoindex_t_1".to_owned(),
                             seqno: i32::try_from(i).unwrap(),
                             column_name: Some((*c).to_owned()),
+                            modified: 0,
                         })
                         .collect(),
                 );

@@ -4,7 +4,8 @@
 // (both the explicit `table = "..."` form and the bare, inferred form) must be
 // ACCEPTED and validated by the `#[model]` macro, stripped from the generated
 // query struct, and change NO codegen — the model still generates its normal
-// New*/Update* types over the Diesel table below.
+// New*/Update* types over the Diesel table below. `#[renamed_from("...")]` on
+// the model (after `#[model]`) and on a field is accepted and stripped too.
 
 mod schema {
     autumn_web::reexports::diesel::table! {
@@ -20,10 +21,12 @@ mod schema {
 use schema::memberships;
 
 #[autumn_web::model(managed)]
+#[renamed_from("old_memberships")]
 pub struct Membership {
     #[id]
     pub id: i64,
     #[unique]
+    #[renamed_from("handle")]
     pub slug: String,
     #[references(table = "accounts")]
     pub account_id: i64,
