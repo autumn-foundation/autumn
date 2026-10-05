@@ -136,8 +136,14 @@ let ddl = autumn_web::scheduler::PG_TICK_TABLE_DDL;
 
 Three behaviour changes come with it:
 
-- A row stays for `scheduler.lease_ttl_secs`. A fixed-delay row stays for its
-  delay plus `scheduler.lease_ttl_secs`.
+- A row stays for the task's period plus `scheduler.lease_ttl_secs`. The
+  period is the fixed delay, or the time to the next cron occurrence.
+- **Rolling upgrade.** A new replica does not claim a tick while an old
+  replica holds its advisory lock for that tick. But an old replica that
+  reaches a tick after a new replica finished it runs the tick again, as old
+  replicas did before. To prevent this, stop the old scheduler replicas
+  before the new ones start (for example, deploy the `worker` role with a
+  recreate strategy).
 - A leader that crashes mid-tick does not free the tick. The next tick runs.
 - `PostgresAdvisorySchedulerCoordinator` is a deprecated alias of
   `PostgresTickSchedulerCoordinator`.

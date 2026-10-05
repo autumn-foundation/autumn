@@ -617,10 +617,15 @@ impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
                     ))
                 })?;
 
+            // The statement also takes the advisory key that releases before
+            // #3052 held for the whole tick. While an old replica runs the
+            // tick in a rolling upgrade, this claim fails. The lock is
+            // transaction-scoped, so it frees when the statement commits.
             let claimed = diesel::sql_query(
                 "INSERT INTO autumn_scheduler_ticks \
                  (key_prefix, task_name, tick_key, owner, expires_at) \
-                 VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5)) \
+                 SELECT $1, $2, $3, $4, now() + make_interval(secs => $5) \
+                 WHERE pg_try_advisory_xact_lock($6) \
                  ON CONFLICT DO NOTHING \
                  RETURNING generation",
             )
@@ -629,6 +634,11 @@ impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
             .bind::<diesel::sql_types::Text, _>(tick_key)
             .bind::<diesel::sql_types::Text, _>(&self.replica_id)
             .bind::<diesel::sql_types::Double, _>(tick_hold(self.retention, period).as_secs_f64())
+            .bind::<diesel::sql_types::BigInt, _>(advisory_lock_key(
+                &self.key_prefix,
+                task_name,
+                tick_key,
+            ))
             .load::<TickGenerationRow>(&mut *conn)
             .await
             .map_err(|error| {

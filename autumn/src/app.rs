@@ -9138,6 +9138,16 @@ async fn execute_fixed_delay_task(
     }
 }
 
+/// One cron occurrence to run.
+#[derive(Debug, Clone, Copy)]
+struct CronTick {
+    /// The occurrence's scheduled time, in Unix seconds.
+    unix_secs: u64,
+    /// Time from this occurrence to the next. The loop still runs a late
+    /// occurrence inside this window, so the claim must hold for all of it.
+    window: std::time::Duration,
+}
+
 /// Handle the execution of a single cron task.
 #[allow(clippy::cognitive_complexity)]
 async fn execute_cron_task(
@@ -9147,11 +9157,11 @@ async fn execute_cron_task(
     coordination: crate::task::TaskCoordination,
     coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
     lease_ttl: std::time::Duration,
-    scheduled_unix_secs: u64,
+    occurrence: CronTick,
 ) {
-    let tick_key = crate::scheduler::cron_tick_key(&name, scheduled_unix_secs);
+    let tick_key = crate::scheduler::cron_tick_key(&name, occurrence.unix_secs);
     let lease = match coordinator
-        .try_acquire(&name, &tick_key, coordination)
+        .try_acquire_for_period(&name, &tick_key, coordination, occurrence.window)
         .await
     {
         Ok(Some(lease)) => lease,
@@ -9325,7 +9335,10 @@ async fn run_cron_task_loop(
                         return;
                     }
                 }
-                let scheduled_unix_secs = u64::try_from(scheduled_at.timestamp()).unwrap_or_default();
+                let occurrence = CronTick {
+                    unix_secs: u64::try_from(scheduled_at.timestamp()).unwrap_or_default(),
+                    window: cron_occurrence_window(&cron, &scheduled_at),
+                };
                 tokio::spawn(execute_cron_task(
                     name.clone(),
                     state.clone(),
@@ -9333,7 +9346,7 @@ async fn run_cron_task_loop(
                     coordination,
                     Arc::clone(&coordinator),
                     lease_ttl,
-                    scheduled_unix_secs,
+                    occurrence,
                 ));
                 cursor = scheduled_at;
             }
@@ -9378,6 +9391,19 @@ fn cron_occurrence_is_overdue<Tz: chrono::TimeZone>(
 ) -> Result<bool, croner::errors::CronError> {
     let next_after_scheduled = cron.find_next_occurrence(scheduled_at, false)?;
     Ok(&next_after_scheduled <= now)
+}
+
+/// Time from `scheduled_at` to the next occurrence: the window in which the
+/// loop still runs a late `scheduled_at` (see [`cron_occurrence_is_overdue`]).
+/// Zero when no next occurrence exists.
+fn cron_occurrence_window<Tz: chrono::TimeZone>(
+    cron: &croner::Cron,
+    scheduled_at: &chrono::DateTime<Tz>,
+) -> std::time::Duration {
+    cron.find_next_occurrence(scheduled_at, false)
+        .ok()
+        .and_then(|next| next.signed_duration_since(scheduled_at).to_std().ok())
+        .unwrap_or_default()
 }
 
 /// How long to sleep from `now` until `scheduled_at`, saturating at zero for a
@@ -19801,7 +19827,10 @@ mod tests {
             crate::task::TaskCoordination::Fleet,
             std::sync::Arc::new(FencingSchedulerCoordinator),
             std::time::Duration::from_secs(5),
-            1_700_000_000,
+            super::CronTick {
+                unix_secs: 1_700_000_000,
+                window: std::time::Duration::from_secs(60),
+            },
         )
         .await;
 
@@ -19840,7 +19869,10 @@ mod tests {
             crate::task::TaskCoordination::Fleet,
             coordinator,
             std::time::Duration::from_secs(30),
-            scheduled_unix_secs,
+            super::CronTick {
+                unix_secs: scheduled_unix_secs,
+                window: std::time::Duration::from_secs(10),
+            },
         )
         .await;
 
@@ -19921,6 +19953,57 @@ mod tests {
             chrono_tz::UTC
                 .with_ymd_and_hms(2026, 5, 5, 12, 31, 0)
                 .unwrap()
+        );
+    }
+
+    // Issue #3052: a late cron occurrence still runs until the next one, so
+    // the claim must hold for that whole window.
+    #[test]
+    fn cron_occurrence_window_spans_to_the_next_occurrence() {
+        use chrono::TimeZone as _;
+
+        let daily = "0 0 3 * * *".parse::<croner::Cron>().expect("parse");
+        let at = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 3, 0, 0)
+            .unwrap();
+        assert_eq!(
+            super::cron_occurrence_window(&daily, &at),
+            std::time::Duration::from_secs(24 * 60 * 60)
+        );
+        let every_ten = "*/10 * * * * *".parse::<croner::Cron>().expect("parse");
+        let at = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 3, 0, 10)
+            .unwrap();
+        assert_eq!(
+            super::cron_occurrence_window(&every_ten, &at),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_task_claims_its_tick_for_the_occurrence_window() {
+        let coordinator = std::sync::Arc::new(PeriodRecordingCoordinator {
+            period: std::sync::Mutex::new(None),
+        });
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+
+        super::execute_cron_task(
+            "daily_task".to_owned(),
+            AppState::for_test(),
+            handler,
+            crate::task::TaskCoordination::Fleet,
+            std::sync::Arc::clone(&coordinator) as _,
+            std::time::Duration::from_secs(300),
+            super::CronTick {
+                unix_secs: 1_700_000_000,
+                window: std::time::Duration::from_secs(86_400),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *coordinator.period.lock().unwrap(),
+            Some(std::time::Duration::from_secs(86_400))
         );
     }
 

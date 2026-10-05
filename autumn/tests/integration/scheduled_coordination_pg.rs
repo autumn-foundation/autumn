@@ -468,3 +468,40 @@ async fn pg_release_and_free_frees_only_its_own_row() {
         "B still holds the key"
     );
 }
+
+/// Rolling upgrade: a replica on the old release holds the session advisory
+/// lock for the whole tick. A new replica must not claim that tick meanwhile.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn pg_claim_waits_out_an_old_release_advisory_lock() {
+    use diesel_async::RunQueryDsl as _;
+
+    let (_container, url) = start_postgres().await;
+    let old_pool = replica_pool(&url, "old-release", 1);
+    let new = coordinator(replica_pool(&url, "new-release", 1), "new-release");
+    let tick = "nightly-invoice:1700000000";
+    let key = autumn_web::scheduler::advisory_lock_key(PREFIX, TASK, tick);
+
+    let mut old = old_pool.get().await.expect("conn");
+    diesel::sql_query("SELECT pg_advisory_lock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(key)
+        .execute(&mut old)
+        .await
+        .expect("the old release takes its session lock");
+
+    let runs = AtomicUsize::new(0);
+    assert!(
+        !run_tick(&new, tick, &runs).await,
+        "the old release runs this tick"
+    );
+
+    diesel::sql_query("SELECT pg_advisory_unlock($1)")
+        .bind::<diesel::sql_types::BigInt, _>(key)
+        .execute(&mut old)
+        .await
+        .expect("unlock");
+    assert!(
+        run_tick(&new, "nightly-invoice:1700000060", &runs).await,
+        "the next tick is free"
+    );
+}
