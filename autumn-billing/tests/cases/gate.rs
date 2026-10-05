@@ -528,6 +528,263 @@ async fn current_subscription_falls_back_to_the_newest_ended_row() {
     assert!(!view.entitled);
 }
 
+/// Seed an older entitled `pro` row and a newer entitled `team` row.
+async fn seed_pro_then_team(store: &MemoryBillingStore, user_id: &str) {
+    let customer = seed_customer(store, user_id).await;
+    for (key, price, age) in [("older-pro", PRO_PRICE, 2), ("newer-team", TEAM_PRICE, 1)] {
+        store
+            .upsert_subscription(sub(
+                &customer,
+                key,
+                Some(price),
+                SubscriptionStatus::Active,
+                Some(now() + hours(24)),
+                now() - hours(age),
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+/// Issue #3114: the gate tests every entitled row, not only the newest.
+#[tokio::test]
+async fn rule_satisfied_only_by_an_older_entitled_subscription_is_allowed() {
+    let h = build();
+    seed_pro_then_team(&h.store, "7").await;
+    let billing = Billing::from_state(h.client.state()).expect("plugin started");
+
+    let shown = billing.current_subscription("7").await.unwrap().unwrap();
+    assert_eq!(shown.plan.as_ref().map(|p| p.id.as_str()), Some("team"));
+
+    assert!(billing.is_entitled("7", &PlanRule::plan("pro")).await.unwrap());
+    assert!(billing.is_entitled("7", &PlanRule::entitlement("sso")).await.unwrap());
+    assert!(!billing.is_entitled("7", &PlanRule::plan("enterprise")).await.unwrap());
+    assert!(!billing.is_entitled("7", &PlanRule::entitlement("audit")).await.unwrap());
+    let err = billing
+        .require("7", &PlanRule::plan("enterprise"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, BillingError::Forbidden(_)), "{err}");
+
+    h.client.acting_as("7").await;
+    h.client.get("/pro").send().await.assert_status(200);
+    h.client.get("/sso").send().await.assert_status(200);
+}
+
+/// Issue #3114: `require` returns the row that satisfies the rule.
+#[tokio::test]
+async fn require_returns_the_satisfying_subscription_not_the_newest() {
+    let h = build();
+    seed_pro_then_team(&h.store, "7").await;
+    let billing = Billing::from_state(h.client.state()).expect("plugin started");
+
+    let view = billing.require("7", &PlanRule::plan("pro")).await.unwrap();
+    assert!(view.entitled);
+    assert_eq!(view.plan.as_ref().map(|p| p.id.as_str()), Some("pro"));
+    assert!(view.subscription.id.ends_with("older-pro"));
+
+    // Two rows satisfy `AnyActive`. The newest one wins.
+    let view = billing.require("7", &PlanRule::AnyActive).await.unwrap();
+    assert!(view.subscription.id.ends_with("newer-team"));
+}
+
+/// Two satisfying rows with one event time resolve by row id. The memory
+/// store has no order for this tie, so the gate must make one.
+#[tokio::test]
+async fn require_breaks_an_event_time_tie_by_row_id() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    for key in ["b", "a", "c"] {
+        h.store
+            .upsert_subscription(sub(
+                &customer,
+                key,
+                Some(PRO_PRICE),
+                SubscriptionStatus::Active,
+                Some(now() + hours(24)),
+                now() - hours(1),
+            ))
+            .await
+            .unwrap();
+    }
+    let billing = Billing::from_state(h.client.state()).expect("plugin started");
+    let view = billing.require("7", &PlanRule::plan("pro")).await.unwrap();
+    assert_eq!(view.subscription.id, format!("sub-{customer}-a"));
+}
+
+/// Issue #3114: a row that is not entitled never grants access, even when a
+/// newer entitled row exists on another plan.
+#[tokio::test]
+async fn an_unentitled_row_never_satisfies_a_rule() {
+    let cases: [(&str, Option<&str>, SubscriptionStatus, i64); 6] = [
+        ("canceled", Some(PRO_PRICE), SubscriptionStatus::Canceled, 24),
+        ("incomplete", Some(PRO_PRICE), SubscriptionStatus::Incomplete, 24),
+        ("unpaid", Some(PRO_PRICE), SubscriptionStatus::Unpaid, 24),
+        ("past-due", Some(PRO_PRICE), SubscriptionStatus::PastDue, 24),
+        ("expired", Some(PRO_PRICE), SubscriptionStatus::Active, -73),
+        ("unknown-price", Some("price_unknown"), SubscriptionStatus::Active, 24),
+    ];
+    for (key, price, status, period_hours) in cases {
+        let h = build();
+        let customer = seed_customer(&h.store, "7").await;
+        h.store
+            .upsert_subscription(sub(
+                &customer,
+                key,
+                price,
+                status,
+                Some(now() + hours(period_hours)),
+                now() - hours(2),
+            ))
+            .await
+            .unwrap();
+        h.store
+            .upsert_subscription(sub(
+                &customer,
+                "team",
+                Some(TEAM_PRICE),
+                SubscriptionStatus::Active,
+                Some(now() + hours(24)),
+                now() - hours(1),
+            ))
+            .await
+            .unwrap();
+        let billing = Billing::from_state(h.client.state()).expect("plugin started");
+        assert!(
+            !billing.is_entitled("7", &PlanRule::plan("pro")).await.unwrap(),
+            "{key} row granted plan pro"
+        );
+        let err = billing
+            .require("7", &PlanRule::plan("pro"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BillingError::Forbidden(_)), "{key}: {err}");
+        h.client.acting_as("7").await;
+        h.client.get("/pro").send().await.assert_status(403);
+        h.client.get("/sso").send().await.assert_status(200);
+    }
+}
+
+/// One row shape for the model check below.
+#[derive(Clone, Copy, Debug)]
+struct RowShape {
+    price: &'static str,
+    status: SubscriptionStatus,
+    in_period: bool,
+}
+
+/// The oracle plan of a row: the catalog plan, when the row is entitled.
+fn oracle_plan(row: RowShape) -> Option<&'static str> {
+    let status_ok = matches!(
+        row.status,
+        SubscriptionStatus::Active | SubscriptionStatus::Trialing
+    );
+    if !status_ok || !row.in_period {
+        return None;
+    }
+    match row.price {
+        PRO_PRICE => Some("pro"),
+        TEAM_PRICE => Some("team"),
+        _ => None,
+    }
+}
+
+/// The oracle rule check, written apart from `PlanRule::accepts`.
+fn oracle_accepts(rule: &PlanRule, plan: &str) -> bool {
+    match rule {
+        PlanRule::Plan(id) => id.as_str() == plan,
+        PlanRule::Entitlement(name) => {
+            name == "export" || (name == "sso" && plan == "team")
+        }
+        PlanRule::AnyActive => true,
+        other => panic!("the oracle does not model {other:?}"),
+    }
+}
+
+/// Every pair of row shapes, in both orders, against an oracle. The gate
+/// allows a rule if and only if one entitled row satisfies it. `require`
+/// returns the newest row that satisfies it.
+#[tokio::test]
+async fn gate_matches_the_any_row_oracle_for_every_pair_of_rows() {
+    let prices = [PRO_PRICE, TEAM_PRICE, "price_unknown"];
+    let statuses = [
+        SubscriptionStatus::Active,
+        SubscriptionStatus::Trialing,
+        SubscriptionStatus::PastDue,
+        SubscriptionStatus::Canceled,
+        SubscriptionStatus::Incomplete,
+        SubscriptionStatus::Unpaid,
+    ];
+    let mut shapes = Vec::new();
+    for price in prices {
+        for status in statuses {
+            for in_period in [true, false] {
+                shapes.push(RowShape {
+                    price,
+                    status,
+                    in_period,
+                });
+            }
+        }
+    }
+    let rules = [
+        PlanRule::AnyActive,
+        PlanRule::plan("pro"),
+        PlanRule::plan("team"),
+        PlanRule::plan("enterprise"),
+        PlanRule::entitlement("export"),
+        PlanRule::entitlement("sso"),
+        PlanRule::entitlement("audit"),
+    ];
+
+    let h = build();
+    let billing = Billing::from_state(h.client.state()).expect("plugin started");
+    let mut checked = 0_usize;
+    for (i, older) in shapes.iter().enumerate() {
+        for (j, newer) in shapes.iter().enumerate() {
+            let user = format!("u{i}-{j}");
+            let customer = seed_customer(&h.store, &user).await;
+            for (key, row, age) in [("older", older, 2), ("newer", newer, 1)] {
+                let period = if row.in_period { 24 } else { -73 };
+                h.store
+                    .upsert_subscription(sub(
+                        &customer,
+                        key,
+                        Some(row.price),
+                        row.status,
+                        Some(now() + hours(period)),
+                        now() - hours(age),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            for rule in &rules {
+                let newer_ok = oracle_plan(*newer).is_some_and(|p| oracle_accepts(rule, p));
+                let older_ok = oracle_plan(*older).is_some_and(|p| oracle_accepts(rule, p));
+                let expected = if newer_ok {
+                    Some("newer")
+                } else if older_ok {
+                    Some("older")
+                } else {
+                    None
+                };
+                let allowed = billing.is_entitled(&user, rule).await.unwrap();
+                assert_eq!(allowed, expected.is_some(), "{rule:?} {older:?} {newer:?}");
+                match (billing.require(&user, rule).await, expected) {
+                    (Ok(view), Some(key)) => {
+                        assert!(view.entitled);
+                        assert!(view.subscription.id.ends_with(key), "{rule:?}");
+                    }
+                    (Err(BillingError::Forbidden(_)), None) => {}
+                    (got, want) => panic!("{rule:?} {older:?} {newer:?}: {got:?} vs {want:?}"),
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, shapes.len() * shapes.len() * rules.len());
+}
+
 #[tokio::test]
 async fn billing_extractor_is_503_without_the_plugin() {
     #[get("/billing-handle")]
