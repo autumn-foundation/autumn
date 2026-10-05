@@ -13,4 +13,6 @@
   run `terraform apply`. If the app still runs the bootstrap image, then run
   `bash azure-cutover.sh --remove-credentials`: the old template gave the
   placeholder the credentials, and `terraform apply` does not remove them.
-  The script needs all app secrets on the migration job.
+  To turn Redis off, run `bash azure-cutover.sh --without-redis` first, then
+  set `enable_redis_cache = false` and run `terraform apply`. The script
+  needs all app secrets on the migration job.

@@ -27,6 +27,10 @@
 # `bash azure-cutover.sh --remove-credentials`. It does nothing to an app that
 # runs a real release.
 #
+# To turn Redis off, run `bash azure-cutover.sh --without-redis` with the
+# tag that runs now, then set enable_redis_cache = false and run terraform
+# apply. The app stops using Redis before Terraform deletes the cache.
+#
 # azure-deploy.yml runs this script after migrations. To run it manually, set
 # these variables. All except IMAGE_TAG come from `terraform output`. Then run
 # `bash azure-cutover.sh`.
@@ -40,10 +44,12 @@
 set -euo pipefail
 
 MODE=cutover
+WITHOUT_REDIS=""
 case "${1:-}" in
   "") ;;
   --remove-credentials) MODE=remove ;;
-  *) echo "usage: azure-cutover.sh [--remove-credentials]" >&2; exit 2 ;;
+  --without-redis) WITHOUT_REDIS=1 ;;
+  *) echo "usage: azure-cutover.sh [--remove-credentials | --without-redis]" >&2; exit 2 ;;
 esac
 
 : "${AZURE_APP_NAME:?set AZURE_APP_NAME (terraform output app_name)}"
@@ -65,6 +71,11 @@ JOB=$(az containerapp job show \
   --name "$AZURE_MIGRATE_JOB_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
   --output json)
+# To turn Redis off, the app stops using it first, while the cache still
+# exists. Then terraform apply deletes the cache and the job's redis-url.
+if [ -n "$WITHOUT_REDIS" ]; then
+  JOB=$(jq -c '.properties.configuration.secrets |= map(select(.name != "redis-url"))' <<< "$JOB")
+fi
 APP=$(az containerapp show \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \

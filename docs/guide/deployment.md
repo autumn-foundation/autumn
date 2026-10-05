@@ -2162,11 +2162,25 @@ inactive. Then it removes the identity, registry and secrets.
 latest version of each Key Vault secret. Container Apps gets a new version
 in 30 minutes or less, and restarts the revision.
 
-**To turn Redis on or off after the first deploy,** change
-`enable_redis_cache`, run `terraform apply`, then deploy again immediately.
-The cutover reads the migration job's secrets. If the job has `redis-url`,
-the cutover sets the Redis env vars and secret ref. If not, it removes them.
-Until you deploy again, the app refers to the old Redis secret.
+**To turn Redis on after the first deploy,** set `enable_redis_cache = true`,
+run `terraform apply`, then deploy again. The cutover reads the migration
+job's secrets. When the job has `redis-url`, the cutover sets the Redis env
+vars and secret ref.
+
+**To turn Redis off,** stop using it before Terraform deletes it. First run
+the cutover with `--without-redis` and the tag that runs now:
+
+```bash
+AZURE_APP_NAME="$APP_NAME" AZURE_RESOURCE_GROUP="$RG" \
+AZURE_MIGRATE_JOB_NAME="$MIGRATE_JOB" ACR_LOGIN_SERVER="$ACR" IMAGE_TAG="$TAG" \
+  bash azure-cutover.sh --without-redis
+```
+
+It deploys a revision without the Redis env vars. When the old revision is
+inactive, it removes the `redis-url` secret. Then set
+`enable_redis_cache = false` and run `terraform apply`, which deletes the
+cache. Do not deploy between these two steps: a normal cutover puts Redis
+back while the job still has `redis-url`.
 
 **Automated deploys on tag push:** `.github/workflows/azure-deploy.yml` only
 runs once you add the required repository secrets and variables it documents
