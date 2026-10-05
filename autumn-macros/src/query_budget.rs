@@ -1794,17 +1794,25 @@ struct ExitFrame {
     depth: usize,
     /// The join of the bindings at every exit that landed here.
     env: Option<Env>,
+    /// The same for a `continue`: it starts the next pass, not the code
+    /// after the loop.
+    continues: Option<Env>,
 }
 
 impl ExitFrame {
-    fn record(&mut self, env: &Env) {
+    fn record(&mut self, env: &Env, continues: bool) {
         let env = Env {
             scopes: env.scopes[..self.depth].to_vec(),
             closed: Rc::clone(&env.closed),
         };
-        match &mut self.env {
+        let slot = if continues {
+            &mut self.continues
+        } else {
+            &mut self.env
+        };
+        match slot {
             Some(joined) => joined.join(&env),
-            None => self.env = Some(env),
+            None => *slot = Some(env),
         }
     }
 }
@@ -2151,7 +2159,12 @@ impl Analyzer {
                     || HANDLE_ACCESSORS.contains(&method.as_str())
                     || HANDLE_TRANSITIONS.contains(&method.as_str())
             }
-            Expr::Call(call) => !is_handle_constructor(call),
+            // A constructor is not a future (`Some(&repo)`, `Arc::new(&repo)`).
+            Expr::Call(call) => {
+                !(is_handle_constructor(call)
+                    || is_container_constructor(call)
+                    || is_smart_pointer_new(call))
+            }
             // A path that diverges gives no value.
             Expr::Async(_)
             | Expr::Macro(_)
@@ -2367,24 +2380,42 @@ impl Analyzer {
         label: Option<&syn::Label>,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        self.exits.push(ExitFrame {
-            target,
-            label: label.map(|l| l.name.ident.to_string()),
-            depth: self.env.depth(),
-            env: None,
-        });
-        let out = f(self);
-        if let Some(frame) = self.exits.pop()
-            && let Some(env) = frame.env
-        {
+        let (out, frame) = self.in_frame(target, label, f);
+        for env in [frame.env, frame.continues].into_iter().flatten() {
             self.env.join(&env);
         }
         out
     }
 
+    /// Run `f` in an exit frame, and give back the frame.
+    fn in_frame<T>(
+        &mut self,
+        target: Target,
+        label: Option<&syn::Label>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> (T, ExitFrame) {
+        let depth = self.env.depth();
+        self.exits.push(ExitFrame {
+            target,
+            label: label.map(|l| l.name.ident.to_string()),
+            depth,
+            env: None,
+            continues: None,
+        });
+        let out = f(self);
+        let frame = self.exits.pop().unwrap_or(ExitFrame {
+            target,
+            label: None,
+            depth,
+            env: None,
+            continues: None,
+        });
+        (out, frame)
+    }
+
     /// Record the bindings at a `break` or `continue` in the frame it
     /// targets: the nearest loop, or the frame with its label.
-    fn exit_loop(&mut self, label: Option<&syn::Lifetime>) {
+    fn exit_loop(&mut self, label: Option<&syn::Lifetime>, continues: bool) {
         let label = label.map(|l| l.ident.to_string());
         for frame in self.exits.iter_mut().rev() {
             if frame.target == Target::Body {
@@ -2395,7 +2426,7 @@ impl Analyzer {
                 Some(name) => frame.label.as_ref() == Some(name),
             };
             if hit {
-                frame.record(&self.env);
+                frame.record(&self.env, continues);
                 return;
             }
         }
@@ -2409,7 +2440,7 @@ impl Analyzer {
             .rev()
             .find(|f| f.target == Target::Body)
         {
-            frame.record(&self.env);
+            frame.record(&self.env, false);
         }
     }
 
@@ -2674,7 +2705,7 @@ impl Analyzer {
                         s.unreachable(|s| s.block(&w.body));
                         return cond;
                     }
-                    s.exit_loop(None);
+                    s.exit_loop(None, false);
                     let stop = Flow {
                         fall: None,
                         exits: vec![(
@@ -2791,11 +2822,11 @@ impl Analyzer {
             }
             Expr::Break(b) => {
                 let value = b.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
-                self.exit_loop(b.label.as_ref());
+                self.exit_loop(b.label.as_ref(), false);
                 value.then(Flow::exit_to(b.label.as_ref(), true))
             }
             Expr::Continue(c) => {
-                self.exit_loop(c.label.as_ref());
+                self.exit_loop(c.label.as_ref(), true);
                 Flow::exit_to(c.label.as_ref(), false)
             }
             Expr::Cast(c) => self.expr(&c.expr),
@@ -3032,17 +3063,32 @@ impl Analyzer {
         }
         let before = self.ledger.len();
         // A pass that never falls through brings no bindings to the next
-        // pass or past the loop. Its `break` and `continue` record their own.
+        // pass or past the loop. A `continue` brings its bindings to the next
+        // pass. A `break` brings them past the loop only.
+        let mut breaks: Option<Env> = None;
         let mut flow = self.repeated(|s| {
-            s.framed(Target::Loop, shape.label, |s| {
+            let (flow, frame) = s.in_frame(Target::Loop, shape.label, |s| {
                 let start = s.env.clone();
                 let flow = s.scoped(&mut body);
                 if flow.fall.is_none() {
                     s.env = start;
                 }
                 flow
-            })
+            });
+            if let Some(env) = frame.continues {
+                s.env.join(&env);
+            }
+            if let Some(env) = frame.env {
+                match &mut breaks {
+                    Some(joined) => joined.join(&env),
+                    None => breaks = Some(env),
+                }
+            }
+            flow
         });
+        if let Some(env) = breaks {
+            self.env.join(&env);
+        }
         let (breaks, continues): (Vec<_>, Vec<_>) = flow
             .take_exits(shape.label, true)
             .into_iter()
@@ -10611,6 +10657,55 @@ mod tests {
                 "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
                  let _ = (if flag { repo.scoped() } else { repo.find(1) }).await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn deferred_constructors_and_break_bindings() {
+        check_handlers(&[
+            (
+                "guard: a stored smart-pointer new is not a known future",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = Arc::new(&repo); pending.await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a stored Some is not a known future",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = Some(&repo); pending.await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a break binding does not reach the next pass",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>, flag: bool) -> AutumnResult<usize> { \
+                 let mut slot = None; for _ in &ids { if flag { slot = Some(&repo); break; } render(slot); } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a break binding reaches the code after the loop",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>, flag: bool) -> AutumnResult<usize> { \
+                 let mut slot = None; for _ in &ids { if flag { slot = Some(&repo); break; } } render(slot); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a continue binding reaches the next pass",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>, flag: bool) -> AutumnResult<usize> { \
+                 let mut slot = None; for _ in &ids { if flag { slot = Some(&repo); continue; } render(slot); } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a labeled break binds after the outer loop",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mut slot = None; 'outer: for _ in &ids { for _ in &ids { slot = Some(&repo); break 'outer; } } \
+                 render(slot); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a while that ends by its condition binds after the loop",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut slot = None; while { slot = Some(&repo); flag } {} render(slot); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
