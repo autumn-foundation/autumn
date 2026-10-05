@@ -242,8 +242,11 @@ const PLAYGROUND_TEMPLATE: &str = include_str!("templates/playground.rs.tmpl");
 /// It goes on the command line only, so `Cargo.toml` does not change.
 pub const REPL_FEATURE: &str = "autumn-web/repl";
 
-/// The macro call that opens the REPL from the playground.
-const REPL_HOOK: &str = "console_repl!";
+/// The macro that opens the REPL from the playground.
+const REPL_HOOK: &str = "console_repl";
+
+/// The crate the hook macro must come from when the call names a path.
+const REPL_HOOK_CRATE: &str = "autumn_web";
 
 /// The `cargo` arguments that build and run the playground.
 #[must_use]
@@ -266,11 +269,39 @@ pub fn playground_cargo_args(package: Option<&str>, repl: bool) -> Vec<String> {
     args
 }
 
-/// Whether `source` calls `console_repl!` in code, not in a comment or a
-/// string.
+/// Whether `source` calls `autumn_web::console_repl!(…)` (or a bare
+/// `console_repl!(…)`) in code, not in a comment or a string.
+///
+/// This catches a stale or renamed hook. It cannot prove that the call is on
+/// the path `main` runs.
 #[must_use]
 pub fn has_repl_hook(source: &str) -> bool {
-    crate::rust_source::mask_non_code(source).contains(REPL_HOOK)
+    let code = crate::rust_source::mask_non_code(source);
+    code.match_indices(REPL_HOOK)
+        .any(|(at, _)| is_hook_call(&code[..at], &code[at + REPL_HOOK.len()..]))
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// `before` and `after` surround one `console_repl` match.
+fn is_hook_call(before: &str, after: &str) -> bool {
+    // `console_repl` then `!` then `(`, with optional spaces.
+    let is_call = after
+        .trim_start()
+        .strip_prefix('!')
+        .is_some_and(|rest| rest.trim_start().starts_with('('));
+    if !is_call || before.ends_with(is_ident_char) {
+        return false;
+    }
+    let before = before.trim_end();
+    let Some(path) = before.strip_suffix("::") else {
+        return true;
+    };
+    path.trim_end()
+        .strip_suffix(REPL_HOOK_CRATE)
+        .is_some_and(|rest| !rest.ends_with(is_ident_char))
 }
 
 /// Decide what to do with the playground source file.
@@ -1140,6 +1171,18 @@ fn report_manifest_edits(changes: ManifestChanges) {
 /// no-write-on-failure behaviour intact. A restore that itself fails is
 /// reported explicitly rather than swallowed — the user needs to know the
 /// manifest still carries the edits.
+/// Refuses `--repl` on a kept playground without the hook, before any write.
+/// Without the hook, its edit-and-run body would run instead of the prompt.
+fn require_repl_hook(playground_path: &Path, playground_rel: &str) {
+    let source =
+        std::fs::read_to_string(playground_path).unwrap_or_else(|e| fail_io(playground_path, &e));
+    if !has_repl_hook(&source) {
+        fail(&ConsoleError::PlaygroundLacksReplHook(
+            playground_rel.to_owned(),
+        ));
+    }
+}
+
 fn commit_playground(
     staged: &Path,
     playground_path: &Path,
@@ -1208,15 +1251,9 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     // Only a run that will actually write the file needs a usable destination:
     // an existing playground we are keeping is left alone either way.
     let outcome = scaffold_outcome(exists, force);
-    // A kept playground from before #2148 has no hook: under `--repl` its
-    // edit-and-run body would run instead of the prompt. Refuse before any
-    // write. A written playground comes from the template, which has the hook.
+    // A written playground comes from the template, which has the hook.
     if repl && !outcome.writes_file() {
-        let source = std::fs::read_to_string(&playground_path)
-            .unwrap_or_else(|e| fail_io(&playground_path, &e));
-        if !has_repl_hook(&source) {
-            fail(&ConsoleError::PlaygroundLacksReplHook(playground_rel));
-        }
+        require_repl_hook(&playground_path, &playground_rel);
     }
     if outcome.writes_file()
         && let Some(problem) = playground_destination_problem(&project_dir, &playground_rel)
@@ -1405,6 +1442,15 @@ mod tests {
         assert!(has_repl_hook(
             "let u = \"http://x\"; autumn_web::console_repl!(ctx.pool());"
         ));
+        assert!(has_repl_hook("::autumn_web::console_repl! (ctx.pool());"));
+    }
+
+    #[test]
+    fn repl_hook_detection_needs_the_real_macro_path() {
+        assert!(!has_repl_hook("my_console_repl!(ctx.pool());"));
+        assert!(!has_repl_hook("other::console_repl!(ctx.pool());"));
+        assert!(!has_repl_hook("autumn_web::console_repl_v2!(ctx.pool());"));
+        assert!(!has_repl_hook("let console_repl = 1;"));
     }
 
     #[test]
