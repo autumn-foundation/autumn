@@ -30,9 +30,9 @@
   `TestApp::with_flag_service`) registers a configured service, for example
   one with declared defaults.
 - **feature_flags:** `FlagStore::preload` (default: no-op) and
-  `PgFlagStore::refresh`. At startup, before user startup hooks, the app runs
-  `preload` on the blocking pool and waits up to 5 s for it. `autumn build`,
-  one-off tasks and `TestApp::build` wait until it ends.
+  `PgFlagStore::refresh`. When the app installs the flag service, it runs
+  `preload` and waits up to 10 s for it, in every mode, before job workers,
+  startup hooks and requests.
 
 ### Changed
 

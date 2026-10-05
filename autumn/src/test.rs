@@ -1241,15 +1241,7 @@ impl TestApp {
     #[must_use]
     pub fn with_flag_service(mut self, service: crate::feature_flags::FeatureFlagService) -> Self {
         self.state_initializers.push(Box::new(move |state| {
-            // Preload on its own thread, like the startup hooks below: the
-            // build can run on a Tokio worker.
-            let preload = service.clone();
-            let loaded = std::thread::spawn(move || preload.preload())
-                .join()
-                .expect("feature flag preload thread panicked");
-            if let Err(error) = loaded {
-                tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
-            }
+            crate::feature_flags::preload_blocking(&service, crate::feature_flags::PRELOAD_WAIT);
             state.insert_extension(service);
         }));
         self

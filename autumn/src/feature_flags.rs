@@ -225,7 +225,8 @@ pub trait FlagStore: Send + Sync + 'static {
     /// Load the store before the first read. This can block.
     ///
     /// [`AppBuilder::with_flag_store`](crate::app::AppBuilder::with_flag_store)
-    /// calls it once at startup on the blocking pool. The default does nothing.
+    /// calls it once, on its own thread, when the app installs the store. The
+    /// default does nothing.
     ///
     /// # Errors
     ///
@@ -1787,41 +1788,42 @@ impl FeatureFlagService {
     }
 }
 
-/// Longest time that server startup waits for [`FlagStore::preload`].
-pub(crate) const PRELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Longest time that the app waits for [`FlagStore::preload`]. It covers
+/// the Postgres store's connect and statement timeouts.
+pub(crate) const PRELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Preload the store of the registered service on the blocking pool.
+/// Preload the store of `service` on its own thread, and wait up to `wait`.
 ///
-/// The app calls it before user startup hooks, a static build and a one-off
-/// task, so they see stored flags. With `wait`, it stops waiting after that
-/// time and the load continues. Without `wait`, it waits until the load ends;
-/// the store's own timeouts bound that wait. A failure logs a warning; it
-/// does not stop the app.
-pub(crate) async fn preload_registered(state: &crate::AppState, wait: Option<std::time::Duration>) {
-    let Some(service) = state.extension::<FeatureFlagService>() else {
+/// The app calls it when it installs the service, in every mode. So later
+/// state initializers, job workers, startup hooks, routes, a static build, a
+/// one-off task and a replay all see stored flags. After `wait`, the load
+/// goes on and the app goes on. A failure logs a warning; it does not stop
+/// the app.
+pub(crate) fn preload_blocking(service: &FeatureFlagService, wait: std::time::Duration) {
+    let service = service.clone();
+    let (done, loaded) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("autumn-flag-preload".to_owned())
+        .spawn(move || {
+            // The receiver can be gone after a timeout.
+            let _ = done.send(service.preload());
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "feature flag preload thread did not start");
         return;
-    };
-    let service = (*service).clone();
-    let load = crate::time::spawn_blocking(move || service.preload());
-    let loaded = match wait {
-        Some(wait) => {
-            let Ok(loaded) = tokio::time::timeout(wait, load).await else {
-                tracing::warn!(
-                    ?wait,
-                    "feature flag preload is slow; startup continues with declared defaults"
-                );
-                return;
-            };
-            loaded
-        }
-        None => load.await,
-    };
-    match loaded {
+    }
+    match loaded.recv_timeout(wait) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
         }
-        Err(error) => tracing::warn!(%error, "feature flag preload task failed"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+            ?wait,
+            "feature flag preload is slow; the app continues with declared defaults"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::warn!("feature flag preload panicked");
+        }
     }
 }
 
@@ -2449,6 +2451,8 @@ mod tests {
         failing: std::sync::atomic::AtomicBool,
         hidden: std::sync::atomic::AtomicBool,
         preloads: std::sync::atomic::AtomicUsize,
+        /// `preload` sleeps this long (ms).
+        preload_delay_ms: std::sync::atomic::AtomicU64,
     }
 
     impl ScriptedStore {
@@ -2512,6 +2516,10 @@ mod tests {
             self.inner.history(key, limit)
         }
         fn preload(&self) -> Result<(), FlagStoreError> {
+            let delay = self
+                .preload_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(delay));
             self.preloads
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -2659,15 +2667,23 @@ mod tests {
         assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn preload_registered_loads_the_registered_store() {
+    #[test]
+    fn preload_blocking_waits_for_the_load_up_to_the_limit() {
         let store = Arc::new(ScriptedStore::default());
-        let state = crate::AppState::for_test();
-        preload_registered(&state, None).await; // No service: nothing to do.
-        state.insert_extension(FeatureFlagService::new(store.clone()));
-        preload_registered(&state, None).await;
-        preload_registered(&state, Some(PRELOAD_WAIT)).await;
-        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let svc = FeatureFlagService::new(store.clone());
+        preload_blocking(&svc, std::time::Duration::from_secs(10));
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A slow load: the wait ends first, and the load goes on.
+        store
+            .preload_delay_ms
+            .store(300, std::sync::atomic::Ordering::SeqCst);
+        preload_blocking(&svc, std::time::Duration::from_millis(10));
+        assert_eq!(
+            store.preloads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wait ended before the slow load"
+        );
     }
 
     #[test]

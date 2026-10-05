@@ -177,10 +177,12 @@ autumn_web::app()
     .await;
 ```
 
-At startup, the app calls `FlagStore::preload` once on the blocking pool and
-waits up to 5 seconds for it. Until startup ends, requests get `503`. If the
-load takes longer, startup continues and reads get declared defaults until the
-load ends. Outside an app, call `PgFlagStore::refresh` to load the flags.
+When the app installs the flag service, it calls `FlagStore::preload` once and
+waits up to 10 seconds for it. This occurs in every mode (server, `autumn
+build`, one-off tasks, replay), before later state initializers, job workers,
+startup hooks and requests. If the load takes longer, the app continues and
+reads get declared defaults until the load ends. Outside an app, call
+`PgFlagStore::refresh` to load the flags.
 
 Each store connection has a 5 second statement timeout. The store adds a 5
 second `connect_timeout` when the URL sets none. While refreshes fail, the wait
