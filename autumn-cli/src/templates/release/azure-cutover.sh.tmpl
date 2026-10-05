@@ -80,6 +80,47 @@ OLD_IMAGE=$(jq -r '.properties.template.containers[0].image' <<< "$APP")
 JOB_IDENTITY=$(jq -r '.properties.configuration.registries[0].identity // ""' <<< "$JOB")
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
+JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$JOB")
+# Redis is off now, but the app still has the redis-url secret. The old
+# revision refers to it, so the script removes it only after that revision
+# stops.
+STALE_REDIS=""
+if jq -e 'any(.[]; .name == "redis-url")' "$APP_SECRETS" > /dev/null \
+  && ! jq -e 'index("redis-url")' <<< "$JOB_SECRET_NAMES" > /dev/null; then
+  STALE_REDIS=1
+fi
+
+# A PATCH can return 202 Accepted, and a GET can still show the old state.
+# So the script reads the app until it shows the change. These checks use
+# the app GET, which has no secret values.
+# shellcheck disable=SC2016 # a jq program, not a shell expression
+APPLIED='
+  ($id | ascii_downcase) as $lid
+  | [.identity.userAssignedIdentities // {} | to_entries[]
+     | select(.value != null) | .key | ascii_downcase] as $ids
+  | [.properties.configuration.secrets // [] | .[].name] as $names
+  | .properties.provisioningState == "Succeeded"
+    and ($ids | index($lid)) != null
+    and ($want | all(. as $n | $names | index($n) != null))'
+# shellcheck disable=SC2016 # a jq program, not a shell expression
+REMOVED='
+  ($id | ascii_downcase) as $lid
+  | [.identity.userAssignedIdentities // {} | to_entries[]
+     | select(.value != null) | .key | ascii_downcase] as $ids
+  | .properties.provisioningState == "Succeeded"
+    and ($ids | index($lid)) == null
+    and all(.properties.configuration.registries // [] | .[];
+            (.identity // "" | ascii_downcase) != $lid)
+    and all(.properties.configuration.secrets // [] | .[];
+            .name | IN("database-url", "signing-secret", "redis-url") | not)'
+app_shows() {
+  local now
+  now=$(az containerapp show \
+    --name "$AZURE_APP_NAME" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --output json) || return 1
+  jq -e --arg id "$JOB_IDENTITY" --argjson want "$JOB_SECRET_NAMES" "$1" <<< "$now" > /dev/null
+}
 
 # A PATCH body goes in a file, not on the command line: it can hold secret
 # values. `--body @file` reads it.
@@ -101,7 +142,8 @@ remove_credentials() {
     | ($app.identity.userAssignedIdentities // {}) as $ids
     | ($ids | with_entries(select(.key | ascii_downcase != $lid)) | map_values({})) as $own
     | ($ids | with_entries(select(.key | ascii_downcase == $lid)) | map_values(null)) as $drop
-    | {identity: (if $own != {} then {type: $type, userAssignedIdentities: ($drop + $own)}
+    | {location: $app.location,
+       identity: (if $own != {} then {type: $type, userAssignedIdentities: ($drop + $own)}
                   elif ($type | test("SystemAssigned")) then {type: "SystemAssigned", userAssignedIdentities: null}
                   else {type: "None", userAssignedIdentities: null} end),
        properties: {
@@ -118,13 +160,7 @@ remove_credentials() {
   patch_app "$body" || return 1
   for _ in $(seq 1 30); do
     sleep 10
-    STATE=$(az containerapp show --name "$AZURE_APP_NAME" \
-      --resource-group "$AZURE_RESOURCE_GROUP" \
-      --query properties.provisioningState --output tsv) || return 1
-    case "$STATE" in
-      Succeeded) return 0 ;;
-      Failed|Canceled) return 1 ;;
-    esac
+    app_shows "$REMOVED" && return 0
   done
   return 1
 }
@@ -221,10 +257,12 @@ PATCH=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets
   | if $id == "" or ($job_secrets | length) == 0
     then error("the migration job has no identity or secrets to copy")
     else . end
+  | ($job_secrets | map(.name)) as $job_names
   | ($app_secrets[0]
-     | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not) | secret_ref)
+     | map(select(.name as $n | $job_names | index($n) | not) | secret_ref)
      + $job_secrets) as $secrets
-  | {identity: {
+  | {location: $app.location,
+     identity: {
        type: (if ($app.identity.type // "None" | test("SystemAssigned"))
               then "SystemAssigned,UserAssigned" else "UserAssigned" end),
        userAssignedIdentities: {($id): {}}},
@@ -254,6 +292,7 @@ for _ in $(seq 1 60); do
   if [ "$STATE" != "Succeeded" ] || [ -z "$REVISION" ] || [ "$REVISION" = "$OLD_REVISION" ]; then
     continue
   fi
+  app_shows "$APPLIED" || continue
   REVISION_STATUS=$(az containerapp revision show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -291,4 +330,37 @@ az containerapp ingress enable \
   --target-port 3000 \
   --transport http \
   --output none
+
+# Remove the unused redis-url secret when the old revision is inactive. The
+# release runs already, so a failure here is only a warning.
+if [ -n "$STALE_REDIS" ]; then
+  ACTIVE=true
+  if [ -n "$OLD_REVISION" ]; then
+    for _ in $(seq 1 30); do
+      ACTIVE=$(az containerapp revision show \
+        --name "$AZURE_APP_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --revision "$OLD_REVISION" \
+        --query properties.active \
+        --output tsv) || break
+      [ "$ACTIVE" = false ] && break
+      sleep 10
+    done
+  else
+    # No new revision: the current env has no Redis reference.
+    ACTIVE=false
+  fi
+  CLEANUP=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
+    "$SECRET_REF"'
+    ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
+    | ($job_secrets | map(.name) + ["redis-url"]) as $drop
+    | {location: $app.location,
+       properties: {configuration: {secrets: (($app_secrets[0]
+         | map(select(.name as $n | $drop | index($n) | not) | secret_ref)) + $job_secrets)}}}')
+  if [ "$ACTIVE" = false ] && patch_app "$CLEANUP"; then
+    echo "removed the unused redis-url secret"
+  else
+    echo "::warning::remove the unused redis-url secret from $AZURE_APP_NAME when no revision uses it" >&2
+  fi
+fi
 echo "cutover complete: $AZURE_APP_NAME runs $IMAGE"
