@@ -9111,17 +9111,16 @@ async fn execute_fixed_delay_task(
         if wait_first && !gate.wait(&state, &name).await {
             return;
         }
-        let tick_key = CostGate::retry_key(
-            &crate::scheduler::fixed_delay_tick_key(
-                &name,
-                delay,
-                crate::time::clock_unix_duration(state.clock()),
-            ),
-            retry,
+        let tick_key = crate::scheduler::fixed_delay_tick_key(
+            &name,
+            delay,
+            crate::time::clock_unix_duration(state.clock()),
         );
+        // Only the lease sees a retry key; the task sees `tick_key`.
+        let lease_key = CostGate::retry_key(&tick_key, retry);
         let lease = match coordinator
             // Pass the delay: replica timers can reach one bucket a full delay apart.
-            .try_acquire_for_period(&name, &tick_key, coordination, delay)
+            .try_acquire_for_period(&name, &lease_key, coordination, delay)
             .await
         {
             Ok(Some(lease)) => lease,
@@ -9137,7 +9136,7 @@ async fn execute_fixed_delay_task(
         // The signal can rise while an expiring lease attempt waits: give the
         // lease back, wait again, and retry under a key of its own.
         if wait_first && CostGate::must_wait(&state, &name) {
-            release_task_lease(lease, &name, &tick_key).await;
+            release_task_lease(lease, &name, &lease_key).await;
             retry += 1;
             continue;
         }
@@ -9301,19 +9300,20 @@ async fn execute_cron_task(
             gate.release();
             return;
         }
-        let tick_key = CostGate::retry_key(&scheduled_key, retry);
+        // Only the lease sees a retry key; the task sees `scheduled_key`.
+        let lease_key = CostGate::retry_key(&scheduled_key, retry);
         let lease = match coordinator
-            .try_acquire_for_period(&name, &tick_key, coordination, occurrence.window)
+            .try_acquire_for_period(&name, &lease_key, coordination, occurrence.window)
             .await
         {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                tracing::debug!(task = %name, tick = %tick_key, "Cron task tick already claimed");
+                tracing::debug!(task = %name, tick = %lease_key, "Cron task tick already claimed");
                 gate.release();
                 return;
             }
             Err(error) => {
-                tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire cron task lease");
+                tracing::warn!(task = %name, tick = %lease_key, error = %error, "Failed to acquire cron task lease");
                 gate.release();
                 return;
             }
@@ -9321,11 +9321,11 @@ async fn execute_cron_task(
         // As in `execute_fixed_delay_task`: the signal can rise during a
         // lease attempt that waited first.
         if wait_first && CostGate::must_wait(&state, &name) {
-            release_task_lease(lease, &name, &tick_key).await;
+            release_task_lease(lease, &name, &lease_key).await;
             retry += 1;
             continue;
         }
-        break (lease, tick_key);
+        break (lease, scheduled_key.clone());
     };
     state
         .task_registry
@@ -19910,6 +19910,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deferred_tick_gives_back_a_sqlite_lease_when_the_signal_rises() {
         static RAN: AtomicUsize = AtomicUsize::new(0);
+        static SEEN_RETRY_TICK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let name = "cost_sqlite_rising_signal".to_owned();
         crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
         let state = AppState::for_test();
@@ -19928,6 +19929,8 @@ mod tests {
         let handler: crate::task::TaskHandler = |_| {
             Box::pin(async {
                 RAN.fetch_add(1, Ordering::SeqCst);
+                *SEEN_RETRY_TICK.lock().unwrap() =
+                    crate::scheduler::current_tick().map(|tick| tick.tick_key().to_owned());
                 Ok(())
             })
         };
@@ -19979,6 +19982,11 @@ mod tests {
         assert!(
             !flag.load(Ordering::SeqCst),
             "the tick clears the reservation"
+        );
+        assert_eq!(
+            SEEN_RETRY_TICK.lock().unwrap().as_deref(),
+            Some("cost_sqlite_rising_signal:1700000000"),
+            "the task sees the scheduled tick, not the retry key"
         );
     }
 
