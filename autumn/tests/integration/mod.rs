@@ -398,6 +398,8 @@ mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;
 mod sim_crash_at;
+#[cfg(feature = "http-client")]
+mod sim_deadline;
 mod sim_default_entropy;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
@@ -412,6 +414,8 @@ mod sim_monotonic_clock;
 #[cfg(feature = "http-client")]
 mod sim_net;
 mod sim_rate_limit_clock;
+#[cfg(feature = "http-client")]
+mod sim_retry_budget;
 mod sim_retry_storm;
 mod sim_scheduled_ticks;
 #[cfg(feature = "sla")]

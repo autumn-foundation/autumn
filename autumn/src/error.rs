@@ -225,6 +225,13 @@ where
             ) {
                 status = StatusCode::SERVICE_UNAVAILABLE;
             }
+            // The request deadline passed before the upstream call (#3058).
+            if matches!(
+                any_err.downcast_ref::<crate::http_client::ClientError>(),
+                Some(crate::http_client::ClientError::DeadlineExceeded)
+            ) {
+                status = StatusCode::GATEWAY_TIMEOUT;
+            }
         }
 
         // A failed service-to-service call (#1755) is a dependency fault, not

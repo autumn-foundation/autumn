@@ -296,3 +296,99 @@ async fn timeout_fires_cleanly_during_graceful_drain() {
         .expect("server must drain and exit cleanly")
         .ok();
 }
+
+// ── Issue #3058: Retry-After and the inbound deadline header ─────────────
+
+/// A config with a global deadline that also accepts the deadline header.
+fn with_deadline_header(ms: u64) -> AutumnConfig {
+    let mut config = with_global_timeout(ms);
+    config.server.timeouts.accept_deadline_header = true;
+    config
+}
+
+#[tokio::test]
+async fn timeout_503_carries_a_jittered_retry_after() {
+    let client = TestApp::new()
+        .routes(routes![slow])
+        .config(with_global_timeout(50))
+        .build();
+    for accept in ["application/json", "text/html"] {
+        let resp = client.get("/slow").header("accept", accept).send().await;
+        resp.assert_status(503);
+        let value = resp
+            .header("retry-after")
+            .unwrap_or_else(|| panic!("no Retry-After for {accept}"));
+        let secs: u64 = value.parse().expect("Retry-After is whole seconds");
+        assert!((1..=3).contains(&secs), "Retry-After {secs} not in 1..=3");
+    }
+}
+
+#[tokio::test]
+async fn inbound_deadline_header_shortens_the_route_deadline() {
+    let client = TestApp::new()
+        .routes(routes![slow])
+        .config(with_deadline_header(5_000))
+        .build();
+    client
+        .get("/slow")
+        .header("x-autumn-deadline-ms", "50")
+        .send()
+        .await
+        .assert_status(503);
+}
+
+#[tokio::test]
+async fn inbound_deadline_header_cannot_extend_the_route_deadline() {
+    let client = TestApp::new()
+        .routes(routes![slow])
+        .config(with_deadline_header(50))
+        .build();
+    client
+        .get("/slow")
+        .header("x-autumn-deadline-ms", "10000")
+        .send()
+        .await
+        .assert_status(503);
+}
+
+#[tokio::test]
+async fn inbound_deadline_header_is_ignored_unless_accepted() {
+    let client = TestApp::new()
+        .routes(routes![slow])
+        .config(with_global_timeout(5_000))
+        .build();
+    client
+        .get("/slow")
+        .header("x-autumn-deadline-ms", "50")
+        .send()
+        .await
+        .assert_status(200);
+}
+
+#[tokio::test]
+async fn inbound_deadline_header_that_is_not_a_number_is_ignored() {
+    let client = TestApp::new()
+        .routes(routes![slow])
+        .config(with_deadline_header(5_000))
+        .build();
+    client
+        .get("/slow")
+        .header("x-autumn-deadline-ms", "soon")
+        .send()
+        .await
+        .assert_status(200);
+}
+
+#[tokio::test]
+async fn inbound_deadline_header_does_not_bound_an_exempt_route() {
+    let client = TestApp::new()
+        .routes(routes![longpoll])
+        .config(with_deadline_header(5_000))
+        .build();
+    client
+        .get("/longpoll")
+        .header("x-autumn-deadline-ms", "50")
+        .send()
+        .await
+        .assert_status(200);
+}

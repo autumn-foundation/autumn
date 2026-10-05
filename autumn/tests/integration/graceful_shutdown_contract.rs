@@ -242,3 +242,27 @@ fn an_upgrade_cutover_drains_without_flipping_readiness_or_waiting_out_the_grace
         "an ordinary SIGTERM drain must still flip readiness and wait out the grace"
     );
 }
+
+// ── Issue #3058: the `ShutdownToken` extractor ──────────────────────────────
+
+#[autumn_web::get("/shutdown-state")]
+async fn shutdown_state(token: autumn_web::extract::ShutdownToken) -> &'static str {
+    if token.is_cancelled() {
+        "stopping"
+    } else {
+        "running"
+    }
+}
+
+#[tokio::test]
+async fn shutdown_token_extractor_sees_the_shutdown_signal() {
+    let client = autumn_web::test::TestApp::new()
+        .routes(autumn_web::routes![shutdown_state])
+        .build();
+    assert_eq!(client.get("/shutdown-state").send().await.text(), "running");
+    client.state().trigger_shutdown_for_test();
+    assert_eq!(
+        client.get("/shutdown-state").send().await.text(),
+        "stopping"
+    );
+}

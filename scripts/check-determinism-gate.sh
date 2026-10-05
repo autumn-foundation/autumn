@@ -168,6 +168,8 @@ GATED_MODULES=(
   autumn/src/feature_flags.rs:default
   autumn/src/gdpr.rs:default
   autumn/src/http_client.rs:default
+  # Request deadlines (#3058): tokio time only.
+  autumn/src/deadline.rs:default
   autumn/src/idempotency.rs:default
   autumn/src/inspector.rs:default
   autumn/src/job_tracking.rs:default
@@ -211,7 +213,7 @@ GATED_MODULES=(
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=76
+MODULE_COUNT_FLOOR=77
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

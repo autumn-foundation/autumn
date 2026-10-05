@@ -65,6 +65,10 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::config::RetryBudgetConfig;
+use crate::deadline::{DEADLINE_HEADER, Deadline};
+use crate::retry_budget::{RetryBudget, RetryBudgets, RetryKind};
+
 // ── Error ────────────────────────────────────────────────────────────────────
 
 /// Errors produced by [`Client`] and [`RequestBuilder`].
@@ -156,6 +160,11 @@ pub enum ClientError {
     /// request or response it could not build.
     #[error("simulated network: {0}")]
     SimNetwork(String),
+
+    /// The request deadline passed before an attempt could start (issue
+    /// #3058). See [`crate::deadline`].
+    #[error("request deadline exceeded before the outbound request could start")]
+    DeadlineExceeded,
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -1144,6 +1153,10 @@ pub struct Client {
     /// When present (a sim with a `SimNet`), calls go through the simulated
     /// network instead of the real one.
     sim_net: Option<Arc<crate::sim::SimNet>>,
+    /// Retry budgets, one for each host. `None` when the budget is off.
+    retry_budgets: Option<Arc<RetryBudgets>>,
+    /// Send [`DEADLINE_HEADER`] when a request deadline is set.
+    send_deadline_header: bool,
 }
 
 impl Client {
@@ -1180,6 +1193,8 @@ impl Client {
             mock: None,
             resilience_config: None,
             sim_net: None,
+            retry_budgets: Some(Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()))),
+            send_deadline_header: true,
         }
     }
 
@@ -1221,6 +1236,9 @@ impl Client {
             mock: None,
             resilience_config: None,
             sim_net: None,
+            // `from_config` and `from_state` set the budgets.
+            retry_budgets: None,
+            send_deadline_header: config.send_deadline_header,
         }
     }
 
@@ -1237,6 +1255,9 @@ impl Client {
             mock: None,
             resilience_config: None,
             sim_net: None,
+            // `from_state` sets the budgets.
+            retry_budgets: None,
+            send_deadline_header: true,
         }
     }
 
@@ -1248,7 +1269,12 @@ impl Client {
     /// happen with the default `rustls-tls` feature).
     #[must_use]
     pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
-        Self::from_config_with_inner(Self::build_inner(config), config)
+        let mut client = Self::from_config_with_inner(Self::build_inner(config), config);
+        client.retry_budgets = config
+            .retry_budget
+            .enabled
+            .then(|| Arc::new(RetryBudgets::new(&config.retry_budget)));
+        client
     }
 
     /// Attach a mock registry (used by the test harness).
@@ -1291,12 +1317,26 @@ impl Client {
             }
         });
 
+        let budget_config = config
+            .as_ref()
+            .map_or_else(RetryBudgetConfig::default, |cfg| {
+                cfg.client.retry_budget.clone()
+            });
         let mut client = match (config, shared) {
             (Some(cfg), Some(inner)) => Self::from_config_with_inner(inner, &cfg.client),
             (Some(cfg), None) => Self::from_config(&cfg.client),
             (None, Some(inner)) => Self::with_inner(inner),
             (None, None) => Self::new(),
         };
+
+        // The extractor builds a new client for each request, so the budgets
+        // live in the app state. Thus all requests of one app share them.
+        client.retry_budgets = budget_config.enabled.then(|| {
+            let budgets = state.extension_or_insert_with(|| {
+                SharedRetryBudgets(Arc::new(RetryBudgets::new(&budget_config)))
+            });
+            Arc::clone(&budgets.0)
+        });
 
         client.resilience_config = autumn_config.map(|c| Arc::new(c.resilience.clone()));
 
@@ -1330,6 +1370,8 @@ impl Client {
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
+            retry_budgets: self.retry_budgets.clone(),
+            send_deadline_header: self.send_deadline_header,
         }
     }
 
@@ -1345,6 +1387,8 @@ impl Client {
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
+            retry_budgets: self.retry_budgets.clone(),
+            send_deadline_header: self.send_deadline_header,
         }
     }
 
@@ -1379,6 +1423,8 @@ impl Client {
             discard_response_body: false,
             breaker_scoped: false,
             sim_net: self.sim_net.clone(),
+            retry_budgets: self.retry_budgets.clone(),
+            send_deadline_header: self.send_deadline_header,
         }
     }
 
@@ -1540,6 +1586,10 @@ pub struct RequestBuilder {
     breaker_scoped: bool,
     /// The simulated network, when the client came from a sim app state.
     sim_net: Option<Arc<crate::sim::SimNet>>,
+    /// Retry budgets, one for each host. `None` when the budget is off.
+    retry_budgets: Option<Arc<RetryBudgets>>,
+    /// Send [`DEADLINE_HEADER`] when a request deadline is set.
+    send_deadline_header: bool,
 }
 
 impl RequestBuilder {
@@ -1971,19 +2021,29 @@ impl RequestBuilder {
         // ── Real network request with retries ───────────────────────────────
         let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
+        let gate = self.retry_gate(url_host(&self.url).as_deref());
+        let mut last_retry = None;
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                // Cap the exponent to prevent u64 overflow when max_retries is large.
-                let exp = (attempt - 1).min(10);
-                let delay = Duration::from_millis(100 * (1_u64 << exp));
-                tokio::time::sleep(delay).await;
+                tokio::time::sleep(retry_backoff(attempt)).await;
             }
+            gate.check()?;
+            let last = attempt + 1 == max_attempts;
+            let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
 
             let mut req = self.client.request(self.method.clone(), &self.url);
+            if gate.deadline.is_some()
+                && let Some(timeout) = timeout
+            {
+                req = req.timeout(timeout);
+            }
 
             // Inject W3C trace context headers from the active span.
             req = inject_trace_context(req);
+            if let Some(value) = gate.header(timeout, &self.extra_headers) {
+                req = req.header(DEADLINE_HEADER, value);
+            }
 
             // Apply caller-supplied headers (may override or extend trace headers).
             for (name, value) in &self.extra_headers {
@@ -2000,16 +2060,25 @@ impl RequestBuilder {
                     let headers = resp.headers().clone();
                     let url_used = resp.url().clone();
 
-                    // 429 → honour Retry-After and retry if attempts remain.
-                    if status.as_u16() == 429 && attempt + 1 < max_attempts {
-                        tokio::time::sleep(self.retry_after_delay(&headers)).await;
-                        continue;
+                    // 429 → honour Retry-After; 502-504 → back off. Retry
+                    // only while attempts, time and budget remain.
+                    if !last {
+                        if status.as_u16() == 429 {
+                            let wait = self.retry_after_delay(&headers);
+                            if gate.allow(RetryKind::Throttling, wait + retry_backoff(attempt + 1))
+                            {
+                                tokio::time::sleep(wait).await;
+                                last_retry = Some(RetryKind::Throttling);
+                                continue;
+                            }
+                        } else if is_retryable_status(status.as_u16())
+                            && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1))
+                        {
+                            last_retry = Some(RetryKind::Transient);
+                            continue;
+                        }
                     }
-
-                    // 5xx transient gateway errors → retry if attempts remain.
-                    if is_retryable_status(status.as_u16()) && attempt + 1 < max_attempts {
-                        continue;
-                    }
+                    gate.finish(last_retry, status.as_u16());
 
                     let body = if self.discard_response_body {
                         // Dropped unread — see `discard_response_body`.
@@ -2037,13 +2106,28 @@ impl RequestBuilder {
                 }
                 // Only retry transient connect/timeout errors; non-transient errors
                 // (e.g. malformed URL) fail immediately.
-                Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {}
+                Err(e)
+                    if (e.is_connect() || e.is_timeout())
+                        && !last
+                        && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1)) =>
+                {
+                    last_retry = Some(RetryKind::Transient);
+                }
                 Err(e) => return Err(ClientError::Request(e.without_url())),
             }
         }
 
         // The retry loop always returns inside the last attempt; this is unreachable.
         unreachable!("retry loop exited without returning a result — this is a bug")
+    }
+
+    /// The deadline and retry budget for one send to `host`.
+    fn retry_gate(&self, host: Option<&str>) -> RetryGate {
+        RetryGate::start(
+            self.retry_budgets.as_deref(),
+            host,
+            self.send_deadline_header,
+        )
     }
 
     /// How many attempts the retry policy allows for this request.
@@ -2111,14 +2195,18 @@ impl RequestBuilder {
             .ok_or_else(|| ClientError::InvalidUrl(format!("{}: no host", self.url)))?
             .to_owned();
         let max_attempts = self.max_attempts(false);
+        let gate = self.retry_gate(Some(&host));
+        let mut last_retry = None;
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                let exp = (attempt - 1).min(10);
-                tokio::time::sleep(Duration::from_millis(100 * (1_u64 << exp))).await;
+                tokio::time::sleep(retry_backoff(attempt)).await;
             }
+            gate.check()?;
             let last = attempt + 1 == max_attempts;
-            let exchange = self.sim_attempt(net, &host, &url);
-            let outcome = match self.retry_policy.request_timeout {
+            let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
+            let deadline_header = gate.header(timeout, &self.extra_headers);
+            let exchange = self.sim_attempt(net, &host, &url, timeout, deadline_header);
+            let outcome = match timeout {
                 Some(limit) => {
                     tokio::time::timeout(limit, exchange)
                         .await
@@ -2134,19 +2222,34 @@ impl RequestBuilder {
                 Ok(response) => response,
                 // A drop or a timeout is transient, like a real connect or
                 // timeout error, so it is retried.
-                Err(SimAttemptError::Transient(_)) if !last => continue,
+                Err(SimAttemptError::Transient(_))
+                    if !last && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1)) =>
+                {
+                    last_retry = Some(RetryKind::Transient);
+                    continue;
+                }
                 Err(SimAttemptError::Transient(message)) => {
                     return Err(ClientError::SimNetwork(message));
                 }
                 Err(SimAttemptError::Fatal(error)) => return Err(error),
             };
-            if response.status.as_u16() == 429 && !last {
-                tokio::time::sleep(self.retry_after_delay(&response.headers)).await;
-                continue;
+            let status = response.status.as_u16();
+            if !last {
+                if status == 429 {
+                    let wait = self.retry_after_delay(&response.headers);
+                    if gate.allow(RetryKind::Throttling, wait + retry_backoff(attempt + 1)) {
+                        tokio::time::sleep(wait).await;
+                        last_retry = Some(RetryKind::Throttling);
+                        continue;
+                    }
+                } else if is_retryable_status(status)
+                    && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1))
+                {
+                    last_retry = Some(RetryKind::Transient);
+                    continue;
+                }
             }
-            if is_retryable_status(response.status.as_u16()) && !last {
-                continue;
-            }
+            gate.finish(last_retry, status);
             return Ok(response);
         }
         unreachable!("the sim retry loop returns on its last attempt")
@@ -2174,12 +2277,14 @@ impl RequestBuilder {
         net: &crate::sim::SimNet,
         host: &str,
         url: &reqwest::Url,
+        timeout: Option<Duration>,
+        deadline_header: Option<HeaderValue>,
     ) -> Result<Response, SimAttemptError> {
-        net.transmit(host, self.retry_policy.request_timeout)
+        net.transmit(host, timeout)
             .await
             .map_err(|fault| SimAttemptError::Transient(format!("request to {host} {fault}")))?;
         match (net.service(host), self.mock.as_ref()) {
-            (Some(router), _) => serve_sim_host(router, self, url.clone())
+            (Some(router), _) => serve_sim_host(router, self, url.clone(), deadline_header)
                 .await
                 .map_err(SimAttemptError::Fatal),
             (None, Some(mock)) => self.mock_response(mock).map_err(SimAttemptError::Fatal),
@@ -2255,13 +2360,16 @@ impl RequestBuilder {
             ));
         }
 
-        let timeout = self
-            .retry_policy
-            .request_timeout
+        // One gate for the whole send, across redirect hops. The request
+        // deadline also makes the one-shot client timeout shorter.
+        let gate = self.retry_gate(url_host(&self.url).as_deref());
+        gate.check()?;
+        let timeout = gate
+            .attempt_timeout(self.retry_policy.request_timeout)
             .unwrap_or_else(|| Duration::from_secs(30));
 
         if self.ssrf_safe {
-            return self.send_ssrf_safe(timeout, is_half_open).await;
+            return self.send_ssrf_safe(timeout, is_half_open, &gate).await;
         }
 
         // Extract the follow parameters (ending the borrow) before moving `self`.
@@ -2271,7 +2379,7 @@ impl RequestBuilder {
         };
         if let Some((max, validator)) = follow {
             return self
-                .follow_loop(max, validator, timeout, is_half_open)
+                .follow_loop(max, validator, timeout, is_half_open, &gate)
                 .await;
         }
 
@@ -2296,6 +2404,7 @@ impl RequestBuilder {
             self.discard_response_body,
             None,
             is_half_open,
+            &gate,
         )
         .await
     }
@@ -2317,6 +2426,7 @@ impl RequestBuilder {
         validator: RedirectValidator,
         timeout: Duration,
         is_half_open: bool,
+        gate: &RetryGate,
     ) -> Result<Response, ClientError> {
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -2352,6 +2462,7 @@ impl RequestBuilder {
                 self.discard_response_body,
                 None,
                 is_half_open,
+                gate,
             )
             .await?;
 
@@ -2431,6 +2542,7 @@ impl RequestBuilder {
         self,
         timeout: Duration,
         is_half_open: bool,
+        gate: &RetryGate,
     ) -> Result<Response, ClientError> {
         let deadline = crate::time::ambient_instant() + timeout;
         let (follow, max) = self.ssrf_redirect_plan();
@@ -2478,6 +2590,7 @@ impl RequestBuilder {
                 self.discard_response_body,
                 Some(deadline),
                 is_half_open,
+                gate,
             )
             .await?;
 
@@ -2593,6 +2706,105 @@ fn breaker_for_url(
     )
 }
 
+// ── Deadline and retry budget (issue #3058) ──────────────────────────────────
+
+/// The backoff before retry `attempt` (1 or more): 100 ms x 2^(attempt - 1).
+/// The exponent stops at 10, so a large `max_retries` cannot overflow.
+fn retry_backoff(attempt: u32) -> Duration {
+    let exp = attempt.saturating_sub(1).min(10);
+    Duration::from_millis(100 * (1_u64 << exp))
+}
+
+/// The host of `url`, if it is an absolute URL.
+fn url_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+}
+
+/// The app's retry budgets, stored in `AppState`.
+pub(crate) struct SharedRetryBudgets(pub(crate) Arc<RetryBudgets>);
+
+/// The request deadline and the retry budget for one send.
+///
+/// All three retry loops (plain, sim, custom) ask it the same questions.
+struct RetryGate {
+    deadline: Option<Deadline>,
+    budget: Option<Arc<RetryBudget>>,
+    send_header: bool,
+}
+
+impl RetryGate {
+    /// Read the current deadline. Record the first attempt in the budget of
+    /// `host`.
+    fn start(budgets: Option<&RetryBudgets>, host: Option<&str>, send_header: bool) -> Self {
+        let budget = budgets
+            .zip(host)
+            .map(|(budgets, host)| budgets.for_host(host));
+        if let Some(budget) = &budget {
+            budget.record_request();
+        }
+        Self {
+            deadline: Deadline::current(),
+            budget,
+            send_header,
+        }
+    }
+
+    /// An error when no time is left to start an attempt.
+    fn check(&self) -> Result<(), ClientError> {
+        if self.deadline.is_some_and(Deadline::is_expired) {
+            return Err(ClientError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+
+    /// The timeout of the next attempt: `per_try`, made shorter to the time
+    /// left.
+    fn attempt_timeout(&self, per_try: Option<Duration>) -> Option<Duration> {
+        match (per_try, self.deadline) {
+            (Some(limit), Some(deadline)) => Some(deadline.clamp(limit)),
+            (None, Some(deadline)) => Some(deadline.remaining()),
+            (limit, None) => limit,
+        }
+    }
+
+    /// `true` when a retry of `kind` can start after `wait`. It must have time
+    /// left after the wait, and it takes tokens from the budget.
+    fn allow(&self, kind: RetryKind, wait: Duration) -> bool {
+        if self
+            .deadline
+            .is_some_and(|deadline| deadline.remaining() <= wait)
+        {
+            return false;
+        }
+        self.budget
+            .as_ref()
+            .is_none_or(|budget| budget.try_acquire(kind))
+    }
+
+    /// Give back the tokens of the last retry when the final `status` is a
+    /// success.
+    fn finish(&self, last_retry: Option<RetryKind>, status: u16) {
+        if let (Some(budget), Some(kind)) = (&self.budget, last_retry)
+            && status != 429
+            && !is_retryable_status(status)
+        {
+            budget.release(kind);
+        }
+    }
+
+    /// The [`DEADLINE_HEADER`] value for an attempt with `timeout`. `None`
+    /// with no deadline, or when the caller set the header.
+    fn header(&self, timeout: Option<Duration>, caller: &HeaderMap) -> Option<HeaderValue> {
+        if !self.send_header || self.deadline.is_none() || caller.contains_key(DEADLINE_HEADER) {
+            return None;
+        }
+        let millis = u64::try_from(timeout?.as_millis()).unwrap_or(u64::MAX);
+        Some(HeaderValue::from(millis))
+    }
+}
+
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
 
 /// Why one simulated attempt failed.
@@ -2608,6 +2820,7 @@ async fn serve_sim_host(
     router: axum::Router,
     request: &RequestBuilder,
     url: reqwest::Url,
+    deadline_header: Option<HeaderValue>,
 ) -> Result<Response, ClientError> {
     let target = url.query().map_or_else(
         || url.path().to_owned(),
@@ -2628,6 +2841,9 @@ async fn serve_sim_host(
         if !request.extra_headers.contains_key(name.as_str()) {
             builder = builder.header(name, value);
         }
+    }
+    if let Some(value) = deadline_header {
+        builder = builder.header(DEADLINE_HEADER, value);
     }
     // The real client sends a `Content-Length` for a known-size body. A
     // caller header of the same name wins.
@@ -2758,8 +2974,10 @@ async fn send_one(
     discard_response_body: bool,
     deadline: Option<Instant>,
     suppress_retries: bool,
+    gate: &RetryGate,
 ) -> Result<Response, ClientError> {
     let start = crate::time::ambient_instant();
+    let mut last_retry = None;
     let max_attempts = if suppress_retries {
         1
     } else if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
@@ -2781,12 +2999,12 @@ async fn send_one(
     };
 
     for attempt in 0..max_attempts {
+        let last = attempt + 1 == max_attempts;
         if attempt > 0 {
             if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(deadline_exceeded_err(&mut last_transient_err));
             }
-            let exp = (attempt - 1).min(10);
-            let mut delay = Duration::from_millis(100 * (1_u64 << exp));
+            let mut delay = retry_backoff(attempt);
             if let Some(d) = deadline {
                 delay = delay.min(d.saturating_duration_since(crate::time::ambient_instant()));
             }
@@ -2796,16 +3014,28 @@ async fn send_one(
             }
         }
 
+        gate.check()?;
         let mut req = client.request(method.clone(), url);
         // Recomputed fresh every attempt (not just retries) rather than
         // relying solely on `client`'s own timeout, which was fixed when the
         // caller built it at hop-start: without this override, a retry deep
         // into a hop's budget would still get the full original per-attempt
         // timeout rather than what's actually left before `deadline`.
-        if let Some(d) = deadline {
-            req = req.timeout(d.saturating_duration_since(crate::time::ambient_instant()));
+        let hop_timeout =
+            deadline.map(|d| d.saturating_duration_since(crate::time::ambient_instant()));
+        // The request deadline (issue #3058) can make it shorter again.
+        let attempt_timeout = if gate.deadline.is_some() {
+            gate.attempt_timeout(hop_timeout.or(retry_policy.request_timeout))
+        } else {
+            hop_timeout
+        };
+        if let Some(timeout) = attempt_timeout {
+            req = req.timeout(timeout);
         }
         req = inject_trace_context(req);
+        if let Some(value) = gate.header(attempt_timeout, extra_headers) {
+            req = req.header(DEADLINE_HEADER, value);
+        }
         for (name, value) in extra_headers {
             req = req.header(name.clone(), value.clone());
         }
@@ -2819,7 +3049,7 @@ async fn send_one(
                 let headers = resp.headers().clone();
                 let url_used = resp.url().clone();
 
-                if status.as_u16() == 429 && attempt + 1 < max_attempts {
+                if status.as_u16() == 429 && !last {
                     let mut sleep_delay =
                         parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
                     sleep_delay = sleep_delay.min(retry_policy.max_retry_after);
@@ -2830,9 +3060,15 @@ async fn send_one(
                         sleep_delay = sleep_delay
                             .min(d.saturating_duration_since(crate::time::ambient_instant()));
                     }
-                    tokio::time::sleep(sleep_delay).await;
-                    if deadline.is_none_or(|d| crate::time::ambient_instant() < d) {
-                        continue;
+                    if gate.allow(
+                        RetryKind::Throttling,
+                        sleep_delay + retry_backoff(attempt + 1),
+                    ) {
+                        tokio::time::sleep(sleep_delay).await;
+                        if deadline.is_none_or(|d| crate::time::ambient_instant() < d) {
+                            last_retry = Some(RetryKind::Throttling);
+                            continue;
+                        }
                     }
                     // Deadline exceeded during (or because of) the
                     // Retry-After wait — fall through and return this 429
@@ -2841,11 +3077,14 @@ async fn send_one(
                     // the deadline and only then giving up.
                 }
                 if is_retryable_status(status.as_u16())
-                    && attempt + 1 < max_attempts
+                    && !last
                     && deadline.is_none_or(|d| crate::time::ambient_instant() < d)
+                    && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1))
                 {
+                    last_retry = Some(RetryKind::Transient);
                     continue;
                 }
+                gate.finish(last_retry, status.as_u16());
 
                 let body = if discard_response_body {
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
@@ -2869,7 +3108,12 @@ async fn send_one(
                     url: Some(url_used),
                 });
             }
-            Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {
+            Err(e)
+                if (e.is_connect() || e.is_timeout())
+                    && !last
+                    && gate.allow(RetryKind::Transient, retry_backoff(attempt + 1)) =>
+            {
+                last_retry = Some(RetryKind::Transient);
                 last_transient_err = Some(e);
             }
             Err(e) => return Err(ClientError::Request(e.without_url())),
@@ -3486,6 +3730,7 @@ mod tests {
             max_retries: 1,
             max_retry_after_secs: 10,
             base_urls: std::collections::HashMap::new(),
+            ..HttpClientConfig::default()
         };
         let client = Client::from_config(&config);
         assert_eq!(client.retry_policy.max_retries, 1);
@@ -3566,6 +3811,7 @@ mod tests {
             max_retries: 3,
             max_retry_after_secs: 10,
             base_urls,
+            ..HttpClientConfig::default()
         };
         let client = Client::from_config(&config);
         let stripe = client.named("stripe");
@@ -3610,6 +3856,7 @@ mod tests {
             max_retries: 3,
             max_retry_after_secs: 10,
             base_urls,
+            ..HttpClientConfig::default()
         };
         let client = Client::from_config(&config);
 
@@ -3927,7 +4174,7 @@ mod tests {
             ] {
                 let request = Client::new().get(url);
                 let parsed = reqwest::Url::parse(url).unwrap();
-                let seen = serve_sim_host(echo.clone(), &request, parsed)
+                let seen = serve_sim_host(echo.clone(), &request, parsed, None)
                     .await
                     .unwrap()
                     .text();
@@ -3963,7 +4210,7 @@ mod tests {
                 (Client::new().post(url).bytes_body(Bytes::new()), "0"),
                 (Client::new().get(url), "none"),
             ] {
-                let seen = serve_sim_host(echo.clone(), &request, parsed.clone())
+                let seen = serve_sim_host(echo.clone(), &request, parsed.clone(), None)
                     .await
                     .unwrap()
                     .text();

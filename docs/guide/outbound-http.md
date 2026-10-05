@@ -49,6 +49,9 @@ stripe   = "https://api.stripe.com"
 sendgrid = "https://api.sendgrid.com"
 ```
 
+The client also obeys the request deadline and a retry budget. See
+[Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md).
+
 Base URL aliases let you name your upstream services and reference them by
 alias in handlers and tests:
 
@@ -69,6 +72,10 @@ methods) are retried up to three times on:
 | `504 Gateway Timeout` | Same |
 | `429 Too Many Requests` | Retried after the `Retry-After` header delay (1 s default) |
 | Connection / timeout error | Retried up to `max_retries` times |
+
+A retry starts only when the request deadline has time for it and the retry
+budget has tokens for it. See
+[Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md).
 
 `POST` and `PATCH` are **not** retried by default (not idempotent). Override
 per-call:

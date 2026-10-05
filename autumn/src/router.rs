@@ -1019,7 +1019,7 @@ fn build_router_pre_state(
             mcp_router = apply_request_timeout_middleware(
                 mcp_router,
                 config,
-                state.metrics.clone(),
+                &state,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 false,
             );
@@ -4333,12 +4333,11 @@ fn expand_route_timeout_table_for_locale_prefix(
 fn apply_request_timeout_middleware(
     router: axum::Router<AppState>,
     config: &AutumnConfig,
-    metrics: crate::middleware::MetricsCollector,
+    state: &AppState,
     route_timeouts: RouteTimeoutTable,
     mirror_cors: bool,
 ) -> axum::Router<AppState> {
-    let Some(settings) =
-        build_request_timeout_settings(config, metrics, route_timeouts, mirror_cors)
+    let Some(settings) = build_request_timeout_settings(config, state, route_timeouts, mirror_cors)
     else {
         return router;
     };
@@ -4362,6 +4361,10 @@ struct RequestTimeoutSettings {
     route_timeouts: RouteTimeoutTable,
     metrics: crate::middleware::MetricsCollector,
     cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
+    /// Read the caller's [`crate::deadline::DEADLINE_HEADER`] (issue #3058).
+    accept_deadline_header: bool,
+    /// The jitter source for the timeout `Retry-After` (seeded in a sim).
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 /// Resolve the request-timeout settings, or `None` when no global timeout is
@@ -4377,7 +4380,7 @@ struct RequestTimeoutSettings {
 /// place the layer in the composed ingress stack (issue #2193).
 fn build_request_timeout_settings(
     config: &AutumnConfig,
-    metrics: crate::middleware::MetricsCollector,
+    state: &AppState,
     route_timeouts: RouteTimeoutTable,
     mirror_cors: bool,
 ) -> Option<RequestTimeoutSettings> {
@@ -4407,8 +4410,10 @@ fn build_request_timeout_settings(
     Some(RequestTimeoutSettings {
         global,
         route_timeouts,
-        metrics,
+        metrics: state.metrics.clone(),
         cors,
+        accept_deadline_header: config.server.timeouts.accept_deadline_header,
+        entropy: state.entropy_arc(),
     })
 }
 
@@ -4481,11 +4486,19 @@ impl<S> RequestTimeoutService<S> {
             .and_then(|by_method| by_method.get(req.method()))
             .copied()
             .unwrap_or(crate::route::RouteTimeout::Inherit);
-        match route_timeout {
+        let route_deadline = match route_timeout {
             crate::route::RouteTimeout::Disabled => None,
             crate::route::RouteTimeout::Override(d) => Some(d),
             crate::route::RouteTimeout::Inherit => self.settings.global,
-        }
+        }?;
+        // The caller's deadline header can only make the deadline shorter.
+        let caller_deadline = self
+            .settings
+            .accept_deadline_header
+            .then(|| req.headers().get(crate::deadline::DEADLINE_HEADER))
+            .flatten()
+            .and_then(crate::deadline::Deadline::parse_header);
+        Some(caller_deadline.map_or(route_deadline, |caller| caller.min(route_deadline)))
     }
 }
 
@@ -4542,11 +4555,15 @@ where
         // inside a Tokio runtime. `tower::timeout::Timeout::call` has the same
         // requirement, and every driver in this crate reaches it through
         // `ServiceExt::oneshot`, which calls `call` only from inside a poll.
-        let inner = self.inner.call(req);
+        //
+        // The handler sees the deadline through `Deadline::current()` (issue
+        // #3058). The task-local scope costs no allocation.
+        let deadline = crate::deadline::Deadline::after(duration);
+        let inner = deadline.sync_scope(|| self.inner.call(req));
         let start = crate::time::ambient_instant();
 
         RequestTimeoutFuture::Bounded {
-            inner: tokio::time::timeout(duration, inner),
+            inner: tokio::time::timeout_at(deadline.instant(), deadline.scope_future(inner)),
             settings: Arc::clone(&self.settings),
             duration,
             matched_path,
@@ -4583,7 +4600,7 @@ pin_project_lite::pin_project! {
         },
         Bounded {
             #[pin]
-            inner: tokio::time::Timeout<F>,
+            inner: tokio::time::Timeout<crate::deadline::DeadlineScope<F>>,
             settings: Arc<RequestTimeoutSettings>,
             duration: Duration,
             matched_path: Option<String>,
@@ -4690,6 +4707,11 @@ fn deadline_exceeded_response(
     // Tag the 503 so the outer session layer skips persisting any partial
     // session mutation the cancelled handler made before the deadline.
     response.extensions_mut().insert(RequestDeadlineCancelled);
+    // Tell the client when to retry. Jitter spreads the retries (issue #3058).
+    response.headers_mut().insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from(timeout_retry_after_secs(settings.entropy.as_ref())),
+    );
     // This layer is outside `CorsLayer` in the main stack, so the 503
     // never passes back through it; mirror the CORS headers ourselves so
     // cross-origin browser clients can read the Problem Details body
@@ -4698,6 +4720,16 @@ fn deadline_exceeded_response(
         mirror_cors_headers(cors, cors_origin, &mut response);
     }
     response
+}
+
+/// The lowest and highest `Retry-After` seconds on a timeout `503`.
+const TIMEOUT_RETRY_AFTER_SECS: std::ops::RangeInclusive<u64> = 1..=3;
+
+/// A `Retry-After` value for a timeout `503`, from `entropy`. Each value in
+/// [`TIMEOUT_RETRY_AFTER_SECS`] has about the same chance.
+fn timeout_retry_after_secs(entropy: &dyn crate::entropy::Entropy) -> u64 {
+    let (low, high) = TIMEOUT_RETRY_AFTER_SECS.into_inner();
+    low + entropy.next_u64() % (high - low + 1)
 }
 
 struct BuiltIdempotencyLayers {
@@ -5113,9 +5145,8 @@ fn apply_middleware(
     //
     // `apply_request_timeout_middleware` installs the same layer type for the
     // `/mcp` envelope, so the two cannot drift.
-    let timeout_layer =
-        build_request_timeout_settings(config, state.metrics.clone(), route_timeouts, true)
-            .map(RequestTimeoutLayer::new);
+    let timeout_layer = build_request_timeout_settings(config, state, route_timeouts, true)
+        .map(RequestTimeoutLayer::new);
 
     // Failure-capsule capture (#1598). Outer to the reporting layer, because a
     // request's capture scope must exist before that layer snapshots its context;
@@ -13353,15 +13384,10 @@ mod trusted_host_tests {
         );
 
         // Place timeout inner to RequestIdLayer (matches apply_middleware ordering).
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -13397,15 +13423,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state.clone());
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state.clone());
 
         router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -13435,15 +13456,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         // A live inbound request (no marker) is bounded by the deadline -> 503.
         let live = router
@@ -13495,15 +13511,10 @@ mod trusted_host_tests {
 
         // `mirror_cors = true`, matching the main ingress stack where the timeout
         // layer is outside `CorsLayer` and the 503 would otherwise be opaque.
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            true,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), true)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         let response = router
             .oneshot(
@@ -13558,15 +13569,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            true,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), true)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         let response = router
             .oneshot(
@@ -13603,15 +13609,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -13641,14 +13642,9 @@ mod trusted_host_tests {
         let router: axum::Router<AppState> =
             axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -13667,14 +13663,9 @@ mod trusted_host_tests {
         let router: axum::Router<AppState> =
             axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -13702,14 +13693,9 @@ mod trusted_host_tests {
 
         // No RequestIdLayer — exercises the `request_id: None` branch in
         // `RequestTimeoutService`.
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -13740,9 +13726,8 @@ mod trusted_host_tests {
             "/export",
             crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10)),
         );
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
-                .with_state(state);
+        let router = apply_request_timeout_middleware(router, &config, &state, table, false)
+            .with_state(state);
 
         let response = router
             .oneshot(
@@ -13777,9 +13762,8 @@ mod trusted_host_tests {
         );
 
         let table = get_route_timeouts("/stream", crate::route::RouteTimeout::Disabled);
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
-                .with_state(state.clone());
+        let router = apply_request_timeout_middleware(router, &config, &state, table, false)
+            .with_state(state.clone());
 
         let response = router
             .oneshot(
@@ -13817,9 +13801,8 @@ mod trusted_host_tests {
             "/export",
             crate::route::RouteTimeout::Override(std::time::Duration::from_millis(100)),
         );
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
-                .with_state(state);
+        let router = apply_request_timeout_middleware(router, &config, &state, table, false)
+            .with_state(state);
 
         let response = router
             .oneshot(

@@ -55,6 +55,7 @@
 //! | `AUTUMN_SERVER__UPGRADE__ENABLED` | `server.upgrade.enabled` | `bool` |
 //! | `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` | `server.upgrade.ready_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER` | `server.timeouts.accept_deadline_header` | `bool` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_SERVER__CAPACITY_CONTRACT` | `server.capacity_contract` | `String` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
@@ -559,7 +560,8 @@ environment = "production"
 
 [server]
 host = "0.0.0.0"
-shutdown_timeout_secs = 30
+# Request timeout + 5 s margin (issue #3058).
+shutdown_timeout_secs = 35
 
 [server.timeouts]
 request_timeout_ms = 30_000
@@ -2262,6 +2264,94 @@ pub struct HttpClientConfig {
     /// [`TestApp::http_mock`](crate::test::TestApp::http_mock).
     #[serde(default)]
     pub base_urls: std::collections::HashMap<String, String>,
+
+    /// Send the time left of the request deadline downstream in the
+    /// `x-autumn-deadline-ms` header. The client sends it only when a deadline
+    /// is set. Default: `true`.
+    #[serde(default = "default_http_send_deadline_header")]
+    pub send_deadline_header: bool,
+
+    /// Retry budget (`[http.client.retry_budget]`). See
+    /// [`crate::retry_budget`].
+    #[serde(default)]
+    pub retry_budget: RetryBudgetConfig,
+}
+
+/// Retry budget settings (`[http.client.retry_budget]`, issue #3058).
+///
+/// A token bucket for each upstream host. See [`crate::retry_budget`].
+///
+/// ```toml
+/// [http.client.retry_budget]
+/// enabled = true
+/// capacity = 500
+/// transient_cost = 14
+/// throttling_cost = 5
+/// retry_ratio = 0.1
+/// ```
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryBudgetConfig {
+    /// Use the retry budget. Default: `true`.
+    #[serde(default = "default_retry_budget_enabled")]
+    pub enabled: bool,
+    /// Tokens in a full bucket. Default: 500.
+    #[serde(default = "default_retry_budget_capacity")]
+    pub capacity: u32,
+    /// Tokens for a retry after a `5xx`, a connect error or a timeout.
+    /// Default: 14.
+    #[serde(default = "default_retry_budget_transient_cost")]
+    pub transient_cost: u32,
+    /// Tokens for a retry after a `429`. Default: 5.
+    #[serde(default = "default_retry_budget_throttling_cost")]
+    pub throttling_cost: u32,
+    /// The share of requests that can retry a transient failure when the
+    /// bucket is empty. Default: 0.1 (10 %).
+    #[serde(default = "default_retry_budget_retry_ratio")]
+    pub retry_ratio: f64,
+}
+
+#[cfg(feature = "http-client")]
+const fn default_http_send_deadline_header() -> bool {
+    true
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_capacity() -> u32 {
+    500
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_transient_cost() -> u32 {
+    14
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_throttling_cost() -> u32 {
+    5
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_retry_ratio() -> f64 {
+    0.1
+}
+
+#[cfg(feature = "http-client")]
+impl Default for RetryBudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_retry_budget_enabled(),
+            capacity: default_retry_budget_capacity(),
+            transient_cost: default_retry_budget_transient_cost(),
+            throttling_cost: default_retry_budget_throttling_cost(),
+            retry_ratio: default_retry_budget_retry_ratio(),
+        }
+    }
 }
 
 #[cfg(feature = "http-client")]
@@ -2287,6 +2377,8 @@ impl Default for HttpClientConfig {
             max_retries: default_http_max_retries(),
             max_retry_after_secs: default_http_max_retry_after_secs(),
             base_urls: std::collections::HashMap::new(),
+            send_deadline_header: default_http_send_deadline_header(),
+            retry_budget: RetryBudgetConfig::default(),
         }
     }
 }
@@ -5151,6 +5243,7 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__PORT` → `server.port` (u16)
     /// - `AUTUMN_SERVER__HOST` → `server.host` (String)
     /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
+    /// - `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER` → `server.timeouts.accept_deadline_header` (bool)
     /// - `AUTUMN_SERVER__PRESTOP_GRACE_SECS` → `server.prestop_grace_secs` (u64)
     /// - `AUTUMN_SERVER__UPGRADE__ENABLED` → `server.upgrade.enabled` (bool)
     /// - `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` →
@@ -5734,6 +5827,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS",
             &mut self.server.timeouts.request_timeout_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER",
+            &mut self.server.timeouts.accept_deadline_header,
         );
         parse_env_option_string(
             env,
@@ -7062,6 +7160,13 @@ pub struct RequestTimeoutsConfig {
     /// `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
+
+    /// Read the caller's `x-autumn-deadline-ms` header (issue #3058). The
+    /// header can only make the route deadline shorter. A route with no
+    /// deadline ignores it. Default: `false`. Configured via
+    /// `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER`.
+    #[serde(default)]
+    pub accept_deadline_header: bool,
 }
 
 /// `[server.upgrade]` — in-place upgrades (issue #1674).
@@ -10309,6 +10414,32 @@ fn default_ready_path() -> String {
 
 fn default_startup_path() -> String {
     "/startup".to_owned()
+}
+
+/// Seconds of drain window above the request timeout (issue #3058).
+///
+/// A request that starts just before shutdown can run for the full request
+/// timeout. The drain window must be longer, or the watchdog stops it.
+pub const DRAIN_MARGIN_SECS: u64 = 5;
+
+impl ServerConfig {
+    /// A warning when `shutdown_timeout_secs` is not longer than the request
+    /// timeout plus [`DRAIN_MARGIN_SECS`]. `None` when the drain window is
+    /// safe or no request timeout is set.
+    #[must_use]
+    pub fn drain_window_warning(&self) -> Option<String> {
+        let timeout_ms = self.timeouts.request_timeout_ms.filter(|ms| *ms > 0)?;
+        let safe_secs = timeout_ms.div_ceil(1_000).saturating_add(DRAIN_MARGIN_SECS);
+        (self.shutdown_timeout_secs < safe_secs).then(|| {
+            format!(
+                "server.shutdown_timeout_secs ({}) is too short for \
+                 server.timeouts.request_timeout_ms ({timeout_ms}): a request that starts \
+                 just before shutdown can be stopped. Set shutdown_timeout_secs to {safe_secs} \
+                 or more.",
+                self.shutdown_timeout_secs
+            )
+        })
+    }
 }
 
 // ── Default trait impls ────────────────────────────────────────────
@@ -17884,7 +18015,7 @@ path = "/healthz"
         assert_eq!(config.log.level, "info");
         assert_eq!(config.log.format, LogFormat::Json);
         assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.server.shutdown_timeout_secs, 30);
+        assert_eq!(config.server.shutdown_timeout_secs, 35);
         assert_eq!(config.telemetry.environment, "production");
         assert!(!config.health.detailed);
         // AC: HSTS auto-enabled in the production profile.
@@ -19045,6 +19176,80 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.timeouts.request_timeout_ms, Some(15_000));
+    }
+
+    #[test]
+    fn prod_drain_window_is_request_timeout_plus_margin() {
+        let defaults = profile_defaults_as_toml("prod");
+        let config: AutumnConfig = toml::from_str(&toml::to_string(&defaults).unwrap()).unwrap();
+        let timeout_secs = config.server.timeouts.request_timeout_ms.unwrap() / 1000;
+        assert_eq!(
+            config.server.shutdown_timeout_secs,
+            timeout_secs + DRAIN_MARGIN_SECS
+        );
+        assert!(config.server.drain_window_warning().is_none());
+    }
+
+    #[test]
+    fn drain_window_shorter_than_request_timeout_is_flagged() {
+        let mut server = ServerConfig::default();
+        server.timeouts.request_timeout_ms = Some(30_000);
+        server.shutdown_timeout_secs = 30;
+        let warning = server
+            .drain_window_warning()
+            .expect("30 s drain, 30 s timeout");
+        assert!(warning.contains("35"), "names the safe value: {warning}");
+
+        server.shutdown_timeout_secs = 35;
+        assert!(server.drain_window_warning().is_none());
+
+        server.timeouts.request_timeout_ms = None;
+        server.shutdown_timeout_secs = 1;
+        assert!(
+            server.drain_window_warning().is_none(),
+            "no timeout, no risk"
+        );
+    }
+
+    #[test]
+    fn accept_deadline_header_is_off_by_default_and_configurable() {
+        assert!(!RequestTimeoutsConfig::default().accept_deadline_header);
+        let config: ServerConfig =
+            toml::from_str("[timeouts]\naccept_deadline_header = true\n").unwrap();
+        assert!(config.timeouts.accept_deadline_header);
+
+        let env = MockEnv::new().with("AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.timeouts.accept_deadline_header);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn http_client_deadline_header_and_retry_budget_defaults() {
+        let config = HttpClientConfig::default();
+        assert!(config.send_deadline_header);
+        let budget = &config.retry_budget;
+        assert!(budget.enabled);
+        assert_eq!(budget.capacity, 500);
+        assert_eq!(budget.transient_cost, 14);
+        assert_eq!(budget.throttling_cost, 5);
+        assert!((budget.retry_ratio - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn http_client_retry_budget_parses_from_toml() {
+        let config: HttpConfig = toml::from_str(
+            "[client]\nsend_deadline_header = false\n\
+             [client.retry_budget]\nenabled = false\ncapacity = 50\nretry_ratio = 0.2\n",
+        )
+        .unwrap();
+        assert!(!config.client.send_deadline_header);
+        assert!(!config.client.retry_budget.enabled);
+        assert_eq!(config.client.retry_budget.capacity, 50);
+        assert_eq!(config.client.retry_budget.transient_cost, 14);
+        assert!((config.client.retry_budget.retry_ratio - 0.2).abs() < f64::EPSILON);
     }
 
     #[test]

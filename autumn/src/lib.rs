@@ -172,6 +172,8 @@ pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
 pub(crate) mod db_url;
+/// Request deadlines: read the time left, scope and bound work (issue #3058).
+pub mod deadline;
 pub mod dotenv;
 pub mod download;
 #[cfg(test)]
@@ -582,6 +584,9 @@ pub mod etag;
 pub mod http_client;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
+/// Retry budget for outbound HTTP (issue #3058).
+#[cfg(feature = "http-client")]
+pub mod retry_budget;
 
 #[cfg(feature = "flash")]
 pub mod flash;

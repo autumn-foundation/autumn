@@ -2091,7 +2091,6 @@ impl TestApp {
             #[cfg(feature = "ws")]
             channels: test_channels,
 
-            #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: self

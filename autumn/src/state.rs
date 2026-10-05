@@ -40,7 +40,6 @@ use crate::middleware;
 #[cfg(feature = "presence")]
 use crate::presence::Presence;
 use crate::probe;
-#[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
 
 /// A read-only view of one [`AppState`]'s extension map, for a caller that
@@ -215,9 +214,8 @@ pub struct AppState {
 
     /// Cancellation token signalled during graceful shutdown.
     ///
-    /// WebSocket handlers receive a child token so they can clean up
-    /// when the server is stopping.
-    #[cfg(feature = "ws")]
+    /// WebSocket handlers and the [`crate::extract::ShutdownToken`] extractor
+    /// receive a child token so they can clean up when the server is stopping.
     pub(crate) shutdown: CancellationToken,
 
     /// Per-resource policy + scope registry used by `#[authorize]`
@@ -975,14 +973,12 @@ impl AppState {
     ///
     /// WebSocket handlers should select on this to clean up when the
     /// server is shutting down.
-    #[cfg(feature = "ws")]
     #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.child_token()
     }
 
     /// Helper for integration tests to simulate a server shutdown.
-    #[cfg(feature = "ws")]
     #[doc(hidden)]
     pub fn trigger_shutdown_for_test(&self) {
         self.begin_shutdown();
@@ -1049,7 +1045,6 @@ impl AppState {
             presence,
             #[cfg(feature = "ws")]
             channels,
-            #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),
             forbidden_response: ForbiddenResponse::default(),
@@ -1347,7 +1342,6 @@ impl AppState {
             presence,
             #[cfg(feature = "ws")]
             channels,
-            #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),

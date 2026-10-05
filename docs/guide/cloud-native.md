@@ -864,7 +864,7 @@ timeout.
 | 3 | **prestop_grace** | Autumn sleeps `server.prestop_grace_secs` (default `5`). Set this to at least your LB's health-check interval plus deregistration propagation time. |
 | 4 | **ws_closing** | The WebSocket shutdown token fires. Handlers that opt into `WithShutdown` should send a `1001 Going Away` close frame so clients can reconnect to another replica. Handlers that do not use `WithShutdown` will have their connections closed without a close frame. |
 | 5 | **listener_stopping** | The TCP listener stops accepting new connections. `#[job]` workers and `#[scheduled]` tasks stop dequeuing/launching new work — they share the same cancellation token as the listener. The HTTP drain then starts after a 100 ms settle window, so a connection accepted just before the stop has its request read and served rather than being closed as idle. |
-| 6 | **in_flight_drain** | In-flight HTTP requests complete for up to `server.shutdown_timeout_secs` (default `30`). Requests still running at the deadline are aborted and counted in `autumn_shutdown_aborted_requests_total`. The process exits with code `1` and a structured log line naming the exceeded phase. |
+| 6 | **in_flight_drain** | In-flight HTTP requests complete for up to `server.shutdown_timeout_secs` (default `30`, prod profile `35`). Requests still running at the deadline are aborted and counted in `autumn_shutdown_aborted_requests_total`. The process exits with code `1` and a structured log line naming the exceeded phase. |
 | 7 | **app_hooks** | `on_shutdown` hooks run in **LIFO registration order** with a per-hook and total budget equal to `shutdown_timeout_secs`. Plugin hooks registered during `build()` run after app hooks (LIFO means last-registered runs first). Overruns are logged at WARN but do not block the remaining budget. |
 | 8 | **telemetry_flush** | OpenTelemetry span exporter flushes buffered spans (handled by the `_telemetry_guard` drop). |
 | 9 | **db_pool_close** | The Diesel connection pool is dropped with the process. |
@@ -878,8 +878,10 @@ timeout.
 # Tune to: LB health-check interval + deregistration propagation time.
 prestop_grace_secs = 5
 
-# Maximum seconds for in-flight requests to drain (default: 30).
-shutdown_timeout_secs = 30
+# Maximum seconds for in-flight requests to drain (default: 30; prod
+# profile: 35, the 30 s request timeout + 5 s). Keep it above
+# server.timeouts.request_timeout_ms; see timeouts-and-budgets.md.
+shutdown_timeout_secs = 35
 ```
 
 Environment variable overrides:
@@ -902,8 +904,8 @@ spec:
       # shutdown_timeout_secs covers drain AND on_shutdown hooks combined
       # (they share one budget, not two separate windows).
       # If you use a Kubernetes preStop hook, include its duration in the total.
-      # Example: 5 (preStop sleep) + 5 (prestop_grace) + 30 (drain+hooks) + 10 (buffer) = 50 s.
-      terminationGracePeriodSeconds: 50
+      # Example: 5 (preStop sleep) + 5 (prestop_grace) + 35 (drain+hooks) + 10 (buffer) = 55 s.
+      terminationGracePeriodSeconds: 55
       containers:
         - name: app
           readinessProbe:
