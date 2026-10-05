@@ -1460,6 +1460,10 @@ struct Binding {
     /// What `.await` on an `async` block gives: `let pending = async {
     /// &repo };`.
     output: Option<Kind>,
+    /// A builder chain on a handle, not awaited yet: `let pending =
+    /// repo.scoped();`. A finder may share the builder's name, so
+    /// `pending.await` counts one query.
+    pending_query: bool,
     /// The shape of a part, when known: a part of an `Option<Db>` is a `Db`.
     inner: Option<Shape>,
 }
@@ -1473,6 +1477,7 @@ impl Binding {
             referents: Vec::new(),
             future: false,
             output: None,
+            pending_query: false,
             inner: None,
         }
     }
@@ -1521,6 +1526,7 @@ impl Binding {
             },
             future: self.future && other.future,
             output: self.output.max(other.output),
+            pending_query: self.pending_query || other.pending_query,
             inner: if self.inner == other.inner {
                 self.inner
             } else {
@@ -2047,6 +2053,7 @@ impl Analyzer {
             shape: self.shape_of(init),
             referents: self.referents_of(init),
             future: self.is_known_future(init),
+            pending_query: self.is_pending_query(init),
             output: match peel_parens(init) {
                 Expr::Async(a) => Some(self.async_output(&a.block)),
                 // `(|| async { &repo })()`: what its `async` block gives.
@@ -2077,6 +2084,18 @@ impl Analyzer {
             Expr::Call(call) => !is_handle_constructor(call),
             Expr::Async(_) | Expr::Macro(_) => true,
             other => path_ident(other).is_some_and(|name| self.env.binding(&name).future),
+        }
+    }
+
+    /// Is `e` a builder chain on a handle (`repo.scoped()`), or a name bound
+    /// to one?
+    fn is_pending_query(&self, e: &Expr) -> bool {
+        let e = peel_parens(e);
+        match e {
+            Expr::MethodCall(mc) => {
+                is_handle_builder(&mc.method.to_string()) && self.chain_root_is_handle(e)
+            }
+            other => path_ident(other).is_some_and(|name| self.env.binding(&name).pending_query),
         }
     }
 
@@ -2436,6 +2455,12 @@ impl Analyzer {
         match expr {
             Expr::Await(e) => {
                 let flow = self.expr_in(&e.base, true);
+                // `pending.await` on `let pending = repo.scoped();`: the
+                // terminal call runs here.
+                if matches!(peel_parens(&e.base), Expr::Path(_)) && self.is_pending_query(&e.base) {
+                    let query = self.count("deferred builder awaited");
+                    return flow.then(Flow::cost(query));
+                }
                 // `.await` on a value that holds a handle and is not a known
                 // future: `PgPostRepository::new(&mut db)` stored, then
                 // awaited. A base that is already reported keeps its reason.
@@ -3096,8 +3121,12 @@ impl Analyzer {
             let callback = takes_callback && (every || i == last);
             let param = self.side_param(method, i).unwrap_or(param);
             let next = if runs_once {
+                // Only this argument's closure gets a connection: a named
+                // callback never consumes the flag.
                 self.connection_params = is_transaction;
-                self.callback_arg(arg, param, callback)
+                let next = self.callback_arg(arg, param, callback);
+                self.connection_params = false;
+                next
             } else {
                 self.closure_arg(arg, param, callback)
             };
@@ -9586,6 +9615,36 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let maybe = Option::Some(&repo); let _ = maybe.is_some(); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn deferred_builders_and_named_transaction_callbacks() {
+        check_handlers(&[
+            (
+                "a deferred builder awaited later costs one",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = repo.scoped(); let _ = pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a deferred builder copied, then awaited, costs one",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = repo.scoped(); let again = pending; let _ = again.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a builder refined then run is one query",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let q = repo.scoped(); let _ = q.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a named transaction callback does not leak the connection flag",
+                "async fn h(db: Db, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 #[query_cost(1)] let _ = db.tx(run); let _ = (|r| r.tx(|c| c.find_all()))(repo); Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
