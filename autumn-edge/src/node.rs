@@ -380,6 +380,17 @@ impl TrustedProxy {
         if prefix > bits {
             return Err(bad());
         }
+        // An IPv4-mapped IPv6 range (`::ffff:a.b.c.d/n`) is the IPv4 range
+        // `a.b.c.d/(n - 96)`; a peer is compared as IPv4 too.
+        if let IpAddr::V6(v6) = network
+            && let Some(v4) = v6.to_ipv4_mapped()
+        {
+            let prefix = prefix.checked_sub(96).ok_or_else(bad)?;
+            return Ok(Self {
+                network: IpAddr::V4(v4),
+                prefix,
+            });
+        }
         Ok(Self { network, prefix })
     }
 

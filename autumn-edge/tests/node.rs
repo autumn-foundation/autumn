@@ -1133,3 +1133,20 @@ async fn a_connection_named_host_still_gives_the_public_host() {
     let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
     assert_eq!(header(&seen[0], "x-forwarded-host"), Some(address));
 }
+
+#[test]
+fn an_ipv4_mapped_trusted_proxy_matches_the_ipv4_peer() {
+    use autumn_edge::node::TrustedProxy;
+    use std::net::IpAddr;
+
+    let ip = |raw: &str| raw.parse::<IpAddr>().unwrap();
+    let one = TrustedProxy::parse("::ffff:192.0.2.10").unwrap();
+    assert!(one.contains(ip("192.0.2.10")));
+    assert!(one.contains(ip("::ffff:192.0.2.10")));
+    assert!(!one.contains(ip("192.0.2.11")));
+    let range = TrustedProxy::parse("::ffff:10.0.0.0/104").unwrap();
+    assert!(range.contains(ip("10.9.9.9")));
+    assert!(!range.contains(ip("11.0.0.1")));
+    // A mapped range wider than the IPv4 space is not valid.
+    assert!(TrustedProxy::parse("::ffff:0.0.0.0/95").is_err());
+}

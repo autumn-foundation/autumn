@@ -578,7 +578,20 @@ Rules:
   - From any other peer, it is the first proxy: `x-forwarded-for` is the
     peer, `x-forwarded-host` is the request `host`, and
     `x-forwarded-proto` is `http`.
-- Configure the origin to trust the node as a proxy.
+- Configure the origin to trust every proxy hop between it and the client:
+  the node, and each `--trusted-proxy` in front of the node. The origin
+  reads `x-forwarded-for` from the right and stops at the first address it
+  does not trust:
+
+  ```toml
+  # autumn.toml on the ORIGIN
+  [security.trusted_proxies]
+  ranges = ["10.0.1.5/32",   # the edge node
+            "10.0.2.0/24"]   # the TLS terminator in front of it
+  ```
+
+  If you trust only the node, the origin sees the terminator as the client.
+  `trusted_hops` (the number of proxies) is the other option.
 - It refuses a path with a `.` or `..` segment (also `%2e`) or a `\` with
   a `400`. An HTTP client resolves these segments, so the origin would get
   a different path.
@@ -592,8 +605,9 @@ Rules:
 - It stops on Ctrl-C or SIGTERM. Open requests then have 10 s to finish.
 
 The node serves plain HTTP. Put a TLS terminator or a load balancer in
-front of it, and give its address with `--trusted-proxy`. Then the origin
-sees the client's scheme and address. That server also limits slow clients
+front of it, and give its address with `--trusted-proxy`. When the origin
+also trusts that address (see above), it sees the client's scheme and
+address. That server also limits slow clients
 and connection counts.
 
 In Rust, the same node is `autumn_edge::node::EdgeNode` (feature `node`).
