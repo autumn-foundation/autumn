@@ -1753,11 +1753,11 @@ redis_readiness = false  # true: redis:<subsystem> indicators gate /ready
 ```
 
 - The read replica and `db:shard:<name>` use the same ping.
-- Each Redis-backed subsystem (cache, channels, idempotency, jobs, rate_limit,
+- Each subsystem that runs on Redis (channels, idempotency, jobs, rate_limit,
   sessions, submit_token, webhook_replay) gets a `redis:<subsystem>` indicator
-  (feature `redis`). It is health-only by default, because all replicas share
-  Redis. For another Redis, register
-  `autumn_web::redis_health::RedisHealthIndicator::new(url)?.with_timeout(..)`
+  (feature `redis`); `RedisCachePlugin` adds `redis:cache`. It is health-only
+  by default, because all replicas share Redis. For another Redis, register
+  `autumn_web::redis_health::RedisHealthIndicator::new(url)?.configured(&config.health)`
   with `.health_indicator(name, Arc::new(..))`.
 - Registered indicators are cached too
   (`HealthIndicatorRegistry::set_cache_ttl`). In a `TestApp` test that flips an

@@ -2316,7 +2316,8 @@ impl TestApp {
         crate::redis_health::register_redis_health_indicators(
             &self.config,
             &state.health_indicator_registry,
-            &[],
+            // With no jobs, no job runtime starts (see below).
+            if self.jobs.is_empty() { &["jobs"] } else { &[] },
         );
 
         // Mirror production `AppBuilder` wiring: surface each configured shard's

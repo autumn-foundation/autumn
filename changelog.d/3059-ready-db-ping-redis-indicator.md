@@ -34,9 +34,11 @@
 - **probes:** a change of the database ping result writes a `warn` (failed)
   or `info` (recovered) log event.
 - **redis:** `RedisHealthIndicator` sends `PING` with a time limit. The
-  framework registers `redis:<subsystem>` for each subsystem whose config
-  selects Redis (cache, channels, idempotency, jobs, rate limit, sessions,
-  submit tokens, webhook replay). Subsystems on one URL share one connection
+  framework registers `redis:<subsystem>` for each subsystem that runs on
+  Redis (channels, idempotency, jobs, rate limit, sessions, submit tokens,
+  webhook replay). `RedisCachePlugin` registers `redis:cache`.
+  `RedisHealthIndicator::configured` applies the `[health]` rules to an
+  indicator you register. Subsystems on one URL share one connection
   and one concurrent `PING`. A backend installed with the builder
   (`with_session_store`, `with_cache_backend`, `with_channels_backend`) gets
   no indicator.

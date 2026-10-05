@@ -1,7 +1,8 @@
 //! Redis health indicator: a `PING` with a time limit (issue #3059).
 //!
-//! The framework registers one indicator for each subsystem whose config
-//! selects the Redis backend, named `redis:<subsystem>`. By default they are
+//! The framework registers one indicator for each subsystem that runs on
+//! Redis, named `redis:<subsystem>`. `RedisCachePlugin` registers
+//! `redis:cache` itself. By default they are
 //! [`IndicatorGroup::HealthOnly`]: Redis is shared by all replicas, so a
 //! Redis failure must not take every replica out of rotation at the same
 //! time. Set `health.redis_readiness = true` to make them gate `/ready`.
@@ -161,6 +162,19 @@ impl RedisHealthIndicator {
         self.group = group;
         self
     }
+
+    /// Apply `[health]`: the `PING` time limit (`ping_timeout_ms`) and the
+    /// group (`Readiness` when `redis_readiness` is `true`). Use it to
+    /// register a Redis indicator with the same rules as the built-in ones.
+    #[must_use]
+    pub const fn configured(self, health: &crate::config::HealthConfig) -> Self {
+        let group = if health.redis_readiness {
+            IndicatorGroup::Readiness
+        } else {
+            IndicatorGroup::HealthOnly
+        };
+        self.with_timeout(health.ping_timeout()).with_group(group)
+    }
 }
 
 impl std::fmt::Debug for RedisHealthIndicator {
@@ -208,8 +222,9 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
     use crate::config::IdempotencyBackend;
 
     let idempotency_redis = config.idempotency.backend == IdempotencyBackend::Redis;
-    let candidates: [(&'static str, bool, &Option<String>); 8] = [
-        ("cache", config.cache.is_redis(), &config.cache.redis.url),
+    // `cache` is not here: the framework does not build the Redis cache.
+    // `RedisCachePlugin` registers `redis:cache` when it installs it.
+    let candidates: [(&'static str, bool, &Option<String>); 7] = [
         (
             "channels",
             cfg!(feature = "ws") && config.channels.backend == crate::config::ChannelBackend::Redis,
@@ -279,13 +294,13 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
 /// Register a `redis:<subsystem>` indicator for each enabled Redis-backed
 /// subsystem. Logs and skips a subsystem whose URL is not valid.
 ///
-/// `replaced` names the subsystems whose backend the builder installed (for
-/// example, `with_session_store`). They do not use the configured Redis, so
-/// they get no indicator.
+/// `skip` names the subsystems that do not use the configured Redis: a
+/// backend the builder installed (for example, `with_session_store`), or
+/// `jobs` when the app has no jobs. They get no indicator.
 pub(crate) fn register_redis_health_indicators(
     config: &AutumnConfig,
     registry: &HealthIndicatorRegistry,
-    replaced: &[&str],
+    skip: &[&str],
 ) {
     let group = if config.health.redis_readiness {
         IndicatorGroup::Readiness
@@ -295,7 +310,7 @@ pub(crate) fn register_redis_health_indicators(
     // One kept connection per Redis server, not per subsystem.
     let mut pingers: HashMap<String, Arc<RedisPinger>> = HashMap::new();
     for (subsystem, url) in redis_subsystems(config) {
-        if replaced.contains(&subsystem) {
+        if skip.contains(&subsystem) {
             continue;
         }
         let name = format!("redis:{subsystem}");
@@ -319,9 +334,7 @@ pub(crate) fn register_redis_health_indicators(
                 }
             }
         };
-        let indicator = RedisHealthIndicator::sharing(pinger)
-            .with_timeout(config.health.ping_timeout())
-            .with_group(group);
+        let indicator = RedisHealthIndicator::sharing(pinger).configured(&config.health);
         if let Err(error) = registry.register(name, group, Arc::new(indicator)) {
             tracing::warn!("{error}");
         }
@@ -370,8 +383,9 @@ mod tests {
             .map(|(name, url)| format!("{name}={url}"))
             .collect();
 
+        // `cache` is not listed: `RedisCachePlugin` registers it when it
+        // installs the Redis cache.
         let expected: Vec<&str> = [
-            "cache=redis://cache:6379",
             "channels=redis://channels:6379",
             "idempotency=redis://idem:6379",
             "jobs=redis://jobs:6379",
@@ -453,14 +467,38 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = Some("redis://127.0.0.1:1".to_owned());
-        config.cache.backend = crate::config::CacheBackend::Redis;
-        config.cache.redis.url = Some("redis://127.0.0.1:1".to_owned());
+        config.jobs.backend = "redis".to_owned();
+        config.jobs.redis.url = Some("redis://127.0.0.1:1".to_owned());
         let registry = HealthIndicatorRegistry::new();
 
         register_redis_health_indicators(&config, &registry, &["sessions"]);
 
         assert!(!registry.contains("redis:sessions"));
-        assert!(registry.contains("redis:cache"));
+        assert!(registry.contains("redis:jobs"));
+    }
+
+    #[test]
+    fn cache_is_left_to_the_cache_plugin() {
+        let mut config = AutumnConfig::default();
+        config.cache.backend = crate::config::CacheBackend::Redis;
+        config.cache.redis.url = Some("redis://cache:6379".to_owned());
+
+        assert!(redis_subsystems(&config).is_empty());
+    }
+
+    #[test]
+    fn configured_applies_the_health_config() {
+        let health = crate::config::HealthConfig {
+            ping_timeout_ms: 700,
+            redis_readiness: true,
+            ..crate::config::HealthConfig::default()
+        };
+        let indicator = RedisHealthIndicator::new("redis://127.0.0.1:1")
+            .expect("valid url")
+            .configured(&health);
+
+        assert_eq!(indicator.timeout_ms(), 1_200);
+        assert_eq!(indicator.group(), IndicatorGroup::Readiness);
     }
 
     #[test]

@@ -4056,15 +4056,15 @@ impl AppBuilder {
         // Subsystems whose backend the builder installed do not use the
         // configured Redis, so they get no Redis indicator (#3059).
         #[cfg(feature = "redis")]
-        let builder_replaced_backends: Vec<&'static str> = [
-            ("sessions", session_store.is_some()),
-            ("cache", cache_backend.is_some()),
-            #[cfg(feature = "ws")]
-            ("channels", channels_backend.is_some()),
-        ]
-        .into_iter()
-        .filter_map(|(subsystem, replaced)| replaced.then_some(subsystem))
-        .collect();
+        let mut unused_redis_subsystems: Vec<&'static str> = Vec::new();
+        #[cfg(feature = "redis")]
+        if session_store.is_some() {
+            unused_redis_subsystems.push("sessions");
+        }
+        #[cfg(all(feature = "redis", feature = "ws"))]
+        if channels_backend.is_some() {
+            unused_redis_subsystems.push("channels");
+        }
 
         // 6. Build the router (with optional static-file layer)
         let mut state = build_state(
@@ -4247,16 +4247,6 @@ impl AppBuilder {
                 tracing::warn!("{e}");
             }
         }
-
-        // One `redis:<subsystem>` PING indicator per Redis-backed subsystem
-        // (#3059). Register these after the user indicators: if two names are
-        // the same, the user indicator stays.
-        #[cfg(feature = "redis")]
-        crate::redis_health::register_redis_health_indicators(
-            &config,
-            &state.health_indicator_registry,
-            &builder_replaced_backends,
-        );
 
         // Continuous SQLite replication (#1628). Resolved here, next to the other
         // indicator registrations, so lag and verification are baked into
@@ -4501,6 +4491,22 @@ impl AppBuilder {
             std::process::exit(1);
         }
         finalize_event_bus(listeners, &mut jobs, &state);
+
+        // One `redis:<subsystem>` PING indicator per Redis-backed subsystem
+        // (#3059). Here, the job set is final: with no jobs, no job runtime
+        // starts, so `jobs` gets no indicator. The user indicators are already
+        // registered: if two names are the same, the user indicator stays.
+        #[cfg(feature = "redis")]
+        {
+            if jobs.is_empty() {
+                unused_redis_subsystems.push("jobs");
+            }
+            crate::redis_health::register_redis_health_indicators(
+                &config,
+                &state.health_indicator_registry,
+                &unused_redis_subsystems,
+            );
+        }
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);

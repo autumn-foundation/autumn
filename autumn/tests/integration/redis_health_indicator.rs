@@ -5,8 +5,9 @@
 use std::time::{Duration, Instant};
 
 use autumn_web::actuator::{HealthIndicator as _, HealthStatus};
-use autumn_web::config::{AutumnConfig, CacheBackend};
+use autumn_web::config::AutumnConfig;
 use autumn_web::redis_health::RedisHealthIndicator;
+use autumn_web::security::RateLimitBackend;
 use autumn_web::test::TestApp;
 use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
@@ -82,14 +83,15 @@ async fn indicator_recovers_when_redis_comes_back() {
     assert!(recovered.is_ok(), "indicator did not recover");
 }
 
-fn cache_on_redis(url: &str) -> AutumnConfig {
+fn rate_limit_on_redis(url: &str) -> AutumnConfig {
     let mut config = AutumnConfig::default();
     config.health.detailed = true;
     config.health.ping_timeout_ms = 500;
     // No cache: each request sees the state of Redis now.
     config.health.cache_ttl_ms = 0;
-    config.cache.backend = CacheBackend::Redis;
-    config.cache.redis.url = Some(url.to_owned());
+    config.security.rate_limit.enabled = true;
+    config.security.rate_limit.backend = RateLimitBackend::Redis;
+    config.security.rate_limit.redis.url = Some(url.to_owned());
     config
 }
 
@@ -97,18 +99,18 @@ fn cache_on_redis(url: &str) -> AutumnConfig {
 #[ignore = "requires Docker (testcontainers)"]
 async fn app_reports_redis_subsystem_in_actuator_health_only_by_default() {
     let (container, url) = start_redis().await;
-    let client = TestApp::new().config(cache_on_redis(&url)).build();
+    let client = TestApp::new().config(rate_limit_on_redis(&url)).build();
 
     let health = client.get("/actuator/health").send().await;
     health.assert_ok();
     health.assert_json::<serde_json::Value, _>(|body| {
-        assert_eq!(body["components"]["redis:cache"]["status"], "UP");
+        assert_eq!(body["components"]["redis:rate_limit"]["status"], "UP");
     });
 
     container.stop().await.expect("stop Redis");
     let health = client.get("/actuator/health").send().await;
     health.assert_json::<serde_json::Value, _>(|body| {
-        assert_eq!(body["components"]["redis:cache"]["status"], "DOWN");
+        assert_eq!(body["components"]["redis:rate_limit"]["status"], "DOWN");
     });
     // Health-only: a shared Redis outage does not take the replica out.
     client.get("/ready").send().await.assert_ok();
@@ -118,7 +120,7 @@ async fn app_reports_redis_subsystem_in_actuator_health_only_by_default() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn redis_readiness_config_makes_redis_gate_ready() {
     let (container, url) = start_redis().await;
-    let mut config = cache_on_redis(&url);
+    let mut config = rate_limit_on_redis(&url);
     config.health.redis_readiness = true;
     let client = TestApp::new().config(config).build();
     client.get("/ready").send().await.assert_ok();
