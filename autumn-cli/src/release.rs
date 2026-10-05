@@ -2058,6 +2058,7 @@ previous_secrets = []
             "outputs.tf",
             "terraform.tfvars.example",
             ".github/workflows/azure-deploy.yml",
+            "azure-cutover.sh",
         ] {
             assert!(
                 dir.join(name).is_file(),
@@ -2723,7 +2724,7 @@ previous_secrets = []
     }
 
     #[test]
-    fn main_tf_wires_redis_url_into_container_app_when_enabled() {
+    fn azure_cutover_wires_redis_url_when_the_job_has_it() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2736,16 +2737,19 @@ previous_secrets = []
         // `[cache.redis] url` (env: AUTUMN_CACHE__REDIS__URL, double
         // underscore before URL). Without AUTUMN_CACHE__BACKEND=redis,
         // Autumn keeps its in-memory cache and never reads the URL.
-        let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
         assert!(
-            workflow.contains(
-                "AUTUMN_CACHE__BACKEND=redis AUTUMN_CACHE__REDIS__URL=secretref:redis-url"
-            ),
-            "the cutover must select the Redis backend and wire its URL: {workflow}"
+            script.contains(r#"{name: "AUTUMN_CACHE__BACKEND", value: "redis"}"#)
+                && script.contains(r#"{name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}"#),
+            "the cutover must select the Redis backend and wire its URL: {script}"
         );
         assert!(
-            !workflow.contains("AUTUMN_CACHE__REDIS_URL"),
-            "the cutover must not use the single-underscore variant, which Autumn ignores: {workflow}"
+            script.contains(r#"any($secrets[]; .name == "redis-url")"#),
+            "the cutover must set the Redis env vars only when the job has redis-url: {script}"
+        );
+        assert!(
+            !script.contains("AUTUMN_CACHE__REDIS_URL"),
+            "the cutover must not use the single-underscore variant, which Autumn ignores: {script}"
         );
     }
 
@@ -2900,13 +2904,10 @@ previous_secrets = []
 
     #[test]
     fn azure_bootstrap_keeps_external_ingress_disabled_until_first_deploy() {
-        // Between `terraform apply` and the first real-image cutover, an
-        // inbound request to the public FQDN must not be able to start the
-        // bootstrap placeholder revision with production secret refs and the
-        // Key Vault-capable managed identity attached. `min_replicas = 0`
-        // only permits scale-to-zero; it does not stop the HTTP scale rule
-        // waking the placeholder on traffic — so external ingress itself
-        // stays disabled until the cutover opens it (#2312).
+        // Between `terraform apply` and the first real-image cutover, no
+        // inbound request may start the bootstrap placeholder revision.
+        // `min_replicas = 0` does not stop the HTTP scale rule from waking
+        // it, so external ingress stays disabled until the cutover (#2312).
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2932,24 +2933,13 @@ previous_secrets = []
              placeholder with production secrets: {ingress_block}"
         );
 
-        // The cutover opens ingress once the real image is serving — after
-        // the image update, never before.
-        let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
-        // Match the invocation (with its line continuation), not the bare
-        // text an earlier concurrency comment also contains.
-        let update_at = workflow
-            .find("az containerapp update \\")
-            .expect("workflow must cut over via az containerapp update");
-        let enable_at = workflow
-            .find("az containerapp ingress enable")
-            .expect("workflow must enable external ingress at cutover");
+        // The cutover script opens ingress after the real image is set.
+        // azure_cutover_opens_ingress_only_after_the_real_revision_is_provisioned
+        // pins the order.
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
         assert!(
-            enable_at > update_at,
-            "ingress must open AFTER the real image is deployed, not before: {workflow}"
-        );
-        assert!(
-            workflow.contains("--type external"),
-            "the cutover must open external (public) ingress: {workflow}"
+            script.contains("az containerapp ingress enable"),
+            "the cutover must enable external ingress: {script}"
         );
     }
 
@@ -2958,7 +2948,7 @@ previous_secrets = []
         main_tf
             .split("resource \"azurerm_container_app\" \"this\"")
             .nth(1)
-            .and_then(|rest| rest.split("\nresource").next())
+            .and_then(|rest| rest.split("\n}\n").next())
             .expect("main.tf must declare azurerm_container_app.this")
     }
 
@@ -2987,8 +2977,8 @@ previous_secrets = []
             );
         }
 
-        // The cutover attaches these out of band. A later `terraform apply`
-        // must not strip them from the live app.
+        // The cutover attaches these outside Terraform. A later
+        // `terraform apply` must not strip them from the live app.
         let lifecycle = app
             .split("ignore_changes = [")
             .nth(1)
@@ -3009,8 +2999,9 @@ previous_secrets = []
 
     #[test]
     fn azure_migrate_job_carries_the_full_app_secret_set() {
-        // The deploy copies the job's secret refs onto the app. A job with
+        // The cutover copies the job's secret refs to the app. A job with
         // only the database URL would deploy an app with no signing secret.
+        // Versionless IDs let a Terraform secret rotation reach the app.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -3018,11 +3009,12 @@ previous_secrets = []
         let job = content
             .split("resource \"azurerm_container_app_job\" \"migrate\"")
             .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
             .expect("main.tf must declare the migration job");
         for secret in [
-            "azurerm_key_vault_secret.database_url.id",
-            "azurerm_key_vault_secret.signing_secret.id",
-            "azurerm_key_vault_secret.redis_url[0].id",
+            "azurerm_key_vault_secret.database_url.versionless_id",
+            "azurerm_key_vault_secret.signing_secret.versionless_id",
+            "azurerm_key_vault_secret.redis_url[0].versionless_id",
         ] {
             assert!(
                 job.contains(secret),
@@ -3036,50 +3028,151 @@ previous_secrets = []
     }
 
     #[test]
-    fn azure_deploy_attaches_identity_and_secrets_only_at_cutover() {
-        // #2314: the workflow attaches the identity, registry and secret refs
-        // in the deploy step, after migrations, before the image swap.
+    fn azure_target_scaffolds_the_cutover_script() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        let files = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        assert!(files.iter().any(|f| f == "azure-cutover.sh"));
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        assert!(script.starts_with("#!/usr/bin/env bash\n"));
+        assert!(script.contains("set -euo pipefail"));
+        assert!(
+            !script.contains("{{"),
+            "no template placeholder may reach the script: {script}"
+        );
+    }
+
+    #[test]
+    fn azure_cutover_attaches_credentials_and_image_in_one_write() {
+        // #2314: separate `identity assign` / `secret set` calls apply to
+        // every revision, so the placeholder would hold the identity until
+        // the image update lands. One merge-PATCH sets all of it at once.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        for split in [
+            "az containerapp identity assign",
+            "az containerapp registry set",
+            "az containerapp secret set",
+            "az containerapp update",
+        ] {
+            assert!(
+                !script.contains(split),
+                "`{split}` is a separate write; use the one PATCH: {script}"
+            );
+        }
+        assert_eq!(
+            script.matches("az rest --method patch").count(),
+            2,
+            "one PATCH for the cutover and one for the rollback: {script}"
+        );
+        let patch = script
+            .split("PATCH=$(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n')").next())
+            .expect("the script must build the cutover PATCH body");
+        for field in [
+            "userAssignedIdentities",
+            "registries:",
+            "secrets: $secrets",
+            ".image = $image",
+            "AUTUMN_DATABASE__PRIMARY_URL",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "AUTUMN_CACHE__BACKEND",
+            "AUTUMN_CACHE__REDIS__URL",
+        ] {
+            assert!(
+                patch.contains(field),
+                "the cutover PATCH must set `{field}`: {patch}"
+            );
+        }
+        assert!(
+            patch.contains("keyVaultUrl"),
+            "secrets must stay Key Vault secret refs, never plain values: {patch}"
+        );
+    }
+
+    #[test]
+    fn azure_cutover_opens_ingress_only_after_the_real_revision_is_provisioned() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        let patch_at = script
+            .find("az rest --method patch --url \"$APP_ID?$API\" --body \"$PATCH\"")
+            .expect("the script must send the cutover PATCH");
+        let provisioned_at = script
+            .find("Provisioned)")
+            .expect("the script must wait for the new revision");
+        let enable_at = script
+            .find("az containerapp ingress enable")
+            .expect("the script must open external ingress");
+        assert!(patch_at < provisioned_at && provisioned_at < enable_at);
+        assert!(script.contains("--type external"));
+        assert!(
+            script.contains("\"$REVISION_IMAGE\" = \"$IMAGE\""),
+            "ingress must open only when the new revision runs the real image: {script}"
+        );
+    }
+
+    #[test]
+    fn azure_cutover_rolls_back_a_failed_first_cutover() {
+        // A failed first cutover leaves the placeholder as the active
+        // revision. It must not keep the identity or the secret refs.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        let rollback = script
+            .split("rollback() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("the script must define rollback()");
+        for field in [
+            "type: \"None\"",
+            "registries: []",
+            "secrets: []",
+            "az rest --method patch",
+        ] {
+            assert!(rollback.contains(field), "rollback must set `{field}`: {rollback}");
+        }
+        assert!(
+            rollback.contains("\"$ACR_LOGIN_SERVER\"/*) return"),
+            "rollback must skip a later deploy, whose old revision is a real release: {rollback}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_runs_the_cutover_script_after_migrations() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
-
-        let order = [
-            "az containerapp job start",
-            "az containerapp job show",
-            "az containerapp identity assign",
-            "az containerapp registry set",
-            "az containerapp secret set",
-            "az containerapp update \\",
-            "az containerapp ingress enable",
-        ];
-        let positions: Vec<usize> = order
-            .iter()
-            .map(|step| {
-                workflow
-                    .find(step)
-                    .unwrap_or_else(|| panic!("workflow must run `{step}`: {workflow}"))
-            })
-            .collect();
-        assert!(
-            positions.windows(2).all(|pair| pair[0] < pair[1]),
-            "the cutover must run in this order: {order:?}: {workflow}"
-        );
-        for env in [
-            "AUTUMN_DATABASE__PRIMARY_URL=secretref:database-url",
-            "AUTUMN_SECURITY__SIGNING_SECRET=secretref:signing-secret",
-            "AUTUMN_CACHE__REDIS__URL=secretref:redis-url",
-            "--remove-env-vars AUTUMN_CACHE__BACKEND AUTUMN_CACHE__REDIS__URL",
+        let migrate_at = workflow
+            .find("az containerapp job start \\")
+            .expect("workflow must start the migration job");
+        let cutover_at = workflow
+            .find("run: bash azure-cutover.sh")
+            .expect("workflow must run the cutover script");
+        assert!(migrate_at < cutover_at);
+        let cutover_step = &workflow[cutover_at..];
+        let cutover_step = cutover_step
+            .split("\n      - name:")
+            .next()
+            .unwrap_or(cutover_step);
+        for var in [
+            "AZURE_APP_NAME:",
+            "AZURE_RESOURCE_GROUP:",
+            "AZURE_MIGRATE_JOB_NAME:",
+            "ACR_LOGIN_SERVER:",
+            "IMAGE_TAG:",
         ] {
             assert!(
-                workflow.contains(env),
-                "the cutover must handle `{env}`: {workflow}"
+                cutover_step.contains(var),
+                "the cutover step must pass {var}: {cutover_step}"
             );
         }
-        assert!(
-            workflow.contains("keyvaultref:") && workflow.contains("identityref:"),
-            "secrets must stay Key Vault references, never plain values: {workflow}"
-        );
     }
 
     #[test]

@@ -1804,41 +1804,44 @@ fn deployment_guide_references_build_and_boot_gate() {
 }
 
 #[test]
-fn azure_walkthrough_attaches_secrets_only_at_cutover() {
-    // #2314: the manual Azure cutover must attach the identity and secret
-    // refs that main.tf keeps off the bootstrap app, before the image swap.
+fn azure_walkthrough_runs_the_cutover_script_after_migrations() {
+    // #2314: main.tf keeps credentials off the placeholder app. The manual
+    // walkthrough must attach them with the scaffolded script, which sets
+    // them and the real image in one write.
     let doc_path = workspace_root().join("docs/guide/deployment.md");
     let doc = std::fs::read_to_string(&doc_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", doc_path.display()));
-    let azure = doc
-        .split("## Deploy to Azure Container Apps")
-        .nth(1)
-        .and_then(|rest| rest.split("\n## ").next())
-        .expect("deployment.md must have an Azure Container Apps section");
-
-    let order = [
-        "az containerapp job show",
+    let section = |heading: &str| -> String {
+        doc.split(heading)
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .unwrap_or_else(|| panic!("deployment.md must have a `{heading}` section"))
+            .to_owned()
+    };
+    let azure = section("## Deploy to Azure Container Apps");
+    let migrate_at = azure
+        .find("az containerapp job start \\")
+        .expect("the Azure walkthrough must run the migration job");
+    let cutover_at = azure
+        .find("bash azure-cutover.sh")
+        .expect("the Azure walkthrough must run the cutover script");
+    assert!(
+        migrate_at < cutover_at,
+        "the Azure walkthrough must migrate before the cutover"
+    );
+    for split in [
         "az containerapp identity assign",
-        "az containerapp registry set",
         "az containerapp secret set",
         "az containerapp update \\",
-        "az containerapp ingress enable",
-    ];
-    let positions: Vec<usize> = order
-        .iter()
-        .map(|step| {
-            azure
-                .find(step)
-                .unwrap_or_else(|| panic!("the Azure walkthrough must run `{step}`"))
-        })
-        .collect();
+    ] {
+        assert!(
+            !azure.contains(split),
+            "the Azure walkthrough must not use the separate write `{split}`"
+        );
+    }
     assert!(
-        positions.windows(2).all(|pair| pair[0] < pair[1]),
-        "the Azure walkthrough must run these in order: {order:?}"
-    );
-    assert!(
-        azure.contains("AUTUMN_SECURITY__SIGNING_SECRET=secretref:signing-secret"),
-        "the Azure walkthrough must wire the signing secret at cutover"
+        !section("## Deploy to GCP Cloud Run").contains("az containerapp"),
+        "Azure commands must stay out of the GCP section"
     );
 }
 
