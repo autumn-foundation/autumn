@@ -9,4 +9,6 @@
 ### Changed
 
 - **jobs:** the Redis dead-letter list keeps 10 000 entries by default. Before,
-  it kept 1 000 and removed older entries without a log or a metric.
+  it kept 1 000 and removed older entries without a log or a metric. Each
+  entry uses Redis memory for a list entry and a per-id record, so the new
+  default can use up to 10 times more memory.

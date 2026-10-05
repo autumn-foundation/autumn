@@ -336,10 +336,16 @@ The Redis backend keeps dead letters in a list, newest first. Each entry also
 has a per-id record that the dashboard uses to retry or discard the job.
 
 `jobs.redis.dead_letter_limit` sets the maximum length of that list. The
-default is 10 000. When a new dead letter makes the list longer than the
-limit, the worker removes the oldest entries and their per-id records. Set the
-limit to `0` to keep all dead letters. Then you must remove old entries
-yourself, because Redis memory increases with each dead letter.
+default is 10 000. Before, the limit was 1 000 and you could not change it.
+Each dead letter uses Redis memory two times: one list entry and one per-id
+record. Thus the new default can use 10 times more memory.
+
+When the worker adds a dead letter and the list becomes longer than the limit,
+the worker removes the oldest entries and their per-id records. One dead letter
+removes at most 1 000 entries, so one script call does not block Redis for
+long. If you decrease the limit, the list becomes shorter over the next dead
+letters. Set the limit to `0` to keep all dead letters. Then you must remove
+old entries yourself, because Redis memory increases with each dead letter.
 
 A trim is never silent:
 
@@ -348,8 +354,8 @@ A trim is never silent:
 - The worker adds the count to `autumn_jobs_dead_letter_trimmed_total` on
   `/actuator/prometheus`. The counter is per process.
 
-Alert on `increase(autumn_jobs_dead_letter_trimmed_total[1h]) > 0`. A trim
-means that you lost the data to replay a failed job.
+Alert on `increase(autumn_jobs_dead_letter_trimmed_total[1h]) > 0`. After a
+trim, you cannot replay the removed jobs.
 
 The dashboard shows the newest 1 000 dead letters. Older entries stay in
 Redis, and you can retry or discard them by id.
@@ -359,8 +365,8 @@ Redis, and you can retry or discard them by id.
 | Backend | Retention of dead letters |
 |---|---|
 | `redis` | The newest `jobs.redis.dead_letter_limit` entries (default 10 000; `0` = all). |
-| `postgres` | All `failed` rows, until `retention.job_history` deletes them by age. No count limit. |
-| `sqlite` | All `failed` rows, until `retention.job_history` deletes them by age. No count limit. |
+| `postgres` | All `failed` rows. No count limit. If you set `retention.job_history`, the sweep deletes rows older than that window. If you do not set it, the rows stay. |
+| `sqlite` | All `failed` rows. No count limit. If you set `retention.job_history`, the runtime deletes rows older than that window. If you do not set it, the rows stay. |
 | `local` | In memory only. The process loses them at restart. The dashboard keeps the newest 1 000 finished jobs. |
 
 ## SQLite delivery semantics

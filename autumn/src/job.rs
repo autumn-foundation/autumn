@@ -7550,19 +7550,28 @@ fn expected_claim_args(record: &RedisJobRecord) -> Option<(&str, u64)> {
 
 #[cfg(feature = "redis")]
 const CLAIMED_REDIS_TRANSITION_SCRIPT: &str = r"
--- Returns the number of removed entries. A limit of 0 keeps all entries.
-local function trim_dead_history(dead_key, dead_record_prefix, limit)
+-- Removes the oldest entries above `limit`, at most `batch` per call, so one
+-- call never blocks Redis for a long backlog. Returns the number removed.
+-- A limit of 0 keeps all entries.
+local function trim_dead_history(dead_key, dead_record_prefix, limit, batch)
   if limit == nil or limit <= 0 then
     return 0
   end
-  local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
+  local excess = redis.call('LLEN', dead_key) - limit
+  if excess <= 0 then
+    return 0
+  end
+  if batch ~= nil and batch > 0 and excess > batch then
+    excess = batch
+  end
+  local trimmed_records = redis.call('LRANGE', dead_key, -excess, -1)
   for _, encoded in ipairs(trimmed_records) do
     local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
     if trimmed_ok and trimmed['id'] then
       redis.call('DEL', dead_record_prefix .. trimmed['id'])
     end
   end
-  redis.call('LTRIM', dead_key, 0, limit - 1)
+  redis.call('LTRIM', dead_key, 0, -excess - 1)
   return #trimmed_records
 end
 -- Every return is {status, number of trimmed dead letters}.
@@ -7613,7 +7622,7 @@ elseif ARGV[4] == 'retry' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[6] .. ARGV[1], ARGV[5])
-  trimmed = trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]))
+  trimmed = trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]), tonumber(ARGV[13]))
   redis.call('DEL', key)
 else
   return {0, 0}
@@ -7684,6 +7693,7 @@ async fn apply_claimed_redis_transition(
         })
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
         .arg(worker_config.dead_letter_limit)
+        .arg(REDIS_DEAD_LETTER_TRIM_BATCH)
         .query_async(connection)
         .await?;
 
@@ -7764,6 +7774,23 @@ async fn schedule_redis_retry(
     })
 }
 
+/// Maximum dead letters one script call removes. A longer backlog shrinks
+/// over the next dead letters, so one call never blocks Redis for long.
+#[cfg(feature = "redis")]
+const REDIS_DEAD_LETTER_TRIM_BATCH: usize = 1_000;
+
+/// The worker's dead-letter limit from `jobs.redis.dead_letter_limit`.
+///
+/// A Redis list holds at most `u32::MAX` entries, so a larger limit never
+/// trims. The clamp is necessary: Lua reads numbers as doubles, and `LRANGE`
+/// rejects a value above `i64::MAX` after the script has written.
+#[cfg(feature = "redis")]
+fn redis_dead_letter_limit(config: &crate::config::JobRedisConfig) -> usize {
+    config
+        .dead_letter_limit
+        .min(usize::try_from(u32::MAX).unwrap_or(usize::MAX))
+}
+
 /// Make a dead-letter trim visible: log at warn level and count it.
 #[cfg(feature = "redis")]
 fn report_redis_dead_letter_trim(
@@ -7817,19 +7844,28 @@ async fn dead_letter_redis_job(
 
 #[cfg(feature = "redis")]
 const STALE_REDIS_RECOVERY_SCRIPT: &str = r"
--- Returns the number of removed entries. A limit of 0 keeps all entries.
-local function trim_dead_history(dead_key, dead_record_prefix, limit)
+-- Removes the oldest entries above `limit`, at most `batch` per call, so one
+-- call never blocks Redis for a long backlog. Returns the number removed.
+-- A limit of 0 keeps all entries.
+local function trim_dead_history(dead_key, dead_record_prefix, limit, batch)
   if limit == nil or limit <= 0 then
     return 0
   end
-  local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
+  local excess = redis.call('LLEN', dead_key) - limit
+  if excess <= 0 then
+    return 0
+  end
+  if batch ~= nil and batch > 0 and excess > batch then
+    excess = batch
+  end
+  local trimmed_records = redis.call('LRANGE', dead_key, -excess, -1)
   for _, encoded in ipairs(trimmed_records) do
     local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
     if trimmed_ok and trimmed['id'] then
       redis.call('DEL', dead_record_prefix .. trimmed['id'])
     end
   end
-  redis.call('LTRIM', dead_key, 0, limit - 1)
+  redis.call('LTRIM', dead_key, 0, -excess - 1)
   return #trimmed_records
 end
 -- Every return is {status, number of trimmed dead letters}.
@@ -7878,7 +7914,7 @@ if ARGV[4] == 'requeue' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[5] .. ARGV[1], ARGV[5])
-  trimmed = trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))
+  trimmed = trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]), tonumber(ARGV[11]))
   redis.call('DEL', key)
 else
   return {0, 0}
@@ -7945,6 +7981,7 @@ async fn apply_stale_redis_recovery(
             ""
         })
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(REDIS_DEAD_LETTER_TRIM_BATCH)
         .query_async(connection)
         .await?;
 
@@ -8745,7 +8782,7 @@ fn start_redis_runtime(
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
                 retry_promotion_interval,
-                dead_letter_limit: config.redis.dead_letter_limit,
+                dead_letter_limit: redis_dead_letter_limit(&config.redis),
                 clock: state.clock_arc(),
             },
         )?;
@@ -13406,13 +13443,15 @@ mod tests {
     #[test]
     fn redis_dead_letter_scripts_delete_trimmed_dead_record_metadata() {
         assert!(
-            CLAIMED_REDIS_TRANSITION_SCRIPT
-                .contains("trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]))"),
+            CLAIMED_REDIS_TRANSITION_SCRIPT.contains(
+                "trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]), tonumber(ARGV[13]))"
+            ),
             "claimed-job dead-letter trim should delete metadata for records beyond the history limit"
         );
         assert!(
-            STALE_REDIS_RECOVERY_SCRIPT
-                .contains("trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))"),
+            STALE_REDIS_RECOVERY_SCRIPT.contains(
+                "trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]), tonumber(ARGV[11]))"
+            ),
             "stale-recovery dead-letter trim should delete metadata for records beyond the history limit"
         );
         assert!(
@@ -13447,6 +13486,20 @@ mod tests {
                 "the dead-letter trim must report how many entries it removed"
             );
         }
+    }
+
+    /// Issue #3055: the worker reads the limit from config. A Redis list holds
+    /// at most `u32::MAX` entries, so a larger limit is clamped. Without the
+    /// clamp, Lua sends a float to `LRANGE` and the script fails part way.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_dead_letter_limit_from_config_is_clamped_to_the_list_maximum() {
+        let mut config = crate::config::JobRedisConfig::default();
+        assert_eq!(redis_dead_letter_limit(&config), 10_000);
+        config.dead_letter_limit = 0;
+        assert_eq!(redis_dead_letter_limit(&config), 0);
+        config.dead_letter_limit = usize::MAX;
+        assert_eq!(redis_dead_letter_limit(&config) as u64, u64::from(u32::MAX));
     }
 
     /// Issue #3055: a trim logs at warn level and adds to the counter.
@@ -14255,7 +14308,7 @@ mod tests {
     ) -> Vec<String> {
         let mut connection = new_redis_connection_manager(client, "test redis worker").unwrap();
         let job_admin = JobAdminMemoryBackend::new_for_test(32);
-        let jobs = redis_jobs_by_name(redis_counting_failure_handler, 1);
+        let jobs = redis_jobs_by_name(always_fail_handler, 1);
         state.job_registry().register("send_email");
         let mut ids = Vec::with_capacity(count);
         for _ in 0..count {
@@ -14359,8 +14412,9 @@ mod tests {
         use redis::AsyncCommands as _;
 
         let (_container, client) = redis_test_client().await;
+        // A short timeout lets the stale-recovery step below reclaim a claim.
         let mut worker_config =
-            redis_test_worker_config("autumn:test:dead-unbounded", "worker-a", 30_000);
+            redis_test_worker_config("autumn:test:dead-unbounded", "worker-a", 1);
         worker_config.dead_letter_limit = 0;
         let state = AppState::for_test().with_profile("dev");
         let mut connection = new_redis_connection_manager(&client, "test redis seed").unwrap();
@@ -14379,8 +14433,27 @@ mod tests {
 
         let ids = redis_dead_letter_test_jobs(&client, &worker_config, &state, 5).await;
 
+        // The stale-recovery script must not trim either.
+        redis_enqueue_test_job(&client, &worker_config, 1).await;
+        let reclaimed = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("the final attempt should be claimed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
+            .await
+            .unwrap();
+
         let dead_len: usize = connection.llen(&worker_config.dead_key).await.unwrap();
-        assert_eq!(dead_len, seeded + 5);
+        assert_eq!(dead_len, seeded + 6);
+        let stale_key = format!("{}{}", worker_config.dead_record_prefix, reclaimed.id);
+        let stale_kept: bool = connection.exists(&stale_key).await.unwrap();
+        assert!(stale_kept, "the stale dead letter keeps its metadata");
         let oldest_key = format!("{}seeded-0", worker_config.dead_record_prefix);
         let oldest_kept: bool = connection.exists(&oldest_key).await.unwrap();
         assert!(oldest_kept, "the oldest dead record keeps its metadata");
@@ -14390,6 +14463,61 @@ mod tests {
             assert!(exists, "dead-record metadata for {id}");
         }
         assert_eq!(state.job_registry().dead_letter_trimmed_total(), 0);
+    }
+
+    /// Issue #3055: one dead letter trims at most one batch. A backlog (for
+    /// example after `0` changes to a finite limit) shrinks over several
+    /// dead letters, so one script call never blocks Redis for long.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dead_letter_limit_trims_a_bounded_batch_per_dead_letter() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let mut worker_config =
+            redis_test_worker_config("autumn:test:dead-batch", "worker-a", 30_000);
+        worker_config.dead_letter_limit = 10;
+        let state = AppState::for_test().with_profile("dev");
+        let mut connection = new_redis_connection_manager(&client, "test redis seed").unwrap();
+
+        let batch = REDIS_DEAD_LETTER_TRIM_BATCH;
+        let seeded = batch + 500;
+        let mut pipe = redis::pipe();
+        for index in 0..seeded {
+            let id = format!("seeded-{index}");
+            let body = serde_json::json!({ "id": id, "name": "send_email" }).to_string();
+            pipe.lpush(&worker_config.dead_key, &body).ignore();
+            pipe.set(format!("{}{id}", worker_config.dead_record_prefix), &body)
+                .ignore();
+        }
+        pipe.query_async::<()>(&mut connection).await.unwrap();
+
+        redis_dead_letter_test_jobs(&client, &worker_config, &state, 1).await;
+        let dead_len: usize = connection.llen(&worker_config.dead_key).await.unwrap();
+        assert_eq!(
+            dead_len,
+            seeded + 1 - batch,
+            "the first trim removes one batch"
+        );
+        let trimmed = u64::try_from(batch).unwrap();
+        assert_eq!(state.job_registry().dead_letter_trimmed_total(), trimmed);
+        for (index, kept) in [(0, false), (batch - 1, false), (batch, true)] {
+            let key = format!("{}seeded-{index}", worker_config.dead_record_prefix);
+            let exists: bool = connection.exists(&key).await.unwrap();
+            assert_eq!(exists, kept, "metadata of seeded-{index}");
+        }
+
+        redis_dead_letter_test_jobs(&client, &worker_config, &state, 1).await;
+        let dead_len: usize = connection.llen(&worker_config.dead_key).await.unwrap();
+        assert_eq!(
+            dead_len, 10,
+            "the next trim removes the rest of the backlog"
+        );
+        assert_eq!(
+            state.job_registry().dead_letter_trimmed_total(),
+            u64::try_from(seeded + 2 - 10).unwrap()
+        );
     }
 
     /// Issue #3055: stale-claim recovery obeys the same limit and counter.

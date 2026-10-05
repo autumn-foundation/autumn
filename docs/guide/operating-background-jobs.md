@@ -108,8 +108,8 @@ an unbounded queue traversal.
 
 The Redis backend uses `LLEN`/`ZCARD` for active queue counters and reads only
 the bounded completed/dead-letter history window for recent completed and failed
-counts. The dashboard reads the newest 1,000 dead letters. Redis can keep more:
-`jobs.redis.dead_letter_limit` sets that limit. See
+counts. The dashboard reads the newest 1,000 dead letters. Redis can keep
+more: `jobs.redis.dead_letter_limit` sets that limit. See
 [Redis dead-letter retention](jobs.md#redis-dead-letter-retention). Durable custom backends should preserve that property with indexed
 status/time-window queries or similarly bounded history reads.
 

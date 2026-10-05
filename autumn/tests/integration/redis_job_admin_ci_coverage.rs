@@ -102,7 +102,7 @@ fn ignored_redis_dead_letter_limit_tests_are_named_in_ci() {
     let marker =
         "#[ignore = \"requires Docker (testcontainers)\"]\n    async fn redis_dead_letter_limit_";
     assert!(
-        source.matches(marker).count() >= 3,
-        "expected 3 ignored `redis_dead_letter_limit_` Docker tests in job.rs"
+        source.matches(marker).count() >= 4,
+        "expected 4 ignored `redis_dead_letter_limit_` Docker tests in job.rs"
     );
 }
