@@ -174,12 +174,48 @@ Not actioned, for the same reason as last week's ammonia/html5ever finding:
 deduping means waiting on `webauthn-rs` to move its own x509-parser pin, not
 something to force from this side.
 
+**The new-crate-name trace, corrected.** An earlier draft of this report
+attributed the 686→687 unique-crate-name increase to `rand_chacha`
+"becoming direct." A Codex review comment on this PR's own diff caught that
+this doesn't hold: `rand_chacha` was already a name in the graph
+(transitively, through `rand`) before #1899's merge, so promoting it to a
+direct dependency changes the direct-dependency *count*, not the *set* of
+names — it cannot be the source of a name-count delta at all. Re-derived
+properly this time, by diffing the full `Cargo.lock` name list against a
+commit from before this week's window (`7e33bfc2`, the last commit at or
+before 2026-09-28 end-of-day) rather than guessing from proximity:
+
+```
+$ comm -13 names_before.txt names_now.txt   # added
+card-validate
+$ comm -23 names_before.txt names_now.txt   # removed
+(empty)
+```
+
+One name added, none removed — `card-validate` v2.4.0, confirmed via
+`cargo tree -i card-validate` to have exactly one path into the graph:
+
+```
+card-validate v2.4.0
+└── validator v0.21.0
+    └── autumn-web v0.8.0
+```
+
+`validator` 0.20.0's own dependency list (from #2302's `Cargo.lock` diff)
+was `idna, once_cell, regex, serde, serde_derive, serde_json, url,
+validator_derive`; 0.21.0's is `card-validate, idna, regex, serde,
+serde_derive, serde_json, url, validator_derive` — `once_cell` dropped,
+`card-validate` added. `once_cell` didn't disappear from the full lockfile
+(other crates still use it), so the net full-lockfile name delta from this
+one swap is exactly +1, matching the observed count precisely. `validator`
+#2302's bump (not #1899's `rand_chacha` migration) is the real mechanism.
+
 **Graph facts, root workspace**:
 
 | Metric | 2026-09-28 | 2026-10-05 | Δ | Mechanism |
 | --- | --- | --- | --- | --- |
 | Unique crate@version nodes | 774 | 779 | +5 | x509-parser chain duplication (+6 node-pairs' worth of new versions) partly offset by other movement in the same merge window |
-| Unique crate names | 686 | 687 | +1 | `rand_chacha` promoted to a tracked direct name (see below) |
+| Unique crate names | 686 | 687 | +1 | `card-validate`, a brand-new name (see below) — `rand_chacha` does **not** explain this: it was already a name in the graph (transitively, via `rand`) before becoming direct, so promoting it changes the direct-dependency count, not the name set |
 | Direct (non-dev) deps referenced by workspace members | 139 | 140 | +1 | `rand_chacha` became a **direct** dependency of `autumn-web` during the rand 0.9→0.10 migration (#1899's merge commit: "migrate to rand 0.10 / rand_chacha 0.10") — confirmed by diffing `autumn/Cargo.toml` across that commit, not inferred from the count |
 | Workspace members | 37 | 37 | 0 | — |
 | Duplicate crate names (`cargo deny check bans`, warn-level) | 84 | 90 | +6 | x509-parser direct-dep bump stranding `webauthn-rs-core`'s old 0.16 chain (traced above) |
@@ -391,15 +427,18 @@ python3 -c "import yaml; yaml.safe_load(open('.github/dependabot.yml'))"
    prior pass: extend `dependabot.yml`, or have Ballast own satellite-graph
    batches on its own cadence. Still a human decision.
    `examples/island-flock/Cargo.toml` still declares no `rust-version`.
-8. **GitHub-native Dependabot alert count**: last pass's push reported 9 (2
-   high, 7 moderate, 0 low); this pass's own push count will land in this
-   report's git history but not in this document's body (it can only be read
-   after the push that carries this very file). Still no tool in this session
-   that enumerates which alerts are open, so the count — whatever this pass's
-   push reports — stays an unlinked fact pending Security-tab access. The two
-   "high" alerts being unchanged across the last four passes is the one
-   piece worth a human's attention regardless of how the total moves; worth
-   checking explicitly once the push count for this pass is known.
+8. **GitHub-native Dependabot alert count — now the thing to act on, not
+   just watch.** This pass's push moved it from 9 (2 high, 7 moderate, 0
+   low) to **16 (4 high, 10 moderate, 2 low)** — see Evidence — breaking a
+   two-pass streak where "high" sat flat at 2. Escalated in this PR's
+   description rather than left for next week. Still no tool in this
+   session that lists individual alerts or joins them to a specific
+   manifest, so whether the new highs are inside this ledger's 5 audited
+   Rust graphs (unlikely — `cargo deny check advisories` reports 0 unwaived
+   this pass) or in one of the two manifests this harness doesn't cover
+   (`examples/react-graphql/frontend/package-lock.json`,
+   `benchmarks/runtime/django/requirements.txt`) is still open. Next pass:
+   check whether a human has triaged this before re-deriving from scratch.
 9. The `cargo deny list` vs `cargo deny check bans` discrepancy (flagged
    2026-09-21, re-tested clean twice since, including the `phf_codegen`/
    `phf_generator` edge found via a Codex review comment last pass): not

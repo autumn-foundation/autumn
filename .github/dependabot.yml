@@ -39,9 +39,11 @@ updates:
       # sandboxed plugin manifest that passes validation panics the router
       # at boot. Revisit trigger: an axum release that moves to matchit 0.9;
       # bump both together in one PR. See PR #1897's review comments for the
-      # full rehearsal.
+      # full rehearsal. No `versions:` filter: ANY bump above exactly 0.8.4
+      # (including an 0.8.5/0.8.6 patch) would still desync from axum's own
+      # `=0.8.4` pin and reopen the same conflict-oracle gap, so the whole
+      # dependency is ignored, not just the 0.9 line.
       - dependency-name: "matchit"
-        versions: [">=0.9"]
     labels:
       - dependencies
       - automated
