@@ -3224,14 +3224,27 @@ case "$1 $2" in
   "containerapp show")
     if [ -z "$query" ]; then
       env='{"name":"AUTUMN_PROFILE","value":"prod"}'
-      [ -n "$STUB_APP_ENV_FULL" ] && env="$env"',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
-      echo "{\"id\":\"/subscriptions/s/app\",\"properties\":{\"latestRevisionName\":\"app--old\",\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
+      [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && env="$env"',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
+      # A placeholder app made by the old template has the job's credentials.
+      legacy=""
+      [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
+      registries=""
+      [ -n "$STUB_APP_LEGACY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
+      echo "{\"id\":\"/subscriptions/s/app\",$legacy\"properties\":{\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
+    elif [ "$query" = properties.provisioningState ]; then
+      echo Succeeded
     else
       tsv Succeeded "${STUB_LATEST:-app--new}"
     fi
     ;;
   "containerapp revision") tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
-  "containerapp secret") echo '[{"name":"api-key","value":"user-value"}]' ;;
+  "containerapp secret")
+    if [ -n "$STUB_APP_LEGACY" ]; then
+      echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}]"
+    else
+      echo '[{"name":"api-key","value":"user-value"}]'
+    fi
+    ;;
   "containerapp replica") echo "${STUB_REPLICAS:-0}" ;;
   "rest --method") echo "$body" >> "$STUB_LOG.bodies" ;;
   "containerapp ingress") ;;
@@ -3244,6 +3257,27 @@ esac
     /// `jq` is not installed.
     #[cfg(unix)]
     fn run_azure_cutover(
+        old_image: &str,
+        revision_state: &str,
+        redis: bool,
+        placeholder_replicas: u32,
+        extra_env: &[(&str, &str)],
+    ) -> Option<(std::process::ExitStatus, String, String)> {
+        run_azure_cutover_with_args(
+            &[],
+            old_image,
+            revision_state,
+            redis,
+            placeholder_replicas,
+            extra_env,
+        )
+    }
+
+    /// [`run_azure_cutover`] with script arguments. With arguments, the
+    /// script gets no `IMAGE_TAG`.
+    #[cfg(unix)]
+    fn run_azure_cutover_with_args(
+        args: &[&str],
         old_image: &str,
         revision_state: &str,
         redis: bool,
@@ -3278,6 +3312,7 @@ esac
         let mut command = std::process::Command::new("bash");
         command
             .arg(dir.join("azure-cutover.sh"))
+            .args(args)
             .env("PATH", path)
             .env("STUB_LOG", &log)
             .env("STUB_OLD_IMAGE", old_image)
@@ -3290,7 +3325,11 @@ esac
             .env("IMAGE_TAG", "t1");
         command
             .env_remove("STUB_LATEST")
-            .env_remove("STUB_APP_ENV_FULL");
+            .env_remove("STUB_APP_ENV_FULL")
+            .env_remove("STUB_APP_LEGACY");
+        if !args.is_empty() {
+            command.env_remove("IMAGE_TAG");
+        }
         command.envs(extra_env.iter().copied());
         if redis {
             command.env("STUB_REDIS", "1");
@@ -3328,6 +3367,10 @@ esac
             .find("az containerapp ingress enable")
             .unwrap_or_else(|| panic!("the cutover must open ingress: {calls}"));
         assert!(replicas_at < patch_at && patch_at < ingress_at, "{calls}");
+        assert!(
+            !calls.contains("revision restart"),
+            "a new revision needs no restart: {calls}"
+        );
         for field in [
             "\"userAssignedIdentities\"",
             "\"registries\"",
@@ -3483,7 +3526,102 @@ esac
             return;
         };
         assert!(status.success(), "{calls}");
-        assert!(calls.contains("ingress enable"), "{calls}");
+        // Secrets are application-scope: a change makes no new revision,
+        // and the running revision reads them only when it restarts.
+        let restart_at = calls
+            .find("az containerapp revision restart")
+            .unwrap_or_else(|| panic!("the current revision must restart: {calls}"));
+        assert!(
+            calls[restart_at..].contains("--revision app--old"),
+            "{calls}"
+        );
+        let ingress_at = calls.find("ingress enable").unwrap();
+        assert!(restart_at < ingress_at, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_legacy_credentials_from_the_placeholder() {
+        // An app made by the old template has the job's identity, registry
+        // and secrets. Terraform ignores them now, so it cannot remove them.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            1,
+            "{calls}"
+        );
+        assert!(!calls.contains("ingress enable"), "{calls}");
+        assert!(bodies.contains("\"type\":\"None\""), "{bodies}");
+        assert!(bodies.contains("\"registries\":[]"), "{bodies}");
+        for kept in ["\"api-key\"", "\"AUTUMN_PROFILE\"", "\"sidecar\""] {
+            assert!(
+                bodies.contains(kept),
+                "the PATCH must keep {kept}: {bodies}"
+            );
+        }
+        for removed in [
+            "database-url",
+            "signing-secret",
+            "AUTUMN_DATABASE__PRIMARY_URL",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+        ] {
+            assert!(
+                !bodies.contains(removed),
+                "the PATCH must remove {removed}: {bodies}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_credentials_on_a_released_app() {
+        // A real release needs its credentials.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rollback_removes_legacy_credentials() {
+        // A failed first cutover of an app made by the old template must
+        // not put the job's credentials back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let rollback = bodies.lines().last().unwrap_or_default();
+        assert!(rollback.contains("\"type\":\"None\""), "{rollback}");
+        assert!(
+            !rollback.contains("signing-secret")
+                && !rollback.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "{rollback}"
+        );
     }
 
     #[test]
