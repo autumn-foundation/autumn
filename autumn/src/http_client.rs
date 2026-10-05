@@ -2022,7 +2022,7 @@ impl RequestBuilder {
                 req = req.body(body.clone());
             }
 
-            let sent = send_in_span(req, &span).await;
+            let sent = send_in_span(req, span).await;
             match sent {
                 Ok(resp) => {
                     let status = resp.status();
@@ -2843,7 +2843,7 @@ async fn send_one(
             req = req.body(body.clone());
         }
 
-        match send_in_span(req, &span).await {
+        match send_in_span(req, span).await {
             Ok(resp) => {
                 let status = resp.status();
                 let headers = resp.headers().clone();
@@ -3199,9 +3199,12 @@ fn client_attempt_span(method: &Method, url: &str, attempt: u32) -> tracing::Spa
 
 /// Send `request` inside `span`, then record the status code or the error
 /// class on the span.
+///
+/// Takes `span` by value: the span closes when this returns, so a
+/// `Retry-After` sleep after a 429 is not part of the attempt.
 async fn send_in_span(
     request: reqwest::RequestBuilder,
-    span: &tracing::Span,
+    span: tracing::Span,
 ) -> Result<reqwest::Response, reqwest::Error> {
     use tracing::Instrument as _;
 
@@ -4290,6 +4293,98 @@ mod tests {
                 values.record(&mut SpanFieldVisitor(fields));
             }
         }
+    }
+
+    /// Records how long each `http.client.request` span stays open.
+    #[derive(Clone, Default)]
+    struct ClientSpanDurations {
+        opened: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Instant>>>,
+        closed: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ClientSpanDurations
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "http.client.request" {
+                self.opened
+                    .lock()
+                    .unwrap()
+                    .insert(id.into_u64(), Instant::now());
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let start = self.opened.lock().unwrap().remove(&id.into_u64());
+            if let Some(start) = start {
+                self.closed.lock().unwrap().push(start.elapsed());
+            }
+        }
+    }
+
+    // A 429 attempt span ends before the `Retry-After` sleep, so its duration
+    // is the HTTP exchange only, on the plain and the custom send paths.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn attempt_span_ends_before_the_retry_after_sleep() {
+        use axum::{Router, http::StatusCode, response::IntoResponse as _, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        for custom_path in [false, true] {
+            let durations = ClientSpanDurations::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(durations.clone()),
+            );
+            drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
+            tracing::callsite::rebuild_interest_cache();
+            durations.closed.lock().unwrap().clear();
+
+            // The first call answers 429 with `Retry-After: 1`, the next 200.
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route(
+                "/limited",
+                get(move || {
+                    let calls = std::sync::Arc::clone(&calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")]).into_response()
+                        } else {
+                            StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let mut request = Client::new().get(format!("http://{addr}/limited"));
+            if custom_path {
+                request = request.no_redirect();
+            }
+            assert_eq!(request.send().await.unwrap().status().as_u16(), 200);
+
+            let closed = durations.closed.lock().unwrap().clone();
+            assert_eq!(closed.len(), 2, "custom={custom_path}: {closed:?}");
+            assert!(
+                closed[0] < Duration::from_millis(500),
+                "custom={custom_path}: the 429 attempt span held the 1s sleep: {closed:?}"
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
     // One CLIENT span per outbound attempt (issue #3064), on the plain and
