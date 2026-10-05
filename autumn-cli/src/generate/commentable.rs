@@ -304,11 +304,88 @@ fn model_using_comments_table(project_root: &Path) -> Option<std::path::PathBuf>
     let needle = format!("schema::{COMMENTS_TABLE}");
     files.into_iter().find(|file| {
         std::fs::read_to_string(file).is_ok_and(|source| {
-            source
-                .match_indices(&needle)
-                .any(|(at, _)| !source[at + needle.len()..].starts_with(is_ident_char))
+            let code = strip_rust_comments_and_literals(&source);
+            // A binding ends the path: `use crate::schema::comments;`. A path
+            // that goes on (`schema::comments::table`) only reads the table.
+            code.match_indices(&needle).any(|(at, _)| {
+                let rest = &code[at + needle.len()..];
+                !rest.starts_with(is_ident_char) && !rest.trim_start().starts_with("::")
+            })
         })
     })
+}
+
+/// `source` with Rust comments and string and char literals blanked out, so a
+/// mention in prose is not read as code.
+fn strip_rust_comments_and_literals(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '/' if chars.peek() == Some(&'/') => {
+                // Line comment: skip to the end of the line.
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Block comment. Rust nests them.
+                chars.next();
+                let mut depth = 1;
+                while depth > 0 {
+                    match chars.next() {
+                        Some('/') if chars.peek() == Some(&'*') => {
+                            chars.next();
+                            depth += 1;
+                        }
+                        Some('*') if chars.peek() == Some(&'/') => {
+                            chars.next();
+                            depth -= 1;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                out.push(' ');
+            }
+            '"' => {
+                // String literal, with `\` escapes.
+                while let Some(next) = chars.next() {
+                    match next {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+                out.push_str("\"\"");
+            }
+            '\'' => {
+                // A char literal (`'"'`, `'\''`) or a lifetime (`'a`).
+                let mut ahead = chars.clone();
+                let literal = match ahead.next() {
+                    Some('\\') => {
+                        ahead.next();
+                        ahead.any(|next| next == '\'')
+                    }
+                    Some(_) => ahead.next() == Some('\''),
+                    None => false,
+                };
+                if literal {
+                    chars = ahead;
+                    out.push_str("' '");
+                } else {
+                    out.push(c);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The refusal for a model that still uses the `comments` table (#2283).
@@ -3457,6 +3534,37 @@ mod tests {
                 false,
             )
             .expect("no model uses `comments` now")
+        );
+    }
+
+    /// Only a live binding counts. A comment, a string, or a path that goes on
+    /// (`schema::comments::table`, a join from another model) does not bind a
+    /// model to the table. `examples/reddit-clone/src/models.rs` has such a
+    /// comment.
+    #[test]
+    fn only_a_live_binding_marks_a_model_as_using_comments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("models")).expect("mkdir");
+        std::fs::write(
+            src.join("models.rs"),
+            "// `crate::schema::comments` is kept, but no `#[model]` maps it.\n\
+             /* crate::schema::comments; */\n\
+             const NOTE: &str = \"crate::schema::comments;\";\n\
+             const QUOTE: char = '\"';\n\
+             fn count() { crate::schema::comments::table; }\n",
+        )
+        .expect("write");
+        assert_eq!(model_using_comments_table(tmp.path()), None);
+
+        std::fs::write(
+            src.join("models").join("comment.rs"),
+            "use crate::schema::comments;\n",
+        )
+        .expect("write");
+        assert_eq!(
+            model_using_comments_table(tmp.path()),
+            Some(src.join("models").join("comment.rs"))
         );
     }
 }
