@@ -235,6 +235,9 @@ const FLATTENING_CALLBACKS: &[&str] = &["filter_map", "flat_map", "map_while", "
 /// arguments hold: `fold(init, f)`, `unwrap_or_else(f)`, `find_map(f)`.
 const DIRECT_CALLBACKS: &[&str] = &[
     "and_then",
+    "or",
+    "xor",
+    "unwrap_or",
     "or_else",
     "find_map",
     "fold",
@@ -363,6 +366,7 @@ const SCALAR_METHODS: &[&str] = &[
 /// Methods on a carrier that return a carrier: a view, an iterator, or an
 /// `Option` of a part.
 const CARRIER_METHODS: &[&str] = &[
+    "xor",
     "err",
     "map_err",
     "then",
@@ -648,6 +652,7 @@ const OPTION_METHODS: &[&str] = &[
     "map_or_else",
     "and_then",
     "or",
+    "xor",
     "or_else",
     "filter",
     "take",
@@ -680,6 +685,7 @@ const OPTION_REF_METHODS: &[&str] = &[
     "map_or_else",
     "and_then",
     "or",
+    "xor",
     "or_else",
     "filter",
     "take",
@@ -1422,6 +1428,13 @@ impl Binding {
         };
         let shape = match (self.shape, other.shape) {
             (a, b) if a == b => a,
+            // The shape with fewer known methods: both sides have it.
+            (Some(Shape::Opt | Shape::OptRef), Some(Shape::Opt | Shape::OptRef)) => {
+                Some(Shape::Opt)
+            }
+            (Some(Shape::Iter | Shape::IterRef), Some(Shape::Iter | Shape::IterRef)) => {
+                Some(Shape::Iter)
+            }
             (None, b) if self.kind == Kind::Plain => b,
             (a, None) if other.kind == Kind::Plain => a,
             _ => None,
@@ -3053,6 +3066,11 @@ impl Analyzer {
     /// The container shape of `e`, when it is known.
     fn shape_of(&self, e: &Expr) -> Option<Shape> {
         match e {
+            Expr::Path(p)
+                if p.path.is_ident("None") && self.env.binding("None").shape.is_none() =>
+            {
+                Some(Shape::Opt)
+            }
             Expr::Path(_) => path_ident(e).and_then(|name| self.env.binding(&name).shape),
             Expr::Reference(r) => self.shape_of(&r.expr),
             Expr::Paren(p) => self.shape_of(&p.expr),
@@ -8149,6 +8167,37 @@ mod tests {
                 "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
                  let r = Some(1).and_then(|_| Some(&repo)).unwrap(); \
                  let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn option_fallback_arguments_keep_their_handles() {
+        check_handlers(&[
+            (
+                "None.or(Some(repo))",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let slot = None.or(Some(repo)); let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "None.unwrap_or(repo)",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let r = None.unwrap_or(repo); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "None.xor(Some(repo))",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let slot = None.xor(Some(repo)); let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            // Guard: a plain fallback stays plain.
+            (
+                "None.unwrap_or(0)",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let n = None.unwrap_or(0); render(n); let _ = repo.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
