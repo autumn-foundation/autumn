@@ -32,6 +32,7 @@ CREATE TABLE users (
     credit amount,
     fee MONEY,
     tip cash,
+    fees MONEY[],
     ratio DOUBLE PRECISION,
     created_at TIMESTAMPTZ NOT NULL,
     born DATE,
@@ -58,15 +59,15 @@ CREATE TABLE comments (
 ";
 
 const SEED: &str = r#"
-INSERT INTO users (email, balance, credit, fee, tip, ratio, created_at, born, avatar, prefs, tags, uid, active)
+INSERT INTO users (email, balance, credit, fee, tip, fees, ratio, created_at, born, avatar, prefs, tags, uid, active)
 VALUES
   ('Ada@Example.com', 12345678901234567.123456789012, 98765432109876543210.01234567890123456789,
-   1234567.89, 12.5,
+   1234567.89, 12.5, ARRAY[1.5, 2000]::money[],
    0.30000000000000004,
    '2026-01-02 03:04:05.123456+00', '1815-12-10', '\x00ff10'::bytea,
    '{"theme": "dark", "n": [1, 2.5, {"deep": null}]}', ARRAY['a', 'b "q"', 'ü'],
    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', true),
-  ('bob@example.com', 1, NULL, NULL, NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
+  ('bob@example.com', 1, NULL, NULL, NULL, '{}', NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
    'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', false);
 INSERT INTO posts (author_id, parent_id, title, score) VALUES
   (1, NULL, 'First <post>', 3.14159),
@@ -263,6 +264,11 @@ async fn postgres_round_trip_is_lossless_at_field_level() {
     assert_eq!(first.records("users")[0]["tip"], "12.50");
     let tip = users.fields.iter().find(|f| f.name == "tip").expect("tip");
     assert_eq!(tip.base_type.as_deref(), Some("money"));
+    // A `money[]` travels as plain numbers too.
+    assert_eq!(
+        first.records("users")[0]["fees"],
+        serde_json::json!(["1.50", "2000.00"])
+    );
 
     // A subject that the column type cannot read is bad input, not a fault.
     let err = export_subject(registry.capsule_models(), &source, "not-a-number")

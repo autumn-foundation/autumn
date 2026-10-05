@@ -89,7 +89,8 @@ workspace member, so it reads its own `autumn.toml` and `.env`.
 
 On a profile that is not `dev` or `test`, `import` needs `--force`. Add
 `--json` to get the raw report. `verify` uses the signer of an installed
-`CapsuleService`, if the app has one.
+`CapsuleService`, if the app has one. `verify` does not open the database or
+run a migration.
 
 ## Use the actuator
 
@@ -173,10 +174,10 @@ directory to a link after the open, the reads do not follow it.
 
 Postgres export reads all models in one snapshot. It reads rows with
 `to_jsonb`. Export writes `numeric`, `real`, `double precision`, and `money`
-as text, also through a domain. Export writes `money` as a plain number, so
-the value does not depend on the `lc_monetary` locale. The manifest keeps the
-base type of each domain, so import also reads a domain over `money` as a
-plain number. Time stamps, `bytea`,
+as text, also through a domain. Export writes `money` and each `money[]`
+item as a plain number, so the value does not depend on the `lc_monetary`
+locale. The manifest keeps the base type of each domain, so import also reads
+a domain over `money` or `money[]` as plain numbers. Time stamps, `bytea`,
 `uuid`, and arrays keep their exact values.
 
 The subject id must be a valid value of the subject column type. For example,

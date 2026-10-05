@@ -7509,7 +7509,7 @@ impl AppBuilder {
     /// All modes boot the app's state initializers, which install the
     /// [`crate::gdpr::GdprRegistry`] and any `CapsuleService`. Export and
     /// import also use the database and the blob store. Verify uses only the
-    /// signer, so it works when no database is configured.
+    /// signer: it does not open the database or run a migration.
     #[allow(clippy::too_many_lines)]
     async fn run_data_capsule_mode(self, mode: DataCapsuleMode) {
         let Self {
@@ -7554,44 +7554,55 @@ impl AppBuilder {
         )
         .await;
 
+        // Verify skips the blob store and the database.
+        let verify = mode == DataCapsuleMode::Verify;
+
         #[cfg(feature = "storage")]
-        let storage_bootstrap = blob_store.map_or_else(
-            || preflight_storage(&config),
-            |store| {
-                Some(StorageBootstrap {
-                    store,
-                    serving: None,
-                })
-            },
-        );
+        let storage_bootstrap = if verify {
+            None
+        } else {
+            blob_store.map_or_else(
+                || preflight_storage(&config),
+                |store| {
+                    Some(StorageBootstrap {
+                        store,
+                        serving: None,
+                    })
+                },
+            )
+        };
 
         #[cfg(feature = "db")]
-        let database = match setup_database(
-            &config,
-            migrations,
-            pool_provider_factory,
-            shard_provider_factory,
-            shard_router,
-            directory_shard_router,
-            RepositoryCommitHookQueueMigrationMode::Runtime,
-        )
-        .await
-        {
-            Ok(database) => database,
-            Err(error) => {
-                eprintln!("{error}");
-                #[cfg(feature = "managed-pg")]
-                crate::managed_pg::emergency_stop_async().await;
-                std::process::exit(1);
+        let (topology, shards) = if verify {
+            (None, None)
+        } else {
+            match setup_database(
+                &config,
+                migrations,
+                pool_provider_factory,
+                shard_provider_factory,
+                shard_router,
+                directory_shard_router,
+                RepositoryCommitHookQueueMigrationMode::Runtime,
+            )
+            .await
+            {
+                Ok(database) => (database.topology, database.shards),
+                Err(error) => {
+                    eprintln!("{error}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
             }
         };
 
         let state = build_state(
             &config,
             #[cfg(feature = "db")]
-            database.topology.as_ref(),
+            topology.as_ref(),
             #[cfg(feature = "db")]
-            database.shards,
+            shards,
             #[cfg(feature = "ws")]
             channels_backend,
         );

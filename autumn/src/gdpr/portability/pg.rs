@@ -81,8 +81,10 @@ fn select_expr(column: &Column) -> Result<String, DataCapsuleError> {
     let col = quote(&column.field.name)?;
     // `money::text` depends on `lc_monetary` (for example `$1,234.50`).
     // Through `numeric` the text is a plain number in every locale.
-    if column.base_type == "money" {
-        return Ok(format!("{col}::numeric::text AS {col}"));
+    match column.base_type.as_str() {
+        "money" => return Ok(format!("{col}::numeric::text AS {col}")),
+        "money[]" => return Ok(format!("{col}::numeric[]::text[] AS {col}")),
+        _ => {}
     }
     Ok(if travels_as_text(&column.base_type) {
         let cast = if column.base_type.ends_with("[]") {
@@ -359,9 +361,26 @@ impl From<DieselError> for DataCapsuleError {
     }
 }
 
-/// `true` for a `money` column or a domain over `money`.
+/// `true` for a `money` or `money[]` column, or a domain over one.
 fn is_money(field: &FieldSpec) -> bool {
-    field.base_type.as_deref().unwrap_or(&field.data_type) == "money"
+    matches!(
+        field.base_type.as_deref().unwrap_or(&field.data_type),
+        "money" | "money[]"
+    )
+}
+
+/// The locale-free read of a `money` or `money[]` value from `e.j`.
+fn money_expr(field: &FieldSpec) -> String {
+    let name = &field.name;
+    if field.base_type.as_deref().unwrap_or(&field.data_type) == "money" {
+        return format!("(e.j ->> '{name}')::numeric::money");
+    }
+    // Keep the element order. A JSON `null` gives SQL `NULL`.
+    format!(
+        "CASE WHEN jsonb_typeof(e.j -> '{name}') = 'array' THEN ARRAY(SELECT x::numeric::money \
+         FROM jsonb_array_elements_text(e.j -> '{name}') WITH ORDINALITY AS t(x, n) \
+         ORDER BY n) END"
+    )
 }
 
 /// The `INSERT` of one batch. Generated columns are skipped.
@@ -400,7 +419,7 @@ fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
     for field in batch.model.fields.iter().filter(|f| !f.generated) {
         let col = quote(&field.name)?;
         exprs.push(if is_money(field) {
-            format!("(e.j ->> '{}')::numeric::money", field.name)
+            money_expr(field)
         } else {
             format!("r.{col}")
         });
@@ -494,6 +513,10 @@ mod tests {
             select_expr(&col("m", "money")).unwrap(),
             "\"m\"::numeric::text AS \"m\""
         );
+        assert_eq!(
+            select_expr(&col("m", "money[]")).unwrap(),
+            "\"m\"::numeric[]::text[] AS \"m\""
+        );
         assert!(select_expr(&col("a\"b", "text")).is_err());
     }
 
@@ -545,6 +568,21 @@ mod tests {
         })
         .unwrap();
         assert!(sql.contains("(e.j ->> 'fee')::numeric::money"), "{sql}");
+        // A `money[]` column is rebuilt element by element, in order.
+        model.fields[2] = FieldSpec::new("fee", "money[]").nullable();
+        let sql = insert_sql(&ImportBatch {
+            model: &model,
+            records: &records,
+        })
+        .unwrap();
+        assert!(
+            sql.contains(
+                "CASE WHEN jsonb_typeof(e.j -> 'fee') = 'array' THEN ARRAY(SELECT x::numeric::money \
+                 FROM jsonb_array_elements_text(e.j -> 'fee') WITH ORDINALITY AS t(x, n) \
+                 ORDER BY n) END"
+            ),
+            "{sql}"
+        );
         model.fields.clear();
         assert!(
             insert_sql(&ImportBatch {
