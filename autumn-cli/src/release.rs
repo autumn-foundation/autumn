@@ -4309,12 +4309,9 @@ esac
     #[cfg(unix)]
     #[test]
     fn azure_cutover_script_assigns_every_identity_of_the_job_secrets() {
-        // A Key Vault job secret can use another identity, or the system
-        // identity. The app needs each one to read the secret.
-        for (identity, want) in [
-            ("/kv-id-2", "\"/kv-id-2\":{}"),
-            ("system", "\"type\":\"SystemAssigned,UserAssigned\""),
-        ] {
+        // A Key Vault job secret can use another user-assigned identity. The
+        // app needs each one to read the secret.
+        for (identity, want) in [("/kv-id-2", "\"/kv-id-2\":{}")] {
             let Some((status, calls, bodies)) = run_azure_cutover(
                 "mcr.microsoft.com/k8se/quickstart:latest",
                 "Provisioned",
@@ -4391,8 +4388,8 @@ esac
     #[cfg(unix)]
     #[test]
     fn azure_cutover_rollback_keeps_a_system_identity_that_was_there() {
-        // A job secret uses the system identity, but the app had its own
-        // system identity before the cutover. The rollback keeps it.
+        // The app had its own system identity before the cutover. The
+        // cutover never turns it on, and the rollback keeps it.
         let Some((status, calls, bodies)) = run_azure_cutover(
             "mcr.microsoft.com/k8se/quickstart:latest",
             "Failed",
@@ -4400,7 +4397,7 @@ esac
             0,
             &[
                 ("STUB_JOB_CUSTOM_KV", "1"),
-                ("STUB_JOB_CUSTOM_KV_IDENTITY", "system"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "/kv-id-2"),
                 ("STUB_APP_SYSTEM_IDENTITY", "1"),
             ],
         ) else {
@@ -4412,39 +4409,6 @@ esac
             .rfind(|line| line.contains("\"identity\":{") && !line.contains("\"template\""))
             .unwrap_or_else(|| panic!("{bodies}"));
         assert!(removal.contains("SystemAssigned"), "{removal}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn azure_cutover_rollback_drops_a_system_identity_that_it_turned_on() {
-        // The cutover turned the system identity on for a job secret, and
-        // marks that with a tag. The rollback turns it off again.
-        let Some((status, calls, bodies)) = run_azure_cutover(
-            "mcr.microsoft.com/k8se/quickstart:latest",
-            "Failed",
-            false,
-            0,
-            &[
-                ("STUB_JOB_CUSTOM_KV", "1"),
-                ("STUB_JOB_CUSTOM_KV_IDENTITY", "system"),
-            ],
-        ) else {
-            return;
-        };
-        assert!(!status.success(), "{calls}");
-        let cutover = bodies
-            .lines()
-            .find(|line| line.contains("\"template\""))
-            .unwrap_or_else(|| panic!("{bodies}"));
-        assert!(
-            cutover.contains("\"autumn-system-identity\":\"cutover\""),
-            "{cutover}"
-        );
-        let removal = bodies
-            .lines()
-            .rfind(|line| line.contains("\"identity\":{") && !line.contains("\"template\""))
-            .unwrap_or_else(|| panic!("{bodies}"));
-        assert!(!removal.contains("SystemAssigned"), "{removal}");
     }
 
     #[cfg(unix)]
@@ -4496,6 +4460,31 @@ esac
         assert!(status.success(), "{calls}");
         let first = bodies.lines().next().unwrap_or_default();
         assert!(first.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rejects_a_job_secret_on_the_system_identity() {
+        // The job's system identity has the vault access; the app's system
+        // identity is another principal and has none. The secret cannot
+        // move to the app, so the script stops before any write.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "system"),
+                ("STUB_INGRESS_EXTERNAL", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+        assert!(!calls.contains("az tags-patch"), "{calls}");
     }
 
     #[cfg(unix)]
