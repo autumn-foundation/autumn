@@ -2722,6 +2722,38 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Connection limits, WebSocket limits, replica lag (issue #3065)
+
+Bound slow, idle and excess connections. Every key is optional; the `prod`
+profile sets all `[server.http]` keys and the `[realtime]` size/ping/idle keys:
+
+```toml
+[server.http]
+header_read_timeout_ms = 10_000   # slowloris: full head in time, or disconnect
+keep_alive_timeout_ms = 75_000    # close a connection with no request in flight
+max_header_bytes = 65_536         # HTTP/1 head over the limit gets 431
+http2_max_concurrent_streams = 100
+max_connections = 10_000          # per listener; accept waits at the cap
+
+[realtime]                        # every #[ws] route
+max_connections = 5_000           # 503 + Retry-After above the cap
+max_message_bytes = 1_048_576     # close code 1009
+ping_interval_ms = 30_000         # pongs are hidden from the handler
+idle_timeout_ms = 120_000         # close code 1001
+
+[database]
+replica_max_lag_ms = 5_000        # reads use the primary while lag is over/unknown
+warn_on_pooler = true             # boot warning for PgBouncer / RDS Proxy URLs
+```
+
+`autumn_web::ws::WebSocket` / `WebSocketUpgrade` are Autumn wrappers (same
+`recv` / `send` / `Stream` / `Sink`); `into_inner()` gives the axum type
+without limits. Lag alone never fails readiness. See
+`docs/guide/connection-limits.md`, `docs/guide/websockets.md` (Limits),
+`docs/guide/cloud-native.md` (Lag-aware reads) and
+`docs/guide/connection-poolers.md` (what breaks behind a transaction-mode
+pooler).
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
