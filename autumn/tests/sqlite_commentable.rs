@@ -15,7 +15,7 @@
 //! This proves the #2275 refusal, and the plain subtree-removal path it
 //! guards, against a real SQLite connection: no Docker, in-memory database.
 //!
-//! It also proves #2284 on SQLite: each repository of a model applies its own
+//! It also proves #2284 on `SQLite`: each repository of a model applies its own
 //! soft-delete rule to the parent.
 //!
 //! Only meaningful under `--features sqlite` (same convention as
