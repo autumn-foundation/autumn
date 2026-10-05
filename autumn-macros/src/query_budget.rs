@@ -2693,6 +2693,13 @@ impl Analyzer {
                 }
                 left.then(Flow::ZERO.or_worst(right))
             }
+            // `ctx += repo`: an overloaded compound assignment may store the
+            // right side in the left.
+            Expr::Binary(b) if is_compound_assign(&b.op) => {
+                let flow = self.expr(&b.left).then(self.expr(&b.right));
+                self.store_into(&b.left, "", &[&b.right]);
+                flow
+            }
             Expr::Binary(b) => self.expr(&b.left).then(self.expr(&b.right)),
             Expr::Return(r) => {
                 let value = r.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
@@ -2777,30 +2784,43 @@ impl Analyzer {
             let depth = self.env.depth();
             let (guard, after_guard, body) = self.scoped(|s| {
                 s.bind_init(pat, &m.expr);
-                let guard = guard.map_or(Cost::ZERO, |g| s.cost_of(g));
+                let guard = guard.map_or(Flow::ZERO, |g| s.expr(g));
                 let after_guard = s.env.clone();
-                (
-                    guard,
-                    after_guard,
-                    s.annotated(&arm.attrs, |s| s.expr(&arm.body)),
-                )
+                // A guard that never falls through never runs the body.
+                let body = if guard.fall.is_some() {
+                    s.annotated(&arm.attrs, |s| s.expr(&arm.body))
+                } else {
+                    s.unreachable(|s| s.annotated(&arm.attrs, |s| s.expr(&arm.body)))
+                };
+                (guard, after_guard, body)
             });
-            guards = guards.then(guard);
-            let body = Flow::cost(guards.clone()).then(body);
-            // A failing guard falls through to the next arm with its bindings.
-            let mut after_guard = after_guard;
-            after_guard.scopes.truncate(depth);
-            entry.join(&after_guard);
+            let guard_falls = guard.fall.clone();
+            let body = Flow::cost(guards.clone()).then(guard).then(body);
+            // A later arm runs after this guard falls through, or after
+            // this pattern fails (and the guard does not run).
+            if let Some(cost) = guard_falls.clone() {
+                guards = guards.then(cost);
+                // A failing guard falls through to the next arm with its
+                // bindings.
+                let mut after_guard = after_guard;
+                after_guard.scopes.truncate(depth);
+                entry.join(&after_guard);
+            }
+            // `_ if { return …; } => …`: no later arm can run.
+            let ends = guard_falls.is_none() && pattern_always_matches(pat);
             let falls = body.fall.is_some();
             bodies = bodies.or_worst(body);
-            if !falls {
-                // The arm always leaves; its exits recorded their bindings.
-                continue;
+            if falls {
+                let arm_env = std::mem::replace(&mut self.env, Env::new());
+                match &mut joined {
+                    Some(env) => env.join(&arm_env),
+                    None => joined = Some(arm_env),
+                }
             }
-            let arm_env = std::mem::replace(&mut self.env, Env::new());
-            match &mut joined {
-                Some(env) => env.join(&arm_env),
-                None => joined = Some(arm_env),
+            // Otherwise the arm always leaves; its exits recorded their
+            // bindings.
+            if ends {
+                break;
             }
         }
         self.env = joined.unwrap_or(entry);
@@ -4888,6 +4908,40 @@ fn call_path_name(call: &ExprCall) -> Option<String> {
     match &*call.func {
         Expr::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
         _ => None,
+    }
+}
+
+/// Is `op` a compound assignment: `+=`, `-=`, `|=`, …?
+const fn is_compound_assign(op: &syn::BinOp) -> bool {
+    matches!(
+        op,
+        syn::BinOp::AddAssign(_)
+            | syn::BinOp::SubAssign(_)
+            | syn::BinOp::MulAssign(_)
+            | syn::BinOp::DivAssign(_)
+            | syn::BinOp::RemAssign(_)
+            | syn::BinOp::BitXorAssign(_)
+            | syn::BinOp::BitAndAssign(_)
+            | syn::BinOp::BitOrAssign(_)
+            | syn::BinOp::ShlAssign(_)
+            | syn::BinOp::ShrAssign(_)
+    )
+}
+
+/// Does `pat` match every value: `_`, or a lowercase binding?
+fn pattern_always_matches(pat: &Pat) -> bool {
+    match pat {
+        Pat::Wild(_) => true,
+        Pat::Ident(id) => {
+            id.subpat.is_none()
+                && id
+                    .ident
+                    .to_string()
+                    .starts_with(|c: char| c.is_lowercase() || c == '_')
+        }
+        Pat::Paren(p) => pattern_always_matches(&p.pat),
+        Pat::Type(p) => pattern_always_matches(&p.pat),
+        _ => false,
     }
 }
 
@@ -9904,6 +9958,36 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let r = (|r, _n| r)(repo, 1); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn diverging_guards_and_compound_assignments() {
+        check_handlers(&[
+            (
+                "a match guard that returns ends the match",
+                "async fn h(repo: PgPostRepository, x: i64) -> AutumnResult<usize> { \
+                 let _ = match x { _ if { return Ok(repo.a().await?); } => repo.b().await?, _ => repo.c().await? }; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a refutable arm with a returning guard leaves later arms reachable",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let _ = match x { Some(_) if { return Ok(repo.a().await?); } => 0, None => repo.c().await? }; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a compound assignment stores a handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut ctx = Holder::default(); ctx += repo; let _ = ctx.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a plain compound assignment is free",
+                "async fn h(x: i64) -> AutumnResult<usize> { \
+                 let mut n = 0; n += x; render(n); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
