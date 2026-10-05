@@ -519,7 +519,7 @@ impl Env {
         self.scopes.pop();
     }
 
-    fn depth(&self) -> usize {
+    const fn depth(&self) -> usize {
         self.scopes.len()
     }
 
@@ -700,9 +700,9 @@ impl Analyzer {
             Pat::TupleStruct(p) => {
                 // `Err(e)` binds the error, not the handle of a `Result<Db, E>`.
                 let is_err = p.path.segments.last().is_some_and(|s| s.ident == "Err");
-                let part = if is_err { Kind::Plain } else { kind.element() };
+                let inner = if is_err { Kind::Plain } else { kind.element() };
                 for elem in &p.elems {
-                    self.bind_pat(elem, part);
+                    self.bind_pat(elem, inner);
                 }
             }
             Pat::Struct(p) => {
