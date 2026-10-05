@@ -3259,7 +3259,10 @@ done
   [ -n "$STUB_INGRESS_INTERNAL" ] && external=false
   [ -n "$STUB_INGRESS_EXTERNAL" ] && external=true
   ingress="{\"external\":$external,\"targetPort\":3000,\"transport\":\"http\",\"fqdn\":\"app.example.internal\",\"customDomains\":[{\"name\":\"www.example.com\"}]}"
-  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
+  containers="{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar"
+  # An operator can put a sidecar before the app container.
+  [ -n "$STUB_SIDECAR_FIRST" ] && containers="$sidecar,{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]}"
+  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$scale}}}"
 case "$1 $2" in
   "containerapp job")
     secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"$id\"}"; }
@@ -3349,10 +3352,10 @@ case "$1 $2" in
       properties.template.containers)
         if [ -n "$STUB_ACTIVE_HAS_REFS" ]; then
           jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" --argjson refs "[${refs#,}]" \
-            '.properties.template.containers | .[0].image = $image | .[0].env += $refs' <<< "$app"
+            '.properties.template.containers | map(if .name == "app" then .image = $image | .env += $refs else . end)' <<< "$app"
         else
           jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" \
-            '.properties.template.containers | .[0].image = $image' <<< "$app"
+            '.properties.template.containers | map(if .name == "app" then .image = $image else . end)' <<< "$app"
         fi
         ;;
       properties.active) echo false ;;
@@ -3485,6 +3488,7 @@ esac
         command
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
+            .env_remove("STUB_SIDECAR_FIRST")
             .env_remove("STUB_JOB_NO_SECRETS")
             .env_remove("STUB_ACTIVE_EMPTY")
             .env_remove("STUB_RESTART_STALE")
@@ -3810,6 +3814,63 @@ esac
         assert!(!status.success(), "{calls}");
         assert!(!calls.contains("ingress disable"), "{calls}");
         assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_finds_the_app_container_by_name() {
+        // An operator can put a sidecar first. The image and the secret env
+        // vars go to the container named after the app, not to the sidecar.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_SIDECAR_FIRST", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch: serde_json::Value = serde_json::from_str(
+            bodies
+                .lines()
+                .find(|line| line.contains("\"template\""))
+                .expect("a template PATCH"),
+        )
+        .unwrap();
+        let containers = patch["properties"]["template"]["containers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(containers[0]["name"], "sidecar", "{patch}");
+        assert_eq!(containers[0]["image"], "busybox", "{patch}");
+        assert!(containers[0].get("env").is_none(), "{patch}");
+        assert_eq!(containers[1]["name"], "app", "{patch}");
+        assert_eq!(containers[1]["image"], "acr.azurecr.io/app:t1", "{patch}");
+        assert!(
+            containers[1]["env"].to_string().contains("signing-secret"),
+            "{patch}"
+        );
+        // The active revisions and the new revision are read by name too.
+        assert!(
+            calls.matches("containers[?name=='app']").count() >= 2,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_without_an_app_container() {
+        // With two containers and none named after the app, the script
+        // cannot tell which one to deploy. It stops before any change.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        let check = script
+            .find("no container named")
+            .unwrap_or_else(|| panic!("the script must check the app container: {script}"));
+        let disable = script.find("ingress disable").unwrap();
+        assert!(check < disable, "{script}");
     }
 
     #[cfg(unix)]
