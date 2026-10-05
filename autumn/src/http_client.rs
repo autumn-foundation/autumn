@@ -2184,6 +2184,7 @@ impl RequestBuilder {
                     };
                     // Refund only after the body arrived.
                     gate.finish(last_retry, status.as_u16());
+                    gate.record_destination(url_used.as_str());
                     let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
@@ -2943,6 +2944,20 @@ impl RetryGate {
         let host = url_host(url);
         if host.is_some() && host != self.host {
             *self = self.for_hop(url);
+        }
+    }
+
+    /// Record a first attempt in the budget of `url`'s host when it is not
+    /// the current host: the HTTP stack followed a redirect and the answer is
+    /// final. The gate keeps its budget, so a refund still goes to the budget
+    /// that paid for the retry.
+    fn record_destination(&self, url: &str) {
+        let host = url_host(url);
+        if host.is_none() || host == self.host || self.expired() {
+            return;
+        }
+        if let Some((budgets, host)) = self.budgets.as_deref().zip(host) {
+            budgets.for_host(&host).record_request();
         }
     }
 
@@ -6376,6 +6391,38 @@ mod tests {
                 gate.budget.as_ref().unwrap(),
                 &budgets.for_host("target:443")
             ));
+        }
+
+        #[test]
+        fn a_redirected_answer_refills_the_destination_budget() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let target = budgets.for_host("target:443");
+            while target.try_acquire(RetryKind::Transient) {}
+            let gate = RetryGate::with_deadline(
+                None,
+                Some(Arc::clone(&budgets)),
+                Some("origin:443"),
+                true,
+            );
+            let origin = Arc::clone(gate.budget.as_ref().unwrap());
+            let (before, origin_before) = (target.available(), origin.available());
+
+            gate.record_destination("https://origin/x");
+            assert!(
+                (target.available() - before).abs() < f64::EPSILON,
+                "same host"
+            );
+
+            gate.record_destination("https://target/x");
+            assert!(target.available() > before, "the destination is refilled");
+            assert!(
+                (origin.available() - origin_before).abs() < f64::EPSILON,
+                "the origin budget is unchanged"
+            );
+            assert!(
+                Arc::ptr_eq(gate.budget.as_ref().unwrap(), &origin),
+                "no rekey"
+            );
         }
 
         #[tokio::test(start_paused = true)]
