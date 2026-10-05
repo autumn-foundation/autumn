@@ -842,6 +842,23 @@ impl Shape {
     }
 }
 
+/// The shape of the standard container type `name`.
+fn shape_named(name: &str) -> Option<Shape> {
+    match name {
+        "Vec" => Some(Shape::Vec),
+        "VecDeque" => Some(Shape::Deque),
+        "LinkedList" => Some(Shape::List),
+        "BinaryHeap" => Some(Shape::Heap),
+        "Option" => Some(Shape::Opt),
+        "Result" => Some(Shape::Res),
+        "HashMap" | "IndexMap" => Some(Shape::Map),
+        "BTreeMap" => Some(Shape::SortedMap),
+        "HashSet" | "IndexSet" => Some(Shape::Set),
+        "BTreeSet" => Some(Shape::SortedSet),
+        _ => None,
+    }
+}
+
 /// The container shape a type names, when it names one.
 fn type_shape(ty: &Type) -> Option<Shape> {
     match ty {
@@ -853,20 +870,10 @@ fn type_shape(ty: &Type) -> Option<Shape> {
         Type::Path(path) => {
             let segment = path.path.segments.last()?;
             match segment.ident.to_string().as_str() {
-                "Vec" => Some(Shape::Vec),
-                "VecDeque" => Some(Shape::Deque),
-                "LinkedList" => Some(Shape::List),
-                "BinaryHeap" => Some(Shape::Heap),
-                "Option" => Some(Shape::Opt),
-                "Result" => Some(Shape::Res),
-                "HashMap" | "IndexMap" => Some(Shape::Map),
-                "BTreeMap" => Some(Shape::SortedMap),
-                "HashSet" | "IndexSet" => Some(Shape::Set),
-                "BTreeSet" => Some(Shape::SortedSet),
                 name if SMART_POINTERS.contains(&name) => {
                     generic_types(segment).next().and_then(type_shape)
                 }
-                _ => None,
+                name => shape_named(name),
             }
         }
         _ => None,
@@ -2865,6 +2872,17 @@ impl Analyzer {
             Expr::Call(c) => match call_path_name(c).as_deref() {
                 Some("Some") => Some(Shape::Opt),
                 Some("Ok" | "Err") => Some(Shape::Res),
+                // `Vec::new()`, `HashMap::with_capacity(n)`.
+                Some("new" | "with_capacity" | "default") => match &*c.func {
+                    Expr::Path(p) => p
+                        .path
+                        .segments
+                        .iter()
+                        .rev()
+                        .nth(1)
+                        .and_then(|s| shape_named(&s.ident.to_string())),
+                    _ => None,
+                },
                 _ => None,
             },
             Expr::MethodCall(mc) => {
@@ -2986,6 +3004,10 @@ impl Analyzer {
                         // `repos.chunks(2)` yields slices of handles.
                         || (matches!(method.as_str(), "chunks" | "windows")
                             && self.expr_is_carrier(&mc.receiver))
+                        // `zip` yields tuples, with handles on either side.
+                        || (method == "zip"
+                            && (self.holds(&mc.receiver) || mc.args.iter().any(|a| self.holds(a))))
+                        || (method == "chain" && mc.args.iter().any(|a| self.expr_is_nested(a)))
                         || (self.expr_is_holder(&mc.receiver)
                             && !SAME_TYPE_METHODS.contains(&method.as_str())
                             && !HANDLE_ACCESSORS.contains(&method.as_str()))
@@ -3361,6 +3383,8 @@ impl Analyzer {
                     && self.expr_is_carrier(&mc.receiver))
                     // `ids.iter().map(|_| &repo)` gives handles.
                     || self.callback_result(mc) == Kind::Carrier
+                    // `chain` yields the parts of either side.
+                    || (mc.method == "chain" && mc.args.iter().any(|a| self.expr_is_carrier(a)))
             }
             Expr::If(i) => {
                 block_tail(&i.then_branch).is_some_and(|e| self.expr_is_carrier(e))
@@ -7373,6 +7397,41 @@ mod tests {
             ),
         ];
         check_cases(cases);
+    }
+
+    #[test]
+    fn zip_and_chain_keep_the_handles_of_either_side() {
+        check_handlers(&[
+            (
+                "a zip item is a tuple",
+                "async fn h(repos: Vec<PgPostRepository>, others: Vec<PgPostRepository>) \
+                 -> AutumnResult<usize> { \
+                 let pair = repos.into_iter().zip(others).next().unwrap(); \
+                 pair.refresh_both().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "zip with handles on the argument side",
+                "async fn h(ids: Vec<i64>, repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let pair = ids.iter().zip(&repos).next().unwrap(); \
+                 pair.refresh_both().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "chain with handles on the argument side",
+                "async fn h(ids: Vec<i64>, repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let all: Vec<_> = Vec::new().iter().chain(repos.iter()).collect(); \
+                 let _ = all[0].find_all().await?; render(ids); Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "chain of plain values stays plain",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let all: Vec<i64> = ids.iter().chain(ids.iter()).copied().collect(); \
+                 render(all); let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
     }
 
     #[test]
