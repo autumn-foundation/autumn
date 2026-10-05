@@ -3240,18 +3240,25 @@ case "$1 $2" in
       legacy=""
       [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
       registries=""
-      [ -n "$STUB_APP_LEGACY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
-      app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
-      # After a PATCH, a GET shows the merged result. Like ARM after a 202,
-      # the first STUB_PATCH_PENDING reads still show the old state.
-      pending="$STUB_LOG.pending"
-      [ -f "$pending" ] || echo "${STUB_PATCH_PENDING:-0}" > "$pending"
-      if [ -s "$STUB_LOG.bodies" ] && [ "$(cat "$pending")" -le 0 ]; then
-        jq -cs '.[0] * .[1]' <(echo "$app") <(tail -n 1 "$STUB_LOG.bodies")
-      else
-        [ -s "$STUB_LOG.bodies" ] && echo $(( $(cat "$pending") - 1 )) > "$pending"
-        echo "$app"
+      [ -n "$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_NO_REGISTRY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
+      secrets=""
+      [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}"
+      app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
+      # A GET shows the app state with each PATCH merged in. Like ARM after
+      # a 202, the first STUB_PATCH_PENDING reads after a PATCH still show
+      # the state before it.
+      state="$STUB_LOG.state"
+      [ -f "$state" ] || echo "$app" > "$state"
+      if [ -f "$STUB_LOG.unapplied" ]; then
+        if [ "$(cat "$STUB_LOG.pending")" -le 0 ]; then
+          jq -cs '.[0] * .[1]' "$state" "$STUB_LOG.unapplied" > "$state.new"
+          mv "$state.new" "$state"
+          rm "$STUB_LOG.unapplied"
+        else
+          echo $(( $(cat "$STUB_LOG.pending") - 1 )) > "$STUB_LOG.pending"
+        fi
       fi
+      cat "$state"
     else
       tsv Succeeded "${STUB_LATEST:-app--new}"
     fi
@@ -3269,7 +3276,11 @@ case "$1 $2" in
     fi
     ;;
   "containerapp replica") echo "${STUB_REPLICAS:-0}" ;;
-  "rest --method") echo "$body" >> "$STUB_LOG.bodies" ;;
+  "rest --method")
+    echo "$body" >> "$STUB_LOG.bodies"
+    echo "$body" > "$STUB_LOG.unapplied"
+    echo "${STUB_PATCH_PENDING:-0}" > "$STUB_LOG.pending"
+    ;;
   "containerapp ingress") ;;
   *) echo "unexpected az call: $*" >&2; exit 2 ;;
 esac
@@ -3351,6 +3362,7 @@ esac
             .env_remove("STUB_APP_ENV_FULL")
             .env_remove("STUB_APP_LEGACY")
             .env_remove("STUB_APP_REDIS")
+            .env_remove("STUB_APP_NO_REGISTRY")
             .env_remove("STUB_PATCH_PENDING");
         if !args.is_empty() {
             command.env_remove("IMAGE_TAG");
@@ -3392,6 +3404,12 @@ esac
             .find("az containerapp ingress enable")
             .unwrap_or_else(|| panic!("the cutover must open ingress: {calls}"));
         assert!(replicas_at < patch_at && patch_at < ingress_at, "{calls}");
+        // Without ingress, nothing can start the placeholder again between
+        // the replica check and the PATCH.
+        let disable_at = calls
+            .find("az containerapp ingress disable")
+            .unwrap_or_else(|| panic!("the first cutover must disable ingress: {calls}"));
+        assert!(disable_at < replicas_at, "{calls}");
         assert!(
             !calls.contains("revision restart"),
             "a new revision needs no restart: {calls}"
@@ -3517,6 +3535,10 @@ esac
         assert!(
             !calls.contains("az containerapp replica list"),
             "a later deploy has no placeholder to check: {calls}"
+        );
+        assert!(
+            !calls.contains("ingress disable"),
+            "a later deploy keeps serving: {calls}"
         );
     }
 
@@ -3661,6 +3683,51 @@ esac
         assert!(status.success(), "{calls}");
         let restart_at = calls.find("revision restart").expect("restart");
         assert!(full_reads_after_patch(&calls[..restart_at]) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_checks_the_registry_before_a_restart() {
+        // The stale GET already has the identity and secret names, but not
+        // the registry. A restart then could not pull the private image.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_NO_REGISTRY", "1"),
+                ("STUB_PATCH_PENDING", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(full_reads_after_patch(&calls[..restart_at]) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_until_redis_url_is_gone() {
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_REDIS", "1"), ("STUB_PATCH_PENDING", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let second_patch_at = calls.rfind("az rest --method patch").unwrap();
+        assert!(
+            full_reads_after_patch(&calls[second_patch_at..]) >= 3,
+            "{calls}"
+        );
     }
 
     #[cfg(unix)]
