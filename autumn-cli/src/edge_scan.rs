@@ -3077,10 +3077,10 @@ fn extractor_names(ty: &syn::Type, out: &mut Vec<String>) {
             };
             let name = last.ident.to_string();
             if name == "Option" || name == "Result" {
-                if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
-                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                        extractor_names(inner, out);
-                    }
+                if let syn::PathArguments::AngleBracketed(args) = &last.arguments
+                    && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+                {
+                    extractor_names(inner, out);
                 }
             } else {
                 out.push(name);
