@@ -174,6 +174,10 @@ mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
 mod job_recorder_integration;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod job_retry_jitter_pg;
+#[cfg(feature = "redis")]
+mod job_retry_jitter_redis;
 mod job_tenant_scope;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
@@ -415,6 +419,8 @@ mod sim_monotonic_clock;
 mod sim_net;
 mod sim_rate_limit_clock;
 mod sim_retry_storm;
+#[cfg(feature = "http-client")]
+mod sim_retry_storm_http;
 mod sim_scheduled_ticks;
 #[cfg(feature = "sla")]
 mod sim_sla;

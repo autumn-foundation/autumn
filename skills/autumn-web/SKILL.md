@@ -1538,11 +1538,9 @@ Two things to get right when generating this code:
       distinguishes a first attempt from a retry of the same event, and the
       `Autumn-Signature` header's `t=` is recomputed per attempt but is
       neither unique nor stable — it is a whole-second `Utc::now().timestamp()`
-      and nothing guarantees two attempts differ. On the `local` backend they
-      routinely do not: equal jitter puts the first retry 500-1000 ms later, so
-      the same second yields a byte-identical signature. (`redis`/`postgres` do
-      not jitter and retry at the exact exponential delay — do not describe
-      jitter as backend-neutral.) (Do not enumerate
+      and nothing guarantees two attempts differ. Every backend uses full
+      jitter (issue #3054), so the first retry can come 0-1000 ms later and the
+      same second yields a byte-identical signature. (Do not enumerate
       the headers — under `telemetry-otlp` the shared client also injects W3C
       `traceparent`/`tracestate`.) Receiver-side deduplication needs an ID the
       app mints into the payload itself.
