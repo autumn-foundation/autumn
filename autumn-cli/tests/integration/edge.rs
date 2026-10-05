@@ -165,8 +165,10 @@ pub fn edge_route_list() -> Vec<EdgeRoute> {
 }
 "#;
 
+/// A warning: the scan is a best guess, and rustc is the authority.
+/// `--strict` turns it into a non-zero exit.
 #[test]
-fn doctor_fails_on_edge_route_with_unsupported_capability() {
+fn doctor_warns_on_edge_route_with_unsupported_capability() {
     let dir = project(&[
         ("src/main.rs", DB_EDGE_APP),
         (
@@ -174,11 +176,10 @@ fn doctor_fails_on_edge_route_with_unsupported_capability() {
             "fn main() { autumn_edge::serve(edgeapp::edge_route_list()); }\n",
         ),
     ]);
-    let (report, code) = doctor_json(dir.path());
+    let (report, _) = doctor_json(dir.path());
 
-    assert_ne!(code, Some(0), "{report}");
     let caps = check(&report, "edge_capabilities");
-    assert_eq!(caps["status"], "fail", "{caps}");
+    assert_eq!(caps["status"], "warn", "{caps}");
     let detail = caps["detail"].as_str().unwrap_or_default();
     assert!(detail.contains("dashboard @ src/main.rs:"), "{detail}");
     assert!(detail.contains("needs(db)"), "{detail}");

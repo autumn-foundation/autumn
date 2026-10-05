@@ -10509,8 +10509,8 @@ pub fn run(opts: DoctorOptions) {
         check_edge_routes_impl(&scan, capsule_bin_exists)
     }));
 
-    // 17b. Edge capabilities (issue #1790 AC-5): an `#[edge]` route that needs
-    //      something the edge cannot provide fails before the build does.
+    // 17b. Edge capabilities (issue #1790 AC-5): name each `#[edge]` route
+    //      that needs something the edge cannot provide (a warning).
     tasks.push(Box::new(move || {
         if edge_virtual_workspace_root {
             return edge_virtual_workspace_warn("edge_capabilities");
@@ -10521,9 +10521,7 @@ pub fn run(opts: DoctorOptions) {
             &[],
             capsule_bin.as_deref(),
         );
-        let reachable =
-            crate::edge_scan::reachable_files(std::path::Path::new("."), capsule_bin.as_deref());
-        check_edge_capabilities_impl(&scan, &reachable)
+        check_edge_capabilities_impl(&scan)
     }));
 
     // 18. Orphaned plugin residue (issue #1631): a dependency with no mount, a
@@ -11780,14 +11778,11 @@ pub fn check_edge_routes_impl(
 /// extractor, or an undeclared `EdgeIdentity`. Each one also stops the build
 /// in rustc; doctor names it before the build starts.
 ///
-/// Fails for a route in a file the compiler reads (`reachable`, from
-/// [`crate::edge_scan::reachable_files`]): the build stops on it. Only warns
-/// for a route in another file: the scan reads every file under `src/`, also
-/// one that no `mod` declares.
-pub fn check_edge_capabilities_impl(
-    scan: &crate::edge_scan::EdgeScan,
-    reachable: &std::collections::BTreeSet<String>,
-) -> CheckResult {
+/// Warns, never fails. The scan is a best guess: it reads every file under
+/// `src/` (also one no `mod` declares), cannot resolve target cfgs, and sees
+/// names, not types. rustc is the authority, and `autumn build` stops on a
+/// real case. `autumn doctor --strict` exits non-zero on the warning.
+pub fn check_edge_capabilities_impl(scan: &crate::edge_scan::EdgeScan) -> CheckResult {
     const NAME: &str = "edge_capabilities";
     if scan.is_empty() {
         return CheckResult {
@@ -11809,14 +11804,9 @@ pub fn check_edge_capabilities_impl(
             hint: None,
         };
     }
-    let status = if unsupported.iter().any(|f| reachable.contains(&f.file)) {
-        CheckStatus::Fail
-    } else {
-        CheckStatus::Warn
-    };
     CheckResult {
         name: NAME,
-        status,
+        status: CheckStatus::Warn,
         detail: Some(crate::edge_scan::format_unsupported(&unsupported)),
         hint: Some(crate::edge_scan::EDGE_UNSUPPORTED_HINT),
     }
@@ -11923,7 +11913,7 @@ mod tests {
 
     #[test]
     fn edge_capabilities_passes_without_edge_routes() {
-        let r = check_edge_capabilities_impl(&edge_scan_of("fn plain() {}"), &reachable());
+        let r = check_edge_capabilities_impl(&edge_scan_of("fn plain() {}"));
         assert_eq!(r.status, CheckStatus::Pass);
         assert_eq!(r.detail.as_deref(), Some("no #[edge] routes"));
     }
@@ -11931,15 +11921,20 @@ mod tests {
     #[test]
     fn edge_capabilities_passes_for_supported_capabilities() {
         let scan = edge_scan_of("#[edge(needs(kv))]\nfn note(cache: EdgeCache) {}");
-        let r = check_edge_capabilities_impl(&scan, &reachable());
+        let r = check_edge_capabilities_impl(&scan);
         assert_eq!(r.status, CheckStatus::Pass, "{:?}", r.detail);
     }
 
+    /// The scan is a best guess (it cannot see `mod` reachability, target
+    /// cfgs or every alias), so doctor warns. rustc is the authority, and
+    /// `autumn build` stops on a real case.
     #[test]
-    fn edge_capabilities_fails_on_a_capability_the_edge_cannot_provide() {
-        let scan = edge_scan_of("#[get(\"/d\")]\n#[edge(needs(db))]\nfn dash(db: Db) {}");
-        let r = check_edge_capabilities_impl(&scan, &reachable());
-        assert_eq!(r.status, CheckStatus::Fail);
+    fn edge_capabilities_warns_on_a_capability_the_edge_cannot_provide() {
+        let scan = edge_scan_of(
+            "#[get(\"/d\")]\n#[edge(needs(db))]\nfn dash(db: Db) {}\nfn wire() { edge_routes![dash]; }",
+        );
+        let r = check_edge_capabilities_impl(&scan);
+        assert_eq!(r.status, CheckStatus::Warn);
         let detail = r.detail.unwrap();
         assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
         assert!(detail.contains("needs(db)"), "{detail}");
@@ -11947,25 +11942,6 @@ mod tests {
         let hint = r.hint.unwrap();
         assert!(hint.contains("needs(kv)"), "{hint}");
         assert!(hint.contains("Remove #[edge]"), "{hint}");
-    }
-
-    /// The files the compiler reads, for the `edge_scan_of` fixtures.
-    fn reachable() -> std::collections::BTreeSet<String> {
-        std::iter::once("src/routes.rs".to_owned()).collect()
-    }
-
-    /// A file that no `mod` declares is not compiled. A route in it, even a
-    /// registered one, only warns.
-    #[test]
-    fn edge_capabilities_only_warns_for_a_file_the_compiler_does_not_read() {
-        let scan = edge_scan_of(
-            "#[get(\"/d\")]\n#[edge]\nfn dash(db: Db) {}\nfn wire() { edge_routes![dash]; }",
-        );
-        let r = check_edge_capabilities_impl(&scan, &std::collections::BTreeSet::new());
-        assert_eq!(r.status, CheckStatus::Warn);
-        let detail = r.detail.unwrap();
-        assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
-        assert!(detail.contains("`Db`"), "{detail}");
     }
 
     #[test]

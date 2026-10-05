@@ -163,8 +163,9 @@ const ROUTE_ATTRS: &[&str] = &[
 /// Extractors that need a capability only the origin has, and that capability.
 ///
 /// This is a denylist. Each name also fails the `EdgeHandler` allowlist at
-/// compile time. Thus a match here is never a false positive. A type alias
-/// hides the name from this scan. The compiler still stops it.
+/// compile time. A name the module defines itself (`type Request = ...`) is
+/// skipped. A type alias in another module can still confuse the scan, so
+/// doctor only warns. The compiler stops every real case.
 const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("Db", "a database"),
     ("LazyDb", "a database"),
@@ -209,6 +210,50 @@ const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("SignedCookieJar", "cookies"),
     ("PrivateCookieJar", "cookies"),
     ("WebSocketUpgrade", "a WebSocket"),
+    // The rest of `autumn-web`'s own extractors. A guard test keeps this
+    // list complete.
+    ("ShardedDb", "a database"),
+    ("ShardedReadDb", "a database"),
+    ("Shards", "a database"),
+    ("CrossShard", "a database"),
+    ("Events", "app state"),
+    ("Notifications", "app state"),
+    ("Presence", "app state"),
+    ("CollabHub", "app state"),
+    ("Experiments", "app state"),
+    ("Flags", "app state"),
+    ("AutumnConfig", "app state"),
+    ("Tenant", "app state"),
+    ("Sla", "app state"),
+    ("WebPush", "app state"),
+    ("Client", "app state"),
+    ("Impersonation", "a session"),
+    ("AuthorizedComment", "auth state"),
+    ("SubmitToken", "a session"),
+    ("SubmitFormField", "a session"),
+    ("CspNonce", "origin middleware"),
+    ("RequestInspector", "origin middleware"),
+    ("CanaryRoute", "origin middleware"),
+    ("SeoMeta", "origin middleware"),
+    ("Locale", "origin middleware"),
+    ("TimeZone", "origin middleware"),
+    ("ClientAddr", "the client connection"),
+    ("ClientHost", "the client connection"),
+    ("ClientScheme", "the client connection"),
+    ("ClientCert", "the client connection"),
+    ("OptionalClientCert", "the client connection"),
+    ("CurrentPath", "request data the edge does not pass"),
+    ("HxRequest", "request data the edge does not pass"),
+    ("LastEventId", "request data the edge does not pass"),
+    ("CursorRequest", "request data the edge does not pass"),
+    ("PageRequest", "request data the edge does not pass"),
+    ("ListQuery", "request data the edge does not pass"),
+    ("Negotiate", "request data the edge does not pass"),
+    ("SyncScope", "request data the edge does not pass"),
+    ("ChangesetForm", "a request body"),
+    ("NestedChangesetForm", "a request body"),
+    ("SignedWebhook", "a request body"),
+    ("TaskArgs", "a request body"),
 ];
 
 /// One reason an `#[edge]` route needs something the edge cannot provide.
@@ -955,83 +1000,6 @@ pub fn resolve_edge_scan_with_extra_file(
     extra_file: Option<&Path>,
 ) -> EdgeScan {
     resolve_edge_scan_impl(project_root, requested_features, extra_file)
-}
-
-/// Every source file the compiler reads, relative to `project_root` with `/`
-/// separators (the form of [`EdgeFn::file`]).
-///
-/// Starts at each crate root — the library (`src/lib.rs` or a custom
-/// `[lib] path`), `src/main.rs`, every `src/bin/` target, each `[[bin]]
-/// path`, and `capsule_bin` — and follows `mod name;` declarations. A
-/// `#[cfg(...)]` that is definitely false stops the walk. A file this misses
-/// (a module made by a macro, say) only turns a doctor failure into a warning.
-#[must_use]
-pub fn reachable_files(project_root: &Path, capsule_bin: Option<&Path>) -> BTreeSet<String> {
-    let manifest = std::fs::read_to_string(project_root.join("Cargo.toml")).ok();
-    let table = manifest
-        .as_deref()
-        .and_then(|manifest| toml::from_str::<toml::Table>(manifest).ok());
-    let resolver_v1 = resolver_v1_is_in_effect(project_root, table.as_ref());
-    let default_features = manifest
-        .as_deref()
-        .map(|manifest| enabled_features_from_manifest_for_resolver(manifest, &[], resolver_v1))
-        .unwrap_or_default();
-
-    let mut roots: Vec<PathBuf> = vec![
-        table
-            .as_ref()
-            .and_then(custom_lib_path_from_manifest)
-            .map_or_else(
-                || project_root.join("src/lib.rs"),
-                |lib| project_root.join(lib),
-            ),
-        project_root.join("src/main.rs"),
-    ];
-    if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            roots.push(if path.is_dir() {
-                path.join("main.rs")
-            } else {
-                path
-            });
-        }
-    }
-    if let Some(bins) = table
-        .as_ref()
-        .and_then(|t| t.get("bin"))
-        .and_then(toml::Value::as_array)
-    {
-        roots.extend(
-            bins.iter()
-                .filter_map(|bin| bin.get("path").and_then(toml::Value::as_str))
-                .map(|path| project_root.join(path)),
-        );
-    }
-    roots.extend(capsule_bin.map(Path::to_path_buf));
-
-    let canonical_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let mut reachable = BTreeSet::new();
-    for root in roots.iter().filter(|root| root.is_file()) {
-        let mut scratch = EdgeScan::default();
-        let (touched, _) = scan_bin_crate_tree(
-            root,
-            project_root,
-            "",
-            Vec::new(),
-            &default_features,
-            &mut scratch,
-        );
-        for file in touched {
-            let file = file.canonicalize().unwrap_or(file);
-            if let Ok(rel) = file.strip_prefix(&canonical_root) {
-                reachable.insert(rel.to_string_lossy().replace('\\', "/"));
-            }
-        }
-    }
-    reachable
 }
 
 /// The scanned crate's own `[package] name`, when the manifest table parses
@@ -2189,10 +2157,11 @@ fn scan_items(
     default_features: &BTreeSet<String>,
     scan: &mut EdgeScan,
 ) {
+    let local_types = local_type_names(items);
     for item in items {
         match item {
             syn::Item::Fn(item_fn) => {
-                if let Some(found) = edge_fn(
+                if let Some(mut found) = edge_fn(
                     &item_fn.attrs,
                     &item_fn.sig,
                     file,
@@ -2200,6 +2169,12 @@ fn scan_items(
                     module_path,
                     default_features,
                 ) {
+                    // A name this module defines is not the framework's
+                    // extractor of that name: `type Request = HeaderMap;`.
+                    found.unsupported.retain(|reason| {
+                        !matches!(reason, EdgeUnsupported::Extractor { name, .. }
+                            if local_types.contains(name))
+                    });
                     scan.functions.push(found);
                 }
             }
@@ -3163,6 +3138,45 @@ fn parse_edge_args(input: syn::parse::ParseStream) -> syn::Result<Vec<String>> {
         input.parse::<syn::Token![,]>()?;
     }
     Ok(needs)
+}
+
+/// The type names a module defines itself: `type`, `struct`, `enum`, `union`,
+/// and the new name of a `use ... as Name`.
+fn local_type_names(items: &[syn::Item]) -> BTreeSet<String> {
+    fn renames(tree: &syn::UseTree, out: &mut BTreeSet<String>) {
+        match tree {
+            syn::UseTree::Rename(rename) => {
+                out.insert(rename.rename.to_string());
+            }
+            syn::UseTree::Path(path) => renames(&path.tree, out),
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    renames(tree, out);
+                }
+            }
+            syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+        }
+    }
+    let mut names = BTreeSet::new();
+    for item in items {
+        match item {
+            syn::Item::Type(item) => {
+                names.insert(item.ident.to_string());
+            }
+            syn::Item::Struct(item) => {
+                names.insert(item.ident.to_string());
+            }
+            syn::Item::Enum(item) => {
+                names.insert(item.ident.to_string());
+            }
+            syn::Item::Union(item) => {
+                names.insert(item.ident.to_string());
+            }
+            syn::Item::Use(item) => renames(&item.tree, &mut names),
+            _ => {}
+        }
+    }
+    names
 }
 
 /// The extractor type names in one parameter type: its last path segment, the
@@ -10068,42 +10082,89 @@ mod tests {
     }
 
     #[test]
-    fn reachable_files_follow_mod_declarations_from_every_crate_root() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let write = |rel: &str, src: &str| {
-            let path = dir.path().join(rel);
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-            std::fs::write(path, src).expect("write");
-        };
-        write(
-            "Cargo.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
-        );
-        write(
-            "src/main.rs",
-            "mod routes;\n#[cfg(feature = \"off\")]\nmod gated;\nfn main() {}",
-        );
-        write("src/routes.rs", "mod nested;");
-        write("src/routes/nested.rs", "");
-        write("src/gated.rs", "");
-        write("src/orphan.rs", "");
-        write("src/bin/edge-capsule.rs", "fn main() {}");
-
-        let reachable = reachable_files(dir.path(), None);
-
-        for file in [
-            "src/main.rs",
-            "src/routes.rs",
-            "src/routes/nested.rs",
-            "src/bin/edge-capsule.rs",
+    fn a_name_the_module_defines_itself_is_not_flagged() {
+        for definition in [
+            "type Request = HeaderMap;",
+            "use axum::http::HeaderMap as Session;",
+            "struct Db;",
         ] {
-            assert!(reachable.contains(file), "{file} missing: {reachable:?}");
-        }
-        for file in ["src/orphan.rs", "src/gated.rs"] {
+            let name = ["Request", "Session", "Db"]
+                .into_iter()
+                .find(|name| definition.contains(name))
+                .expect("a name");
+            let scan = scan_one(&format!(
+                "{definition}\n#[get(\"/x\")]\n#[edge]\nasync fn f(x: {name}) {{}}"
+            ));
             assert!(
-                !reachable.contains(file),
-                "{file} is not compiled: {reachable:?}"
+                scan.unsupported().is_empty(),
+                "{definition}: {:?}",
+                scan.functions
             );
+        }
+    }
+
+    /// Every extractor `autumn-web` defines is on the denylist, so a new one
+    /// cannot slip past doctor. `Path` and `Query` share their names with
+    /// the edge-safe axum extractors.
+    #[test]
+    fn the_denylist_covers_every_autumn_web_extractor() {
+        const EDGE_SAFE_NAMES: &[&str] = &["Path", "Query"];
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../autumn/src");
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
+        let mut missing = BTreeSet::new();
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(parsed) = syn::parse_file(&text) else {
+                continue;
+            };
+            collect_extractor_impls(&parsed.items, &mut missing);
+        }
+        missing.retain(|name: &String| {
+            !EDGE_SAFE_NAMES.contains(&name.as_str())
+                && !ORIGIN_ONLY_EXTRACTORS
+                    .iter()
+                    .any(|(known, _)| known == name)
+        });
+        assert!(
+            missing.is_empty(),
+            "add to ORIGIN_ONLY_EXTRACTORS: {missing:?}"
+        );
+    }
+
+    /// The `Self` type name of every `FromRequest`/`FromRequestParts` impl,
+    /// test modules excluded.
+    fn collect_extractor_impls(items: &[syn::Item], out: &mut BTreeSet<String>) {
+        for item in items {
+            match item {
+                syn::Item::Impl(item_impl) => {
+                    let is_extractor = item_impl.trait_.as_ref().is_some_and(|(path, _)| {
+                        path.segments.last().is_some_and(|s| {
+                            s.ident == "FromRequest" || s.ident == "FromRequestParts"
+                        })
+                    });
+                    if is_extractor
+                        && let syn::Type::Path(ty) = &*item_impl.self_ty
+                        && let Some(last) = ty.path.segments.last()
+                    {
+                        out.insert(last.ident.to_string());
+                    }
+                }
+                syn::Item::Mod(item_mod) => {
+                    let test_only = item_mod.attrs.iter().any(|attr| match &attr.meta {
+                        syn::Meta::List(list) => {
+                            list.path.is_ident("cfg") && list.tokens.to_string().contains("test")
+                        }
+                        _ => false,
+                    });
+                    if let (false, Some((_, inner))) = (test_only, &item_mod.content) {
+                        collect_extractor_impls(inner, out);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
