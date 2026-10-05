@@ -3227,7 +3227,8 @@ for arg in "$@"; do
 done
 # The app as the GET shows it before any PATCH.
   env='{"name":"AUTUMN_PROFILE","value":"prod"}'
-  [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && env="$env"',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
+  refs=',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
+  [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_TEMPLATE_CLEAN" ] && env="$env$refs"
   [ -n "$STUB_APP_REDIS" ] && env="$env"',{"name":"AUTUMN_CACHE__BACKEND","value":"redis"},{"name":"AUTUMN_CACHE__REDIS__URL","secretRef":"redis-url"}'
   # A placeholder app made by the old template has the job's credentials.
   legacy=""
@@ -3242,8 +3243,9 @@ done
   [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$sid\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$sid\"}"
   sidecar='{"name":"sidecar","image":"busybox"}'
   [ -n "$STUB_SIDECAR_SECRET_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_DB","secretRef":"database-url"}]}'
+  [ -n "$STUB_SIDECAR_REDIS_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_REDIS","secretRef":"redis-url"}]}'
   scale=""
-  [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"database-url","triggerParameter":"connection"}]}}]}'
+  [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"'"$STUB_SCALE_SECRET_REF"'","triggerParameter":"connection"}]}}]}'
   app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
 case "$1 $2" in
   "containerapp job")
@@ -3286,6 +3288,19 @@ case "$1 $2" in
     if [ "$3" = list ]; then
       n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
       if [ "${n:-0}" -eq 0 ]; then
+        # An interrupted run made the latest revision; the old one stays
+        # active for the first STUB_ACTIVE_LAG reads.
+        if [ -n "$STUB_ACTIVE_LAG" ] && [ -n "$STUB_LATEST" ]; then
+          [ -f "$STUB_LOG.lag" ] || echo "$STUB_ACTIVE_LAG" > "$STUB_LOG.lag"
+          lag=$(cat "$STUB_LOG.lag")
+          if [ "$lag" -gt 0 ]; then
+            echo $((lag - 1)) > "$STUB_LOG.lag"
+            printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+            exit 0
+          fi
+          printf '%s\t%s\n' "$STUB_LATEST" "$STUB_OLD_IMAGE"
+          exit 0
+        fi
         printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
         exit 0
       fi
@@ -3301,8 +3316,13 @@ case "$1 $2" in
     case "$query" in
       # The template of the active (old) revision runs the active image.
       properties.template.containers)
-        jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" \
-          '.properties.template.containers | .[0].image = $image' <<< "$app"
+        if [ -n "$STUB_ACTIVE_HAS_REFS" ]; then
+          jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" --argjson refs "[${refs#,}]" \
+            '.properties.template.containers | .[0].image = $image | .[0].env += $refs' <<< "$app"
+        else
+          jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" \
+            '.properties.template.containers | .[0].image = $image' <<< "$app"
+        fi
         ;;
       properties.active) echo false ;;
       # The placeholder image always provisions.
@@ -3413,6 +3433,9 @@ esac
             .env_remove("STUB_SCALE_SECRET_REF")
             .env_remove("STUB_ACTIVE_IMAGE")
             .env_remove("STUB_ACTIVE_LAG")
+            .env_remove("STUB_APP_TEMPLATE_CLEAN")
+            .env_remove("STUB_ACTIVE_HAS_REFS")
+            .env_remove("STUB_SIDECAR_REDIS_REF")
             .env_remove("STUB_PATCH_PENDING");
         if args.contains(&"--remove-credentials") {
             command.env_remove("IMAGE_TAG");
@@ -3825,6 +3848,46 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_removes_sidecar_redis_refs_without_redis() {
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[("STUB_APP_REDIS", "1"), ("STUB_SIDECAR_REDIS_REF", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(!patches[0].contains("SIDECAR_REDIS"), "{}", patches[0]);
+        assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_without_redis_on_a_scale_rule_ref() {
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[
+                ("STUB_APP_REDIS", "1"),
+                ("STUB_SCALE_SECRET_REF", "redis-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_waits_until_redis_url_is_gone() {
         let Some((status, calls, _)) = run_azure_cutover(
             "acr.azurecr.io/app:t0",
@@ -3907,7 +3970,10 @@ esac
             "Provisioned",
             false,
             0,
-            &[("STUB_APP_LEGACY", "1"), ("STUB_SCALE_SECRET_REF", "1")],
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_SCALE_SECRET_REF", "database-url"),
+            ],
         ) else {
             return;
         };
@@ -4006,6 +4072,41 @@ esac
             "{stage1}"
         );
         assert!(!stage1.contains("acr.azurecr.io/app:t1"), "{stage1}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_retries_an_interrupted_credential_removal() {
+        // An earlier --remove-credentials run sent its stage 1 PATCH: the
+        // template is clean, but the active revision still refers to the
+        // secrets. The retry must wait for the clean revision first.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_HAS_REFS", "1"),
+                ("STUB_LATEST", "app--clean"),
+                ("STUB_ACTIVE_LAG", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert_eq!(bodies.lines().count(), 1, "{bodies}");
+        assert!(!bodies.contains("\"template\""), "{bodies}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[..patch_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 4,
+            "stage 2 must wait until the clean revision is the only active one: {calls}"
+        );
     }
 
     #[cfg(unix)]
