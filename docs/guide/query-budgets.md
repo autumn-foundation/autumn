@@ -181,8 +181,8 @@ The analysis follows the handle through every name that holds it:
     `lazy.expect("…").checkout()` instead.
   - A method or function given a handle may store it: after
     `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. A
-    store through a `&mut` alias (`let slot = &mut list; slot.push(repo);`)
-    is a store into `list`. A callback stores what it returns (`slot.get_or_insert_with(|| &repo)`).
+    store or an assignment through a `&mut` alias (`let slot = &mut list;
+    slot.push(repo);`, `*slot = …`) is a store into `list`. A callback stores what it returns (`slot.get_or_insert_with(|| &repo)`).
     Every method on a user struct that holds a handle (`ctx.clear()` on
     `Ctx { repo }`) is reported too.
   - A callback's result holds what the callback returns, whatever the
@@ -194,7 +194,8 @@ The analysis follows the handle through every name that holds it:
     default and callback give: `Some(repo).map_or(0, |_| 1)` is plain. A
     callback on a `Result` parameter gets only its side: in
     `result.map_err(|e| …)`, `e` is the error, not the handle. `result.ok()`
-    and `result.err()` also give only their side.
+    and `result.err()` also give only their side, and `result.map(|_| 1)`
+    keeps only the `Err` side.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
     `Option<Vec<…>>`, `[ctx]`, `repos.chunks(2)`, or
     `repos.iter().map(|r| Ctx { repo: r })`) keeps that shape for all its
@@ -223,7 +224,9 @@ negative ships an N+1 to production.
   one-query finder. An awaited constructor of a handle type
   (`PgPostRepository::new(&mut db).await`) is reported too: an `async fn` can
   run queries. This is also true when the `.await` comes later
-  (`let pending = PgPostRepository::new(&mut db); pending.await`).
+  (`let pending = PgPostRepository::new(&mut db); pending.await`). An
+  `.await` on any value that holds a handle is reported, unless the value is
+  a query or accessor on a handle, a call, or an `async` block.
 - **A macro body that `await`s while naming the handle** — `html! { …
   (fetch(&mut db).await?) … }`. A macro body is token soup to `syn`. A template
   that merely *passes* the handle to a render helper is fine: only an `await`

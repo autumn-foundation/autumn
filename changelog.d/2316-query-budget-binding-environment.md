@@ -44,6 +44,10 @@
   such as a repository, may run its callback many times and hand it a
   connection. The callback's `conn` is now a handle. Before, a query through
   it was not counted (#2316).
+- **query budgets:** an `.await` on a value that holds a handle is reported,
+  unless the value is a query or accessor on a handle, a call, or an `async`
+  block. An `async` constructor stored before its `.await`
+  (`let pending = PgPostRepository::new(&mut db);`) is no longer free (#2316).
 - **query budgets:** `#[query_cost]` and `#[query_exempt]` on an assignment
   or compound-assignment statement (`=`, `+=`) now apply, as in
   `#[query_cost(2)] links = load_links(&mut db).await?;`. Before, they were

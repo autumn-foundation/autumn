@@ -112,6 +112,7 @@ const AT_MOST_ONCE_CLOSURE_METHODS: &[&str] = &[
     "or_else",
     "filter",
     "inspect",
+    "inspect_err",
     "is_some_and",
     "is_none_or",
     "is_ok_and",
@@ -423,6 +424,7 @@ const CARRIER_METHODS: &[&str] = &[
     "find",
     "find_map",
     "inspect",
+    "inspect_err",
     "step_by",
     "chunks",
     "windows",
@@ -669,6 +671,7 @@ const OPTION_METHODS: &[&str] = &[
     "as_mut",
     "iter",
     "into_iter",
+    "inspect",
 ];
 
 /// An `Option` of a reference also has `cloned`, `copied` and `as_deref`. On
@@ -704,6 +707,7 @@ const OPTION_REF_METHODS: &[&str] = &[
     "cloned",
     "copied",
     "as_deref",
+    "inspect",
 ];
 
 const RESULT_METHODS: &[&str] = &[
@@ -730,6 +734,8 @@ const RESULT_METHODS: &[&str] = &[
     "as_mut",
     "iter",
     "into_iter",
+    "inspect",
+    "inspect_err",
 ];
 
 const MAP_METHODS: &[&str] = &[
@@ -1450,10 +1456,13 @@ struct Binding {
     /// The name a `&mut` binding points to: `slot` in `let slot = &mut
     /// repos;` points to `repos`.
     referent: Option<String>,
-    /// A handle constructor handed the handle and not awaited yet: `let
-    /// pending = PgPostRepository::new(&mut db);`. An `async fn new` can run
-    /// queries, so `pending.await` is reported.
-    deferred: bool,
+    /// A known future: `.await` on it runs what it names. A name bound to
+    /// anything else that holds a handle (`PgPostRepository::new(&mut db)`,
+    /// an `async fn new`) is reported when it is awaited.
+    future: bool,
+    /// What `.await` on an `async` block gives: `let pending = async {
+    /// &repo };`.
+    output: Option<Kind>,
     /// The shape of a part, when known: a part of an `Option<Db>` is a `Db`.
     inner: Option<Shape>,
 }
@@ -1465,7 +1474,8 @@ impl Binding {
             parts: None,
             shape: None,
             referent: None,
-            deferred: false,
+            future: false,
+            output: None,
             inner: None,
         }
     }
@@ -1506,7 +1516,8 @@ impl Binding {
             parts,
             shape,
             referent: self.referent.clone().or_else(|| other.referent.clone()),
-            deferred: self.deferred || other.deferred,
+            future: self.future && other.future,
+            output: self.output.max(other.output),
             inner: if self.inner == other.inner {
                 self.inner
             } else {
@@ -2030,19 +2041,38 @@ impl Analyzer {
             parts,
             shape: self.shape_of(init),
             referent: self.referent_of(init),
-            deferred: self.is_deferred(init),
+            future: self.is_known_future(init),
+            output: match peel_parens(init) {
+                Expr::Async(a) => Some(self.async_output(&a.block)),
+                other => path_ident(other).and_then(|name| self.env.binding(&name).output),
+            },
             inner: path_ident(peel_parens(init)).and_then(|name| self.env.binding(&name).inner),
         }
     }
 
-    /// Is `e` a handle constructor handed the handle, or a name bound to one?
-    fn is_deferred(&self, e: &Expr) -> bool {
-        match peel_parens(e) {
-            Expr::Call(call) => {
-                is_handle_constructor(call) && call.args.iter().any(|a| self.expr_carries_handle(a))
+    /// Is `e` a known future: a query or accessor on a handle
+    /// (`repo.find_all()`, `ctx.conn()`), a call that is not a handle
+    /// constructor, an `async` block, a macro, or a name bound to one?
+    fn is_known_future(&self, e: &Expr) -> bool {
+        let e = peel_parens(e);
+        match e {
+            Expr::MethodCall(mc) => {
+                let method = mc.method.to_string();
+                self.chain_root_is_handle(e)
+                    || HANDLE_ACCESSORS.contains(&method.as_str())
+                    || HANDLE_TRANSITIONS.contains(&method.as_str())
             }
-            other => path_ident(other).is_some_and(|name| self.env.binding(&name).deferred),
+            Expr::Call(call) => !is_handle_constructor(call),
+            Expr::Async(_) | Expr::Macro(_) => true,
+            other => path_ident(other).is_some_and(|name| self.env.binding(&name).future),
         }
+    }
+
+    /// What `.await` on `async { block }` gives.
+    fn async_output(&self, block: &Block) -> Kind {
+        let mut probe = self.probe();
+        let tail = probe.block_value(block);
+        tail.max(probe.returned)
     }
 
     /// The name that `init` points to when it is a `&mut` place or a `&mut`
@@ -2121,8 +2151,7 @@ impl Analyzer {
                 let deref = matches!(place, Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)));
                 if let Some(root) = place_root(place) {
                     let held = if deref { kind } else { Kind::Holder };
-                    let kind = self.env.get(&root).max(held);
-                    self.env.assign(root, Binding::of(kind));
+                    self.raise(root, held);
                 }
             }
         }
@@ -2365,19 +2394,24 @@ impl Analyzer {
     #[allow(clippy::too_many_lines)]
     fn expr_in(&mut self, expr: &Expr, awaited: bool) -> Flow {
         match expr {
-            // `pending.await` on `let pending = Repo::new(&mut db);`. A direct
-            // `Repo::new(&mut db).await` is reported by `call`.
-            Expr::Await(e)
-                if matches!(peel_parens(&e.base), Expr::Path(_)) && self.is_deferred(&e.base) =>
-            {
-                Flow::cost(Cost::unbounded(
+            Expr::Await(e) => {
+                let flow = self.expr_in(&e.base, true);
+                // `.await` on a value that holds a handle and is not a known
+                // future: `PgPostRepository::new(&mut db)` stored, then
+                // awaited. A base that is already reported keeps its reason.
+                if matches!(flow.fall, Some(Cost::Unbounded(_)))
+                    || self.is_known_future(&e.base)
+                    || self.value_of(&e.base) == Kind::Plain
+                {
+                    return flow;
+                }
+                flow.then(Flow::cost(Cost::unbounded(
                     e.span(),
-                    "this awaits a constructor that was handed the database handle, and an \
-                     `async` constructor can run any number of queries",
+                    "this awaits a value that holds the database handle, such as an `async` \
+                     constructor, and what it runs is another function's business",
                     DECLARE_HINT,
-                ))
+                )))
             }
-            Expr::Await(e) => self.expr_in(&e.base, true),
             Expr::Try(e) => {
                 let flow = self.expr_in(&e.expr, awaited);
                 self.exit_body();
@@ -3369,7 +3403,12 @@ impl Analyzer {
         } else {
             Kind::Nested
         };
-        // A store through `slot = &mut repos` is a store into `repos` too.
+        self.raise(root, kind);
+    }
+
+    /// `root` now holds at least `kind`. A store through `slot = &mut repos`
+    /// is a store into `repos` too.
+    fn raise(&mut self, root: String, kind: Kind) {
         let mut next = Some(root);
         for _ in 0..8 {
             let Some(root) = next.take() else { break };
@@ -3549,13 +3588,9 @@ impl Analyzer {
                 })
             }
             Expr::Await(a) => match peel_parens(&a.base) {
-                // `pending.await` on `let pending = Repo::new(&mut db);`.
-                base @ Expr::Path(_) if self.is_deferred(base) => Some(Kind::Handle),
-                Expr::Async(block) => {
-                    let mut probe = self.probe();
-                    let tail = probe.block_value(&block.block);
-                    Some(tail.max(probe.returned))
-                }
+                // `pending.await` on `let pending = async { &repo };`.
+                base @ Expr::Path(_) => self.env.binding(&path_ident(base)?).output,
+                Expr::Async(block) => Some(self.async_output(&block.block)),
                 Expr::Call(call) => self.invoked(call, true),
                 _ => None,
             },
@@ -3697,6 +3732,12 @@ impl Analyzer {
             }
             // A closure that captures a handle holds it, like a user value.
             Expr::Closure(c) => self.closure_captures_handle(c),
+            // A future that gives a handle holds it: `async { &repo }`.
+            Expr::Async(a) => {
+                tokens_mention_any(&a.block.to_token_stream(), &|name| {
+                    self.env.is_tracked(name)
+                }) && self.async_output(&a.block) != Kind::Plain
+            }
             Expr::Reference(r) => self.expr_is_holder(&r.expr),
             Expr::Paren(p) => self.expr_is_holder(&p.expr),
             Expr::Group(g) => self.expr_is_holder(&g.expr),
@@ -3801,6 +3842,23 @@ impl Analyzer {
                 "and_then" => matches!(shape, Some(Shape::Opt | Shape::OptRef)),
                 _ => false,
             }
+            || self.keeps_plain_side(mc)
+    }
+
+    /// Does `mc` map one side of a named `Result` and keep a side that is
+    /// plain? `result.map(|_| 1)` keeps the `Err` side.
+    fn keeps_plain_side(&self, mc: &ExprMethodCall) -> bool {
+        if self.shape_of(&mc.receiver) != Some(Shape::Res) {
+            return false;
+        }
+        let kept = match mc.method.to_string().as_str() {
+            "map" | "and_then" => "Err",
+            "map_err" | "or_else" => "Ok",
+            _ => return false,
+        };
+        path_ident(peel_parens(&mc.receiver))
+            .and_then(|name| self.env.part(&name, kept))
+            .is_some_and(|kind| kind == Kind::Plain)
     }
 
     /// What callback `arg` of `mc` takes when the receiver is a named
@@ -8877,6 +8935,78 @@ mod tests {
     }
 
     #[test]
+    fn awaits_deref_stores_result_maps_and_inspect() {
+        check_handlers(&[
+            (
+                "a stored async block gives its output when awaited",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = async { &repo }; let r = pending.await; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "an async block in a container is opaque when awaited",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let wrapped = Some(async { &repo }); let r = wrapped.unwrap().await; let _ = r; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a deferred constructor in a container is opaque when awaited",
+                "async fn h(db: Db) -> AutumnResult<usize> { \
+                 let pending = PgPostRepository::new(&mut db); let wrapped = Some(pending); let repo = wrapped.unwrap().await; let _ = repo; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a deferred query future is counted once",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = repo.find_all(); let _ = pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a deferred accessor future in a let chain stays free",
+                "async fn h(ctx: Ctx) -> AutumnResult<usize> { \
+                 let pending = ctx.conn(); let again = pending; let db = again.await?; let _ = db; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a dereference assignment reaches the referent",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut saved = None; let slot = &mut saved; *slot = Some(repo); let _ = saved.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "map on a Result drops the handle side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let status = result.map(|_| 1); render(status); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "map_err on a Result keeps the handle side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let kept = result.map_err(|_| 1); render(kept); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map_err on a Result drops a plain value side",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let status = result.map_err(|_| 1); render(status); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "inspect on an Option is a known method",
+                "async fn h(maybe: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 let kept = maybe.inspect(|_| {}); let _ = kept.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "inspect_err on a Result is a known method",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let kept = result.inspect_err(|_| {}); let _ = kept.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
     fn each_container_type_has_its_own_methods() {
         // `(parameter type, call)`: the type has no such method, so an
         // extension trait gives it, and it may query.
@@ -8904,7 +9034,7 @@ mod tests {
         let handler = |ty: &str, call: &str| {
             format!(
                 "async fn h(mut repos: {ty}, other: PgPostRepository) -> AutumnResult<usize> \
-                 {{ let _ = {call}.await; Ok(0) }}"
+                 {{ let _ = {call}; Ok(0) }}"
             )
         };
         // `VecDeque::remove` gives an `Option` of the handle.
