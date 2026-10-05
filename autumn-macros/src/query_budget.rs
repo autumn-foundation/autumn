@@ -3414,10 +3414,9 @@ impl Analyzer {
     fn known_container_method(&self, receiver: &Expr, method: &str, args: usize) -> bool {
         !self.expr_is_holder(receiver)
             && !self.expr_is_nested(receiver)
-            && std_arities(method).contains(&args)
-            && self
-                .shape_of(receiver)
-                .is_some_and(|shape| shape.has(method))
+            && self.shape_of(receiver).is_some_and(|shape| {
+                shape.has(method) && std_arities(shape, method).contains(&args)
+            })
     }
 
     /// `receiver.method(arg)` may store `arg` in `receiver`. When an argument
@@ -4529,14 +4528,25 @@ fn is_container_constructor(call: &ExprCall) -> bool {
         })
 }
 
-/// The argument counts of the standard container method `method`. A call
-/// with another count is a trait method of that name: `repos.push()`.
-fn std_arities(method: &str) -> &'static [usize] {
+/// The argument counts of the method `method` of the standard container
+/// `shape`. A call with another count is a trait method of that name:
+/// `repos.push()`, or `repos.insert(id)` on a `Vec`.
+fn std_arities(shape: Shape, method: &str) -> &'static [usize] {
+    let keyed = matches!(shape, Shape::Map | Shape::SortedMap);
+    let sequence = matches!(
+        shape,
+        Shape::Vec | Shape::Deque | Shape::Slice | Shape::Array
+    );
     match method {
-        "drain" | "take" => &[0, 1],
-        "insert" => &[1, 2],
+        // `Vec::insert(i, x)`, `HashMap::insert(k, v)`; `HashSet::insert(x)`.
+        "insert" if sequence || keyed => &[2],
+        // `Vec::drain(range)`; `HashMap::drain()`.
+        "drain" if sequence => &[1],
+        // `Iterator::take(n)`; `Option::take()`.
+        "take" if matches!(shape, Shape::Iter | Shape::IterRef) => &[1],
         "fold" | "try_fold" | "map_or" | "map_or_else" | "swap" | "resize" => &[2],
-        "all"
+        "insert"
+        | "all"
         | "any"
         | "and_then"
         | "append"
@@ -9539,6 +9549,30 @@ mod tests {
                 "guard: push with one argument is a known method",
                 "async fn h(repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut all = repos; all.push(repo); let _ = all.len(); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a Vec insert with one argument is opaque",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 repos.insert(1).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an Option take with an argument is opaque",
+                "async fn h(maybe: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 maybe.take(1).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a set insert with one argument is known",
+                "async fn h(ids: HashSet<i64>, repos: HashSet<PgPostRepository>) -> AutumnResult<usize> { \
+                 let mut all = repos; let _ = all.insert(1); let _ = ids; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a Vec insert with two arguments is known",
+                "async fn h(repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut all = repos; all.insert(0, repo); let _ = all.len(); Ok(0) }",
                 Expect::Exact(0),
             ),
             (
