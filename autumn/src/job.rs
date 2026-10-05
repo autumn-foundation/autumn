@@ -4785,6 +4785,7 @@ pub fn start_runtime(
     })?;
 
     crate::job_tracking::ensure_tracking_store_installed_from_config(state, config);
+    warn_deferrable_jobs_not_deferred(&jobs, &config.backend);
 
     match config.backend.as_str() {
         "local" => {
@@ -5318,6 +5319,27 @@ pub(crate) fn start_local_runtime_inner(
     }
 }
 
+/// Warn when a `#[job(deferrable)]` job runs on a backend that does not defer.
+///
+/// Only the `local` backend defers jobs in this slice (issue #1720). On the
+/// durable backends the job runs as usual, so say so at boot rather than fail
+/// silently.
+fn warn_deferrable_jobs_not_deferred(jobs: &[JobInfo], backend: &str) {
+    if backend == "local" {
+        return;
+    }
+    for job in jobs {
+        if crate::cost::is_deferrable(crate::cost::WorkKind::Job, &job.name) {
+            tracing::warn!(
+                job = %job.name,
+                backend,
+                "job is deferrable, but this jobs backend does not defer; it runs \
+                 when the cost signal is high. Only `local` defers jobs"
+            );
+        }
+    }
+}
+
 /// Whether this process should evaluate queue-pin coverage and emit the AC6
 /// startup diagnostic (issue #1623). Only worker/combined roles
 /// (`run_workers == true`) claim queues, so a web replica (`run_workers ==
@@ -5624,6 +5646,23 @@ async fn execute_local_job(
         .await;
         return;
     };
+
+    // Cost gate (issue #1720): a deferrable job waits while the cost signal is
+    // high. It has not started, so it holds no slot and uses no attempt. It
+    // goes back on the queue after the recheck interval, so it is never
+    // dropped. Its queued gauge stays as it is until it starts.
+    if let Some(signal) = crate::cost::deferral_signal(state, crate::cost::WorkKind::Job, &job.name)
+    {
+        crate::cost::note_deferral(&signal);
+        tracing::debug!(job = %job.name, value = signal.value(), "cost signal is high; job deferred");
+        let sender = tx.clone();
+        let recheck = signal.recheck();
+        tokio::spawn(async move {
+            tokio::time::sleep(recheck).await;
+            let _ = sender.send(job).await;
+        });
+        return;
+    }
 
     // Concurrency gate: park the job when its group is saturated. Parked jobs
     // keep their enqueued status and resume when release_slot pops them.

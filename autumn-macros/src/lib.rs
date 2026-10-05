@@ -588,6 +588,15 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
 /// #[scheduled(cron = "0 0 0 * * *", name = "nightly")]
 /// async fn nightly(state: AppState) -> AutumnResult<()> { Ok(()) }
 /// ```
+///
+/// Add `deferrable` to let a task wait while the cost signal is high
+/// (`[cost] defer_threshold`). The tick runs when the signal falls. Ticks in
+/// the window fold into one run. See `docs/guide/cost.md`.
+///
+/// ```ignore
+/// #[scheduled(every = "15m", deferrable)]
+/// async fn compact(state: AppState) -> AutumnResult<()> { Ok(()) }
+/// ```
 #[proc_macro_attribute]
 pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (crate_override, attr) =
@@ -634,6 +643,18 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// let handle = ExportOrdersJob::enqueue_tracked(ExportArgs { account_id: 1 }).await?;
 /// println!("poll at {}", handle.status_path());
+/// ```
+///
+/// Add `deferrable` to let a job wait while the cost signal is high
+/// (`[cost] defer_threshold`). The job runs when the signal falls. It is never
+/// dropped and uses no attempt while it waits. The `local` backend supports
+/// it. See `docs/guide/cost.md`.
+///
+/// ```ignore
+/// #[job(deferrable)]
+/// async fn rebuild_search_index(state: AppState, args: RebuildArgs) -> AutumnResult<()> {
+///     Ok(())
+/// }
 /// ```
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {

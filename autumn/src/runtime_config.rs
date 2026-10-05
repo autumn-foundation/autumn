@@ -713,7 +713,33 @@ impl ConfigRegistry {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// Declare the framework cost-signal key, [`COST_SIGNAL_KEY`].
+    ///
+    /// The key is a `Float` with the default `0.0` and must be `>= 0`. Change
+    /// it with `autumn config set autumn_cost_signal <value>`. The app reads
+    /// the new value without a redeploy. See [`crate::cost::CostSignal`].
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::DuplicateKey`] when the key is already declared.
+    pub fn define_cost_signal(&mut self) -> Result<(), RegistryError> {
+        self.define(
+            ConfigKeySchema::new(COST_SIGNAL_KEY, ConfigValueType::Float, ConfigValue::Float(0.0))
+                .description("Live cost signal: carbon g/kWh or price per unit (issue #1720)")
+                .validator(ConfigValidator::FloatRange {
+                    min: Some(0.0),
+                    max: None,
+                }),
+        )
+    }
 }
+
+/// The runtime-config key of the live cost signal (issue #1720).
+///
+/// The value is carbon intensity (g/kWh) or a price per unit. The unit is
+/// your choice. Declare it with [`ConfigRegistry::define_cost_signal`].
+pub const COST_SIGNAL_KEY: &str = "autumn_cost_signal";
 
 fn is_valid_key_name(name: &str) -> bool {
     if name.is_empty() {

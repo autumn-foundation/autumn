@@ -403,6 +403,19 @@ pub trait ProvideActuatorState {
     fn shadow(&self) -> Option<crate::shadow::ShadowHandle> {
         None
     }
+
+    /// Returns the cost signal and the cost accountant (issue #1720).
+    ///
+    /// The default returns `(None, None)`. `{prefix}/cost` then reports
+    /// `"enabled": false`.
+    fn cost_plane(
+        &self,
+    ) -> (
+        Option<crate::cost::CostSignal>,
+        Option<crate::cost::CostAccountant>,
+    ) {
+        (None, None)
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -4229,6 +4242,27 @@ fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
     )
 }
 
+/// `GET <actuator-prefix>/cost` -- the cost signal and the cost total for
+/// each tenant (issue #1720).
+///
+/// Sensitive-gated: tenant ids and their costs are not public. With
+/// `[cost] enabled = false` the endpoint answers `{"enabled": false, ...}`.
+pub(crate) async fn cost_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let (signal, accountant) = state.cost_plane();
+    let snapshot = accountant
+        .as_ref()
+        .map(crate::cost::CostAccountant::snapshot)
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "enabled": accountant.is_some(),
+        "signal": signal.map(|signal| signal.snapshot()),
+        "total": snapshot.total,
+        "tenants": snapshot.tenants,
+    }))
+}
+
 /// `GET <actuator-prefix>/shadow` -- shadow-mirroring counters and the most
 /// recent primary-vs-shadow divergences (issue #1653).
 ///
@@ -4610,6 +4644,7 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/shadow"));
+        paths.push(actuator_route_path(prefix, "/cost"));
         paths.push(actuator_route_path(prefix, "/graph"));
         #[cfg(feature = "db")]
         {
@@ -4763,6 +4798,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/shadow"),
                 axum::routing::get(shadow_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/cost"),
+                axum::routing::get(cost_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/graph"),

@@ -257,6 +257,16 @@ pub fn snapshot() -> Option<LogFields> {
     current().map(|ctx| ctx.snapshot())
 }
 
+/// The tenant id of the current request context, if any.
+///
+/// Cheaper than [`snapshot`]: it copies only the tenant id.
+pub(crate) fn current_tenant_id() -> Option<String> {
+    CURRENT
+        .try_with(|ctx| ctx.inner.read().ok().and_then(|g| g.tenant_id.clone()))
+        .ok()
+        .flatten()
+}
+
 /// Attach a custom field to the current request context.
 ///
 /// No-op when called outside of a request (no context installed).

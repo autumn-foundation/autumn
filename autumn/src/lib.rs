@@ -166,6 +166,7 @@ pub mod consent;
 pub mod confidential;
 #[cfg(feature = "constela")]
 pub mod constela;
+pub mod cost;
 pub mod credentials;
 pub mod current;
 pub mod custom_domain;

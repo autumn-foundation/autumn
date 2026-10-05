@@ -4467,6 +4467,7 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        crate::cost::install(&state, &config.cost);
         // A live-state block that could not be installed is a refusal to start,
         // not a silent fallback: the previous build is still serving and still
         // holds the only copy of that state (#1674). Checked here, in async
@@ -6392,6 +6393,7 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        crate::cost::install(&state, &config.cost);
         // Static generation has no job runtime, so register only sync listeners.
         // Durable listeners are dropped entirely (not just their jobs) so a
         // static route publishing such an event is a clean no-op for the durable
@@ -7759,6 +7761,7 @@ impl AppBuilder {
         #[cfg(feature = "storage")]
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
         run_state_initializers(state_initializers, &state);
+        crate::cost::install(&state, &config.cost);
         finalize_event_bus(listeners, &mut jobs, &state);
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
@@ -8139,6 +8142,7 @@ impl AppBuilder {
 
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        crate::cost::install(&state, &config.cost);
         // Durable listeners need the job runtime this path never starts, so —
         // as in static builds — only sync listeners are registered, and a
         // durable side effect is a clean no-op.
@@ -8860,6 +8864,18 @@ pub(crate) fn start_task_scheduler_with_config(
                         tokio::select! {
                             () = shutdown.cancelled() => break,
                             () = tokio::time::sleep(delay) => {
+                                // Cost gate (#1720): wait before the lease, so a
+                                // waiting task holds none.
+                                if !crate::cost::wait_while_deferred(
+                                    &state,
+                                    crate::cost::WorkKind::Task,
+                                    &name,
+                                    &shutdown,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
                                 execute_fixed_delay_task(
                                     name.clone(),
                                     state.clone(),
@@ -9277,6 +9293,19 @@ async fn run_cron_task_loop(
                         tracing::error!(task = %name, expression = %expression, error = %error, "Failed to evaluate cron tick lateness");
                         return;
                     }
+                }
+                // Cost gate (#1720): wait here, before the lease. The next
+                // tick is found from the time the wait ends, so the ticks in
+                // the window fold into this one run.
+                if !crate::cost::wait_while_deferred(
+                    &state,
+                    crate::cost::WorkKind::Task,
+                    &name,
+                    &shutdown,
+                )
+                .await
+                {
+                    break;
                 }
                 let scheduled_unix_secs = u64::try_from(scheduled_at.timestamp()).unwrap_or_default();
                 tokio::spawn(execute_cron_task(

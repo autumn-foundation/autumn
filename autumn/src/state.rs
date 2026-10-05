@@ -1221,6 +1221,20 @@ impl crate::actuator::ProvideActuatorState for AppState {
             .map(|handle| (*handle).clone())
     }
 
+    fn cost_plane(
+        &self,
+    ) -> (
+        Option<crate::cost::CostSignal>,
+        Option<crate::cost::CostAccountant>,
+    ) {
+        (
+            self.extension::<crate::cost::CostSignal>()
+                .map(|signal| (*signal).clone()),
+            self.extension::<crate::cost::CostAccountant>()
+                .map(|accountant| (*accountant).clone()),
+        )
+    }
+
     fn deploy_version(&self) -> String {
         self.extension::<crate::canary::CanaryState>().map_or_else(
             || crate::canary::STABLE.to_owned(),

@@ -370,6 +370,13 @@ as every other durable backend.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
   during the backoff window does not drop the job.
 
+## Cost-aware deferral
+
+Mark a job `#[job(deferrable)]` to let it wait while the cost signal is above
+`[cost] defer_threshold`. The job runs when the signal falls. It is never
+dropped and uses no attempt while it waits. Only the `local` backend defers
+jobs. See [Request Cost and Carbon-Aware Deferral](cost.md).
+
 ## Job priorities
 
 By default every job drains from a single FIFO queue, so a flood of low-value
