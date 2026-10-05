@@ -753,11 +753,13 @@ fn invalidations_dimension(mutations: &[Mutation]) -> Dimension<ManifestInvalida
         source: "macro:#[repository(..., invalidates(...))]".to_string(),
         runtime_caveat: "the edge's target is proven — `invalidates(path)` resolves to the \
                          `#[cached]` function's own generated id constant, so rustc rejects a \
-                         path that names anything else. That the invalidator is actually CALLED \
-                         on the write path is not proven by this slice: the generated \
-                         `Repository::invalidate_declared_caches()` helper must be invoked by the \
-                         app (or a commit hook). Automatic invocation is deliberately out of the \
-                         first slice — see docs/guide/cache-coherence.md."
+                         path that names anything else. Each generated write method calls the \
+                         invalidator after its own transaction commits (#3056), and a durable \
+                         commit-hook row retries it when `commit_hooks` is on. Not proven: that \
+                         the backend sweep succeeds (a failure is logged and counted in \
+                         `autumn_cache_invalidation_failures_total`), and that no fill on \
+                         another replica writes an old value back — see \
+                         docs/guide/cache-coherence.md."
             .to_string(),
         entries,
     }
@@ -792,9 +794,9 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
         ExcludedDimension {
             dimension: "invalidation_call_sites".to_string(),
             eventual_provenance: "provable".to_string(),
-            reason: "whether the declared invalidator actually runs on the write path is carried \
-                     as the invalidations dimension's runtime_caveat; wiring it automatically \
-                     through repository commit hooks is the next slice"
+            reason: "generated write methods call the declared invalidator after they commit \
+                     (#3056); what that does not prove is carried as the invalidations \
+                     dimension's runtime_caveat"
                 .to_string(),
         },
         ExcludedDimension {
@@ -1237,47 +1239,9 @@ pub fn with_fill_fence<R>(
 /// # Panics
 ///
 /// Panics if the internal `RwLock` is poisoned.
+#[must_use = "a `false` means stale entries can still be served"]
 pub fn invalidate_namespace(namespace: &str) -> bool {
-    // Bump the epoch FIRST, so a fill already computing is fenced out before
-    // anything is cleared — the other order leaves a window where a fill both
-    // passes the fence and lands after the clear.
-    //
-    // The bump happens under the fill fence held EXCLUSIVELY, which is what
-    // makes it atomic with respect to a concurrent `with_fill_fence`: that fill
-    // either completes its check-and-insert before this bump (and the clear
-    // below removes what it wrote) or observes the bump and skips its insert.
-    // Comparing epochs without this mutual exclusion leaves the window where a
-    // fill passes the check, this invalidation bumps and clears, and the fill's
-    // insert lands afterwards.
-    //
-    // Only the bump is exclusive. Clone the handles out and DROP both guards
-    // before calling into any backend: `clear()` can be a network round-trip,
-    // and `register_namespace_store` is public with `Cache` user-implementable,
-    // so a `clear()` that happens to call a `#[cached]` function would otherwise
-    // re-enter these non-reentrant `RwLock`s and deadlock. Releasing early is
-    // safe — the ordering argument needs only the bump to be indivisible, and
-    // every clear follows it.
-    let dedicated: Vec<std::sync::Arc<dyn super::Cache>> = {
-        let fence = FILL_FENCE
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let guard = NAMESPACES
-            .read()
-            .expect("cache namespace store lock poisoned");
-        let stores = guard
-            .as_ref()
-            .and_then(|map| map.get(namespace))
-            .map_or_else(Vec::new, |entry| {
-                entry
-                    .epoch
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                entry.stores.clone()
-            });
-        drop(guard);
-        drop(fence);
-        stores
-    };
-    for store in dedicated {
+    for store in fence_and_collect_stores(namespace) {
         store.clear();
     }
 
@@ -1286,7 +1250,197 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
     // function store holds nothing. Ask the backend — `MokaCache` and
     // `RedisCache` both drop the namespace; a backend that cannot, or one whose
     // sweep failed, says so, and that `false` is what the caller reports.
-    super::global_cache().is_none_or(|global| global.invalidate_namespace(namespace))
+    super::global_cache().is_none_or(|global| {
+        let complete = global.invalidate_namespace(namespace);
+        if !complete {
+            report_incomplete_invalidation(
+                namespace,
+                "the backend cannot drop a namespace, or its sweep failed",
+            );
+        }
+        complete
+    })
+}
+
+/// Async form of [`invalidate_namespace`], with the same contract.
+///
+/// The epoch bump and the local store clears are the same. The wait for the
+/// fill fence runs on the blocking pool. The backend call is
+/// [`Cache::invalidate_namespace_async`](super::Cache::invalidate_namespace_async),
+/// so a network backend (Redis) does not block a runtime worker and works on a
+/// current-thread runtime.
+///
+/// A `false` result is also logged with `warn!` and counted in
+/// `autumn_cache_invalidation_failures_total`.
+#[must_use = "a `false` means stale entries can still be served"]
+pub async fn invalidate_namespace_async(namespace: &str) -> bool {
+    // The fence is a std `RwLock`. A fill holds it shared during its insert,
+    // which can be a Redis round trip. Take it at once when it is free. Else
+    // wait for it on the blocking pool, so a writer never parks a runtime
+    // worker (and so never starves the task that the fill waits on).
+    let stores = if let Some(stores) = try_fence_and_collect_stores(namespace) {
+        stores
+    } else {
+        let owned = namespace.to_owned();
+        match tokio::task::spawn_blocking(move || fence_and_collect_stores(&owned)).await {
+            Ok(stores) => stores,
+            Err(join) => match join.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(_cancelled) => {
+                    report_incomplete_invalidation(namespace, "the runtime is shutting down");
+                    return false;
+                }
+            },
+        }
+    };
+    for store in stores {
+        store.clear();
+    }
+    let Some(global) = super::global_cache() else {
+        return true;
+    };
+    match global.invalidate_namespace_async(namespace).await {
+        Ok(()) => true,
+        Err(error) => {
+            report_incomplete_invalidation(namespace, error.reason());
+            false
+        }
+    }
+}
+
+/// Runs a repository's declared invalidation once its write ends (#3056).
+///
+/// Generated write methods make one before the write body and call
+/// [`run`](Self::run) after it, on `Ok` and on `Err`: a write can commit and
+/// then fail in an `after_*` hook. The invalidation runs on a spawned task, so
+/// a caller that is dropped while it waits does not stop it.
+///
+/// If the guard drops without `run` (a panic, or a cancelled request), it
+/// spawns the invalidation on the current runtime. Over-invalidation is safe:
+/// the cost is one cache miss. A request cancelled during its `COMMIT` round
+/// trip can invalidate before the server applies the commit. A durable
+/// commit-hook row (`commit_hooks`) covers that case.
+#[doc(hidden)]
+#[must_use = "call `run().await` after the write body"]
+pub struct InvalidateAfterWrite {
+    make: Option<fn() -> super::CacheFuture<'static, bool>>,
+}
+
+impl InvalidateAfterWrite {
+    /// Arm the guard. `make` builds the repository's invalidation future.
+    pub const fn new(make: fn() -> super::CacheFuture<'static, bool>) -> Self {
+        Self { make: Some(make) }
+    }
+
+    /// Run the invalidation now and wait for it.
+    ///
+    /// Returns whether it was complete. A `false` is already logged and
+    /// counted.
+    pub async fn run(mut self) -> bool {
+        let Some(make) = self.make.take() else {
+            return true;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            report_skipped_invalidation("the write ran outside a Tokio runtime");
+            return false;
+        };
+        handle.spawn(make()).await.unwrap_or_else(|_| {
+            report_skipped_invalidation("the invalidation task panicked or was cancelled");
+            false
+        })
+    }
+
+    /// Skip the invalidation: the write wrote nothing (for example a
+    /// `find_or_create_by_*` that found the row).
+    pub fn disarm(mut self) {
+        self.make = None;
+    }
+}
+
+impl Drop for InvalidateAfterWrite {
+    fn drop(&mut self) {
+        let Some(make) = self.make.take() else {
+            return;
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(make());
+        } else {
+            report_skipped_invalidation("the write ended outside a Tokio runtime");
+        }
+    }
+}
+
+/// Log and count a repository invalidation that did not run to its end.
+fn report_skipped_invalidation(reason: &str) {
+    tracing::warn!(
+        reason,
+        "a repository write's declared cache invalidation did not complete; stale entries \
+         can be served until their TTL"
+    );
+    super::record_invalidation_failure();
+}
+
+/// Log and count a namespace invalidation that did not complete.
+fn report_incomplete_invalidation(namespace: &str, reason: &str) {
+    tracing::warn!(
+        namespace,
+        reason,
+        "cache namespace invalidation incomplete; stale entries can be served until their TTL"
+    );
+    super::record_invalidation_failure();
+}
+
+/// Bump the namespace epoch under the exclusive fill fence, and return the
+/// stores registered for it.
+///
+/// The epoch bump comes FIRST. Then a fill that is already computing is
+/// fenced out before the clear. In the other order, a fill can pass the fence
+/// and insert after the clear.
+///
+/// The bump holds the fill fence exclusively. Thus a concurrent
+/// `with_fill_fence` either inserts before the bump, and the clear removes its
+/// value, or it sees the bump and skips its insert.
+///
+/// Only the bump is exclusive. Both guards drop before the caller calls a
+/// backend: `clear()` can be a network round trip, and a `clear()` that calls
+/// a `#[cached]` function would re-enter these `RwLock`s and deadlock.
+fn fence_and_collect_stores(namespace: &str) -> Vec<std::sync::Arc<dyn super::Cache>> {
+    let fence = FILL_FENCE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    bump_and_collect_stores(namespace, fence)
+}
+
+/// [`fence_and_collect_stores`] if the fence is free now, else `None`.
+fn try_fence_and_collect_stores(namespace: &str) -> Option<Vec<std::sync::Arc<dyn super::Cache>>> {
+    let fence = match FILL_FENCE.try_write() {
+        Ok(fence) => fence,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(bump_and_collect_stores(namespace, fence))
+}
+
+/// The epoch bump and store lookup. `fence` is the exclusive fill fence.
+fn bump_and_collect_stores(
+    namespace: &str,
+    fence: std::sync::RwLockWriteGuard<'_, ()>,
+) -> Vec<std::sync::Arc<dyn super::Cache>> {
+    let guard = NAMESPACES
+        .read()
+        .expect("cache namespace store lock poisoned");
+    let stores = guard
+        .as_ref()
+        .and_then(|map| map.get(namespace))
+        .map_or_else(Vec::new, |entry| {
+            entry
+                .epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            entry.stores.clone()
+        });
+    drop(guard);
+    drop(fence);
+    stores
 }
 
 // ── Reading the binary's own registrations ───────────────────────────
@@ -2142,6 +2296,89 @@ mod tests {
         super::super::set_global_cache(std::sync::Arc::new(FailingSweep));
         assert!(!invalidate_namespace("tests::failed_sweep_ns"));
         super::super::clear_global_cache();
+    }
+
+    // ── #3056: async invalidation, surfaced failures ──────────────────
+
+    /// A backend whose namespace sweep always fails.
+    struct RefusingBackend;
+    impl super::super::Cache for RefusingBackend {
+        fn get_value(&self, _key: &str) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(
+            &self,
+            _key: &str,
+            _value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        ) {
+        }
+        fn invalidate(&self, _key: &str) {}
+        fn clear(&self) {}
+        fn invalidate_namespace(&self, _namespace: &str) -> bool {
+            false
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn async_invalidation_with_no_backend_is_complete() {
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+        assert!(block_on(invalidate_namespace_async(
+            "tests::async_no_backend"
+        )));
+    }
+
+    #[test]
+    fn async_invalidation_bumps_the_epoch_first() {
+        let epoch = namespace_epoch("tests::async_epoch");
+        let before = epoch.load(std::sync::atomic::Ordering::Acquire);
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+        assert!(block_on(invalidate_namespace_async("tests::async_epoch")));
+        assert!(
+            epoch.load(std::sync::atomic::Ordering::Acquire) > before,
+            "a fill already in flight must be fenced out"
+        );
+    }
+
+    #[test]
+    fn a_failed_async_invalidation_is_reported_and_counted() {
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::set_global_cache(std::sync::Arc::new(RefusingBackend));
+        let before = super::super::invalidation_failures_total();
+        let complete = block_on(invalidate_namespace_async("tests::async_refused"));
+        let after = super::super::invalidation_failures_total();
+        super::super::clear_global_cache();
+        assert!(!complete, "a refused sweep must not report success");
+        assert!(after > before, "the failure must be counted");
+    }
+
+    #[test]
+    fn a_failed_sync_invalidation_is_counted_too() {
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::set_global_cache(std::sync::Arc::new(RefusingBackend));
+        let before = super::super::invalidation_failures_total();
+        let complete = invalidate_namespace("tests::sync_refused");
+        let after = super::super::invalidation_failures_total();
+        super::super::clear_global_cache();
+        assert!(!complete);
+        assert!(after > before, "the failure must be counted");
     }
 
     // ── declare_cached_read! ─────────────────────────────────────────

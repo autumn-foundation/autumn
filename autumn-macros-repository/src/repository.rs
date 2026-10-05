@@ -277,6 +277,10 @@ pub(crate) struct RepoConfig {
     /// of the coherence gate (#1716). The reason is mandatory and non-blank so
     /// the escape hatch always carries its justification into the manifest.
     acknowledge_stale: Option<String>,
+    /// Set after the trait is parsed: the repository declares at least one
+    /// invalidation edge, at trait or method level (#3056). Each write then
+    /// invalidates after it commits.
+    declared_invalidation_edges: bool,
 }
 
 /// Per-method cache-coherence overrides read off the declared trait (#1716).
@@ -643,6 +647,71 @@ fn reject_orphaned_coherence_attrs(
     ))
 }
 
+/// The generated invalidators for a repository with declared edges (#1716,
+/// #3056): sync, async, and the hidden hook each write runs when it ends.
+fn declared_invalidator(declared_edges: &[syn::Path], pg_name: &Ident) -> TokenStream {
+    // Reference the id CONSTANT, not the generated invalidator function:
+    // a mistyped edge then produces one "cannot find value" error naming
+    // the user's own path, rather than two errors that also leak the
+    // invalidator's mangled name.
+    let ids: Vec<syn::Path> = declared_edges
+        .iter()
+        .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
+        .collect();
+    quote! {
+        impl #pg_name {
+            /// Drop every cached read this repository declares it
+            /// invalidates.
+            ///
+            /// Returns whether every one of them was invalidated
+            /// **completely** — see
+            /// [`autumn_web::cache::coherence::invalidate_namespace`]. It is
+            /// `false` when a registered cache backend cannot drop a
+            /// namespace; the shipped `MokaCache` and `RedisCache` both can.
+            ///
+            /// Each generated write calls the async form when it ends
+            /// (#3056). Call this only for a write that does not use this
+            /// repository. Prefer `invalidate_declared_caches_async`: this
+            /// form blocks on a network backend.
+            #[must_use = "an ignored `false` means the cached value is still being served"]
+            pub fn invalidate_declared_caches() -> bool {
+                let mut __autumn_complete = true;
+                #(
+                    __autumn_complete &=
+                        ::autumn_web::cache::coherence::invalidate_namespace(#ids);
+                )*
+                __autumn_complete
+            }
+
+            /// Async form of `invalidate_declared_caches`, with the same
+            /// result. It does not block a runtime worker. A `false` is also
+            /// logged and counted in `autumn_cache_invalidation_failures_total`.
+            ///
+            /// Each write method of this repository calls it after it
+            /// commits (#3056), so an app does not have to.
+            #[must_use = "an ignored `false` means the cached value is still being served"]
+            pub async fn invalidate_declared_caches_async() -> bool {
+                let mut __autumn_complete = true;
+                #(
+                    __autumn_complete &=
+                        ::autumn_web::cache::coherence::invalidate_namespace_async(#ids).await;
+                )*
+                __autumn_complete
+            }
+
+            /// The invalidation each write runs when it ends (#3056).
+            /// A failure does not fail the write: it is logged and counted
+            /// where it happens.
+            #[doc(hidden)]
+            fn __autumn_invalidate_after_commit()
+                -> ::autumn_web::cache::CacheFuture<'static, bool>
+            {
+                ::std::boxed::Box::pin(Self::invalidate_declared_caches_async())
+            }
+        }
+    }
+}
+
 /// The `inventory` registrations and invalidator this repository publishes for
 /// the cache-coherence manifest (#1716).
 fn generate_coherence_items(
@@ -745,40 +814,7 @@ fn generate_coherence_items(
     let invalidator = if declared_edges.is_empty() {
         quote! {}
     } else {
-        // Reference the id CONSTANT, not the generated invalidator function:
-        // a mistyped edge then produces one "cannot find value" error naming
-        // the user's own path, rather than two errors that also leak the
-        // invalidator's mangled name.
-        let ids: Vec<syn::Path> = declared_edges
-            .iter()
-            .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
-            .collect();
-        quote! {
-            impl #pg_name {
-                /// Drop every cached read this repository declares it
-                /// invalidates.
-                ///
-                /// Returns whether every one of them was invalidated
-                /// **completely** — see
-                /// [`autumn_web::cache::coherence::invalidate_namespace`]. It is
-                /// `false` when a registered cache backend cannot drop a
-                /// namespace; the shipped `MokaCache` and `RedisCache` both can.
-                ///
-                /// Call this after a write (or from a commit hook). The
-                /// build-time gate proves the *edge* is declared and that it
-                /// names a real cached read; it does not prove this function
-                /// runs.
-                #[must_use = "an ignored `false` means the cached value is still being served"]
-                pub fn invalidate_declared_caches() -> bool {
-                    let mut __autumn_complete = true;
-                    #(
-                        __autumn_complete &=
-                            ::autumn_web::cache::coherence::invalidate_namespace(#ids);
-                    )*
-                    __autumn_complete
-                }
-            }
-        }
+        declared_invalidator(&declared_edges, pg_name)
     };
 
     let cascade_submissions =
@@ -1502,6 +1538,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         position,
         invalidates,
         acknowledge_stale,
+        declared_invalidation_edges: false,
     })
 }
 
@@ -2724,6 +2761,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         config.hooks_type = Some(format_ident!("Pg{}InternalHooks", trait_def.ident));
         config.generated_internal_hooks = true;
     }
+
+    // #3056: a declared edge binds invalidation to the commit. An attribute
+    // that does not parse is reported by `generate_coherence_items`.
+    config.declared_invalidation_edges = !config.invalidates.is_empty()
+        || parse_method_coherence_attrs(&trait_def)
+            .is_ok_and(|overrides| overrides.values().any(|o| !o.invalidates.is_empty()));
 
     let model_name = &config.model_name;
     let table_name = &config.table_name;
@@ -5763,7 +5806,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    quote! {
+    let expanded = quote! {
         #coherence_items
 
         /// Generated repository trait with CRUD + derived queries.
@@ -6302,7 +6345,104 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #search_compile_check
 
         #internal_hooks_defn
+    };
+
+    if config.declared_invalidation_edges {
+        let writes = write_method_names(&config, &trait_def);
+        // Also writes, but rolled up for the gate (see `write_method_names`):
+        // the closure of `with_lock`, and the insert of `find_or_create_by_*`.
+        let mut also: Vec<String> = vec!["with_lock".to_owned()];
+        also.extend(trait_def.items.iter().filter_map(|item| match item {
+            TraitItem::Fn(f) if f.sig.ident.to_string().starts_with("find_or_create_by_") => {
+                Some(f.sig.ident.to_string())
+            }
+            _ => None,
+        }));
+        invalidate_after_each_write(expanded, &pg_name, &writes, &also)
+    } else {
+        expanded
     }
+}
+
+/// Make each write method of `pg_name` invalidate the declared cached reads
+/// when it ends (#3056).
+///
+/// A generated write runs and commits its own transaction inside the method
+/// body. So "after the body" is "after the commit". The invalidation runs on
+/// `Ok` and on `Err`: a write can commit and then fail in an `after_*` hook.
+/// A guard also runs it on a panic or a cancelled request. A reader that read
+/// the old row before the commit cannot put it back: the invalidation bumps
+/// the namespace epoch, and the reader's fenced insert then skips.
+///
+/// This function wraps the parsed output, not each body generator. Thus a new
+/// write path cannot skip the wrap. Each name in `writes` must be found, or
+/// this is a compile error. Names in `also` are wrapped when they exist.
+fn invalidate_after_each_write(
+    expanded: TokenStream,
+    pg_name: &Ident,
+    writes: &[String],
+    also: &[String],
+) -> TokenStream {
+    let mut file: syn::File = match syn::parse2(expanded) {
+        Ok(file) => file,
+        Err(err) => return err.to_compile_error(),
+    };
+    let mut wrapped: Vec<String> = Vec::new();
+    for item in &mut file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let is_pg = matches!(&*item_impl.self_ty, syn::Type::Path(ty) if ty.path.is_ident(pg_name));
+        if !is_pg {
+            continue;
+        }
+        for impl_item in &mut item_impl.items {
+            let syn::ImplItem::Fn(method) = impl_item else {
+                continue;
+            };
+            let name = method.sig.ident.to_string();
+            let is_write = writes.contains(&name) || also.contains(&name);
+            if !is_write || method.sig.asyncness.is_none() {
+                continue;
+            }
+            let output = match &method.sig.output {
+                syn::ReturnType::Type(_, ty) => quote! { #ty },
+                syn::ReturnType::Default => quote! { () },
+            };
+            let body = &method.block;
+            // A `find_or_create_by_*` that found the row wrote nothing.
+            let finish = if name.starts_with("find_or_create_by_") {
+                quote! {
+                    if ::core::matches!(&__autumn_write_result, ::core::result::Result::Ok((_, false))) {
+                        __autumn_invalidation.disarm();
+                    } else {
+                        let _ = __autumn_invalidation.run().await;
+                    }
+                }
+            } else {
+                quote! { let _ = __autumn_invalidation.run().await; }
+            };
+            method.block = syn::parse_quote! {{
+                let __autumn_invalidation = ::autumn_web::cache::coherence::InvalidateAfterWrite::new(
+                    #pg_name::__autumn_invalidate_after_commit,
+                );
+                let __autumn_write_result: #output = async #body.await;
+                #finish
+                __autumn_write_result
+            }};
+            wrapped.push(name);
+        }
+    }
+    let missed: Vec<&String> = writes.iter().filter(|w| !wrapped.contains(w)).collect();
+    let mut out = file.into_token_stream();
+    if !missed.is_empty() {
+        let message = format!(
+            "autumn internal error: write method(s) {missed:?} were not found as async methods \
+             of `{pg_name}`, so they would not invalidate the declared cached reads after commit"
+        );
+        out.extend(quote! { ::core::compile_error!(#message); });
+    }
+    out
 }
 
 struct CrudBodies {
@@ -10366,6 +10506,18 @@ fn emit_crud_bodies_hooked(
             )
         };
 
+    // #3056: the durable runner also invalidates, before the user's
+    // `after_*_commit` hook. This covers a crash between the commit and the
+    // inline invalidation. A failure is logged and counted, but it does not
+    // fail the row: a cache outage must not delay or dead-letter user hooks.
+    let durable_invalidation = if config.declared_invalidation_edges {
+        quote! {
+            let _ = Self::invalidate_declared_caches_async().await;
+        }
+    } else {
+        quote! {}
+    };
+
     let hook_support_methods = if commit_hooks_enabled {
         quote! {
         #[doc(hidden)]
@@ -10399,6 +10551,7 @@ fn emit_crud_bodies_hooked(
                                 })?;
                         let __record: #model_name =
                             #model_name::__autumn_commit_hook_from_value(__record)?;
+                        #durable_invalidation
                         let __hooks =
                             <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
                         <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_create_commit(
@@ -10420,6 +10573,7 @@ fn emit_crud_bodies_hooked(
                                 })?;
                         let __record: #model_name =
                             #model_name::__autumn_commit_hook_from_value(__record)?;
+                        #durable_invalidation
                         let __hooks =
                             <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
                         <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_update_commit(
@@ -10441,6 +10595,7 @@ fn emit_crud_bodies_hooked(
                                 })?;
                         let __record: #model_name =
                             #model_name::__autumn_commit_hook_from_value(__record)?;
+                        #durable_invalidation
                         let __hooks =
                             <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
                         <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_delete_commit(
@@ -20149,6 +20304,189 @@ mod tests {
             ),
             "the invalidator must resolve through the same id constant, so a mistyped edge \
              yields ONE error naming the user's own path: {out}"
+        );
+    }
+
+    // ── #3056: commit-bound invalidation ─────────────────────────────
+
+    /// The body tokens of each method in `impl {trait} for Pg{trait}`.
+    fn trait_impl_method_bodies(
+        generated: &TokenStream,
+        trait_name: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let file: syn::File = syn::parse2(generated.clone()).expect("generated code parses");
+        let mut bodies = std::collections::HashMap::new();
+        for item in file.items {
+            let syn::Item::Impl(item_impl) = item else {
+                continue;
+            };
+            let is_trait_impl = item_impl
+                .trait_
+                .as_ref()
+                .and_then(|(path, _)| path.segments.last())
+                .is_some_and(|seg| seg.ident == trait_name);
+            if !is_trait_impl {
+                continue;
+            }
+            for impl_item in item_impl.items {
+                if let syn::ImplItem::Fn(method) = impl_item {
+                    bodies.insert(
+                        method.sig.ident.to_string(),
+                        method.block.to_token_stream().to_string(),
+                    );
+                }
+            }
+        }
+        bodies
+    }
+
+    #[test]
+    fn every_write_invalidates_declared_reads_after_commit() {
+        let attr = quote! { Post, invalidates(crate::views::recent_posts) };
+        let item = quote! {
+            pub trait PostRepository {
+                fn delete_by_author_id(author_id: i64) -> ();
+            }
+        };
+        let config = parse_repo_args(attr.clone()).expect("args");
+        let trait_def: ItemTrait = syn::parse2(item.clone()).expect("trait");
+        let writes = write_method_names(&config, &trait_def);
+        assert!(writes.contains(&"delete_by_author_id".to_owned()));
+
+        let bodies = trait_impl_method_bodies(&repository_macro(attr, item), "PostRepository");
+        for write in &writes {
+            let body = bodies
+                .get(write)
+                .unwrap_or_else(|| panic!("`{write}` must be in the trait impl"));
+            assert!(
+                body.contains("__autumn_invalidate_after_commit"),
+                "`{write}` must invalidate after it commits: {body}"
+            );
+        }
+        for read in ["find_by_id", "find_all", "count", "exists_by_id"] {
+            let body = bodies.get(read).expect("read method");
+            assert!(
+                !body.contains("__autumn_invalidate_after_commit"),
+                "a read (`{read}`) must not invalidate: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_invalidation_runs_after_the_body_on_ok_and_err() {
+        // A write can commit and then fail in an `after_*` hook, so the
+        // invalidation must not depend on `Ok`.
+        let bodies = trait_impl_method_bodies(
+            &repository_macro(
+                quote! { Post, invalidates(crate::views::recent_posts) },
+                quote! { pub trait PostRepository {} },
+            ),
+            "PostRepository",
+        );
+        let save = bodies.get("save").expect("save");
+        let guard = save
+            .find("InvalidateAfterWrite :: new")
+            .expect("a guard is armed before the body");
+        let body = save
+            .find("let __autumn_write_result")
+            .expect("the body runs");
+        let run = save
+            .find("__autumn_invalidation . run () . await")
+            .expect("the invalidation runs after the body");
+        assert!(guard < body && body < run, "{save}");
+        assert!(
+            !save.contains("is_ok ()"),
+            "it must not depend on Ok: {save}"
+        );
+    }
+
+    #[test]
+    fn with_lock_and_find_or_create_also_invalidate() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! {
+                pub trait PostRepository {
+                    fn find_or_create_by_title(&self, title: String, new: &NewPost);
+                }
+            },
+        )
+        .to_string();
+        let find_or_create = generated_fn(&out, "pub async fn find_or_create_by_title");
+        assert!(
+            find_or_create.contains("__autumn_invalidate_after_commit"),
+            "{find_or_create}"
+        );
+        assert!(
+            find_or_create.contains("Ok ((_ , false))") && find_or_create.contains("disarm ()"),
+            "a find that wrote nothing must not invalidate: {find_or_create}"
+        );
+        let with_lock = generated_fn(&out, "pub async fn with_lock");
+        assert!(
+            with_lock.contains("__autumn_invalidate_after_commit"),
+            "{with_lock}"
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_edges_adds_no_after_commit_invalidation() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(!out.contains("__autumn_invalidate_after_commit"), "{out}");
+        assert!(!out.contains("invalidate_declared_caches_async"), "{out}");
+    }
+
+    #[test]
+    fn a_declared_edge_also_gets_an_async_invalidator() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("pub async fn invalidate_declared_caches_async"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "invalidate_namespace_async (crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts)"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn durable_commit_hook_runners_invalidate_without_failing_the_row() {
+        let out = repository_macro(
+            quote! {
+                Post,
+                hooks = PostHooks,
+                commit_hooks = true,
+                invalidates(crate::views::recent_posts)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let runners = section_between(
+            &out,
+            "fn __autumn_register_repository_commit_hooks",
+            "inventory :: submit",
+        );
+        assert_eq!(
+            runners.matches("invalidate_declared_caches_async").count(),
+            3,
+            "the create, update and delete runners must each invalidate: {runners}"
+        );
+        assert!(
+            runners.contains("let _ = Self :: invalidate_declared_caches_async () . await"),
+            "a cache outage must not fail the row and dead-letter user hooks: {runners}"
+        );
+        let first_invalidation = runners
+            .find("invalidate_declared_caches_async")
+            .expect("invalidation");
+        let first_hook = runners.find("after_create_commit").expect("hook");
+        assert!(
+            first_invalidation < first_hook,
+            "the cache is fresh before the user's hook runs: {runners}"
         );
     }
 

@@ -30,6 +30,8 @@ mod boundary_hooks_integration;
 mod broadcast_recorder;
 #[cfg(all(feature = "db", feature = "cache-moka"))]
 mod cache_coherence;
+#[cfg(all(feature = "db", feature = "cache-moka", feature = "test-support"))]
+mod cache_invalidation_after_commit;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
 #[cfg(all(feature = "db", feature = "cache-moka"))]

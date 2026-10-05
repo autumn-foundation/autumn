@@ -2997,6 +2997,26 @@ pub(crate) async fn env_endpoint<S: ProvideActuatorState + Send + Sync + 'static
 // ── Metrics ────────────────────────────────────────────────────
 
 /// `GET <actuator-prefix>/metrics` -- request metrics, latency, status codes, DB pool stats.
+/// The `cache` section of `/actuator/metrics`: the read-through snapshot, plus
+/// the stale-if-error and invalidation-failure counters (#3056).
+fn cache_metrics_json() -> serde_json::Value {
+    let mut cache =
+        serde_json::to_value(crate::cache::read_through_metrics().snapshot()).unwrap_or_default();
+    if let serde_json::Value::Object(ref mut map) = cache {
+        map.insert(
+            "stale_if_error_serves".to_string(),
+            crate::cache::read_through_metrics()
+                .stale_if_error_serves()
+                .into(),
+        );
+        map.insert(
+            "invalidation_failures".to_string(),
+            crate::cache::invalidation_failures_total().into(),
+        );
+    }
+    cache
+}
+
 pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
@@ -3006,11 +3026,7 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     // Include read-through cache stampede-protection counters (always
     // present; the read-through API works standalone without app state).
     if let serde_json::Value::Object(ref mut map) = result {
-        map.insert(
-            "cache".to_string(),
-            serde_json::to_value(crate::cache::read_through_metrics().snapshot())
-                .unwrap_or_default(),
-        );
+        map.insert("cache".to_string(), cache_metrics_json());
     }
 
     // Include DB pool stats if available
@@ -3211,7 +3227,7 @@ pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_to
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 23] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 25] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
@@ -3239,6 +3255,8 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 23] = [
     "autumn_cache_read_through_stale_serves_total",
     "autumn_cache_fill_lock_acquires_total",
     "autumn_cache_fill_lock_contended_total",
+    "autumn_cache_read_through_stale_if_error_serves_total",
+    "autumn_cache_invalidation_failures_total",
     crate::shadow::COMPARISONS_METRIC,
     crate::shadow::DIVERGENCES_METRIC,
 ];
@@ -3579,6 +3597,16 @@ fn write_builtin_cache_metrics(
             "autumn_cache_fill_lock_contended_total",
             "Distributed cache fill lock attempts that found the lock held by another replica",
             snapshot.fill_lock_contended,
+        ),
+        (
+            "autumn_cache_read_through_stale_if_error_serves_total",
+            "Read-through fills that failed and served the last value instead (stale-if-error)",
+            crate::cache::read_through_metrics().stale_if_error_serves(),
+        ),
+        (
+            "autumn_cache_invalidation_failures_total",
+            "Cache invalidations that failed after all retries; stale data can be served",
+            crate::cache::invalidation_failures_total(),
         ),
     ] {
         let _ = writeln!(out, "# HELP {name} {help}");
@@ -7638,6 +7666,8 @@ mod tests {
             "autumn_cache_read_through_stale_serves_total",
             "autumn_cache_fill_lock_acquires_total",
             "autumn_cache_fill_lock_contended_total",
+            "autumn_cache_read_through_stale_if_error_serves_total",
+            "autumn_cache_invalidation_failures_total",
         ] {
             assert!(
                 text.contains(&format!("# TYPE {name} counter")),
@@ -7686,6 +7716,8 @@ mod tests {
         assert!(json["cache"]["stale_serves"].is_u64());
         assert!(json["cache"]["fill_lock_acquires"].is_u64());
         assert!(json["cache"]["fill_lock_contended"].is_u64());
+        assert!(json["cache"]["stale_if_error_serves"].is_u64());
+        assert!(json["cache"]["invalidation_failures"].is_u64());
     }
 
     #[tokio::test]

@@ -216,23 +216,64 @@ pub trait PostRepository {
 }
 ```
 
-A repository that declares any edge also gets a generated invalidator:
+A repository that declares any edge invalidates those reads **after each
+write commits**. You do not need to call anything:
 
 ```rust
-repo.save(&new).await?;
-if !PgPostRepository::invalidate_declared_caches() {
-    tracing::warn!("cache backend cannot drop a namespace; entries may still be served");
+repo.save(&new).await?; // committed, then the declared reads are dropped
+```
+
+Each generated write runs and commits its own transaction. When the write
+ends, it calls `invalidate_declared_caches_async()`. See
+[Commit-bound invalidation](#commit-bound-invalidation).
+
+The repository also gets the invalidator itself, for a write that does not go
+through the repository:
+
+```rust
+if !PgPostRepository::invalidate_declared_caches_async().await {
+    // Already logged and counted. Stale entries can be served until the TTL.
 }
 ```
 
-It is `#[must_use]`: it returns whether every declared read was invalidated
-**completely**, and an ignored `false` means the stale value is still being
-served. See [What this does not prove](#what-this-does-not-prove).
+`invalidate_declared_caches()` is the sync form. Both are `#[must_use]`: they
+return whether every declared read was invalidated **completely**. An ignored
+`false` means the stale value can still be served. See
+[What this does not prove](#what-this-does-not-prove).
 
 A method-level `#[invalidates(...)]` is folded into the same call. That
 over-invalidates on other write paths, which is safe; the alternative — an edge
 that discharges the gate with nothing callable behind it — is the paperwork this
 feature exists to prevent.
+
+### Commit-bound invalidation
+
+Issue [#3056](https://github.com/autumn-foundation/autumn/issues/3056).
+
+The order is: write, commit, then invalidate.
+
+1. The write method runs its transaction and commits.
+2. When the method ends, it bumps the epoch of each declared namespace.
+3. It clears the local stores and asks the backend to drop the namespace.
+
+If you invalidate before the commit, a reader can refill the old value between
+the `DEL` and the `COMMIT`. If you invalidate after the commit, step 2 stops the
+insert of a reader that read the old row before the commit.
+
+| Case | Result |
+| --- | --- |
+| The write returns `Err` | Invalidated too: a write can commit and then fail in an `after_*` hook. After a rollback, the cost is one cache miss. |
+| The request is cancelled, or the write panics | A guard spawns the invalidation, so it still runs. A cancel during the `COMMIT` round trip can invalidate before the server applies the commit; `commit_hooks` covers that case. |
+| `with_lock`, `find_or_create_by_*` | Also invalidate. `find_or_create_by_*` skips it when it found the row and wrote nothing. |
+| The backend sweep fails | Retried (Redis: 3 attempts, jittered backoff). Then `warn!` and `autumn_cache_invalidation_failures_total`. The write stays `Ok`: it is committed. |
+| The repository has `commit_hooks` | The durable runner also invalidates, before `after_*_commit`. This covers a crash between the commit and the inline invalidation. A failure is logged and counted. It does not fail the row, so a cache outage does not delay or dead-letter your hooks. |
+| Each write | One namespace sweep per declared read. On Redis this is a `SCAN MATCH` over the keyspace, so write latency grows with the keyspace. |
+| A write inside `Db::tx` | The repository write uses its own connection and commits on its own, so it invalidates at its own commit. |
+
+The fence is per process. A fill on **another replica** that read the old row
+before the commit can still write it back. A fill that starts after the
+invalidation but reads a **lagging read replica** can also cache the old row.
+A TTL bounds both cases.
 
 ### 2. Or acknowledge the staleness
 
@@ -433,7 +474,7 @@ $ autumn cache audit --manifest target/cache-coherence.json --json
     "invalidations": {
       "provenance": "provable",
       "source": "macro:#[repository(..., invalidates(...))]",
-      "runtime_caveat": "the edge's target is proven … That the invalidator is actually CALLED on the write path is not proven by this slice …",
+      "runtime_caveat": "the edge's target is proven … Each generated write method calls the invalidator after its own transaction commits … Not proven: that the backend sweep succeeds …",
       "entries": [
         {
           "mutation": "ProjectRepository::delete_by_id",
@@ -459,7 +500,7 @@ three dimensions here are `provable`: each is recovered from macro-expanded code
 with no config read and no process started. Where a dimension has an adjacent
 weak step it carries a `runtime_caveat` rather than being demoted, which is that
 rubric's stated tie-breaker — the invalidation edge is genuinely proven, and
-what is *not* proven is that the invalidator runs.
+what is *not* proven is that the backend sweep succeeds.
 
 The **entry** level of `cached_reads` uses a second, narrower vocabulary —
 `declared` / `derived` / `undetermined` — describing how one read's dependency
@@ -471,10 +512,11 @@ tell "we checked and it was fine" from "we never looked".
 
 ## What this does not prove
 
-* **That the invalidator runs.** The build proves the edge exists and that it
-  names a real cached read. Whether `invalidate_declared_caches()` is actually
-  called on the write path is the `invalidations` dimension's `runtime_caveat`;
-  wiring it automatically through repository commit hooks is the next slice.
+* **That the invalidation succeeds.** Each generated write calls the
+  invalidator after it commits, so the call is no longer up to you. The build
+  does not prove that the backend sweep succeeds. A failure is retried, then
+  logged and counted in `autumn_cache_invalidation_failures_total`. Alert on
+  that counter.
 * **Complete invalidation under an opaque backend.** Namespace invalidation
   clears every store registered for the read *and* asks the registered backend
   to drop the namespace — `MokaCache` by iteration, `RedisCache` by a `SCAN
@@ -483,6 +525,9 @@ tell "we checked and it was fine" from "we never looked".
   `Cache::invalidate_namespace`, and `invalidate_declared_caches()` reports that
   `false` verbatim rather than letting you believe the value is gone. It is
   `#[must_use]` for exactly that reason.
+* **A fill that reads a lagging read replica.** A fill that starts after the
+  invalidation reads the database again. If that read goes to a replica that
+  has not applied the write, the old row is cached with a current epoch.
 * **A fill in flight on another replica.** The epoch fence stops a fill *this
   process* started before an invalidation from writing its stale value back
   after it. It cannot speak for another replica's in-flight fill into a shared

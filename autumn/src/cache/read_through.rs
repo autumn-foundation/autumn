@@ -66,6 +66,9 @@ pub struct GetOrComputeOptions {
     /// considered stale but is still served for up to `grace` while a single
     /// background task refreshes it.
     pub stale_while_revalidate: Option<Duration>,
+    /// `Some(window)` enables stale-if-error (RFC 5861): when a fill fails,
+    /// serve the last value for up to `window` after its freshness ended.
+    pub stale_if_error: Option<Duration>,
     /// Clock used to evaluate stale-while-revalidate freshness. Defaults to
     /// [`SystemClock`]; overridden in tests via [`with_clock`] so freshness
     /// transitions are deterministic instead of depending on real
@@ -86,6 +89,7 @@ impl GetOrComputeOptions {
             lock_poll_interval: Duration::from_millis(50),
             lock_wait_timeout: Duration::from_secs(5),
             stale_while_revalidate: None,
+            stale_if_error: None,
             clock: Arc::new(SystemClock),
         }
     }
@@ -132,6 +136,32 @@ impl GetOrComputeOptions {
         self
     }
 
+    /// Enable stale-if-error (RFC 5861).
+    ///
+    /// When a fill fails and the last value ended its freshness less than
+    /// `window` ago, the caller gets that value instead of the error. The
+    /// value is kept for `ttl + window`, so it is still there to serve.
+    #[must_use]
+    pub const fn stale_if_error(mut self, window: Duration) -> Self {
+        self.stale_if_error = Some(window);
+        self
+    }
+
+    /// Whether values are stored in a [`SwrEnvelope`] with a freshness stamp.
+    /// Both stale modes need one.
+    pub(crate) const fn uses_envelope(&self) -> bool {
+        self.stale_while_revalidate.is_some() || self.stale_if_error.is_some()
+    }
+
+    /// How long the backend keeps a value: `ttl` plus the longer stale window.
+    pub(crate) fn physical_ttl(&self) -> Option<Duration> {
+        let extra = self
+            .stale_while_revalidate
+            .unwrap_or_default()
+            .max(self.stale_if_error.unwrap_or_default());
+        self.ttl.map(|ttl| ttl.saturating_add(extra))
+    }
+
     /// Override the clock used to evaluate stale-while-revalidate freshness.
     ///
     /// Defaults to [`SystemClock`]; tests can pass a
@@ -159,6 +189,7 @@ impl std::fmt::Debug for GetOrComputeOptions {
             .field("lock_poll_interval", &self.lock_poll_interval)
             .field("lock_wait_timeout", &self.lock_wait_timeout)
             .field("stale_while_revalidate", &self.stale_while_revalidate)
+            .field("stale_if_error", &self.stale_if_error)
             .finish_non_exhaustive()
     }
 }
@@ -209,6 +240,7 @@ pub struct ReadThroughMetrics {
     stale_serves: AtomicU64,
     fill_lock_acquires: AtomicU64,
     fill_lock_contended: AtomicU64,
+    stale_if_error_serves: AtomicU64,
 }
 
 /// Point-in-time copy of [`ReadThroughMetrics`].
@@ -233,6 +265,14 @@ pub struct ReadThroughMetricsSnapshot {
 }
 
 impl ReadThroughMetrics {
+    /// Failed fills that served the last value instead (stale-if-error).
+    ///
+    /// A method, not a [`ReadThroughMetricsSnapshot`] field, so the snapshot
+    /// type does not change.
+    pub fn stale_if_error_serves(&self) -> u64 {
+        self.stale_if_error_serves.load(Ordering::Relaxed)
+    }
+
     /// Take a consistent-enough snapshot of all counters (each counter is
     /// read atomically; the set is not read under a global lock).
     pub fn snapshot(&self) -> ReadThroughMetricsSnapshot {
@@ -419,7 +459,7 @@ where
     // bound, since the same `V` is written back through `insert_cached`.
     V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    if options.stale_while_revalidate.is_some() {
+    if options.uses_envelope() {
         get_cached::<SwrEnvelope<V>>(cache.as_ref(), key)
             .filter(|envelope| now_unix_ms(options.clock.as_ref()) < envelope.fresh_until_unix_ms)
             .map(|envelope| envelope.value)
@@ -579,7 +619,7 @@ where
 {
     match result {
         Ok(value) => {
-            if let Some(grace) = options.stale_while_revalidate {
+            if options.uses_envelope() {
                 // `ttl: None` means "no expiry" (per its own doc comment): the
                 // envelope must stay fresh forever, not go stale immediately.
                 // Treating a missing TTL as `ttl_ms = 0` would stamp
@@ -594,8 +634,7 @@ where
                     value: value.clone(),
                     fresh_until_unix_ms,
                 };
-                let physical_ttl = options.ttl.map(|ttl| ttl + grace);
-                insert_cached(cache.as_ref(), key, envelope, physical_ttl);
+                insert_cached(cache.as_ref(), key, envelope, options.physical_ttl());
             } else {
                 insert_cached(cache.as_ref(), key, value.clone(), options.ttl);
             }
@@ -723,9 +762,59 @@ fn swr_within_grace(now_unix_ms: u64, fresh_until_unix_ms: u64, grace: Option<Du
     now_unix_ms < fresh_until_unix_ms.saturating_add(grace_ms)
 }
 
-/// Stale-while-revalidate read-through: `fill` must be `'static` because a
-/// stale read may hand it to a background task instead of awaiting it.
-async fn swr_read_through<V, E, F, Fut>(
+/// Whether a value can stand in for a failed fill (stale-if-error) at `now`:
+/// `now < fresh_until_unix_ms + window`. `None` means the mode is off.
+fn stale_if_error_usable(
+    now_unix_ms: u64,
+    fresh_until_unix_ms: u64,
+    window: Option<Duration>,
+) -> bool {
+    window.is_some_and(|window| {
+        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+        now_unix_ms < fresh_until_unix_ms.saturating_add(window_ms)
+    })
+}
+
+/// Replace a fill error with the last value when stale-if-error allows it.
+///
+/// The value is read again after the failure. A value that an invalidation
+/// dropped during the fill is not served.
+fn serve_stale_on_error<V, E>(
+    cache: &Arc<dyn Cache>,
+    key: &str,
+    result: Result<V, CacheFillError<E>>,
+    options: &GetOrComputeOptions,
+) -> Result<V, CacheFillError<E>>
+where
+    V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    let Err(error) = result else {
+        return result;
+    };
+    if options.stale_if_error.is_none() {
+        return Err(error);
+    }
+    match get_cached::<SwrEnvelope<V>>(cache.as_ref(), key) {
+        Some(envelope)
+            if stale_if_error_usable(
+                now_unix_ms(options.clock.as_ref()),
+                envelope.fresh_until_unix_ms,
+                options.stale_if_error,
+            ) =>
+        {
+            read_through_metrics()
+                .stale_if_error_serves
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(envelope.value)
+        }
+        _ => Err(error),
+    }
+}
+
+/// Read-through over a [`SwrEnvelope`], for stale-while-revalidate and
+/// stale-if-error. `fill` must be `'static` because a stale read may hand it
+/// to a background task instead of awaiting it.
+async fn envelope_read_through<V, E, F, Fut>(
     cache: &Arc<dyn Cache>,
     key: &str,
     options: GetOrComputeOptions,
@@ -784,14 +873,14 @@ where
                 }
                 let result = run_leader_fill(cache, key, &options, fill, tx).await;
                 drop(guard);
-                return result;
+                return serve_stale_on_error(cache, key, result, &options);
             }
             Role::Waiter(rx) => {
                 read_through_metrics()
                     .coalesced_waits
                     .fetch_add(1, Ordering::Relaxed);
                 if let Some(result) = await_result::<V, E>(rx).await {
-                    return result;
+                    return serve_stale_on_error(cache, key, result, &options);
                 }
                 // Channel closed or type mismatch: loop back and re-contend.
             }
@@ -839,8 +928,8 @@ where
     simple_read_through(cache, key, &options, fill).await
 }
 
-/// [`get_or_compute`] with cross-replica options: a distributed fill lock
-/// and/or stale-while-revalidate. See [`GetOrComputeOptions`].
+/// [`get_or_compute`] with cross-replica options: a distributed fill lock,
+/// stale-while-revalidate and/or stale-if-error. See [`GetOrComputeOptions`].
 ///
 /// The `'static` bounds on `fill` exist because stale-while-revalidate may
 /// run the fill on a background task; capture owned handles (`Arc`-clone your
@@ -861,8 +950,8 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = Result<V, E>> + Send + 'static,
 {
-    if options.stale_while_revalidate.is_some() {
-        swr_read_through(cache, key, options, fill).await
+    if options.uses_envelope() {
+        envelope_read_through(cache, key, options, fill).await
     } else {
         simple_read_through(cache, key, &options, fill).await
     }
@@ -997,6 +1086,51 @@ mod tests {
             "fill must not run when another replica already wrote the value"
         );
         assert!(matches!(*rx.borrow_and_update(), FillState::Done(_)));
+    }
+
+    #[test]
+    fn stale_if_error_window_starts_at_fresh_until() {
+        let window = Some(Duration::from_secs(60));
+        // Fresh values never need the fallback, but are still usable.
+        assert!(stale_if_error_usable(1_000, 2_000, window));
+        // Inside the window.
+        assert!(stale_if_error_usable(2_000, 2_000, window));
+        assert!(stale_if_error_usable(61_999, 2_000, window));
+        // The window end is exclusive.
+        assert!(!stale_if_error_usable(62_000, 2_000, window));
+        // No window: nothing stale is usable.
+        assert!(!stale_if_error_usable(2_000, 2_000, None));
+        // A huge window saturates instead of wrapping.
+        assert!(stale_if_error_usable(
+            u64::MAX - 1,
+            2_000,
+            Some(Duration::MAX)
+        ));
+    }
+
+    #[test]
+    fn options_use_an_envelope_for_either_stale_mode() {
+        assert!(!GetOrComputeOptions::new().uses_envelope());
+        assert!(
+            GetOrComputeOptions::new()
+                .stale_while_revalidate(Duration::from_secs(1))
+                .uses_envelope()
+        );
+        assert!(
+            GetOrComputeOptions::new()
+                .stale_if_error(Duration::from_secs(1))
+                .uses_envelope()
+        );
+    }
+
+    #[test]
+    fn physical_ttl_keeps_the_value_for_the_longest_stale_window() {
+        let opts = GetOrComputeOptions::new()
+            .ttl(Duration::from_secs(10))
+            .stale_while_revalidate(Duration::from_secs(5))
+            .stale_if_error(Duration::from_secs(60));
+        assert_eq!(opts.physical_ttl(), Some(Duration::from_secs(70)));
+        assert_eq!(GetOrComputeOptions::new().physical_ttl(), None);
     }
 
     #[test]

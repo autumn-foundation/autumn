@@ -127,6 +127,32 @@ refreshes can run concurrently across all keys, so a burst of simultaneously
 expiring keys can't spawn unbounded background work; a key that misses the
 cap simply retries the refresh on its next stale read.
 
+## Stale-if-error
+
+`GetOrComputeOptions::stale_if_error(window)` (RFC 5861) serves the last value
+when a fill fails. Use it to keep reads up during a database outage.
+
+```rust,ignore
+let opts = GetOrComputeOptions::new()
+    .ttl(Duration::from_secs(30))
+    .stale_if_error(Duration::from_secs(600));
+```
+
+- A fresh value is a hit. No fill runs.
+- After `ttl`, the next read runs the fill.
+  - The fill succeeds: the caller gets the new value.
+  - The fill fails, and `now < fresh_until + window`: the caller gets the last
+    value. `autumn_cache_read_through_stale_if_error_serves_total` counts it.
+  - The fill fails, and the window has ended: the caller gets the error.
+- Coalesced waiters get the same fallback as the leader.
+- The backend keeps the value for `ttl + window`, so it is there to serve.
+- A key that has no value yet returns the error. There is nothing to serve.
+
+It uses the same stored envelope as stale-while-revalidate, so a key must use
+the same options on each read. You can use both modes on one key: the
+stale-while-revalidate grace comes first, and stale-if-error covers a failed
+fill after the grace ends.
+
 ## Failure semantics
 
 A failing fill never poisons the key:
@@ -144,6 +170,8 @@ A failing fill never poisons the key:
 - The distributed lock's `lock_ttl` bounds the damage from a filler that
   crashes while holding it: the lock self-clears and another replica takes
   over.
+- With `stale_if_error`, a failed fill can serve the last value instead. See
+  [Stale-if-error](#stale-if-error).
 
 ## De-synchronizing mass expiry
 
@@ -174,6 +202,8 @@ The read-through API updates process-wide counters, visible on
 | `autumn_cache_read_through_stale_serves_total` | stale-while-revalidate reads served while a refresh ran |
 | `autumn_cache_fill_lock_acquires_total` | distributed fill locks acquired |
 | `autumn_cache_fill_lock_contended_total` | distributed fill lock attempts that found the lock held elsewhere |
+| `autumn_cache_read_through_stale_if_error_serves_total` | failed fills that served the last value (stale-if-error) |
+| `autumn_cache_invalidation_failures_total` | invalidations that failed after all retries (see [Cache Coherence](cache-coherence.md#commit-bound-invalidation)) |
 
 **Falsifiable success metric:** K concurrent requests hitting an expired key
 should record 1 fill and K−1 coalesced waits. With the Redis distributed fill
