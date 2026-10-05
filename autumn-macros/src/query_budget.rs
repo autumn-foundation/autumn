@@ -3025,8 +3025,10 @@ impl Analyzer {
             param
         };
         // A function given by path where a closure would run is opaque.
+        // An at-most-once method calls its argument too: `inspect_err(f)`.
         let takes_callback = is_transaction
-            || (CALLBACK_METHODS.contains(&name.as_str())
+            || ((CALLBACK_METHODS.contains(&name.as_str())
+                || AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str()))
                 && self.value_of(&method.receiver) != Kind::Plain);
         // The callback is the last argument: `db.tx_with(opts, |conn| …)`,
         // `opt.map_or(default, f)`. Every argument of `map_or_else` is one.
@@ -3571,6 +3573,21 @@ impl Analyzer {
             Expr::Paren(p) => self.produced(&p.expr),
             Expr::Group(g) => self.produced(&g.expr),
             Expr::Call(call) => self.invoked(call, false),
+            // `result.unwrap_err()` on a `Result` with known sides: that side.
+            Expr::MethodCall(mc)
+                if matches!(
+                    mc.method.to_string().as_str(),
+                    "unwrap" | "expect" | "unwrap_err" | "expect_err"
+                ) && self.shape_of(&mc.receiver) == Some(Shape::Res) =>
+            {
+                let method = mc.method.to_string();
+                let side = if method.ends_with("_err") {
+                    "Err"
+                } else {
+                    "Ok"
+                };
+                self.env.part(&path_ident(peel_parens(&mc.receiver))?, side)
+            }
             // `result.err()` on a `Result` with known sides: an `Option` of
             // that side.
             Expr::MethodCall(mc)
@@ -9001,6 +9018,60 @@ mod tests {
                 "inspect_err on a Result is a known method",
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
                  let kept = result.inspect_err(|_| {}); let _ = kept.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn once_callbacks_take_named_functions_and_unwrap_err_takes_its_side() {
+        check_handlers(&[
+            (
+                "inspect_err with a named function is opaque",
+                "async fn h(result: Result<(), PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = result.inspect_err(refresh_repository); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map_err with a named function is opaque",
+                "async fn h(result: Result<(), PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = result.map_err(refresh_repository); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "or_else with a named function is opaque",
+                "async fn h(result: Result<(), PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = result.or_else(refresh_repository); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "is_err_and with a named function is opaque",
+                "async fn h(result: Result<(), PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = result.is_err_and(refresh_repository); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "unwrap_err takes the error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let e = result.unwrap_err(); render(&e); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "expect_err takes the error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let e = result.expect_err(\"no\"); render(&e); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: unwrap_err on a handle error side is a handle",
+                "async fn h(result: Result<i64, PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = result.unwrap_err().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: unwrap takes the value side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let _ = result.unwrap().find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
