@@ -4286,7 +4286,7 @@ fn capsule_error(error: &crate::gdpr::portability::DataCapsuleError) -> axum::re
     use crate::gdpr::portability::DataCapsuleError as E;
     let status = match error {
         E::NotConfigured(_) | E::MissingSigningSecret => StatusCode::NOT_IMPLEMENTED,
-        E::InvalidName(_) => StatusCode::BAD_REQUEST,
+        E::InvalidName(_) | E::InvalidInput(_) => StatusCode::BAD_REQUEST,
         E::NotEmpty(_) | E::Conflict(_) => StatusCode::CONFLICT,
         E::Integrity(_)
         | E::UnsupportedFormat(_)
@@ -4314,7 +4314,10 @@ fn existing_capsule<S: ProvideActuatorState>(
 {
     let service = state.data_capsules().map_err(|e| capsule_error(&e))?;
     let path = service.capsule_path(name).map_err(|e| capsule_error(&e))?;
-    if !path.is_dir() {
+    // `symlink_metadata` does not follow a link, so a link to a capsule
+    // outside the directory is "not found".
+    let is_real_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_dir());
+    if !is_real_dir {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"status": "error", "message": "capsule not found"})),
@@ -9924,6 +9927,46 @@ mod tests {
         assert_eq!(json["summary"]["records"], 1);
         assert_eq!(json["summary"]["tables"][0]["table"], "users");
         assert_eq!(empty.rows("users").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_export_rejects_an_empty_subject_with_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": ""}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actuator_capsule_verify_does_not_follow_a_symlinked_entry() {
+        // A signed capsule outside the directory, linked in by name.
+        let outside = tempfile::tempdir().unwrap();
+        let (_, json) = post_json(
+            capsule_state(outside.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        let name = json["capsule"].as_str().unwrap().to_owned();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join(&name), dir.path().join("linked")).unwrap();
+        for endpoint in ["verify", "import"] {
+            let (status, json) = post_json(
+                capsule_state(dir.path()),
+                true,
+                &format!("/actuator/capsules/{endpoint}"),
+                serde_json::json!({"capsule": "linked"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{endpoint}: {json}");
+        }
     }
 
     #[tokio::test]

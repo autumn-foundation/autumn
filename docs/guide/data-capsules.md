@@ -17,6 +17,9 @@ data portability.
 | `blobs/<sha256>` | The blob bytes that the records refer to (feature `storage`). |
 | `viewer/index.html` | An offline HTML viewer. It has no script. It loads nothing from a network. |
 
+A capsule holds personal data. On Unix, export makes each directory `0700`
+and each file `0600`. Export refuses an output path that is a link.
+
 The viewer has one page for each model. A `belongs_to` value is a link to the
 target record. Each record also shows the records that point at it.
 
@@ -102,7 +105,8 @@ use autumn_web::gdpr::portability::CapsuleDirectory;
 | `/actuator/capsules/import` | `{"capsule": "<name>"}` | `{"summary": {...}}` |
 
 A capsule name is one plain path segment in the capsule directory. The
-endpoints do not read or write outside that directory.
+endpoints do not follow a link, and do not read or write outside that
+directory.
 
 | Status | Cause |
 | --- | --- |

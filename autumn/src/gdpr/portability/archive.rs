@@ -214,11 +214,7 @@ impl DataCapsule {
             if !is_safe_rel_path(rel) {
                 return Err(DataCapsuleError::InvalidName(rel.clone()));
             }
-            let path = join(dir, rel);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| DataCapsuleError::io(parent, e))?;
-            }
-            std::fs::write(&path, bytes).map_err(|e| DataCapsuleError::io(path, e))?;
+            write_private(dir, rel, bytes)?;
         }
 
         let manifest_bytes = to_json(MANIFEST_FILE, &manifest)?;
@@ -226,12 +222,8 @@ impl DataCapsule {
             algorithm: ALGORITHM.to_owned(),
             signature: signer.sign(&manifest_bytes),
         };
-        let manifest_path = dir.join(MANIFEST_FILE);
-        std::fs::write(&manifest_path, &manifest_bytes)
-            .map_err(|e| DataCapsuleError::io(manifest_path, e))?;
-        let signature_path = dir.join(SIGNATURE_FILE);
-        std::fs::write(&signature_path, to_json(SIGNATURE_FILE, &signature)?)
-            .map_err(|e| DataCapsuleError::io(signature_path, e))
+        write_private(dir, MANIFEST_FILE, &manifest_bytes)?;
+        write_private(dir, SIGNATURE_FILE, &to_json(SIGNATURE_FILE, &signature)?)
     }
 
     /// Verify the capsule in `dir`, then read it.
@@ -282,20 +274,45 @@ impl DataCapsule {
     }
 }
 
-/// Make sure `dir` is an empty directory. Give `true` when this call made it.
+/// Write one capsule file. A capsule holds personal data, so each directory
+/// is owner-only (`0700`) and each file is owner-only (`0600`) on Unix.
+fn write_private(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), DataCapsuleError> {
+    let mut dir = root.to_path_buf();
+    let mut segments: Vec<&str> = rel.split('/').collect();
+    segments.pop();
+    for segment in segments {
+        dir.push(segment);
+        crate::fs_atomic::ensure_owner_only_dir(&dir).map_err(|e| DataCapsuleError::io(&dir, e))?;
+    }
+    let path = join(root, rel);
+    crate::fs_atomic::write_owner_only(&path, bytes).map_err(|e| DataCapsuleError::io(path, e))
+}
+
+/// Make sure `dir` is an empty, owner-only directory. Give `true` when this
+/// call made it.
+///
+/// A link is refused: the capsule must not go to a place that the path does
+/// not name.
 fn prepare_empty_dir(dir: &Path) -> Result<bool, DataCapsuleError> {
-    match std::fs::read_dir(dir) {
-        Ok(mut entries) => {
+    let created = match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(DataCapsuleError::InvalidName(format!(
+                "{} is a link",
+                dir.display()
+            )));
+        }
+        Ok(_) => {
+            let mut entries = std::fs::read_dir(dir).map_err(|e| DataCapsuleError::io(dir, e))?;
             if entries.next().is_some() {
                 return Err(DataCapsuleError::NotEmpty(dir.to_path_buf()));
             }
-            Ok(false)
+            false
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir)
-            .map(|()| true)
-            .map_err(|e| DataCapsuleError::io(dir, e)),
-        Err(e) => Err(DataCapsuleError::io(dir, e)),
-    }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(DataCapsuleError::io(dir, e)),
+    };
+    crate::fs_atomic::ensure_owner_only_dir(dir).map_err(|e| DataCapsuleError::io(dir, e))?;
+    Ok(created)
 }
 
 /// Verify the signature and every file hash of the capsule in `dir`.

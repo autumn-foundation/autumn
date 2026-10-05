@@ -217,6 +217,47 @@ async fn write_dir_removes_a_partial_capsule_on_error() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn capsule_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let capsule = export_ada(&seeded_store()).await;
+    let dir = tempfile::tempdir().unwrap();
+    // An empty directory that the caller made with a wide mode.
+    let root = dir.path().join("capsule");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    capsule.write_dir(&root, &signer()).unwrap();
+
+    for d in ["", "records", "viewer", "viewer/posts"] {
+        assert_eq!(mode(&root.join(d)), 0o700, "dir {d:?}");
+    }
+    for f in [
+        "manifest.json",
+        "signature.json",
+        "records/users.json",
+        "viewer/index.html",
+    ] {
+        assert_eq!(mode(&root.join(f)), 0o600, "file {f}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_dir_refuses_a_symlinked_directory() {
+    let capsule = export_ada(&seeded_store()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let link = dir.path().join("capsule");
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+    let err = capsule.write_dir(&link, &signer()).expect_err("symlink");
+    assert!(matches!(err, DataCapsuleError::InvalidName(_)), "{err:?}");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+}
+
 // ── Integrity ───────────────────────────────────────────────────────────────
 
 async fn written() -> (tempfile::TempDir, std::path::PathBuf) {
