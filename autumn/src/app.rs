@@ -6196,6 +6196,11 @@ impl AppBuilder {
         if static_metas.is_empty() {
             let allow_empty = std::env::var(BUILD_STATIC_ALLOW_EMPTY_ENV).as_deref() == Ok("1");
             if allow_empty {
+                let dist_dir = project_dir("dist", &crate::config::OsEnv);
+                if let Err(error) = clear_stale_static_output(&dist_dir) {
+                    eprintln!("Failed to remove stale {}: {error}", dist_dir.display());
+                    std::process::exit(1);
+                }
                 eprintln!("No static routes registered. Nothing to render.");
             } else {
                 eprintln!("No static routes registered. Nothing to build.");
@@ -8238,6 +8243,15 @@ pub(crate) fn is_static_build_mode() -> bool {
 /// Set to `1` by `autumn build` when the build has another output (an edge
 /// capsule), so a static build with no static routes is not an error.
 pub(crate) const BUILD_STATIC_ALLOW_EMPTY_ENV: &str = "AUTUMN_BUILD_STATIC_ALLOW_EMPTY";
+
+/// Remove `dist/` from an earlier build. An edge-only build renders no pages,
+/// so old ones must not ship with it. A missing `dist/` is not an error.
+fn clear_stale_static_output(dist_dir: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dist_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
 
 /// The exit code of a static build that finds no static routes.
 const fn no_static_routes_exit_code(allow_empty: bool) -> i32 {
@@ -18608,6 +18622,21 @@ mod tests {
             "nosniff is why the recorded type has to be correct: the browser \
              will not second-guess it"
         );
+    }
+
+    /// An edge-only build has no static pages. Old ones in `dist/` must not
+    /// ship with it.
+    #[test]
+    fn an_empty_static_build_clears_stale_output() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(dist.join("about")).expect("mkdir");
+        std::fs::write(dist.join("about/index.html"), "stale").expect("write");
+
+        clear_stale_static_output(&dist).expect("clears");
+        assert!(!dist.exists(), "stale dist/ must be gone");
+
+        clear_stale_static_output(&dist).expect("a missing dist/ is fine");
     }
 
     #[test]
