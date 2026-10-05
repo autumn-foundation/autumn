@@ -160,8 +160,9 @@ The relay claims ready messages, calls their handlers, and marks them sent.
 - **Several replicas:** on Postgres, the claim uses `FOR UPDATE SKIP LOCKED`.
   Two relays do not claim one message.
 - **Shards:** a write on a shard connection puts the row in that shard. The
-  relay drains the app pool and the primary pool of each shard. At boot, the
-  app creates the tables on each of them. If one pool fails, the relay logs
+  relay drains the app pool, if there is one, and the primary pool of each
+  shard. At boot, the app creates the tables on each of them. With no app
+  pool, `deliver_later` writes on the first shard. If one pool fails, the relay logs
   the error and drains the others.
 - **Lease:** a claim holds a batch for `lease_ms`. A handler that is still
   running when the lease ends fails, and the relay stops the batch. It gives

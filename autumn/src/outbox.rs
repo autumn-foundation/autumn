@@ -931,7 +931,12 @@ pub(crate) fn install(state: &AppState, config: &OutboxConfig, handlers: OutboxH
         }
         return;
     }
-    let Some(pool) = state.pool().cloned() else {
+    // `deliver_later` has no shard key: it writes on the app pool, or on the
+    // first shard when there is no app pool.
+    let Some(pool) = relay_pools(state)
+        .ok()
+        .and_then(|pools| pools.into_iter().next())
+    else {
         tracing::warn!("outbox.enabled = true needs a database; the relay does not run");
         return;
     };
@@ -1013,17 +1018,17 @@ async fn drain_until(
     Ok(handled)
 }
 
-/// The pools the relay drains: the app pool and the primary pool of each
-/// shard. A write on a shard connection puts its row in that shard.
+/// The pools the relay drains: the app pool, if any, and the primary pool of
+/// each shard. A write on a shard connection puts its row in that shard.
 fn relay_pools(state: &AppState) -> AutumnResult<Vec<Pool<RuntimeConnection>>> {
     let mut pools: Vec<Pool<RuntimeConnection>> = state.pool().cloned().into_iter().collect();
+    if let Some(shards) = state.shards() {
+        pools.extend(shards.iter().map(|shard| shard.primary_pool().clone()));
+    }
     if pools.is_empty() {
         return Err(AutumnError::internal_server_error_msg(
             "outbox relay needs a database",
         ));
-    }
-    if let Some(shards) = state.shards() {
-        pools.extend(shards.iter().map(|shard| shard.primary_pool().clone()));
     }
     Ok(pools)
 }

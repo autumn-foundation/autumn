@@ -810,6 +810,51 @@ mod sqlite {
         assert!(purge(&state).await.is_ok(), "the app pool still purges");
     }
 
+    /// With shards and no app pool, the relay still installs and drains the
+    /// shards.
+    #[tokio::test]
+    async fn relay_runs_on_shards_without_an_app_pool() {
+        let shard = SqliteSubstrate::new().expect("shard substrate");
+        let config = crate::config::DatabaseConfig {
+            shards: vec![crate::config::ShardConfig {
+                name: "only".to_owned(),
+                primary_url: shard.url().to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shards = crate::sharding::build_shard_set(
+            &config,
+            vec![crate::db::DatabaseTopology::primary_only(shard.pool())],
+            Arc::new(crate::sharding::HashShardRouter),
+        )
+        .expect("shard set");
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert("t", |_, _| async { Ok(()) });
+        let state = AppState::for_test().with_shards(shards);
+        assert!(state.pool().is_none());
+        install(
+            &state,
+            &OutboxConfig {
+                enabled: true,
+                ..OutboxConfig::default()
+            },
+            handlers,
+        );
+        ensure_relay_schema(&state)
+            .await
+            .expect("schema on the shard");
+        let mut conn = shard.pool().get().await.unwrap();
+        Outbox::new(&state)
+            .write(&mut conn, "a", "t", &serde_json::json!({}))
+            .await
+            .expect("the outbox is on");
+        drop(conn);
+
+        assert_eq!(drain(&state, 10).await.unwrap(), 1);
+        assert!(purge(&state).await.is_ok());
+    }
+
     #[tokio::test]
     async fn schema_is_idempotent() {
         let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
