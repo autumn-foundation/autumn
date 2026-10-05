@@ -3290,6 +3290,8 @@ fi
   ingress="{\"external\":$external,\"targetPort\":3000,\"transport\":\"http\",\"fqdn\":\"app.example.internal\",\"customDomains\":[{\"name\":\"www.example.com\"}]}"
   # An interrupted first cutover can leave ingress disabled.
   [ -n "$STUB_INGRESS_NONE" ] && ingress=null
+  # Terraform can make a new, plain ingress after such a stop.
+  [ -n "$STUB_INGRESS_PLAIN" ] && ingress='{"external":false,"targetPort":3000,"transport":"http"}'
   # The snapshot that an interrupted first cutover saved in the app's tags.
   tags='{"team":"web"}'
   if [ -n "$STUB_SAVED_INGRESS_TAGS" ]; then
@@ -3600,6 +3602,7 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_INGRESS_PLAIN")
             .env_remove("STUB_LATEST_STATE")
             .env_remove("STUB_APP_SYSTEM_IDENTITY")
             .env_remove("STUB_MIN_REPLICAS")
@@ -4433,6 +4436,57 @@ esac
             .rfind(|line| line.contains("\"identity\":{") && !line.contains("\"template\""))
             .unwrap_or_else(|| panic!("{bodies}"));
         assert!(!removal.contains("SystemAssigned"), "{removal}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_prefers_the_ingress_snapshot_in_tags() {
+        // After a stop, terraform apply made a plain ingress again. The tags
+        // still hold the full snapshot (with the custom domain), and that
+        // one goes back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_PLAIN", "1"),
+                ("STUB_SAVED_INGRESS_TAGS", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let open = bodies
+            .lines()
+            .find(|line| line.contains("\"external\":true"))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(open.contains("www.example.com"), "{open}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_retries_after_a_canceled_cleanup_revision() {
+        // A canceled clean revision never provisions, like a failed one.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_HAS_REFS", "1"),
+                ("STUB_LATEST_FAILED", "app--clean"),
+                ("STUB_LATEST_STATE", "Canceled"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let first = bodies.lines().next().unwrap_or_default();
+        assert!(first.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
     }
 
     #[cfg(unix)]
