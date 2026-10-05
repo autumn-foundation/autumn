@@ -79,6 +79,11 @@ struct Column {
 /// The select expression of one column.
 fn select_expr(column: &Column) -> Result<String, DataCapsuleError> {
     let col = quote(&column.field.name)?;
+    // `money::text` depends on `lc_monetary` (for example `$1,234.50`).
+    // Through `numeric` the text is a plain number in every locale.
+    if column.base_type == "money" {
+        return Ok(format!("{col}::numeric::text AS {col}"));
+    }
     Ok(if travels_as_text(&column.base_type) {
         let cast = if column.base_type.ends_with("[]") {
             "text[]"
@@ -167,6 +172,60 @@ fn fields(columns: Vec<Column>) -> Vec<FieldSpec> {
     columns.into_iter().map(|c| c.field).collect()
 }
 
+#[derive(diesel::QueryableByName)]
+struct CastRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    ok: bool,
+}
+
+/// The type name of the subject column of `model`.
+fn subject_type<'c>(
+    model: &CapsuleModel,
+    columns: &'c [Column],
+) -> Result<&'c str, DataCapsuleError> {
+    columns
+        .iter()
+        .find(|c| c.field.name == model.subject_column)
+        .map(|c| c.field.data_type.as_str())
+        .ok_or_else(|| {
+            DataCapsuleError::Store(format!(
+                "{} has no column {:?}",
+                model.table, model.subject_column
+            ))
+        })
+}
+
+/// Check that the subject column type can read `subject`.
+///
+/// Run it outside a transaction: a failed cast aborts the transaction.
+async fn check_subject(
+    conn: &mut AsyncPgConnection,
+    model: &CapsuleModel,
+    columns: &[Column],
+    subject: &str,
+) -> Result<(), DataCapsuleError> {
+    let subject_type = subject_type(model, columns)?;
+    let invalid = |reason: String| {
+        DataCapsuleError::InvalidInput(format!(
+            "subject {subject:?} is not a valid {subject_type} for {}: {reason}",
+            model.table
+        ))
+    };
+    let row = diesel::sql_query(format!(
+        "SELECT CAST($1 AS {subject_type}) IS NOT NULL AS ok"
+    ))
+    .bind::<diesel::sql_types::Text, _>(subject)
+    .get_result::<CastRow>(conn)
+    .await
+    .map_err(|e| invalid(e.to_string()))?;
+    // A cast that gives `NULL` (a custom type can do this) matches no row.
+    if row.ok {
+        Ok(())
+    } else {
+        Err(invalid("the cast gives NULL".to_owned()))
+    }
+}
+
 /// The records of `model` whose subject column is `subject`.
 ///
 /// The subject is cast to the column type, so `01` finds `1` in a `bigint`
@@ -177,16 +236,7 @@ async fn fetch_rows(
     columns: &[Column],
     subject: &str,
 ) -> Result<Vec<Record>, DataCapsuleError> {
-    let subject_type = columns
-        .iter()
-        .find(|c| c.field.name == model.subject_column)
-        .map(|c| c.field.data_type.as_str())
-        .ok_or_else(|| {
-            DataCapsuleError::Store(format!(
-                "{} has no column {:?}",
-                model.table, model.subject_column
-            ))
-        })?;
+    let subject_type = subject_type(model, columns)?;
     let exprs = columns
         .iter()
         .map(select_expr)
@@ -227,6 +277,7 @@ impl CapsuleStore for PgCapsuleStore {
         Box::pin(async move {
             let mut conn = self.conn().await?;
             let columns = describe_table(&mut conn, &model.table).await?;
+            check_subject(&mut conn, model, &columns, subject).await?;
             fetch_rows(&mut conn, model, &columns, subject).await
         })
     }
@@ -240,6 +291,10 @@ impl CapsuleStore for PgCapsuleStore {
     ) -> CapsuleFuture<'a, Vec<ModelData>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
+            for model in models {
+                let columns = describe_table(&mut conn, &model.table).await?;
+                check_subject(&mut conn, model, &columns, subject).await?;
+            }
             conn.transaction::<Vec<ModelData>, DataCapsuleError, _>(async move |conn| {
                 diesel::sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                     .execute(conn)
@@ -311,11 +366,43 @@ fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
             batch.model.table
         )));
     }
-    let columns = columns.join(", ");
     let table = quote(&batch.model.table)?;
+    let money: Vec<&str> = batch
+        .model
+        .fields
+        .iter()
+        .filter(|f| !f.generated && f.data_type == "money")
+        .map(|f| f.name.as_str())
+        .collect();
+    if money.is_empty() {
+        let columns = columns.join(", ");
+        return Ok(format!(
+            "INSERT INTO {table} ({columns}) OVERRIDING SYSTEM VALUE \
+             SELECT {columns} FROM jsonb_populate_recordset(NULL::{table}, $1::jsonb)"
+        ));
+    }
+    // A `money` value arrives as a plain number. Read it through `numeric`, not
+    // through the `money` input, which depends on the `lc_monetary` locale.
+    let mut exprs = Vec::with_capacity(columns.len());
+    for field in batch.model.fields.iter().filter(|f| !f.generated) {
+        let col = quote(&field.name)?;
+        exprs.push(if field.data_type == "money" {
+            format!("(e.j ->> '{}')::numeric::money", field.name)
+        } else {
+            format!("r.{col}")
+        });
+    }
+    let skip = money
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     Ok(format!(
         "INSERT INTO {table} ({columns}) OVERRIDING SYSTEM VALUE \
-         SELECT {columns} FROM jsonb_populate_recordset(NULL::{table}, $1::jsonb)"
+         SELECT {exprs} FROM jsonb_array_elements($1::jsonb) AS e(j) \
+         CROSS JOIN LATERAL jsonb_populate_record(NULL::{table}, e.j - ARRAY[{skip}]::text[]) AS r",
+        columns = columns.join(", "),
+        exprs = exprs.join(", "),
     ))
 }
 
@@ -390,6 +477,10 @@ mod tests {
             "\"n\"::text[] AS \"n\""
         );
         assert_eq!(select_expr(&col("id", "bigint")).unwrap(), "\"id\"");
+        assert_eq!(
+            select_expr(&col("m", "money")).unwrap(),
+            "\"m\"::numeric::text AS \"m\""
+        );
         assert!(select_expr(&col("a\"b", "text")).is_err());
     }
 
@@ -418,6 +509,18 @@ mod tests {
             sql,
             "INSERT INTO \"t\" (\"id\") OVERRIDING SYSTEM VALUE SELECT \"id\" FROM \
              jsonb_populate_recordset(NULL::\"t\", $1::jsonb)"
+        );
+        model.fields.push(FieldSpec::new("fee", "money").nullable());
+        let sql = insert_sql(&ImportBatch {
+            model: &model,
+            records: &records,
+        })
+        .unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO \"t\" (\"id\", \"fee\") OVERRIDING SYSTEM VALUE SELECT r.\"id\", \
+             (e.j ->> 'fee')::numeric::money FROM jsonb_array_elements($1::jsonb) AS e(j) \
+             CROSS JOIN LATERAL jsonb_populate_record(NULL::\"t\", e.j - ARRAY['fee']::text[]) AS r"
         );
         model.fields.clear();
         assert!(

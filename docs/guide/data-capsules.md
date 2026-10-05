@@ -84,7 +84,8 @@ autumn data capsule import ./capsule-42
 ```
 
 The CLI compiles the app. Then it runs the app with the app models, database,
-blob store, and secret. On a profile that is not `dev` or `test`, `import`
+blob store, and secret. With `-p`, the app runs from the directory of that
+workspace member, so it reads its own `autumn.toml` and `.env`. On a profile that is not `dev` or `test`, `import`
 needs `--force`. Add `--json` to get the raw report.
 
 ## Use the actuator
@@ -165,8 +166,12 @@ time, so it imports the same bytes that it verified.
 
 Postgres export reads all models in one snapshot. It reads rows with
 `to_jsonb`. Export writes `numeric`, `real`, `double precision`, and `money`
-as text, also through a domain. Time stamps, `bytea`, `uuid`, and arrays keep
-their exact values.
+as text, also through a domain. Export writes `money` as a plain number, so
+the value does not depend on the `lc_monetary` locale. Time stamps, `bytea`,
+`uuid`, and arrays keep their exact values.
+
+The subject id must be a valid value of the subject column type. For example,
+`abc` for a `bigint` column is an input error (`400`).
 
 ## Limits
 

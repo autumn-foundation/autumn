@@ -29,6 +29,7 @@ CREATE TABLE users (
     email TEXT NOT NULL UNIQUE,
     balance NUMERIC(30, 12) NOT NULL,
     credit amount,
+    fee MONEY,
     ratio DOUBLE PRECISION,
     created_at TIMESTAMPTZ NOT NULL,
     born DATE,
@@ -55,14 +56,15 @@ CREATE TABLE comments (
 ";
 
 const SEED: &str = r#"
-INSERT INTO users (email, balance, credit, ratio, created_at, born, avatar, prefs, tags, uid, active)
+INSERT INTO users (email, balance, credit, fee, ratio, created_at, born, avatar, prefs, tags, uid, active)
 VALUES
   ('Ada@Example.com', 12345678901234567.123456789012, 98765432109876543210.01234567890123456789,
+   1234567.89,
    0.30000000000000004,
    '2026-01-02 03:04:05.123456+00', '1815-12-10', '\x00ff10'::bytea,
    '{"theme": "dark", "n": [1, 2.5, {"deep": null}]}', ARRAY['a', 'b "q"', 'ü'],
    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', true),
-  ('bob@example.com', 1, NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
+  ('bob@example.com', 1, NULL, NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
    'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', false);
 INSERT INTO posts (author_id, parent_id, title, score) VALUES
   (1, NULL, 'First <post>', 3.14159),
@@ -138,6 +140,10 @@ async fn subject_rows(pool: &Pool<AsyncPgConnection>, table: &str, column: &str)
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one round trip, checked step by step"
+)]
 async fn postgres_round_trip_is_lossless_at_field_level() {
     // Generated columns need Postgres 12 or later.
     let container = Postgres::default()
@@ -246,6 +252,16 @@ async fn postgres_round_trip_is_lossless_at_field_level() {
         .await
         .expect("export with 01");
     assert_eq!(typed.records("users").len(), 1);
+
+    // `money` travels as a plain number, with no currency symbol or group
+    // separator from `lc_monetary`.
+    assert_eq!(first.records("users")[0]["fee"], "1234567.89");
+
+    // A subject that the column type cannot read is bad input, not a fault.
+    let err = export_subject(registry.capsule_models(), &source, "not-a-number")
+        .await
+        .expect_err("bad subject");
+    assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
 
     // A domain over `numeric` also travels as text.
     assert_eq!(

@@ -85,7 +85,8 @@ pub fn run(opts: &CapsuleOptions<'_>) {
     });
     crate::routes::compile_binary(opts.package, opts.bin);
     let binary = crate::routes::find_binary(opts.package, opts.bin);
-    let mut command = build_command(&binary, opts, &path);
+    let manifest_dir = opts.package.and_then(crate::dev::find_manifest_dir);
+    let mut command = build_command(&binary, opts, &path, manifest_dir.as_deref());
     crate::task::apply_managed_pg_env(&mut command, opts.package);
 
     let output = command.output().unwrap_or_else(|error| {
@@ -127,8 +128,19 @@ fn production_refusal(opts: &CapsuleOptions<'_>) -> Option<String> {
 }
 
 /// The child command. Separate from [`run`] so tests can read its env.
-fn build_command(binary: &Path, opts: &CapsuleOptions<'_>, path: &Path) -> Command {
+///
+/// A workspace member chosen with `-p` runs from its own directory, so the app
+/// reads its own `autumn.toml` and `.env`, the same as `autumn serve`.
+fn build_command(
+    binary: &Path,
+    opts: &CapsuleOptions<'_>,
+    path: &Path,
+    manifest_dir: Option<&Path>,
+) -> Command {
     let mut command = Command::new(binary);
+    if let Some(dir) = manifest_dir {
+        command.current_dir(dir).env("AUTUMN_MANIFEST_DIR", dir);
+    }
     clear_competing_one_shot_env(&mut command);
     command
         .env(MODE_ENV, opts.action.env_value())
@@ -271,7 +283,7 @@ mod tests {
             "dev",
             false,
         );
-        let cmd = build_command(Path::new("/bin/true"), &o, Path::new("/tmp/c"));
+        let cmd = build_command(Path::new("/bin/true"), &o, Path::new("/tmp/c"), None);
         assert_eq!(env_of(&cmd, MODE_ENV), Env::Set("export".into()));
         assert_eq!(env_of(&cmd, SUBJECT_ENV), Env::Set("42".into()));
         assert_eq!(env_of(&cmd, PATH_ENV), Env::Set("/tmp/c".into()));
@@ -281,9 +293,28 @@ mod tests {
     }
 
     #[test]
+    fn a_member_runs_from_its_manifest_dir() {
+        let o = opts(CapsuleAction::Verify, "dev", false);
+        let member = Path::new("/ws/apps/shop");
+        let cmd = build_command(
+            Path::new("/bin/true"),
+            &o,
+            Path::new("/tmp/c"),
+            Some(member),
+        );
+        assert_eq!(cmd.get_current_dir(), Some(member));
+        assert_eq!(
+            env_of(&cmd, "AUTUMN_MANIFEST_DIR"),
+            Env::Set("/ws/apps/shop".into())
+        );
+        let cmd = build_command(Path::new("/bin/true"), &o, Path::new("/tmp/c"), None);
+        assert_eq!(cmd.get_current_dir(), None);
+    }
+
+    #[test]
     fn import_command_removes_an_inherited_subject() {
         let o = opts(CapsuleAction::Import, "dev", false);
-        let cmd = build_command(Path::new("/bin/true"), &o, Path::new("/tmp/c"));
+        let cmd = build_command(Path::new("/bin/true"), &o, Path::new("/tmp/c"), None);
         assert_eq!(env_of(&cmd, MODE_ENV), Env::Set("import".into()));
         assert_eq!(env_of(&cmd, SUBJECT_ENV), Env::Removed);
     }
