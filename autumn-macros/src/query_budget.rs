@@ -2028,8 +2028,9 @@ impl Analyzer {
                     .map(|(i, e)| (i.to_string(), self.value_of(e)))
                     .collect(),
             ),
-            // `let alias = result;` keeps the recorded parts.
-            other => path_ident(peel_refs(other)).and_then(|name| self.env.binding(&name).parts),
+            // `let alias = result;` or `result.as_ref()` keeps the recorded
+            // parts.
+            other => wrapper_root(other).and_then(|name| self.env.binding(&name).parts),
         };
         Binding {
             kind,
@@ -2551,10 +2552,18 @@ impl Analyzer {
                 self.assign(&a.left, &a.right);
                 flow
             }
-            // The right side of `&&` / `||` may not run.
+            // The right side of `&&` / `||` may not run. Its bindings go on
+            // only when it falls through.
             Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) => {
                 let left = self.expr(&b.left);
-                left.then(Flow::ZERO.or_worst(self.optional(|s| s.expr(&b.right))))
+                let entry = self.env.clone();
+                let right = self.expr(&b.right);
+                if right.fall.is_some() {
+                    self.env.join(&entry);
+                } else {
+                    self.env = entry;
+                }
+                left.then(Flow::ZERO.or_worst(right))
             }
             Expr::Binary(b) => self.expr(&b.left).then(self.expr(&b.right)),
             Expr::Return(r) => {
@@ -9324,6 +9333,30 @@ mod tests {
                 "async fn h(maybe: Option<Db>) -> AutumnResult<usize> { \
                  let alias = &maybe; let db = alias.as_ref().unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
                 Expect::Exact(2),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn short_circuit_exits_and_adapter_aliases() {
+        check_handlers(&[
+            (
+                "a short-circuit side that returns binds nothing after it",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut slot = None; let _ = flag || { slot = Some(&repo); return Ok(0); }; render(slot); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a short-circuit side that falls through binds after it",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut slot = None; let _ = flag || { slot = Some(&repo); true }; render(slot); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an alias of an adapter keeps the Result sides",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 let alias = result.as_ref(); let _ = alias.map_err(|e| render(e)); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
