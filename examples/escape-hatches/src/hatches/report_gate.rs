@@ -1,16 +1,16 @@
 //! H4: one report at a time, as a per-route tower layer.
 //!
-//! The stock-value report reads every product. Ten callers at once would
-//! hold ten pool connections and slow every page. The framework has two
-//! close tools, and neither fits:
+//! The stock-value report reads every product. Ten parallel callers hold ten
+//! pool connections and slow every page. The framework has two related
+//! tools. Neither does this job:
 //!
 //! - `#[throttle]` limits each caller's request rate. It does not limit how
 //!   many reports run at once across all callers.
 //! - `timeout_ms` stops a slow request. It does not stop requests that pile up.
 //!
 //! So `#[intercept(ReportGate)]` puts this layer on the report route only.
-//! When the one slot is in use, a caller gets `503` with `Retry-After: 1` at
-//! once. Callers do not queue.
+//! The gate has one slot (a semaphore permit). When the slot is in use, a
+//! caller gets `503` with `Retry-After: 1` at once. Callers do not queue.
 
 use std::convert::Infallible;
 use std::future::Future;

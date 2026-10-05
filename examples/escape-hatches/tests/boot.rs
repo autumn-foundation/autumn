@@ -1,5 +1,5 @@
-//! Boots the real binary. `TestApp` cannot install a pool provider, error
-//! pages, or an exception filter, so this test proves that `app()` wires them.
+//! Starts the real binary. `TestApp` cannot install a pool provider, error
+//! pages, or an exception filter. So this test proves that `app()` wires them.
 //!
 //! - H12: the URL has no password. The pool reads it from a file.
 //! - H10: an unknown SKU gets the stockroom 404 page.
@@ -17,17 +17,18 @@ use autumn_web::reexports::diesel::connection::SimpleConnection;
 use autumn_web::reexports::diesel::pg::PgConnection;
 use escape_hatches::MIGRATIONS;
 
-/// Products in the large table. The report sorts all of them, so it cannot
-/// finish inside the 20 ms statement timeout below.
+/// The number of bulk products. The report sorts all of them, so it cannot
+/// finish in the 20 ms statement timeout below.
 const BULK_ROWS: u32 = 300_000;
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn real_binary_wires_every_app_level_hatch() {
+async fn real_binary_wires_pool_error_pages_and_filter() {
     let db = example_e2e::provision_postgres(1).await;
     let url = db.urls()[0].clone();
 
-    // A release step runs migrations with its own credentials. The app does not.
+    // In production, a release step runs migrations with its own credentials.
+    // So the app starts with auto-migrate off.
     let setup_url = url.clone();
     tokio::task::spawn_blocking(move || {
         autumn_web::migrate::run_pending(&setup_url, MIGRATIONS).expect("migrate");
@@ -44,7 +45,7 @@ async fn real_binary_wires_every_app_level_hatch() {
     .await
     .expect("setup task");
 
-    // H12: the password lives only in a file, as a secrets sidecar writes it.
+    // H12: only a file holds the password. A secrets sidecar writes it.
     let secrets = tempfile::tempdir().expect("tempdir");
     let password_file = secrets.path().join("db-password");
     std::fs::write(&password_file, "postgres\n").expect("write password");

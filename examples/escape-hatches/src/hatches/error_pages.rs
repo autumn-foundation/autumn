@@ -1,9 +1,9 @@
 //! H10: error pages that know the stockroom, with `.error_pages(..)`.
 //!
-//! A scanner reads a barcode and opens `/products/{sku}`. If the SKU is not
-//! in stock, the default 404 page shows the status and a link to `/`. Staff
-//! then need the supplier catalog to order the item. This renderer adds that
-//! link, inside the app's own page frame.
+//! Staff open `/products/{sku}` in a browser. If no product has that SKU, the
+//! default 404 page shows only the status and a link to `/`. To order the
+//! item, staff need the supplier catalog. This renderer adds a link to it, in
+//! the app's page frame.
 
 use autumn_web::error_pages::{ErrorContext, ErrorPageRenderer};
 use maud::{Markup, html};
@@ -23,9 +23,9 @@ impl ErrorPageRenderer for StockroomErrorPages {
             return self.render_error(ctx);
         };
         layout(
-            "Not in stock",
+            "Unknown SKU",
             &html! {
-                h1 { "SKU " (sku) " is not in the stockroom" }
+                h1 { "Unknown SKU " (sku) }
                 p { a href={ "/supplier/items/" (sku) } { "Find " (sku) " in the supplier catalog" } }
                 p { a href="/" { "Back to products" } }
             },

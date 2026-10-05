@@ -21,7 +21,7 @@ diesel-async = { version = "0.9", features = ["postgres", "deadpool"] }
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"] }
 diesel_migrations = "2"
 maud = { version = "0.27", features = ["axum"] }
-# Migrations run on a libpq connection. Bundle libpq so no system install is needed.
+# Migrations run on a libpq connection. Bundle libpq, so the host needs no libpq install.
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -64,10 +64,9 @@ path = "tests/system/smoke.rs"
 [lints.rust]
 unsafe_code = "forbid"
 
-# Determinism seam gate (autumn #1797): this package is outside the gate's
-# manifest, so it grandfathers `clippy::disallowed_methods` the same way the
-# other examples do.
+# The determinism gate (autumn #1797) does not check this package. Like the
+# other examples, it allows `clippy::disallowed_methods`.
 [lints.clippy]
 disallowed_methods = "allow"
-# `#[derive(diesel::QueryableByName)]` emits `field: field`; rustc 1.99 flags it.
+# `#[derive(diesel::QueryableByName)]` emits `field: field`. Clippy flags it.
 redundant_field_names = "allow"

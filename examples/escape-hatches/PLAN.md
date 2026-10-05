@@ -1,6 +1,6 @@
 # Plan: the `escape-hatches` example
 
-Written in ASD-STE100 style: short sentences, active voice, one word for one
+This plan uses ASD-STE100: short sentences, active voice, one word for one
 meaning.
 
 ## 1. Goal
@@ -16,6 +16,7 @@ The domain is a stockroom: products, stock counts, and orders.
 | Term | Meaning |
 |---|---|
 | Convention | The framework default: `#[model]`, `#[repository]`, `#[get]`, `autumn.toml`. |
+| Go below | Use a lower-level API than the convention. |
 | Escape hatch | A supported API that goes below the convention. |
 | Limit | A thing the convention cannot do, or cannot do safely. |
 
@@ -24,8 +25,8 @@ The domain is a stockroom: products, stock counts, and orders.
 Question: "Where does a stockroom app need more than a model and a repository?"
 We wrote all ideas first and judged them later.
 
-1. Reserve the last unit of a product. Two buyers. One unit.
-2. Check out a cart of several products. All lines or none.
+1. Two buyers want the last unit of a product.
+2. Check out a cart of several products: all lines or none.
 3. Add stock to a whole category in one action.
 4. Rank the most valuable products in each category.
 5. Stop the ranking query from running many times at once.
@@ -34,7 +35,7 @@ We wrote all ideas first and judged them later.
 8. Stock counts change all the time. Proxies must not cache pages.
 9. A nightly job writes CSV files. Serve them.
 10. The supplier team owns a plain Axum router. Mount it.
-11. Show a 404 page that links back to the product list.
+11. Link the 404 page for an unknown SKU to the supplier catalog.
 12. Tell clients when to retry after a database timeout.
 13. A sidecar rotates the database password into a file.
 14. Return `201 Created` with a `Location` header.
@@ -66,36 +67,36 @@ Question: "How do we make this example bad?" Each answer gives a rule.
 | `Deprecation`/`Sunset` layer on `/v1` | Built in: API version lifecycles. |
 | `statement_timeout` pool provider | Built in: `database.statement_timeout`. |
 | Custom rate-limit layer | Built in: `#[throttle]`. |
-| Ideas 15 to 18 | This app has no need. A hatch without a need is noise. Section 7 lists where each one is shown. |
+| Ideas 15 to 18 | This app has no need for them. Do not add a hatch that the app does not need. Section 7 tells where each one is shown. |
 
 ## 5. Six thinking hats
 
 | Hat | Finding |
 |---|---|
-| White (facts) | `with_lock` locks one row. Repository writes set absolute values. Diesel's DSL has no window functions. The framework sets `Cache-Control` only on `/static`. Autumn serves files only from `static/`. tokio-postgres reads no password file. The query-timeout `503` has no `Retry-After`. |
+| White (facts) | See the "Limit" column in section 6. Each limit is a fact from the framework source, and a test or a comment cites it. |
 | Red (feelings) | Readers distrust examples with invented needs. A test that shows the hazard builds trust. |
-| Black (risks) | Concurrency tests can be flaky. Use a deterministic interleave for the lost update. Use a semaphore that the test holds for the gate. Process-global state needs its own binary. |
+| Black (risks) | Concurrency tests can fail at random. Use a fixed order of calls for the lost update. Use a semaphore that the test holds for the gate. Process-global state needs its own binary. |
 | Yellow (benefits) | One app shows the full ladder: convention, then hatch, with the reason in the code. |
-| Green (ideas) | One end-to-end test boots the real binary. It proves the wiring that `TestApp` cannot reach: the pool provider, error pages, exception filter. |
-| Blue (process) | Red, green, refactor for each hatch. Then a multi-angle review. Then the AC table. |
+| Green (ideas) | One end-to-end test starts the real binary. It proves the wiring that `TestApp` cannot reach: the pool provider, error pages, exception filter. |
+| Blue (process) | Do red, green, refactor for each hatch. Then review from many angles. Then check the acceptance criteria (AC, section 8). |
 
 ## 6. Hatches in this app
 
 | # | Convention first | Limit | Hatch | Proof |
 |---|---|---|---|---|
-| H1 | `with_lock` per product | Locks one row. A cart needs all lines or none. | `Db::tx` with a guarded Diesel `UPDATE` per line | `checkout_*` tests |
-| H2 | Repository `update` per row | N round trips. Absolute values lose concurrent decrements. | One set-based Diesel `UPDATE` | `restock_*` tests |
-| H3 | Repository finders and aggregates | No window functions | `diesel::sql_query` + `QueryableByName` | `report_*` tests |
-| H4 | `#[throttle]`, `timeout_ms` | Per caller rate, not a global limit on concurrent runs | `#[intercept(ReportGate)]` | `report_gate` test binary |
-| H5 | Session auth on browser routes | Scanners are machines with bearer tokens | `scoped("/api", RequireApiToken, ..)` | `api_*` tests |
-| H6 | CSRF on for all POSTs in `prod` | Bearer clients have no CSRF cookie | `security.csrf.exempt_paths` | `csrf_*` test |
-| H7 | No app-wide header | Live stock must not sit in a shared cache | `.layer(SetResponseHeaderLayer)` | `cache_control_*` tests |
-| H8 | `static/` file serving | Build assets only. Runtime files need another mount. | `.nest(Router)` with `ServeDir` + `declare_plugin_routes` | `exports_*` tests |
-| H9 | `#[get]` handlers on `AppState` | Supplier code is plain Axum with its own state | `Plugin` + `nest` + `declare_plugin_routes` | `supplier_*` tests |
-| H10 | Default error pages | The 404 page knows only the status. A scanner that reads an unknown SKU needs a link to order it. | `.error_pages(..)` | `not_found_*` tests |
-| H11 | Default problem response | Query-timeout `503` has no `Retry-After` | `.exception_filter(..)` | `retry_after_*` tests |
-| H12 | Default pool factory | Password rotates in a file | `.with_pool_provider(..)` | `password_file_*` tests |
-| H13 | `Markup` / `Json` return | No `201` + `Location` helper | `impl IntoResponse` tuple | `checkout_returns_201_*` test |
+| H1 | `with_lock` per product | It locks one row. A cart needs all lines or none. | `Db::tx` with a guarded Diesel `UPDATE` per line | `checkout_*` tests |
+| H2 | Repository `update` per row | It needs one round trip per row. Its absolute values can lose a concurrent sale. | One set-based Diesel `UPDATE` | `restock_*` tests |
+| H3 | Repository finders and aggregates | They cannot express a window function. | `diesel::sql_query` + `QueryableByName` | `report_*` tests |
+| H4 | `#[throttle]`, `timeout_ms` | They limit rate and time, not concurrent runs. | `#[intercept(ReportGate)]` | `report_gate` test binary |
+| H5 | Browser routes with no login | Scanners are machines with bearer tokens. | `scoped("/api", RequireApiToken, ..)` | `api_*` tests |
+| H6 | CSRF on for every POST in `prod` | Scanners send no CSRF cookie. | `security.csrf.exempt_paths` | `csrf_*` test |
+| H7 | `Cache-Control` only on `/static` | Live stock must not stay in a shared cache. | `.layer(SetResponseHeaderLayer)` | `cache_control_*` tests |
+| H8 | `static/` file serving | It serves only build assets. Runtime files need another mount. | `.nest(Router)` with `ServeDir` + `declare_plugin_routes` | `exports_*` tests |
+| H9 | `#[get]` handlers on `AppState` | The supplier code is plain Axum with its own state. | `Plugin` + `nest` + `declare_plugin_routes` | `supplier_*` tests |
+| H10 | Default error pages | The 404 page links only to `/`. Staff need a link to order an unknown SKU. | `.error_pages(..)` | `not_found_*` tests |
+| H11 | Default problem response | The query-timeout `503` has no `Retry-After`. | `.exception_filter(..)` | `retry_after_*` tests |
+| H12 | Default pool factory | A sidecar rotates the password in a file. | `.with_pool_provider(..)` | `password_file_*` tests |
+| H13 | `Markup` / `Json` return | There is no helper for `201 Created` with `Location`. | `impl IntoResponse` tuple | `checkout_returns_201_*` test |
 
 ## 7. Hatches not used here
 
@@ -107,7 +108,7 @@ Question: "How do we make this example bad?" Each answer gives a rule.
 | `with_telemetry_provider`, `with_channels_backend` | No need. | `docs/guide/custom-subsystems.md` |
 | `with_*_interceptor` (job, mail, DB, HTTP) | No jobs, mail, or outbound HTTP. | `docs/guide/middleware.md` |
 | `static_gate` | No static page cache. | `docs/guide/middleware.md` |
-| `.merge(Router)` | `merge` hides routes from `autumn routes audit`. `nest` + `declare_plugin_routes` does not. A test mounts the supplier router with `merge` to show that raw routes get the app middleware. | `docs/guide/getting-started.md` |
+| `.merge(Router)` | `merge` hides routes from `autumn routes audit`. `nest` + `declare_plugin_routes` does not. A test uses `merge` to show that raw routes get the app state and middleware. | `docs/guide/getting-started.md` |
 | `on_startup` + raw SQL seed | No seed data. | `examples/react-graphql` |
 | `state_initializer` + extensions | No shared service. | `examples/media-room` |
 | Custom `FromRequestParts` | Built-in extractors are enough. | `docs/guide/extractors.md` |
@@ -116,7 +117,8 @@ Question: "How do we make this example bad?" Each answer gives a rule.
 ## 8. Acceptance criteria
 
 No GitHub issue exists for this example. The criteria come from the request
-and from the PRD (FR-041, FR-042, FR-045).
+and from the PRD ([`docs/prd-autumn-2026-03-20.md`](../../docs/prd-autumn-2026-03-20.md):
+FR-041, FR-042, FR-045).
 
 1. AC1: An example app shows each escape hatch kind, each with a real reason.
 2. AC2: Each hatch starts from the convention (a model and a repository).

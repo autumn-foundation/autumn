@@ -1,8 +1,8 @@
 //! H9: mount the supplier's plain Axum router as a plugin.
 //!
-//! The router has its own state, so it cannot become `#[get]` handlers
-//! without a rewrite, and a rewrite forks the supplier's code. A `Plugin`
-//! mounts it as it is:
+//! The router has its own state. To use `#[get]` handlers, the app must
+//! rewrite it. A rewrite makes a second copy of the supplier's code. A
+//! `Plugin` mounts the router as it is:
 //!
 //! - `nest` puts it under `/supplier`.
 //! - `declare_plugin_routes` lists its routes, so `autumn routes` and

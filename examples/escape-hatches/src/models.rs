@@ -21,7 +21,7 @@ pub struct Product {
     pub price_cents: i64,
 }
 
-/// One checkout. `order_ref` is unique, so a retry cannot run twice.
+/// One checkout. `order_ref` is unique, so a retried checkout cannot apply twice.
 #[autumn_web::model]
 pub struct Order {
     #[id]

@@ -1,7 +1,8 @@
 //! Chromium smoke for the `escape-hatches` example.
 //!
-//! Boots the real binary on a fresh Postgres (it migrates on boot in
-//! `development`). A browser opens the product list and a missing SKU.
+//! Starts the real binary on a fresh Postgres. In the `dev` profile, it
+//! applies its migration at boot. A browser opens the product list and the
+//! page for an unknown SKU.
 //!
 //! Needs Chromium and Docker:
 //!   cargo test -p escape-hatches --features system-tests --test smoke -- --include-ignored
@@ -34,7 +35,7 @@ async fn product_list_and_not_found_page_render() {
 
     page.visit("/products/ZZ-9")
         .await
-        .expect("visit a missing SKU");
+        .expect("visit an unknown SKU");
     // The page's own status is 404, and Chromium logs that as a console
     // error. So this visit checks the text only.
     page.expect_text("ZZ-9")

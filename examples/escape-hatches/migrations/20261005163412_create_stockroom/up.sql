@@ -1,4 +1,4 @@
--- Products. The CHECK is the last line of defense: no write can make stock negative.
+-- Products. The CHECK stops any write that makes stock negative.
 CREATE TABLE products (
     id          BIGSERIAL PRIMARY KEY,
     sku         TEXT   NOT NULL UNIQUE,

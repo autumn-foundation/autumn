@@ -1,15 +1,15 @@
-//! Tests for each escape hatch. Each test names the hatch it proves (H1..H13,
-//! see `PLAN.md`).
+//! Tests for the escape hatches. Most tests name the hatch that they prove
+//! (see `PLAN.md`). The H4 test is in `report_gate.rs`.
 //!
 //! Two tiers:
 //!
-//! - No Docker: layers, plugins, routers, filters, error pages.
-//! - Docker: everything that reads or writes rows. These tests share one
-//!   Postgres container and its tables, so run them on one thread:
+//! - No-database tier: layers, plugins, routers, filters, error pages.
+//! - Postgres tier (Docker): each test that reads or writes rows. These tests
+//!   share one Postgres container and its tables, so run them on one thread:
 //!
 //! ```text
-//! cargo test -p escape-hatches --test hatches                                         # tier 1
-//! cargo test -p escape-hatches --test hatches -- --include-ignored --test-threads=1   # both
+//! cargo test -p escape-hatches --test hatches                                         # no-database tier
+//! cargo test -p escape-hatches --test hatches -- --include-ignored --test-threads=1   # both tiers
 //! ```
 
 mod support;
@@ -103,7 +103,7 @@ async fn post_api(client: &TestClient, path: &str, body: &Value) -> autumn_web::
         .await
 }
 
-// ── Tier 1: no database ────────────────────────────────────────────────────
+// ── No-database tier ────────────────────────────────────────────────────
 
 /// H7: every page says `no-store`, because stock counts are live.
 #[tokio::test]
@@ -266,18 +266,36 @@ fn app_declares_every_route() {
     }
 }
 
-/// `merge`: the same plain router, merged as-is, gets the app middleware.
+/// `merge` (FR-041): a raw router, merged as it is, gets the app middleware.
+/// A raw route can also read the app's `AppState`.
 #[tokio::test]
-async fn merged_raw_router_gets_app_middleware() {
+async fn merged_raw_router_gets_app_middleware_and_state() {
+    let profile = axum::Router::<autumn_web::AppState>::new().route(
+        "/profile",
+        axum::routing::get(
+            |axum::extract::State(state): axum::extract::State<autumn_web::AppState>| async move {
+                state.profile().to_owned()
+            },
+        ),
+    );
     let client = TestApp::new()
+        .profile("test")
         .merge(supplier::router(supplier::Catalog::sample()))
+        .merge(profile)
         .build();
+
     let response = client.get("/items").send().await;
     response.assert_ok();
     assert!(
         response.header("x-request-id").is_some(),
         "request id layer must run"
     );
+    client
+        .get("/profile")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_eq("test");
 }
 
 /// H10: a 404 for an unknown SKU links to the supplier catalog.
@@ -422,8 +440,9 @@ async fn csrf_exempts_the_bearer_api_only() {
 
     // No CSRF token on a browser route: refused.
     client.post("/form").send().await.assert_status(403);
-    // No CSRF token on the bearer API: not refused by CSRF. (No DB here, so
-    // the handler answers 503. The point is that it is not 403.)
+    // No CSRF token on the scanner API: CSRF does not refuse it. This client
+    // has no database, so the handler returns 503. The test checks only that
+    // the status is not 403.
     let response = post_api(&client, "/api/checkout", &cart("o-1", &[("A-1", 1)])).await;
     assert_ne!(
         response.status,
@@ -433,11 +452,28 @@ async fn csrf_exempts_the_bearer_api_only() {
     );
 }
 
-// ── Tier 2: Postgres (Docker) ──────────────────────────────────────────────
+/// H12: the provider refuses a URL that asks for TLS. Its custom connect
+/// step replaces Autumn's TLS setup, so it must not drop TLS silently.
+#[tokio::test]
+async fn password_file_refuses_tls_urls() {
+    use autumn_web::config::DatabaseConfig;
+    use autumn_web::db::DatabasePoolProvider;
 
-/// Why `with_lock` exists. Two requests read the same row, then each writes
-/// an absolute value. The second write erases the first. Five units, two
-/// sales, and the table says four.
+    let config = DatabaseConfig {
+        url: Some("postgres://app@db.internal/app?sslmode=require".to_owned()),
+        ..DatabaseConfig::default()
+    };
+    let result = PasswordFilePool::new("/run/secrets/db-password")
+        .create_pool(&config)
+        .await;
+    assert!(result.is_err(), "TLS URL must be refused");
+}
+
+// ── Postgres tier (Docker) ──────────────────────────────────────────────
+
+/// Why `with_lock` exists. Two callers read the same row. Each writes an
+/// absolute value. The second write erases the first. The stock starts at 5,
+/// two sales occur, and the table shows 4.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn hazard_repository_read_modify_write_loses_an_update() {
@@ -840,21 +876,4 @@ async fn password_file_is_read_on_each_new_connection() {
     std::fs::write(&file, "postgres\n").expect("rotate password");
     let conn = pool.get().await;
     assert!(conn.is_ok(), "rotated password must work: {:?}", conn.err());
-}
-
-/// H12: the provider refuses a URL that asks for TLS. Its custom connect
-/// step replaces Autumn's TLS setup, so it must not drop TLS without a word.
-#[tokio::test]
-async fn password_file_refuses_tls_urls() {
-    use autumn_web::config::DatabaseConfig;
-    use autumn_web::db::DatabasePoolProvider;
-
-    let config = DatabaseConfig {
-        url: Some("postgres://app@db.internal/app?sslmode=require".to_owned()),
-        ..DatabaseConfig::default()
-    };
-    let result = PasswordFilePool::new("/run/secrets/db-password")
-        .create_pool(&config)
-        .await;
-    assert!(result.is_err(), "TLS URL must be refused");
 }

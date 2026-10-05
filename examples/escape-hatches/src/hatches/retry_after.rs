@@ -1,6 +1,6 @@
 //! H11: add `Retry-After` to 503 responses, with `.exception_filter(..)`.
 //!
-//! A 503 says "try again later". Scanner clients wait for the number of
+//! A 503 says "try again later". Scanners wait for the number of
 //! seconds in `Retry-After`. The framework turns a Postgres statement
 //! timeout into a 503 (`autumn.query_timeout`), but it sends no
 //! `Retry-After`. Without it, clients retry at once and add load.

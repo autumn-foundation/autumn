@@ -1,4 +1,4 @@
-// Diesel tables. They match `migrations/20261005000000_create_stockroom`.
+// Diesel tables. They match `migrations/20261005163412_create_stockroom`.
 diesel::table! {
     products (id) {
         id -> Int8,

@@ -1,6 +1,6 @@
 //! A stockroom app that shows each Autumn escape hatch with a real reason.
 //!
-//! Read `PLAN.md` first. Each hatch has a number (H1..H13). The convention
+//! Read `README.md` first. Each hatch has a number (H1 to H13). The convention
 //! comes first in each file. The hatch comes only where the convention
 //! cannot do the job, and a comment says why.
 
@@ -62,7 +62,8 @@ pub fn scanner_guard(token: Option<&str>) -> RequireApiToken {
     RequireApiToken::new(Arc::new(store))
 }
 
-/// Build the app. Each line after `routes` is one escape hatch.
+/// Build the app. Each call after `.routes(..)` adds an escape hatch. A
+/// comment names it.
 #[must_use]
 pub fn app() -> AppBuilder {
     let scanner_token = std::env::var(SCANNER_TOKEN_ENV).ok();
@@ -83,7 +84,7 @@ pub fn app() -> AppBuilder {
         .declare_plugin_routes(exports::routes())
         // H9: the supplier's plain Axum router, as a plugin.
         .plugin(SupplierPlugin::sample())
-        // H7: no shared cache keeps a page.
+        // H7: tell shared caches not to keep pages.
         .layer(cache_control::no_store())
         // H10: error pages in the stockroom frame.
         .error_pages(StockroomErrorPages)

@@ -22,7 +22,7 @@ use crate::repositories::{
 };
 use crate::schema::{order_lines, orders, products};
 
-/// The most units one call can move. It keeps `stock + add` inside `INT`.
+/// The most units that one call can move.
 const MAX_QUANTITY: i32 = 10_000;
 
 /// The body of a reserve call.
@@ -78,10 +78,11 @@ pub async fn reserve(
 ///
 /// Why not the convention:
 ///
-/// - `with_lock` locks one row in its own transaction. A cart needs many
-///   rows in one transaction, so a short line rolls back the lines before it.
-/// - `#[lock_version]` detects a conflict, but the loser gets 409 and must
-///   retry. On a busy SKU most callers would fail.
+/// - `with_lock` locks one row in its own transaction. A cart needs all its
+///   rows in one transaction, so that a short line (a line with not enough
+///   stock) can roll back the lines before it.
+/// - `#[lock_version]` finds a conflict, but the second caller gets 409 and
+///   must retry. On a busy SKU, most callers fail.
 ///
 /// So the handler opens `Db::tx` and sends one guarded `UPDATE` per line:
 /// `SET stock = stock - n WHERE stock >= n`. Postgres does the check and the
@@ -99,7 +100,8 @@ pub async fn checkout(mut db: Db, Json(cart): Json<Cart>) -> AutumnResult<Respon
             let order_ref = order_ref.clone();
             let lines = lines.clone();
             async move {
-                // A used `order_ref` inserts no row. Nothing else runs.
+                // A used `order_ref` inserts no row. The handler returns 409
+                // and writes nothing.
                 let order_id: Option<i64> = diesel::insert_into(orders::table)
                     .values(orders::order_ref.eq(&order_ref))
                     .on_conflict_do_nothing()
@@ -175,9 +177,9 @@ async fn short_line_error(conn: &mut autumn_web::RuntimeConnection, sku: &str) -
 ///
 /// Why not the convention: the repository writes absolute values. A loop of
 /// `find_by_category` then `update` per row costs a round trip per product.
-/// Worse, a checkout between the read and the write is lost (see the hazard
-/// test). One relative `UPDATE … SET stock = stock + n` has no read, so it
-/// cannot lose a checkout.
+/// The loop also loses a checkout that runs between its read and its write
+/// (see `hazard_repository_read_modify_write_loses_an_update`). One relative
+/// `UPDATE … SET stock = stock + n` has no read, so it cannot lose a checkout.
 #[post("/restock")]
 pub async fn restock(
     mut db: Db,

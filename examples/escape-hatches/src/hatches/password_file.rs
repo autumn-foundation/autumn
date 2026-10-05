@@ -15,7 +15,7 @@
 //!
 //! Trade-off: a custom connect step replaces Autumn's own, which also sets
 //! up TLS. This provider does not set up TLS, so it refuses a URL that asks
-//! for it. Do not drop TLS without a word.
+//! for it. It never drops TLS silently.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
