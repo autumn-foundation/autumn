@@ -255,6 +255,8 @@ const DIRECT_CALLBACKS: &[&str] = &[
     "find_map",
     "fold",
     "try_fold",
+    // Its `Try` result holds the callback's residual: `Err(&repo)`.
+    "try_for_each",
     "unwrap_or_else",
     "map_or",
     "map_or_else",
@@ -3330,6 +3332,17 @@ impl Analyzer {
                     || (method == "checkout" && self.expr_is_lazy_db(&mc.receiver))
                 {
                     return Some(Shape::Db);
+                }
+                // `try_for_each(|_| Err(&repo))` gives what its callback gives.
+                if matches!(method.as_str(), "try_for_each" | "try_fold") {
+                    let tail = match mc.args.last()? {
+                        Expr::Closure(c) => match &*c.body {
+                            Expr::Block(b) => block_tail(&b.block)?,
+                            body => body,
+                        },
+                        _ => return None,
+                    };
+                    return self.shape_of(tail);
                 }
                 // `maybe.unwrap()` on an `Option<Db>` gives a `Db`.
                 if UNWRAP_METHODS.contains(&method.as_str())
@@ -9356,6 +9369,24 @@ mod tests {
                 "an alias of an adapter keeps the Result sides",
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
                  let alias = result.as_ref(); let _ = alias.map_err(|e| render(e)); Ok(0) }",
+                Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn try_for_each_gives_its_residual() {
+        check_handlers(&[
+            (
+                "try_for_each gives its callback's residual",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let failed = ids.into_iter().try_for_each(|_| Err::<(), _>(&repo)); let r = failed.unwrap_err(); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: try_for_each with a plain callback is plain",
+                "async fn h(ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let done = ids.into_iter().try_for_each(|_| Ok::<(), i64>(())); render(done); Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);
