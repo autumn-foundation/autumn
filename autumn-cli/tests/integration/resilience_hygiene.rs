@@ -159,9 +159,9 @@ fn app_runner_cutover_health_check_uses_ready() {
 }
 
 #[test]
-fn healthcheck_url_overrides_use_live() {
-    // The image HEALTHCHECK is a liveness probe. An override must keep the
-    // same path and change only the scheme. Each file shows one or more
+fn healthcheck_url_overrides_use_startup() {
+    // The image HEALTHCHECK uses /startup. An override must keep the same
+    // path and change only the scheme. Each file shows one or more
     // overrides, so a reworded example cannot make this check empty.
     for file in [
         "docs/guide/tls.md",
@@ -179,8 +179,8 @@ fn healthcheck_url_overrides_use_live() {
         );
         for line in overrides {
             assert!(
-                line.contains("/live") && !line.contains("/health"),
-                "{file}: an AUTUMN_HEALTHCHECK_URL override must point at /live: {line}"
+                line.contains("/startup") && !line.contains("/health"),
+                "{file}: an AUTUMN_HEALTHCHECK_URL override must point at /startup: {line}"
             );
         }
     }

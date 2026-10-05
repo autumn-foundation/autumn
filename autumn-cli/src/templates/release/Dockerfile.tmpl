@@ -126,15 +126,18 @@ LABEL org.opencontainers.image.title="{{project_name}}" \
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000
 
-# Container liveness probe. It uses /live, not /ready. /live does not fail
-# when a dependency, such as the database, is down. Plain Docker only marks a
-# failed container unhealthy. An orchestrator that acts on health status
-# (Docker Swarm, for example) replaces it. Platforms that route traffic use
-# their own /ready check.
+# Container health probe. It uses /startup, not /ready or /live:
+# - /startup fails until startup is complete, so `docker compose up --wait`
+#   and `condition: service_healthy` wait for a started app.
+# - After startup it does not fail when a dependency, such as the database,
+#   is down. Plain Docker only marks a failed container unhealthy, but an
+#   orchestrator that acts on health status (Docker Swarm, for example)
+#   replaces it.
+# Platforms that route traffic use their own /ready check.
 #
 # When the app terminates TLS itself ([server.tls], issue #1603), set
 # AUTUMN_HEALTHCHECK_URL to an https URL, for example
-# `https://localhost:3000/live`. A plain-HTTP probe always fails on an HTTPS
+# `https://localhost:3000/startup`. A plain-HTTP probe always fails on an HTTPS
 # listener.
 #
 # Certificate verification is skipped only when AUTUMN_HEALTHCHECK_INSECURE is
@@ -149,7 +152,7 @@ EXPOSE 3000
 # always verifies.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS ${AUTUMN_HEALTHCHECK_INSECURE:+--insecure} \
-        "${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/live}" >/dev/null || exit 1
+        "${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/startup}" >/dev/null || exit 1
 
 USER autumn
 

@@ -1830,7 +1830,7 @@ In-process HTTPS termination on the same host:port (off by default).
 - **In a container:** the image builder runs a bare `cargo build --release`, so
   `tls` must be a *default* feature of the app; mount the PEMs and set
   `AUTUMN_SERVER__TLS__CERT_PATH` / `__KEY_PATH`; set
-  `AUTUMN_HEALTHCHECK_URL=https://localhost:3000/live` plus
+  `AUTUMN_HEALTHCHECK_URL=https://localhost:3000/startup` plus
   `AUTUMN_HEALTHCHECK_INSECURE=1` so the generated Dockerfile's HEALTHCHECK
   probes its own loopback listener over TLS instead of failing forever. See
   `docs/guide/tls.md`.

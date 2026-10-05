@@ -1672,11 +1672,12 @@ The command emits three files at the project root:
 > The production Dockerfile adds cargo-chef dependency caching (so rebuilds only
 > recompile what changed), installs `libpq`, `tini`, and `ca-certificates` in the
 > slim runtime, copies compiled Tailwind assets from `static/`, leaves
-> migrations to an explicit primary-role job, and wires the `/live` liveness
-> probe as the container `HEALTHCHECK`. Plain Docker and Compose only mark a
-> failed container `unhealthy`. An orchestrator that acts on health status
-> (Docker Swarm, for example) replaces it, so the check uses `/live`, not
-> `/ready`.
+> migrations to an explicit primary-role job, and wires the `/startup` probe
+> as the container `HEALTHCHECK`. `/startup` fails until startup is complete,
+> so `docker compose up --wait` waits for a started app. After that it does
+> not fail on a dependency. Plain Docker and Compose only mark a failed
+> container `unhealthy`, but Docker Swarm replaces it, so the check does not
+> use `/ready`.
 
 ---
 

@@ -1385,8 +1385,8 @@ mod tests {
             "Dockerfile must have a HEALTHCHECK directive"
         );
         assert!(
-            content.contains("localhost:3000/live"),
-            "HEALTHCHECK must probe the /live liveness endpoint"
+            content.contains("localhost:3000/startup"),
+            "HEALTHCHECK must probe the /startup endpoint"
         );
     }
 
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     /// Issue #1603 AC6: an image whose app terminates TLS itself
-    /// (`[server.tls]`) answers `/live` over **HTTPS**, so a HEALTHCHECK
+    /// (`[server.tls]`) answers `/startup` over **HTTPS**, so a HEALTHCHECK
     /// hardcoded to `http://` marks that container permanently unhealthy —
     /// and in compose, `depends_on: condition: service_healthy` never
     /// releases. The probe URL must therefore be overridable at runtime.
@@ -1429,7 +1429,7 @@ mod tests {
              image can be probed over https://, got: {healthcheck}"
         );
         assert!(
-            healthcheck.contains("http://localhost:3000/live"),
+            healthcheck.contains("http://localhost:3000/startup"),
             "the default probe URL must stay today's plain-HTTP one, got: {healthcheck}"
         );
         assert!(
@@ -1465,21 +1465,25 @@ mod tests {
             // Default: today's plain-HTTP probe, verification on.
             (None, None, false),
             // An https URL alone is NOT enough — fail safe, not fail open.
-            (Some("https://localhost:3000/live"), None, false),
+            (Some("https://localhost:3000/startup"), None, false),
             // The documented direct-TLS pairing.
-            (Some("https://localhost:3000/live"), Some("1"), true),
+            (Some("https://localhost:3000/startup"), Some("1"), true),
             // Any non-empty value opts in; the value itself is not parsed.
-            (Some("https://localhost:3000/live"), Some("true"), true),
+            (Some("https://localhost:3000/startup"), Some("true"), true),
             // An empty value is not an opt-in.
-            (Some("https://localhost:3000/live"), Some(""), false),
+            (Some("https://localhost:3000/startup"), Some(""), false),
             // URLs that a parser would have mistaken for loopback stay verified
             // unless the operator opted in — curl resolves both remotely.
             (
-                Some("https://localhost:3000@remote.example/live"),
+                Some("https://localhost:3000@remote.example/startup"),
                 None,
                 false,
             ),
-            (Some("https://remote.example#@localhost/live"), None, false),
+            (
+                Some("https://remote.example#@localhost/startup"),
+                None,
+                false,
+            ),
         ];
 
         for (url, insecure, expect_insecure) in cases {
@@ -1508,7 +1512,7 @@ mod tests {
                 if expect_insecure { "" } else { "NOT" }
             );
             // The probe must hit the URL it was given, verbatim.
-            let expected_url = url.unwrap_or("http://localhost:3000/live");
+            let expected_url = url.unwrap_or("http://localhost:3000/startup");
             assert!(
                 invocation.contains(expected_url),
                 "the probe must request {expected_url}; curl was called as: {invocation}"
@@ -7002,22 +7006,24 @@ previous_secrets = []
     /// `/ready` gates traffic. `/live` triggers a restart. `/startup` holds
     /// a new instance until startup is complete.
     fn probe_expectations(target: Target) -> &'static [(&'static str, &'static str, &'static str)] {
-        // The Docker HEALTHCHECK is a liveness signal: Swarm replaces an
-        // unhealthy container, so it must not fail on a dependency.
-        const DOCKER_LIVENESS: (&str, &str, &str) = (
+        // The Docker HEALTHCHECK uses /startup. It fails until startup is
+        // complete, so `compose up --wait` and `service_healthy` wait. After
+        // that it does not fail on a dependency, so Swarm does not replace
+        // containers during a database outage.
+        const DOCKER_HEALTHCHECK: (&str, &str, &str) = (
             "Dockerfile",
             "${AUTUMN_HEALTHCHECK_URL:-",
-            "localhost:3000/live",
+            "localhost:3000/startup",
         );
         match target {
-            Target::Default | Target::DockerCompose => &[DOCKER_LIVENESS],
+            Target::Default | Target::DockerCompose => &[DOCKER_HEALTHCHECK],
             Target::Fly => &[
-                DOCKER_LIVENESS,
+                DOCKER_HEALTHCHECK,
                 ("fly.toml", "[[http_service.checks]]", r#"path = "/ready""#),
                 ("fly.toml", "[checks.live]", r#"path = "/live""#),
             ],
             Target::AwsEcs => &[
-                DOCKER_LIVENESS,
+                DOCKER_HEALTHCHECK,
                 ("main.tf", "health_check {", r#"path = "/ready""#),
                 // The bootstrap container must pass the same check.
                 ("main.tf", "command = [", "location /ready"),
@@ -7025,18 +7031,18 @@ previous_secrets = []
             // The real path is set by the cutover call in
             // docs/guide/deployment.md. The bootstrap image only serves "/".
             Target::AwsAppRunner => &[
-                DOCKER_LIVENESS,
+                DOCKER_HEALTHCHECK,
                 ("main.tf", "health_check_configuration {", r#"path = "/""#),
             ],
             Target::GcpCloudRun => &[
-                DOCKER_LIVENESS,
+                DOCKER_HEALTHCHECK,
                 // Cloud Run has no readiness probe. Its startup probe uses
                 // /startup, as docs/guide/cloud-native.md recommends.
                 ("main.tf", "startup_probe {", r#"path = "/startup""#),
                 ("main.tf", "liveness_probe {", r#"path = "/live""#),
             ],
             Target::AzureContainerApps => &[
-                DOCKER_LIVENESS,
+                DOCKER_HEALTHCHECK,
                 ("main.tf", "startup_probe {", r#"path = "/startup""#),
                 ("main.tf", "readiness_probe {", r#"path = "/ready""#),
                 ("main.tf", "liveness_probe {", r#"path = "/live""#),
