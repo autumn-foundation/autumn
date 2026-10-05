@@ -255,6 +255,8 @@ mod offline_sync_store;
 mod openapi;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+#[cfg(feature = "db")]
+mod outbox_pg;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;

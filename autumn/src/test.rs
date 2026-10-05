@@ -782,6 +782,8 @@ pub struct TestApp {
     jobs: Vec<crate::job::JobInfo>,
     tasks: Vec<crate::task::TaskInfo>,
     listeners: Vec<crate::events::ListenerInfo>,
+    #[cfg(feature = "db")]
+    outbox_handlers: crate::outbox::OutboxHandlers,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     #[cfg(feature = "mail")]
     suppression_store: Option<crate::mail::SuppressionStoreHandle>,
@@ -868,6 +870,8 @@ impl TestApp {
             jobs: Vec::new(),
             tasks: Vec::new(),
             listeners: Vec::new(),
+            #[cfg(feature = "db")]
+            outbox_handlers: crate::outbox::OutboxHandlers::default(),
             exception_filters: Vec::new(),
             #[cfg(feature = "mail")]
             suppression_store: None,
@@ -1317,6 +1321,8 @@ impl TestApp {
         self.jobs.extend(app_builder.jobs);
         self.tasks.extend(app_builder.tasks);
         self.listeners.extend(app_builder.listeners);
+        #[cfg(feature = "db")]
+        self.outbox_handlers.extend(app_builder.outbox_handlers);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
         self.health_indicators.extend(app_builder.health_indicators);
@@ -1562,6 +1568,39 @@ impl TestApp {
     #[must_use]
     pub fn listeners(mut self, listeners: Vec<crate::events::ListenerInfo>) -> Self {
         self.listeners.extend(listeners);
+        self
+    }
+
+    /// Enable the outbox relay with `config` (it sets `enabled = true`).
+    ///
+    /// `build` cannot create the tables. Call
+    /// [`crate::outbox::ensure_schema`] in the test first.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn with_outbox(mut self, config: crate::config::OutboxConfig) -> Self {
+        self.config.outbox = config;
+        self.config.outbox.enabled = true;
+        self
+    }
+
+    /// Set the outbox handler of `topic`, as `AppBuilder::outbox_handler`.
+    ///
+    /// The test app runs no relay worker. Drain the outbox with
+    /// [`crate::outbox::drain`] or [`crate::sim::Sim::run_to_idle`]. Set
+    /// `outbox.enabled = true` in the config, and create the tables with
+    /// [`crate::outbox::ensure_schema`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `topic` is empty or starts with `autumn.`.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn outbox_handler<F, Fut>(mut self, topic: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(AppState, crate::outbox::OutboxMessage) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.outbox_handlers.insert(topic, handler);
         self
     }
 
@@ -2254,6 +2293,15 @@ impl TestApp {
         if let Some(interceptor) = self.http_interceptor {
             state.insert_extension(interceptor);
         }
+
+        // Before the mailer: with `outbox.enabled`, `deliver_later` goes
+        // through the outbox queue the relay installs.
+        #[cfg(feature = "db")]
+        crate::outbox::install(
+            &state,
+            &self.config.outbox,
+            std::mem::take(&mut self.outbox_handlers),
+        );
 
         #[cfg(feature = "mail")]
         {

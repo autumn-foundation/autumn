@@ -83,6 +83,8 @@ pub fn app() -> AppBuilder {
         one_off_tasks: Vec::new(),
         jobs: Vec::new(),
         listeners: Vec::new(),
+        #[cfg(feature = "db")]
+        outbox_handlers: crate::outbox::OutboxHandlers::default(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
@@ -427,6 +429,9 @@ pub struct AppBuilder {
     /// Registered event listeners; durable ones are synthesized into jobs at
     /// build time and the rest dispatch synchronously via the event registry.
     pub(crate) listeners: Vec<crate::events::ListenerInfo>,
+    /// Outbox topic handlers (issue #3062).
+    #[cfg(feature = "db")]
+    pub(crate) outbox_handlers: crate::outbox::OutboxHandlers,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     pub(crate) exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     pub(crate) scoped_groups: Vec<ScopedGroup>,
@@ -846,6 +851,27 @@ impl AppBuilder {
     #[must_use]
     pub fn listeners(mut self, listeners: Vec<crate::events::ListenerInfo>) -> Self {
         self.listeners.extend(listeners);
+        self
+    }
+
+    /// Set the outbox handler of `topic` (issue #3062).
+    ///
+    /// The relay calls it for each message written with
+    /// [`Outbox::write`](crate::outbox::Outbox::write) on `topic`. It runs
+    /// only when `outbox.enabled = true`. A message can arrive more than
+    /// once; drop copies with [`Inbox::seen`](crate::outbox::Inbox::seen).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `topic` is empty or starts with `autumn.` (reserved).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn outbox_handler<F, Fut>(mut self, topic: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(AppState, crate::outbox::OutboxMessage) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.outbox_handlers.insert(topic, handler);
         self
     }
 
@@ -3693,6 +3719,8 @@ impl AppBuilder {
             one_off_tasks: _,
             mut jobs,
             listeners,
+            #[cfg(feature = "db")]
+            outbox_handlers,
             static_metas,
             exception_filters,
             scoped_groups,
@@ -4413,6 +4441,20 @@ impl AppBuilder {
         if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
+        // Before the mailer: with `outbox.enabled`, `deliver_later` goes
+        // through the outbox unless the app set its own queue (issue #3062).
+        #[cfg(feature = "db")]
+        {
+            crate::outbox::install(&state, &config.outbox, outbox_handlers);
+            if state.extension::<crate::outbox::OutboxRelay>().is_some()
+                && let Some(pool) = state.pool()
+                && let Err(error) = crate::outbox::ensure_schema(pool).await
+            {
+                tracing::error!(error = %error, "Failed to create the outbox tables");
+                exit_stop_managed_pg();
+                std::process::exit(1);
+            }
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
@@ -5085,6 +5127,15 @@ impl AppBuilder {
                 pool,
                 server_shutdown.child_token(),
             );
+        }
+        // The outbox relay is background work too: only roles that run
+        // workers send messages (issue #3062).
+        #[cfg(feature = "db")]
+        if role.runs_workers() {
+            drop(crate::outbox::start_relay_worker(
+                state.clone(),
+                server_shutdown.child_token(),
+            ));
         }
         // Repositories built over a shard pool (`with_pool`) enqueue durable
         // commit hooks into that shard's queue table; drain each one too — again
@@ -6038,6 +6089,8 @@ impl AppBuilder {
             one_off_tasks: _,
             jobs: _,
             listeners,
+            #[cfg(feature = "db")]
+                outbox_handlers: _,
             static_metas,
             exception_filters: _,
             scoped_groups,
@@ -7533,6 +7586,8 @@ impl AppBuilder {
             one_off_tasks,
             mut jobs,
             listeners,
+            #[cfg(feature = "db")]
+            outbox_handlers,
             #[cfg(feature = "i18n")]
             custom_layers,
             #[cfg(not(feature = "i18n"))]
@@ -7749,6 +7804,19 @@ impl AppBuilder {
         #[cfg(feature = "mail")]
         if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
+        }
+        // A one-off task writes to the outbox; the server relay sends it.
+        #[cfg(feature = "db")]
+        {
+            crate::outbox::install(&state, &config.outbox, outbox_handlers);
+            if state.extension::<crate::outbox::OutboxRelay>().is_some()
+                && let Some(pool) = state.pool()
+                && let Err(error) = crate::outbox::ensure_schema(pool).await
+            {
+                eprintln!("Failed to create the outbox tables: {error}");
+                exit_stop_managed_pg();
+                std::process::exit(1);
+            }
         }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(

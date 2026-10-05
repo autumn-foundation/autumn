@@ -2213,6 +2213,18 @@ impl Mailer {
         }
     }
 
+    /// Apply the mailer defaults and freeze the CSS-inline choice. The
+    /// deferred paths do this before a mail leaves this process.
+    ///
+    /// The CSS-inline default resolves once, so a queue consumer on another
+    /// worker uses the choice of this mailer. Only `None` is frozen; an
+    /// explicit per-message choice stays (issue #1254).
+    pub(crate) fn prepare_deferred(&self, mail: Mail) -> Mail {
+        let mut mail = mail.with_defaults(&self.defaults);
+        self.freeze_inline_css_default(&mut mail);
+        mail
+    }
+
     /// Queue mail for later delivery, deferring when inside a `db.tx`.
     ///
     /// # Errors
@@ -2233,13 +2245,7 @@ impl Mailer {
         if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
             return Err(MailError::NoDurableQueueInProduction);
         }
-        let mut mail = mail.with_defaults(&self.defaults);
-        // Resolve the CSS-inlining default onto the message once, at the top of
-        // the deferred path, so BOTH the durable-queue branch (persisted for a
-        // possibly-different worker to consume) and the in-process fallback
-        // branch carry the originating mailer's decision. Only `None` is frozen;
-        // explicit per-message overrides are preserved (issue #1254).
-        self.freeze_inline_css_default(&mut mail);
+        let mail = self.prepare_deferred(mail);
 
         // When inside a db.tx, push the spawn as an after-commit callback so
         // the mail only fires if the transaction commits successfully.
@@ -2310,8 +2316,7 @@ impl Mailer {
         if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
             return Err(MailError::NoDurableQueueInProduction);
         }
-        let mut mail = mail.with_defaults(&self.defaults);
-        self.freeze_inline_css_default(&mut mail);
+        let mail = self.prepare_deferred(mail);
         self.spawn_mail_delivery(mail)
     }
 
