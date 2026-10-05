@@ -146,6 +146,11 @@ import_capsule(&loaded, registry.capsule_models(), &store).await?;
 `CapsuleStore`, install a `CapsuleService` extension. You can do this on
 SQLite.
 
+**Sharded apps must install a `CapsuleService`.** The default store reads the
+control database, but the rows of a subject are on a shard. With
+`[[database.shards]]`, the default service is not available (`501`). Give a
+`CapsuleStore` that reads the shard of the subject.
+
 ## Integrity
 
 `verify` and `import` do these checks:
@@ -161,6 +166,11 @@ On Unix, export and verify open the capsule directory one time and do not
 follow a link. All reads and writes go through that open directory. If a
 process changes a directory to a link after the open, the reads and writes do
 not follow it. Export makes each file new and never replaces a file.
+
+The capsule itself must not be a link. The directories above it are resolved
+one time, when the capsule is opened. A link among them is followed, as the
+operator configured it. So only the app user may write to the configured
+capsule directory and to each directory above it.
 
 ## Import rules
 

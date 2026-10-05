@@ -99,7 +99,15 @@ pub async fn restore_blobs(
         {
             Ok(Some(_)) => {
                 written.push(entry.key.as_str());
-                Ok(())
+                // A store can keep the bytes but lose the MIME type.
+                match stored_content_type(store, entry).await {
+                    Ok(content_type) if content_type == entry.content_type => Ok(()),
+                    Ok(content_type) => Err(DataCapsuleError::Blob(format!(
+                        "blob {:?} was stored with MIME type {content_type:?}, not {:?}",
+                        entry.key, entry.content_type
+                    ))),
+                    Err(e) => Err(e),
+                }
             }
             // Another writer took the key after the check.
             Ok(None) => check_existing(store, entry).await.map(drop),
@@ -136,13 +144,7 @@ async fn check_existing(
             entry.key
         )));
     }
-    // Export writes `application/octet-stream` when a blob has no metadata,
-    // so compare with the same default.
-    let content_type = match store.head(&entry.key).await {
-        Ok(Some(meta)) => meta.content_type,
-        Ok(None) | Err(BlobStoreError::NotFound(_)) => "application/octet-stream".to_owned(),
-        Err(e) => return Err(DataCapsuleError::Blob(format!("head {:?}: {e}", entry.key))),
-    };
+    let content_type = stored_content_type(store, entry).await?;
     if content_type != entry.content_type {
         return Err(DataCapsuleError::Conflict(format!(
             "blob {:?} exists with MIME type {content_type:?}, not {:?}",
@@ -150,4 +152,18 @@ async fn check_existing(
         )));
     }
     Ok(true)
+}
+
+/// The MIME type that `store` keeps for `entry.key`. Export writes
+/// `application/octet-stream` when a blob has no metadata, so use the same
+/// default.
+async fn stored_content_type(
+    store: &dyn BlobStore,
+    entry: &BlobEntry,
+) -> Result<String, DataCapsuleError> {
+    match store.head(&entry.key).await {
+        Ok(Some(meta)) => Ok(meta.content_type),
+        Ok(None) | Err(BlobStoreError::NotFound(_)) => Ok("application/octet-stream".to_owned()),
+        Err(e) => Err(DataCapsuleError::Blob(format!("head {:?}: {e}", entry.key))),
+    }
 }

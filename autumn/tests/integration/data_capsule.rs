@@ -813,13 +813,14 @@ mod blobs {
     }
 
     /// A blob store where another writer takes `raced` just before the
-    /// conditional write.
-    struct RacedStore {
+    /// conditional write, and where `loses_mime` keeps no MIME type.
+    struct OddStore {
         inner: LocalBlobStore,
-        raced: &'static str,
+        raced: Option<&'static str>,
+        loses_mime: Option<&'static str>,
     }
 
-    impl BlobStore for RacedStore {
+    impl BlobStore for OddStore {
         fn provider_id(&self) -> &str {
             self.inner.provider_id()
         }
@@ -838,7 +839,7 @@ mod blobs {
             bytes: Bytes,
         ) -> BlobFuture<'a, Option<Blob>> {
             Box::pin(async move {
-                if key == self.raced {
+                if Some(key) == self.raced {
                     self.inner
                         .put(key, "text/plain", Bytes::from_static(b"theirs"))
                         .await?;
@@ -861,7 +862,15 @@ mod blobs {
             self.inner.delete(key)
         }
         fn head<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
-            self.inner.head(key)
+            Box::pin(async move {
+                let meta = self.inner.head(key).await?;
+                Ok(meta.map(|mut meta| {
+                    if Some(key) == self.loses_mime {
+                        "application/octet-stream".clone_into(&mut meta.content_type);
+                    }
+                    meta
+                }))
+            })
         }
         fn presigned_url<'a>(
             &'a self,
@@ -893,9 +902,10 @@ mod blobs {
 
         // The check finds both keys free. Then another writer takes the
         // second key before the import writes it.
-        let target = RacedStore {
+        let target = OddStore {
             inner: blob_store(&tmp.path().join("b")),
-            raced: "docs/ada-cv.txt",
+            raced: Some("docs/ada-cv.txt"),
+            loses_mime: None,
         };
         let err = restore_blobs(&capsule, &target)
             .await
@@ -910,6 +920,43 @@ mod blobs {
             target.get("avatars/ada.png").await,
             Err(BlobStoreError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn restore_fails_when_the_store_does_not_keep_the_mime_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source_blobs).await.unwrap();
+
+        let target = OddStore {
+            inner: blob_store(&tmp.path().join("b")),
+            raced: None,
+            loses_mime: Some("docs/ada-cv.txt"),
+        };
+        let err = restore_blobs(&capsule, &target)
+            .await
+            .expect_err("MIME type not kept");
+        assert!(matches!(err, DataCapsuleError::Blob(_)), "{err:?}");
+        // Nothing that this import wrote stays.
+        for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
+            assert!(
+                matches!(target.get(key).await, Err(BlobStoreError::NotFound(_))),
+                "{key}"
+            );
+        }
     }
 
     #[tokio::test]

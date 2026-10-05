@@ -122,7 +122,8 @@ impl CapsuleService {
     /// # Errors
     ///
     /// [`DataCapsuleError::NotConfigured`] when no models or no database is
-    /// available, or [`DataCapsuleError::MissingSigningSecret`].
+    /// available, or when the app is sharded and has no installed service.
+    /// [`DataCapsuleError::MissingSigningSecret`] when no secret is set.
     pub fn from_state(state: &crate::AppState) -> Result<Self, DataCapsuleError> {
         let dir = state
             .extension::<CapsuleDirectory>()
@@ -312,6 +313,15 @@ fn no_store_for_blob_keys(capsule: &DataCapsule) -> Result<(), DataCapsuleError>
 
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 fn default_store(state: &crate::AppState) -> Result<Arc<dyn CapsuleStore>, DataCapsuleError> {
+    // The default store reads the control pool. In a sharded app the rows of a
+    // subject are on a shard, so the app must give a store that routes there.
+    if state.shards().is_some() {
+        return Err(DataCapsuleError::NotConfigured(
+            "this app is sharded: install a CapsuleService whose store reads the shard of the \
+             subject"
+                .to_owned(),
+        ));
+    }
     state
         .pool()
         .map(|pool| Arc::new(super::PgCapsuleStore::new(pool.clone())) as Arc<dyn CapsuleStore>)
@@ -343,6 +353,35 @@ mod tests {
         // No pool in a test state, and no Postgres store with `sqlite`.
         let err = CapsuleService::from_state(&state_with_models()).expect_err("no store");
         assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
+    }
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[test]
+    fn from_state_refuses_the_default_store_for_a_sharded_app() {
+        // The rows of a subject are on a shard, not on the control pool.
+        let shard = crate::config::ShardConfig {
+            name: "s1".to_owned(),
+            primary_url: crate::test_urls::primary("s1"),
+            slots: None,
+            replica_url: None,
+            primary_pool_size: None,
+            replica_pool_size: None,
+            replica_fallback: None,
+        };
+        let db = crate::config::DatabaseConfig {
+            shards: vec![shard],
+            ..Default::default()
+        };
+        let shards =
+            crate::sharding::create_shard_set(&db, Arc::new(crate::sharding::HashShardRouter))
+                .expect("lazy pools")
+                .expect("one shard");
+        let state = state_with_models().with_shards(shards);
+        let err = CapsuleService::from_state(&state).expect_err("sharded");
+        assert!(
+            matches!(&err, DataCapsuleError::NotConfigured(m) if m.contains("shard")),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -335,7 +335,13 @@ impl BlobStore for LocalBlobStore {
             .await
             .is_err()
             {
+                // The blob is new, so it is ours to remove: a caller must
+                // not get a blob without its MIME type.
+                let _ = tokio::fs::remove_file(&path).await;
                 drop_stale_sidecar(&path).await;
+                return Err(BlobStoreError::Io(format!(
+                    "could not store the metadata of {key}"
+                )));
             }
             Ok(Some(Blob {
                 provider_id: self.inner.provider_id.clone(),
@@ -1356,6 +1362,23 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["b.png", "b.png.meta"]);
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_fails_and_leaves_nothing_when_metadata_is_not_stored() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        // A directory at the sidecar path makes the metadata write fail.
+        std::fs::create_dir_all(dir.path().join("a/b.png.meta")).unwrap();
+        let err = s
+            .put_if_absent("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .expect_err("no metadata");
+        assert!(matches!(err, BlobStoreError::Io(_)), "{err:?}");
+        assert!(matches!(
+            s.get("a/b.png").await,
+            Err(BlobStoreError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

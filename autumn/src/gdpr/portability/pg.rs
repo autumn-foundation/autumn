@@ -232,7 +232,7 @@ fn subject_column<'c>(
 /// the value after the cast must be equal to the value as the base type
 /// without a modifier.
 ///
-/// Run it outside a transaction: a failed cast aborts the transaction.
+/// A failed cast aborts the transaction, so run it last before the query.
 async fn check_subject(
     conn: &mut AsyncPgConnection,
     model: &CapsuleModel,
@@ -338,18 +338,26 @@ impl CapsuleStore for PgCapsuleStore {
     ) -> CapsuleFuture<'a, Vec<ModelData>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
-            for model in models {
-                let columns = describe_table(&mut conn, &model.table).await?;
-                check_subject(&mut conn, model, &columns, subject).await?;
-            }
             conn.transaction::<Vec<ModelData>, DataCapsuleError, _>(async move |conn| {
                 diesel::sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                     .execute(conn)
                     .await
                     .map_err(|e| store_error("start snapshot", &e))?;
+                // Lock every table first: no column type can change until the
+                // end, so the subject check below stays true for the query.
+                for model in models {
+                    let table = quote(&model.table)?;
+                    diesel::sql_query(format!("LOCK TABLE {table} IN ACCESS SHARE MODE"))
+                        .execute(conn)
+                        .await
+                        .map_err(|e| store_error(&format!("lock {}", model.table), &e))?;
+                }
                 let mut data = Vec::with_capacity(models.len());
                 for model in models {
                     let columns = describe_table(conn, &model.table).await?;
+                    // A failed cast stops the transaction, and the export
+                    // stops with it: the transaction only reads.
+                    check_subject(conn, model, &columns, subject).await?;
                     let rows = fetch_rows(conn, model, &columns, subject).await?;
                     data.push((fields(columns), rows));
                 }
@@ -383,7 +391,12 @@ impl CapsuleStore for PgCapsuleStore {
                             })?;
                     }
                     // A rollback does not undo `setval`, so move the sequences
-                    // only after every insert has succeeded.
+                    // only after every insert has succeeded. Check deferred
+                    // constraints now too: at commit it is too late.
+                    diesel::sql_query("SET CONSTRAINTS ALL IMMEDIATE")
+                        .execute(conn)
+                        .await
+                        .map_err(|e| store_error("check deferred constraints", &e))?;
                     for (_, _, batch) in &statements {
                         advance_sequence(conn, &batch.model.table, &batch.model.primary_key)
                             .await?;

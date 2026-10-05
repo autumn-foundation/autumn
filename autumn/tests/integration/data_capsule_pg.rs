@@ -466,7 +466,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
-    for db in ["target", "busy"] {
+    for db in ["target", "busy", "deferred"] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
             .expect("create db");
@@ -478,7 +478,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
              INSERT INTO notes (id, owner, body) VALUES (500, 1, 'mine');"
         ))
         .expect("source");
-    for db in ["target", "busy"] {
+    for db in ["target", "busy", "deferred"] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
             .batch_execute(LEDGER)
@@ -521,6 +521,29 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
     let last = text(
         &busy,
+        "SELECT COALESCE(pg_sequence_last_value(pg_get_serial_sequence('ledger', 'id'))::text, \
+         'unused') AS value",
+    )
+    .await;
+    assert_eq!(last, "unused");
+
+    // A deferred constraint fails only at commit. It must fail before any
+    // sequence moves.
+    let deferred = pool(&format!("{base}/deferred"));
+    PgConnection::establish(&format!("{base}/deferred"))
+        .expect("connect")
+        .batch_execute(
+            "ALTER TABLE notes ADD CONSTRAINT notes_body_key UNIQUE (body) \
+             DEFERRABLE INITIALLY DEFERRED; \
+             INSERT INTO notes (id, owner, body) VALUES (900, 9, 'mine')",
+        )
+        .expect("deferred constraint");
+    let err = import_capsule(&capsule, &models, &PgCapsuleStore::new(deferred.clone()))
+        .await
+        .expect_err("deferred conflict on notes");
+    assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+    let last = text(
+        &deferred,
         "SELECT COALESCE(pg_sequence_last_value(pg_get_serial_sequence('ledger', 'id'))::text, \
          'unused') AS value",
     )
