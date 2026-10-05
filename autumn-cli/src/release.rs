@@ -2964,7 +2964,10 @@ previous_secrets = []
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
-        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        // A Windows checkout gives main.tf CRLF line endings.
+        let content = fs::read_to_string(dir.join("main.tf"))
+            .unwrap()
+            .replace("\r\n", "\n");
         let app = azure_app_block(&content);
         for forbidden in [
             "identity {",
@@ -3009,7 +3012,10 @@ previous_secrets = []
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
-        let content = fs::read_to_string(dir.join("main.tf")).unwrap();
+        // A Windows checkout gives main.tf CRLF line endings.
+        let content = fs::read_to_string(dir.join("main.tf"))
+            .unwrap()
+            .replace("\r\n", "\n");
         let job = content
             .split_once("resource \"azurerm_container_app_job\" \"migrate\"")
             .and_then(|(_, rest)| rest.split_once("\n}\n"))
