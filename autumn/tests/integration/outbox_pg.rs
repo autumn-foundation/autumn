@@ -93,10 +93,10 @@ mod docker {
         );
         assert!(a + b >= 200, "the relays handle every message");
 
-        let log = log.lock().unwrap();
+        let log = log.lock().unwrap().clone();
         assert_eq!(log.len(), 200, "each message is handled once");
         let mut sent: HashMap<String, Vec<String>> = HashMap::new();
-        for (aggregate, id) in log.iter() {
+        for (aggregate, id) in &log {
             sent.entry(aggregate.clone()).or_default().push(id.clone());
         }
         assert_eq!(sent, written, "each aggregate is sent once, in write order");

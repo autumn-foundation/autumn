@@ -102,10 +102,10 @@ The consumer receives the header, extracts `t` and `v1`, concatenates `t` and th
 
 If a webhook delivery fails (network exception, connection timeout, or a non-2xx HTTP status code), the background job initiates a robust retry flow:
 
-* **Exponential Backoff**: every backend computes `initial_backoff_ms * 2^(attempt-1)`, so the default 1000 ms base gives 1 s, 2 s, 4 s, 8 s (`local_retry_delay_ms`, `redis_retry_delay_ms`, `pg_retry_delay_ms` in `autumn/src/job.rs`).
-* **Jitter — on the `local` backend only.** `execute_local_job` passes that delay through `jittered_retry_delay_ms`, which applies **equal jitter**: it *reduces* the delay to a random point in `[delay/2, delay]`, so the first retry lands 500-1000 ms after the failure. Half is guaranteed so a retry can never fire near-instantly, and the delay never exceeds the un-jittered value, so it cannot push a retry past an existing timeout budget. The durable backends do **not** jitter — `redis` and `postgres` schedule the exact exponential delay — so the same app retries at 500-1000 ms in development and at exactly 1 s in production.
-* **Capped Attempts**: Delivery is retried up to a maximum of **5 attempts**.
-* **Dead Letter Queue (DLQ)**: If all 5 attempts fail, the delivery log is permanently archived as `is_dlq = true` and retired from active background processing.
+* **Exponential backoff with full jitter.** Every backend (`local`, `postgres`, `redis`, `sqlite`) waits a random time in `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]` before a retry (`job_retry_delay_ms` in `autumn/src/job.rs`, which uses `autumn_web::backoff`). With the default 1000 ms base, the ceilings are 1 s, 2 s, 4 s, 8 s. The jitter stops deliveries that fail together from retrying together. The cap is `[jobs] max_backoff_ms` (default 1 h).
+* **Capped attempts.** A delivery has **5 attempts** by default. Change this with `OutboundWebhookPlugin::with_max_attempts(n)`.
+  A lower limit also applies to a delivery that already waits for a retry: when it has used up the new limit, it goes to the DLQ without another request. A manual DLQ replay is not limited.
+* **Dead Letter Queue (DLQ)**: If all attempts fail, the delivery log is permanently archived as `is_dlq = true` and retired from active background processing.
 
 ---
 

@@ -126,7 +126,7 @@ copy of the publish order.
 | `static_gen::StaticFileLayer::resolve_entry` → `ResolvedStatic` | Manifest lookup returning the file path **and** the ready-to-serve `Content-Type`; `resolve` is the file-path-only shorthand. `static_gen::resolved_content_type` is the decision function: recorded type → recognized route extension → served file name → `application/octet-stream` (0.8.0, #1832) |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
-| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716) |
+| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716); each generated write then drops those reads after it commits, with no manual call (#3056) |
 | `#[service]` | Service implementation scaffolding (`db`) |
 | `#[secured]` | Session auth and role guard |
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
@@ -1035,7 +1035,22 @@ in **Typed accessible primitives** above.)
 
 `autumn_web::cache::{get_or_compute, get_or_compute_with,
 GetOrComputeOptions, CacheFillError, jittered_ttl}` — single-flight fills,
-optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
+optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)` /
+`.stale_if_error(window)`. With `stale_if_error`, a failed fill serves the last
+value for up to `window` after it went stale (RFC 5861, #3056). A `MokaCache`
+must have no TTL, or a TTL of at least `ttl + window`.
+
+## Cache invalidation errors (#3056)
+
+- `Cache::invalidate_async(key)` / `Cache::invalidate_namespace_async(ns)`
+  return `Result<(), InvalidationError>`. Prefer them in async code: the sync
+  `invalidate` cannot report a failure.
+- `coherence::invalidate_namespace_async(ns)` and the generated
+  `invalidate_declared_caches_async()` return `false` when a sweep failed.
+- A final failure is logged with `warn!` and counted in
+  `autumn_cache_invalidation_failures_total`. Alert on it.
+- `RedisCache` retries with `InvalidationRetry` (default 3 attempts);
+  change it with `.with_invalidation_retry(InvalidationRetry::new(..))`.
 
 ## Downloads (0.6.0)
 

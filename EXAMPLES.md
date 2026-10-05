@@ -277,6 +277,21 @@ Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`
 
 ---
 
+### `examples/escape-hatches` — Escape Hatches, Each With a Reason
+
+<!-- catalog:example name=escape-hatches tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer who knows the conventions and asks: "What do I do when `#[model]` + `#[repository]` is not enough?" |
+| **Journey** | Convention first, then the hatch: each hatch in a stockroom app starts from the convention, names the exact limit, and has a test that proves the limit and the fix (a lost-update hazard test comes first) |
+| **Key capabilities** | `with_lock` (baseline); `Db::tx` + guarded Diesel `UPDATE` for an all-or-nothing cart; a set-based Diesel `UPDATE`; `diesel::sql_query` + `QueryableByName` for a window function; `#[intercept]` with a custom tower layer; `.scoped(..)` with `RequireApiToken`; a CSRF `exempt_paths` for bearer clients; `.layer(..)` with `tower_http`; `.nest(..)` + `ServeDir` + `declare_plugin_routes`; a `Plugin` around a plain Axum router with its own state; `.merge(..)` (in a test); `.error_pages(..)`; `.exception_filter(..)`; `.with_pool_provider(..)` that reads a rotated password file; a `201 Created` + `Location` tuple response |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL (`docker compose up -d` in the example directory provides one) |
+| **Run command** | `STOCKROOM_SCANNER_TOKEN=dev-scanner-token cargo run -p escape-hatches` |
+| **Success proof** | After the README's seed `INSERT`, `curl -si http://127.0.0.1:3000/api/checkout -H 'authorization: Bearer dev-scanner-token' -H 'content-type: application/json' -d '{"order_ref":"o-100","lines":[{"sku":"HAM-1","quantity":2}]}'` returns `201 Created` with `location: /api/orders/o-100`; `curl -s http://127.0.0.1:3000/reports/stock-value` returns the top products per category |
+
+---
+
 ## Experimental Examples
 
 Experimental examples **are** workspace members — they compile, lint and test
@@ -410,6 +425,7 @@ can pick the closest starting point without overlap.
 | Collaborative editing | `collab-notes` | A `#[collaborative]` text field merged by an in-tree CRDT, streamed with live presence over `#[ws]` + channels, with no external real-time service |
 | PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf`; also carries the worked `#[lifecycle]` invoice state machine |
 | SPA + GraphQL plugin | `react-graphql` | Autumn-rendered shell, committed Vite/React/TypeScript bundle, and a generic `GraphqlPlugin` whose resolvers go through a `#[model]`/`#[repository]` with hooks — the same rows also served by generated REST |
+| Escape hatches | `escape-hatches` | Each Autumn escape hatch in one stockroom app, each with a real reason and a test: raw Diesel and SQL below the repository, custom tower layers, raw Axum routers, a plugin, error pages, an exception filter, and a custom pool provider |
 
 ---
 
