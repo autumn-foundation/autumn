@@ -3106,7 +3106,7 @@ previous_secrets = []
             .0;
         for field in [
             ".image = $image",
-            "+ .[1:]",
+            ".[$i] |= ",
             "AUTUMN_DATABASE__PRIMARY_URL",
             "AUTUMN_SECURITY__SIGNING_SECRET",
             "AUTUMN_CACHE__BACKEND",

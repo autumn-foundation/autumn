@@ -98,6 +98,16 @@ APP_ID=$(jq -r '.id' <<< "$APP")
 # "ingress enable" command would build a new ingress object without custom
 # domains, IP restrictions or CORS. So the script sends this saved
 # object back. fqdn is read-only.
+# The app container is the one named after the app (main.tf names it so).
+# An operator can add sidecars before it. A template with one container
+# uses that one.
+NAME_JSON=$(jq -n --arg n "$AZURE_APP_NAME" '$n')
+APP_C="def app_i: (map(.name) | index($NAME_JSON)) // (if length == 1 then 0 else error(\"no container named \" + $NAME_JSON) end);"
+APP_IMAGE="(properties.template.containers[?name=='$AZURE_APP_NAME'] || properties.template.containers)[0].image"
+if ! jq -e "$APP_C"' .properties.template.containers | app_i' <<< "$APP" > /dev/null 2>&1; then
+  echo "::error::$AZURE_APP_NAME has no container named $AZURE_APP_NAME. Give the app container the name of the app." >&2
+  exit 1
+fi
 SAVED_INGRESS=$(jq -c '.properties.configuration.ingress // null | if . then del(.fqdn) else . end' <<< "$APP")
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 # The active revisions decide if a real release runs. The template image is
@@ -107,7 +117,7 @@ OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 ACTIVE=$(az containerapp revision list \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
-  --query "[?properties.active].[name, properties.template.containers[0].image]" \
+  --query "[?properties.active].[name, $APP_IMAGE]" \
   --output tsv)
 RELEASED=""
 ACTIVE_REVISIONS=""
@@ -235,7 +245,7 @@ sole_active() {
     list=$(az containerapp revision list \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
-      --query "[?properties.active].[name, properties.template.containers[0].image]" \
+      --query "[?properties.active].[name, $APP_IMAGE]" \
       --output tsv) || return 1
     # The list must name only this revision. An empty list (during the
     # handoff) does not show that it serves.
@@ -276,10 +286,11 @@ remove_credentials() {
   fi
   # The stage 1 containers: no env var that refers to a managed secret (in
   # any container), and not the four env vars that this script sets.
-  containers=$(jq -c '
+  containers=$(jq -c "$APP_C"'
     map(if .env then .env = [.env[] | select((.secretRef // "")
             | IN("database-url", "signing-secret", "redis-url") | not)] else . end)
-    | .[0].env = [(.[0].env // [])[] | select(.name | IN(
+    | app_i as $i
+    | .[$i].env = [(.[$i].env // [])[] | select(.name | IN(
         "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
         "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)]' <<< "$source")
   # A scale rule or a volume can also refer to a secret. The script cannot
@@ -318,10 +329,11 @@ remove_credentials() {
       [ "$state" = Failed ] && patch=1
     fi
     if [ -n "$patch" ]; then
-      body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" --arg now "$(date +%s)" '
+      body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" --arg now "$(date +%s)" "$APP_C"'
         {location: $app.location, properties: {template: {containers: ($containers
-          | .[0].env = [(.[0].env // [])[] | select(.name != "AUTUMN_CREDENTIAL_CLEANUP")]
-                       + [{name: "AUTUMN_CREDENTIAL_CLEANUP", value: $now}])}}}')
+          | app_i as $i
+          | .[$i].env = [(.[$i].env // [])[] | select(.name != "AUTUMN_CREDENTIAL_CLEANUP")]
+                        + [{name: "AUTUMN_CREDENTIAL_CLEANUP", value: $now}])}}}')
       patch_app "$body" || return 1
       revision=""
     fi
@@ -476,11 +488,12 @@ if [ -z "$RELEASED" ]; then
     fi
 fi
 
-# The new containers. The script changes only the app container (the first
-# one): it sets the image and the env. Other containers (sidecars) stay. The
+# The new containers. The script changes only the app container (the one
+# named after the app): it sets the image and the env. Other containers
+# (sidecars) stay, in their order. The
 # env keeps the variables that this script does not set, and replaces the
 # four that it sets. This JSON has no secret values.
-CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAGE" '
+CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAGE" "$APP_C"'
   any(($job.properties.configuration.secrets // [])[]; .name == "redis-url") as $redis
   | ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
       {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
@@ -493,13 +506,12 @@ CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAG
   | (if $redis then . else
        map(if .env then .env = [.env[] | select(.secretRef != "redis-url")] else . end)
      end)
-  | [(.[0]
-      | .image = $image
+  | app_i as $i
+  | .[$i] |= (.image = $image
       | .env = ([(.env // [])[] | select(.name | IN(
           "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
           "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL",
-          "AUTUMN_CREDENTIAL_CLEANUP", "AUTUMN_FORCE_REVISION") | not)] + $env))]
-    + .[1:]
+          "AUTUMN_CREDENTIAL_CLEANUP", "AUTUMN_FORCE_REVISION") | not)] + $env))
 ') || fail "cannot build the new containers"
 
 # A changed template makes a new revision, so the script waits for it. If
@@ -518,7 +530,7 @@ if jq -en --argjson app "$APP" --argjson containers "$CONTAINERS" \
     --output tsv) || fail "cannot read revision $OLD_REVISION"
   if [ "$LATEST_STATE" = Failed ]; then
     CONTAINERS=$(jq -c --arg now "$(date +%s)" \
-      '.[0].env += [{name: "AUTUMN_FORCE_REVISION", value: $now}]' <<< "$CONTAINERS")
+      "$APP_C"' .[app_i].env += [{name: "AUTUMN_FORCE_REVISION", value: $now}]' <<< "$CONTAINERS")
   else
     OLD_REVISION=""
     RESTART=1
@@ -583,7 +595,7 @@ for _ in $(seq 1 60); do
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --revision "$REVISION" \
-    --query "[[properties.provisioningState, properties.template.containers[0].image]]" \
+    --query "[[properties.provisioningState, $APP_IMAGE]]" \
     --output tsv) || fail "cannot read revision $REVISION"
   read -r REVISION_STATE REVISION_IMAGE <<< "$REVISION_STATUS"
   case "$REVISION_STATE" in
