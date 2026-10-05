@@ -2018,8 +2018,10 @@ impl Analyzer {
             Pat::TupleStruct(p) => {
                 // A `Result` is a handle only when its `Ok` side is one, so
                 // `Err(e)` on it binds the error. On a carrier, such as a
-                // `Result<(), Db>`, `Err(e)` may be the handle.
-                let is_err = p.path.segments.last().is_some_and(|s| s.ident == "Err");
+                // `Result<(), Db>`, `Err(e)` may be the handle. Only the std
+                // `Err`: a handle type may have its own `Err` variant.
+                let is_err = pattern_variant(pat, &self.shadowed)
+                    .is_some_and(|(_, variant)| variant == "Err");
                 let inner = if is_err && kind.is_handle() {
                     Kind::Plain
                 } else {
@@ -12528,6 +12530,31 @@ mod tests {
                 "a clear in one statement still holds in the next",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); source = None; render(source); Ok(0) }",
+                Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn only_the_std_err_binds_a_plain_error() {
+        check_handlers(&[
+            (
+                "guard: a handle type's own Err variant binds the handle",
+                "async fn h(repo: TaggedRepository) -> AutumnResult<usize> { \
+                 match repo { TaggedRepository::Err(r) => { r.find_all().await?; } _ => {} } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an imported Err variant binds the handle",
+                "async fn h(repo: TaggedRepository) -> AutumnResult<usize> { \
+                 use TaggedRepository::Err; \
+                 match repo { Err(r) => { r.find_all().await?; } _ => {} } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "the std Err of a handle result binds the error",
+                "async fn h(res: Result<PgPostRepository, AppError>) -> AutumnResult<usize> { \
+                 match res { Err(e) => render(e), Ok(_) => () } Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);
