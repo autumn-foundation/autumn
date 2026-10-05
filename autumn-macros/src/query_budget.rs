@@ -5705,9 +5705,9 @@ impl<'a> Visit<'a> for FreeNames<'_> {
 
 /// The most that the guards one value can run may cost. A value runs the
 /// guard of every earlier arm whose pattern it matches. A guard with no
-/// variant key (`_`, a binding, a constant) may always run. Of the guards
-/// on one written owner (`Some(_)`, `None`), a value runs those of one
-/// variant only. Owners may name one enum, so they add up.
+/// variant key (`_`, a binding, a constant, a user variant) may always
+/// run. Of the guards on the std variants (`Some(_)`, `None`) or on
+/// literals, a value runs those of one variant or value only.
 fn guard_prefix<'a>(guards: impl Iterator<Item = (&'a Pat, &'a Cost)>) -> Cost {
     let mut keyless = Cost::ZERO;
     let mut variants: Vec<((String, String), Cost)> = Vec::new();
@@ -5743,10 +5743,10 @@ fn pattern_key(pat: &Pat) -> Option<(String, String)> {
     }
 }
 
-/// Can no value match both `a` and `b`? Only when they name different
-/// variants (`Some(_)` and `None`, `Msg::A(..)` and `Msg::B { .. }`) or are
-/// different literals. A constant pattern (`A`, `Foo::MAX`) may equal any
-/// other, so it is never disjoint.
+/// Can no value match both `a` and `b`? Only when they name different std
+/// variants (`Some(_)` and `None`) or are different literals. A constant
+/// (`A`, `Foo::MAX`) or a user variant path (`m::A`) may name the same
+/// value as another, so it is never disjoint.
 fn patterns_disjoint(a: &Pat, b: &Pat) -> bool {
     match (a, b) {
         (Pat::Paren(p), _) => patterns_disjoint(&p.pat, b),
@@ -5779,14 +5779,14 @@ fn literal_value(lit: &syn::Lit) -> Option<String> {
 }
 
 /// The variant a pattern names, as `(owner, variant)`: a std `Some`,
-/// `None`, `Ok` or `Err`, or a tuple-struct or struct pattern with a path
-/// of two or more segments. A bare or unit path may be a constant.
+/// `None`, `Ok` or `Err`. Any other path may be a constant or a re-export
+/// of another variant.
 fn pattern_variant(pat: &Pat) -> Option<(String, String)> {
     const STD: &[&str] = &["Some", "None", "Ok", "Err"];
-    let (path, unit) = match pat {
-        Pat::TupleStruct(p) => (&p.path, false),
-        Pat::Struct(p) => (&p.path, false),
-        Pat::Path(p) => (&p.path, true),
+    let path = match pat {
+        Pat::TupleStruct(p) => &p.path,
+        Pat::Struct(p) => &p.path,
+        Pat::Path(p) => &p.path,
         Pat::Ident(p) if p.ident == "None" && p.subpat.is_none() && p.by_ref.is_none() => {
             return Some(("std".to_string(), "None".to_string()));
         }
@@ -5801,10 +5801,9 @@ fn pattern_variant(pat: &Pat) -> Option<(String, String)> {
             "std" | "core" | "option" | "result" | "Option" | "Result"
         )
     });
-    if STD.contains(&name.as_str()) && std_owner {
-        return Some(("std".to_string(), name));
-    }
-    (!unit && !owner.is_empty()).then(|| (owner.join("::"), name))
+    // A module may re-export one variant under two names (`m::A`, `m::B`),
+    // so only the std variants are known to differ.
+    (STD.contains(&name.as_str()) && std_owner).then(|| ("std".to_string(), name))
 }
 
 /// Methods that give a `&mut` into their receiver without the `_mut`
@@ -11607,10 +11606,16 @@ mod tests {
                 Expect::Exact(2),
             ),
             (
-                "variants of one owner are disjoint",
+                "guard: user variants of one written owner may alias",
                 "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
                  let _ = match x { E::V(_) if repo.a().await? => plain(), E::W(_) => repo.b().await?, _ => plain() }; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Exact(2),
+            ),
+            (
+                "guard: re-exported variant names may alias in guard groups",
+                "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
+                 let _ = match x { m::A(_) if repo.a().await? => (), m::B(_) if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
             ),
         ]);
     }
