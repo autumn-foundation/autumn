@@ -56,6 +56,7 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
+const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 
 /// A failure of the node or the probe. A capsule failure is not one of
 /// these: it is a fallthrough.
@@ -300,10 +301,14 @@ fn forwarded_headers(incoming: &HeaderMap) -> HeaderMap {
 /// `x-forwarded-proto` of `http`/`https` tokens (a chain is allowed), and
 /// appends `peer` to `x-forwarded-for`.
 /// From any other peer, the node is the first proxy: `x-forwarded-for` is
-/// `peer`, `x-forwarded-host` is `host`, `x-forwarded-proto` is `http`. It
-/// always removes `forwarded`.
+/// `peer`, `x-forwarded-host` is `host`, `x-forwarded-proto` is `http`, and
+/// `x-real-ip` is removed. It always removes `forwarded`.
 fn set_forwarded_headers(headers: &mut HeaderMap, peer: Option<IpAddr>, trusted: bool) {
     headers.remove(FORWARDED);
+    if !trusted {
+        // The origin falls back to `x-real-ip`; only a trusted proxy sets it.
+        headers.remove(X_REAL_IP);
+    }
     let chain: Vec<String> = if trusted {
         headers
             .get_all(X_FORWARDED_FOR)

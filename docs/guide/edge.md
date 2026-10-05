@@ -577,7 +577,7 @@ Rules:
     `https, http`), and appends the peer to `x-forwarded-for`.
   - From any other peer, it is the first proxy: `x-forwarded-for` is the
     peer, `x-forwarded-host` is the request `host`, and
-    `x-forwarded-proto` is `http`.
+    `x-forwarded-proto` is `http`. It removes `x-real-ip`.
 - Configure the origin to trust every proxy hop between it and the client:
   the node, and each `--trusted-proxy` in front of the node. The origin
   reads `x-forwarded-for` from the right and stops at the first address it

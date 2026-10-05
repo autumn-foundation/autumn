@@ -1209,3 +1209,22 @@ async fn the_probe_gives_the_origin_the_same_forwarded_host_and_scheme() {
 
     assert!(report.divergences.is_empty(), "{:?}", report.divergences);
 }
+
+#[tokio::test]
+async fn x_real_ip_is_kept_only_from_a_trusted_proxy() {
+    for (trusted, expected) in [(&[][..], None), (&["127.0.0.1"][..], Some("203.0.113.9"))] {
+        let (edge, seen) = recording_node(trusted, None).await;
+        client()
+            .get(format!("{edge}/x"))
+            .header("x-real-ip", "203.0.113.9")
+            .send()
+            .await
+            .expect("node answers");
+        let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(
+            header(&seen[0], "x-real-ip"),
+            expected,
+            "trusted: {trusted:?}"
+        );
+    }
+}
