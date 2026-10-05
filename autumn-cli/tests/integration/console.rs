@@ -741,6 +741,136 @@ fn cargo_check_playground(project: &Path) {
     );
 }
 
+// ── #2148: `--repl` opens a Rhai prompt on the same playground ─────────────
+
+#[test]
+fn console_help_documents_repl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run_autumn_ok(tmp.path(), &["console", "--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--repl"), "{help}");
+    assert!(help.contains("Rhai"), "{help}");
+}
+
+/// `--repl` adds a feature on the command line only: the manifest it writes is
+/// byte-identical to the one plain `autumn console` writes.
+#[test]
+fn console_repl_does_not_change_the_manifest_wiring() {
+    let (_plain_tmp, plain) = new_project("console-repl-app");
+    let (_repl_tmp, repl) = new_project("console-repl-app");
+    run_autumn_ok(&plain, &["console", "--scaffold-only"]);
+    run_autumn_ok(&repl, &["console", "--repl", "--scaffold-only"]);
+    assert_eq!(
+        fs::read_to_string(plain.join("Cargo.toml")).unwrap(),
+        fs::read_to_string(repl.join("Cargo.toml")).unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(playground_path(&plain)).unwrap(),
+        fs::read_to_string(playground_path(&repl)).unwrap(),
+        "one template serves both modes"
+    );
+}
+
+/// A playground from before #2148 has no hook. `--repl` must not run its
+/// edit-and-run body instead of a prompt, and must not write anything.
+#[test]
+fn console_repl_refuses_a_playground_without_the_hook() {
+    let (_tmp, project) = new_project("console-repl-nohook-app");
+    fs::create_dir_all(project.join("src/bin")).unwrap();
+    let edited = "// MY OLD PLAYGROUND\nfn main() {}\n";
+    fs::write(playground_path(&project), edited).unwrap();
+    let manifest_before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    let out = run_autumn(&project, &["console", "--repl", "--scaffold-only"]);
+    assert!(
+        !out.status.success(),
+        "a hook-less playground must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("autumn_web::console_repl!(ctx.pool());"),
+        "the error names the line to add:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        manifest_before,
+        "nothing is written on refusal"
+    );
+    assert_eq!(
+        fs::read_to_string(playground_path(&project)).unwrap(),
+        edited
+    );
+
+    // Plain `autumn console` still accepts the same file.
+    run_autumn_ok(&project, &["console", "--scaffold-only"]);
+}
+
+/// The REPL builds against a generated app and answers piped lines. The
+/// database is unreachable, so a repository read must be a script error and
+/// the session must still end cleanly.
+///
+/// Ignored by default; run with:
+/// `cargo test -p autumn-cli --test cli_tests -- --ignored console_repl_runs`
+#[test]
+#[ignore = "slow: builds and runs a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn console_repl_runs_and_reports_errors_as_script_errors() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let (_tmp, project) = new_project("console-repl-run-app");
+    run_autumn_ok(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "body:Text"],
+    );
+    run_autumn_ok(&project, &["console", "--scaffold-only"]);
+    patch_autumn_web_to_workspace(&project);
+
+    let mut child = Command::new(autumn_bin())
+        .args(["console", "--repl"])
+        .current_dir(&project)
+        .env_remove("AUTUMN_DATABASE__PRIMARY_URL")
+        .env_remove("AUTUMN_DATABASE__URL")
+        .env_remove("AUTUMN_ENV")
+        .env_remove("AUTUMN_PROFILE")
+        .env("DATABASE_URL", "postgres://nobody@127.0.0.1:1/nodb")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run autumn console --repl");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"40 + 2\nPostRepository::count()\nrepositories()\nexit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("42"),
+        "an expression is evaluated:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"PostRepository\""),
+        "the generated repository is registered:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("error: "),
+        "a failed read is a script error:\n{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "never a panic:\n{stderr}");
+    assert!(
+        !stderr.contains("autumn console: done."),
+        "the edit-and-run body does not run in REPL mode:\n{stderr}"
+    );
+}
+
 // ── AC2/AC6: no drift from `autumn seed`, and the docs exist ───────────────
 
 /// AC2: the console's bootstrap must stay the same one `autumn seed` uses.

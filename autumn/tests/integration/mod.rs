@@ -274,6 +274,7 @@ mod problem_details;
 mod process_role_worker_gating;
 #[cfg(feature = "maud")]
 mod profile_conditional_surfaces;
+mod repl_off_by_default;
 #[cfg(feature = "repl")]
 mod repl_registration;
 #[cfg(feature = "db")]

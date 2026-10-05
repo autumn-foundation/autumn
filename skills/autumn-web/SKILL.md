@@ -3138,6 +3138,7 @@ autumn serve --role worker       # run only workers + scheduler (web/worker spli
 autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
 autumn console --force           # regenerate the playground from the template (never overwritten otherwise)
 autumn console --scaffold-only   # scaffold + wire Cargo.toml, then stop
+autumn console --repl            # interactive Rhai prompt: PostRepository::find_all() / find_by_id(id) / count()
 autumn release init --target azure-container-apps   # Terraform scaffold: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ACR, Container Apps, Postgres Flexible Server, Key Vault-backed secrets, opt-in Redis) + .github/workflows/azure-deploy.yml (#1278). Same --force/collision guard as the fly/docker-compose targets; see docs/guide/deployment.md.
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
@@ -3290,6 +3291,11 @@ Two things to know when advising on it:
   entirely. Only `autumn console` compiles it. Never suggest removing that
   gate: without it, a playground that fails to compile would break the app's
   default build.
+- `autumn console --repl` (#2148) opens a Rhai prompt on the same binary. It
+  adds `autumn-web/repl` on the command line only; `Cargo.toml` does not
+  change. `#[model]` / `#[repository]` register through `inventory`; reads
+  only (`find_all`, `find_by_id`, `count`); rows are JSON. An older playground
+  needs `autumn_web::console_repl!(ctx.pool());` after `SeedContext::build()`.
 
 `autumn i18n check` scans `**/*.rs` for string-literal keys passed to
 `t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via

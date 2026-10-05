@@ -24,6 +24,8 @@ on:
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/console.rs"
+      # The `autumn console --repl` prompt (#2148).
+      - "autumn/src/repl.rs"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/src/migrate.rs"
       - "autumn-cli/Cargo.toml"
@@ -106,6 +108,8 @@ on:
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/console.rs"
+      # The `autumn console --repl` prompt (#2148).
+      - "autumn/src/repl.rs"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/src/migrate.rs"
       - "autumn-cli/Cargo.toml"
@@ -536,6 +540,19 @@ jobs:
             | tee "$RUNNER_TEMP/conformance-console_run_surfaces_a_compile_error_in_the_playground.log"
 
           assert_ran "$RUNNER_TEMP/conformance-console_run_surfaces_a_compile_error_in_the_playground.log" console_run_surfaces_a_compile_error_in_the_playground
+      - name: console_repl_runs_and_reports_errors_as_script_errors
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
+          }
+          cargo test -p autumn-cli --test cli_tests \
+            integration::console::console_repl_runs_and_reports_errors_as_script_errors \
+            -- --ignored --exact 2>&1 \
+            | tee "$RUNNER_TEMP/conformance-console_repl_runs_and_reports_errors_as_script_errors.log"
+
+          assert_ran "$RUNNER_TEMP/conformance-console_repl_runs_and_reports_errors_as_script_errors.log" console_repl_runs_and_reports_errors_as_script_errors
       # ── zero-JS attachment uploads (#1236) ──────────────────────────────
       #
       # The machine proof that a scaffolded `Attachment` column actually

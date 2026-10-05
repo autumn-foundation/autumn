@@ -11,7 +11,10 @@
 //! autumn> PostRepository::count()
 //! 3
 //! autumn> PostRepository::find_by_id(1)
-//! { "id": 1, "title": "Hello" }
+//! {
+//!   "id": 1,
+//!   "title": "Hello"
+//! }
 //! ```
 //!
 //! Rows reach the prompt as JSON: the same projection `Json(model)` sends.

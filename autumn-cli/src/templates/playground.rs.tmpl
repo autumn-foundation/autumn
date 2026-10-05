@@ -20,7 +20,7 @@
 //! A Cargo binary target is its own crate and cannot see the app's `src/`
 //! modules, so the app's data modules are pulled in with `#[path]` below. Add
 //! more `#[path]` lines the same way if your queries need them.
-#![allow(dead_code, unused_imports, unused_mut, unused_variables)]
+#![allow(dead_code, unreachable_code, unused_imports, unused_mut, unused_variables)]
 
 {{app_modules}}
 use autumn_web::seed::SeedContext;
@@ -38,6 +38,10 @@ async fn main() {
     };
 
     eprintln!("autumn console: profile `{}`", ctx.profile());
+
+    // `autumn console --repl` opens an interactive Rhai prompt here and exits.
+    // Plain `autumn console` skips this line and runs your code below.
+    autumn_web::console_repl!(ctx.pool());
 
     let mut db = match ctx.conn().await {
         Ok(db) => db,
