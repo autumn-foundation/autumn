@@ -240,12 +240,27 @@ clean confirms the x509-parser chain's new transitive crates
 (`der-parser`/`asn1-rs`/`asn1-rs-derive`/`nom`/`oid-registry`) introduced no
 new license class — no manual diff needed beyond that pass/fail signal.
 
-**GitHub-native Dependabot alert count** (follow-up 8, highest priority):
-not re-checked this pass before the report commit's own push — recorded
-after push in Measurement, same mechanism as every prior pass (the count
-only appears in `git push`'s own stderr banner). This session's GitHub MCP
-tools were searched again; still nothing exposes the Security tab's alert
-list directly, so the count remains an unlinked fact if it moves.
+**GitHub-native Dependabot alert count** (follow-up 8, highest priority) —
+**moved sharply, in the direction that matters.** This pass's own `git push`
+(of the commit carrying this report) printed **16 vulnerabilities (4 high,
+10 moderate, 2 low)**, up from last pass's 9 (2 high, 7 moderate, 0 low):
+total +7, high **doubled** (2→4), moderate +3, low +2. The two prior passes
+had the "high" count flat at 2, which this report called "worth a human's
+attention regardless of how the moderates moved" — it just moved. This
+session still has no tool that lists the individual alerts (GitHub MCP
+tools searched again this pass; nothing exposes the Security tab), so which
+specific advisories are behind the new highs is not established here, and
+neither is whether they land inside this repo's own `deny.toml`-audited
+graph, the scaffold template's graph, a satellite (`fuzz/`,
+`island-flock/`), or one of the two non-Rust manifests
+(`examples/react-graphql/frontend/package-lock.json`,
+`benchmarks/runtime/django`) that this ledger's `cargo deny` harness does
+not cover at all. Given `cargo deny check advisories` still reports 0
+unwaived findings across all 5 Rust graphs this pass, the two new highs are
+either in one of those two uncovered manifests, or GitHub's advisory
+database added matches this session's harness hasn't re-synced against.
+Escalated to the user directly rather than left for next week's pass to
+re-discover.
 
 ## 💡 Mechanism / forcing fact
 
