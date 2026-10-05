@@ -9106,7 +9106,6 @@ async fn execute_fixed_delay_task(
         waiting: None,
     };
     let wait_first = CostGate::waits_before_lease(&*coordinator);
-    let mut retry = 0;
     let (lease, tick_key) = loop {
         if wait_first && !gate.wait(&state, &name).await {
             return;
@@ -9116,11 +9115,9 @@ async fn execute_fixed_delay_task(
             delay,
             crate::time::clock_unix_duration(state.clock()),
         );
-        // Only the lease sees a retry key; the task sees `tick_key`.
-        let lease_key = CostGate::retry_key(&tick_key, retry);
         let lease = match coordinator
             // Pass the delay: replica timers can reach one bucket a full delay apart.
-            .try_acquire_for_period(&name, &lease_key, coordination, delay)
+            .try_acquire_for_period(&name, &tick_key, coordination, delay)
             .await
         {
             Ok(Some(lease)) => lease,
@@ -9133,11 +9130,10 @@ async fn execute_fixed_delay_task(
                 return;
             }
         };
-        // The signal can rise while an expiring lease attempt waits: give the
-        // lease back, wait again, and retry under a key of its own.
+        // The signal can rise while an expiring lease attempt waits: free the
+        // claim (the tick has not run), wait again, and retry the same key.
         if wait_first && CostGate::must_wait(&state, &name) {
-            release_task_lease(lease, &name, &lease_key).await;
-            retry += 1;
+            CostGate::free_unrun_claim(lease, &name, &tick_key).await;
             continue;
         }
         break (lease, tick_key);
@@ -9222,14 +9218,15 @@ impl CostGate {
         .await
     }
 
-    /// The lease key for a retry: a released row stays until it expires,
-    /// so a retry needs a key of its own. Only the replica that held the tick
-    /// retries, so the derived key still runs the tick one time.
-    fn retry_key(tick_key: &str, retry: u32) -> String {
-        if retry == 0 {
-            tick_key.to_owned()
-        } else {
-            format!("{tick_key}#cost-retry-{retry}")
+    /// Free a claim whose tick has not run, so a retry of the same key can
+    /// take it again. Every replica then resumes against that one key, so the
+    /// tick runs one time. A tick that ran keeps its claim
+    /// ([`SchedulerLease::release`](crate::scheduler::SchedulerLease::release)).
+    /// If the delete fails, the claim stays until it expires: the tick may
+    /// then not run, but it never runs twice.
+    async fn free_unrun_claim(lease: crate::scheduler::SchedulerLease, name: &str, tick_key: &str) {
+        if let Err(error) = lease.release_and_free().await {
+            tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to free the claim of a deferred tick");
         }
     }
 
@@ -9294,26 +9291,24 @@ async fn execute_cron_task(
     // Cost gate (#1720), as in `execute_fixed_delay_task`. The fold
     // reservation holds until this tick has its lease and is done waiting.
     let wait_first = CostGate::waits_before_lease(&*coordinator);
-    let mut retry = 0;
-    let (lease, tick_key) = loop {
+    let tick_key = scheduled_key;
+    let lease = loop {
         if wait_first && !gate.wait(&state, &name).await {
             gate.release();
             return;
         }
-        // Only the lease sees a retry key; the task sees `scheduled_key`.
-        let lease_key = CostGate::retry_key(&scheduled_key, retry);
         let lease = match coordinator
-            .try_acquire_for_period(&name, &lease_key, coordination, occurrence.window)
+            .try_acquire_for_period(&name, &tick_key, coordination, occurrence.window)
             .await
         {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                tracing::debug!(task = %name, tick = %lease_key, "Cron task tick already claimed");
+                tracing::debug!(task = %name, tick = %tick_key, "Cron task tick already claimed");
                 gate.release();
                 return;
             }
             Err(error) => {
-                tracing::warn!(task = %name, tick = %lease_key, error = %error, "Failed to acquire cron task lease");
+                tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire cron task lease");
                 gate.release();
                 return;
             }
@@ -9321,11 +9316,10 @@ async fn execute_cron_task(
         // As in `execute_fixed_delay_task`: the signal can rise during a
         // lease attempt that waited first.
         if wait_first && CostGate::must_wait(&state, &name) {
-            release_task_lease(lease, &name, &lease_key).await;
-            retry += 1;
+            CostGate::free_unrun_claim(lease, &name, &tick_key).await;
             continue;
         }
-        break (lease, scheduled_key.clone());
+        break lease;
     };
     state
         .task_registry
@@ -19971,9 +19965,9 @@ mod tests {
             seen[0].0, "cost_sqlite_rising_signal:1700000000",
             "{seen:?}"
         );
-        assert!(
-            seen[1].0.ends_with("#cost-retry-1"),
-            "the retry has a key of its own: the first SQLite row stays: {seen:?}"
+        assert_eq!(
+            seen[1].0, seen[0].0,
+            "every replica resumes against the one tick key: {seen:?}"
         );
         assert!(
             seen.iter().all(|(_, reserved)| *reserved),
