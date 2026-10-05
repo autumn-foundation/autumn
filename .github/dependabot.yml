@@ -27,6 +27,21 @@ updates:
         patterns:
           - "diesel*"
           - "libsqlite3-sys"
+    ignore:
+      # matchit is lockstepped to whatever version axum's own Cargo.toml
+      # pins (currently "=0.8.4"), because the #1012 duplicate-route
+      # preflight and the plugin-sandbox route-shape check use matchit as a
+      # conflict oracle against the SAME version axum routes through. #1897
+      # (0.8.4 -> 0.9.2) was rehearsed on 2026-09-30: matchit 0.9 accepts a
+      # route shape (`/hello/a{b}c`) that axum 0.8.9's matchit 0.8.4 still
+      # rejects, so `plugin_sandbox::manifest::tests::
+      # a_route_path_the_router_would_refuse_is_refused_here` fails and a
+      # sandboxed plugin manifest that passes validation panics the router
+      # at boot. Revisit trigger: an axum release that moves to matchit 0.9;
+      # bump both together in one PR. See PR #1897's review comments for the
+      # full rehearsal.
+      - dependency-name: "matchit"
+        versions: [">=0.9"]
     labels:
       - dependencies
       - automated
@@ -36,6 +51,22 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    ignore:
+      # dtolnay/rust-toolchain has no version tags of its own; its `@<ver>`
+      # ref picks which Rust toolchain CI installs. ci.yml's MSRV job and
+      # trybuild pre-install deliberately pin 1.88.0 (the workspace
+      # rust-version, checked by scripts/check-msrv.sh) and
+      # publish-gate.yml's SemVer check deliberately pins 1.94.1 (the
+      # aws-smithy MSRV floor; later toolchains ICE in cargo-semver-checks,
+      # per scripts/check-semver.sh). #2615 (1.88.0 -> 1.120.0) was
+      # rehearsed on 2026-09-29/30: moving either pin breaks the lane it
+      # exists to gate, not something a merge or a code fix can resolve.
+      # CI's own stable toolchain is tracked separately by #3089's drift
+      # workflow. Revisit trigger: a deliberate MSRV or semver-floor bump,
+      # done together with rust-version/check-semver.sh, not a bot bump of
+      # this action alone. See PR #2615's review comments for the full
+      # rehearsal.
+      - dependency-name: "dtolnay/rust-toolchain"
     labels:
       - ci
       - automated
