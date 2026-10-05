@@ -202,6 +202,8 @@ Looking for the API reference instead? That is
 - [Daemon Mode](daemon.md) — `autumn serve` as a long-running service
 - [Maintenance Mode](maintenance-mode.md) — taking the app offline deliberately, with probes still answering
 - [Cloud-Native Autumn](cloud-native.md) — containers, Kubernetes, liveness/readiness probes, and the twelve-factor surface
+- [Server Connection Limits](connection-limits.md) — header-read and idle timeouts, header size and connection caps
+- [Running behind PgBouncer / RDS Proxy](connection-poolers.md) — which features work behind a connection pooler
 - [Embedded Clustering](clustering.md) — two-node clustering with no external dependency
 - [Per-Tenant Memory Cells](tenant-cells.md) — bounding per-tenant memory, with deterministic eviction
 - [Runtime Configuration](runtime-config.md) — `autumn.toml`, profiles, and environment overrides

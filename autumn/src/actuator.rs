@@ -2028,6 +2028,13 @@ impl ConfigProperties {
             &format!("{:?}", defaults.database.replica_fallback),
             profile_str,
         );
+        Self::track_property(
+            props,
+            "database.replica_max_lag_ms",
+            &format!("{:?}", config.database.replica_max_lag_ms),
+            &format!("{:?}", defaults.database.replica_max_lag_ms),
+            profile_str,
+        );
     }
 
     fn track_log_props(

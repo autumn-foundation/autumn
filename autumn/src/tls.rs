@@ -695,6 +695,24 @@ impl
     }
 }
 
+impl
+    axum::extract::connect_info::Connected<
+        crate::http_server::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<TlsListener>,
+        >,
+    > for TlsConnectInfo
+{
+    fn connect_info(
+        stream: crate::http_server::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<TlsListener>,
+        >,
+    ) -> Self {
+        Self::from_stream(stream.io(), *stream.remote_addr())
+    }
+}
+
 impl TlsConnectInfo {
     fn from_stream(
         io: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
@@ -1615,19 +1633,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     }
 
     // Regression (Codex P1 on PR #2780): advertising `h2` in ALPN is only
-    // safe while the serve stack can actually speak HTTP/2. `axum::serve`
-    // runs every connection through
-    // `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled
-    // out unless hyper-util's `http2` feature is enabled (via `axum/http2`
-    // in the workspace Cargo.toml). Without it, a client that negotiates
-    // `h2` gets "HTTP/2 is not supported" and the connection dies instead
-    // of serving — the advertisement becomes a breakage, not an upgrade.
-    //
-    // `Builder::http2()` exists only under hyper-util's `http2` feature,
-    // so this test fails to COMPILE if the feature is ever dropped: that is
-    // the point. The dev-dependency deliberately does not enable `http2`
-    // itself (see the workspace Cargo.toml), so only `axum/http2` keeps
-    // this green.
+    // safe while the serve stack can speak HTTP/2. The serve loop
+    // (`crate::http_server`) runs every connection through
+    // `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled out
+    // unless hyper-util's `http2` feature is on. `Builder::http2()` exists
+    // only under that feature, so this test does not compile without it.
     #[test]
     fn serve_stack_speaks_http2() {
         let mut builder =

@@ -307,6 +307,8 @@ mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod replica_lag_pg;
 // ci.yml names the `--lib` Redis job-admin Docker tests by prefix filter; this
 // fails when one of them stops matching (#1186). No feature gate: it only reads
 // job.rs and ci.yml as text.
@@ -377,6 +379,7 @@ mod search_index_definition;
 mod secured_route;
 mod security;
 mod seo;
+mod server_http_limits;
 mod server_timing;
 #[cfg(feature = "http-client")]
 mod shadow_mirror;
@@ -493,3 +496,5 @@ mod widgets_tabs;
 mod widgets_toast;
 #[cfg(feature = "ws")]
 mod ws_integration;
+#[cfg(feature = "ws")]
+mod ws_realtime_limits;

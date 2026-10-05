@@ -134,6 +134,58 @@ For SSE streams, htmx out-of-band HTML broadcasts, Redis-backed
 multi-replica fan-out, and channel actuator metrics, see
 [`realtime.md`](realtime.md).
 
+## Limits
+
+The `[realtime]` section limits WebSocket connections. It applies to every
+`#[ws]` route.
+
+```toml
+[realtime]
+max_connections = 5_000          # 503 with Retry-After above this
+max_message_bytes = 1_048_576    # close code 1009 above 1 MiB
+ping_interval_ms = 30_000        # server ping every 30 s
+idle_timeout_ms = 120_000        # close code 1001 after 120 s of silence
+```
+
+| Key | Effect | Off |
+|-----|--------|-----|
+| `max_connections` | An upgrade above the limit gets `503` and `Retry-After: 1`. The count is per app. | unset or `0` |
+| `max_message_bytes` | A larger received message closes the socket with code `1009`. `recv()` then returns the error, and then `None`. A single frame over 16 MiB also gets `1009`. | unset (64 MiB) |
+| `ping_interval_ms` | The server sends a ping at this interval. The handler does not see the pong. | unset or `0` |
+| `idle_timeout_ms` | When no frame arrives for this long, the server sends close code `1001`. `recv()` then returns `None`. Pongs count as frames. The time counts from the last received frame. | unset or `0` |
+
+The `prod` profile sets `max_message_bytes`, `ping_interval_ms` and
+`idle_timeout_ms` to the values above. It does not set `max_connections`.
+`[server.http] max_connections` also limits WebSocket connections.
+See [Server Connection Limits](connection-limits.md).
+
+The ping and idle timers run only while the handler waits in `recv()` (or
+`next()` on a split stream). A handler that never reads gets no pings and no
+idle timeout. A handler that does long work between reads gets no pings
+during that work, so a quiet client can reach the idle timeout.
+
+The actuator `tasks/stream` socket does not use these limits.
+
+`autumn_web::ws::WebSocket` is an Autumn type. It has the `recv`, `send` and
+`protocol` methods of the axum socket, and a new `close` method. It
+implements `Stream`, `FusedStream` and `Sink`, so `split()` works. To get the
+axum socket, call `into_inner()`. That socket has no limits, and it does not
+count toward `max_connections`.
+
+To set a different message limit on one route, write the upgrade yourself:
+
+```rust,ignore
+use autumn_web::ws::WebSocketUpgrade;
+
+#[get("/upload")]
+async fn upload(ws: WebSocketUpgrade) -> axum::response::Response {
+    ws.max_message_size(16 * 1024 * 1024)
+        .on_upgrade(|mut socket| async move {
+            while let Some(Ok(_msg)) = socket.recv().await {}
+        })
+}
+```
+
 ## Testing
 
 See `examples/reddit-clone/src/routes/live.rs` for a runnable WebSocket live-feed

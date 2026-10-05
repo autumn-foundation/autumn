@@ -106,6 +106,8 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
+/// Connection pooler detection (issue #3065).
+pub mod pooler;
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
 pub mod sqlite_types;
@@ -2697,6 +2699,62 @@ pub(crate) async fn probe_connection_alive(
 ) -> Result<(), diesel::result::Error> {
     use diesel_async::SimpleAsyncConnection as _;
     conn.batch_execute("SELECT 1").await
+}
+
+/// Replica lag query (issue #3065).
+///
+/// - Not in recovery (a primary, or a plain database): lag is `0`.
+/// - The WAL receiver runs and all received WAL is replayed: lag is `0`. An
+///   idle primary writes no new transactions, so the replay timestamp alone
+///   would grow without limit. The receiver must run: a disconnected replica
+///   keeps its last receive LSN, so the check alone would read as fresh.
+/// - Else: time since the last replayed transaction. `NULL` when nothing has
+///   been replayed yet, which means "unknown".
+#[cfg(not(feature = "sqlite"))]
+const REPLICA_LAG_SQL: &str = "SELECT CASE \
+     WHEN NOT pg_is_in_recovery() THEN 0::BIGINT \
+     WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver) \
+          AND pg_last_wal_receive_lsn() IS NOT NULL \
+          AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0::BIGINT \
+     ELSE GREATEST(0, FLOOR(EXTRACT(EPOCH FROM \
+          (clock_timestamp() - pg_last_xact_replay_timestamp())) * 1000))::BIGINT \
+     END AS lag_ms";
+
+/// Measure the replica lag on `conn`. See [`REPLICA_LAG_SQL`].
+#[cfg(not(feature = "sqlite"))]
+pub(crate) async fn measure_replica_lag(
+    conn: &mut PooledConnection,
+) -> Result<std::time::Duration, String> {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct LagRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        lag_ms: Option<i64>,
+    }
+
+    let row: LagRow = diesel::sql_query(REPLICA_LAG_SQL)
+        .get_result(&mut **conn)
+        .await
+        .map_err(|error| error.to_string())?;
+    let lag_ms = row
+        .lag_ms
+        .ok_or_else(|| "replica has not replayed a transaction yet".to_owned())?;
+    Ok(std::time::Duration::from_millis(
+        u64::try_from(lag_ms).unwrap_or(0),
+    ))
+}
+
+/// `SQLite` has no replicas, so the lag is always `0`.
+#[cfg(feature = "sqlite")]
+#[allow(
+    clippy::unused_async,
+    reason = "same signature as the Postgres variant"
+)]
+pub(crate) async fn measure_replica_lag(
+    _conn: &mut PooledConnection,
+) -> Result<std::time::Duration, String> {
+    Ok(std::time::Duration::ZERO)
 }
 
 struct TxDepthGuard<'a> {

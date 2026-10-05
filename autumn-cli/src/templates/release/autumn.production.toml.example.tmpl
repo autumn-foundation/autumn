@@ -7,6 +7,11 @@ host = "0.0.0.0"
 port = 3000
 # shutdown_timeout_secs = 30
 
+# The prod profile sets connection limits. See docs/guide/connection-limits.md.
+# [server.http]
+# header_read_timeout_ms = 10000
+# max_connections = 10000
+
 [log]
 level = "info"
 format = "Json"
@@ -28,6 +33,8 @@ pool_size = 10
 # primary_pool_size = 10
 # replica_pool_size = 5
 replica_fallback = "fail_readiness" # fail_readiness | primary
+# replica_max_lag_ms = 5000   # reads use the primary above this replica lag
+# warn_on_pooler = false      # silence the PgBouncer / RDS Proxy boot warning
 connect_timeout_secs = 5
 # Production migrations belong to one explicit primary-role job:
 #   AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate

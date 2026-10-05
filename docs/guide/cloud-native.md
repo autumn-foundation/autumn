@@ -624,6 +624,61 @@ target. A spike in this counter after a deployment indicates more reads than
 expected are being pinned — tune `pin_after_write_secs` or audit which handlers
 are injecting `Db` unnecessarily.
 
+### Lag-aware reads
+
+The read-your-own-writes pin lasts a fixed time. A replica that is further
+behind serves stale reads after the pin ends. Set a lag limit to stop this:
+
+```toml
+[database]
+replica_url = "postgres://user:pass@replica:5432/app"
+replica_max_lag_ms = 5_000
+```
+
+With a limit set:
+
+- The app measures the lag on the replica, in the background and on each
+  `/ready` call. The interval is half the limit, between 250 ms and 5 s.
+- The age of the last sample counts as lag. When the checks stop (a hung
+  query, a full pool), the sample ages out and reads go to the primary.
+- While the lag is over the limit, reads go to the primary. This is true for
+  both `replica_fallback` values: a lagging replica is stale, not down. With
+  `fail_readiness`, this puts the read load of every pod on the primary.
+- While the lag is not known (no sample yet, or the query failed), reads go
+  to the primary.
+- Lag alone does not fail readiness. A shared replica that falls behind must
+  not remove every pod from the load balancer.
+- With `[health] detailed = true`, `/ready` reports the replica:
+  `{"replica": {"ready": false, "lag_ms": 30000, "max_lag_ms": 5000, "detail": "..."}}`.
+
+The lag query returns `0` when the WAL receiver runs and all received WAL is
+replayed. If not, it returns the time since the last replayed transaction.
+This is a simplified form of the query:
+
+```sql
+SELECT CASE
+  WHEN NOT pg_is_in_recovery() THEN 0
+  WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver)
+       AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0
+  ELSE clock_timestamp() - pg_last_xact_replay_timestamp()  -- in ms
+END
+```
+
+Know these limits of the query:
+
+- After a long quiet period on the primary, the first new WAL can show a
+  large lag for one check. Reads then use the primary for one interval.
+- A replica that restores WAL from an archive (no WAL receiver) shows the
+  time since its last replayed transaction.
+- Clock skew between the primary and the replica adds to the value.
+
+The limit applies only to `database.replica_url`. Shard replicas do not use
+it yet. Without `replica_url`, the app ignores the limit
+and logs a warning.
+
+The environment variable is `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS`. Behind a
+connection pooler, see [Running behind PgBouncer / RDS Proxy](connection-poolers.md).
+
 ## Shared Cache
 
 In-process Moka caches are the zero-config default and are perfect for

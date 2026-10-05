@@ -115,6 +115,62 @@ struct ReplicaDependency {
     migrations_ready: bool,
     migration_check: Option<ReplicaMigrationCheck>,
     detail: Option<String>,
+    /// `database.replica_max_lag_ms`. `None` turns lag checks off.
+    max_lag: Option<std::time::Duration>,
+    /// The last measured lag. `None` when not measured or unknown.
+    lag: Option<std::time::Duration>,
+    /// When `lag` was measured. The sample ages: a monitor that stops (a hung
+    /// query, a full pool) cannot keep an old "fresh" sample alive.
+    lag_at: Option<tokio::time::Instant>,
+    /// Why the lag is unknown.
+    lag_detail: Option<String>,
+}
+
+#[cfg(feature = "db")]
+impl ReplicaDependency {
+    /// Connection and migrations pass, or no replica dependency is set up.
+    const fn base_ready(&self) -> bool {
+        !self.configured || (self.connection_ready && self.migrations_ready)
+    }
+
+    /// The age of the lag sample.
+    fn lag_age(&self) -> std::time::Duration {
+        self.lag_at
+            .map_or(std::time::Duration::ZERO, |at| at.elapsed())
+    }
+
+    /// The lag is known and inside the limit, or no limit is set. The sample
+    /// age counts as lag.
+    fn lag_ok(&self) -> bool {
+        self.max_lag.is_none_or(|max| {
+            self.lag
+                .is_some_and(|lag| lag.saturating_add(self.lag_age()) <= max)
+        })
+    }
+
+    fn lag_problem(&self) -> Option<String> {
+        if self.lag_ok() {
+            return None;
+        }
+        let max = self.max_lag.map_or(0, duration_ms);
+        Some(match (self.lag, &self.lag_detail) {
+            (Some(lag), _) if lag <= self.max_lag.unwrap_or_default() => format!(
+                "replica lag sample is {}ms old; database.replica_max_lag_ms is {max}ms",
+                duration_ms(self.lag_age())
+            ),
+            (Some(lag), _) => format!(
+                "replica lag {}ms exceeds database.replica_max_lag_ms {max}ms",
+                duration_ms(lag)
+            ),
+            (None, Some(detail)) => detail.clone(),
+            (None, None) => "replica lag is not measured yet".to_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "db")]
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(feature = "db")]
@@ -127,6 +183,10 @@ impl Default for ReplicaDependency {
             migrations_ready: true,
             migration_check: None,
             detail: None,
+            max_lag: None,
+            lag: None,
+            lag_at: None,
+            lag_detail: None,
         }
     }
 }
@@ -195,6 +255,10 @@ impl ProbeState {
             migrations_ready: true,
             migration_check: None,
             detail: Some("replica has not passed a readiness check".to_owned()),
+            max_lag: dependency.max_lag,
+            lag: None,
+            lag_at: None,
+            lag_detail: None,
         };
     }
 
@@ -331,9 +395,9 @@ impl ProbeState {
             .replica_dependency
             .read()
             .expect("replica dependency lock poisoned");
-        let ready = dependency.connection_ready && dependency.migrations_ready;
-        !dependency.configured
-            || ready
+        // Lag alone does not fail readiness: reads then use the primary. A
+        // lagging shared replica must not take every pod out of rotation.
+        dependency.base_ready()
             || matches!(dependency.fallback, crate::config::ReplicaFallback::Primary)
     }
 
@@ -343,18 +407,136 @@ impl ProbeState {
             .replica_dependency
             .read()
             .expect("replica dependency lock poisoned");
-        !dependency.configured || (dependency.connection_ready && dependency.migrations_ready)
+        dependency.base_ready() && dependency.lag_ok()
     }
 
     #[cfg(feature = "db")]
     pub(crate) fn should_fallback_reads_to_primary(&self) -> bool {
+        let (base_ready, lag_ok, fallback) = {
+            let dependency = self
+                .replica_dependency
+                .read()
+                .expect("replica dependency lock poisoned");
+            (
+                dependency.base_ready(),
+                dependency.lag_ok(),
+                dependency.fallback,
+            )
+        };
+        // A stale replica always falls back: the primary is up and has the
+        // fresh rows. A down replica falls back only when the policy allows.
+        let stale_only = base_ready && !lag_ok;
+        let down_and_allowed =
+            !base_ready && matches!(fallback, crate::config::ReplicaFallback::Primary);
+        stale_only || down_and_allowed
+    }
+
+    /// Set the replica lag limit. `None` turns lag checks off.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn configure_replica_max_lag(&self, max_lag: Option<std::time::Duration>) {
+        self.replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned")
+            .max_lag = max_lag;
+    }
+
+    /// Record a measured replica lag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn record_replica_lag(&self, lag: std::time::Duration) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.lag = Some(lag);
+        dependency.lag_at = Some(tokio::time::Instant::now());
+        dependency.lag_detail = None;
+    }
+
+    /// Record that the replica lag could not be measured. Reads go to the
+    /// primary until a measurement succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_lag_unknown(&self, detail: impl Into<String>) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.lag = None;
+        dependency.lag_at = None;
+        dependency.lag_detail = Some(detail.into());
+    }
+
+    /// The last measured replica lag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn replica_lag(&self) -> Option<std::time::Duration> {
+        self.replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned")
+            .lag
+    }
+
+    /// `true` when the lag check passes (or is off).
+    #[cfg(feature = "db")]
+    pub(crate) fn replica_lag_ok(&self) -> bool {
+        self.replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned")
+            .lag_ok()
+    }
+
+    /// The configured replica lag limit.
+    #[cfg(feature = "db")]
+    pub(crate) fn replica_max_lag(&self) -> Option<std::time::Duration> {
+        self.replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned")
+            .max_lag
+    }
+
+    /// A snapshot of the replica state. `None` when no replica is configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn replica_status(&self) -> Option<ReplicaStatus> {
         let dependency = self
             .replica_dependency
             .read()
             .expect("replica dependency lock poisoned");
-        dependency.configured
-            && !(dependency.connection_ready && dependency.migrations_ready)
-            && matches!(dependency.fallback, crate::config::ReplicaFallback::Primary)
+        if !dependency.configured && dependency.max_lag.is_none() {
+            return None;
+        }
+        let base_ready = dependency.base_ready();
+        Some(ReplicaStatus {
+            ready: base_ready && dependency.lag_ok(),
+            lag_ms: dependency.lag.map(duration_ms),
+            max_lag_ms: dependency.max_lag.map(duration_ms),
+            // Driver errors can name a host: redact before a probe shows it.
+            detail: if base_ready {
+                dependency.lag_problem()
+            } else {
+                dependency.detail.clone()
+            }
+            .map(|detail| crate::db_url::redact_targets_in_message(&detail)),
+        })
     }
 
     #[cfg(feature = "db")]
@@ -393,6 +575,24 @@ pub(crate) struct ProbeResponse {
     uptime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pool: Option<PoolStatus>,
+    #[cfg(feature = "db")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replica: Option<ReplicaStatus>,
+}
+
+/// The replica state the detailed `/ready` body reports (issue #3065).
+#[cfg(feature = "db")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReplicaStatus {
+    /// `true` when reads go to the replica.
+    pub ready: bool,
+    /// The last measured lag, in milliseconds.
+    pub lag_ms: Option<u64>,
+    /// The configured lag limit, in milliseconds.
+    pub max_lag_ms: Option<u64>,
+    /// Why the replica is not ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -448,6 +648,10 @@ async fn refresh_replica_readiness<S: ProvideProbeState + Sync>(state: &S) {
     match replica_pool.get().await {
         Ok(mut conn) => {
             let alive = crate::db::probe_connection_alive(&mut conn).await;
+            if alive.is_ok() && state.probes().replica_max_lag().is_some() {
+                refresh_replica_lag_with(state.probes(), crate::db::measure_replica_lag(&mut conn))
+                    .await;
+            }
             drop(conn);
             match alive {
                 Ok(()) => {
@@ -496,6 +700,29 @@ where
     }
 }
 
+/// Measure the replica lag with `measure` and record the result.
+#[cfg(feature = "db")]
+pub(crate) async fn refresh_replica_lag_with<Fut>(probes: &ProbeState, measure: Fut)
+where
+    Fut: std::future::Future<Output = Result<std::time::Duration, String>>,
+{
+    let was_fresh = probes.replica_lag_ok();
+    match measure.await {
+        Ok(lag) => probes.record_replica_lag(lag),
+        Err(error) => probes.mark_replica_lag_unknown(format!("replica lag check failed: {error}")),
+    }
+    let fresh = probes.replica_lag_ok();
+    if was_fresh && !fresh {
+        let detail = probes
+            .replica_status()
+            .and_then(|status| status.detail)
+            .unwrap_or_default();
+        tracing::warn!(target: "autumn::db", %detail, "replica is stale: reads use the primary");
+    } else if !was_fresh && fresh {
+        tracing::info!(target: "autumn::db", "replica is fresh again: reads use the replica");
+    }
+}
+
 fn probe_response<S: ProvideProbeState>(
     state: &S,
     kind: ProbeKind,
@@ -536,6 +763,12 @@ fn probe_response<S: ProvideProbeState>(
             None
         },
         pool: if detailed { pool_status } else { None },
+        #[cfg(feature = "db")]
+        replica: if detailed && matches!(kind, ProbeKind::Ready) {
+            state.probes().replica_status()
+        } else {
+            None
+        },
     };
 
     (status_code, Json(body))
@@ -699,6 +932,85 @@ mod tests {
         let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "degraded");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn replica_lag_alone_keeps_the_pod_ready_and_is_reported() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        let probes = state.probes();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_secs(1)));
+        probes.record_replica_lag(std::time::Duration::from_secs(30));
+
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "reads use the primary, so stay ready"
+        );
+        let replica = response
+            .replica
+            .expect("detailed probe reports the replica");
+        assert!(!replica.ready);
+        assert_eq!(replica.lag_ms, Some(30_000));
+        assert_eq!(replica.max_lag_ms, Some(1_000));
+        let body = serde_json::to_value(&replica).unwrap();
+        assert_eq!(body["lag_ms"], 30_000);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn replica_lag_refresh_records_the_measured_lag() {
+        let state = TestProbeState::new();
+        let probes = state.probes();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::Primary);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_millis(500)));
+
+        refresh_replica_lag_with(probes, async { Ok(std::time::Duration::from_millis(900)) }).await;
+        assert_eq!(
+            probes.replica_lag(),
+            Some(std::time::Duration::from_millis(900))
+        );
+        assert!(!probes.should_route_reads_to_replica());
+        assert!(probes.should_fallback_reads_to_primary());
+
+        refresh_replica_lag_with(probes, async { Err("no route to host".to_owned()) }).await;
+        assert_eq!(probes.replica_lag(), None);
+        assert!(!probes.should_route_reads_to_replica());
+
+        refresh_replica_lag_with(probes, async { Ok(std::time::Duration::ZERO) }).await;
+        assert!(probes.should_route_reads_to_replica());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn an_old_lag_sample_ages_out() {
+        let probes = ProbeState::default();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_secs(1)));
+        probes.record_replica_lag(std::time::Duration::from_millis(100));
+        assert!(probes.should_route_reads_to_replica());
+
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert!(
+            !probes.should_route_reads_to_replica(),
+            "no new sample for 2s, so freshness is unknown"
+        );
+        assert!(probes.should_fallback_reads_to_primary());
+        let detail = probes.replica_status().unwrap().detail.unwrap();
+        assert!(detail.contains("old"), "{detail}");
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn replica_status_is_absent_without_a_replica() {
+        assert!(ProbeState::default().replica_status().is_none());
     }
 
     #[cfg(feature = "db")]
