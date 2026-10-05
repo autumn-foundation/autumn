@@ -122,6 +122,9 @@ pub struct FieldSpec {
     /// `true` for a generated column. Import does not write it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub generated: bool,
+    /// For a domain column: the type that the domain is based on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_type: Option<String>,
 }
 
 impl FieldSpec {
@@ -133,6 +136,7 @@ impl FieldSpec {
             data_type: data_type.into(),
             nullable: false,
             generated: false,
+            base_type: None,
         }
     }
 
@@ -419,6 +423,18 @@ mod tests {
         assert_eq!(m.relationships[0].target_column, "id");
         assert_eq!(m.relationships[1].target_column, "slug");
         assert_eq!(m.blob_columns, ["cover"]);
+    }
+
+    #[test]
+    fn base_type_is_written_only_when_set() {
+        let json = serde_json::to_string(&FieldSpec::new("a", "money")).unwrap();
+        assert!(!json.contains("base_type"), "{json}");
+        let mut field = FieldSpec::new("a", "cash");
+        field.base_type = Some("money".to_owned());
+        let json = serde_json::to_string(&field).unwrap();
+        assert!(json.contains("\"base_type\":\"money\""), "{json}");
+        let back: FieldSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, field);
     }
 
     #[test]

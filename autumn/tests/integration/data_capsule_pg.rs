@@ -24,12 +24,14 @@ use testcontainers_modules::postgres::Postgres;
 
 const SCHEMA: &str = r"
 CREATE DOMAIN amount AS NUMERIC(40, 20);
+CREATE DOMAIN cash AS MONEY;
 CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
     balance NUMERIC(30, 12) NOT NULL,
     credit amount,
     fee MONEY,
+    tip cash,
     ratio DOUBLE PRECISION,
     created_at TIMESTAMPTZ NOT NULL,
     born DATE,
@@ -56,15 +58,15 @@ CREATE TABLE comments (
 ";
 
 const SEED: &str = r#"
-INSERT INTO users (email, balance, credit, fee, ratio, created_at, born, avatar, prefs, tags, uid, active)
+INSERT INTO users (email, balance, credit, fee, tip, ratio, created_at, born, avatar, prefs, tags, uid, active)
 VALUES
   ('Ada@Example.com', 12345678901234567.123456789012, 98765432109876543210.01234567890123456789,
-   1234567.89,
+   1234567.89, 12.5,
    0.30000000000000004,
    '2026-01-02 03:04:05.123456+00', '1815-12-10', '\x00ff10'::bytea,
    '{"theme": "dark", "n": [1, 2.5, {"deep": null}]}', ARRAY['a', 'b "q"', 'ü'],
    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', true),
-  ('bob@example.com', 1, NULL, NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
+  ('bob@example.com', 1, NULL, NULL, NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
    'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', false);
 INSERT INTO posts (author_id, parent_id, title, score) VALUES
   (1, NULL, 'First <post>', 3.14159),
@@ -256,6 +258,11 @@ async fn postgres_round_trip_is_lossless_at_field_level() {
     // `money` travels as a plain number, with no currency symbol or group
     // separator from `lc_monetary`.
     assert_eq!(first.records("users")[0]["fee"], "1234567.89");
+    // A domain over `money` keeps its base type in the manifest, so import
+    // reads it through `numeric` too.
+    assert_eq!(first.records("users")[0]["tip"], "12.50");
+    let tip = users.fields.iter().find(|f| f.name == "tip").expect("tip");
+    assert_eq!(tip.base_type.as_deref(), Some("money"));
 
     // A subject that the column type cannot read is bad input, not a fault.
     let err = export_subject(registry.capsule_models(), &source, "not-a-number")

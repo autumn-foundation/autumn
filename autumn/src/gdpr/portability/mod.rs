@@ -49,6 +49,7 @@ mod blobs;
 mod model;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod pg;
+mod root;
 mod service;
 mod store;
 mod viewer;

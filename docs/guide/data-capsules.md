@@ -85,8 +85,11 @@ autumn data capsule import ./capsule-42
 
 The CLI compiles the app. Then it runs the app with the app models, database,
 blob store, and secret. With `-p`, the app runs from the directory of that
-workspace member, so it reads its own `autumn.toml` and `.env`. On a profile that is not `dev` or `test`, `import`
-needs `--force`. Add `--json` to get the raw report.
+workspace member, so it reads its own `autumn.toml` and `.env`.
+
+On a profile that is not `dev` or `test`, `import` needs `--force`. Add
+`--json` to get the raw report. `verify` uses the signer of an installed
+`CapsuleService`, if the app has one.
 
 ## Use the actuator
 
@@ -150,6 +153,10 @@ SQLite.
 Import reads only a capsule that passes these checks. It reads each file one
 time, so it imports the same bytes that it verified.
 
+On Unix, verify opens the capsule directory one time and does not follow a
+link. All reads go through that open directory. If a process changes a
+directory to a link after the open, the reads do not follow it.
+
 ## Import rules
 
 - Each table in the capsule must be a registered capsule model.
@@ -167,7 +174,9 @@ time, so it imports the same bytes that it verified.
 Postgres export reads all models in one snapshot. It reads rows with
 `to_jsonb`. Export writes `numeric`, `real`, `double precision`, and `money`
 as text, also through a domain. Export writes `money` as a plain number, so
-the value does not depend on the `lc_monetary` locale. Time stamps, `bytea`,
+the value does not depend on the `lc_monetary` locale. The manifest keeps the
+base type of each domain, so import also reads a domain over `money` as a
+plain number. Time stamps, `bytea`,
 `uuid`, and arrays keep their exact values.
 
 The subject id must be a valid value of the subject column type. For example,

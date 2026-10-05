@@ -22,6 +22,7 @@ use super::model::{
     CapsuleManifest, DATA_CAPSULE_FORMAT, DATA_CAPSULE_FORMAT_VERSION, DataCapsuleError, Record,
     check_model_names, record_file,
 };
+use super::root::Root;
 use crate::security::config::{ResolvedSigningKeys, SigningSecretConfig};
 
 const MANIFEST_FILE: &str = "manifest.json";
@@ -146,17 +147,6 @@ fn is_safe_rel_path(path: &str) -> bool {
 
 fn join(root: &Path, rel: &str) -> PathBuf {
     rel.split('/').fold(root.to_path_buf(), |p, s| p.join(s))
-}
-
-fn read_file(root: &Path, rel: &str) -> Result<Vec<u8>, DataCapsuleError> {
-    let path = join(root, rel);
-    std::fs::read(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            DataCapsuleError::Integrity(format!("file is missing: {rel}"))
-        } else {
-            DataCapsuleError::io(path, e)
-        }
-    })
 }
 
 impl DataCapsule {
@@ -340,9 +330,11 @@ fn load_verified(
     dir: &Path,
     signer: &CapsuleSigner,
 ) -> Result<(CapsuleManifest, BTreeMap<String, Vec<u8>>), DataCapsuleError> {
-    // List the files before any read: a link or a device file fails here,
-    // so no read follows a link to `/dev/zero` or to a file outside.
-    let present = list_regular_files(dir)?;
+    // Open the directory one time, without following a link. List the files
+    // before any read: a link or a device file fails here, so no read
+    // follows a link to `/dev/zero` or to a file outside.
+    let root = Root::open(dir)?;
+    let present = root.list_regular_files()?;
     for required in [MANIFEST_FILE, SIGNATURE_FILE] {
         if !present.contains(required) {
             return Err(DataCapsuleError::Integrity(format!(
@@ -350,8 +342,8 @@ fn load_verified(
             )));
         }
     }
-    let manifest_bytes = read_file(dir, MANIFEST_FILE)?;
-    let signature: SignatureFile = from_json(SIGNATURE_FILE, &read_file(dir, SIGNATURE_FILE)?)?;
+    let manifest_bytes = root.read(MANIFEST_FILE)?;
+    let signature: SignatureFile = from_json(SIGNATURE_FILE, &root.read(SIGNATURE_FILE)?)?;
     if signature.algorithm != ALGORITHM {
         return Err(DataCapsuleError::UnsupportedFormat(format!(
             "signature algorithm {:?}",
@@ -399,7 +391,7 @@ fn load_verified(
     }
     let mut contents = BTreeMap::new();
     for (rel, expected) in &manifest.files {
-        let bytes = read_file(dir, rel)?;
+        let bytes = root.read(rel)?;
         if sha256_hex(&bytes) != *expected {
             return Err(DataCapsuleError::Integrity(format!(
                 "file is changed: {rel}"
@@ -441,46 +433,79 @@ fn check_manifest_refs(manifest: &CapsuleManifest) -> Result<(), DataCapsuleErro
     Ok(())
 }
 
-/// The relative paths of all files in `dir`.
-///
-/// # Errors
-///
-/// [`DataCapsuleError::Integrity`] for an entry that is not a regular file or a
-/// directory, for example a symbolic link.
-fn list_regular_files(dir: &Path) -> Result<BTreeSet<String>, DataCapsuleError> {
-    let mut files = BTreeSet::new();
-    let mut stack = vec![(dir.to_path_buf(), String::new())];
-    while let Some((path, prefix)) = stack.pop() {
-        let entries = std::fs::read_dir(&path).map_err(|e| DataCapsuleError::io(&path, e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| DataCapsuleError::io(&path, e))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let rel = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
-            // `DirEntry::file_type` does not follow links.
-            let kind = entry
-                .file_type()
-                .map_err(|e| DataCapsuleError::io(entry.path(), e))?;
-            if kind.is_dir() {
-                stack.push((entry.path(), rel));
-            } else if kind.is_file() {
-                files.insert(rel);
-            } else {
-                return Err(DataCapsuleError::Integrity(format!(
-                    "entry is not a regular file: {rel}"
-                )));
-            }
-        }
-    }
-    Ok(files)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod no_follow {
+        use super::*;
+
+        fn capsule_dir() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("records")).unwrap();
+            std::fs::write(dir.path().join("records/a.json"), b"[]").unwrap();
+            dir
+        }
+
+        #[test]
+        fn open_refuses_a_linked_capsule_dir() {
+            let dir = capsule_dir();
+            let link = dir.path().with_extension("link");
+            std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+            let err = Root::open(&link).expect_err("a link must fail");
+            assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+            let _ = std::fs::remove_file(link);
+        }
+
+        #[test]
+        fn read_goes_through_the_open_handle() {
+            let dir = capsule_dir();
+            let root = Root::open(dir.path()).unwrap();
+            // Swap the directory after open: reads still see the original.
+            let moved = dir.path().with_extension("moved");
+            std::fs::rename(dir.path(), &moved).unwrap();
+            let decoy = tempfile::tempdir().unwrap();
+            std::fs::create_dir(decoy.path().join("records")).unwrap();
+            std::fs::write(decoy.path().join("records/a.json"), b"[1]").unwrap();
+            std::os::unix::fs::symlink(decoy.path(), dir.path()).unwrap();
+            assert_eq!(root.read("records/a.json").unwrap(), b"[]");
+            let listed = root.list_regular_files().unwrap();
+            assert_eq!(listed.into_iter().collect::<Vec<_>>(), ["records/a.json"]);
+            std::fs::remove_file(dir.path()).unwrap();
+            std::fs::rename(&moved, dir.path()).unwrap();
+        }
+
+        #[test]
+        fn read_refuses_a_linked_file_or_dir() {
+            let dir = capsule_dir();
+            std::os::unix::fs::symlink(
+                dir.path().join("records/a.json"),
+                dir.path().join("records/b.json"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(dir.path().join("records"), dir.path().join("viewer"))
+                .unwrap();
+            let root = Root::open(dir.path()).unwrap();
+            for rel in ["records/b.json", "viewer/a.json"] {
+                let err = root.read(rel).expect_err("a link must fail");
+                assert!(
+                    matches!(err, DataCapsuleError::Integrity(_)),
+                    "{rel}: {err:?}"
+                );
+            }
+            let err = root.list_regular_files().expect_err("links in the tree");
+            assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+        }
+
+        #[test]
+        fn read_of_a_missing_file_is_an_integrity_error() {
+            let dir = capsule_dir();
+            let root = Root::open(dir.path()).unwrap();
+            let err = root.read("records/none.json").expect_err("missing");
+            assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+        }
+    }
 
     #[test]
     fn safe_rel_path_accepts_capsule_paths() {

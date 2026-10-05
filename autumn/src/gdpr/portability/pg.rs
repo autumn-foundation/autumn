@@ -105,6 +105,8 @@ struct ColumnRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     base_type: String,
     #[diesel(sql_type = diesel::sql_types::Bool)]
+    is_domain: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
     nullable: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     generated: bool,
@@ -133,6 +135,7 @@ async fn describe_table(
                 format_type(a.atttypid, a.atttypmod) AS data_type, \
                 format_type(CASE WHEN t.typtype = 'd' THEN t.typbasetype \
                                  ELSE a.atttypid END, NULL) AS base_type, \
+                t.typtype = 'd' AS is_domain, \
                 NOT a.attnotnull AS nullable, \
                 COALESCE(c.is_generated = 'ALWAYS', false) AS generated \
          FROM pg_attribute a \
@@ -160,6 +163,11 @@ async fn describe_table(
             let mut field = FieldSpec::new(r.name, r.data_type);
             field.nullable = r.nullable;
             field.generated = r.generated;
+            // The manifest keeps the base type of a domain, so import can
+            // treat a domain over `money` as `money`.
+            if r.is_domain {
+                field.base_type = Some(r.base_type.clone());
+            }
             Column {
                 field,
                 base_type: r.base_type,
@@ -351,6 +359,11 @@ impl From<DieselError> for DataCapsuleError {
     }
 }
 
+/// `true` for a `money` column or a domain over `money`.
+fn is_money(field: &FieldSpec) -> bool {
+    field.base_type.as_deref().unwrap_or(&field.data_type) == "money"
+}
+
 /// The `INSERT` of one batch. Generated columns are skipped.
 fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
     let columns = batch
@@ -371,7 +384,7 @@ fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
         .model
         .fields
         .iter()
-        .filter(|f| !f.generated && f.data_type == "money")
+        .filter(|f| !f.generated && is_money(f))
         .map(|f| f.name.as_str())
         .collect();
     if money.is_empty() {
@@ -386,7 +399,7 @@ fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
     let mut exprs = Vec::with_capacity(columns.len());
     for field in batch.model.fields.iter().filter(|f| !f.generated) {
         let col = quote(&field.name)?;
-        exprs.push(if field.data_type == "money" {
+        exprs.push(if is_money(field) {
             format!("(e.j ->> '{}')::numeric::money", field.name)
         } else {
             format!("r.{col}")
@@ -522,6 +535,16 @@ mod tests {
              (e.j ->> 'fee')::numeric::money FROM jsonb_array_elements($1::jsonb) AS e(j) \
              CROSS JOIN LATERAL jsonb_populate_record(NULL::\"t\", e.j - ARRAY['fee']::text[]) AS r"
         );
+        // A domain over `money` takes the same locale-free path.
+        let mut cash = FieldSpec::new("fee", "cash").nullable();
+        cash.base_type = Some("money".to_owned());
+        model.fields[2] = cash;
+        let sql = insert_sql(&ImportBatch {
+            model: &model,
+            records: &records,
+        })
+        .unwrap();
+        assert!(sql.contains("(e.j ->> 'fee')::numeric::money"), "{sql}");
         model.fields.clear();
         assert!(
             insert_sql(&ImportBatch {

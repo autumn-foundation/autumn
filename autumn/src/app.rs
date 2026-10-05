@@ -7506,9 +7506,10 @@ impl AppBuilder {
 
     /// Run `AUTUMN_DATA_CAPSULE=export|import|verify` and exit (issue #1811).
     ///
-    /// `verify` needs only the signing secret, so it opens no database. The
-    /// other modes boot the database, the blob store, and the app's state
-    /// initializers, which install the [`crate::gdpr::GdprRegistry`].
+    /// All modes boot the app's state initializers, which install the
+    /// [`crate::gdpr::GdprRegistry`] and any `CapsuleService`. Export and
+    /// import also use the database and the blob store. Verify uses only the
+    /// signer, so it works when no database is configured.
     #[allow(clippy::too_many_lines)]
     async fn run_data_capsule_mode(self, mode: DataCapsuleMode) {
         let Self {
@@ -7552,15 +7553,6 @@ impl AppBuilder {
             plugin_config_roots,
         )
         .await;
-
-        if mode == DataCapsuleMode::Verify {
-            let result = crate::gdpr::portability::CapsuleSigner::from_config(
-                &config.security.signing_secret,
-            )
-            .and_then(|signer| crate::gdpr::portability::verify_dir(&path, &signer))
-            .map(|report| serde_json::json!(report));
-            emit_data_capsule_report(mode, &result);
-        }
 
         #[cfg(feature = "storage")]
         let storage_bootstrap = blob_store.map_or_else(
@@ -7609,22 +7601,27 @@ impl AppBuilder {
         }
         run_state_initializers(state_initializers, &state);
 
-        let result = match crate::gdpr::portability::CapsuleService::from_state(&state) {
-            Ok(service) => match mode {
-                DataCapsuleMode::Export => service
-                    .export_to(&subject, &path)
-                    .await
-                    .map(|report| serde_json::json!(report)),
-                DataCapsuleMode::Import => service
-                    .import_from(&path)
-                    .await
-                    .map(|summary| serde_json::json!(summary)),
-                DataCapsuleMode::Verify => service
-                    .verify(&path)
-                    .await
-                    .map(|report| serde_json::json!(report)),
-            },
-            Err(error) => Err(error),
+        let result = match mode {
+            // Verify needs only the signer. An installed `CapsuleService` can
+            // bring its own, so it runs after the state initializers too.
+            DataCapsuleMode::Verify => {
+                crate::gdpr::portability::CapsuleService::signer_for_state(&state)
+                    .and_then(|signer| crate::gdpr::portability::verify_dir(&path, &signer))
+                    .map(|report| serde_json::json!(report))
+            }
+            DataCapsuleMode::Export | DataCapsuleMode::Import => {
+                match crate::gdpr::portability::CapsuleService::from_state(&state) {
+                    Ok(service) if mode == DataCapsuleMode::Export => service
+                        .export_to(&subject, &path)
+                        .await
+                        .map(|report| serde_json::json!(report)),
+                    Ok(service) => service
+                        .import_from(&path)
+                        .await
+                        .map(|summary| serde_json::json!(summary)),
+                    Err(error) => Err(error),
+                }
+            }
         };
         // `process::exit` skips `on_shutdown`: stop a managed postmaster first.
         #[cfg(feature = "managed-pg")]

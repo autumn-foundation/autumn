@@ -153,6 +153,20 @@ impl CapsuleService {
         Ok(service)
     }
 
+    /// The signer of the app: the one of an installed `CapsuleService`
+    /// extension, else one from `[security.signing_secret]`.
+    ///
+    /// # Errors
+    ///
+    /// [`DataCapsuleError::MissingSigningSecret`] when no service is installed
+    /// and no secret is set.
+    pub fn signer_for_state(state: &crate::AppState) -> Result<CapsuleSigner, DataCapsuleError> {
+        state.extension::<Self>().map_or_else(
+            || CapsuleSigner::from_config(&state.config().security.signing_secret),
+            |service| Ok(service.signer.clone()),
+        )
+    }
+
     /// The path of the capsule `name` in the capsule directory.
     ///
     /// # Errors
@@ -311,6 +325,35 @@ mod tests {
         // No pool in a test state, and no Postgres store with `sqlite`.
         let err = CapsuleService::from_state(&state_with_models()).expect_err("no store");
         assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
+    }
+
+    #[test]
+    fn signer_for_state_prefers_an_installed_service() {
+        let own = CapsuleSigner::new(b"installed-service-secret-0123456789");
+        let service = CapsuleService::new(
+            vec![CapsuleModel::new("users", "id")],
+            Arc::new(super::super::MemoryCapsuleStore::new()),
+            own.clone(),
+        );
+        // No secret in the config: only the installed signer can work.
+        let state = crate::AppState::for_test().with_extension(service);
+        let signer = CapsuleService::signer_for_state(&state).expect("installed signer");
+        assert_eq!(signer.sign(b"m"), own.sign(b"m"));
+    }
+
+    #[test]
+    fn signer_for_state_falls_back_to_the_config_secret() {
+        let err =
+            CapsuleService::signer_for_state(&crate::AppState::for_test()).expect_err("no secret");
+        assert!(
+            matches!(err, DataCapsuleError::MissingSigningSecret),
+            "{err:?}"
+        );
+        let signer = CapsuleService::signer_for_state(&state_with_models()).expect("config");
+        assert_eq!(
+            signer.sign(b"m"),
+            CapsuleSigner::new(b"service-test-secret-0123456789abcdef").sign(b"m")
+        );
     }
 
     #[test]
