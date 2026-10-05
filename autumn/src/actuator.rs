@@ -4378,7 +4378,7 @@ pub(crate) async fn capsules_export_endpoint<S: ProvideActuatorState + Send + Sy
         Ok(service) => service,
         Err(e) => return capsule_error(&e),
     };
-    let name = crate::gdpr::portability::CapsuleService::capsule_name(&body.subject);
+    let name = crate::gdpr::portability::CapsuleService::capsule_name();
     let path = match service.capsule_path(&name) {
         Ok(path) => path,
         Err(e) => return capsule_error(&e),

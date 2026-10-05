@@ -1079,14 +1079,22 @@ mod service {
     }
 
     #[test]
-    fn capsule_names_are_safe_for_any_subject() {
-        let name = CapsuleService::capsule_name("../../etc/passwd x");
-        assert!(
-            name.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-            "{name}"
+    fn capsule_names_are_safe_and_do_not_hold_the_subject() {
+        // Another user can list the capsule directory: a name must not show
+        // who asked for an export.
+        let (a, b) = (
+            CapsuleService::capsule_name(),
+            CapsuleService::capsule_name(),
         );
-        assert!(name.starts_with("capsule-"), "{name}");
+        assert_ne!(a, b, "each export gets its own name");
+        for name in [&a, &b] {
+            assert!(name.starts_with("capsule-"), "{name}");
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -381,6 +381,10 @@ impl CapsuleStore for PgCapsuleStore {
                             .map_err(|e| {
                                 store_error(&format!("import {}", batch.model.table), &e)
                             })?;
+                    }
+                    // A rollback does not undo `setval`, so move the sequences
+                    // only after every insert has succeeded.
+                    for (_, _, batch) in &statements {
                         advance_sequence(conn, &batch.model.table, &batch.model.primary_key)
                             .await?;
                     }
@@ -495,10 +499,19 @@ async fn advance_sequence(
         return Ok(());
     };
     let pk = quote(primary_key)?;
+    // Move the sequence past the imported keys, in its own direction. An
+    // unused sequence has no last value: then compare with the value before
+    // its start.
     diesel::sql_query(format!(
-        "SELECT setval($1::regclass, m) \
-         FROM (SELECT MAX({pk})::bigint AS m FROM {quoted_table}) s \
-         WHERE m IS NOT NULL AND m > COALESCE(pg_sequence_last_value($1::regclass), 0)"
+        "SELECT setval($1::regclass, s.m) \
+         FROM (SELECT CASE WHEN q.seqincrement > 0 THEN MAX(t.{pk}) ELSE MIN(t.{pk}) END::bigint AS m, \
+                      q.seqincrement AS inc, q.seqstart AS start \
+               FROM {quoted_table} t CROSS JOIN pg_sequence q \
+               WHERE q.seqrelid = $1::regclass \
+               GROUP BY q.seqincrement, q.seqstart) s \
+         WHERE s.m IS NOT NULL AND CASE WHEN s.inc > 0 \
+           THEN s.m > COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) \
+           ELSE s.m < COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) END"
     ))
     .bind::<diesel::sql_types::Text, _>(seq)
     .execute(conn)

@@ -111,9 +111,10 @@ use autumn_web::gdpr::portability::CapsuleDirectory;
 | `/actuator/capsules/verify` | `{"capsule": "<name>"}` | `{"report": {...}}` |
 | `/actuator/capsules/import` | `{"capsule": "<name>"}` | `{"summary": {...}}` |
 
-A capsule name is one plain path segment in the capsule directory. The
-endpoints do not follow a link, and do not read or write outside that
-directory.
+A capsule name is one plain path segment in the capsule directory. Export
+makes the name from the time and a count, not from the subject, so a listing of
+the directory does not show who asked for an export. The endpoints do not
+follow a link, and do not read or write outside that directory.
 
 | Status | Cause |
 | --- | --- |
@@ -169,7 +170,9 @@ not follow it. Export makes each file new and never replaces a file.
 - Postgres import uses one transaction. If one record fails, import writes no
   record.
 - Import skips generated columns.
-- Import moves each serial or identity sequence past the largest key.
+- Import moves each serial or identity sequence past the imported keys, in
+  the direction of the sequence. It does this only after all inserts succeed,
+  so a failed import does not change a sequence.
 - Import writes blobs before records. If a blob key holds different bytes or a
   different MIME type, import stops and writes no blob. If another writer
   takes a key during the import, import stops and deletes the blobs that it

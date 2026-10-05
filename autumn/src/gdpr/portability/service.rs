@@ -185,24 +185,18 @@ impl CapsuleService {
         Ok(dir.join(name))
     }
 
-    /// A new capsule name for `subject`: `capsule-<subject>-<time>`.
+    /// A new capsule name: `capsule-<time>-<count>`.
     ///
-    /// Characters that are not safe in a file name become `_`.
+    /// The name does not hold the subject: other users can often list the
+    /// capsule directory. The count makes names in one process unique. Two
+    /// processes that get the same name cannot share a directory: export
+    /// needs an empty one and never replaces a file.
     #[must_use]
-    pub fn capsule_name(subject: &str) -> String {
-        let subject: String = subject
-            .chars()
-            .take(48)
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+    pub fn capsule_name() -> String {
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let time = crate::time::ambient_now().format("%Y%m%dT%H%M%S%6f");
-        format!("capsule-{subject}-{time}")
+        format!("capsule-{time}-{count}")
     }
 
     /// Export `subject` and write the signed capsule to `dir`.
