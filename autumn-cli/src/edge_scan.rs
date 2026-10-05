@@ -138,6 +138,95 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 /// `#[edge]` macro rejects each of these on the same handler.
 pub const EDGE_GUARD_ATTRS: &[&str] = &["secured", "authorize", "step_up", "throttle", "intercept"];
 
+/// Capabilities the edge host can mediate. `needs(...)` may name only these.
+pub const EDGE_CAPABILITIES: &[&str] = &["kv", "identity"];
+
+/// Route attributes for methods the edge lane does not serve.
+const EDGE_WRITE_METHOD_ATTRS: &[&str] = &["post", "put", "delete", "patch"];
+
+/// Extractors that need a capability only the origin has, and that capability.
+///
+/// A denylist on purpose: each name also fails the `EdgeHandler` whitelist at
+/// compile time, so a match here is never a false positive. A type alias hides
+/// the name from this scan; the compiler still catches it.
+const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
+    ("Db", "a database"),
+    ("LazyDb", "a database"),
+    ("Session", "a session"),
+    ("Flash", "a session"),
+    ("CsrfToken", "a session"),
+    ("CsrfTokenHeader", "a session"),
+    ("CsrfFormField", "a session"),
+    ("Consent", "a session"),
+    ("Auth", "auth state"),
+    ("ApiToken", "auth state"),
+    ("RequestPrincipal", "auth state"),
+    ("Clock", "the clock"),
+    ("Rng", "randomness"),
+    ("Mailer", "mail"),
+    ("Extension", "app state"),
+    ("State", "app state"),
+    ("Form", "a request body"),
+    ("Json", "a request body"),
+    ("Valid", "a request body"),
+    ("Csv", "a request body"),
+    ("Multipart", "a request body"),
+    ("Request", "the whole request"),
+];
+
+/// One reason an `#[edge]` route needs something the edge cannot provide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeUnsupported {
+    /// `needs(name)` names a capability not in [`EDGE_CAPABILITIES`].
+    Need(String),
+    /// A write-method route attribute, such as `post`.
+    Method(String),
+    /// A parameter whose extractor needs an origin-only capability.
+    Extractor {
+        /// The extractor's type name.
+        name: String,
+        /// What it needs.
+        capability: &'static str,
+    },
+    /// An `EdgeIdentity` parameter without `needs(identity)`.
+    UndeclaredIdentity,
+}
+
+/// How to fix an [`EdgeUnsupported`] route. Shared by doctor and `autumn build`.
+pub const EDGE_UNSUPPORTED_HINT: &str = "Remove #[edge] from the route, or use only what the \
+     edge provides: GET, needs(kv) or needs(identity), and the Path, Query, HeaderMap, \
+     EdgeCache and EdgeIdentity extractors. See docs/guide/edge.md.";
+
+/// One line per route: `name @ file:line: reason; reason`.
+#[must_use]
+pub fn format_unsupported(functions: &[&EdgeFn]) -> String {
+    functions
+        .iter()
+        .map(|f| {
+            let reasons: Vec<String> = f.unsupported.iter().map(ToString::to_string).collect();
+            format!("{}: {}", f.location(), reasons.join("; "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl std::fmt::Display for EdgeUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Need(name) => write!(f, "needs({name}) is not an edge capability"),
+            Self::Method(method) => {
+                write!(f, "#[{method}] is a write method; the edge serves GET only")
+            }
+            Self::Extractor { name, capability } => {
+                write!(f, "takes `{name}`, which needs {capability}")
+            }
+            Self::UndeclaredIdentity => {
+                write!(f, "takes `EdgeIdentity` without needs(identity)")
+            }
+        }
+    }
+}
+
 /// One `#[edge]`-marked handler function found in the project's sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeFn {
@@ -150,6 +239,9 @@ pub struct EdgeFn {
     /// Guard attributes carried by the same function, in source order
     /// (a subset of [`EDGE_GUARD_ATTRS`]).
     pub guards: Vec<String>,
+    /// Capabilities the function needs that the edge cannot provide, in
+    /// source order. Empty for a route the edge can serve.
+    pub unsupported: Vec<EdgeUnsupported>,
     /// Names of the modules the function is declared under, outermost first
     /// (`mod a { mod b { ... } }` gives `["a", "b"]`; an out-of-line `mod a;`
     /// backed by `src/a.rs` gives the same, derived from the file's own
@@ -243,6 +335,16 @@ impl EdgeScan {
         self.functions
             .iter()
             .filter(|f| !f.guards.is_empty())
+            .collect()
+    }
+
+    /// Marked functions that need a capability the edge cannot provide — a
+    /// route the `#[edge]` macro or the `EdgeHandler` bound rejects.
+    #[must_use]
+    pub fn unsupported(&self) -> Vec<&EdgeFn> {
+        self.functions
+            .iter()
+            .filter(|f| !f.unsupported.is_empty())
             .collect()
     }
 }
@@ -2774,6 +2876,7 @@ fn edge_fn(
     if cfg_excludes {
         return None;
     }
+    let unsupported = unsupported_capabilities(attrs, &names, sig);
     let guards: Vec<String> = names
         .into_iter()
         .filter(|n| EDGE_GUARD_ATTRS.contains(&n.as_str()))
@@ -2783,9 +2886,112 @@ fn edge_fn(
         file: file.to_owned(),
         line: sig.ident.span().start().line,
         guards,
+        unsupported,
         module_path: module_path.to_vec(),
         crate_root: crate_root.to_owned(),
     })
+}
+
+/// Every capability an `#[edge]` function needs that the edge cannot provide.
+///
+/// `names` are the function's attribute names, `cfg_attr` payloads included.
+/// `needs(...)` is read from a direct `#[edge(...)]` attribute only.
+fn unsupported_capabilities(
+    attrs: &[syn::Attribute],
+    names: &[String],
+    sig: &syn::Signature,
+) -> Vec<EdgeUnsupported> {
+    let needs = edge_needs(attrs);
+    let mut found: Vec<EdgeUnsupported> = needs
+        .iter()
+        .filter(|need| !EDGE_CAPABILITIES.contains(&need.as_str()))
+        .map(|need| EdgeUnsupported::Need(need.clone()))
+        .collect();
+    found.extend(
+        names
+            .iter()
+            .filter(|n| EDGE_WRITE_METHOD_ATTRS.contains(&n.as_str()))
+            .map(|n| EdgeUnsupported::Method(n.clone())),
+    );
+    let mut extractors = Vec::new();
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = input {
+            extractor_names(&pat_type.ty, &mut extractors);
+        }
+    }
+    for name in extractors {
+        if name == "EdgeIdentity" {
+            if !needs.iter().any(|need| need == "identity") {
+                found.push(EdgeUnsupported::UndeclaredIdentity);
+            }
+        } else if let Some((_, capability)) = ORIGIN_ONLY_EXTRACTORS
+            .iter()
+            .find(|(known, _)| *known == name)
+        {
+            found.push(EdgeUnsupported::Extractor { name, capability });
+        }
+    }
+    found
+}
+
+/// The capability names in `#[edge(needs(a, b))]`. Empty for a bare `#[edge]`
+/// or a malformed argument list (the macro reports that one).
+fn edge_needs(attrs: &[syn::Attribute]) -> Vec<String> {
+    let parser = |input: syn::parse::ParseStream| {
+        let key: syn::Ident = input.parse()?;
+        if key != "needs" {
+            return Err(syn::Error::new(key.span(), "expected `needs`"));
+        }
+        let content;
+        syn::parenthesized!(content in input);
+        let names =
+            syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(&content)?;
+        Ok(names.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    attrs
+        .iter()
+        .filter(|attr| {
+            attr.path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "edge")
+        })
+        .filter_map(|attr| match &attr.meta {
+            syn::Meta::List(list) => syn::parse::Parser::parse2(parser, list.tokens.clone()).ok(),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// The extractor type names in one parameter type: its last path segment, the
+/// elements of a tuple, and the inner type of `Option`/`Result`.
+fn extractor_names(ty: &syn::Type, out: &mut Vec<String>) {
+    match ty {
+        syn::Type::Path(path) => {
+            let Some(last) = path.path.segments.last() else {
+                return;
+            };
+            let name = last.ident.to_string();
+            if name == "Option" || name == "Result" {
+                if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
+                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                        extractor_names(inner, out);
+                    }
+                }
+            } else {
+                out.push(name);
+            }
+        }
+        syn::Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                extractor_names(elem, out);
+            }
+        }
+        syn::Type::Paren(inner) => extractor_names(&inner.elem, out),
+        syn::Type::Group(inner) => extractor_names(&inner.elem, out),
+        _ => {}
+    }
 }
 
 /// A `#[cfg(...)]` predicate this scan can fully resolve: built only from
@@ -9597,5 +9803,80 @@ mod tests {
             module_paths.contains(&vec!["alias".to_owned()]),
             "{module_paths:?}"
         );
+    }
+
+    // ── Capability check (#1790 AC-5) ────────────────────────────────
+
+    fn unsupported_of(src: &str) -> Vec<String> {
+        let scan = scan_one(src);
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        scan.functions[0]
+            .unsupported
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_well_formed_edge_route_has_no_unsupported_capability() {
+        let found = unsupported_of(
+            r#"
+            #[get("/note/{key}")]
+            #[edge(needs(kv, identity))]
+            pub async fn note(
+                Path(key): Path<String>,
+                Query(q): Query<Vec<(String, String)>>,
+                headers: HeaderMap,
+                cache: EdgeCache,
+                who: EdgeIdentity,
+                both: (Path<String>, HeaderMap),
+            ) -> String { key }
+            "#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+        assert!(scan_one("#[edge]\nfn f() {}").unsupported().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_needs_capability_is_unsupported() {
+        let found = unsupported_of("#[get(\"/x\")]\n#[edge(needs(kv, db))]\nfn f() {}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("needs(db)"), "{found:?}");
+    }
+
+    #[test]
+    fn a_write_method_is_unsupported() {
+        let found = unsupported_of("#[post(\"/x\")]\n#[edge]\nfn f() {}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("#[post]"), "{found:?}");
+    }
+
+    #[test]
+    fn an_origin_only_extractor_is_unsupported() {
+        let found = unsupported_of(
+            r#"
+            #[get("/x")]
+            #[edge]
+            pub async fn f(db: autumn_web::Db, s: Option<Session>, pair: (Path<u32>, Clock)) {}
+            "#,
+        );
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found[0].contains("`Db`"), "{found:?}");
+        assert!(found[1].contains("`Session`"), "{found:?}");
+        assert!(found[2].contains("`Clock`"), "{found:?}");
+    }
+
+    #[test]
+    fn an_undeclared_identity_is_unsupported() {
+        let found = unsupported_of("#[edge]\nasync fn f(who: EdgeIdentity) {}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("needs(identity)"), "{found:?}");
+    }
+
+    #[test]
+    fn scan_lists_only_routes_with_an_unsupported_capability() {
+        let scan = scan_one("#[edge]\nfn ok() {}\n#[edge(needs(fs))]\nfn bad() {}");
+        let names: Vec<&str> = scan.unsupported().iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["bad"]);
     }
 }

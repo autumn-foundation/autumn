@@ -115,6 +115,16 @@ pub enum EdgePlan {
     Build,
 }
 
+/// Tells the static renderer that no static routes is not an error. Read by
+/// `autumn-web`'s static build.
+const STATIC_ALLOW_EMPTY_ENV: &str = "AUTUMN_BUILD_STATIC_ALLOW_EMPTY";
+
+/// Whether the static renderer may find no static routes. True when the build
+/// also makes an edge capsule: the capsule is then the build's output.
+fn static_render_allows_empty(plan: EdgePlan) -> bool {
+    plan == EdgePlan::Build
+}
+
 /// Decide whether this invocation builds an edge capsule.
 ///
 /// Pure so the whole flag matrix is unit-tested; `run` performs the printing and
@@ -305,6 +315,20 @@ fn format_unregistered_warning(unregistered: &[&EdgeFn]) -> String {
          Add them to edge_routes![] in the list passed to autumn_edge::serve().",
         unregistered.len()
     )
+}
+
+/// The error for `#[edge]` routes that need what the edge cannot provide, or
+/// `None` when there are none. The same text as doctor's `edge_capabilities`.
+fn format_unsupported_error(unsupported: &[&EdgeFn]) -> Option<String> {
+    if unsupported.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\u{2717} {} #[edge] route(s) need what the edge cannot provide:\n{}\n  {}",
+        unsupported.len(),
+        crate::edge_scan::format_unsupported(unsupported),
+        crate::edge_scan::EDGE_UNSUPPORTED_HINT,
+    ))
 }
 
 /// The success line printed after the capsule compiles.
@@ -585,6 +609,10 @@ pub fn run(
     // build. The capsule itself is compiled much later — after the native build
     // and fingerprinting — by `run_edge_capsule_build`.
     let edge_scan = resolve_project_edge_scan(debug, embed, package, bin, features);
+    if let Some(error) = format_unsupported_error(&edge_scan.unsupported()) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     let plan = plan_edge_step(!edge_scan.is_empty(), edge, embed, debug).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
@@ -645,6 +673,9 @@ pub fn run(
 
     let mut cmd = Command::new(&binary);
     cmd.env("AUTUMN_BUILD_STATIC", "1");
+    if static_render_allows_empty(plan) {
+        cmd.env(STATIC_ALLOW_EMPTY_ENV, "1");
+    }
     apply_renderer_env(
         &mut cmd,
         debug,
@@ -1416,6 +1447,30 @@ mod tests {
         assert!(warning.contains("stats @ src/routes.rs:4"), "{warning}");
         assert!(!warning.contains("greet @"), "{warning}");
         assert!(warning.contains("edge_routes![]"), "{warning}");
+    }
+
+    #[test]
+    fn only_an_edge_build_lets_the_static_renderer_find_no_routes() {
+        assert!(static_render_allows_empty(EdgePlan::Build));
+        assert!(!static_render_allows_empty(EdgePlan::Skip));
+        assert!(!static_render_allows_empty(EdgePlan::SkipDebug));
+    }
+
+    #[test]
+    fn unsupported_error_names_the_route_the_reason_and_the_fix() {
+        let scan = crate::edge_scan::scan_sources(&[(
+            "src/routes.rs",
+            "#[edge]\nfn ok() {}\n#[post(\"/x\")]\n#[edge]\nfn write() {}",
+        )]);
+        assert!(format_unsupported_error(&[]).is_none());
+        let error = format_unsupported_error(&scan.unsupported()).expect("one route");
+        assert!(error.contains("1 #[edge] route(s)"), "{error}");
+        assert!(
+            error.contains("write @ src/routes.rs:5: #[post]"),
+            "{error}"
+        );
+        assert!(!error.contains("ok @"), "{error}");
+        assert!(error.contains("Remove #[edge]"), "{error}");
     }
 
     fn expected_binary(path: &str) -> PathBuf {

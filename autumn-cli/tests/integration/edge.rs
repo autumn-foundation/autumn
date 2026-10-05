@@ -150,6 +150,70 @@ pub fn edge_route_list() -> Vec<EdgeRoute> {
 }
 "#;
 
+/// An edge handler that needs a database: a capability the edge cannot give.
+const DB_EDGE_APP: &str = r#"
+use autumn_web::prelude::*;
+
+#[get("/dashboard")]
+#[edge(needs(db))]
+pub async fn dashboard(db: Db) -> &'static str {
+    "rows"
+}
+
+pub fn edge_route_list() -> Vec<EdgeRoute> {
+    edge_routes![dashboard]
+}
+"#;
+
+#[test]
+fn doctor_fails_on_edge_route_with_unsupported_capability() {
+    let dir = project(&[
+        ("src/main.rs", DB_EDGE_APP),
+        (
+            "src/bin/edge-capsule.rs",
+            "fn main() { autumn_edge::serve(edgeapp::edge_route_list()); }\n",
+        ),
+    ]);
+    let (report, code) = doctor_json(dir.path());
+
+    assert_ne!(code, Some(0), "{report}");
+    let caps = check(&report, "edge_capabilities");
+    assert_eq!(caps["status"], "fail", "{caps}");
+    let detail = caps["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("dashboard @ src/main.rs:"), "{detail}");
+    assert!(detail.contains("needs(db)"), "{detail}");
+    assert!(detail.contains("`Db`"), "{detail}");
+    assert!(
+        caps["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Remove #[edge]"),
+        "{caps}"
+    );
+}
+
+#[test]
+fn build_fails_on_unsupported_edge_capability_before_compiling() {
+    let dir = project(&[
+        ("src/main.rs", DB_EDGE_APP),
+        (
+            "src/bin/edge-capsule.rs",
+            "fn main() { autumn_edge::serve(edgeapp::edge_route_list()); }\n",
+        ),
+    ]);
+    let (stdout, stderr, code) = run_autumn(dir.path(), &["build"], &[]);
+    let combined = format!("{stdout}{stderr}");
+
+    assert_ne!(code, Some(0), "{combined}");
+    assert!(combined.contains("dashboard @ src/main.rs:"), "{combined}");
+    assert!(combined.contains("needs(db)"), "{combined}");
+    assert!(combined.contains("Remove #[edge]"), "{combined}");
+    assert!(
+        !combined.contains("Compiling"),
+        "the capability check must run before the native build: {combined}"
+    );
+}
+
 #[test]
 fn doctor_fails_on_edge_route_with_auth_guard() {
     let dir = project(&[
@@ -208,13 +272,13 @@ fn doctor_warns_on_unregistered_edge_route() {
 
 #[test]
 fn doctor_edge_checks_pass_without_edge_routes() {
-    // Deliberately asserts on the two checks rather than on the exit code: this
+    // Deliberately asserts on the edge checks rather than on the exit code: this
     // must hold on a runner that has no `wasm32-wasip1` target installed, which
     // is exactly what "no edge routes ⇒ no wasm requirement" means.
     let dir = project(&[("src/main.rs", PLAIN_APP)]);
     let (report, _) = doctor_json(dir.path());
 
-    for name in ["edge_target", "edge_routes"] {
+    for name in ["edge_target", "edge_routes", "edge_capabilities"] {
         let result = check(&report, name);
         assert_eq!(result["status"], "pass", "{result}");
         assert_eq!(result["detail"], "no #[edge] routes", "{result}");
@@ -224,7 +288,7 @@ fn doctor_edge_checks_pass_without_edge_routes() {
 #[test]
 fn doctor_warns_from_a_virtual_workspace_root() {
     // A bare workspace root (`[workspace]`, no `[package]`) has no sources
-    // of its own — real sources live under a member crate. Both edge checks
+    // of its own — real sources live under a member crate. All edge checks
     // must warn instead of silently reporting "no #[edge] routes".
     let dir = tempfile::tempdir().expect("create temp project dir");
     fs::write(
@@ -234,7 +298,7 @@ fn doctor_warns_from_a_virtual_workspace_root() {
     .expect("write Cargo.toml");
     let (report, _) = doctor_json(dir.path());
 
-    for name in ["edge_target", "edge_routes"] {
+    for name in ["edge_target", "edge_routes", "edge_capabilities"] {
         let result = check(&report, name);
         assert_eq!(result["status"], "warn", "{result}");
         assert_eq!(

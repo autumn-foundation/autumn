@@ -10509,6 +10509,21 @@ pub fn run(opts: DoctorOptions) {
         check_edge_routes_impl(&scan, capsule_bin_exists)
     }));
 
+    // 17b. Edge capabilities (issue #1790 AC-5): an `#[edge]` route that needs
+    //      something the edge cannot provide fails before the build does.
+    tasks.push(Box::new(move || {
+        if edge_virtual_workspace_root {
+            return edge_virtual_workspace_warn("edge_capabilities");
+        }
+        let capsule_bin = resolve_edge_capsule_bin(std::path::Path::new("."));
+        let scan = crate::edge_scan::resolve_edge_scan_with_extra_file(
+            std::path::Path::new("."),
+            &[],
+            capsule_bin.as_deref(),
+        );
+        check_edge_capabilities_impl(&scan)
+    }));
+
     // 18. Orphaned plugin residue (issue #1631): a dependency with no mount, a
     //     mount with no dependency, or migrations still applied for a plugin
     //     that is no longer in the app. The migration half is best effort —
@@ -11757,6 +11772,41 @@ pub fn check_edge_routes_impl(
     }
 }
 
+/// Whether every `#[edge]` route uses only what the edge can provide.
+///
+/// Fails on an unknown `needs(...)` capability, a write method, an
+/// origin-only extractor, or an undeclared `EdgeIdentity`. Each one also
+/// stops the build in rustc; doctor names it before the build starts.
+pub fn check_edge_capabilities_impl(scan: &crate::edge_scan::EdgeScan) -> CheckResult {
+    const NAME: &str = "edge_capabilities";
+    if scan.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some("no #[edge] routes".into()),
+            hint: None,
+        };
+    }
+    let unsupported = scan.unsupported();
+    if unsupported.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{} #[edge] route(s) use only edge capabilities",
+                scan.functions.len()
+            )),
+            hint: None,
+        };
+    }
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Fail,
+        detail: Some(crate::edge_scan::format_unsupported(&unsupported)),
+        hint: Some(crate::edge_scan::EDGE_UNSUPPORTED_HINT),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -11854,6 +11904,34 @@ mod tests {
             "the warning must name the handler and its location"
         );
         assert!(r.hint.unwrap().contains("edge_routes![]"));
+    }
+
+    #[test]
+    fn edge_capabilities_passes_without_edge_routes() {
+        let r = check_edge_capabilities_impl(&edge_scan_of("fn plain() {}"));
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert_eq!(r.detail.as_deref(), Some("no #[edge] routes"));
+    }
+
+    #[test]
+    fn edge_capabilities_passes_for_supported_capabilities() {
+        let scan = edge_scan_of("#[edge(needs(kv))]\nfn note(cache: EdgeCache) {}");
+        let r = check_edge_capabilities_impl(&scan);
+        assert_eq!(r.status, CheckStatus::Pass, "{:?}", r.detail);
+    }
+
+    #[test]
+    fn edge_capabilities_fails_on_a_capability_the_edge_cannot_provide() {
+        let scan = edge_scan_of("#[edge(needs(db))]\nfn dash(db: Db) {}");
+        let r = check_edge_capabilities_impl(&scan);
+        assert_eq!(r.status, CheckStatus::Fail);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("dash @ src/routes.rs:2"), "{detail}");
+        assert!(detail.contains("needs(db)"), "{detail}");
+        assert!(detail.contains("`Db`"), "{detail}");
+        let hint = r.hint.unwrap();
+        assert!(hint.contains("needs(kv)"), "{hint}");
+        assert!(hint.contains("Remove #[edge]"), "{hint}");
     }
 
     #[test]

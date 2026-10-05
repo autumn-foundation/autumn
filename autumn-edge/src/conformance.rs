@@ -42,6 +42,21 @@ pub const VOLATILE_HEADERS: &[&str] = &[
     "x-request-id",
 ];
 
+/// Headers the origin's security middleware sets and a capsule does not.
+///
+/// The host sets them on an edge response (see
+/// `EdgeGateway::with_response_headers`). [`compare_capsule`] excuses them,
+/// because a capsule never sets them. [`compare`] does not: what the client
+/// gets from the host must match the origin.
+pub const SECURITY_HEADERS: &[&str] = &[
+    "permissions-policy",
+    "referrer-policy",
+    "strict-transport-security",
+    "x-content-type-options",
+    "x-frame-options",
+    "x-xss-protection",
+];
+
 /// What a conformance case expects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expectation {
@@ -204,6 +219,26 @@ pub fn compare(native: &EdgeResponse, edge: &EdgeResponse) -> Verdict {
     Verdict::Reproduced
 }
 
+/// Compare an origin response with a raw capsule response.
+///
+/// The same as [`compare`], but [`SECURITY_HEADERS`] are dropped from both
+/// sides first: the host sets them, not the capsule. Every other header must
+/// match in both directions.
+#[must_use]
+pub fn compare_capsule(origin: &EdgeResponse, capsule: &EdgeResponse) -> Verdict {
+    let without_security = |response: &EdgeResponse| EdgeResponse {
+        status: response.status,
+        headers: response
+            .headers
+            .iter()
+            .filter(|(name, _)| !SECURITY_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
+            .cloned()
+            .collect(),
+        body: response.body.clone(),
+    };
+    compare(&without_security(origin), &without_security(capsule))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +384,43 @@ mod tests {
         assert_eq!(request.uri, "/note/greeting");
         assert_eq!(request.headers, owned(&[("accept", "text/html")]));
         assert!(request.body.is_empty());
+    }
+
+    #[test]
+    fn the_capsule_comparison_excuses_only_security_headers() {
+        let origin = response(
+            &[
+                ("content-type", "text/plain"),
+                ("x-frame-options", "DENY"),
+                ("x-content-type-options", "nosniff"),
+                ("referrer-policy", "strict-origin-when-cross-origin"),
+                ("date", "then"),
+            ],
+            "hi",
+        );
+        let capsule = response(&[("content-type", "text/plain")], "hi");
+        assert_eq!(compare_capsule(&origin, &capsule), Verdict::Reproduced);
+        assert!(matches!(
+            compare(&origin, &capsule),
+            Verdict::Diverged { .. }
+        ));
+
+        let origin_only = response(&[("content-type", "text/plain"), ("x-other", "1")], "hi");
+        let Verdict::Diverged { detail } = compare_capsule(&origin_only, &capsule) else {
+            panic!("a header only the origin sends must diverge");
+        };
+        assert!(detail.contains("x-other"), "{detail}");
+    }
+
+    #[test]
+    fn the_security_set_is_lowercase_sorted_and_disjoint_from_the_volatile_set() {
+        let mut sorted = SECURITY_HEADERS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(SECURITY_HEADERS, sorted);
+        for name in SECURITY_HEADERS {
+            assert_eq!(*name, name.to_ascii_lowercase());
+            assert!(!VOLATILE_HEADERS.contains(name), "{name}");
+        }
     }
 
     #[test]

@@ -227,7 +227,8 @@ forwards the original request upstream:
 | `missing_capability` | the route needs a seam this host did not provide | serves it, because the origin has the seam |
 | `capsule_error` | a trap (a panic), a malformed frame, an unsupported wire version | its normal error handling — a panicking handler becomes the origin's 500 page, not a broken edge response |
 
-None of these require author-written glue. A handler can also decline
+None of these require author-written glue. `EdgeGateway` (below) is a host
+that does the forwarding. A handler can also decline
 explicitly by setting the `x-autumn-edge-fallthrough` response header to one of
 those reasons; the runtime converts it and never lets the header — or that
 response's body — reach the wire.
@@ -253,6 +254,24 @@ canonically sorted, and everything else must match exactly. **A header your
 handler set is compared value-for-value** — the projection only excuses the
 headers the origin's middleware stack adds and the edge lane structurally cannot
 emit.
+
+The origin's security middleware also sets static headers. The capsule does
+not. The host sets them — `conformance::SECURITY_HEADERS`:
+
+```text
+permissions-policy · referrer-policy · strict-transport-security
+x-content-type-options · x-frame-options · x-xss-protection
+```
+
+So there are two comparisons:
+
+| Comparison | Excused | Function |
+| --- | --- | --- |
+| raw capsule vs origin | volatile and security headers | `compare_capsule` |
+| what the client gets from the host vs origin | volatile headers only | `compare` |
+
+Both check headers in both directions. A header only one side sends is a
+divergence.
 
 The guarantee is scoped to one build. Two Autumn versions may render the same
 handler differently (that is what a release is for); the promise is that *your*
@@ -384,6 +403,19 @@ attributes and `edge_routes![]` invocations under `src/`. A handler that is
 marked but never registered is reported as a warning naming the function — the
 one failure mode the type system cannot catch.
 
+Before it compiles, `autumn build` stops on an `#[edge]` route that needs
+something the edge cannot provide. The error is the same as doctor's
+`edge_capabilities` check:
+
+```text
+✗ 1 #[edge] route(s) need what the edge cannot provide:
+dashboard @ src/routes.rs:4: needs(db) is not an edge capability; takes `Db`, which needs a database
+  Remove #[edge] from the route, or use only what the edge provides: GET, needs(kv) or needs(identity), ...
+```
+
+An app with `#[edge]` routes and no static routes builds clean. The capsule is
+the build's output, so the static renderer does not fail on an empty route set.
+
 `--embed` is refused alongside edge routes in this slice, with an actionable
 error rather than a silently skipped step.
 
@@ -394,10 +426,14 @@ error rather than a silently skipped step.
 | `edge_target` | **Fail** | the project has `#[edge]` routes and `wasm32-wasip1` is not installed — hinting ``Run `rustup target add wasm32-wasip1` `` |
 | `edge_routes` | **Fail** | an `#[edge]` handler also carries an auth/rate guard or `#[intercept]` (the build would fail too; doctor catches it first) |
 | `edge_routes` | **Warn** | a handler is marked but never registered with `edge_routes![]`, or `src/bin/edge-capsule.rs` is missing |
+| `edge_capabilities` | **Fail** | an `#[edge]` route needs what the edge cannot provide: an unknown `needs(...)`, a write method (`#[post]`, …), an origin-only extractor (`Db`, `Session`, `Clock`, `Extension`, …), or `EdgeIdentity` without `needs(identity)` |
 
-`edge_routes` reports `handler @ file:line` for the handler at fault;
-`edge_target` names the files that carry edge routes. Both pass with "no
-`#[edge]` routes" on a project that has none.
+`edge_routes` and `edge_capabilities` report `handler @ file:line` for the
+handler at fault; `edge_target` names the files that carry edge routes. All
+three pass with "no `#[edge]` routes" on a project that has none.
+
+The scan reads names, not types. A type alias hides an extractor from it. The
+compiler still stops that route (see "What an edge handler may use").
 
 ### Deploying
 
@@ -406,17 +442,54 @@ Lambda, an nginx sidecar — loads the `.wasm`, speaks the NDJSON dialogue on
 stdio, answers `kv_get` from its own replica, and forwards any `fallthrough` to
 your origin unchanged.
 
-**Autumn does not ship that shim.** Vendor bindings are explicitly out of scope
-for this slice (see [ADR-0011](../adr/0011-edge-capsule-read-lane.md)): the
+**Autumn does not ship a vendor shim.** Vendor bindings are explicitly out of
+scope for this slice (see [ADR-0011](../adr/0011-edge-capsule-read-lane.md)): the
 deliverable is a portable artifact and a documented protocol, so no Autumn
 release is coupled to a CDN vendor's SDK cadence. `autumn-edge`'s reference host
 is the worked specification a shim implements against.
 
+### The reference gateway
+
+`autumn_edge::gateway::EdgeGateway` (feature `host`) is that specification as
+code. It puts a capsule in front of any origin `tower::Service`, for example
+your app's `axum::Router`:
+
+```rust
+use autumn_edge::gateway::{EdgeGateway, Lane};
+use autumn_edge::host::EdgeArtifact;
+
+let artifact = Arc::new(EdgeArtifact::from_bytes(&std::fs::read(wasm_path)?)?);
+let gateway = EdgeGateway::new(artifact, origin_router)
+    .with_kv(kv)                              // provide `kv`
+    .with_response_headers(security_headers); // the origin's security headers
+
+let response = gateway.handle(request).await;
+let lane = response.extensions().get::<Lane>(); // Edge, Fallthrough(reason), OriginOnly
+```
+
+What it does:
+
+- It offers each `GET`/`HEAD` request to the capsule, without the body and
+  without credentials.
+- When the capsule serves the request, it returns those bytes and does not
+  ask the origin.
+- When the capsule declines, it sends the **original** request (body and
+  credentials included) to the origin and returns the origin's response
+  unchanged. The fallthrough detail does not reach the client.
+- It sends a write, or a request with a non-UTF-8 header value, to the origin
+  without asking the capsule.
+- It records the lane in the response extensions, not in a header, so the
+  bytes stay the origin's.
+
+The capsule runs on the calling task. A production shim runs it off the
+request thread and sets its own time limit.
+
 ## Proving it, in your own app
 
 The `edge-greeting` example ships the harness this framework uses on itself, and
-it is copyable. It drives one request corpus through three lanes — the native
-edge lane, a real wasm artifact, and the full origin app — and compares them:
+it is copyable. It drives one request corpus through four lanes — the native
+edge lane, a real wasm artifact, the full origin app, and the gateway — and
+compares them:
 
 ```sh
 cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
@@ -442,7 +515,31 @@ cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --n
     panicking handler                                    edge capsule_error → origin 500
 ```
 
-CI runs it on every push in the `edge-conformance` job. It is not path-filtered:
+```text
+  Tier C — gateway (capsule + origin) vs the lanes behind it
+
+    happy path                                           Edge
+    write method                                         Fallthrough(MethodNotEdgeEligible)
+    panicking handler                                    Fallthrough(CapsuleError)
+
+  Tier D — 10000 generated requests (seed 0x1790000000000001)
+
+    Edge                                                 5903
+    Fallthrough(MethodNotEdgeEligible)                   1968
+    Fallthrough(MissingCapability)                       336
+    Fallthrough(UnknownRoute)                            1793
+```
+
+Tier C puts `EdgeGateway` in front of the origin. For each served request the
+client must get the origin's bytes; for each declined request the gateway must
+return the origin's response unchanged. Tier D sends 10,000 seeded requests
+(unicode and invalid percent-encoding, repeated query keys, `HEAD`, writes,
+credentials, `kv` on and off) through Tiers A to C and requires zero
+divergence.
+
+CI runs it on every push in the `edge-conformance` job. The same job runs the
+real `autumn build --debug --edge` on the example and checks that the `.wasm`
+exists. It is not path-filtered:
 byte-identity is a property of the whole framework, and a change to the router,
 a middleware, a macro or a dependency is exactly what could break it.
 
@@ -453,7 +550,10 @@ a middleware, a macro or a dependency is exactly what could break it.
 - **No compression, no i18n locale prefix, no sessions** in the edge lane. The
   origin's middleware stack does not run there — the capsule serves exactly what
   the handler produced.
-- **No CDN shim ships with Autumn.** Artifact plus protocol; see above.
+- **No vendor shim ships with Autumn.** Artifact, protocol and a reference
+  gateway; see above.
+- **Response time at a real CDN is not measured in CI.** The issue's
+  time-to-first-byte metric needs a deployed shim and a distant client.
 - **`paths::*` helpers are unavailable inside a capsule.**
 - **`autumn build --embed` refuses to combine with edge routes.**
 - **The wire protocol and the host API are experimental.** They will change; the

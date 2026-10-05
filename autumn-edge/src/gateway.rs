@@ -1,0 +1,244 @@
+//! The reference gateway: the capsule in front of the origin (AC-3).
+//!
+//! [`EdgeGateway`] does what a CDN shim does. It offers each request to the
+//! capsule. When the capsule serves it, the gateway returns those bytes. When
+//! the capsule declines, the gateway sends the *original* request to the
+//! origin and returns the origin's answer. The author writes no glue.
+//!
+//! The origin is any `tower::Service`, for example the app's `axum::Router`.
+//! The lane that answered is in the response extensions as [`Lane`], not in a
+//! header, so the bytes on the wire stay identical to the origin's.
+//!
+//! # Rules
+//!
+//! - **The capsule never gets a body.** An edge handler cannot read one (no
+//!   body extractor is on the `EdgeHandler` list). The gateway does not buffer
+//!   the body; it keeps it for the origin.
+//! - **Credentials go to the origin only.** [`EdgeArtifact::run`] strips them
+//!   from the capsule's copy. The forwarded request keeps them.
+//! - **Writes skip the capsule.** A method other than `GET`/`HEAD` goes to the
+//!   origin at once, with the same reason the capsule would give.
+//! - **A request the wire cannot carry skips the capsule.** A header value
+//!   that is not UTF-8 goes to the origin as [`Lane::OriginOnly`].
+//! - **A bad edge response is a fallthrough.** An invalid status or header
+//!   from the capsule becomes a `capsule_error` fallthrough.
+//! - **Fallthrough detail stays in the gateway.** It never reaches the client.
+//!
+//! The capsule runs synchronously on the calling task. This is a reference
+//! host, not a production server: a production shim runs it off the request
+//! thread and sets its own time limit.
+
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use axum::body::Body;
+use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
+use tower::{Service, ServiceExt};
+
+use crate::host::EdgeArtifact;
+use crate::kv::{EdgeKv, EmptyEdgeKv};
+use crate::route::EdgeCapability;
+use crate::wire::{EdgeOutcome, EdgeRequest, EdgeResponse, FallthroughReason};
+
+/// The lane that answered a request. Stored in the response extensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// The capsule served the response.
+    Edge,
+    /// The capsule declined, for this reason. The origin served the response.
+    Fallthrough(FallthroughReason),
+    /// The request cannot cross the wire. The origin served it and the
+    /// capsule was not asked.
+    OriginOnly,
+}
+
+/// A capsule in front of an origin service.
+pub struct EdgeGateway<O> {
+    artifact: Arc<EdgeArtifact>,
+    kv: Arc<dyn EdgeKv>,
+    capabilities: Vec<EdgeCapability>,
+    response_headers: Vec<(HeaderName, HeaderValue)>,
+    origin: O,
+}
+
+impl<O: Clone> Clone for EdgeGateway<O> {
+    fn clone(&self) -> Self {
+        Self {
+            artifact: Arc::clone(&self.artifact),
+            kv: Arc::clone(&self.kv),
+            capabilities: self.capabilities.clone(),
+            response_headers: self.response_headers.clone(),
+            origin: self.origin.clone(),
+        }
+    }
+}
+
+impl<O> std::fmt::Debug for EdgeGateway<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EdgeGateway")
+            .field("capabilities", &self.capabilities)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<O> EdgeGateway<O>
+where
+    O: Service<Request<Body>, Response = Response<Body>, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    O::Future: Send,
+{
+    /// A gateway with no capabilities: a route that needs `kv` falls through.
+    pub fn new(artifact: Arc<EdgeArtifact>, origin: O) -> Self {
+        Self {
+            artifact,
+            kv: Arc::new(EmptyEdgeKv),
+            capabilities: Vec::new(),
+            response_headers: Vec::new(),
+            origin,
+        }
+    }
+
+    /// Provide the `kv` capability from this store.
+    #[must_use]
+    pub fn with_kv(mut self, kv: Arc<dyn EdgeKv>) -> Self {
+        self.kv = kv;
+        if !self.capabilities.contains(&EdgeCapability::Kv) {
+            self.capabilities.push(EdgeCapability::Kv);
+        }
+        self
+    }
+
+    /// Set these headers on every edge response, as the origin's security
+    /// middleware does on its own. A value replaces one the capsule set.
+    ///
+    /// Give the same headers the origin sends (`x-frame-options`,
+    /// `x-content-type-options`, ...). Then the client gets the same headers
+    /// from both lanes.
+    #[must_use]
+    pub fn with_response_headers(
+        mut self,
+        headers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
+    ) -> Self {
+        self.response_headers.extend(headers);
+        self
+    }
+
+    /// Serve one request: from the capsule if it can, else from the origin.
+    ///
+    /// The capsule runs before this returns. The future only waits for the
+    /// origin, and it does not borrow the gateway.
+    pub fn handle(
+        &self,
+        request: Request<Body>,
+    ) -> impl Future<Output = Response<Body>> + Send + 'static {
+        let lane = match edge_request(&request) {
+            None => Err(Lane::OriginOnly),
+            Some(edge) if !is_edge_method(&edge.method) => {
+                Err(Lane::Fallthrough(FallthroughReason::MethodNotEdgeEligible))
+            }
+            Some(edge) => self.ask_capsule(&edge).map_err(Lane::Fallthrough),
+        };
+        let origin = self.origin.clone();
+        async move {
+            match lane {
+                Ok(response) => with_lane(response, Lane::Edge),
+                Err(lane) => {
+                    let response = origin
+                        .oneshot(request)
+                        .await
+                        .unwrap_or_else(|never| match never {});
+                    with_lane(response, lane)
+                }
+            }
+        }
+    }
+
+    /// Run the capsule. `Err` is the reason to fall through.
+    fn ask_capsule(&self, request: &EdgeRequest) -> Result<Response<Body>, FallthroughReason> {
+        match self
+            .artifact
+            .run(request, &self.capabilities, self.kv.as_ref())
+        {
+            Ok(EdgeOutcome::Served(response)) => {
+                let mut response = into_http(response).ok_or(FallthroughReason::CapsuleError)?;
+                for (name, value) in &self.response_headers {
+                    response.headers_mut().insert(name.clone(), value.clone());
+                }
+                Ok(response)
+            }
+            Ok(EdgeOutcome::Fallthrough { reason, .. }) => Err(reason),
+            Err(_) => Err(FallthroughReason::CapsuleError),
+        }
+    }
+}
+
+impl<O> Service<Request<Body>> for EdgeGateway<O>
+where
+    O: Service<Request<Body>, Response = Response<Body>, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    O::Future: Send,
+{
+    type Response = Response<Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let response = self.handle(request);
+        Box::pin(async move { Ok(response.await) })
+    }
+}
+
+/// The same rule as the capsule's own method check.
+fn is_edge_method(method: &str) -> bool {
+    method == "GET" || method == "HEAD"
+}
+
+/// The capsule's view of `request`: no body. `None` when a header value is
+/// not UTF-8 and so cannot cross the wire.
+fn edge_request<B>(request: &Request<B>) -> Option<EdgeRequest> {
+    let mut headers = Vec::with_capacity(request.headers().len());
+    for (name, value) in request.headers() {
+        headers.push((name.as_str().to_owned(), value.to_str().ok()?.to_owned()));
+    }
+    let uri = request
+        .uri()
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    Some(EdgeRequest {
+        method: request.method().as_str().to_owned(),
+        uri: uri.to_owned(),
+        headers,
+        body: Vec::new(),
+        identity: None,
+    })
+}
+
+/// The capsule's answer as an HTTP response. `None` when the status or a
+/// header is not valid HTTP.
+fn into_http(response: EdgeResponse) -> Option<Response<Body>> {
+    let mut http = Response::new(Body::from(response.body));
+    *http.status_mut() = StatusCode::from_u16(response.status).ok()?;
+    for (name, value) in response.headers {
+        http.headers_mut().append(
+            HeaderName::from_bytes(name.as_bytes()).ok()?,
+            HeaderValue::from_str(&value).ok()?,
+        );
+    }
+    Some(http)
+}
+
+fn with_lane(mut response: Response<Body>, lane: Lane) -> Response<Body> {
+    response.extensions_mut().insert(lane);
+    response
+}
