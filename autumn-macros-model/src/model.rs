@@ -91,7 +91,7 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
 ///   ...]`) is an error.
 /// - `#[references]` — bare; the target table is inferred from the field name.
 /// - `#[references(table = "other_table")]` — an explicit target table.
-/// - `#[renamed_from("old_name")]` — one snake_case old column name.
+/// - `#[renamed_from("old_name")]` — one `snake_case` old column name.
 fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
     validate_model_renamed_from(&field.attrs)?;
     for attr in &field.attrs {
@@ -164,13 +164,15 @@ fn validate_model_renamed_from(attrs: &[syn::Attribute]) -> syn::Result<()> {
 }
 
 /// Validate one `#[renamed_from("old_name")]`: one string literal that is a
-/// plain identifier (`[a-z_][a-z0-9_]*`, at most 63 bytes).
+/// plain identifier (`[a-z_][a-z0-9_]*`, at most 63 bytes). Keep in sync with
+/// `autumn-cli/src/schema/rename.rs::is_plain_identifier`.
 fn validate_renamed_from_shape(attr: &syn::Attribute) -> syn::Result<()> {
     let error = || {
         syn::Error::new_spanned(
             attr,
-            "write `#[renamed_from(\"old_name\")]` with one snake_case name \
-             (lowercase letters, digits and `_`)",
+            "write `#[renamed_from(\"old_name\")]` with one snake_case name: \
+             start with a lowercase letter or `_`, then use lowercase letters, \
+             digits and `_`, at most 63 bytes",
         )
     };
     let syn::Meta::List(list) = &attr.meta else {
@@ -18096,7 +18098,13 @@ mod tests {
             syn::parse_quote!(#[renamed_from("a b")]),
             syn::parse_quote!(#[renamed_from("a", "b")]),
             syn::parse_quote!(#[renamed_from("")]),
+            syn::parse_quote!(#[renamed_from("1a")]),
         ];
+        let long = "a".repeat(64);
+        let bad: Vec<syn::Attribute> = bad
+            .into_iter()
+            .chain(std::iter::once(syn::parse_quote!(#[renamed_from(#long)])))
+            .collect();
         for attr in bad {
             let shown = quote!(#attr).to_string();
             let field = syn::Field {
@@ -18148,7 +18156,7 @@ mod tests {
         )
         .to_string();
         let without_hints = model_macro(
-            TokenStream::new(),
+            quote! { managed },
             quote! {
                 pub struct Membership {
                     #[id]

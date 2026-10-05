@@ -158,6 +158,13 @@ async fn schema_dev_url_diffs_against_the_replay_and_leaves_the_database_empty()
     let (_container, url) = start_postgres().await;
     let root = project_with_initial_migration();
     let dir = root.path();
+    // A tool-made project: the replay matches the snapshot, so no warning.
+    let (out, err) = run_ok(
+        dir,
+        &["schema", "diff", "--backend", "pg", "--dev-url", &url],
+    );
+    assert!(out.contains("No schema changes"), "{out}");
+    assert!(!err.contains("warning"), "{err}");
     // The snapshot is not needed with --dev-url.
     std::fs::remove_file(dir.join(".autumn/schema-snapshot.json")).expect("rm snapshot");
     std::fs::write(dir.join("src/models.rs"), models_v2()).expect("models v2");
@@ -185,7 +192,12 @@ async fn schema_dev_url_diffs_against_the_replay_and_leaves_the_database_empty()
             "add_body",
         ],
     );
-    assert!(dir.join(".autumn/schema-snapshot.json").is_file());
+    let snapshot = std::fs::read_to_string(dir.join(".autumn/schema-snapshot.json"))
+        .expect("the snapshot is written");
+    assert!(
+        !snapshot.contains("\"managed\": false"),
+        "model tables stay managed: {snapshot}"
+    );
     let (out, _) = run_ok(
         dir,
         &["schema", "diff", "--backend", "pg", "--dev-url", &url],
@@ -199,9 +211,13 @@ async fn schema_dev_url_diffs_against_the_replay_and_leaves_the_database_empty()
 async fn schema_dev_url_refuses_a_database_that_is_not_empty() {
     let (_container, url) = start_postgres().await;
     let mut conn = PgConnection::establish(&url).expect("connect");
-    diesel::sql_query("CREATE TABLE leftover (id BIGINT PRIMARY KEY)")
-        .execute(&mut conn)
-        .expect("create");
+    // A table outside `public` counts too.
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TABLE app.leftover (id BIGINT PRIMARY KEY)",
+    ] {
+        diesel::sql_query(sql).execute(&mut conn).expect("create");
+    }
     let root = project_with_initial_migration();
 
     let (_, err, code) = run_autumn(
@@ -210,7 +226,7 @@ async fn schema_dev_url_refuses_a_database_that_is_not_empty() {
     );
     assert_ne!(code, Some(0));
     assert!(
-        err.contains("not empty") && err.contains("leftover"),
+        err.contains("not empty") && err.contains("app.leftover"),
         "{err}"
     );
 }
@@ -246,6 +262,10 @@ async fn schema_dev_url_sees_hand_written_migrations_and_warns_on_snapshot_drift
         err.contains("snapshot does not match the migrations"),
         "{err}"
     );
-    assert!(err.contains("DROP COLUMN posts.legacy"), "{err}");
-    assert!(!err.contains("DROP TABLE audit_log"), "{err}");
+    let refusal = err
+        .lines()
+        .find(|l| l.starts_with("error:"))
+        .unwrap_or_else(|| panic!("no error line: {err}"));
+    assert!(refusal.contains("DROP COLUMN posts.legacy"), "{refusal}");
+    assert!(!refusal.contains("audit_log"), "{refusal}");
 }

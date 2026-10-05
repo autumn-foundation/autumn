@@ -112,8 +112,14 @@ pub enum SchemaAction {
         allow_destructive: bool,
         /// Use an empty dev database as the baseline. The command applies the
         /// migrations to it in one transaction, reads the schema, and rolls
-        /// back. The snapshot becomes optional.
-        #[arg(long, value_name = "URL")]
+        /// back. The snapshot becomes optional. Also read from `AUTUMN_DEV_URL`,
+        /// which keeps the password out of the process list.
+        #[arg(
+            long,
+            value_name = "URL",
+            env = "AUTUMN_DEV_URL",
+            hide_env_values = true
+        )]
         dev_url: Option<String>,
     },
     /// Introspect the configured Postgres database and write a canonical,
@@ -723,47 +729,12 @@ fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
         Backend::from,
     );
 
-    // (b) Load the baseline snapshot (default `SNAPSHOT_DEFAULT_PATH`). A missing
-    //     file is a friendly "run `autumn schema snapshot` first" error, except
-    //     with `--dev-url`, where the snapshot is optional.
-    // (c) PROVIDER-LOCK GUARD — before parsing/diffing.
+    // (b) Load the snapshot. (c) PROVIDER-LOCK GUARD — before parsing/diffing.
     let snapshot_path = snapshot_path.map_or_else(
         || project_root.join(SNAPSHOT_DEFAULT_PATH),
         Path::to_path_buf,
     );
-    let snapshot = match snapshot::load_snapshot(&snapshot_path) {
-        Ok(snapshot) => {
-            snapshot
-                .ensure_backend_matches(backend)
-                .map_err(|e| e.to_string())?;
-            Some(snapshot)
-        }
-        Err(snapshot::SnapshotError::Io { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound && dev_url.is_some() =>
-        {
-            None
-        }
-        Err(snapshot::SnapshotError::Io { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            return Err(format!(
-                "no schema snapshot at {} — run `autumn schema snapshot` first to create the diff baseline",
-                snapshot_path.display()
-            ));
-        }
-        Err(other) => return Err(other.to_string()),
-    };
-    let baseline_tables = match dev_url {
-        Some(url) => {
-            let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"))?;
-            if let Some(snapshot) = &snapshot {
-                warn_snapshot_drift(&snapshot.tables, &replayed);
-            }
-            shadow::adopt_managed_flags(&mut replayed, snapshot.as_ref().map(|s| &s.tables[..]));
-            replayed
-        }
-        None => snapshot.map(|s| s.tables).unwrap_or_default(),
-    };
+    let snapshot = load_diff_snapshot(&snapshot_path, backend, dev_url.is_some())?;
 
     // (d) Parse the desired state with the SAME backend tag.
     let models_path = match from {
@@ -774,6 +745,12 @@ fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
     for d in &desired.diagnostics {
         eprintln!("warning: {}", d.message);
     }
+
+    // The baseline: the snapshot, or with `--dev-url` the replayed migrations.
+    let baseline_tables = match dev_url {
+        Some(url) => replay_baseline(project_root, url, backend, snapshot.as_ref(), &desired)?,
+        None => snapshot.map(|s| s.tables).unwrap_or_default(),
+    };
 
     // (e) Diff (pure) then guard (policy).
     let opts = diff::DiffOptions {
@@ -842,21 +819,69 @@ fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Load the diff snapshot, provider-locked to `backend`. A missing snapshot is
+/// a friendly "run `autumn schema snapshot` first" error, except with
+/// `--dev-url` (`optional`), where it is `None`.
+fn load_diff_snapshot(
+    snapshot_path: &Path,
+    backend: Backend,
+    optional: bool,
+) -> Result<Option<SchemaSnapshot>, String> {
+    match snapshot::load_snapshot(snapshot_path) {
+        Ok(snapshot) => {
+            snapshot
+                .ensure_backend_matches(backend)
+                .map_err(|e| e.to_string())?;
+            Ok(Some(snapshot))
+        }
+        Err(snapshot::SnapshotError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            if optional {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "no schema snapshot at {} — run `autumn schema snapshot` first to create the diff baseline",
+                    snapshot_path.display()
+                ))
+            }
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// The `--dev-url` baseline: the migrations replayed on the dev database, with
+/// a warning when they do not match the snapshot, and with managed flags from
+/// the snapshot and the models (see [`shadow::adopt_managed_flags`]).
+fn replay_baseline(
+    project_root: &Path,
+    url: &str,
+    backend: Backend,
+    snapshot: Option<&SchemaSnapshot>,
+    desired: &parse::ParsedSchema,
+) -> Result<Vec<Table>, String> {
+    let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"))?;
+    if let Some(snapshot) = snapshot {
+        warn_snapshot_drift(&snapshot.tables, &replayed);
+    }
+    shadow::adopt_managed_flags(&mut replayed, snapshot.map(|s| &s.tables[..]), desired);
+    Ok(replayed)
+}
+
 /// Warn on stderr when the snapshot does not match the schema the migrations
 /// make (the `--dev-url` replay). The diff still uses the replayed schema.
 fn warn_snapshot_drift(snapshot: &[Table], replayed: &[Table]) {
+    // The same direction as a model diff against a pulled snapshot (replay as
+    // baseline, snapshot as desired), which is clean for a tool-made project.
     let drift = diff::diff_schema(
-        snapshot,
-        &parse::ParsedSchema::from_tables(replayed.to_vec()),
-        diff::DiffOptions {
-            definitions_authoritative: true,
-            ..Default::default()
-        },
+        replayed,
+        &parse::ParsedSchema::from_tables(snapshot.to_vec()),
+        diff::DiffOptions::default(),
     );
     if !drift.is_empty() {
         eprintln!(
-            "warning: the snapshot does not match the migrations. The replayed \
-             migrations differ from the snapshot by:\n{}",
+            "warning: the snapshot does not match the migrations. These changes \
+             turn the migrated schema into the snapshot:\n{}",
             diff::describe_plan(&drift)
         );
     }
@@ -964,14 +989,14 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
                     t.checks.push(check.clone());
                 }
             }
-            // Applied above by `renamed_baseline`.
-            SchemaChange::RenameTable { .. }
-            | SchemaChange::RenameColumn { .. }
-            | SchemaChange::RenameIndex { .. } => {}
-            // The non-emittable marker variants: `guard_plan` refuses these before
+            // The renames were applied above by `renamed_baseline`, and
+            // the non-emittable marker variants: `guard_plan` refuses these before
             // we get here (a guarded plan never carries one), so projecting them is
             // a no-op — never a panic.
-            SchemaChange::RenameConflict { .. }
+            SchemaChange::RenameTable { .. }
+            | SchemaChange::RenameColumn { .. }
+            | SchemaChange::RenameIndex { .. }
+            | SchemaChange::RenameConflict { .. }
             | SchemaChange::PrimaryKeyChange { .. }
             | SchemaChange::ForeignKeyChange { .. }
             | SchemaChange::IdentityChange { .. }

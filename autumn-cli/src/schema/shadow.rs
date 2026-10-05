@@ -25,7 +25,8 @@ use diesel_migrations::{FileBasedMigrations, MigrationHarness};
 ///
 /// Returns a message when `url` is not a database URL for `backend`, when the
 /// database is unreachable or not empty, or when a migration fails. A message
-/// never contains the URL or its password.
+/// never contains the password. A connection error shows only the host and
+/// port (or the `SQLite` file path).
 pub fn replay(backend: Backend, url: &str, migrations_dir: &Path) -> Result<Vec<Table>, String> {
     let dev_backend = match autumn_web::config::DatabaseBackend::detect(url) {
         Some(autumn_web::config::DatabaseBackend::Postgres) => Backend::Postgres,
@@ -41,26 +42,163 @@ pub fn replay(backend: Backend, url: &str, migrations_dir: &Path) -> Result<Vec<
             backend_label(backend)
         ));
     }
+    check_replayable(migrations_dir)?;
     match backend {
         Backend::Postgres => replay_postgres(url, migrations_dir),
         Backend::Sqlite => replay_sqlite(url, migrations_dir),
     }
 }
 
-/// Set `managed` on each replayed table from the checked-in snapshot.
+/// Set `managed` on each replayed table.
 ///
 /// Introspection marks every table managed. But a replay also reads tables that
 /// hand-written migrations make for unmanaged models, and the diff must never
-/// drop those. So a replayed table is managed only when the snapshot records it
-/// as managed. With no snapshot, no replayed table is managed: the diff can
-/// add and alter, but never drop a table.
-pub fn adopt_managed_flags(replayed: &mut [Table], snapshot: Option<&[Table]>) {
+/// drop those. So a replayed table is managed only when:
+/// - the snapshot records it as managed, or
+/// - a managed model declares it, or renames it with `#[renamed_from]`.
+///
+/// Thus with no snapshot, the diff never drops a table.
+pub fn adopt_managed_flags(
+    replayed: &mut [Table],
+    snapshot: Option<&[Table]>,
+    models: &crate::schema::parse::ParsedSchema,
+) {
+    let managed_model = |name: &str| models.tables.iter().any(|t| t.managed && t.name == name);
     for table in replayed {
+        let name = table.name.as_str();
         table.managed = snapshot
             .unwrap_or_default()
             .iter()
-            .any(|s| s.name == table.name && s.managed);
+            .any(|s| s.name == name && s.managed)
+            || managed_model(name)
+            || models
+                .renames
+                .iter()
+                .any(|h| h.column.is_none() && h.from == name && managed_model(&h.table));
     }
+}
+
+/// Refuse a migration that the replay transaction cannot hold, before any
+/// connection: one with `run_in_transaction = false`, or one with its own
+/// transaction-control statement (a `COMMIT` would end the replay transaction
+/// and keep the changes).
+fn check_replayable(migrations_dir: &Path) -> Result<(), String> {
+    if !migrations_dir.exists() {
+        return Ok(());
+    }
+    let read_err =
+        |path: &Path, e: std::io::Error| format!("failed to read {}: {e}", path.display());
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(migrations_dir)
+        .map_err(|e| read_err(migrations_dir, e))?
+        .map(|entry| {
+            entry
+                .map(|e| e.path())
+                .map_err(|e| read_err(migrations_dir, e))
+        })
+        .collect::<Result<_, _>>()?;
+    dirs.sort();
+    let why = "the --dev-url replay runs every migration in one transaction and rolls it back";
+    for dir in dirs.iter().filter(|d| d.join("up.sql").is_file()) {
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        let metadata = dir.join("metadata.toml");
+        if metadata.is_file() {
+            let text = std::fs::read_to_string(&metadata).map_err(|e| read_err(&metadata, e))?;
+            let no_transaction = text
+                .parse::<toml::Table>()
+                .ok()
+                .and_then(|t| t.get("run_in_transaction").and_then(toml::Value::as_bool))
+                == Some(false);
+            if no_transaction {
+                return Err(format!(
+                    "migration `{name}` sets run_in_transaction = false; {why}"
+                ));
+            }
+        }
+        let up = dir.join("up.sql");
+        let sql = std::fs::read_to_string(&up).map_err(|e| read_err(&up, e))?;
+        if let Some(keyword) = transaction_control(&sql) {
+            return Err(format!(
+                "migration `{name}` has a `{keyword}` statement; {why}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The first transaction-control statement (`BEGIN`, `START TRANSACTION`,
+/// `COMMIT`, `END`, `ROLLBACK`, `ABORT`) in `sql`, if any. Comments, string
+/// literals, quoted names, dollar-quoted bodies and `BEGIN ATOMIC ... END`
+/// bodies do not count.
+fn transaction_control(sql: &str) -> Option<String> {
+    let code = strip_sql_noise(sql);
+    let mut in_atomic = false;
+    for statement in code.split(';') {
+        let words: Vec<String> = statement
+            .split_whitespace()
+            .map(str::to_ascii_uppercase)
+            .collect();
+        if in_atomic {
+            in_atomic = words != ["END"];
+            continue;
+        }
+        if words.windows(2).any(|w| w == ["BEGIN", "ATOMIC"]) {
+            in_atomic = true;
+            continue;
+        }
+        let first = words.first().map_or("", String::as_str);
+        let hit = match first {
+            "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" => true,
+            "START" => words.get(1).is_some_and(|w| w == "TRANSACTION"),
+            _ => false,
+        };
+        if hit {
+            return Some(first.to_owned());
+        }
+    }
+    None
+}
+
+/// `sql` with comments, `'...'` and `"..."` literals, and `$tag$...$tag$`
+/// bodies replaced by a space.
+fn strip_sql_noise(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(c) = rest.chars().next() {
+        let skip = if rest.starts_with("--") {
+            rest.find('\n').unwrap_or(rest.len())
+        } else if rest.starts_with("/*") {
+            rest.find("*/").map_or(rest.len(), |i| i + 2)
+        } else if c == '\'' || c == '"' {
+            crate::schema::rename::quoted_len(rest, c)
+        } else if let Some(tag) = dollar_tag(rest) {
+            rest[tag.len()..]
+                .find(tag)
+                .map_or(rest.len(), |i| tag.len() + i + tag.len())
+        } else {
+            0
+        };
+        if skip == 0 {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        } else {
+            out.push(' ');
+            rest = &rest[skip..];
+        }
+    }
+    out
+}
+
+/// The dollar-quote opener (`$$` or `$tag$`) at the start of `s`, if any.
+fn dollar_tag(s: &str) -> Option<&str> {
+    let body = s.strip_prefix('$')?;
+    let end = body.find('$')?;
+    let tag = &body[..end];
+    let valid = tag
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_ascii_alphabetic() || c == '_')
+        && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then(|| &s[..end + 2])
 }
 
 const fn backend_label(backend: Backend) -> &'static str {
@@ -73,31 +211,59 @@ const fn backend_label(backend: Backend) -> &'static str {
 fn replay_postgres(url: &str, migrations_dir: &Path) -> Result<Vec<Table>, String> {
     use crate::schema::introspect;
     let mut conn = introspect::connect_postgres(url).map_err(|e| e.to_string())?;
+    // Any table or view in any user schema makes the database not empty.
     ensure_empty(
         &mut conn,
-        "SELECT table_name AS name FROM information_schema.tables \
-         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
-         ORDER BY table_name LIMIT 1",
+        "SELECT n.nspname || '.' || c.relname AS name FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+         AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+         AND n.nspname NOT LIKE 'pg\\_%' ORDER BY 1 LIMIT 1",
     )?;
-    in_rolled_back_transaction(&mut conn, migrations_dir, |conn| {
-        introspect::introspect_postgres_conn(conn).map_err(|e| e.to_string())
-    })
+    in_rolled_back_transaction(
+        &mut conn,
+        migrations_dir,
+        |conn| {
+            // Introspection reads `public`, so the migrations must write there.
+            diesel::sql_query("SET LOCAL search_path TO public")
+                .execute(conn)
+                .map(|_| ())
+                .map_err(|e| format!("could not set the replay search_path: {e}"))
+        },
+        |conn| {
+            let rows: Vec<NameRow> = diesel::sql_query("SELECT txid_current()::text AS name")
+                .load(conn)
+                .map_err(|e| format!("could not read the replay transaction id: {e}"))?;
+            Ok(rows.into_iter().next().map(|r| r.name).unwrap_or_default())
+        },
+        |conn| introspect::introspect_postgres_conn(conn).map_err(|e| e.to_string()),
+    )
 }
 
 #[cfg(feature = "sqlite")]
 fn replay_sqlite(url: &str, migrations_dir: &Path) -> Result<Vec<Table>, String> {
     use crate::schema::introspect;
     let target = introspect::sqlite_target(url);
+    // `establish` creates a missing file. Refuse instead of making a stray file.
+    if let Some(path) = introspect::sqlite_existence_check_path(&target)
+        && !Path::new(&path).exists()
+    {
+        return Err(format!("the SQLite dev database {path} does not exist"));
+    }
     let mut conn = diesel::SqliteConnection::establish(&target)
         .map_err(|_| format!("could not open the SQLite dev database at {target}"))?;
     ensure_empty(
         &mut conn,
-        "SELECT name FROM sqlite_master WHERE type = 'table' \
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') \
          AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 1",
     )?;
-    in_rolled_back_transaction(&mut conn, migrations_dir, |conn| {
-        introspect::introspect_sqlite_conn(conn).map_err(|e| e.to_string())
-    })
+    in_rolled_back_transaction(
+        &mut conn,
+        migrations_dir,
+        |_| Ok(()),
+        |_| Ok(String::new()),
+        |conn| introspect::introspect_sqlite_conn(conn).map_err(|e| e.to_string()),
+    )
 }
 
 /// The default build targets Postgres only and has no `SQLite` driver.
@@ -125,21 +291,26 @@ where
     let rows: Vec<NameRow> = diesel::sql_query(query)
         .load(conn)
         .map_err(|e| format!("could not read the dev database catalog: {e}"))?;
-    match rows.first() {
-        Some(row) => Err(format!(
+    rows.first().map_or(Ok(()), |row| {
+        Err(format!(
             "the dev database is not empty (it has table `{}`); --dev-url needs an \
              empty database",
             row.name
-        )),
-        None => Ok(()),
-    }
+        ))
+    })
 }
 
 /// Apply the migrations in a test transaction, run `read`, and roll back: a
 /// test transaction is never committed, so the dev database does not change.
+///
+/// `setup` runs first in the transaction. `xact_id` reads the transaction id
+/// before and after the migrations; a change means a migration ended the
+/// transaction, so the replay fails.
 fn in_rolled_back_transaction<C>(
     conn: &mut C,
     migrations_dir: &Path,
+    setup: impl FnOnce(&mut C) -> Result<(), String>,
+    xact_id: impl Fn(&mut C) -> Result<String, String>,
     read: impl FnOnce(&mut C) -> Result<Vec<Table>, String>,
 ) -> Result<Vec<Table>, String>
 where
@@ -148,6 +319,8 @@ where
 {
     conn.begin_test_transaction()
         .map_err(|e| format!("could not start the replay transaction: {e}"))?;
+    setup(conn)?;
+    let before = xact_id(conn)?;
     if migrations_dir.exists() {
         let migrations = FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
             format!(
@@ -158,6 +331,13 @@ where
         conn.run_pending_migrations(migrations)
             .map_err(|e| format!("the --dev-url replay of the migrations failed: {e}"))?;
     }
+    if xact_id(conn)? != before {
+        return Err(
+            "a migration ended the --dev-url replay transaction, so the dev database \
+             may now hold its changes; remove the transaction control from the migration"
+                .to_owned(),
+        );
+    }
     read(conn)
 }
 
@@ -166,23 +346,101 @@ mod tests {
     use super::*;
 
     #[test]
-    fn replayed_tables_are_managed_only_when_the_snapshot_says_so() {
+    fn replayed_tables_are_managed_when_the_snapshot_or_a_model_says_so() {
         let mut snap_users = Table::new("users", Backend::Postgres);
         snap_users.managed = true;
         let mut snap_logs = Table::new("logs", Backend::Postgres);
         snap_logs.managed = false;
         let snapshot = vec![snap_users, snap_logs];
+        let mut posts = Table::new("posts", Backend::Postgres);
+        posts.managed = true;
+        let mut models = crate::schema::parse::ParsedSchema::from_tables(vec![posts]);
+        models.renames.push(crate::schema::parse::RenameHint {
+            table: "posts".to_owned(),
+            column: None,
+            from: "articles".to_owned(),
+        });
 
-        let mut replayed: Vec<Table> = ["users", "logs", "audit"]
+        let names = ["users", "logs", "audit", "posts", "articles"];
+        let mut replayed: Vec<Table> = names
             .iter()
             .map(|n| Table::new(*n, Backend::Postgres))
             .collect();
-        adopt_managed_flags(&mut replayed, Some(&snapshot));
+        adopt_managed_flags(&mut replayed, Some(&snapshot), &models);
         let flags: Vec<bool> = replayed.iter().map(|t| t.managed).collect();
-        assert_eq!(flags, vec![true, false, false]);
+        assert_eq!(flags, vec![true, false, false, true, true]);
 
-        adopt_managed_flags(&mut replayed, None);
-        assert!(replayed.iter().all(|t| !t.managed));
+        adopt_managed_flags(&mut replayed, None, &models);
+        let flags: Vec<bool> = replayed.iter().map(|t| t.managed).collect();
+        assert_eq!(flags, vec![false, false, false, true, true]);
+    }
+
+    fn migration_dir(root: &Path, name: &str, up: &str, metadata: Option<&str>) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("up.sql"), up).expect("up.sql");
+        std::fs::write(dir.join("down.sql"), "SELECT 1;").expect("down.sql");
+        if let Some(meta) = metadata {
+            std::fs::write(dir.join("metadata.toml"), meta).expect("metadata.toml");
+        }
+    }
+
+    #[test]
+    fn transaction_control_is_found_outside_bodies_strings_and_comments() {
+        for sql in [
+            "BEGIN; CREATE TABLE t (id INT); COMMIT;",
+            "CREATE TABLE t (id INT);\ncommit;",
+            "START TRANSACTION;",
+            "ALTER TYPE s ADD VALUE 'x'; END;",
+            "ROLLBACK",
+        ] {
+            assert!(transaction_control(sql).is_some(), "{sql}");
+        }
+        for sql in [
+            "DO $$ BEGIN PERFORM 1; END $$;",
+            "CREATE FUNCTION f() RETURNS trigger AS $body$ BEGIN RETURN NEW; END; $body$ LANGUAGE plpgsql;",
+            "CREATE FUNCTION g() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END;",
+            "INSERT INTO t VALUES ('BEGIN; COMMIT;'); -- COMMIT;\n/* ROLLBACK; */",
+            "CREATE TABLE t (id INT, \"commit\" TEXT);",
+        ] {
+            assert_eq!(transaction_control(sql), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_migration_that_controls_transactions_is_refused_before_connecting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        migration_dir(
+            root.path(),
+            "2026-01-01-000000_enum",
+            "BEGIN; SELECT 1; COMMIT;",
+            None,
+        );
+        let err = check_replayable(root.path()).unwrap_err();
+        assert!(
+            err.contains("2026-01-01-000000_enum") && err.contains("BEGIN"),
+            "{err}"
+        );
+
+        let root = tempfile::tempdir().expect("tempdir");
+        migration_dir(
+            root.path(),
+            "2026-01-01-000000_concurrent",
+            "CREATE INDEX CONCURRENTLY i ON t (x);",
+            Some("run_in_transaction = false\n"),
+        );
+        let err = check_replayable(root.path()).unwrap_err();
+        assert!(err.contains("run_in_transaction"), "{err}");
+
+        let root = tempfile::tempdir().expect("tempdir");
+        migration_dir(
+            root.path(),
+            "2026-01-01-000000_ok",
+            "CREATE TABLE t (id INT);",
+            None,
+        );
+        check_replayable(root.path()).expect("plain migration");
+        check_replayable(&root.path().join("absent")).expect("no migrations directory");
     }
 
     #[test]
@@ -311,6 +569,16 @@ mod tests {
             migration(&migrations, "2026-01-01-000000_bad", "CREATE TABLE (;");
             let err = replay(Backend::Sqlite, "sqlite::memory:", &migrations).unwrap_err();
             assert!(err.contains("replay"), "{err}");
+        }
+
+        #[test]
+        fn a_missing_sqlite_dev_file_is_refused_and_not_created() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let db = root.path().join("absent.db");
+            let url = format!("sqlite://{}", db.display());
+            let err = replay(Backend::Sqlite, &url, &root.path().join("migrations")).unwrap_err();
+            assert!(err.contains("absent.db"), "{err}");
+            assert!(!db.exists(), "the replay must not create the file");
         }
 
         #[test]

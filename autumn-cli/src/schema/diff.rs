@@ -128,7 +128,7 @@
 //! check, so all three always agree on the emitted name. A short FK name (the
 //! common case) is returned unchanged, so Postgres output is byte-stable.
 //!
-//! Parser-provided index names (`idx_<table>_<field>`) are **not** renamed — the
+//! Parser-provided index names (`idx_<table>_<field>`) are **not** truncated — the
 //! app spells them elsewhere — so [`guard_plan`] still refuses (no override — the
 //! SQL is unappliable, not merely lossy) any Postgres plan that generates an index
 //! identifier **longer than 63 bytes**, plus (defensively) any pair of generated
@@ -1772,12 +1772,7 @@ fn plan_backend(baseline: &[Table], desired: &ParsedSchema) -> Backend {
 /// emittable plan (including the empty no-op plan).
 pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffError> {
     // 0. An unsafe `#[renamed_from]` hint — no override.
-    if let Some((table, reason)) = plan.changes.iter().find_map(|c| match c {
-        SchemaChange::RenameConflict { table, reason } => Some((table.clone(), reason.clone())),
-        _ => None,
-    }) {
-        return Err(DiffError::RenameConflict { table, reason });
-    }
+    find_rename_conflict(plan).map_or(Ok(()), Err)?;
 
     // 1. Primary-key change — no override.
     if let Some(table) = plan.changes.iter().find_map(|c| match c {
@@ -1957,6 +1952,18 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
     }
 
     Ok(())
+}
+
+/// The [`DiffError::RenameConflict`] refusal for the first
+/// [`SchemaChange::RenameConflict`] marker in `plan`, if any.
+fn find_rename_conflict(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::RenameConflict { table, reason } => Some(DiffError::RenameConflict {
+            table: table.clone(),
+            reason: reason.clone(),
+        }),
+        _ => None,
+    })
 }
 
 /// The [`DiffError::IdentityChange`] refusal for the first
@@ -2401,11 +2408,18 @@ fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String,
     // gathered so a multi-column retained index is recreated only after ALL its
     // dependent dropped columns are back.
     let mut dropped_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // The reversed renames run last, after the retained-index recreations below:
+    // those use the new (renamed) names.
+    let mut renames = Vec::new();
     for change in ordered {
         let sql = emit_change_down(change, plan.backend)?;
         let sql = sql.trim_end();
         if !sql.is_empty() {
-            groups.push(sql.to_owned());
+            if is_rename(change) {
+                renames.push(sql.to_owned());
+            } else {
+                groups.push(sql.to_owned());
+            }
         }
         if let SchemaChange::DropColumn { table, column } = change {
             dropped_by_table
@@ -2423,6 +2437,7 @@ fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String,
             groups.push(index_sql(table, idx).trim_end().to_owned());
         }
     }
+    groups.extend(renames);
     Ok(join_groups(&groups))
 }
 

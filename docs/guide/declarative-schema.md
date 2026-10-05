@@ -119,9 +119,12 @@ retry regenerates a single migration rather than a duplicate.
 
 ### Renames: `#[renamed_from]`
 
-Without a hint, a renamed field is a drop plus an add. The diff refuses it as a
-possible rename. Put `#[renamed_from("old_name")]` on the new field, or on the
-model (after `#[model]`) for a table rename:
+Without a hint, the diff sees a renamed field as a drop and an add. It refuses
+this change, because it can be a rename.
+
+- To rename a column, put `#[renamed_from("old_name")]` on the field.
+- To rename a table, put it on the model, after `#[model]`. Before `#[model]`,
+  the compiler cannot find the attribute.
 
 ```rust
 #[autumn_web::model(managed)]
@@ -143,29 +146,39 @@ ALTER TABLE posts RENAME COLUMN title TO headline;
 
 - A rename keeps the data, so it does not need `--allow-destructive`.
 - `down.sql` renames back.
-- An index with a convention name (`idx_<table>_<field>`,
-  `idx_<table>_<field>_unique`) gets its new name too. Postgres uses
-  `ALTER INDEX ... RENAME`. SQLite drops the index and creates it again.
-- A hint is used only when the old name is in the baseline and the new name
-  is not. After the migration, the hint has no effect, so you can keep it or
+- A hint has an effect only on a `#[model(managed)]` model.
+- The diff also renames each index that has a convention name
+  (`idx_<table>_<field>` or `idx_<table>_<field>_unique`) and the same shape.
+  Postgres uses `ALTER INDEX ... RENAME`. SQLite drops the index and creates
+  it again.
+- The diff uses a hint only when the old name is in the baseline and the new
+  name is not. After the migration, the hint has no effect. You can keep it or
   remove it.
-- The diff refuses a hint, with no override, when the old name is still
-  declared, when two hints use one old name, or when the hints make a chain or
-  a swap. Do each of those renames in its own migration.
-- The macro accepts only one snake_case name. It removes the hint from the
+- The macro accepts one `snake_case` name only, and removes the hint from the
   generated code.
+
+The diff refuses a hint in these conditions. `--allow-destructive` does not
+override this.
+
+- The old name is still declared.
+- Two hints use the same old name.
+- The parser cannot read the field (an unsupported type).
+- The hints make a chain or a swap. Do each rename in its own migration.
 
 ### Shadow-database baseline: `--dev-url`
 
-`--dev-url <URL>` uses a database, not the snapshot, as the baseline:
+`--dev-url <URL>` uses a database, not the snapshot, as the baseline. You can
+also set the URL in `AUTUMN_DEV_URL`, which keeps the password out of the
+process list.
 
 ```sh
-autumn schema diff --dev-url postgres://localhost/myapp_shadow
+AUTUMN_DEV_URL=postgres://localhost/myapp_shadow autumn schema diff
 ```
 
-1. The dev database must be empty. If it has a table, the command stops.
+1. The dev database must be empty. If it has a table or a view in a user
+   schema, the command stops.
 2. The command applies every migration in `migrations/` to it, in one
-   transaction.
+   transaction. On Postgres, the migrations write to the `public` schema.
 3. It reads the schema back, and then rolls the transaction back. The dev
    database stays empty.
 4. It diffs the models against that schema.
@@ -175,14 +188,20 @@ hand-written migration or with a `#[belongs_to]` foreign key.
 
 - The snapshot is optional. When it is present and does not match the
   migrations, the command writes a warning to stderr.
-- A replayed table is managed only when the snapshot records it as managed.
-  Thus the diff never drops a table that a hand-written migration made.
+- A replayed table is managed only when the snapshot records it as managed,
+  or when a managed model declares it. The diff never drops a table that only
+  a hand-written migration made. With no snapshot, the diff never drops a
+  table.
 - `--write-migration` writes the migration and the snapshot, as usual.
 - The URL backend must match the schema backend. A `sqlite:` URL needs a CLI
-  built with `--features sqlite`.
-- A migration that cannot run in a transaction (for example
-  `CREATE INDEX CONCURRENTLY`) makes the replay fail.
-- Errors never show the URL or its password.
+  built with `--features sqlite`, and the file must exist.
+- The replay applies your migrations only, not the framework migrations.
+- The command refuses a migration with `run_in_transaction = false` or with
+  its own `BEGIN`, `COMMIT`, `END` or `ROLLBACK`. Such a migration can end the
+  replay transaction.
+- Like `schema pull`, the command connects to Postgres without TLS.
+- Errors never show the password. A connection error shows only the host and
+  port.
 
 ### SQLite ALTER support via table-recreate (#2035)
 
@@ -265,18 +284,18 @@ autumn schema migrate --profile prod
 > `autumn migrate` up/down CLI documented in [Migrations](./migrations.md). The
 > classic verb is currently Postgres-only; `autumn schema migrate` can apply on
 > both backends, but — as noted above — the SQLite path needs a CLI built
-> `--features sqlite` (the default binary is Postgres-only). `schema pull` and
-> `schema doctor`'s database-schema-drift check have the same rule. The
-> pending-migrations check is Postgres-only.
+> `--features sqlite` (the default binary is Postgres-only). For SQLite, `schema pull`
+> and the database-schema-drift check of `schema doctor` also need a
+> `--features sqlite` build. The pending-migrations check is Postgres-only.
 
 ---
 
 ## `autumn schema pull`
 
-Introspect a live **Postgres** or **SQLite** database and write (or, with
-`--dry-run`, describe) a snapshot of its actual shape — the DB-derived counterpart to
-`schema snapshot`. Use it to adopt a brownfield schema, or to re-baseline a
-snapshot that drifted from the database.
+Read the schema of a live **Postgres** or **SQLite** database, and write it as
+a snapshot. With `--dry-run`, show the changes and write nothing. This is the
+DB-derived counterpart to `schema snapshot`. Use it to adopt a brownfield
+schema, or to re-baseline a snapshot that drifted from the database.
 
 ```sh
 # Introspect the profile-resolved DB into .autumn/schema-snapshot.json.

@@ -7,7 +7,12 @@
 - **schema:** `autumn schema diff --dev-url <URL>` (issue #1975). The command
   applies the migrations to an empty dev database in one transaction, reads
   the schema back, rolls back, and diffs the models against that schema. The
-  snapshot becomes optional.
+  snapshot becomes optional. `AUTUMN_DEV_URL` can hold the URL.
+
+### Fixed
+
+- **cli:** a CLI build with `--features sqlite` compiles again. A wrapper in
+  `autumn migrate` did not have the `Send` bounds that the library requires.
 
 ### Documentation
 

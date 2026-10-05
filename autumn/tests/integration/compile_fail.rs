@@ -232,8 +232,8 @@ fn compile_fail_tests() {
 
     // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
     // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` /
-    // `#[renamed_from("...")]` but
-    // rejects malformed shapes with a clear, actionable `compile_error!`.
+    // `#[renamed_from("...")]` but rejects malformed shapes with a clear,
+    // actionable `compile_error!`.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_bogus_arg.rs");
     #[cfg(feature = "db")]

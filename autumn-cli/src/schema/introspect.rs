@@ -1459,7 +1459,7 @@ fn serial_kind_for(
 /// own `normalize_sqlite_target` (kept in lock-step so the pull connects to the same
 /// file `schema migrate` does). An empty or `:memory:` target stays `:memory:`.
 #[cfg(feature = "sqlite")]
-pub(crate) fn sqlite_target(url: &str) -> String {
+pub fn sqlite_target(url: &str) -> String {
     if url.starts_with("file:") {
         return url.to_owned();
     }
@@ -1487,7 +1487,7 @@ pub(crate) fn sqlite_target(url: &str) -> String {
 /// separator honored, and the path percent-decoded — then existence-checked like a
 /// bare path.
 #[cfg(feature = "sqlite")]
-fn sqlite_existence_check_path(target: &str) -> Option<String> {
+pub fn sqlite_existence_check_path(target: &str) -> Option<String> {
     if target.is_empty() || target == ":memory:" {
         return None;
     }
