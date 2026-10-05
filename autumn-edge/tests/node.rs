@@ -567,26 +567,22 @@ async fn the_access_log_records_the_lane_of_each_request() {
 }
 
 #[tokio::test]
-async fn a_static_cors_header_is_copied_and_a_changing_one_is_not() {
-    let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let (origin, _) = origin_with(move || {
-        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Answer {
-            headers: vec![
-                ("access-control-allow-origin", "*".into()),
-                ("access-control-expose-headers", format!("x-n-{n}")),
-                // Not a middleware header: never copied.
-                ("cache-control", "no-store".into()),
-            ],
-            ..Answer::created()
-        }
+async fn cors_and_other_route_headers_are_not_copied() {
+    // CORS can differ per route; only the operator knows it is global.
+    let (origin, _) = origin_with(|| Answer {
+        headers: vec![
+            ("access-control-allow-origin", "*".into()),
+            ("cache-control", "no-store".into()),
+            ("x-frame-options", "DENY".into()),
+        ],
+        ..Answer::created()
     })
     .await;
 
     let headers = origin_static_headers(&origin, "/").await.expect("probe");
 
     let names: Vec<_> = headers.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["access-control-allow-origin"]);
+    assert_eq!(names, ["x-frame-options"]);
 }
 
 #[tokio::test]
@@ -1110,4 +1106,30 @@ async fn an_upgrade_does_not_wait_for_a_capsule_slot() {
         "the upgrade must not wait for the busy capsule"
     );
     let _ = busy.await;
+}
+
+#[tokio::test]
+async fn a_connection_named_host_still_gives_the_public_host() {
+    let (edge, seen) = recording_node(&[], None).await;
+    let address = edge.trim_start_matches("http://");
+    // Raw TCP: an HTTP client would not send `connection: host`.
+    let status = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        stream
+            .write_all(
+                format!("GET /x HTTP/1.1\r\nhost: {address}\r\nconnection: host, close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.expect("read");
+        answer
+    };
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(header(&seen[0], "x-forwarded-host"), Some(address));
 }

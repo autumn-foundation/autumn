@@ -264,8 +264,9 @@ permissions-policy · referrer-policy · strict-transport-security
 x-content-type-options · x-frame-options · x-xss-protection
 ```
 
-A CORS layer can also set static headers. The host sets them too —
-`conformance::CORS_HEADERS`:
+A CORS layer can also set headers. When the origin's CORS policy is the same
+for every route, the host can set them too (`autumn edge serve
+--response-header`) — `conformance::CORS_HEADERS`:
 
 ```text
 access-control-allow-credentials · access-control-allow-origin
@@ -550,9 +551,14 @@ For each request, the node does these steps:
 Rules:
 
 - At start, the node sends `GET <probe-path>` to the origin two times. It
-  copies each security, CORS and CSP header that has the same value in both
-  responses. It sets these headers on each edge response. It does not copy
-  a CSP nonce or a CORS value that changes for each request.
+  copies each security and CSP header that has the same value in both
+  responses. It sets these headers on each edge response. Autumn's security
+  middleware sets them on every response, so one path shows them for all.
+  It does not copy a CSP nonce.
+- It does not copy CORS headers: they can differ per route. When the
+  origin's CORS policy is the same for every route, set it with
+  `--response-header`, for example
+  `--response-header 'access-control-allow-origin: *'`.
 - If the origin does not answer at start, the node does not start. Use
   `--no-probe` to start without the header requests.
 - It does not follow redirects. It does not use `HTTP_PROXY` or

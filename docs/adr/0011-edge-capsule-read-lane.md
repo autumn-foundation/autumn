@@ -277,7 +277,8 @@ Rules for the node:
 - It tunnels an `upgrade` request (WebSocket) to the origin.
 - It streams bodies to and from the origin. It runs the capsule on a
   blocking thread, at most one for each CPU at the same time.
-- It copies the origin's static security, CORS and CSP headers at start.
+- It copies the origin's static security and CSP headers at start. CORS
+  headers can differ per route, so the operator sets them explicitly.
 
 `autumn edge ttfb` measures the success metric from any client. CI proves it
 in Tier E with a simulated origin round trip, because CI cannot put a client

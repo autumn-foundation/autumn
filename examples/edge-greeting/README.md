@@ -107,11 +107,15 @@ Start the origin, then the edge node in front of it. From this directory:
 cargo run -p edge-greeting &                     # the origin, on :3000
 autumn edge serve \
   --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
-  --origin http://127.0.0.1:3000 &               # the edge node, on :8787
+  --origin http://127.0.0.1:3000 \
+  --response-header 'access-control-allow-origin: *' &   # the edge node, on :8787
 
 curl http://127.0.0.1:8787/greet/ada             # served by the capsule
 curl -X POST http://127.0.0.1:8787/feedback -d x # sent to the origin
 ```
+
+The dev profile of the origin allows every CORS origin. The node does not
+copy CORS headers, so the command sets the same one.
 
 The node writes one line for each request, with the lane:
 

@@ -1000,8 +1000,10 @@ pub enum EdgeCommands {
     /// returns the origin's response. Run it near your users. Keep the
     /// origin where it is. You write no glue code.
     ///
-    /// At start, the node copies the origin's static security, CORS and CSP
+    /// At start, the node copies the origin's static security and CSP
     /// headers from `GET <probe-path>`, so both lanes send the same headers.
+    /// Set a CORS policy that is the same for every route with
+    /// `--response-header`.
     /// It stops on Ctrl-C or SIGTERM.
     ///
     /// # Examples

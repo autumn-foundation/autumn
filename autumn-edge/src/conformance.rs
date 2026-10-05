@@ -59,9 +59,10 @@ pub const SECURITY_HEADERS: &[&str] = &[
 
 /// CORS headers a CORS layer can send on every response.
 ///
-/// The edge node copies them from the origin when they do not change (see
-/// `node::origin_static_headers`). A policy that answers each request
-/// `Origin` differently cannot be copied.
+/// The host may set them on an edge response, for example with
+/// `autumn edge serve --response-header`, when the origin's CORS policy is
+/// the same for every route. A policy that answers each request `Origin`
+/// differently cannot be set this way.
 pub const CORS_HEADERS: &[&str] = &[
     "access-control-allow-credentials",
     "access-control-allow-origin",

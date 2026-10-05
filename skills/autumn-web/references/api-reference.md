@@ -1634,7 +1634,7 @@ An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
 | `gateway::Lane` | In the response extensions: `Edge`, `Fallthrough(reason)`, `OriginOnly` |
 | `node::EdgeNode::new(gateway)` (feature `node`) | HTTP edge node; capsule on a blocking thread, at most one per CPU (`.with_max_capsules(n)`); 400 on a dot-segment path; `.with_access_log(f)` gets the lane of each request; `.with_host(v)` gives both lanes the origin's `host` (`HttpOrigin::host()`); `.with_trusted_proxies(vec)` keeps `x-forwarded-*` from those peers (`node::TrustedProxy::parse("10.0.0.0/8")`), else replaces them for both lanes |
 | `node::HttpOrigin::new(url)` | The origin over HTTP for the gateway; no redirects, no proxy, no credentials in the URL, hop-by-hop headers removed, `upgrade` (WebSocket) tunnelled; 502 when the origin does not connect in 10 s or stops for 60 s |
-| `node::origin_static_headers(url, path)` | Security, CORS and CSP headers with the same value in two origin responses |
+| `node::origin_static_headers(url, path)` | Security and CSP headers with the same value in two origin responses (CORS is not copied: set it with `--response-header`) |
 | `node::serve(listener, service, shutdown)` | Serves `service` until `shutdown`; gives the peer address to `HttpOrigin` |
 | `node::ttfb::measure(&Probe)` | TTFB edge vs origin and a byte compare of each pair; `Report::passes(min_percent)` |
 | `autumn edge serve --origin URL` | CLI edge node; `--capsule`, `--listen`, `--kv FILE`, `--probe-path`, `--no-probe`, `--response-header`, `--trusted-proxy`, `--quiet`; stops on Ctrl-C or SIGTERM |

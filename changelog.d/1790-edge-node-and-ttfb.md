@@ -3,7 +3,7 @@
 - **edge:** `autumn edge serve` runs an edge node (issue #1790). The node puts
   the capsule from `autumn build` in front of a remote origin. It serves what
   the capsule serves and sends every other request to the origin over HTTP.
-  At start it copies the origin's static security, CORS and CSP headers. It
+  At start it copies the origin's static security and CSP headers. It
   does not follow redirects, removes hop-by-hop headers, refuses a path with
   a dot segment, and tunnels WebSocket upgrades to the origin. It replaces
   the client's `x-forwarded-*` headers for both lanes, except from a

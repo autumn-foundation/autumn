@@ -42,7 +42,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
 use tokio::sync::Semaphore;
 use tower::Service;
 
-use crate::conformance::{CORS_HEADERS, SECURITY_HEADERS};
+use crate::conformance::SECURITY_HEADERS;
 use crate::gateway::{EdgeGateway, HOP_BY_HOP, Lane};
 
 /// How long the node waits for a TCP connection to the origin.
@@ -420,6 +420,7 @@ fn is_safe_path(path_and_query: &str) -> bool {
 }
 
 /// Remove the hop-by-hop headers, and each header that `connection` names.
+/// `connection` cannot remove `host`.
 fn remove_hop_by_hop(headers: &mut HeaderMap) {
     let named: Vec<HeaderName> = headers
         .get_all(CONNECTION)
@@ -427,6 +428,7 @@ fn remove_hop_by_hop(headers: &mut HeaderMap) {
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
         .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .filter(|name| *name != HOST)
         .collect();
     for name in named {
         headers.remove(name);
@@ -682,12 +684,14 @@ where
     .await
 }
 
-/// The origin's static middleware headers, read from two `GET`s of `path`.
+/// The origin's static security headers, read from two `GET`s of `path`.
 ///
-/// It copies each header in [`SECURITY_HEADERS`], [`CORS_HEADERS`] and
+/// It copies each header in [`SECURITY_HEADERS`] and
 /// `content-security-policy` that both responses send with the same values.
-/// A header that changes (a CSP nonce, a CORS policy per request) is not
-/// copied. Give the result to [`EdgeGateway::with_response_headers`].
+/// Autumn's security middleware sets these on every response, so one path
+/// shows them for all. A CSP nonce changes, so it is not copied. CORS headers
+/// are not copied: they can differ per route. Give the result to
+/// [`EdgeGateway::with_response_headers`].
 ///
 /// # Errors
 ///
@@ -715,10 +719,7 @@ pub async fn origin_static_headers(
     let first = get().await?;
     let second = get().await?;
 
-    let names = SECURITY_HEADERS
-        .iter()
-        .chain(CORS_HEADERS)
-        .chain(&["content-security-policy"]);
+    let names = SECURITY_HEADERS.iter().chain(&["content-security-policy"]);
     let mut headers = Vec::new();
     for name in names {
         let values: Vec<&HeaderValue> = first.get_all(*name).iter().collect();

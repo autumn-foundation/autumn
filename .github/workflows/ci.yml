@@ -2490,7 +2490,8 @@ jobs:
           wait_for http://127.0.0.1:3000/greet/ci
           ../../target/debug/autumn edge serve \
             --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
-            --origin http://127.0.0.1:3000 --listen 127.0.0.1:8787 > edge-node.log &
+            --origin http://127.0.0.1:3000 --listen 127.0.0.1:8787 \
+            --response-header 'access-control-allow-origin: *' > edge-node.log &
           wait_for http://127.0.0.1:8787/greet/ci
           ../../target/debug/autumn edge ttfb --divergence-only --rounds 20 \
             --edge http://127.0.0.1:8787 --origin http://127.0.0.1:3000 \
