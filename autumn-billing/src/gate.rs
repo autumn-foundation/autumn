@@ -22,6 +22,10 @@
 //! price maps to a catalog plan, and whose `current_period_end` plus the
 //! grace period is not in the past. Without a known period end the grace
 //! period counts from the last event applied. Every missing piece denies.
+//!
+//! The gate tests the rule against every subscription of the customer. At
+//! least one entitled subscription that satisfies the rule gives access
+//! (issue #3114).
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -177,8 +181,8 @@ impl Billing {
     /// The user's current subscription from the mirror. No provider call.
     ///
     /// Picks an entitled subscription first, then a live one, then the
-    /// newest event within that group. An abandoned `incomplete` checkout
-    /// never hides an active subscription.
+    /// latest `last_event_at` within that group, then the lowest `id`. An
+    /// abandoned `incomplete` checkout never hides an active subscription.
     ///
     /// `user_id` is looked up against `Customer.user_id` verbatim — under
     /// Autumn's tenancy feature that is the tenant-scoped identity
@@ -186,10 +190,13 @@ impl Billing {
     /// a bare application user id. A caller resolving the current user some
     /// other way (outside `SessionUser`/`Entitled<R>`, which already go
     /// through `session_user_id`) must pass that same scoped value here —
-    /// build it explicitly with [`crate::gate::scope_identity`] if it isn't
+    /// build it explicitly with [`crate::gate::scope_identity`] if it is not
     /// already at hand — or this always misses and denies entitlement for an
     /// otherwise-paying tenant user. [`is_entitled`](Self::is_entitled) and
-    /// [`require`](Self::require) share this contract; both call this method.
+    /// [`require`](Self::require) share this contract.
+    ///
+    /// This method picks one subscription to show. It is not a gate: the
+    /// gate tests every subscription (issue #3114).
     ///
     /// # Errors
     ///
@@ -198,49 +205,58 @@ impl Billing {
         &self,
         user_id: &str,
     ) -> Result<Option<SubscriptionView>, BillingError> {
-        let store = self.service.store();
-        let Some(customer) = store.customer_by_user(user_id).await? else {
-            return Ok(None);
+        let rank = |view: &SubscriptionView| {
+            (
+                view.entitled,
+                view.subscription.status.is_live(),
+                view.subscription.last_event_at,
+            )
         };
-        let rows = store.subscriptions_for_customer(&customer.id).await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| self.view(row))
-            .max_by_key(|view| {
-                (
-                    view.entitled,
-                    view.subscription.status.is_live(),
-                    view.subscription.last_event_at,
-                )
-            }))
+        Ok(self.views(user_id).await?.into_iter().max_by(|a, b| {
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| b.subscription.id.cmp(&a.subscription.id))
+        }))
     }
 
-    /// `true` when `user_id` satisfies `rule`. Default deny.
+    /// `true` when at least one entitled subscription of `user_id` satisfies
+    /// `rule`. Default deny.
     ///
     /// # Errors
     ///
     /// Returns the store error.
     pub async fn is_entitled(&self, user_id: &str, rule: &PlanRule) -> Result<bool, BillingError> {
-        Ok(self
-            .current_subscription(user_id)
-            .await?
-            .is_some_and(|view| view.satisfies(rule)))
+        Ok(best_satisfying(self.views(user_id).await?, rule).is_some())
     }
 
-    /// The entitled subscription, or [`BillingError::Forbidden`].
+    /// The entitled subscription that satisfies `rule` and has the latest
+    /// `last_event_at`, or [`BillingError::Forbidden`].
+    ///
+    /// A tie on `last_event_at` goes to the lowest `id`. The result does not
+    /// depend on the store row order.
     ///
     /// # Errors
     ///
-    /// Returns [`BillingError::Forbidden`] when the rule is not satisfied.
+    /// Returns [`BillingError::Forbidden`] when no subscription satisfies
+    /// the rule, or the store error.
     pub async fn require(
         &self,
         user_id: &str,
         rule: &PlanRule,
     ) -> Result<SubscriptionView, BillingError> {
-        match self.current_subscription(user_id).await? {
-            Some(view) if view.satisfies(rule) => Ok(view),
-            _ => Err(BillingError::Forbidden(rule.describe())),
-        }
+        best_satisfying(self.views(user_id).await?, rule)
+            .ok_or_else(|| BillingError::Forbidden(rule.describe()))
+    }
+
+    /// Every subscription of the user, joined with its plan. Empty when the
+    /// user has no customer row.
+    async fn views(&self, user_id: &str) -> Result<Vec<SubscriptionView>, BillingError> {
+        let store = self.service.store();
+        let Some(customer) = store.customer_by_user(user_id).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = store.subscriptions_for_customer(&customer.id).await?;
+        Ok(rows.into_iter().map(|row| self.view(row)).collect())
     }
 
     /// Join the plan and evaluate entitlement.
@@ -274,6 +290,24 @@ impl Billing {
     }
 }
 
+/// Picks the view that grants `rule`. It takes the satisfying view with the
+/// latest `last_event_at`. A tie goes to the lowest `id`. `None` denies.
+/// `verification/billing_gate.rs` models this choice.
+fn best_satisfying(
+    views: impl IntoIterator<Item = SubscriptionView>,
+    rule: &PlanRule,
+) -> Option<SubscriptionView> {
+    views
+        .into_iter()
+        .filter(|view| view.satisfies(rule))
+        .min_by(|a, b| {
+            b.subscription
+                .last_event_at
+                .cmp(&a.subscription.last_event_at)
+                .then_with(|| a.subscription.id.cmp(&b.subscription.id))
+        })
+}
+
 /// The catalog plan for a mirror row: by price id first, then by stored plan id.
 fn resolve_plan<'a>(catalog: &'a PlanCatalog, subscription: &Subscription) -> Option<&'a Plan> {
     subscription
@@ -298,7 +332,8 @@ impl FromRequestParts<AppState> for Billing {
 /// Pre-body gate: 401 without a session user, 403 without an entitled
 /// subscription that satisfies `R`.
 pub struct Entitled<R: PlanRequirement> {
-    /// The entitled subscription.
+    /// The entitled subscription that satisfies `R` and has the latest
+    /// `last_event_at`.
     pub view: SubscriptionView,
     _rule: PhantomData<R>,
 }
@@ -550,5 +585,92 @@ mod tenant_scope_tests {
         let coincidental_bare_id = "\u{1}1:a7";
         assert_eq!(strip_tenant_scope(coincidental_bare_id), "7");
         assert_eq!(scope_identity("a", "7"), coincidental_bare_id);
+    }
+}
+
+#[cfg(test)]
+mod best_satisfying_tests {
+    use chrono::{DateTime, TimeZone, Utc};
+
+    use super::{PlanRule, SubscriptionView, best_satisfying};
+    use crate::model::{Subscription, SubscriptionStatus};
+    use crate::money::{Currency, Money};
+    use crate::plan::{BillingInterval, Plan};
+
+    fn at(hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 10, hour, 0, 0).unwrap()
+    }
+
+    fn view(id: &str, plan: &str, hour: u32, entitled: bool) -> SubscriptionView {
+        let row = Subscription::new(
+            id,
+            "cust",
+            format!("sub_{id}"),
+            SubscriptionStatus::Active,
+            at(hour),
+            at(12),
+        );
+        let plan = Plan::new(
+            plan,
+            plan,
+            format!("price_{plan}"),
+            Money::from_minor(100, Currency::USD),
+            BillingInterval::Month,
+        );
+        SubscriptionView::new(row, Some(plan), entitled)
+    }
+
+    /// Every permutation of `items`, by Heap's algorithm.
+    fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        fn heap<T: Clone>(k: usize, items: &mut Vec<T>, out: &mut Vec<Vec<T>>) {
+            if k <= 1 {
+                out.push(items.clone());
+                return;
+            }
+            for i in 0..k {
+                heap(k - 1, items, out);
+                let j = if k.is_multiple_of(2) { i } else { 0 };
+                items.swap(j, k - 1);
+            }
+        }
+        let mut items = items.to_vec();
+        let mut out = Vec::new();
+        heap(items.len(), &mut items, &mut out);
+        out
+    }
+
+    fn pick(views: Vec<SubscriptionView>, rule: &PlanRule) -> Option<String> {
+        best_satisfying(views, rule).map(|view| view.subscription.id)
+    }
+
+    /// The choice does not depend on the input order. A memory store and a
+    /// SQL store can return tied rows in different orders.
+    #[test]
+    fn choice_is_independent_of_row_order() {
+        let views = [
+            view("b", "pro", 9, true),
+            view("a", "pro", 9, true),
+            view("c", "pro", 9, true),
+            view("d", "pro", 8, true),
+            view("e", "pro", 10, false),
+            view("f", "team", 11, true),
+        ];
+        for order in permutations(&views) {
+            assert_eq!(
+                pick(order.clone(), &PlanRule::plan("pro")).as_deref(),
+                Some("a")
+            );
+            assert_eq!(
+                pick(order.clone(), &PlanRule::AnyActive).as_deref(),
+                Some("f")
+            );
+            assert_eq!(pick(order, &PlanRule::plan("enterprise")), None);
+        }
+    }
+
+    /// An empty input denies.
+    #[test]
+    fn no_views_denies() {
+        assert_eq!(pick(Vec::new(), &PlanRule::AnyActive), None);
     }
 }

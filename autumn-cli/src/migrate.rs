@@ -2145,8 +2145,9 @@ fn revert_user_migrations_sqlite_cli<P, F>(
     on_reverted: F,
 ) -> Result<usize, autumn_web::migrate::MigrationError>
 where
-    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, autumn_web::migrate::MigrationError>,
-    F: FnMut(&autumn_web::migrate::RevertedMigration),
+    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, autumn_web::migrate::MigrationError>
+        + Send,
+    F: FnMut(&autumn_web::migrate::RevertedMigration) + Send,
 {
     autumn_web::migrate::revert_user_migrations_sqlite(
         database_url,

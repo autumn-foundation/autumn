@@ -38,7 +38,7 @@ use autumn_web::tenancy::CURRENT_TENANT;
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -1701,6 +1701,178 @@ async fn a_denormalized_tenant_column_does_not_require_a_tenant_context() {
         .expect("reads must not require a tenant context either");
     assert_eq!(flatten(&thread), vec![(0, "no tenant needed".to_owned())]);
     assert_eq!(counter(&mut conn, "cmt_denorm_tenants", target).await, 1);
+}
+
+// ── #2287: a parent change between the probe and the read ───────────────────
+
+/// Read a thread across a parent change that occurs after the probe.
+///
+/// The holder locks `cmt_comments`. The probe reads only the parent table, so
+/// the lock does not stop it. The read then waits on the lock. The holder
+/// applies `change` to the parent and commits. Under read-committed, the read
+/// takes its snapshot after it gets the lock, so it sees the change. Thus the
+/// race of issue #2287 occurs on each run.
+async fn read_across_a_parent_change<T: std::fmt::Debug + Send + 'static>(
+    pool: &Pool<AsyncPgConnection>,
+    read: impl std::future::Future<Output = T> + Send + 'static,
+    change: &str,
+    parent: i64,
+) -> T {
+    use std::time::Duration;
+
+    let mut holder = pool.get().await.expect("holder conn");
+    holder
+        .batch_execute("BEGIN; LOCK TABLE cmt_comments IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock the comments table");
+
+    let task = tokio::spawn(read);
+
+    // When the read waits on the lock, the probe is complete.
+    let mut observer = pool.get().await.expect("observer conn");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pg_locks l \
+             JOIN pg_class r ON r.oid = l.relation \
+             WHERE r.relname = 'cmt_comments' AND NOT l.granted",
+        )
+        .get_result::<CountRow>(&mut observer)
+        .await
+        .expect("read pg_locks")
+        .count;
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            !task.is_finished(),
+            "the read did not wait on the lock: {:?}",
+            task.await
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the read did not reach the comments table"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    diesel::sql_query(change)
+        .bind::<BigInt, _>(parent)
+        .execute(&mut holder)
+        .await
+        .expect("change the parent");
+    holder.batch_execute("COMMIT").await.expect("commit");
+
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the read continues after the commit")
+        .expect("join the read")
+}
+
+/// The thread of `CmtTenanted` record `parent`, read as tenant `acme`.
+fn read_as_acme(
+    pool: &Pool<AsyncPgConnection>,
+    parent: i64,
+) -> impl std::future::Future<Output = autumn_web::AutumnResult<Vec<CommentNode>>> + Send + 'static
+{
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    CURRENT_TENANT.scope(Some("acme".to_owned()), async move {
+        repo.comment_thread(parent).await
+    })
+}
+
+/// Control: a change that keeps the parent visible keeps the thread. This
+/// shows that the lock alone does not empty the thread.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_parent_change_that_keeps_visibility_keeps_the_thread() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let acme = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "kept").await;
+    CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.add_comment(acme, author, "ours", None).await
+        })
+        .await
+        .expect("same-tenant comment");
+
+    let thread = read_across_a_parent_change(
+        &pool,
+        read_as_acme(&pool, acme),
+        "UPDATE cmt_tenanted SET title = 'renamed' WHERE id = $1",
+        acme,
+    )
+    .await
+    .expect("the parent is still visible");
+    assert_eq!(flatten(&thread), vec![(0, "ours".to_owned())]);
+}
+
+/// Issue #2287: the parent moves to another tenant after the probe passes.
+/// The read must not return the thread to the old tenant.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_parent_moved_to_another_tenant_after_the_probe_serves_no_thread() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let moved = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "moved").await;
+    // A second `acme` parent. If the check does not compare the parent id, it
+    // finds this row and returns the thread.
+    seed_tenanted(&mut conn, "cmt_tenanted", "acme", "stays").await;
+    CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.add_comment(moved, author, "private", None).await
+        })
+        .await
+        .expect("same-tenant comment");
+
+    let thread = read_across_a_parent_change(
+        &pool,
+        read_as_acme(&pool, moved),
+        "UPDATE cmt_tenanted SET tenant_id = 'globex' WHERE id = $1",
+        moved,
+    )
+    .await
+    .expect("the probe passed, so the result is an empty thread, not a 404");
+    assert!(
+        thread.is_empty(),
+        "acme read globex's thread: {:?}",
+        flatten(&thread)
+    );
+}
+
+/// Issue #2287: the parent is soft-deleted after the probe passes. The read
+/// must not return the thread.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_parent_soft_deleted_after_the_probe_serves_no_thread() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtSoftRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let deleted = seed_one_col(&mut conn, "cmt_softs", "title", "deleted").await;
+    // A second live parent, for the same reason as in the tenant test.
+    seed_one_col(&mut conn, "cmt_softs", "title", "live").await;
+    repo.add_comment(deleted, author, "gone", None)
+        .await
+        .expect("live parent accepts comments");
+
+    let thread = read_across_a_parent_change(
+        &pool,
+        async move { repo.comment_thread(deleted).await },
+        "UPDATE cmt_softs SET deleted_at = NOW() WHERE id = $1",
+        deleted,
+    )
+    .await
+    .expect("the probe passed, so the result is an empty thread, not a 404");
+    assert!(
+        thread.is_empty(),
+        "a soft-deleted parent served its thread: {:?}",
+        flatten(&thread)
+    );
 }
 
 // ── The generic router ──────────────────────────────────────────────────────
