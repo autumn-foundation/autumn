@@ -37,8 +37,11 @@ set -euo pipefail
 
 IMAGE="$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG"
 API="api-version=2024-03-01"
+# Secret values go through these private files, never through a process
+# argument (visible in /proc/*/cmdline).
 BODY=$(mktemp)
-trap 'rm -f "$BODY"' EXIT
+APP_SECRETS=$(mktemp)
+trap 'rm -f "$BODY" "$APP_SECRETS"' EXIT
 
 JOB=$(az containerapp job show \
   --name "$AZURE_MIGRATE_JOB_NAME" \
@@ -50,14 +53,17 @@ APP=$(az containerapp show \
   --output json)
 # GET omits secret values. Send the app's own secrets back with their values,
 # because the PATCH replaces the whole secrets array.
-APP_SECRETS=$(az containerapp secret list \
+az containerapp secret list \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
   --show-values \
-  --output json)
+  --output json > "$APP_SECRETS"
 APP_ID=$(jq -r '.id' <<< "$APP")
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 OLD_IMAGE=$(jq -r '.properties.template.containers[0].image' <<< "$APP")
+JOB_IDENTITY=$(jq -r '.properties.configuration.registries[0].identity // ""' <<< "$JOB")
+# A secret in PATCH form: a Key Vault ref, or a name and value.
+SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
 
 # A PATCH body goes in a file, not on the command line: it can hold secret
 # values. `--body @file` reads it.
@@ -67,13 +73,27 @@ patch_app() {
 }
 
 # Only the first cutover rolls back. On a later deploy, the old image is a
-# real release, so the script keeps the credentials.
+# real release, so the script keeps the credentials. The rollback removes
+# what the cutover added, and restores the app's own identities, registries
+# and secrets.
 rollback() {
   case "$OLD_IMAGE" in "$ACR_LOGIN_SERVER"/*) return ;; esac
   echo "::warning::removing the credentials from the placeholder app" >&2
-  if patch_app "$(jq -c '{identity: {type: "None", userAssignedIdentities: null},
-      properties: {configuration: {registries: [], secrets: []},
-        template: {containers: .properties.template.containers}}}' <<< "$APP")"; then
+  local body
+  body=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
+    --arg id "$JOB_IDENTITY" "$SECRET_REF"'
+    ($app.identity.userAssignedIdentities // {} | map_values({})) as $own
+    | {identity: (if ($app.identity.type // "None") == "None"
+                  then {type: "None", userAssignedIdentities: null}
+                  else {type: $app.identity.type,
+                        userAssignedIdentities: (if $own == {} then null
+                                                 else {($id): null} + $own end)} end),
+       properties: {
+         configuration: {
+           registries: ($app.properties.configuration.registries // []),
+           secrets: ($app_secrets[0] | map(secret_ref))},
+         template: {containers: $app.properties.template.containers}}}')
+  if patch_app "$body"; then
     for _ in $(seq 1 30); do
       sleep 10
       STATE=$(az containerapp show --name "$AZURE_APP_NAME" \
@@ -123,16 +143,14 @@ if [ "$OLD_IMAGE" = "$IMAGE" ]; then OLD_REVISION=""; fi
 # The env keeps the variables that this script does not set. The script
 # replaces the four variables that it sets. The secrets, registries and
 # identities that you add to the app stay.
-PATCH=$(jq -n --argjson job "$JOB" --argjson app "$APP" --argjson app_secrets "$APP_SECRETS" \
-  --arg acr "$ACR_LOGIN_SERVER" --arg image "$IMAGE" '
-  ($job.properties.configuration.registries[0].identity // "") as $id
-  | ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
+PATCH=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
+  --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" --arg image "$IMAGE" "$SECRET_REF"'
+  ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
   | if $id == "" or ($job_secrets | length) == 0
     then error("the migration job has no identity or secrets to copy")
     else . end
-  | ($app_secrets
-     | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not)
-           | if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end)
+  | ($app_secrets[0]
+     | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not) | secret_ref)
      + $job_secrets) as $secrets
   | ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
       {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]

@@ -3158,8 +3158,9 @@ previous_secrets = []
             .0;
         for field in [
             "type: \"None\"",
-            "registries: []",
-            "secrets: []",
+            "{($id): null}",
+            "registries: ($app.properties.configuration.registries // [])",
+            "secrets: ($app_secrets[0] | map(secret_ref))",
             "patch_app",
         ] {
             assert!(
