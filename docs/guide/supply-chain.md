@@ -422,7 +422,7 @@ When there is no fix — or the vulnerable code path is unreachable from your ap
 [advisories]
 ignore = [
     # Why this is acceptable *here*, and when you will look again.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; review-by 2026-10-01" },
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
 ]
 ```
 

@@ -41,14 +41,14 @@ ignore = [
     # Ingress: rsa 0.9.10 -> jsonwebtoken -> autumn-web, i.e. only the RSA-family
     # JWT sign/verify path. Autumn exposes no network-reachable attacker-timed
     # RSA private-key decryption oracle, so real exposure is limited. Tracked by
-    # issue #1600. Review-by: 2026-10-01 (or when a fixed rsa ships).
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken; tracked in #1600; review-by 2026-10-01" },
+    # issue #1600. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05; or when a fixed rsa ships).
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken; tracked in #1600; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
     # RUSTSEC-2024-0384 — instant unmaintained. Build-time, transitive, and only
     # pulled in by the managed-pg-bundled feature scanned above:
     # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
     # (build) postgresql_embedded -> autumn-web. Not a runtime vulnerability and no
-    # safe upgrade (author recommends web-time). Review-by: 2026-10-01.
-    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive via postgresql_embedded (managed-pg-bundled feature); no safe upgrade; review-by 2026-10-01" },
+    # safe upgrade (author recommends web-time). Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive via postgresql_embedded (managed-pg-bundled feature); no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
     # RUSTSEC-2026-0253 — `lru`'s `LruCache::pop()` is not panic-safe. Kept
     # identical to deny.toml on purpose (see the note above the ignore list);
     # the full rationale lives there. Short version: the workspace's own `lru` is
@@ -56,8 +56,8 @@ ignore = [
     # aws-sdk-s3 1.122, which is MSRV-pinned and has no patched 0.16.x to move
     # to. Its sole `lru` use is the S3 Express identity cache, whose keys are
     # `CacheKey(String)` (no panicking `Drop`) and which never calls `pop()`, so
-    # neither precondition for the UB holds. Review-by: 2026-10-01.
-    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; review-by 2026-10-01" },
+    # neither precondition for the UB holds. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
 ]
 
 [licenses]
