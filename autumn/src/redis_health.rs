@@ -238,8 +238,10 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
             &config.idempotency.redis.url,
         ),
         (
+            // Same exact match as `job::start_runtime`: any other spelling
+            // runs the local backend.
             "jobs",
-            config.jobs.backend.trim().eq_ignore_ascii_case("redis"),
+            config.jobs.backend == "redis",
             &config.jobs.redis.url,
         ),
         (
@@ -475,6 +477,18 @@ mod tests {
 
         assert!(!registry.contains("redis:sessions"));
         assert!(registry.contains("redis:jobs"));
+    }
+
+    #[test]
+    fn jobs_backend_matches_the_runtime_exactly() {
+        // `job::start_runtime` matches `"redis"` exactly. Any other spelling
+        // runs the local backend, which does not use Redis.
+        for backend in ["Redis", " redis", "REDIS"] {
+            let mut config = AutumnConfig::default();
+            config.jobs.backend = backend.to_owned();
+            config.jobs.redis.url = Some("redis://jobs:6379".to_owned());
+            assert!(redis_subsystems(&config).is_empty(), "{backend:?}");
+        }
     }
 
     #[test]
