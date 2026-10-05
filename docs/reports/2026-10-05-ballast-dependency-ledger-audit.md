@@ -124,10 +124,13 @@ it**: added
 ```yaml
 ignore:
   - dependency-name: "matchit"
-    versions: [">=0.9"]
 ```
 
-to the `cargo` ecosystem block and
+(no `versions:` filter — Dependabot filters only the versions an ignore
+rule names, so a scoped `>=0.9` would still leave an 0.8.5/0.8.6 patch
+bump eligible, which would desync from axum's own exact `=0.8.4` pin the
+same way 0.9.2 would; caught by a Codex review comment on this PR's own
+diff and broadened before merge) to the `cargo` ecosystem block and
 
 ```yaml
 ignore:
@@ -317,7 +320,8 @@ CI-verified PR with no action available from this side.
 ## 🔧 Change
 
 - `.github/dependabot.yml`: added an `ignore` entry under the `cargo`
-  ecosystem for `matchit >=0.9`, and an `ignore` entry under the
+  ecosystem for `matchit` (unversioned — every update is ignored, not just
+  0.9+; see Evidence), and an `ignore` entry under the
   `github-actions` ecosystem for `dtolnay/rust-toolchain`, each with an
   inline comment naming the mechanism and the revisit trigger.
 - Closed PR #1897 (`matchit` 0.8.4→0.9.2) and PR #2615
@@ -347,7 +351,7 @@ CI-verified PR with no action available from this side.
 | Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
 | Waivers re-checked (root/fuzz, 3 unique ids) | 3/3 unchanged, review-by 2026-10-01 | 3/3 unchanged, **re-dated** to 2026-11-02 |
 | Waivers re-checked (island-flock, 2 pre-existing) | 2/2 unchanged, review-by 2026-10-01 | 2/2 unchanged, **re-dated** to 2026-11-02 |
-| Dependabot `ignore` entries | 0 | 2 (`matchit >=0.9`, `dtolnay/rust-toolchain`) |
+| Dependabot `ignore` entries | 0 | 2 (`matchit` unversioned, `dtolnay/rust-toolchain`) |
 
 ## 🔬 Reproduce
 
