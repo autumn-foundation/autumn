@@ -1308,62 +1308,83 @@ pub async fn invalidate_namespace_async(namespace: &str) -> bool {
     }
 }
 
-/// Runs a repository's declared invalidation once its write ends (#3056).
+/// Runs a repository's declared invalidation after each commit of a write
+/// (#3056).
 ///
-/// Generated write methods make one before the write body and call
-/// [`run`](Self::run) after it, on `Ok` and on `Err`: a write can commit and
-/// then fail in an `after_*` hook. The invalidation runs on a spawned task, so
-/// a caller that is dropped while it waits does not stop it.
+/// Generated write methods make one before the write body. The body calls
+/// [`committed`](Self::committed) after each transaction, and
+/// [`flush`](Self::flush) before each `after_create` or `after_update` hook.
+/// Thus a hook, and every other reader, sees the committed row while the hook
+/// runs. The method calls [`run`](Self::run) at its end, on `Ok` and on `Err`,
+/// for a commit that no hook followed. The guard starts pending, so a write
+/// with no tracked transaction still invalidates at its end.
 ///
-/// If the guard drops without `run` (a panic, or a cancelled request), it
-/// spawns the invalidation on the current runtime. Over-invalidation is safe:
-/// the cost is one cache miss. A request cancelled during its `COMMIT` round
-/// trip can invalidate before the server applies the commit. A durable
-/// commit-hook row (`commit_hooks`) covers that case.
+/// Each invalidation runs on a spawned task, so a caller that is dropped while
+/// it waits does not stop it. If the guard drops while pending (a panic, or a
+/// cancelled request), it spawns the invalidation on the current runtime.
+/// Over-invalidation is safe: the cost is one cache miss. A request cancelled
+/// during its `COMMIT` round trip can invalidate before the server applies the
+/// commit. A durable commit-hook row (`commit_hooks`) covers that case.
 #[doc(hidden)]
 #[must_use = "call `run().await` after the write body"]
 pub struct InvalidateAfterWrite {
-    make: Option<fn() -> super::CacheFuture<'static, bool>>,
+    make: fn() -> super::CacheFuture<'static, bool>,
+    pending: bool,
 }
 
 impl InvalidateAfterWrite {
     /// Arm the guard. `make` builds the repository's invalidation future.
     pub const fn new(make: fn() -> super::CacheFuture<'static, bool>) -> Self {
-        Self { make: Some(make) }
+        Self {
+            make,
+            pending: true,
+        }
     }
 
-    /// Run the invalidation now and wait for it.
+    /// Record that a transaction ended. The next flush invalidates.
+    pub const fn committed(&mut self) {
+        self.pending = true;
+    }
+
+    /// Invalidate now if a commit is not yet invalidated, and wait for it.
     ///
     /// Returns whether it was complete. A `false` is already logged and
     /// counted.
-    pub async fn run(mut self) -> bool {
-        let Some(make) = self.make.take() else {
+    pub async fn flush(&mut self) -> bool {
+        if !self.pending {
             return true;
-        };
+        }
+        self.pending = false;
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             report_skipped_invalidation("the write ran outside a Tokio runtime");
             return false;
         };
-        handle.spawn(make()).await.unwrap_or_else(|_| {
+        handle.spawn((self.make)()).await.unwrap_or_else(|_| {
             report_skipped_invalidation("the invalidation task panicked or was cancelled");
             false
         })
     }
 
+    /// Flush at the end of the write.
+    pub async fn run(mut self) -> bool {
+        self.flush().await
+    }
+
     /// Skip the invalidation: the write wrote nothing (for example a
     /// `find_or_create_by_*` that found the row).
     pub fn disarm(mut self) {
-        self.make = None;
+        self.pending = false;
     }
 }
 
 impl Drop for InvalidateAfterWrite {
     fn drop(&mut self) {
-        let Some(make) = self.make.take() else {
+        if !self.pending {
             return;
-        };
+        }
+        self.pending = false;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(make());
+            handle.spawn((self.make)());
         } else {
             report_skipped_invalidation("the write ended outside a Tokio runtime");
         }
@@ -2442,5 +2463,67 @@ mod tests {
         assert_eq!(DependencyProvenance::Declared.as_str(), "declared");
         assert_eq!(DependencyProvenance::Derived.as_str(), "derived");
         assert_eq!(DependencyProvenance::Undetermined.as_str(), "undetermined");
+    }
+
+    // ── InvalidateAfterWrite (#3056) ─────────────────────────────────
+
+    static GUARD_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_guard_run() -> crate::cache::CacheFuture<'static, bool> {
+        Box::pin(async {
+            GUARD_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        })
+    }
+
+    fn guard_runs() -> usize {
+        GUARD_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn the_after_write_guard_invalidates_once_per_commit() {
+        // One test owns GUARD_RUNS, so the counts are exact.
+        let before = guard_runs();
+
+        // A hook flush after the commit, then the end: one invalidation.
+        let mut guard = InvalidateAfterWrite::new(count_guard_run);
+        guard.committed();
+        assert!(guard.flush().await);
+        assert!(guard.flush().await, "a second flush has nothing to do");
+        assert!(guard.run().await);
+        assert_eq!(guard_runs(), before + 1);
+
+        // A commit after the flush: the end invalidates again.
+        let mut guard = InvalidateAfterWrite::new(count_guard_run);
+        assert!(guard.flush().await);
+        guard.committed();
+        assert!(guard.run().await);
+        assert_eq!(guard_runs(), before + 3);
+
+        // No commit seen and no flush: the end still invalidates.
+        assert!(InvalidateAfterWrite::new(count_guard_run).run().await);
+        assert_eq!(guard_runs(), before + 4);
+
+        // Disarmed: nothing runs, also on drop.
+        InvalidateAfterWrite::new(count_guard_run).disarm();
+        tokio::task::yield_now().await;
+        assert_eq!(guard_runs(), before + 4);
+
+        // Dropped while pending (a panic or a cancelled request): spawned.
+        drop(InvalidateAfterWrite::new(count_guard_run));
+        for _ in 0..100 {
+            if guard_runs() == before + 5 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(guard_runs(), before + 5);
+
+        // Dropped after the final flush: nothing more runs.
+        let mut guard = InvalidateAfterWrite::new(count_guard_run);
+        assert!(guard.flush().await);
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(guard_runs(), before + 6);
     }
 }

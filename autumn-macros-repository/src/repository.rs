@@ -6368,12 +6368,107 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Make each write method of `pg_name` invalidate the declared cached reads
-/// when it ends (#3056).
+/// The transaction helpers a generated write commits through.
+const COMMIT_HELPERS: [&str; 3] = [
+    "scoped_transaction",
+    "scoped_immediate_transaction",
+    "maybe_immediate_transaction",
+];
+
+/// `helper(..).await` for one of [`COMMIT_HELPERS`].
+fn is_commit(expr: &syn::Expr) -> bool {
+    let syn::Expr::Await(awaited) = expr else {
+        return false;
+    };
+    let syn::Expr::Call(call) = &*awaited.base else {
+        return false;
+    };
+    matches!(&*call.func, syn::Expr::Path(func)
+        if func.path.segments.last().is_some_and(|seg| COMMIT_HELPERS.iter().any(|h| seg.ident == h)))
+}
+
+/// `self.hooks.after_create(..)` or `self.hooks.after_update(..)`.
+fn is_after_hook(expr: &syn::Expr) -> bool {
+    let syn::Expr::MethodCall(call) = expr else {
+        return false;
+    };
+    if call.method != "after_create" && call.method != "after_update" {
+        return false;
+    }
+    matches!(&*call.receiver, syn::Expr::Field(field)
+        if matches!(&field.member, syn::Member::Named(name) if name == "hooks")
+            && matches!(&*field.base, syn::Expr::Path(base) if base.path.is_ident("self")))
+}
+
+/// Ties the invalidation guard to the commits and hooks in one write body.
 ///
-/// A generated write runs and commits its own transaction inside the method
-/// body. So "after the body" is "after the commit". The invalidation runs on
-/// `Ok` and on `Err`: a write can commit and then fail in an `after_*` hook.
+/// After each commit it calls `committed()`. Before each `after_*` hook it
+/// awaits `flush()`. Thus the hook, and every other reader, sees the committed
+/// row while the hook runs. A commit or hook inside a closure or an
+/// `async move` block cannot reach the guard. Then `unreachable` is set, and
+/// the write invalidates again at its end.
+#[derive(Default)]
+struct CommitPoints {
+    hooks: usize,
+    commits: usize,
+    unreachable: bool,
+}
+
+impl CommitPoints {
+    fn contains_site(expr: &syn::Expr) -> bool {
+        struct Find(bool);
+        impl<'ast> syn::visit::Visit<'ast> for Find {
+            fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+                if is_commit(expr) || is_after_hook(expr) {
+                    self.0 = true;
+                } else {
+                    syn::visit::visit_expr(self, expr);
+                }
+            }
+        }
+        let mut find = Find(false);
+        syn::visit::Visit::visit_expr(&mut find, expr);
+        find.0
+    }
+}
+
+impl syn::visit_mut::VisitMut for CommitPoints {
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        let detached = matches!(expr, syn::Expr::Closure(_))
+            || matches!(expr, syn::Expr::Async(block) if block.capture.is_some());
+        if detached {
+            self.unreachable |= Self::contains_site(expr);
+        } else if is_commit(expr) {
+            let commit = expr.clone();
+            *expr = syn::parse_quote! {{
+                let __autumn_committed = #commit;
+                __autumn_invalidation.committed();
+                __autumn_committed
+            }};
+            self.commits += 1;
+        } else if is_after_hook(expr) {
+            let hook = expr.clone();
+            *expr = syn::parse_quote! {
+                async {
+                    let _ = __autumn_invalidation.flush().await;
+                    #hook.await
+                }
+            };
+            self.hooks += 1;
+        } else {
+            syn::visit_mut::visit_expr_mut(self, expr);
+        }
+    }
+}
+
+/// Make each write method of `pg_name` invalidate the declared cached reads
+/// after it commits (#3056).
+///
+/// A generated write runs and commits its own transactions inside the method
+/// body. [`CommitPoints`] marks each commit and invalidates before each
+/// `after_*` hook. The end of the body invalidates a commit that no hook
+/// followed. The end runs on `Ok` and on `Err`: a write can commit and then
+/// fail in an `after_*` hook.
 /// A guard also runs it on a panic or a cancelled request. A reader that read
 /// the old row before the commit cannot put it back: the invalidation bumps
 /// the namespace epoch, and the reader's fenced insert then skips.
@@ -6413,6 +6508,16 @@ fn invalidate_after_each_write(
                 syn::ReturnType::Type(_, ty) => quote! { #ty },
                 syn::ReturnType::Default => quote! { () },
             };
+            let mut points = CommitPoints::default();
+            syn::visit_mut::VisitMut::visit_block_mut(&mut points, &mut method.block);
+            // With hooks but no tracked commit, a commit after a flush is not
+            // seen. Then invalidate again at the end.
+            let unsure = points.unreachable || (points.hooks > 0 && points.commits == 0);
+            let end_unsure = if unsure {
+                quote! { __autumn_invalidation.committed(); }
+            } else {
+                quote! {}
+            };
             let body = &method.block;
             // A `find_or_create_by_*` that found the row, or a retention sweep
             // that deleted nothing, wrote nothing. A failed sweep can still
@@ -6437,10 +6542,12 @@ fn invalidate_after_each_write(
                 quote! { let _ = __autumn_invalidation.run().await; }
             };
             method.block = syn::parse_quote! {{
-                let __autumn_invalidation = ::autumn_web::cache::coherence::InvalidateAfterWrite::new(
+                #[allow(unused_mut)]
+                let mut __autumn_invalidation = ::autumn_web::cache::coherence::InvalidateAfterWrite::new(
                     #pg_name::__autumn_invalidate_after_commit,
                 );
                 let __autumn_write_result: #output = async #body.await;
+                #end_unsure
                 #finish
                 __autumn_write_result
             }};
@@ -20412,6 +20519,75 @@ mod tests {
             !save.contains("is_ok ()"),
             "it must not depend on Ok: {save}"
         );
+    }
+
+    #[test]
+    fn each_after_hook_runs_after_a_flush_of_its_commit() {
+        // Codex review on #3137: an `after_*` hook runs after the commit, so it
+        // must not see, or let other readers see, the cached pre-commit value.
+        for (attr, has_hooks) in [
+            (
+                quote! { Post, invalidates(crate::views::recent_posts) },
+                false,
+            ),
+            (
+                quote! { Post, hooks = PostHooks, invalidates(crate::views::recent_posts) },
+                true,
+            ),
+            (
+                quote! {
+                    Post,
+                    hooks = PostHooks,
+                    commit_hooks = true,
+                    invalidates(crate::views::recent_posts)
+                },
+                true,
+            ),
+        ] {
+            let item = quote! { pub trait PostRepository {} };
+            let config = parse_repo_args(attr.clone()).expect("args");
+            let trait_def: ItemTrait = syn::parse2(item.clone()).expect("trait");
+            let writes = write_method_names(&config, &trait_def);
+            let bodies = trait_impl_method_bodies(&repository_macro(attr, item), "PostRepository");
+            let mut hooked = 0;
+            for write in &writes {
+                let body = &bodies[write];
+                let hooks = body.matches("self . hooks . after_create (").count()
+                    + body.matches("self . hooks . after_update (").count();
+                let flushed = body
+                    .matches("__autumn_invalidation . flush () . await ; self . hooks . after_")
+                    .count();
+                assert_eq!(
+                    hooks, flushed,
+                    "`{write}`: flush before each after hook: {body}"
+                );
+                assert!(
+                    !body.contains(
+                        "__autumn_invalidation . committed () ; let _ = __autumn_invalidation . run"
+                    ) && !body.contains("__autumn_invalidation . committed () ; if"),
+                    "`{write}`: every commit and hook must reach the guard: {body}"
+                );
+                if hooks > 0 {
+                    hooked += 1;
+                    assert!(
+                        body.contains("__autumn_invalidation . committed ()"),
+                        "`{write}`: each commit must mark the guard: {body}"
+                    );
+                }
+            }
+            if !has_hooks {
+                assert_eq!(hooked, 0, "no hooks, no hook calls");
+                continue;
+            }
+            for write in ["save", "update", "save_many", "update_many"] {
+                assert!(
+                    bodies[write].contains("flush () . await ; self . hooks . after_"),
+                    "`{write}` must flush before its after hook: {}",
+                    bodies[write]
+                );
+            }
+            assert!(hooked >= 4);
+        }
     }
 
     #[test]

@@ -143,6 +143,60 @@ impl autumn_web::hooks::MutationHooks for GatedBeforeCreateHooks {
 )]
 pub trait GatedNoteRepository {}
 
+// ── An `after_*` hook reads after the commit (Codex review on #3137) ──
+
+/// The repository the reading hooks use. The test sets it.
+static HOOK_REPO: std::sync::Mutex<Option<PgAfterCommitNoteRepository>> =
+    std::sync::Mutex::new(None);
+/// The counts the reading hooks saw.
+static HOOK_SAW: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Read the cached count for `label` from inside a hook, and record it.
+async fn record_count_seen_by_hook(label: String) -> AutumnResult<()> {
+    let repo = HOOK_REPO
+        .lock()
+        .expect("hook repo lock")
+        .clone()
+        .expect("the test sets HOOK_REPO");
+    let count = after_commit_note_count(label, &repo).await?;
+    HOOK_SAW.lock().expect("hook saw lock").push(count);
+    Ok(())
+}
+
+/// `after_create` and `after_update` hooks that read a declared cached read.
+#[derive(Clone, Default)]
+pub struct ReadingAfterHooks;
+
+impl autumn_web::hooks::MutationHooks for ReadingAfterHooks {
+    type Model = AfterCommitNote;
+    type NewModel = NewAfterCommitNote;
+    type UpdateModel = UpdateAfterCommitNote;
+
+    async fn after_create(
+        &self,
+        _ctx: &mut autumn_web::hooks::MutationContext,
+        record: &AfterCommitNote,
+    ) -> autumn_web::AutumnResult<()> {
+        record_count_seen_by_hook(record.label.clone()).await
+    }
+
+    async fn after_update(
+        &self,
+        _ctx: &mut autumn_web::hooks::MutationContext,
+        record: &AfterCommitNote,
+    ) -> autumn_web::AutumnResult<()> {
+        record_count_seen_by_hook(record.label.clone()).await
+    }
+}
+
+#[autumn_web::repository(
+    AfterCommitNote,
+    table = "after_commit_notes",
+    hooks = ReadingAfterHooks,
+    invalidates(after_commit_note_count)
+)]
+pub trait ReadingHookNoteRepository {}
+
 // ── The retention sweep (Codex review on #3137) ─────────────────────
 
 mod aged_schema {
@@ -432,4 +486,59 @@ async fn the_retention_sweep_invalidates_after_it_deletes_rows() {
         0,
         "the sweep committed a delete, so the cached 1 must be gone"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_after_hook_reads_the_committed_value_not_the_cached_one() {
+    let _serial = SERIAL.lock().await;
+    let repo = repository().await;
+    *HOOK_REPO.lock().expect("hook repo lock") = Some(repo.clone());
+    HOOK_SAW.lock().expect("hook saw lock").clear();
+    let reading = PgReadingHookNoteRepository::with_pool_untracked(pool().await);
+    let (created, moved) = (
+        "hook-reads-create".to_owned(),
+        "hook-reads-update".to_owned(),
+    );
+
+    // Cache the counts before the writes.
+    assert_eq!(
+        after_commit_note_count(created.clone(), &repo)
+            .await
+            .expect("count"),
+        0
+    );
+    assert_eq!(
+        after_commit_note_count(moved.clone(), &repo)
+            .await
+            .expect("count"),
+        0
+    );
+
+    let saved = reading.save(&note(&created)).await.expect("save");
+    // The save cleared the namespace. Cache the 0 for the update again.
+    assert_eq!(
+        after_commit_note_count(moved.clone(), &repo)
+            .await
+            .expect("count"),
+        0
+    );
+    reading
+        .update(
+            saved.id,
+            &UpdateAfterCommitNote {
+                label: autumn_web::Patch::Set(moved.clone()),
+            },
+        )
+        .await
+        .expect("update");
+
+    assert_eq!(
+        *HOOK_SAW.lock().expect("hook saw lock"),
+        vec![1, 1],
+        "after_create and after_update run after the commit, so they must not \
+         read the cached 0"
+    );
+
+    repo.delete_by_label(moved).await.expect("clean up");
 }

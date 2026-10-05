@@ -33,6 +33,7 @@ Status: implemented. Part of #3050.
 | All replicas retry at the same time | Add jitter to each sleep. |
 | Invalidate before the commit | Invalidate after the write's own commit. |
 | A slow reader writes the old value after the invalidation | Bump the namespace epoch first. The fenced insert skips the old value. |
+| Let an `after_*` hook read the old cached value | Invalidate before the hook, not at the end of the write. |
 | Fail the write when only the cache failed | Keep the write `Ok`. Count and log the cache failure. |
 | Fail a durable hook row when only the cache failed | Log and count. Do not dead-letter user hooks. |
 | Skip invalidation when the write commits, then fails | Invalidate on `Ok` and on `Err`. |
@@ -70,9 +71,10 @@ Status: implemented. Part of #3050.
 3. `coherence::invalidate_namespace_async` bumps the epoch, clears local
    stores, and awaits the backend. A failure logs `warn!`, increments the
    counter, and returns `false`.
-4. A repository with declared edges calls
-   `invalidate_declared_caches_async()` when each write method ends, on `Ok`
-   and on `Err` (a write can commit, then fail in an `after_*` hook). A guard
+4. A repository with declared edges invalidates after each commit, before
+   the `after_create` or `after_update` hook, so the hook reads the committed
+   row. The end of the write invalidates a commit that no hook followed, on
+   `Ok` and on `Err` (a write can commit, then fail in an `after_*` hook). A guard
    spawns it on a panic or a cancelled request. With `commit_hooks`, the
    durable runners also invalidate, before the user hook. A failure there is
    logged and counted. It does not fail the row: a cache outage must not
@@ -86,7 +88,7 @@ Status: implemented. Part of #3050.
 | Criterion | Test |
 | --- | --- |
 | `DEL` failure surfaced or retried | `autumn-cache-redis` Docker tests: `redis_invalidate_async_surfaces_readonly_del_failure`, `redis_invalidate_retries_until_del_succeeds`, `redis_invalidate_namespace_async_surfaces_failure`, `redis_sync_invalidate_counts_final_failure`, `coherence_async_invalidation_reaches_redis_and_reports_failure` |
-| After-commit invalidation, no refill of the old value | `autumn/tests/integration/cache_invalidation_after_commit.rs` (Docker): `each_generated_write_invalidates_after_commit_with_no_manual_call`, `a_reader_that_read_before_the_commit_cannot_repopulate_the_old_value`, `a_write_that_commits_then_fails_still_invalidates`, `a_reader_inside_the_transaction_window_cannot_keep_the_old_value`, `the_retention_sweep_invalidates_after_it_deletes_rows` |
+| After-commit invalidation, no refill of the old value | `autumn/tests/integration/cache_invalidation_after_commit.rs` (Docker): `each_generated_write_invalidates_after_commit_with_no_manual_call`, `a_reader_that_read_before_the_commit_cannot_repopulate_the_old_value`, `a_write_that_commits_then_fails_still_invalidates`, `a_reader_inside_the_transaction_window_cannot_keep_the_old_value`, `the_retention_sweep_invalidates_after_it_deletes_rows`, `an_after_hook_reads_the_committed_value_not_the_cached_one` |
 | `stale_if_error` serves the old value | `autumn/tests/integration/cache_stampede.rs` |
 
 ## Out of scope

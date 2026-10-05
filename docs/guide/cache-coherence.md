@@ -253,8 +253,12 @@ Issue [#3056](https://github.com/autumn-foundation/autumn/issues/3056).
 The order is: write, commit, then invalidate.
 
 1. The write method runs its transaction and commits.
-2. When the method ends, it bumps the epoch of each declared namespace.
+2. Before its `after_create` or `after_update` hook, or at its end if no hook
+   follows, it bumps the epoch of each declared namespace.
 3. It clears the local stores and asks the backend to drop the namespace.
+
+Thus an `after_*` hook that reads a declared cached read gets the committed
+row. Other readers also get it while the hook runs.
 
 If you invalidate before the commit, a reader can refill the old value between
 the `DEL` and the `COMMIT`. If you invalidate after the commit, step 2 stops the
@@ -267,6 +271,7 @@ insert of a reader that read the old row before the commit.
 | `with_lock`, `find_or_create_by_*`, the retention sweep | Also invalidate. `find_or_create_by_*` skips it when it found the row, and the sweep skips it when it deleted nothing. |
 | The backend sweep fails | Retried (Redis: 3 attempts, jittered backoff). Then `warn!` and `autumn_cache_invalidation_failures_total`. The write stays `Ok`: it is committed. |
 | The repository has `commit_hooks` | The durable runner also invalidates, before `after_*_commit`. This covers a crash between the commit and the inline invalidation. A failure is logged and counted. It does not fail the row, so a cache outage does not delay or dead-letter your hooks. |
+| A write with several commits (`save_many` in chunks) | One sweep per commit that a hook or the end follows. |
 | Each write | One namespace sweep per declared read. On Redis this is a `SCAN MATCH` over the keyspace, so write latency grows with the keyspace. |
 | A write inside `Db::tx` | The repository write uses its own connection and commits on its own, so it invalidates at its own commit. |
 

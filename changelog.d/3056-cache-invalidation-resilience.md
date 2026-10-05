@@ -6,8 +6,9 @@
   `invalidate` and `clear` log it with `warn!` and count it in the new
   `autumn_cache_invalidation_failures_total` counter.
 - **cache:** a `#[repository]` with `invalidates(...)` now drops the declared
-  cached reads when each write ends, after its commit (issue #3056). This also
-  runs when the write returns `Err`, panics, or is cancelled: a write can
+  cached reads after each write commits, before its `after_create` or
+  `after_update` hook (issue #3056). Thus the hook reads the committed row. This
+  also runs when the write returns `Err`, panics, or is cancelled: a write can
   commit and then fail in an `after_*` hook. You no longer need to
   call `invalidate_declared_caches()`. In this process, a reader that read the
   old row before the commit cannot put it back in the cache. With `commit_hooks`, the durable
