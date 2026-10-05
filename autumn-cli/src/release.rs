@@ -3315,6 +3315,9 @@ fi
   # An operator can put a sidecar before the app container.
   [ -n "$STUB_SIDECAR_FIRST" ] && containers="$sidecar,{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]}"
   app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",\"tags\":$tags,$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$scale}}}"
+# An older placeholder whose credentials use an identity that the job no
+# longer uses.
+[ -n "$STUB_APP_LEGACY_ID" ] && app="${app//$id/$STUB_APP_LEGACY_ID}"
 case "$1 $2" in
   "containerapp job")
     secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"${2:-$id}\"}"; }
@@ -3415,6 +3418,7 @@ case "$1 $2" in
           if [ "$lag" -gt 0 ]; then
             echo $((lag - 1)) > "$STUB_LOG.lag"
             printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+            [ -n "$STUB_TWO_PLACEHOLDERS" ] && printf 'app--old2\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
             exit 0
           fi
           printf '%s\t%s\n' "$STUB_LATEST" "$STUB_OLD_IMAGE"
@@ -3441,6 +3445,8 @@ case "$1 $2" in
       properties.template|properties.template.containers)
         has_refs=false
         [ -n "$STUB_ACTIVE_HAS_REFS" ] && has_refs=true
+        # The second placeholder still refers to the secrets; the first not.
+        [ -n "$STUB_TWO_PLACEHOLDERS" ] && [[ " $* " == *" --revision app--old2 "* ]] && has_refs=true
         template=$(jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" --argjson refs "[${refs#,}]" \
           --argjson has_refs "$has_refs" --arg scale_ref "${STUB_ACTIVE_SCALE_REF:-}" \
           --arg scale_id "${STUB_ACTIVE_SCALE_IDENTITY:+$id}" '
@@ -3481,6 +3487,7 @@ case "$1 $2" in
     esac
     ;;
   "containerapp secret")
+    [ -n "$STUB_APP_LEGACY_ID" ] && id="$STUB_APP_LEGACY_ID"
     # An operator secret on the app that uses the job's identity.
     if [ -n "$STUB_APP_SHARED_SECRET" ]; then
       shared=",{\"name\":\"ops-key\",\"keyVaultUrl\":\"https://kv/secrets/ops-key\",\"identity\":\"$id\"}"
@@ -3569,6 +3576,8 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_APP_LEGACY_ID",
+        "STUB_TWO_PLACEHOLDERS",
         "STUB_APP_COPIED",
         "STUB_ACTIVE_SCALE_IDENTITY",
         "STUB_APP_SCALE_IDENTITY",
@@ -5644,6 +5653,102 @@ esac
         assert!(!stage2.contains("queue-key"), "{stage2}");
         assert!(!stage2.contains("\"/kv-id-2\":{}"), "{stage2}");
         assert!(stage2.contains("\"autumn-copied-0\":null"), "{stage2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_a_legacy_identity_of_the_managed_credentials() {
+        // The older placeholder's managed secrets and ACR entry use /old-id,
+        // which the job no longer uses. That identity can still read the
+        // vault, so the removal drops it with its ACR entry.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_APP_LEGACY_ID", "/old-id")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage2 = bodies
+            .lines()
+            .rfind(|line| line.contains("\"secrets\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(!stage2.contains("\"/old-id\":{}"), "{stage2}");
+        assert!(stage2.contains("\"registries\":[]"), "{stage2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_closes_ingress_again_before_a_rollback() {
+        // A first-cutover retry takes the restart path and opens ingress.
+        // If the restart fails, the rollback must close ingress again
+        // before it changes the template back to the placeholder.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_LATEST", "app--old"),
+                ("STUB_RESTART_UNREADY", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        let after = &calls[restart_at..];
+        let disable_at = after
+            .find("ingress disable")
+            .unwrap_or_else(|| panic!("the rollback must close ingress: {calls}"));
+        if let Some(patch_at) = after.find("az rest --method patch") {
+            assert!(disable_at < patch_at, "{calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_reads_every_active_placeholder_before_cleanup() {
+        // Two placeholder revisions are active; only the second one still
+        // refers to the secrets. Stage 1 must wait for the clean revision.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_TWO_PLACEHOLDERS", "1"),
+                ("STUB_LATEST", "app--clean"),
+                ("STUB_ACTIVE_LAG", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(
+            calls.contains("--revision app--old2 --query properties.template --output json"),
+            "{calls}"
+        );
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[..patch_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 4,
+            "stage 2 must wait until the clean revision is the only active one: {calls}"
+        );
     }
 
     #[cfg(unix)]
