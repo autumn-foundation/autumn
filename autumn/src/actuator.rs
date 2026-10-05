@@ -982,6 +982,9 @@ pub struct JobRegistry {
     /// against `SystemClock`, and the two report different depths and ages for
     /// one set of marks. Installing a clock therefore travels to every clone.
     clock: Arc<RwLock<Arc<dyn crate::time::ClockSource>>>,
+    /// Redis dead letters this process removed to obey
+    /// `jobs.redis.dead_letter_limit` (issue #3055). Shared by all clones.
+    dead_letter_trimmed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl JobRegistry {
@@ -996,6 +999,7 @@ impl JobRegistry {
             clock: Arc::new(RwLock::new(
                 Arc::new(crate::time::SystemClock) as Arc<dyn crate::time::ClockSource>
             )),
+            dead_letter_trimmed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1750,6 +1754,19 @@ impl JobRegistry {
     #[must_use]
     pub fn snapshot(&self) -> HashMap<String, JobStatus> {
         self.inner.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Add `count` dead letters that a trim removed.
+    pub fn record_dead_letter_trimmed(&self, count: u64) {
+        self.dead_letter_trimmed
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Total dead letters that trims removed in this process.
+    #[must_use]
+    pub fn dead_letter_trimmed_total(&self) -> u64 {
+        self.dead_letter_trimmed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -3224,13 +3241,16 @@ fn render_labels(labels: &[(String, String)]) -> String {
 /// cardinality cap; emitted by `write_app_metrics` when any were dropped.
 pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_total";
 
+/// Redis dead letters removed to obey `jobs.redis.dead_letter_limit`.
+pub(crate) const DEAD_LETTER_TRIMMED_FAMILY: &str = "autumn_jobs_dead_letter_trimmed_total";
+
 /// Every metric family name the framework itself emits on `/actuator/prometheus`.
 ///
 /// Two callers share this list: `prometheus_endpoint` seeds its
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 23] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 24] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
@@ -3258,6 +3278,7 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 23] = [
     "autumn_cache_read_through_stale_serves_total",
     "autumn_cache_fill_lock_acquires_total",
     "autumn_cache_fill_lock_contended_total",
+    DEAD_LETTER_TRIMMED_FAMILY,
     crate::shadow::COMPARISONS_METRIC,
     crate::shadow::DIVERGENCES_METRIC,
 ];
@@ -3606,6 +3627,26 @@ fn write_builtin_cache_metrics(
     }
 }
 
+/// Render the built-in job families into `out` (issue #3055).
+///
+/// The family is always present, so an alert on `increase()` sees a `0`
+/// sample before the first trim.
+fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegistry) {
+    use std::fmt::Write;
+
+    let name = DEAD_LETTER_TRIMMED_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Redis dead letters removed to obey jobs.redis.dead_letter_limit"
+    );
+    let _ = writeln!(out, "# TYPE {name} counter");
+    let _ = writeln!(
+        out,
+        "{name}{{version=\"{version}\"}} {}",
+        registry.dead_letter_trimmed_total()
+    );
+}
+
 /// Render the shadow-mirroring families (issue #1653) into `out`.
 ///
 /// Written as built-in families rather than through the [`crate::metrics`]
@@ -3822,6 +3863,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         &version,
         &crate::cache::read_through_metrics().snapshot(),
     );
+    write_builtin_job_metrics(&mut out, &version, state.job_registry());
     if let Some(handle) = state.shadow() {
         write_builtin_shadow_metrics(&mut out, &version, &handle.snapshot());
     }
@@ -7762,6 +7804,61 @@ mod tests {
         assert!(text.contains("# HELP autumn_requests_shed_total"));
         assert!(text.contains("# TYPE autumn_requests_shed_total counter"));
         assert!(text.contains("autumn_requests_shed_total{version=\"stable\"} 0"));
+    }
+
+    /// Issue #3055: clones share one dead-letter trim counter.
+    #[test]
+    fn job_registry_dead_letter_trim_counter_is_shared() {
+        let registry = JobRegistry::new();
+        let clone = registry.clone();
+        assert_eq!(registry.dead_letter_trimmed_total(), 0);
+
+        clone.record_dead_letter_trimmed(3);
+        registry.record_dead_letter_trimmed(0);
+        registry.record_dead_letter_trimmed(2);
+        assert_eq!(registry.dead_letter_trimmed_total(), 5);
+        assert_eq!(clone.dead_letter_trimmed_total(), 5);
+    }
+
+    /// Issue #3055: the trim counter is a built-in Prometheus family.
+    #[tokio::test]
+    async fn prometheus_includes_dead_letter_trimmed_counter() {
+        const NAME: &str = "autumn_jobs_dead_letter_trimmed_total";
+        assert!(BUILTIN_METRIC_FAMILY_NAMES.contains(&NAME));
+
+        let state = test_state();
+        let scrape = |state: TestActuatorState| async move {
+            let resp = actuator_router(true)
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/actuator/prometheus")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+
+        // A zero sample exists before the first trim, so an alert can use rate().
+        let text = scrape(state.clone()).await;
+        assert!(text.contains(&format!("# TYPE {NAME} counter")), "{text}");
+        assert!(
+            text.contains(&format!("{NAME}{{version=\"stable\"}} 0\n")),
+            "{text}"
+        );
+
+        state.job_registry.record_dead_letter_trimmed(7);
+        let text = scrape(state).await;
+        assert!(
+            text.contains(&format!("{NAME}{{version=\"stable\"}} 7\n")),
+            "{text}"
+        );
     }
 
     #[cfg(feature = "cache-moka")]

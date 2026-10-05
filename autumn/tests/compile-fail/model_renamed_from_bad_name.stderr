@@ -1,0 +1,5 @@
+error: write `#[renamed_from("old_name")]` with one snake_case name: start with a lowercase letter or `_`, then use lowercase letters, digits and `_`, at most 63 bytes
+ --> tests/compile-fail/model_renamed_from_bad_name.rs:8:5
+  |
+8 |     #[renamed_from("Old Slug")]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
