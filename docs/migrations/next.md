@@ -109,6 +109,38 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Media: `MediaPlugin` installs only the primitives you enable
+
+**Why:** The docs said both primitives are off by default, but `build`
+installed storage, the encode jobs and the retention sweep for every plugin.
+`with_broadcast()` did nothing. Issue #1974.
+
+**Before (`0.8`):**
+
+```rust
+// Storage, encode jobs and the retention sweep installed.
+autumn_web::app().plugin(MediaPlugin::new().config(media).recordings_root("recordings"))
+```
+
+**After:**
+
+```rust
+// Enable the primitive you use. Broadcast also installs MediaMtxClient and MediaUrls.
+autumn_web::app().plugin(
+    MediaPlugin::new()
+        .config(media)
+        .with_broadcast()
+        .recordings_root("recordings"),
+)
+```
+
+With no primitive, the plugin installs no routes, extensions or jobs, and logs
+a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
+`media` queue have no handler, and the retention sweep does not start.
+
+**Automation:** `manual` — this is a runtime behavior change. The code still
+compiles, so a codemod cannot know which primitive your app uses.
+
 ---
 
 ## Plugin authors
