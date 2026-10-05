@@ -3393,7 +3393,11 @@ case "$1 $2" in
     if [ -n "$query" ]; then
       echo "${STUB_REPLICAS:-0}"
     elif ! grep -q "revision restart" "$STUB_LOG"; then
+      if [ -n "$STUB_RESTART_FROM_ZERO" ]; then echo '[]'; exit 0; fi
       echo '[{"name":"r-old","properties":{"runningState":"Running","containers":[{"ready":true}]}}]'
+    elif [ -n "$STUB_RESTART_FROM_ZERO" ] && { [ "$STUB_RESTART_FROM_ZERO" = never ] || ! grep -q "^curl " "$STUB_LOG"; }; then
+      # Scaled to zero: no replica starts until a request comes in.
+      echo '[]'
     else
       # After a restart, the old replica stays for the first
       # STUB_RESTART_STALE reads. The new one is ready unless
@@ -3469,7 +3473,14 @@ esac
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        for (name, body) in [("az", AZ_STUB), ("sleep", "#!/bin/sh\nexit 0\n")] {
+        for (name, body) in [
+            ("az", AZ_STUB),
+            ("sleep", "#!/bin/sh\nexit 0\n"),
+            (
+                "curl",
+                "#!/bin/sh\necho \"curl $*\" >> \"$STUB_LOG\"\nexit 0\n",
+            ),
+        ] {
             let path = bin.join(name);
             fs::write(&path, body).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3498,6 +3509,7 @@ esac
             .env_remove("STUB_LATEST")
             .env_remove("STUB_STATUS_SEQ")
             .env_remove("STUB_SIDECAR_FIRST")
+            .env_remove("STUB_RESTART_FROM_ZERO")
             .env_remove("STUB_ACTIVE_SCALE_RULE")
             .env_remove("STUB_JOB_NO_SECRETS")
             .env_remove("STUB_ACTIVE_EMPTY")
@@ -3809,6 +3821,53 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_wakes_a_revision_restarted_from_zero() {
+        // Scaled to zero, the restart starts no replica. The script sends a
+        // request to start one, and waits until it is ready.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_RESTART_FROM_ZERO", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(
+            calls[restart_at..].contains("curl ") && calls.contains("app.example.internal"),
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_no_replica_starts_after_the_restart() {
+        // No ready replica, no proof that the app starts with the new
+        // secrets. Zero replicas before the restart is no exception.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_RESTART_FROM_ZERO", "never"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_checks_the_job_before_it_disables_ingress() {
         // Without secrets on the job, the cutover cannot run. The script
         // stops before it changes the ingress.
@@ -3828,39 +3887,39 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn azure_cutover_script_finds_the_app_container_by_name() {
-        // An operator can put a sidecar first. The image and the secret env
-        // vars go to the container named after the app, not to the sidecar.
-        let Some((status, calls, bodies)) = run_azure_cutover(
+    fn azure_cutover_script_stops_when_the_app_container_is_not_first() {
+        // main.tf ignores the env of the first container only. With a sidecar
+        // first, a later `terraform apply` would remove the secret env vars
+        // from the app container. The script stops before any change.
+        let Some((status, calls, _)) = run_azure_cutover(
             "mcr.microsoft.com/k8se/quickstart:latest",
             "Provisioned",
             false,
             0,
-            &[("STUB_SIDECAR_FIRST", "1")],
+            &[("STUB_SIDECAR_FIRST", "1"), ("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_reads_the_app_image_by_name() {
+        // The active revisions and the new revision are read by the name of
+        // the app container, not by position.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[],
         ) else {
             return;
         };
         assert!(status.success(), "{calls}");
-        let patch: serde_json::Value = serde_json::from_str(
-            bodies
-                .lines()
-                .find(|line| line.contains("\"template\""))
-                .expect("a template PATCH"),
-        )
-        .unwrap();
-        let containers = patch["properties"]["template"]["containers"]
-            .as_array()
-            .unwrap();
-        assert_eq!(containers[0]["name"], "sidecar", "{patch}");
-        assert_eq!(containers[0]["image"], "busybox", "{patch}");
-        assert!(containers[0].get("env").is_none(), "{patch}");
-        assert_eq!(containers[1]["name"], "app", "{patch}");
-        assert_eq!(containers[1]["image"], "acr.azurecr.io/app:t1", "{patch}");
-        assert!(
-            containers[1]["env"].to_string().contains("signing-secret"),
-            "{patch}"
-        );
-        // The active revisions and the new revision are read by name too.
         assert!(
             calls.matches("containers[?name=='app']").count() >= 2,
             "{calls}"
