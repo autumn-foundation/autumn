@@ -424,6 +424,22 @@ resource "azurerm_container_app" "this" {
       cpu    = 0.5
       memory = "1Gi"
 
+      # /ready gates traffic. Autumn sets it to 503 when a drain starts, so
+      # the replica gets no new requests before it stops.
+      readiness_probe {
+        transport = "HTTP"
+        port      = 3000
+        path      = "/ready"
+      }
+
+      # A failed liveness probe restarts the replica. /live does not fail
+      # when a dependency (the database, say) is down.
+      liveness_probe {
+        transport = "HTTP"
+        port      = 3000
+        path      = "/live"
+      }
+
       env {
         name  = "AUTUMN_PROFILE"
         value = "prod"

@@ -11,6 +11,20 @@ verus verification/tenant_arena.rs
 The runtime correspondence and boundary are recorded in ADR 0012; executable
 tests remain authoritative for unmodeled allocator, HTTP, and concurrency glue.
 
+## CI
+
+`.github/workflows/verus.yml` runs `scripts/verify-verus.sh`, which runs Verus
+on every `verification/*.rs` file. A new spec needs no workflow change. The job
+runs when a file in this directory changes, and once each week. It is not a
+required check yet, so a failed proof does not block a merge.
+
+Run the same check on your machine:
+
+```sh
+scripts/verify-verus.sh                          # uses `verus` on PATH
+VERUS_BIN=/path/to/verus scripts/verify-verus.sh
+```
+
 ## Billing plan gate
 
 `billing_gate.rs` models the plan gate selection in

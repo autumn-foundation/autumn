@@ -1,7 +1,7 @@
 //! Durable job queue for the `SQLite` backend (issue #1907).
 //!
-//! The Postgres queue coordinates with `LISTEN`/`NOTIFY`, `FOR UPDATE SKIP
-//! LOCKED`, and advisory locks. `SQLite` has none of those, and a `SQLite`
+//! The Postgres queue coordinates with `FOR UPDATE SKIP LOCKED` and advisory
+//! locks. `SQLite` has neither of those, and a `SQLite`
 //! deployment is single-host, so this backend uses the single-host equivalents:
 //!
 //! - **The queue is a table** (`autumn_jobs`) in the app's own database file.
@@ -236,8 +236,8 @@ pub(super) struct SqliteJobQueue {
     ///
     /// The enqueue client and the worker loops hold the same handle, so a job
     /// enqueued in this process starts at once instead of waiting out a poll.
-    /// Work another process enqueued still waits for the poll — `SQLite` has no
-    /// `LISTEN`/`NOTIFY`.
+    /// Work another process enqueued still waits for the poll — `SQLite` has
+    /// no `LISTEN`/`NOTIFY`.
     wake: Arc<tokio::sync::Notify>,
 }
 

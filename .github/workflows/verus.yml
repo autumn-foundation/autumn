@@ -1,0 +1,67 @@
+name: Verus proofs
+
+# Runs every Verus spec in verification/ (issue #3066). The specs are not in
+# the Cargo workspace, because Verus uses an extended Rust dialect.
+#
+# This is not a required check yet. A red run shows a broken proof, but it
+# does not block a merge. The weekly run finds a new Verus release that
+# breaks a proof.
+
+on:
+  pull_request:
+    paths:
+      - "verification/**"
+      - "scripts/verify-verus.sh"
+      - ".github/workflows/verus.yml"
+  push:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "verification/**"
+      - "scripts/verify-verus.sh"
+      - ".github/workflows/verus.yml"
+  schedule:
+    # Mondays 05:17 UTC.
+    - cron: "17 5 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verus:
+    name: Verus proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Verus
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dir="$RUNNER_TEMP/verus"
+          mkdir -p "$dir"
+          # The latest release. The weekly run finds a release that breaks a proof.
+          gh release download --repo verus-lang/verus --pattern '*x86-linux.zip' --dir "$dir"
+          unzip -q "$dir"/*.zip -d "$dir"
+          verus_bin="$(find "$dir" -type f -name verus -perm -u+x | head -n 1)"
+          if [ -z "$verus_bin" ]; then
+            echo "::error::the Verus release asset has no verus binary"
+            exit 1
+          fi
+          # Verus needs one exact Rust toolchain. When it is missing, Verus
+          # names it in a `rustup install <toolchain>` hint.
+          out="$("$verus_bin" --version 2>&1)" || true
+          toolchain="$(printf '%s\n' "$out" | grep -oE 'rustup (toolchain )?install [^ ]+' | awk '{print $NF}' | head -n 1)" || true
+          if [ -n "$toolchain" ]; then
+            rustup toolchain install "$toolchain" --profile minimal
+          fi
+          "$verus_bin" --version
+          echo "VERUS_BIN=$verus_bin" >> "$GITHUB_ENV"
+
+      - name: Verify specs
+        run: ./scripts/verify-verus.sh

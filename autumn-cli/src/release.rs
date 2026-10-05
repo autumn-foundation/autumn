@@ -1385,8 +1385,8 @@ mod tests {
             "Dockerfile must have a HEALTHCHECK directive"
         );
         assert!(
-            content.contains("/health"),
-            "HEALTHCHECK must probe the /health actuator endpoint"
+            content.contains("localhost:3000/live"),
+            "HEALTHCHECK must probe the /live liveness endpoint"
         );
     }
 
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     /// Issue #1603 AC6: an image whose app terminates TLS itself
-    /// (`[server.tls]`) answers `/health` over **HTTPS**, so a HEALTHCHECK
+    /// (`[server.tls]`) answers `/live` over **HTTPS**, so a HEALTHCHECK
     /// hardcoded to `http://` marks that container permanently unhealthy —
     /// and in compose, `depends_on: condition: service_healthy` never
     /// releases. The probe URL must therefore be overridable at runtime.
@@ -1429,7 +1429,7 @@ mod tests {
              image can be probed over https://, got: {healthcheck}"
         );
         assert!(
-            healthcheck.contains("http://localhost:3000/health"),
+            healthcheck.contains("http://localhost:3000/live"),
             "the default probe URL must stay today's plain-HTTP one, got: {healthcheck}"
         );
         assert!(
@@ -1465,25 +1465,21 @@ mod tests {
             // Default: today's plain-HTTP probe, verification on.
             (None, None, false),
             // An https URL alone is NOT enough — fail safe, not fail open.
-            (Some("https://localhost:3000/health"), None, false),
+            (Some("https://localhost:3000/live"), None, false),
             // The documented direct-TLS pairing.
-            (Some("https://localhost:3000/health"), Some("1"), true),
+            (Some("https://localhost:3000/live"), Some("1"), true),
             // Any non-empty value opts in; the value itself is not parsed.
-            (Some("https://localhost:3000/health"), Some("true"), true),
+            (Some("https://localhost:3000/live"), Some("true"), true),
             // An empty value is not an opt-in.
-            (Some("https://localhost:3000/health"), Some(""), false),
+            (Some("https://localhost:3000/live"), Some(""), false),
             // URLs that a parser would have mistaken for loopback stay verified
             // unless the operator opted in — curl resolves both remotely.
             (
-                Some("https://localhost:3000@remote.example/health"),
+                Some("https://localhost:3000@remote.example/live"),
                 None,
                 false,
             ),
-            (
-                Some("https://remote.example#@localhost/health"),
-                None,
-                false,
-            ),
+            (Some("https://remote.example#@localhost/live"), None, false),
         ];
 
         for (url, insecure, expect_insecure) in cases {
@@ -1512,7 +1508,7 @@ mod tests {
                 if expect_insecure { "" } else { "NOT" }
             );
             // The probe must hit the URL it was given, verbatim.
-            let expected_url = url.unwrap_or("http://localhost:3000/health");
+            let expected_url = url.unwrap_or("http://localhost:3000/live");
             assert!(
                 invocation.contains(expected_url),
                 "the probe must request {expected_url}; curl was called as: {invocation}"
@@ -4402,7 +4398,7 @@ previous_secrets = []
     #[test]
     fn aws_app_runner_bootstrap_health_check_matches_the_placeholder_not_the_real_app() {
         // aws_apprunner_service blocks `terraform apply` until the service
-        // reaches a stable state — declaring port 3000 / path "/health"
+        // reaches a stable state — declaring port 3000 / path "/ready"
         // against a bootstrap image that doesn't serve either would hang
         // the very first apply. The placeholder (nginx) listens on 80 and
         // returns 200 for "/" by default; the real port/path are restored
@@ -4425,7 +4421,7 @@ previous_secrets = []
         assert!(
             health_check_block.contains("path     = \"/\""),
             "the bootstrap health check must probe \"/\" (nginx's default 200 response), \
-             not \"/health\": {health_check_block}"
+             not \"/ready\": {health_check_block}"
         );
     }
 
@@ -4433,7 +4429,7 @@ previous_secrets = []
     fn aws_app_runner_ignores_health_check_drift_after_cutover_restores_it() {
         // The cutover call (docs/guide/deployment.md) switches
         // health_check_configuration from the bootstrap's "/" to the real
-        // app's "/health" — without ignoring this block too, a later
+        // app's "/ready" — without ignoring this block too, a later
         // `terraform apply` would see that as drift from this resource's
         // own declared "/" and revert it, breaking the real app's health
         // check.
@@ -5009,7 +5005,7 @@ previous_secrets = []
     #[test]
     fn aws_ecs_app_bootstrap_container_actually_listens_on_the_alb_health_check_port() {
         // Unlike App Runner, the ALB target group's health check (port
-        // 3000, path /health) is a PERMANENT Terraform-managed resource —
+        // 3000, path /ready) is a PERMANENT Terraform-managed resource —
         // there's no separate "swap it back after cutover" step available,
         // so the bootstrap container must satisfy it directly. The public
         // placeholder (nginx) doesn't do this out of the box; the "app"
@@ -5034,8 +5030,8 @@ previous_secrets = []
              on port 3000, matching the ALB target group: {app_block}"
         );
         assert!(
-            app_block.contains("/health"),
-            "the app container's bootstrap command must serve the same /health path the \
+            app_block.contains("location /ready"),
+            "the app container's bootstrap command must serve the same /ready path the \
              target group checks: {app_block}"
         );
         // The "migrate" task's command is already overridden to run `autumn
@@ -7003,12 +6999,16 @@ previous_secrets = []
     ];
 
     /// The probes each target must render, as `(file, block marker, needle)`.
-    /// `/ready` gates traffic. `/live` triggers a restart.
+    /// `/ready` gates traffic. `/live` triggers a restart. `/startup` holds
+    /// a new instance until startup is complete.
     fn probe_expectations(target: Target) -> &'static [(&'static str, &'static str, &'static str)] {
         // The Docker HEALTHCHECK is a liveness signal: an unhealthy container
         // is restarted or replaced, so it must not fail on a dependency.
-        const DOCKER_LIVENESS: (&str, &str, &str) =
-            ("Dockerfile", "HEALTHCHECK ", "localhost:3000/live");
+        const DOCKER_LIVENESS: (&str, &str, &str) = (
+            "Dockerfile",
+            "${AUTUMN_HEALTHCHECK_URL:-",
+            "localhost:3000/live",
+        );
         match target {
             Target::Default | Target::DockerCompose => &[DOCKER_LIVENESS],
             Target::Fly => &[
@@ -7030,7 +7030,9 @@ previous_secrets = []
             ],
             Target::GcpCloudRun => &[
                 DOCKER_LIVENESS,
-                ("main.tf", "startup_probe {", r#"path = "/ready""#),
+                // Cloud Run has no readiness probe. Its startup probe uses
+                // /startup, as docs/guide/cloud-native.md recommends.
+                ("main.tf", "startup_probe {", r#"path = "/startup""#),
                 ("main.tf", "liveness_probe {", r#"path = "/live""#),
             ],
             Target::AzureContainerApps => &[

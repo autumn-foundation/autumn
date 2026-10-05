@@ -299,6 +299,11 @@ the `autumn_jobs` table. Workers claim a row atomically with
 `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)`, which prevents any
 two replicas from claiming the same job simultaneously.
 
+Workers poll. There is no `LISTEN`/`NOTIFY` wake-up. A busy worker claims the
+next job at once. An idle worker polls again after 200ms, so a new job can wait
+up to 200ms before a worker claims it. This is true also for a job that the
+same process enqueued.
+
 A claimed job's status is set to `running` with a `claimed_at` timestamp and a
 `claimed_by` worker id. A maintenance loop running inside each worker process
 requeues jobs whose `claimed_at` is older than `jobs.postgres.visibility_timeout_ms`.

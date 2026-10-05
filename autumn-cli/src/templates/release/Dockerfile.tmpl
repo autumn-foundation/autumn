@@ -126,10 +126,15 @@ LABEL org.opencontainers.image.title="{{project_name}}" \
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000
 
-# Container health probe. Override AUTUMN_HEALTHCHECK_URL when the app
-# terminates TLS itself ([server.tls], issue #1603) — e.g.
-# `https://localhost:3000/health` — otherwise an HTTPS-serving container would
-# be marked unhealthy forever by a plain-HTTP probe.
+# Container liveness probe. It uses /live, not /ready: an unhealthy container
+# is restarted or replaced, and /live does not fail when a dependency (the
+# database, say) is down. Platforms that route traffic use their own /ready
+# check instead.
+#
+# Override AUTUMN_HEALTHCHECK_URL when the app terminates TLS itself
+# ([server.tls], issue #1603) — e.g. `https://localhost:3000/live` — otherwise
+# an HTTPS-serving container would be marked unhealthy forever by a plain-HTTP
+# probe.
 #
 # Certificate verification is skipped only when AUTUMN_HEALTHCHECK_INSECURE is
 # set to a non-empty value. Set it alongside a LOOPBACK https URL: that probe
@@ -143,7 +148,7 @@ EXPOSE 3000
 # always verifies.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -fsS ${AUTUMN_HEALTHCHECK_INSECURE:+--insecure} \
-        "${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/health}" >/dev/null || exit 1
+        "${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/live}" >/dev/null || exit 1
 
 USER autumn
 
