@@ -446,10 +446,23 @@ fi
 if [ -z "$RELEASED" ]; then
     # Without ingress, only a scale rule that is not HTTP can start the
     # placeholder again. Then zero replicas is no proof, so the script stops
-    # before any write.
-    if jq -e '[.properties.template.scale.rules // [] | .[] | select(.http == null)] | length > 0' \
-      <<< "$APP" > /dev/null; then
-      echo "::error::the placeholder has a scale rule that is not HTTP. It can start the placeholder after the script disables ingress. Remove the rule until the first cutover is done." >&2
+    # before any write. The template and each active revision must have no
+    # such rule: a revision keeps its own rules, and the old revision stays
+    # active until a new one is ready.
+    CUSTOM_RULE='[(. // []) | .[] | select(.http == null)] | length > 0'
+    RULE_AT=""
+    jq -e ".properties.template.scale.rules | $CUSTOM_RULE" <<< "$APP" > /dev/null && RULE_AT="the template"
+    for revision in $ACTIVE_REVISIONS; do
+      RULES=$(az containerapp revision show \
+        --name "$AZURE_APP_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --revision "$revision" \
+        --query properties.template.scale.rules \
+        --output json) || { echo "::error::cannot read the scale rules of revision $revision" >&2; exit 1; }
+      jq -e "$CUSTOM_RULE" <<< "${RULES:-null}" > /dev/null && RULE_AT="revision $revision"
+    done
+    if [ -n "$RULE_AT" ]; then
+      echo "::error::$RULE_AT of the placeholder has a scale rule that is not HTTP. It can start the placeholder after the script disables ingress. Remove the rule, wait until no active revision has it, and run the script again." >&2
       exit 1
     fi
     # The first cutover. Disable ingress, so no request (internal or
