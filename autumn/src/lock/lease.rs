@@ -687,13 +687,12 @@ impl Renewal {
             if Instant::now() >= valid_until {
                 return lose(&lease, "no renewal succeeded in time");
             }
-            let sent = Instant::now();
             match tokio::time::timeout_at(valid_until, self.renew_once(&pool, &lease)).await {
-                Ok(Ok(true)) => {
+                Ok(Ok(Some(sent))) => {
                     lease.deadline.set(sent + self.valid_for);
                     next = sent + self.every;
                 }
-                Ok(Ok(false)) => return lose(&lease, "the lease expired or has a new holder"),
+                Ok(Ok(None)) => return lose(&lease, "the lease expired or has a new holder"),
                 Ok(Err(error)) => {
                     tracing::debug!(
                         lock_name = %lease.name,
@@ -707,13 +706,16 @@ impl Renewal {
         }
     }
 
-    /// `Ok(true)` renewed, `Ok(false)` the lease is gone, `Err` no answer.
+    /// `Ok(Some(sent))` renewed, `Ok(None)` the lease is gone, `Err` no
+    /// answer. `sent` is the time after the checkout, before the query: the
+    /// database reads `now()` later, so a deadline from `sent` ends first.
     async fn renew_once(
         self,
         pool: &Pool<AsyncPgConnection>,
         lease: &Lease,
-    ) -> Result<bool, LockError> {
+    ) -> Result<Option<Instant>, LockError> {
         let mut conn = pool.get().await.map_err(pool_error)?;
+        let sent = Instant::now();
         let rows = diesel::sql_query(RENEW)
             .bind::<diesel::sql_types::Text, _>(&*lease.name)
             .bind::<diesel::sql_types::BigInt, _>(lease.token.as_i64())
@@ -721,7 +723,7 @@ impl Renewal {
             .execute(&mut *conn)
             .await
             .map_err(db_error)?;
-        Ok(rows > 0)
+        Ok((rows > 0).then_some(sent))
     }
 }
 
