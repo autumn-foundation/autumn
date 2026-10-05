@@ -209,7 +209,7 @@ sole_active() {
 # provisioned and no other revision is active. Stage 2 then removes the
 # identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local live status state latest revision body containers source first
+  local live status state latest revision body containers source first patch
   live=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -255,9 +255,26 @@ remove_credentials() {
       --output tsv) || return 1
     read -r _ latest <<< "$status"
     revision="$latest"
+    # A PATCH is needed when the template still refers to a secret, or when
+    # the clean revision of an earlier run failed. The marker env var makes
+    # the template differ, so Azure makes a fresh revision.
+    patch=""
     if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null; then
-      body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" '
-        {location: $app.location, properties: {template: {containers: $containers}}}')
+      patch=1
+    else
+      state=$(az containerapp revision show \
+        --name "$AZURE_APP_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --revision "$latest" \
+        --query properties.provisioningState \
+        --output tsv) || return 1
+      [ "$state" = Failed ] && patch=1
+    fi
+    if [ -n "$patch" ]; then
+      body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" --arg now "$(date +%s)" '
+        {location: $app.location, properties: {template: {containers: ($containers
+          | .[0].env = [(.[0].env // [])[] | select(.name != "AUTUMN_CREDENTIAL_CLEANUP")]
+                       + [{name: "AUTUMN_CREDENTIAL_CLEANUP", value: $now}])}}}')
       patch_app "$body" || return 1
       revision=""
     fi
@@ -403,7 +420,8 @@ CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAG
       | .image = $image
       | .env = ([(.env // [])[] | select(.name | IN(
           "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
-          "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)] + $env))]
+          "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL",
+          "AUTUMN_CREDENTIAL_CLEANUP") | not)] + $env))]
     + .[1:]
 ')
 
