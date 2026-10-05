@@ -190,6 +190,14 @@ my-app/
 > time component, a version that isn't a real UTC timestamp, and any duplicate
 > (`scripts/check-migration-versions.sh`).
 
+> **Declarative schema (`autumn schema`).** On a `#[model(managed)]` model,
+> `autumn schema diff --write-migration` derives the migration from the model
+> and the snapshot. To rename, put `#[renamed_from("old_name")]` on the field,
+> or on the model after `#[model]`. The diff then emits `ALTER TABLE ...
+> RENAME`, not a drop plus an add. To diff against what the migrations really
+> make, pass `--dev-url <dev server URL>` (or set `AUTUMN_DEV_URL`). See
+> `docs/guide/declarative-schema.md`.
+
 ## Cargo.toml
 
 ```toml
