@@ -106,7 +106,6 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
-/// Connection pooler detection (issue #3065).
 pub mod pooler;
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]

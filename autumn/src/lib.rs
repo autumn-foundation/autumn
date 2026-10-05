@@ -210,7 +210,6 @@ pub mod format;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
-/// HTTP serve loop with `[server.http]` connection limits.
 pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;
