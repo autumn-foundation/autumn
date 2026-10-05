@@ -210,7 +210,8 @@ impl CapsuleService {
     /// # Errors
     ///
     /// The errors of [`export_subject`], `collect_blobs`, and
-    /// [`DataCapsule::write_dir`].
+    /// [`DataCapsule::write_dir`]. [`DataCapsuleError::NotConfigured`] when a
+    /// record holds a blob key but the service has no blob store.
     pub async fn export_to(
         &self,
         subject: &str,
@@ -219,9 +220,12 @@ impl CapsuleService {
         #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
         let mut capsule = export_subject(&self.models, self.store.as_ref(), subject).await?;
         #[cfg(feature = "storage")]
-        if let Some(blobs) = &self.blobs {
-            super::collect_blobs(&mut capsule, blobs.as_ref()).await?;
+        match &self.blobs {
+            Some(blobs) => super::collect_blobs(&mut capsule, blobs.as_ref()).await?,
+            None => no_store_for_blob_keys(&capsule)?,
         }
+        #[cfg(not(feature = "storage"))]
+        no_store_for_blob_keys(&capsule)?;
         let report = ExportReport {
             subject: subject.to_owned(),
             records: capsule.records.values().map(|r| r.len() as u64).sum(),
@@ -289,6 +293,26 @@ fn no_blob_store(capsule: &DataCapsule) -> Result<(), DataCapsuleError> {
         Err(DataCapsuleError::NotConfigured(
             "the capsule has blobs, but no blob store is configured".to_owned(),
         ))
+    }
+}
+
+/// Export without a blob store fails when a record holds a blob key. A capsule
+/// without those blobs cannot restore them.
+fn no_store_for_blob_keys(capsule: &DataCapsule) -> Result<(), DataCapsuleError> {
+    let holds_key = capsule.manifest.models.iter().any(|model| {
+        capsule.records(&model.table).iter().any(|row| {
+            model
+                .blob_columns
+                .iter()
+                .any(|column| row.get(column).and_then(super::viewer::blob_key).is_some())
+        })
+    });
+    if holds_key {
+        Err(DataCapsuleError::NotConfigured(
+            "records hold blob keys, but no blob store is configured".to_owned(),
+        ))
+    } else {
+        Ok(())
     }
 }
 

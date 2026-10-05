@@ -59,12 +59,14 @@ autumn_web::app()
 - `exclude(column)` keeps a column out of the capsule.
 
 **Exclude all secrets.** Export copies every column that you do not exclude.
-Exclude password hashes, tokens, and internal flags. Import cannot restore an
+Exclude password hashes, tokens, and internal flags. If an excluded column is
+not in the table (for example, a typo), export fails. Import cannot restore an
 excluded column, so the column must accept `NULL` or have a default.
 
 **Check blob ownership.** Export copies each blob that a blob column names. If
 users can write a blob key into a row, make sure that the key belongs to the
-subject.
+subject. If a record holds a blob key and no blob store is configured, export
+fails.
 
 ## Set the signing secret
 
@@ -181,7 +183,9 @@ a domain over `money` or `money[]` as plain numbers. Time stamps, `bytea`,
 `uuid`, and arrays keep their exact values.
 
 The subject id must be a valid value of the subject column type. For example,
-`abc` for a `bigint` column is an input error (`400`).
+`abc` for a `bigint` column is an input error (`400`). The column type must not
+change the value: `ab123-extra` for a `varchar(5)` column, or `1.234` for a
+`numeric(6, 2)` column, is also an input error.
 
 ## Limits
 

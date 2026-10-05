@@ -20,7 +20,7 @@ mod imp {
     use nix::dir::{Dir, Type};
     use nix::errno::Errno;
     use nix::fcntl::{AtFlags, OFlag, open, openat};
-    use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
+    use nix::sys::stat::{Mode, SFlag, fstat, fstatat, mode_t};
 
     use super::DataCapsuleError;
 
@@ -51,7 +51,8 @@ mod imp {
         }
     }
 
-    fn kind_of(mode: u32) -> SFlag {
+    /// `mode_t` is `u16` on macOS and `u32` on Linux.
+    fn kind_of(mode: mode_t) -> SFlag {
         SFlag::from_bits_truncate(mode) & SFlag::S_IFMT
     }
 

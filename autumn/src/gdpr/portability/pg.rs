@@ -186,17 +186,18 @@ fn fields(columns: Vec<Column>) -> Vec<FieldSpec> {
 struct CastRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     ok: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    exact: bool,
 }
 
-/// The type name of the subject column of `model`.
-fn subject_type<'c>(
+/// The subject column of `model`.
+fn subject_column<'c>(
     model: &CapsuleModel,
     columns: &'c [Column],
-) -> Result<&'c str, DataCapsuleError> {
+) -> Result<&'c Column, DataCapsuleError> {
     columns
         .iter()
         .find(|c| c.field.name == model.subject_column)
-        .map(|c| c.field.data_type.as_str())
         .ok_or_else(|| {
             DataCapsuleError::Store(format!(
                 "{} has no column {:?}",
@@ -205,7 +206,13 @@ fn subject_type<'c>(
         })
 }
 
-/// Check that the subject column type can read `subject`.
+/// Check that the subject column type reads `subject` without a change.
+///
+/// An explicit cast to a type with a modifier can change the value:
+/// `varchar(5)` cuts `ab123-extra` to `ab123`, and `numeric(6, 2)` rounds
+/// `1.234` to `1.23`. Then the query finds the records of another subject. So
+/// the value after the cast must be equal to the value as the base type
+/// without a modifier.
 ///
 /// Run it outside a transaction: a failed cast aborts the transaction.
 async fn check_subject(
@@ -214,7 +221,8 @@ async fn check_subject(
     columns: &[Column],
     subject: &str,
 ) -> Result<(), DataCapsuleError> {
-    let subject_type = subject_type(model, columns)?;
+    let column = subject_column(model, columns)?;
+    let (subject_type, bare) = (column.field.data_type.as_str(), column.base_type.as_str());
     let invalid = |reason: String| {
         DataCapsuleError::InvalidInput(format!(
             "subject {subject:?} is not a valid {subject_type} for {}: {reason}",
@@ -222,18 +230,22 @@ async fn check_subject(
         ))
     };
     let row = diesel::sql_query(format!(
-        "SELECT CAST($1 AS {subject_type}) IS NOT NULL AS ok"
+        "SELECT CAST($1 AS {subject_type}) IS NOT NULL AS ok, \
+                CAST(CAST($1 AS {subject_type}) AS {bare}) IS NOT DISTINCT FROM \
+                CAST($1 AS {bare}) AS exact"
     ))
     .bind::<diesel::sql_types::Text, _>(subject)
     .get_result::<CastRow>(conn)
     .await
     .map_err(|e| invalid(e.to_string()))?;
     // A cast that gives `NULL` (a custom type can do this) matches no row.
-    if row.ok {
-        Ok(())
-    } else {
-        Err(invalid("the cast gives NULL".to_owned()))
+    if !row.ok {
+        return Err(invalid("the cast gives NULL".to_owned()));
     }
+    if !row.exact {
+        return Err(invalid("the column type changes the value".to_owned()));
+    }
+    Ok(())
 }
 
 /// The records of `model` whose subject column is `subject`.
@@ -246,7 +258,7 @@ async fn fetch_rows(
     columns: &[Column],
     subject: &str,
 ) -> Result<Vec<Record>, DataCapsuleError> {
-    let subject_type = subject_type(model, columns)?;
+    let subject_type = subject_column(model, columns)?.field.data_type.as_str();
     let exprs = columns
         .iter()
         .map(select_expr)

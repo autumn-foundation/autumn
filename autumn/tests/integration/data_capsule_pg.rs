@@ -364,3 +364,59 @@ async fn postgres_import_is_atomic_and_reports_a_missing_parent() {
 
     drop(container);
 }
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_rejects_a_subject_that_the_column_type_changes() {
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("postgres");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    PgConnection::establish(&url)
+        .expect("connect")
+        .batch_execute(
+            "CREATE TABLE accounts (code VARCHAR(5) PRIMARY KEY, note TEXT); \
+             CREATE TABLE fees (id INT PRIMARY KEY, amount NUMERIC(6, 2), note TEXT); \
+             INSERT INTO accounts VALUES ('ab123', 'mine'); \
+             INSERT INTO fees VALUES (1, 1.23, 'mine');",
+        )
+        .expect("schema");
+    let store = PgCapsuleStore::new(pool(&url));
+
+    // An explicit cast to `varchar(5)` cuts `ab123-extra` to `ab123`, and an
+    // explicit cast to `numeric(6, 2)` rounds `1.234` to `1.23`. Neither
+    // request may get the records of another subject.
+    for (model, subject) in [
+        (
+            CapsuleModel::new("accounts", "code").primary_key("code"),
+            "ab123-extra",
+        ),
+        (CapsuleModel::new("fees", "amount"), "1.234"),
+    ] {
+        let err = export_subject(std::slice::from_ref(&model), &store, subject)
+            .await
+            .expect_err("lossy subject");
+        assert!(
+            matches!(err, DataCapsuleError::InvalidInput(_)),
+            "{subject}: {err:?}"
+        );
+    }
+
+    // The exact values still work, also with a different but equal form.
+    let accounts = [CapsuleModel::new("accounts", "code").primary_key("code")];
+    let capsule = export_subject(&accounts, &store, "ab123")
+        .await
+        .expect("export");
+    assert_eq!(capsule.records("accounts").len(), 1);
+    let fees = [CapsuleModel::new("fees", "amount")];
+    let capsule = export_subject(&fees, &store, "1.230")
+        .await
+        .expect("export");
+    assert_eq!(capsule.records("fees").len(), 1);
+
+    drop(container);
+}

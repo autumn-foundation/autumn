@@ -415,6 +415,17 @@ async fn excluded_columns_are_not_in_the_capsule() {
 }
 
 #[tokio::test]
+async fn export_rejects_an_exclusion_that_names_no_column() {
+    // A typo must not let the real column into the capsule.
+    let models = [CapsuleModel::new("users", "id").exclude("boi")];
+    let err = export_subject(&models, &seeded_store(), "1")
+        .await
+        .expect_err("unknown exclusion");
+    assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+    assert!(err.to_string().contains("boi"), "{err}");
+}
+
+#[tokio::test]
 async fn every_viewer_link_points_at_a_file_and_an_anchor() {
     let (_dir, root) = written().await;
     let mut pages = vec![root.join("viewer/index.html")];
@@ -836,6 +847,23 @@ mod blobs {
         let target = CapsuleService::new(models(), Arc::new(empty), signer());
         let err = target.import_from(&root).await.expect_err("no blob store");
         assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn export_without_a_blob_store_rejects_records_with_blob_keys() {
+        use std::sync::Arc;
+
+        use autumn_web::gdpr::portability::CapsuleService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CapsuleService::new(models(), Arc::new(store()), signer());
+        let root = tmp.path().join("capsule");
+        let err = service
+            .export_to("1", &root)
+            .await
+            .expect_err("records point at blobs");
+        assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
+        assert!(!root.exists(), "no capsule without its blobs");
     }
 
     #[tokio::test]
