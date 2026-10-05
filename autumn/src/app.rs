@@ -3640,6 +3640,16 @@ impl AppBuilder {
             return;
         }
 
+        // ── Data-capsule mode ───────────────────────────────────────────
+        // With AUTUMN_DATA_CAPSULE=export|import|verify, export one subject
+        // to a signed capsule, import a capsule, or verify one, and exit.
+        // Triggered by `autumn data capsule` (issue #1811). It runs inside the
+        // app, so it uses the app's own registry, database, and secret.
+        if let Some(mode) = data_capsule_mode_from_env() {
+            self.run_data_capsule_mode(mode).await;
+            return;
+        }
+
         // ── Capsule replay mode ────────────────────────────────────────
         // When AUTUMN_REPLAY_CAPSULE=<path> is set, rebuild this application
         // offline, drive the request the capsule recorded through it, print the
@@ -7489,6 +7499,133 @@ impl AppBuilder {
         }
     }
 
+    /// Run `AUTUMN_DATA_CAPSULE=export|import|verify` and exit (issue #1811).
+    ///
+    /// `verify` needs only the signing secret, so it opens no database. The
+    /// other modes boot the database, the blob store, and the app's state
+    /// initializers, which install the [`crate::gdpr::GdprRegistry`].
+    #[allow(clippy::too_many_lines)]
+    async fn run_data_capsule_mode(self, mode: DataCapsuleMode) {
+        let Self {
+            state_initializers,
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+            #[cfg(feature = "db")]
+            migrations,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            #[cfg(feature = "db")]
+            shard_provider_factory,
+            #[cfg(feature = "db")]
+            shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            #[cfg(feature = "storage")]
+            blob_store,
+            ..
+        } = self;
+
+        let Some(path) = std::env::var_os(DATA_CAPSULE_PATH_ENV)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+        else {
+            eprintln!("autumn data capsule: {DATA_CAPSULE_PATH_ENV} is not set");
+            std::process::exit(1);
+        };
+        let subject = std::env::var(DATA_CAPSULE_SUBJECT_ENV).unwrap_or_default();
+        if mode == DataCapsuleMode::Export && subject.is_empty() {
+            eprintln!("autumn data capsule export: {DATA_CAPSULE_SUBJECT_ENV} is not set");
+            std::process::exit(1);
+        }
+
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
+
+        if mode == DataCapsuleMode::Verify {
+            let result = crate::gdpr::portability::CapsuleSigner::from_config(
+                &config.security.signing_secret,
+            )
+            .and_then(|signer| crate::gdpr::portability::verify_dir(&path, &signer))
+            .map(|report| serde_json::json!(report));
+            emit_data_capsule_report(mode, &result);
+        }
+
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
+
+        #[cfg(feature = "db")]
+        let database = match setup_database(
+            &config,
+            migrations,
+            pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
+            directory_shard_router,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        {
+            Ok(database) => database,
+            Err(error) => {
+                eprintln!("{error}");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        };
+
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            database.topology.as_ref(),
+            #[cfg(feature = "db")]
+            database.shards,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+        #[cfg(feature = "storage")]
+        if let Some(bootstrap) = storage_bootstrap {
+            let _ = bootstrap.install(&state);
+        }
+        run_state_initializers(state_initializers, &state);
+
+        let result = match crate::gdpr::portability::CapsuleService::from_state(&state) {
+            Ok(service) => match mode {
+                DataCapsuleMode::Export => service
+                    .export_to(&subject, &path)
+                    .await
+                    .map(|report| serde_json::json!(report)),
+                DataCapsuleMode::Import => service
+                    .import_from(&path)
+                    .await
+                    .map(|summary| serde_json::json!(summary)),
+                DataCapsuleMode::Verify => service
+                    .verify(&path)
+                    .map(|report| serde_json::json!(report)),
+            },
+            Err(error) => Err(error),
+        };
+        // `process::exit` skips `on_shutdown`: stop a managed postmaster first.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        emit_data_capsule_report(mode, &result);
+    }
+
     /// The `AUTUMN_RETENTION_DRY_RUN=1` one-shot on a build compiled WITHOUT
     /// database support: there is nothing to sweep, so report and exit 0
     /// (never starting the server).
@@ -8526,6 +8663,131 @@ pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMo
             );
             None
         }
+    }
+}
+
+/// The `autumn data capsule` one-shot mode (issue #1811).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataCapsuleMode {
+    /// Write a capsule for one subject.
+    Export,
+    /// Verify, then import a capsule.
+    Import,
+    /// Verify a capsule only.
+    Verify,
+}
+
+impl DataCapsuleMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Import => "import",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+/// The env var `autumn data capsule` sets to select the one-shot mode.
+pub(crate) const DATA_CAPSULE_ENV: &str = "AUTUMN_DATA_CAPSULE";
+/// The subject id of `autumn data capsule export`.
+pub(crate) const DATA_CAPSULE_SUBJECT_ENV: &str = "AUTUMN_DATA_CAPSULE_SUBJECT";
+/// The capsule directory of `autumn data capsule`.
+pub(crate) const DATA_CAPSULE_PATH_ENV: &str = "AUTUMN_DATA_CAPSULE_PATH";
+/// Line prefix of the JSON report, matched by `autumn-cli/src/data_capsule.rs`.
+pub(crate) const DATA_CAPSULE_JSON_PREFIX: &str = "AUTUMN_DATA_CAPSULE_REPORT=";
+
+/// The `autumn data capsule` mode requested by `AUTUMN_DATA_CAPSULE`, if any.
+///
+/// An unknown value gives a warning and a normal boot, the same as
+/// `AUTUMN_DB_RETENTION`: a stray value must not stop a server.
+pub(crate) fn data_capsule_mode_from_env() -> Option<DataCapsuleMode> {
+    parse_data_capsule_mode(&std::env::var(DATA_CAPSULE_ENV).ok()?)
+}
+
+fn parse_data_capsule_mode(raw: &str) -> Option<DataCapsuleMode> {
+    match raw.trim() {
+        "" => None,
+        "export" => Some(DataCapsuleMode::Export),
+        "import" => Some(DataCapsuleMode::Import),
+        "verify" => Some(DataCapsuleMode::Verify),
+        other => {
+            eprintln!(
+                "Warning: {DATA_CAPSULE_ENV}={other:?} is not valid (expected \"export\", \
+                 \"import\" or \"verify\"), ignoring"
+            );
+            None
+        }
+    }
+}
+
+/// The JSON report line of `autumn data capsule`.
+fn data_capsule_report_line(
+    mode: DataCapsuleMode,
+    result: &Result<serde_json::Value, crate::gdpr::portability::CapsuleError>,
+) -> String {
+    let body = match result {
+        Ok(report) => serde_json::json!({"ok": true, "mode": mode.as_str(), "report": report}),
+        Err(error) => {
+            serde_json::json!({"ok": false, "mode": mode.as_str(), "error": error.to_string()})
+        }
+    };
+    format!("{DATA_CAPSULE_JSON_PREFIX}{body}")
+}
+
+/// Print the report line and exit: `0` on success, else `1`.
+fn emit_data_capsule_report(
+    mode: DataCapsuleMode,
+    result: &Result<serde_json::Value, crate::gdpr::portability::CapsuleError>,
+) -> ! {
+    println!("{}", data_capsule_report_line(mode, result));
+    if let Err(error) = result {
+        eprintln!("autumn data capsule {}: {error}", mode.as_str());
+    }
+    std::process::exit(i32::from(result.is_err()));
+}
+
+#[cfg(test)]
+mod data_capsule_mode_tests {
+    use super::*;
+
+    #[test]
+    fn mode_parses_the_three_values_and_ignores_others() {
+        assert_eq!(
+            parse_data_capsule_mode("export"),
+            Some(DataCapsuleMode::Export)
+        );
+        assert_eq!(
+            parse_data_capsule_mode(" import "),
+            Some(DataCapsuleMode::Import)
+        );
+        assert_eq!(
+            parse_data_capsule_mode("verify"),
+            Some(DataCapsuleMode::Verify)
+        );
+        assert_eq!(parse_data_capsule_mode(""), None);
+        assert_eq!(parse_data_capsule_mode("purge"), None);
+    }
+
+    #[test]
+    fn report_line_carries_the_prefix_and_the_outcome() {
+        let ok = data_capsule_report_line(
+            DataCapsuleMode::Export,
+            &Ok(serde_json::json!({"records": 3})),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(ok.strip_prefix(DATA_CAPSULE_JSON_PREFIX).unwrap()).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "export");
+        assert_eq!(json["report"]["records"], 3);
+
+        let err = data_capsule_report_line(
+            DataCapsuleMode::Verify,
+            &Err(crate::gdpr::portability::CapsuleError::MissingSigningSecret),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(err.strip_prefix(DATA_CAPSULE_JSON_PREFIX).unwrap()).unwrap();
+        assert_eq!(json["ok"], false);
+        assert!(json["error"].as_str().unwrap().contains("signing secret"));
     }
 }
 

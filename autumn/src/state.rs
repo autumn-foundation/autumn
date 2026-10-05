@@ -1221,6 +1221,13 @@ impl crate::actuator::ProvideActuatorState for AppState {
             .map(|handle| (*handle).clone())
     }
 
+    fn data_capsules(
+        &self,
+    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::CapsuleError>
+    {
+        crate::gdpr::portability::CapsuleService::from_state(self)
+    }
+
     fn deploy_version(&self) -> String {
         self.extension::<crate::canary::CanaryState>().map_or_else(
             || crate::canary::STABLE.to_owned(),

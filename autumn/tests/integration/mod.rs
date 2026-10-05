@@ -85,6 +85,9 @@ mod constela;
 mod custom_domain_issuance;
 mod custom_domains;
 mod custom_layer;
+mod data_capsule;
+#[cfg(feature = "db")]
+mod data_capsule_pg;
 #[cfg(feature = "db")]
 mod data_classification;
 mod db_telemetry_tests;

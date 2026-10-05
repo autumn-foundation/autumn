@@ -18,6 +18,7 @@ mod config;
 mod console;
 mod credentials;
 mod data;
+mod data_capsule;
 mod data_flow;
 mod db;
 mod db_pull;
@@ -3303,6 +3304,96 @@ enum DataCommands {
         #[arg(long, value_name = "COOKIE")]
         cookie: Option<String>,
     },
+    /// Export, import, or verify a portable data capsule.
+    ///
+    /// A capsule holds all data of one subject: records, a manifest, blobs,
+    /// a signature, and an offline HTML viewer. The app runs the command with
+    /// its own models, database, and `[security.signing_secret]`.
+    ///
+    /// # Examples
+    ///
+    ///   autumn data capsule export --subject 42 --out ./capsule-42
+    ///   autumn data capsule verify ./capsule-42
+    ///   autumn data capsule import ./capsule-42
+    #[command(subcommand, verbatim_doc_comment)]
+    Capsule(DataCapsuleCommands),
+}
+
+/// Options shared by the `autumn data capsule` subcommands.
+#[derive(clap::Args)]
+struct CapsuleRunArgs {
+    /// Package to run (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to run (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+    #[arg(long, default_value = "dev")]
+    profile: String,
+    /// Print the raw JSON report.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Subcommands for `autumn data capsule`.
+#[derive(Subcommand)]
+enum DataCapsuleCommands {
+    /// Write a signed capsule with all data of one subject.
+    Export {
+        /// The subject id (for example a user id).
+        #[arg(long)]
+        subject: String,
+        /// The output directory. It must not exist, or must be empty.
+        #[arg(long, value_name = "DIR")]
+        out: String,
+        #[command(flatten)]
+        run: CapsuleRunArgs,
+    },
+    /// Verify a capsule, then import its records and blobs.
+    Import {
+        /// The capsule directory.
+        path: String,
+        /// Allow import on a profile that is not `dev` or `test`.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        run: CapsuleRunArgs,
+    },
+    /// Check the signature and every file hash of a capsule.
+    Verify {
+        /// The capsule directory.
+        path: String,
+        #[command(flatten)]
+        run: CapsuleRunArgs,
+    },
+}
+
+/// Dispatch `autumn data capsule`.
+fn run_data_capsule(command: DataCapsuleCommands) {
+    let (action, path, force, run) = match command {
+        DataCapsuleCommands::Export { subject, out, run } => (
+            data_capsule::CapsuleAction::Export { subject },
+            out,
+            false,
+            run,
+        ),
+        DataCapsuleCommands::Import { path, force, run } => {
+            (data_capsule::CapsuleAction::Import, path, force, run)
+        }
+        DataCapsuleCommands::Verify { path, run } => {
+            (data_capsule::CapsuleAction::Verify, path, false, run)
+        }
+    };
+    data_capsule::run(&data_capsule::CapsuleOptions {
+        package: run.package.as_deref(),
+        bin: run.bin.as_deref(),
+        profile: &run.profile,
+        action,
+        path: &path,
+        force,
+        json: run.json,
+    });
 }
 
 /// Subcommands for `autumn maintenance`.
@@ -4983,6 +5074,7 @@ fn run_command(command: Commands) {
             upsert_by.as_deref(),
             cookie.as_deref(),
         ),
+        Commands::Data(DataCommands::Capsule(command)) => run_data_capsule(command),
         Commands::New {
             name,
             starter,

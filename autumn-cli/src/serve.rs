@@ -853,6 +853,9 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     // half-set internal protocol in a server's environment invites the next
     // mode check to trip over it.
     crate::db::retention::clear_inherited_one_shot_env(&mut cmd);
+    // Same for `autumn data capsule` (#1811): an inherited import mode would
+    // write records and exit instead of serving.
+    crate::data_capsule::clear_inherited_one_shot_env(&mut cmd);
     // For a workspace member selected with `-p`, run the child from the member's
     // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
     // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-
@@ -3029,6 +3032,24 @@ mod tests {
             "the flag must be explicitly removed (present with a None value), not \
              merely absent from the overrides -- absent means inherited: {entry:?}"
         );
+    }
+
+    #[test]
+    fn base_command_clears_an_inherited_data_capsule_mode() {
+        // #1811: `AUTUMN_DATA_CAPSULE=import` is read before the server binds.
+        // Inherited, it would import a capsule and exit instead of serving.
+        let opts = serve_opts_with_role(None);
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        for var in [
+            "AUTUMN_DATA_CAPSULE",
+            "AUTUMN_DATA_CAPSULE_SUBJECT",
+            "AUTUMN_DATA_CAPSULE_PATH",
+        ] {
+            let entry = cmd
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(var));
+            assert_eq!(entry, Some((std::ffi::OsStr::new(var), None)), "{var}");
+        }
     }
 
     #[test]

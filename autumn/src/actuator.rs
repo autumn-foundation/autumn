@@ -403,6 +403,25 @@ pub trait ProvideActuatorState {
     fn shadow(&self) -> Option<crate::shadow::ShadowHandle> {
         None
     }
+
+    /// Returns the data-capsule service of `{prefix}/capsules/*` (issue #1811).
+    ///
+    /// The default gives an error, so the endpoints answer `501`.
+    /// [`crate::AppState`] uses
+    /// [`CapsuleService::from_state`](crate::gdpr::portability::CapsuleService::from_state).
+    ///
+    /// # Errors
+    ///
+    /// [`CapsuleError`](crate::gdpr::portability::CapsuleError) when the
+    /// service is not configured.
+    fn data_capsules(
+        &self,
+    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::CapsuleError>
+    {
+        Err(crate::gdpr::portability::CapsuleError::NotConfigured(
+            "this state has no data-capsule service".to_owned(),
+        ))
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -4249,6 +4268,124 @@ pub(crate) async fn shadow_endpoint<S: ProvideActuatorState + Send + Sync + 'sta
     )
 }
 
+// ── Data capsules (issue #1811) ─────────────────────────────────────────────
+
+/// Request body for `POST <actuator-prefix>/capsules/export`.
+#[derive(Deserialize)]
+pub(crate) struct CapsuleExportRequest {
+    subject: String,
+}
+
+/// Request body for `POST <actuator-prefix>/capsules/{import,verify}`.
+#[derive(Deserialize)]
+pub(crate) struct CapsuleNameRequest {
+    capsule: String,
+}
+
+fn capsule_error(error: &crate::gdpr::portability::CapsuleError) -> axum::response::Response {
+    use crate::gdpr::portability::CapsuleError as E;
+    let status = match error {
+        E::NotConfigured(_) | E::MissingSigningSecret => StatusCode::NOT_IMPLEMENTED,
+        E::InvalidName(_) => StatusCode::BAD_REQUEST,
+        E::NotEmpty(_) | E::Conflict(_) => StatusCode::CONFLICT,
+        E::Integrity(_)
+        | E::UnsupportedFormat(_)
+        | E::UnknownTable(_)
+        | E::RelationshipCycle(_)
+        | E::Json { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({"status": "error", "message": error.to_string()})),
+    )
+        .into_response()
+}
+
+/// The service and the path of an existing capsule, or the error response.
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the response itself; it is made once per request"
+)]
+fn existing_capsule<S: ProvideActuatorState>(
+    state: &S,
+    name: &str,
+) -> Result<(crate::gdpr::portability::CapsuleService, std::path::PathBuf), axum::response::Response>
+{
+    let service = state.data_capsules().map_err(|e| capsule_error(&e))?;
+    let path = service.capsule_path(name).map_err(|e| capsule_error(&e))?;
+    if !path.is_dir() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"status": "error", "message": "capsule not found"})),
+        )
+            .into_response());
+    }
+    Ok((service, path))
+}
+
+/// `POST <actuator-prefix>/capsules/export` -- write a capsule for a subject.
+pub(crate) async fn capsules_export_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    Json(body): Json<CapsuleExportRequest>,
+) -> axum::response::Response {
+    let service = match state.data_capsules() {
+        Ok(service) => service,
+        Err(e) => return capsule_error(&e),
+    };
+    let name = crate::gdpr::portability::CapsuleService::capsule_name(&body.subject);
+    let path = match service.capsule_path(&name) {
+        Ok(path) => path,
+        Err(e) => return capsule_error(&e),
+    };
+    match service.export_to(&body.subject, &path).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "capsule": name, "report": report})),
+        )
+            .into_response(),
+        Err(e) => capsule_error(&e),
+    }
+}
+
+/// `POST <actuator-prefix>/capsules/verify` -- check a capsule signature and hashes.
+pub(crate) async fn capsules_verify_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    Json(body): Json<CapsuleNameRequest>,
+) -> axum::response::Response {
+    let (service, path) = match existing_capsule(&state, &body.capsule) {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    match service.verify(&path) {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "report": report})),
+        )
+            .into_response(),
+        Err(e) => capsule_error(&e),
+    }
+}
+
+/// `POST <actuator-prefix>/capsules/import` -- verify, then import a capsule.
+pub(crate) async fn capsules_import_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    Json(body): Json<CapsuleNameRequest>,
+) -> axum::response::Response {
+    let (service, path) = match existing_capsule(&state, &body.capsule) {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    match service.import_from(&path).await {
+        Ok(summary) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "summary": summary})),
+        )
+            .into_response(),
+        Err(e) => capsule_error(&e),
+    }
+}
+
 #[cfg(feature = "http-client")]
 /// Request body for `POST <actuator-prefix>/webhooks/replay`.
 #[derive(Deserialize)]
@@ -4582,6 +4719,9 @@ pub(crate) fn actuator_route_path(prefix: &str, suffix: &str) -> String {
     }
 }
 
+/// The data-capsule routes (issue #1811). All are `POST` and sensitive.
+const CAPSULE_ROUTES: [&str; 3] = ["/capsules/export", "/capsules/import", "/capsules/verify"];
+
 pub(crate) fn actuator_endpoint_paths(
     prefix: &str,
     sensitive: bool,
@@ -4611,6 +4751,11 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/shadow"));
         paths.push(actuator_route_path(prefix, "/graph"));
+        // POST-only, like `/webhooks/replay` below: listed so the startup
+        // barrier lets them through.
+        for suffix in CAPSULE_ROUTES {
+            paths.push(actuator_route_path(prefix, suffix));
+        }
         #[cfg(feature = "db")]
         {
             paths.push(actuator_route_path(prefix, "/derivations"));
@@ -4659,6 +4804,9 @@ pub(crate) fn actuator_mutating_routes(
 
     if sensitive {
         routes.push(("PUT", actuator_route_path(prefix, "/loggers/{name}")));
+        for suffix in CAPSULE_ROUTES {
+            routes.push(("POST", actuator_route_path(prefix, suffix)));
+        }
         #[cfg(feature = "http-client")]
         {
             routes.push(("POST", actuator_route_path(prefix, "/webhooks/replay")));
@@ -4767,6 +4915,18 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/graph"),
                 axum::routing::get(graph_endpoint),
+            )
+            .route(
+                &actuator_route_path(prefix, "/capsules/export"),
+                axum::routing::post(capsules_export_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/capsules/import"),
+                axum::routing::post(capsules_import_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/capsules/verify"),
+                axum::routing::post(capsules_verify_endpoint::<S>),
             );
         #[cfg(feature = "db")]
         {
@@ -5887,6 +6047,7 @@ mod tests {
         channels: crate::channels::Channels,
         #[cfg(feature = "ws")]
         shutdown: tokio_util::sync::CancellationToken,
+        data_capsules: Option<crate::gdpr::portability::CapsuleService>,
     }
 
     impl ProvideActuatorState for TestActuatorState {
@@ -5949,6 +6110,14 @@ mod tests {
         fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
             self.log_buffer.clone()
         }
+        fn data_capsules(
+            &self,
+        ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::CapsuleError>
+        {
+            self.data_capsules.clone().ok_or_else(|| {
+                crate::gdpr::portability::CapsuleError::NotConfigured("test".to_owned())
+            })
+        }
     }
 
     fn test_state() -> TestActuatorState {
@@ -5978,6 +6147,7 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            data_capsules: None,
         }
     }
 
@@ -9590,6 +9760,185 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Data capsules (issue #1811) ─────────────────────────────────────────
+
+    fn capsule_state(dir: &std::path::Path) -> TestActuatorState {
+        use crate::gdpr::portability::{
+            CapsuleModel, CapsuleService, CapsuleSigner, FieldSpec, MemoryCapsuleStore,
+        };
+        let store = MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("email", "text"),
+            ],
+        );
+        store.insert(
+            "users",
+            serde_json::json!({"id": 7, "email": "ada@example.com"}),
+        );
+        let service = CapsuleService::new(
+            vec![CapsuleModel::new("users", "id")],
+            std::sync::Arc::new(store),
+            CapsuleSigner::new(b"actuator-capsule-secret-0123456789"),
+        )
+        .with_dir(dir);
+        let mut state = test_state();
+        state.data_capsules = Some(service);
+        state
+    }
+
+    async fn post_json(
+        state: TestActuatorState,
+        sensitive: bool,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = actuator_router(sensitive)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn actuator_capsules_are_not_mounted_when_not_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, _) = post_json(
+            capsule_state(dir.path()),
+            false,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn actuator_capsules_answer_501_when_not_configured() {
+        let (status, json) = post_json(
+            test_state(),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{json}");
+        assert_eq!(json["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_export_verify_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["report"]["records"], 1);
+        let name = json["capsule"].as_str().expect("capsule name").to_owned();
+        assert!(dir.path().join(&name).join("viewer/index.html").is_file());
+
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/verify",
+            serde_json::json!({"capsule": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["report"]["subject"], "7");
+
+        // The row is already in the store, so import conflicts.
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/import",
+            serde_json::json!({"capsule": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_import_accepts_only_a_plain_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["../etc", "/tmp/x", "a/b"] {
+            let (status, json) = post_json(
+                capsule_state(dir.path()),
+                true,
+                "/actuator/capsules/import",
+                serde_json::json!({"capsule": name}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_verify_answers_404_for_an_unknown_capsule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, _) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/verify",
+            serde_json::json!({"capsule": "missing"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_verify_reports_tampering_as_422() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        let name = json["capsule"].as_str().unwrap().to_owned();
+        std::fs::write(dir.path().join(&name).join("records/users.json"), "[]").unwrap();
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/verify",
+            serde_json::json!({"capsule": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    }
+
+    #[test]
+    fn actuator_capsule_routes_are_listed_only_in_sensitive_mode() {
+        for suffix in ["export", "import", "verify"] {
+            let path = format!("/actuator/capsules/{suffix}");
+            assert!(actuator_endpoint_paths("/actuator", true, false).contains(&path));
+            assert!(!actuator_endpoint_paths("/actuator", false, false).contains(&path));
+            assert!(actuator_mutating_routes("/actuator", true).contains(&("POST", path.clone())));
+            assert!(!actuator_mutating_routes("/actuator", false).contains(&("POST", path)));
+        }
     }
 }
 

@@ -113,6 +113,7 @@ Looking for the API reference instead? That is
 - [Bot Protection and CAPTCHA](bot-protection.md) — keeping automated traffic off a form or route
 - [TLS and HTTPS](tls.md) — certificates, ACME, and terminating TLS
 - [CORS and Cross-Origin Requests](cors.md) — letting a browser on another origin read your responses
+- [Portable Data Capsules](data-capsules.md) — signed, viewable, re-importable export of one subject's data
 - [Data Retention for Framework-Owned Data](data-retention.md) — bounding the tables Autumn itself creates
 - [Data-Retention Sweeps](retention-sweeps.md) — auto-purging your own tables on a schedule
 - [Data Scrubbing](data-scrubbing.md) — turning a production backup into an anonymized staging copy

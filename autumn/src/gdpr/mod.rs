@@ -34,6 +34,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod portability;
+
 /// How a model's data should be handled during account erasure (GDPR Article 17).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -108,6 +110,7 @@ impl ModelRegistration {
 #[derive(Debug, Clone, Default)]
 pub struct GdprRegistry {
     registrations: Vec<ModelRegistration>,
+    capsules: Vec<portability::CapsuleModel>,
 }
 
 impl GdprRegistry {
@@ -143,6 +146,21 @@ impl GdprRegistry {
     #[must_use]
     pub const fn is_populated(&self) -> bool {
         !self.registrations.is_empty()
+    }
+
+    /// Add the capsule specification of a model (issue #1811).
+    ///
+    /// A capsule holds the data of one subject. See [`portability`].
+    #[must_use]
+    pub fn capsule(mut self, model: portability::CapsuleModel) -> Self {
+        self.capsules.push(model);
+        self
+    }
+
+    /// Returns the capsule models, in registration order.
+    #[must_use]
+    pub fn capsule_models(&self) -> &[portability::CapsuleModel] {
+        &self.capsules
     }
 
     /// Returns all registrations with the [`ErasureStrategy::Retain`] strategy.
