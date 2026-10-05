@@ -10,7 +10,7 @@
 //! the sibling check keeps the feature, and the test cannot fail.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 fn run_autumn_ok(dir: &Path, args: &[&str]) {
@@ -28,8 +28,8 @@ fn run_autumn_ok(dir: &Path, args: &[&str]) {
     );
 }
 
-/// The scaffold that enables each feature.
-fn fields(feature: &str) -> &'static [&'static str] {
+/// The `generate`/`destroy scaffold` arguments that enable `feature`.
+fn scaffold_args(feature: &str) -> &'static [&'static str] {
     match feature {
         "storage" => &["Document", "file:Attachment"],
         "markdown" => &["Post", "title:String", "body:richtext"],
@@ -42,10 +42,10 @@ fn fields(feature: &str) -> &'static [&'static str] {
 fn destroy_with(feature: &str, name: &str, handwritten: Option<(&str, &str)>) -> String {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn_ok(tmp.path(), &["new", name]);
-    let project: PathBuf = tmp.path().join(name);
+    let project = tmp.path().join(name);
 
     let mut generate = vec!["generate", "scaffold"];
-    generate.extend_from_slice(fields(feature));
+    generate.extend_from_slice(scaffold_args(feature));
     run_autumn_ok(&project, &generate);
     let before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
     assert!(
@@ -58,7 +58,7 @@ fn destroy_with(feature: &str, name: &str, handwritten: Option<(&str, &str)>) ->
     }
 
     let mut destroy = vec!["destroy", "scaffold"];
-    destroy.extend_from_slice(fields(feature));
+    destroy.extend_from_slice(scaffold_args(feature));
     destroy.push("--force");
     run_autumn_ok(&project, &destroy);
     fs::read_to_string(project.join("Cargo.toml")).unwrap()

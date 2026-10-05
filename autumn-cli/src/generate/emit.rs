@@ -1460,25 +1460,19 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // `MultipartField` and `MultipartError`, themselves part of the multipart API
         // surface, so over-retaining on them is harmless.
         "multipart" => &["Multipart"],
-        // `autumn_web::storage::` covers the model's blob column type
-        // (`autumn_web::storage::Blob`) as well as route usage of the store
-        // (`autumn_web::storage::BlobStoreState`, `save_to_blob_store`
-        // call sites that reference the `autumn_web::storage::` path, etc.).
-        // Unlike `multipart`, the prelude does NOT re-export any storage type
-        // (`Blob`, `BlobStore`, `BlobStoreState`, …), so a hand-written
-        // storage user must reach them through a `autumn_web::storage::…`
-        // path — either fully qualified or via a `use autumn_web::storage::{…}`
-        // import line — both of which this marker already catches. There is no
-        // prelude-unqualified spelling to miss, so no extra marker is needed.
-        "storage" => &["autumn_web::storage::"],
-        // A `richtext` scaffold (issue #1255) enables `markdown` for the
-        // sanitizing `render_user_content` its show/preview paths call, but a
-        // hand-written route can render trusted Markdown through the same
-        // feature's `render`/`MarkdownRegistry`. `autumn_web::markdown::`
-        // catches every spelling: the prelude re-exports none of these types,
-        // so any user must reach them through that path — fully qualified or
-        // via a `use autumn_web::markdown::{…};` import line.
-        "markdown" => &["autumn_web::markdown::"],
+        // The prelude does not re-export storage types (`Blob`,
+        // `BlobStoreState`, …), so all usage starts with `autumn_web::storage`.
+        // No trailing `::` (issue #2186): a module import
+        // (`use autumn_web::storage;` or `… as blobs;`) ends at the module
+        // name. A doc comment that names the module now also keeps the
+        // feature. That is the safe direction, as for `multipart` and `csv`.
+        "storage" => &["autumn_web::storage"],
+        // A `richtext` scaffold (issue #1255) enables `markdown` for
+        // `render_user_content`. Hand-written code can also use `render` or
+        // `MarkdownRegistry`. The prelude re-exports none of them, so all
+        // usage starts with `autumn_web::markdown`. No trailing `::`, for the
+        // same module-import reason as `storage` (issue #2186).
+        "markdown" => &["autumn_web::markdown"],
         // A scaffolded CSV export (issue #1315) enables `csv` for the
         // `CsvSchema` impl and `export_csv` call its `export.csv` route emits,
         // but a hand-written route, job or task can use the same module —
@@ -3650,8 +3644,8 @@ mod tests {
 
         let storage = autumn_web_feature_markers("storage");
         assert!(
-            storage.contains(&"autumn_web::storage::"),
-            "storage marker must catch `autumn_web::storage::` usage, got {storage:?}"
+            storage.contains(&"autumn_web::storage"),
+            "storage marker must catch `autumn_web::storage` usage, got {storage:?}"
         );
     }
 
