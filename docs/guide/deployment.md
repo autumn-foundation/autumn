@@ -2047,8 +2047,9 @@ never gets production credentials (#2314): `main.tf` creates the app with no
 managed identity, no registry and no secret refs. The scaffolded
 `azure-cutover.sh` copies them from the migration job and sets the real image
 in one write. The identity applies to all revisions, so the first cutover
-waits until the placeholder runs no replica. Keep `min_replicas = 0` until
-then. If the first cutover fails, the script removes the credentials. The
+disables ingress (also the internal route) and waits until the placeholder
+runs no replica. Then nothing can start the placeholder again. Keep
+`min_replicas = 0` until then. If the first cutover fails, the script removes the credentials. The
 job also has them, but runs only after you set the real image on it. External
 ingress stays **disabled** until the new revision runs the real image (#2312).
 Build and push your real image, run migrations, then cut the app over:

@@ -11,8 +11,10 @@
 # would hold the identity until the image update completes.
 #
 # The identity applies to all revisions, and Azure keeps the old revision
-# active until the new one is ready. So the first cutover starts only when
-# the placeholder revision has no running replica.
+# active until the new one is ready. So the first cutover disables ingress
+# (also the internal route), and starts only when the placeholder revision
+# has no running replica. Without ingress, with min_replicas = 0 and only
+# the HTTP scale rule, nothing can start it again.
 #
 # Then the script waits for the new revision. It opens external ingress
 # (#2312) only when that revision runs the real image. If the FIRST cutover
@@ -81,6 +83,7 @@ JOB_IDENTITY=$(jq -r '.properties.configuration.registries[0].identity // ""' <<
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
 JOB_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$JOB")
+JOB_SECRET_REFS=$(jq -c '[.properties.configuration.secrets // [] | .[] | {name, keyVaultUrl}]' <<< "$JOB")
 # Redis is off now, but the app still has the redis-url secret. The old
 # revision refers to it, so the script removes it only after that revision
 # stops.
@@ -98,10 +101,12 @@ APPLIED='
   ($id | ascii_downcase) as $lid
   | [.identity.userAssignedIdentities // {} | to_entries[]
      | select(.value != null) | .key | ascii_downcase] as $ids
-  | [.properties.configuration.secrets // [] | .[].name] as $names
+  | [.properties.configuration.secrets // [] | .[] | {name, keyVaultUrl}] as $have
   | .properties.provisioningState == "Succeeded"
     and ($ids | index($lid)) != null
-    and ($want | all(. as $n | $names | index($n) != null))'
+    and any(.properties.configuration.registries // [] | .[];
+            .server == $acr and (.identity // "" | ascii_downcase) == $lid)
+    and ($want | all(. as $s | $have | index([$s]) != null))'
 # shellcheck disable=SC2016 # a jq program, not a shell expression
 REMOVED='
   ($id | ascii_downcase) as $lid
@@ -113,13 +118,18 @@ REMOVED='
             (.identity // "" | ascii_downcase) != $lid)
     and all(.properties.configuration.secrets // [] | .[];
             .name | IN("database-url", "signing-secret", "redis-url") | not)'
+# shellcheck disable=SC2016 # a jq program, not a shell expression
+REDIS_GONE='
+  .properties.provisioningState == "Succeeded"
+  and all(.properties.configuration.secrets // [] | .[]; .name != "redis-url")'
 app_shows() {
   local now
   now=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --output json) || return 1
-  jq -e --arg id "$JOB_IDENTITY" --argjson want "$JOB_SECRET_NAMES" "$1" <<< "$now" > /dev/null
+  jq -e --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" \
+    --argjson want "$JOB_SECRET_REFS" "$1" <<< "$now" > /dev/null
 }
 
 # A PATCH body goes in a file, not on the command line: it can hold secret
@@ -199,9 +209,15 @@ fail() {
 case "$OLD_IMAGE" in
   "$ACR_LOGIN_SERVER"/*) ;;
   *)
-    # The first cutover. Wait until no placeholder replica runs. The
-    # script checks 30 times, 10 seconds apart.
-    for _ in $(seq 1 30); do
+    # The first cutover. Disable ingress, so no request (internal or
+    # external) can start the placeholder. Then wait until no placeholder
+    # replica runs. The HTTP scaler stops a replica after a 300-second cool
+    # down, so the script checks 60 times, 10 seconds apart.
+    az containerapp ingress disable \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --output none
+    for _ in $(seq 1 60); do
       REPLICAS=$(az containerapp replica list \
         --name "$AZURE_APP_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -357,7 +373,14 @@ if [ -n "$STALE_REDIS" ]; then
     | {location: $app.location,
        properties: {configuration: {secrets: (($app_secrets[0]
          | map(select(.name as $n | $drop | index($n) | not) | secret_ref)) + $job_secrets)}}}')
+  REMOVED_REDIS=""
   if [ "$ACTIVE" = false ] && patch_app "$CLEANUP"; then
+    for _ in $(seq 1 30); do
+      sleep 10
+      if app_shows "$REDIS_GONE"; then REMOVED_REDIS=1; break; fi
+    done
+  fi
+  if [ -n "$REMOVED_REDIS" ]; then
     echo "removed the unused redis-url secret"
   else
     echo "::warning::remove the unused redis-url secret from $AZURE_APP_NAME when no revision uses it" >&2
