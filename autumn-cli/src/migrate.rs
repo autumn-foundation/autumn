@@ -1595,6 +1595,24 @@ pub fn resolve_migration_lock_policy_from_sources<F>(
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
+    let mut warnings = Vec::new();
+    let policy = resolve_migration_lock_policy_with_warnings(env_var, table, &mut warnings);
+    for warning in warnings {
+        eprintln!("  Warning: {warning}");
+    }
+    policy
+}
+
+/// [`resolve_migration_lock_policy_from_sources`], with each invalid value
+/// pushed to `warnings` instead of printed.
+fn resolve_migration_lock_policy_with_warnings<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    warnings: &mut Vec<String>,
+) -> autumn_web::migrate::MigrationLockPolicy
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     let mut policy = autumn_web::migrate::MigrationLockPolicy::default();
     let db = table
         .and_then(|t| t.get("database"))
@@ -1602,12 +1620,21 @@ where
 
     let toml_timeout = db
         .and_then(|db| db.get("migration_lock_timeout"))
-        .and_then(|v| match v {
-            toml::Value::String(text) => autumn_web::config::parse_duration_str(text).ok(),
-            toml::Value::Integer(ms) => u64::try_from(*ms)
-                .ok()
-                .map(std::time::Duration::from_millis),
-            _ => None,
+        .and_then(|value| {
+            let parsed = match value {
+                toml::Value::String(text) => autumn_web::config::parse_duration_str(text).ok(),
+                toml::Value::Integer(ms) => u64::try_from(*ms)
+                    .ok()
+                    .map(std::time::Duration::from_millis),
+                _ => None,
+            };
+            if parsed.is_none() {
+                warnings.push(format!(
+                    "`database.migration_lock_timeout = {value}` is not a valid duration; \
+                     using the default."
+                ));
+            }
+            parsed
         });
     let env_timeout = env_var("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT")
         .ok()
@@ -1615,10 +1642,10 @@ where
         .and_then(|text| {
             let parsed = autumn_web::config::parse_duration_str(text.trim()).ok();
             if parsed.is_none() {
-                eprintln!(
-                    "  Warning: AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT={text:?} is not a valid \
-                     duration; ignoring it."
-                );
+                warnings.push(format!(
+                    "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT={text:?} is not a valid duration; \
+                     ignoring it."
+                ));
             }
             parsed
         });
@@ -1628,17 +1655,25 @@ where
 
     let toml_retries = db
         .and_then(|db| db.get("migration_lock_retries"))
-        .and_then(toml::Value::as_integer)
-        .and_then(|n| u32::try_from(n).ok());
+        .and_then(|value| {
+            let parsed = value.as_integer().and_then(|n| u32::try_from(n).ok());
+            if parsed.is_none() {
+                warnings.push(format!(
+                    "`database.migration_lock_retries = {value}` is not a valid count; \
+                     using the default."
+                ));
+            }
+            parsed
+        });
     let env_retries = env_var("AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES")
         .ok()
         .and_then(|text| {
             let parsed = text.trim().parse::<u32>().ok();
             if parsed.is_none() {
-                eprintln!(
-                    "  Warning: AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES={text:?} is not a valid \
-                     count; ignoring it."
-                );
+                warnings.push(format!(
+                    "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES={text:?} is not a valid count; \
+                     ignoring it."
+                ));
             }
             parsed
         });
@@ -4567,6 +4602,30 @@ primary_url = "postgres://prod-s0:5432/app"
         let table = db_table(&[("migration_lock_timeout", toml::Value::Integer(750))]);
         let policy = resolve_migration_lock_policy_from_sources(no_env, Some(&table));
         assert_eq!(policy.lock_timeout, std::time::Duration::from_millis(750));
+    }
+
+    #[test]
+    fn invalid_toml_migration_lock_values_are_reported() {
+        let table = db_table(&[
+            (
+                "migration_lock_timeout",
+                toml::Value::String("5secondsx".into()),
+            ),
+            ("migration_lock_retries", toml::Value::Integer(-1)),
+        ]);
+        let mut warnings = Vec::new();
+        let policy =
+            resolve_migration_lock_policy_with_warnings(no_env, Some(&table), &mut warnings);
+        assert_eq!(policy, autumn_web::migrate::MigrationLockPolicy::default());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("migration_lock_timeout"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("migration_lock_retries"),
+            "{warnings:?}"
+        );
     }
 
     #[test]

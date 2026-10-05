@@ -350,7 +350,17 @@ where
                 .map_err(|e| MigrationError::Migration(e.to_string()))
         },
     )?;
-    Ok(applied.take())
+    Ok(dedup_applied(applied.take()))
+}
+
+/// `log` with repeats removed, first one kept. A version logs again when its
+/// transaction rolled back after `run` (the version insert hit the lock
+/// timeout) and a retry ran it again.
+fn dedup_applied(log: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    log.into_iter()
+        .filter(|version| seen.insert(version.clone()))
+        .collect()
 }
 
 /// Run `$body` with a `&mut` connection to `$url` that honors the
@@ -5204,6 +5214,21 @@ mod tests {
         // Out-of-range jitter input is clamped.
         assert_eq!(lock_retry_delay(1, -3.0), lock_retry_delay(1, 0.0));
         assert_eq!(lock_retry_delay(1, 7.0), lock_retry_delay(1, 1.0));
+    }
+
+    #[test]
+    fn applied_versions_drop_rolled_back_duplicates() {
+        // `b` ran, then its transaction rolled back, then a retry ran it again.
+        let log = vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+        ];
+        assert_eq!(
+            dedup_applied(log),
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
     }
 
     #[test]
