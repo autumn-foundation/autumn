@@ -3275,6 +3275,7 @@ case "$1 $2" in
       # Each PATCH with a template makes a new revision.
       n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
       latest="app--old"
+      [ -n "$STUB_LATEST_FAILED" ] && latest="$STUB_LATEST_FAILED"
       [ "${n:-0}" -gt 0 ] && latest="app--new$n"
       tsv Succeeded "${STUB_LATEST:-$latest}"
     fi
@@ -3325,8 +3326,15 @@ case "$1 $2" in
         fi
         ;;
       properties.active) echo false ;;
-      # The placeholder image always provisions.
-      properties.provisioningState) echo Provisioned ;;
+      # The placeholder image provisions, except a revision that the test
+      # names as failed.
+      properties.provisioningState)
+        if [ -n "$STUB_LATEST_FAILED" ] && [[ " $* " == *" --revision $STUB_LATEST_FAILED "* ]]; then
+          echo Failed
+        else
+          echo Provisioned
+        fi
+        ;;
       *) tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
     esac
     ;;
@@ -3436,6 +3444,7 @@ esac
             .env_remove("STUB_APP_TEMPLATE_CLEAN")
             .env_remove("STUB_ACTIVE_HAS_REFS")
             .env_remove("STUB_SIDECAR_REDIS_REF")
+            .env_remove("STUB_LATEST_FAILED")
             .env_remove("STUB_PATCH_PENDING");
         if args.contains(&"--remove-credentials") {
             command.env_remove("IMAGE_TAG");
@@ -4136,6 +4145,37 @@ esac
                 .count()
                 >= 3,
             "ingress must wait until the new revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_retries_after_a_failed_cleanup_revision() {
+        // An earlier run sent the stage 1 PATCH, and its clean revision
+        // failed. The template is clean, so the retry must force a fresh
+        // revision instead of waiting on the failed one forever.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_HAS_REFS", "1"),
+                ("STUB_LATEST_FAILED", "app--clean"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(
+            patches[0].contains("AUTUMN_CREDENTIAL_CLEANUP"),
+            "the template must change, so Azure makes a new revision: {}",
+            patches[0]
         );
     }
 
