@@ -9222,12 +9222,25 @@ impl CostGate {
     /// take it again. Every replica then resumes against that one key, so the
     /// tick runs one time. A tick that ran keeps its claim
     /// ([`SchedulerLease::release`](crate::scheduler::SchedulerLease::release)).
-    /// If the delete fails, the claim stays until it expires: the tick may
-    /// then not run, but it never runs twice.
+    /// A failed delete is tried again a few times. If it still fails, the
+    /// claim stays until it expires: the tick may then not run, but it never
+    /// runs twice.
     async fn free_unrun_claim(lease: crate::scheduler::SchedulerLease, name: &str, tick_key: &str) {
-        if let Err(error) = lease.release_and_free().await {
-            tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to free the claim of a deferred tick");
+        const ATTEMPTS: u32 = 5;
+        for attempt in 1..=ATTEMPTS {
+            match lease.free().await {
+                Ok(()) => break,
+                Err(error) if attempt < ATTEMPTS => {
+                    tracing::debug!(task = %name, tick = %tick_key, attempt, error = %error, "Retrying the free of a deferred tick's claim");
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to free the claim of a deferred tick; the tick may not run");
+                }
+            }
         }
+        release_task_lease(lease, name, tick_key).await;
     }
 
     /// `true` when the tick waits before it takes its lease.
