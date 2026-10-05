@@ -4111,6 +4111,35 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_opens_ingress_only_when_the_placeholder_is_inactive() {
+        // Provisioned is not ready: Azure keeps the placeholder active until
+        // the new revision scales and passes its probes. Ingress then could
+        // wake the placeholder, which now has the identity and secrets.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_LAG", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        let ingress_at = calls
+            .find("az containerapp ingress enable")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            calls[patch_at..ingress_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 3,
+            "ingress must wait until the new revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_retries_a_canceled_first_cutover_as_a_first_cutover() {
         let Some((status, calls, _)) = run_azure_cutover(
             "acr.azurecr.io/app:t0",
