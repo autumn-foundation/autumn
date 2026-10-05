@@ -354,6 +354,18 @@ fn plan_model_with_options_impl(
              `autumn migrate`. Use a different model name, for example `Remark`."
         )));
     }
+    // The other way round: a `comments` table adopted as the shared one still
+    // starts with this model's `CREATE TABLE`. Removing it breaks every other
+    // `#[commentable]` model on a fresh database.
+    if for_revert
+        && table == super::commentable::COMMENTS_TABLE
+        && super::commentable::another_model_is_still_commentable(project_root, &snake_name)
+    {
+        return Err(GenerateError::Config(format!(
+            "cannot destroy `{pascal_name}`: other `#[commentable]` models use its \
+             `{table}` table. Remove `#[commentable]` from those models first."
+        )));
+    }
     if fields.iter().any(|f| f.kind.is_commentable())
         || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
     {
@@ -7653,5 +7665,47 @@ autumn-web = \"0.3\"\n";
             )
             .is_ok()
         );
+    }
+
+    /// The documented adoption path: a plain `Comment` table, then a migration
+    /// that adds the shared columns. Another `#[commentable]` model uses that
+    /// table, so `destroy` must not take its `CREATE TABLE` away.
+    #[test]
+    fn a_comment_model_revert_is_refused_while_another_model_is_commentable() {
+        let tmp = project();
+        let create = tmp.path().join("migrations/20260101000000_create_comments");
+        fs::create_dir_all(&create).unwrap();
+        fs::write(
+            create.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL, \
+             created_at TIMESTAMP NOT NULL);\n",
+        )
+        .unwrap();
+        let adopt = tmp.path().join("migrations/20260102000000_adopt_comments");
+        fs::create_dir_all(&adopt).unwrap();
+        fs::write(
+            adopt.join("up.sql"),
+            "ALTER TABLE comments ADD COLUMN commentable_type TEXT NOT NULL DEFAULT '', \
+             ADD COLUMN commentable_id BIGINT NOT NULL DEFAULT 0, \
+             ADD COLUMN parent_id BIGINT, ADD COLUMN author_id BIGINT NOT NULL DEFAULT 0, \
+             ADD COLUMN deleted_at TIMESTAMP;\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+        fs::write(
+            tmp.path().join("src/models/post.rs"),
+            "#[commentable]\npub struct Post {}\n",
+        )
+        .unwrap();
+
+        let err = plan_model_with_options_for_revert(
+            tmp.path(),
+            "Comment",
+            &["body:Text".into()],
+            "20260101000000",
+            &ModelOptions::default(),
+        )
+        .expect_err("`Post` still needs the `comments` table");
+        assert!(err.to_string().contains("#[commentable]"), "{err}");
     }
 }

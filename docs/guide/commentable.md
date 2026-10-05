@@ -103,6 +103,10 @@ The other order is refused too. After the shared table exists, the generator
 refuses a model whose table is `comments`. Use a different name, for example
 `Remark`.
 
+After you add the columns, the `Comment` migration creates the shared table.
+`autumn destroy` refuses to remove `Comment` while another model is
+`#[commentable]`.
+
 ### Why `commentable_id` has no foreign key
 
 Because a single column cannot reference two tables. That is the known
