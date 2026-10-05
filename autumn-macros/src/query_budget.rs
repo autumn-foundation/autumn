@@ -2969,7 +2969,11 @@ impl Analyzer {
         // Not rooted at a handle: a diesel executor call is the round trip.
         for method in &methods {
             // `repos.push(repo)`: a known container method stores the handle.
-            if self.known_container_method(&method.receiver, &method.method.to_string()) {
+            if self.known_container_method(
+                &method.receiver,
+                &method.method.to_string(),
+                method.args.len(),
+            ) {
                 continue;
             }
             let is_executor = EXECUTORS.contains(&method.method.to_string().as_str());
@@ -3008,7 +3012,7 @@ impl Analyzer {
                         self.shape_of(&m.receiver),
                         Some(Shape::Opt | Shape::OptRef | Shape::Res)
                     )))
-                && !self.known_container_method(&m.receiver, &m.method.to_string())
+                && !self.known_container_method(&m.receiver, &m.method.to_string(), m.args.len())
         })?;
         Some(Cost::unbounded(
             unknown.span(),
@@ -3403,11 +3407,14 @@ impl Analyzer {
         self.env.binding(&wrapper_root(e)?).inner
     }
 
-    /// Is `method` a known method of the standard container `receiver`? Not
-    /// on a user value or a nested container: their methods are the user's.
-    fn known_container_method(&self, receiver: &Expr, method: &str) -> bool {
+    /// Is `method`, called with `args` arguments, a known method of the
+    /// standard container `receiver`? Not on a user value or a nested
+    /// container: their methods are the user's. Not with an argument count
+    /// the standard method does not take: `repos.push()` is a trait method.
+    fn known_container_method(&self, receiver: &Expr, method: &str, args: usize) -> bool {
         !self.expr_is_holder(receiver)
             && !self.expr_is_nested(receiver)
+            && std_arities(method).contains(&args)
             && self
                 .shape_of(receiver)
                 .is_some_and(|shape| shape.has(method))
@@ -3419,7 +3426,8 @@ impl Analyzer {
         // An executor uses the connection for one query and gives it back.
         // A known container method stores only if it is a store method.
         if EXECUTORS.contains(&method)
-            || (self.known_container_method(receiver, method) && !STORE_METHODS.contains(&method))
+            || (self.known_container_method(receiver, method, args.len())
+                && !STORE_METHODS.contains(&method))
         {
             return;
         }
@@ -3523,7 +3531,7 @@ impl Analyzer {
                 // A scalar name gives a plain value only on a std container:
                 // a user's `ctx.clear()` may return anything.
                 !(SCALAR_METHODS.contains(&method.as_str())
-                    && self.known_container_method(&mc.receiver, &method))
+                    && self.known_container_method(&mc.receiver, &method, mc.args.len()))
                     && ((self.expr_is_nested(&mc.receiver) && !self.maps_away(mc))
                         // `repos.chunks(2)` yields slices of handles.
                         || (matches!(method.as_str(), "chunks" | "windows")
@@ -4505,7 +4513,94 @@ fn place_root(place: &Expr) -> Option<String> {
 
 /// Is this call `Some(x)`, `Ok(x)` or `Err(x)`?
 fn is_container_constructor(call: &ExprCall) -> bool {
-    call_path_name(call).is_some_and(|name| CONTAINER_CONSTRUCTORS.contains(&name.as_str()))
+    let Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    let mut segments = path.path.segments.iter().rev();
+    // `Some`, `Option::Some`, `std::result::Result::Ok`; not `Factory::Some`.
+    segments
+        .next()
+        .is_some_and(|s| CONTAINER_CONSTRUCTORS.contains(&s.ident.to_string().as_str()))
+        && segments.all(|s| {
+            matches!(
+                s.ident.to_string().as_str(),
+                "std" | "core" | "option" | "result" | "Option" | "Result"
+            )
+        })
+}
+
+/// The argument counts of the standard container method `method`. A call
+/// with another count is a trait method of that name: `repos.push()`.
+fn std_arities(method: &str) -> &'static [usize] {
+    match method {
+        "drain" | "take" => &[0, 1],
+        "insert" => &[1, 2],
+        "fold" | "try_fold" | "map_or" | "map_or_else" | "swap" | "resize" => &[2],
+        "all"
+        | "any"
+        | "and_then"
+        | "append"
+        | "chain"
+        | "chunks"
+        | "contains"
+        | "contains_key"
+        | "expect"
+        | "expect_err"
+        | "filter"
+        | "filter_map"
+        | "find"
+        | "find_map"
+        | "flat_map"
+        | "for_each"
+        | "get"
+        | "get_mut"
+        | "get_or_insert_with"
+        | "inspect"
+        | "inspect_err"
+        | "is_err_and"
+        | "is_none_or"
+        | "is_ok_and"
+        | "is_some_and"
+        | "map"
+        | "map_err"
+        | "max_by"
+        | "max_by_key"
+        | "min_by"
+        | "min_by_key"
+        | "nth"
+        | "ok_or"
+        | "ok_or_else"
+        | "or"
+        | "or_else"
+        | "position"
+        | "push"
+        | "push_back"
+        | "push_front"
+        | "reduce"
+        | "remove"
+        | "replace"
+        | "reserve"
+        | "retain"
+        | "skip"
+        | "skip_while"
+        | "sort_by"
+        | "sort_by_key"
+        | "sort_unstable_by"
+        | "sort_unstable_by_key"
+        | "step_by"
+        | "swap_remove"
+        | "take_while"
+        | "then"
+        | "then_some"
+        | "truncate"
+        | "try_for_each"
+        | "unwrap_or"
+        | "unwrap_or_else"
+        | "windows"
+        | "xor"
+        | "zip" => &[1],
+        _ => &[0],
+    }
 }
 
 /// Does this call build a value of a handle type: `PgPostRepository(pool)`
@@ -9420,6 +9515,42 @@ mod tests {
                 "guard: try_for_each with a plain callback is plain",
                 "async fn h(ids: Vec<i64>) -> AutumnResult<usize> { \
                  let done = ids.into_iter().try_for_each(|_| Ok::<(), i64>(())); render(done); Ok(0) }",
+                Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn std_methods_need_their_arity_and_constructors_their_path() {
+        check_handlers(&[
+            (
+                "a container method with the wrong arity is opaque",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 repos.push().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a len with an argument is opaque",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = repos.len(1); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: push with one argument is a known method",
+                "async fn h(repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut all = repos; all.push(repo); let _ = all.len(); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a qualified Some is not Option::Some",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let _ = Factory::Some(&repo).await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: Option::Some is a constructor",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let maybe = Option::Some(&repo); let _ = maybe.is_some(); Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);

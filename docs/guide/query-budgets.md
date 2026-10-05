@@ -412,8 +412,10 @@ callbacks. Two things sit outside it, by construction:
   for a `self` method before a `&self` method, and for a `&self` method before
   a `&mut self` method. So an application trait method `len(self)` on
   `Vec<PgPostRepository>` runs in place of `Vec::len`. The macro has no type
-  information and assumes that no such trait is in scope. Do not give a trait
-  on a container of handles a standard method name.
+  information and assumes that no such trait is in scope. It does see a call
+  with an argument count that the standard method does not take
+  (`repos.push()`), and reports it. Do not give a trait on a container of
+  handles a standard method name.
 
 ### `proven_max` is not `query_count()`
 
