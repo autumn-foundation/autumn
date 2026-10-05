@@ -1449,9 +1449,10 @@ struct Binding {
     parts: Option<Vec<(String, Kind)>>,
     /// The container shape, for a carrier, when it is known.
     shape: Option<Shape>,
-    /// The name a `&mut` binding points to: `slot` in `let slot = &mut
-    /// repos;` points to `repos`.
-    referent: Option<String>,
+    /// The names a `&mut` binding may point to, sorted: `slot` in `let slot
+    /// = &mut repos;` points to `repos`. After a branch it may point to more
+    /// than one.
+    referents: Vec<String>,
     /// A known future: `.await` on it runs what it names. A name bound to
     /// anything else that holds a handle (`PgPostRepository::new(&mut db)`,
     /// an `async fn new`) is reported when it is awaited.
@@ -1469,7 +1470,7 @@ impl Binding {
             kind,
             parts: None,
             shape: None,
-            referent: None,
+            referents: Vec::new(),
             future: false,
             output: None,
             inner: None,
@@ -1511,7 +1512,13 @@ impl Binding {
             kind: self.kind.max(other.kind),
             parts,
             shape,
-            referent: self.referent.clone().or_else(|| other.referent.clone()),
+            referents: {
+                let mut all = self.referents.clone();
+                all.extend(other.referents.iter().cloned());
+                all.sort();
+                all.dedup();
+                all
+            },
             future: self.future && other.future,
             output: self.output.max(other.output),
             inner: if self.inner == other.inner {
@@ -2038,7 +2045,7 @@ impl Analyzer {
             kind,
             parts,
             shape: self.shape_of(init),
-            referent: self.referent_of(init),
+            referents: self.referents_of(init),
             future: self.is_known_future(init),
             output: match peel_parens(init) {
                 Expr::Async(a) => Some(self.async_output(&a.block)),
@@ -2080,19 +2087,43 @@ impl Analyzer {
         tail.max(probe.returned)
     }
 
-    /// The name that `init` points to when it is a `&mut` place or a `&mut`
-    /// binding: `&mut repos`, `&mut *slot`, `slot`.
-    fn referent_of(&self, init: &Expr) -> Option<String> {
+    /// The names that `init` may point to when it is a `&mut` place or a
+    /// `&mut` binding: `&mut repos`, `&mut *slot`, `slot`.
+    fn referents_of(&self, init: &Expr) -> Vec<String> {
         match init {
-            Expr::Paren(p) => self.referent_of(&p.expr),
-            Expr::Group(g) => self.referent_of(&g.expr),
+            Expr::Paren(p) => self.referents_of(&p.expr),
+            Expr::Group(g) => self.referents_of(&g.expr),
             Expr::Reference(r) if r.mutability.is_some() => {
-                let root = place_root(&r.expr)?;
-                self.env.binding(&root).referent.or(Some(root))
+                let Some(root) = place_root(&r.expr) else {
+                    return Vec::new();
+                };
+                let through = self.env.binding(&root).referents;
+                if through.is_empty() {
+                    vec![root]
+                } else {
+                    through
+                }
             }
-            Expr::Path(_) => self.env.binding(&path_ident(init)?).referent,
-            _ => None,
+            Expr::Path(_) => path_ident(init)
+                .map(|name| self.env.binding(&name).referents)
+                .unwrap_or_default(),
+            _ => Vec::new(),
         }
+    }
+
+    /// `root` and every name it may point to through `&mut` bindings.
+    fn alias_targets(&self, root: String) -> Vec<String> {
+        let mut targets = vec![root];
+        let mut i = 0;
+        while i < targets.len() && targets.len() < 32 {
+            for next in self.env.binding(&targets[i]).referents {
+                if !targets.contains(&next) {
+                    targets.push(next);
+                }
+            }
+            i += 1;
+        }
+        targets
     }
 
     /// `place = value`. A tuple or array place over a literal of the same
@@ -2145,11 +2176,10 @@ impl Analyzer {
             // saved`, `slot.value = repo` stores into `saved.value` too.
             Expr::Field(f) if path_ident(&f.base).is_some() => {
                 let member = member_name(&f.member);
-                let mut next = path_ident(&f.base);
-                for _ in 0..8 {
-                    let Some(name) = next.take() else { break };
-                    next = self.env.binding(&name).referent.filter(|r| *r != name);
-                    self.env.assign_part(&name, &member, kind);
+                if let Some(base) = path_ident(&f.base) {
+                    for name in self.alias_targets(base) {
+                        self.env.assign_part(&name, &member, kind);
+                    }
                 }
             }
             // `a.b.c = repo`, `repos[0] = repo`, `*slot = repo`: the name at
@@ -3114,7 +3144,7 @@ impl Analyzer {
         for (i, arg) in call.args.iter().enumerate() {
             let place = match arg {
                 Expr::Reference(r) if r.mutability.is_some() => &*r.expr,
-                _ if self.referent_of(arg).is_some() => arg,
+                _ if !self.referents_of(arg).is_empty() => arg,
                 _ => continue,
             };
             let others: Vec<&Expr> = call
@@ -3445,11 +3475,8 @@ impl Analyzer {
     /// `root` now holds at least `kind`. A store through `slot = &mut repos`
     /// is a store into `repos` too.
     fn raise(&mut self, root: String, kind: Kind) {
-        let mut next = Some(root);
-        for _ in 0..8 {
-            let Some(root) = next.take() else { break };
+        for root in self.alias_targets(root) {
             let mut binding = self.env.binding(&root);
-            next = binding.referent.clone().filter(|r| *r != root);
             if kind > binding.kind {
                 binding.kind = kind;
                 binding.parts = None;
@@ -8961,6 +8988,12 @@ mod tests {
                 "a field assignment through a chain of mutable aliases",
                 "async fn h(repo: PgPostRepository, mut saved: Saved) -> AutumnResult<usize> { \
                  let a = &mut saved; let b = a; b.value = Some(repo); let _ = saved.value.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a store through an alias that may point to either of two places",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut a = Vec::new(); let mut b = Vec::new(); let mut slot = &mut a; if flag { slot = &mut b; } slot.push(repo); for r in b { let _ = r.find_all().await?; } let _ = a; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
