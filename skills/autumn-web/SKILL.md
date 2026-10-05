@@ -111,7 +111,8 @@ the framework almost certainly already generates or ships it:
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
-| Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0) |
+| Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0); `.stale_if_error(window)` serves the last value when a fill fails |
+| Calling `cache.invalidate(key)` by hand after a repository write | `#[repository(Model, invalidates(cached_fn))]`: each generated write drops the read after it commits (#3056). Async code uses `Cache::invalidate_async`, which returns the error |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | `Db` taken before a body extractor (`Form`/`Json`/`Multipart`) in the same handler — pins a pooled connection for as long as the client takes to send the body | `LazyDb` in the same argument spot; call `.checkout().await?` after the body extractor runs — for `Form`/`Json` that means right at handler entry, but `Multipart` doesn't buffer anything during extraction, so checkout must wait until every field this handler needs has been read from the `next_field()` loop, not before it (issue #2264) |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
@@ -1539,11 +1540,9 @@ Two things to get right when generating this code:
       distinguishes a first attempt from a retry of the same event, and the
       `Autumn-Signature` header's `t=` is recomputed per attempt but is
       neither unique nor stable — it is a whole-second `Utc::now().timestamp()`
-      and nothing guarantees two attempts differ. On the `local` backend they
-      routinely do not: equal jitter puts the first retry 500-1000 ms later, so
-      the same second yields a byte-identical signature. (`redis`/`postgres` do
-      not jitter and retry at the exact exponential delay — do not describe
-      jitter as backend-neutral.) (Do not enumerate
+      and nothing guarantees two attempts differ. Every backend uses full
+      jitter (issue #3054), so the first retry can come 0-1000 ms later and the
+      same second yields a byte-identical signature. (Do not enumerate
       the headers — under `telemetry-otlp` the shared client also injects W3C
       `traceparent`/`tracestate`.) Receiver-side deduplication needs an ID the
       app mints into the payload itself.
@@ -1856,8 +1855,19 @@ that already gates migrations and ISR. (`#[scheduled]` uses a tick table.)
   only — under the `sqlite` feature `from_state` refuses rather than pretending
   to hold a lock (see below).
 
-See `docs/guide/distributed-locks.md` and
-`docs/adr/0010-app-facing-distributed-lock.md`.
+- `Lock` is mutual exclusion for efficiency, not correctness. When overlap
+  corrupts data, use `LeaseLock` (Postgres only): each grant gets a strictly
+  larger `FencingToken`, the lease renews in the background, and
+  `lease_lost()` signals loss. `try_with(|lease| ..)` passes the `Lease` and
+  stops the closure on loss (`LockError::LeaseLost`). Check the token at the
+  resource: `UPDATE .. SET fencing_token = $t WHERE .. AND fencing_token <= $t`.
+- Behind a transaction-mode pooler (PgBouncer, RDS Proxy), session advisory
+  locks (`Lock`, migrations) are not safe; `LeaseLock` and the Postgres scheduler
+  (a tick row since #3052) work.
+
+See `docs/guide/distributed-locks.md`,
+`docs/adr/0010-app-facing-distributed-lock.md` and
+`docs/adr/0015-fencing-lease-lock.md`.
 
 ## Postgres-only subsystems on a SQLite app (0.8.0, issue #1905)
 
@@ -3156,6 +3166,7 @@ autumn serve --role worker       # run only workers + scheduler (web/worker spli
 autumn console                   # data playground: scaffolds src/bin/playground.rs (pre-wired config+pool), then builds and runs it; alias `autumn c`
 autumn console --force           # regenerate the playground from the template (never overwritten otherwise)
 autumn console --scaffold-only   # scaffold + wire Cargo.toml, then stop
+autumn console --repl            # interactive Rhai prompt: PostRepository::find_all() / find_by_id(id) / count()
 autumn release init --target azure-container-apps   # Terraform scaffold: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ACR, Container Apps, Postgres Flexible Server, Key Vault-backed secrets, opt-in Redis) + .github/workflows/azure-deploy.yml (#1278). Same --force/collision guard as the fly/docker-compose targets; see docs/guide/deployment.md.
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
@@ -3308,6 +3319,12 @@ Two things to know when advising on it:
   entirely. Only `autumn console` compiles it. Never suggest removing that
   gate: without it, a playground that fails to compile would break the app's
   default build.
+- `autumn console --repl` (#2148) opens a Rhai prompt on the same binary. It
+  adds `autumn-web/repl` on the command line only; `Cargo.toml` does not
+  change. `#[model]` / `#[repository]` register through `inventory`; reads
+  only (`find_all`, `find_by_id`, `count`); rows are JSON. It also sets
+  `AUTUMN_CONSOLE_REPL=1`, so `SeedContext::build()` opens the prompt and
+  exits; the playground body never runs. The template is unchanged.
 
 `autumn i18n check` scans `**/*.rs` for string-literal keys passed to
 `t!(...)`, `.t(...)`, and `.t_with(...)`, loads every `i18n/<locale>.ftl` via

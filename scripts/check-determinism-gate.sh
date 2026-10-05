@@ -99,6 +99,8 @@ die() {
 GATED_MODULES=(
   autumn/src/time.rs:default
   autumn/src/entropy.rs:default
+  # Retry jitter for the HTTP client and every job backend (#3054).
+  autumn/src/backoff.rs:default
   autumn/src/state.rs:default
   autumn/src/scheduler.rs:default
   autumn/src/app.rs:default
@@ -214,7 +216,7 @@ GATED_MODULES=(
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=76
+MODULE_COUNT_FLOOR=77
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

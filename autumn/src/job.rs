@@ -4801,6 +4801,10 @@ pub fn start_runtime(
     if run_workers {
         warn_deferrable_jobs_not_deferred(state, &jobs, &config.backend);
     }
+    if config.max_backoff_ms == 0 {
+        tracing::warn!("jobs.max_backoff_ms = 0: every job retry is due at once, with no backoff");
+    }
+    state.insert_extension(JobMaxBackoff(config.max_backoff_ms));
 
     match config.backend.as_str() {
         "local" => {
@@ -5595,53 +5599,28 @@ impl LocalQueueBuffer {
     }
 }
 
-/// Equal-jitter backoff: spreads job retries across `[base/2, base]` instead of
-/// retrying every failed job at the *exact* same virtual instant.
-///
-/// The local job runtime's exponential backoff (`base_delay =
-/// initial_backoff_ms * 2^(attempt-1)`) is a pure function of
-/// `initial_backoff_ms` and `attempt` — nothing job-specific. When several jobs
-/// in the same queue fail at the same instant (a downstream dependency blips
-/// and takes every in-flight job down with it), every one of them computes the
-/// identical `base_delay` and therefore retries at the identical instant: a
-/// synchronized "thundering herd" that immediately re-floods the dependency it
-/// just backed off from instead of spreading the retry load. Drawing the
-/// spread from the framework's injected [`crate::entropy::Entropy`] seam
-/// breaks the synchronization — real OS entropy in production, seeded and
-/// bit-for-bit reproducible under a [`crate::sim::Sim`] run — while keeping the
-/// worst case no worse than the un-jittered delay (`delay <= base_delay_ms`),
-/// so this changes no existing retry-timeout budget.
-///
-/// "Equal jitter" (half the delay is guaranteed, the other half is random) is
-/// used over "full jitter" (`rand(0, base)`) so a retry can never fire
-/// near-instantly under heavy jitter — see
-/// <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>.
-///
-/// `half` rounds *up* (`div_ceil`, not plain integer division) so a small
-/// configured backoff is still honored: at `base_delay_ms = 1`, plain
-/// `1 / 2 == 0` would let the retry fire immediately (`0ms`) instead of
-/// preserving the configured 1ms floor, and would do so on *every* attempt of
-/// a job configured with a tiny backoff — silently turning it into a tight
-/// retry loop (Codex review). `spread` is sized so `half + (0..spread)` covers
-/// exactly `[half, base_delay_ms]` inclusive, so the delay is never less than
-/// half the base and never more than the base itself.
-fn jittered_retry_delay_ms(entropy: &dyn crate::entropy::Entropy, base_delay_ms: u64) -> u64 {
-    let half = base_delay_ms.div_ceil(2);
-    // `half <= base_delay_ms` (it is the ceiling half), so `spread >= 1` and
-    // the reduction below is always defined; the sum is capped at
-    // `base_delay_ms` by construction.
-    let spread = base_delay_ms.saturating_sub(half).saturating_add(1);
-    half.saturating_add(entropy.next_u64().checked_rem(spread).unwrap_or_default())
-}
+/// `AppState` extension: the `[jobs] max_backoff_ms` cap. `start_runtime`
+/// installs it. Without it, [`crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS`]
+/// applies.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JobMaxBackoff(pub(crate) u64);
 
-/// Exponential backoff delay in ms for `attempt` (1-indexed) on the local
-/// in-process backend — the counterpart of `redis_retry_delay_ms` /
-/// `pg_retry_delay_ms`.
-/// `attempt` is 1-indexed, so the exponent is `attempt - 1`; a `0` attempt
-/// saturates to the first-attempt delay rather than underflowing (matching
-/// the Redis and Postgres backends).
-const fn local_retry_delay_ms(initial_backoff_ms: u64, attempt: u32) -> u64 {
-    initial_backoff_ms.saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1)))
+/// The delay in ms before a job retry, for every backend (issue #3054).
+///
+/// `attempt` is the 1-indexed attempt that failed. The delay is full jitter
+/// in `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]`, drawn from
+/// `state.entropy()`. Jobs that fail together therefore do not retry
+/// together, and a [`crate::sim::Sim`] seed replays the same delays.
+pub(crate) fn job_retry_delay_ms(state: &AppState, initial_backoff_ms: u64, attempt: u32) -> u64 {
+    let cap = state
+        .extension::<JobMaxBackoff>()
+        .map_or(crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS, |cap| cap.0);
+    crate::backoff::full_jitter_ms(
+        state.entropy(),
+        initial_backoff_ms,
+        cap,
+        attempt.saturating_sub(1),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5871,8 +5850,7 @@ async fn execute_local_job(
                 let traceparent = job.traceparent;
                 #[cfg(feature = "telemetry-otlp")]
                 let tracestate = job.tracestate;
-                let base_delay = local_retry_delay_ms(backoff_ms, job.attempt);
-                let delay = jittered_retry_delay_ms(state.entropy(), base_delay);
+                let delay = job_retry_delay_ms(state, backoff_ms, job.attempt);
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     registry.record_enqueue(&name);
@@ -6041,11 +6019,6 @@ fn redis_queue_key(key_prefix: &str, queue: &str) -> String {
 }
 
 #[cfg(feature = "redis")]
-const fn redis_retry_delay_ms(initial_backoff_ms: u64, attempt: u32) -> u64 {
-    initial_backoff_ms.saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1)))
-}
-
-#[cfg(feature = "redis")]
 fn clear_redis_claim(record: &mut RedisJobRecord) {
     record.claimed_by = None;
     record.claimed_at_ms = None;
@@ -6071,6 +6044,7 @@ fn prepare_redis_failure_action(
     mut record: RedisJobRecord,
     error: String,
     now_ms: u64,
+    retry_delay_ms: u64,
 ) -> RedisFailureAction {
     clear_redis_claim(&mut record);
     record.last_error = Some(error);
@@ -6079,10 +6053,7 @@ fn prepare_redis_failure_action(
     if is_final_attempt(&record.attempt, &record.max_attempts) {
         RedisFailureAction::DeadLetter(record)
     } else {
-        let due_at_ms = now_ms.saturating_add(redis_retry_delay_ms(
-            record.initial_backoff_ms,
-            record.attempt,
-        ));
+        let due_at_ms = now_ms.saturating_add(retry_delay_ms);
         record.attempt = record.attempt.saturating_add(1);
         RedisFailureAction::Retry(RedisRetrySchedule { record, due_at_ms })
     }
@@ -8031,7 +8002,11 @@ if ARGV[4] == 'requeue' then
     end
   end
   redis.call('SET', key, ARGV[5])
-  redis.call('LPUSH', KEYS[3], ARGV[1])
+  if ARGV[12] ~= '' then
+    redis.call('ZADD', KEYS[8], tonumber(ARGV[12]), ARGV[1])
+  else
+    redis.call('LPUSH', KEYS[3], ARGV[1])
+  end
   if ARGV[9] == 'running' then
     redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[10]))
   end
@@ -8053,6 +8028,7 @@ async fn apply_stale_redis_recovery(
     registry: &crate::actuator::JobRegistry,
     expected: &RedisJobRecord,
     action: &RedisStaleRecovery,
+    requeue_due_at_ms: Option<u64>,
 ) -> Result<bool, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
         return Ok(false);
@@ -8083,7 +8059,7 @@ async fn apply_stale_redis_recovery(
     let requeue_key = redis_queue_key(&worker_config.key_prefix, &record.queue);
     let (status, trimmed): (i64, u64) = redis::cmd("EVAL")
         .arg(STALE_REDIS_RECOVERY_SCRIPT)
-        .arg(7)
+        .arg(8)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
         .arg(&requeue_key)
@@ -8091,6 +8067,7 @@ async fn apply_stale_redis_recovery(
         .arg(&worker_config.dead_record_prefix)
         .arg(worker_config.unique_lock_key_for(expected))
         .arg(worker_config.concurrency_counter_key_for(expected))
+        .arg(&worker_config.delayed_key)
         .arg(&expected.id)
         .arg(claimed_by)
         .arg(claimed_at_ms)
@@ -8106,6 +8083,7 @@ async fn apply_stale_redis_recovery(
         })
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
         .arg(REDIS_DEAD_LETTER_TRIM_BATCH)
+        .arg(requeue_due_at_ms.map_or_else(String::new, |due| due.to_string()))
         .query_async(connection)
         .await?;
 
@@ -8165,12 +8143,21 @@ async fn recover_stale_redis_jobs(
                 .await?;
             continue;
         };
-        let Some(action) = recover_stale_redis_record(
-            record.clone(),
-            now_unix_ms(worker_config.clock.as_ref()),
-            worker_config.visibility_timeout_ms,
-        ) else {
+        let now_ms = now_unix_ms(worker_config.clock.as_ref());
+        let Some(action) =
+            recover_stale_redis_record(record.clone(), now_ms, worker_config.visibility_timeout_ms)
+        else {
             continue;
+        };
+        // Claims that expire together (handlers that hung on one dependency)
+        // must not all run again at once (issue #3054). A delayed requeue goes
+        // through the `delayed` set; its promotion records the enqueue.
+        let due_at_ms = match &action {
+            RedisStaleRecovery::Requeue(_) => {
+                let delay = job_retry_delay_ms(state, record.initial_backoff_ms, record.attempt);
+                (delay > 0).then(|| now_ms.saturating_add(delay))
+            }
+            RedisStaleRecovery::DeadLetter(_) => None,
         };
 
         if apply_stale_redis_recovery(
@@ -8179,6 +8166,7 @@ async fn recover_stale_redis_jobs(
             &state.job_registry,
             &record,
             &action,
+            due_at_ms,
         )
         .await?
         {
@@ -8190,8 +8178,10 @@ async fn recover_stale_redis_jobs(
                             .record_retry(&requeued.name, error, record.attempt);
                         job_admin.record_retrying(&requeued.id, error);
                     }
-                    state.job_registry.record_enqueue(&requeued.name);
-                    job_admin.record_requeued(&requeued.id, requeued.attempt);
+                    if due_at_ms.is_none() {
+                        state.job_registry.record_enqueue(&requeued.name);
+                        job_admin.record_requeued(&requeued.id, requeued.attempt);
+                    }
                 }
                 RedisStaleRecovery::DeadLetter(dead) => {
                     let error = dead
@@ -8392,6 +8382,7 @@ async fn settle_failed_redis_job(
         record.clone(),
         error.clone(),
         now_unix_ms(worker_config.clock.as_ref()),
+        job_retry_delay_ms(state, record.initial_backoff_ms, record.attempt),
     );
     match action {
         RedisFailureAction::Retry(schedule) => {
@@ -9267,11 +9258,35 @@ struct PgEnqueuedCounts {
     scheduled_count: i64,
 }
 
-/// Exponential backoff delay in ms for attempt `attempt` (1-indexed).
+/// The cap for a stale-claim requeue in SQL, in ms.
+///
+/// Claims that expire together (handlers that hung on one dependency) must
+/// not all run again at once (issue #3054). The SQL draws a per-row jitter in
+/// `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]` with the database's
+/// own `random()`, as the recovery updates many rows in one statement. The
+/// cap is clamped like a relative enqueue, so the SQL cannot overflow.
 #[cfg(feature = "db")]
-fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
-    let exp = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0);
-    initial_backoff_ms.saturating_mul(2_i64.saturating_pow(exp))
+pub(crate) fn stale_requeue_cap_ms(state: &AppState) -> i64 {
+    let cap = state
+        .extension::<JobMaxBackoff>()
+        .map_or(crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS, |cap| cap.0);
+    i64::try_from(cap)
+        .unwrap_or(i64::MAX)
+        .min(PG_MAX_RELATIVE_DELAY_MS)
+}
+
+/// [`job_retry_delay_ms`] for a durable SQL row, whose columns are signed.
+#[cfg(feature = "db")]
+pub(crate) fn sql_row_retry_delay_ms(
+    state: &AppState,
+    initial_backoff_ms: i64,
+    attempt: i32,
+) -> u64 {
+    job_retry_delay_ms(
+        state,
+        u64::try_from(initial_backoff_ms).unwrap_or(0),
+        u32::try_from(attempt).unwrap_or(0),
+    )
 }
 
 #[cfg(feature = "db")]
@@ -10148,7 +10163,8 @@ async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnR
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job ack failed: {e}")))
 }
 
-/// Handle a job failure: schedule a retry with exponential backoff or dead-letter.
+/// Handle a job failure: schedule a retry after `retry_delay_ms`, or
+/// dead-letter.
 #[cfg(feature = "db")]
 #[allow(clippy::if_not_else)]
 async fn pg_nack_failure(
@@ -10158,6 +10174,7 @@ async fn pg_nack_failure(
     error: &str,
     row: &PgJobRow,
     pending_unique_key: Option<&str>,
+    retry_delay_ms: u64,
 ) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
@@ -10167,7 +10184,11 @@ async fn pg_nack_failure(
         .map_err(|e| AutumnError::internal_server_error_msg(format!("pg pool error: {e}")))?;
 
     if !is_final_attempt(&row.attempt, &row.max_attempts) {
-        let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
+        // Clamped like a relative enqueue, so a huge `max_backoff_ms` cannot
+        // overflow the interval and fail the nack.
+        let delay_ms = i64::try_from(retry_delay_ms)
+            .unwrap_or(i64::MAX)
+            .min(PG_MAX_RELATIVE_DELAY_MS);
         // Re-enqueue and restore the pending-window unique key atomically in one
         // UPDATE to eliminate the window where status='enqueued' and
         // unique_key=NULL co-exist, which would let a concurrent enqueue bypass
@@ -10308,7 +10329,10 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
              ELSE attempt \
            END, \
            run_at = CASE \
-             WHEN attempt < max_attempts THEN NOW() \
+             WHEN attempt < max_attempts THEN NOW() + \
+               floor(random() * (LEAST($2::BIGINT::FLOAT8, \
+                 initial_backoff_ms::FLOAT8 * power(2::FLOAT8, LEAST(GREATEST(attempt - 1, 0), 62))) \
+                 + 1)) * INTERVAL '1 millisecond' \
              ELSE run_at \
            END, \
            started_at = NULL, \
@@ -10347,6 +10371,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
          RETURNING id, name, payload::TEXT AS payload, status",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(stale_requeue_cap_ms(state))
     .get_results::<PgStaleRecoveryRow>(&mut *conn)
     .await;
 
@@ -10394,6 +10419,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
 
 /// Execute one claimed job and ack/nack based on the outcome.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn pg_execute_job(
     row: PgJobRow,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
@@ -10406,8 +10432,17 @@ async fn pg_execute_job(
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
 
     if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
-        let ack =
-            pg_nack_failure(pool, &row.id, worker_id, "canceled by operator", &row, None).await;
+        let delay_ms = sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt);
+        let ack = pg_nack_failure(
+            pool,
+            &row.id,
+            worker_id,
+            "canceled by operator",
+            &row,
+            None,
+            delay_ms,
+        )
+        .await;
         record_pg_row_cancel_after_ack(ack, &row, state);
         // `pg_nack_failure` reuses the ordinary retry-vs-dead-letter decision
         // even for a cancellation, so only settle the tracked record here
@@ -10479,17 +10514,17 @@ async fn pg_execute_job(
             );
         }
         JobExecutionOutcome::Failed(error) => {
+            // One draw for the gauge and the nack UPDATE, so both agree.
+            let delay_ms = sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt);
             let lifecycle = if is_final_attempt(&attempt, &max_attempts) {
                 PgLifecycleRecord::Failure { error: &error }
             } else {
                 // Mirror the `run_at = NOW() + backoff` the nack UPDATE applies
-                // (same `pg_retry_delay_ms(row.initial_backoff_ms, row.attempt)`)
                 // so the local gauge tracks the retry as scheduled until it is
                 // actually claimable. A zero backoff is due-now (`None`).
-                let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
                 let ready_at_ms = (delay_ms > 0).then(|| {
                     let now_ms = u64::try_from(state.clock().now().timestamp_millis()).unwrap_or(0);
-                    now_ms.saturating_add(u64::try_from(delay_ms).unwrap_or(0))
+                    now_ms.saturating_add(delay_ms)
                 });
                 PgLifecycleRecord::Retry {
                     error: &error,
@@ -10504,6 +10539,7 @@ async fn pg_execute_job(
                 &error,
                 &row,
                 pending_unique_key.as_deref(),
+                delay_ms,
             )
             .await;
             record_pg_row_lifecycle_ack_result(ack, &row, "failure", lifecycle, state, job_admin);
@@ -11445,80 +11481,98 @@ mod tests {
         })
     }
 
-    #[test]
-    fn local_retry_delay_doubles_per_attempt_and_survives_a_zero_attempt() {
-        // The 1-indexed series must be preserved exactly.
-        assert_eq!(local_retry_delay_ms(100, 1), 100);
-        assert_eq!(local_retry_delay_ms(100, 2), 200);
-        assert_eq!(local_retry_delay_ms(100, 3), 400);
-        assert_eq!(local_retry_delay_ms(100, 4), 800);
-        assert_eq!(local_retry_delay_ms(100, 5), 1_600);
-
-        // Regression (issue #1611): `attempt - 1` underflows for `attempt ==
-        // 0` (a debug-build panic; a wildly wrong exponent in release). A
-        // zero attempt must degrade to the first-attempt delay, matching the
-        // Redis and Postgres backends' `saturating_sub(1)`.
-        assert_eq!(local_retry_delay_ms(100, 0), 100);
-
-        // A huge attempt must saturate, not overflow.
-        assert_eq!(local_retry_delay_ms(100, u32::MAX), u64::MAX);
+    fn seeded_state(seed: u64) -> AppState {
+        AppState::for_test().with_entropy(crate::entropy::SeededEntropy::shared(seed))
     }
 
     #[test]
-    fn jittered_retry_delay_stays_within_the_equal_jitter_bounds() {
-        let entropy = crate::entropy::SeededEntropy::new(0);
-        for _ in 0..1_000 {
-            let delay = jittered_retry_delay_ms(&entropy, 1_000);
+    fn job_retry_delay_stays_under_the_exponential_ceiling() {
+        let state = seeded_state(0);
+        for attempt in 1..=5_u32 {
+            let ceiling = 100 * (1_u64 << (attempt - 1));
+            for _ in 0..256 {
+                let delay = job_retry_delay_ms(&state, 100, attempt);
+                assert!(delay <= ceiling, "attempt {attempt}: {delay} > {ceiling}");
+            }
+        }
+    }
+
+    #[test]
+    fn job_retry_delay_survives_zero_and_huge_attempts() {
+        // Regression (issue #1611): attempt 0 is the first attempt, not an
+        // underflow. A huge attempt saturates at the cap.
+        let state = seeded_state(1);
+        for _ in 0..64 {
+            assert!(job_retry_delay_ms(&state, 100, 0) <= 100);
             assert!(
-                (500..=1_000).contains(&delay),
-                "equal jitter must land in [base/2, base], got {delay}"
+                job_retry_delay_ms(&state, 100, u32::MAX)
+                    <= crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS
             );
         }
     }
 
     #[test]
-    fn jittered_retry_delay_is_a_pure_function_of_the_entropy_stream() {
-        // Same seed, same number of prior draws ⇒ identical jittered delay —
-        // this is what makes a `#[sim_test]` retry-storm run bit-for-bit
-        // reproducible from its seed (W7, issue #1797).
-        let a = crate::entropy::SeededEntropy::new(42);
-        let b = crate::entropy::SeededEntropy::new(42);
-        let delays_a: Vec<u64> = (0..8).map(|_| jittered_retry_delay_ms(&a, 1_000)).collect();
-        let delays_b: Vec<u64> = (0..8).map(|_| jittered_retry_delay_ms(&b, 1_000)).collect();
-        assert_eq!(delays_a, delays_b);
-        assert!(
-            delays_a
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                > 1,
-            "a real spread of draws should not collapse to a single delay value: {delays_a:?}"
-        );
-    }
-
-    #[test]
-    fn jittered_retry_delay_preserves_a_one_millisecond_backoff() {
-        // A job configured with `backoff_ms = 1` must still wait ~1ms, not
-        // retry immediately: plain integer division (`1 / 2 == 0`) would let
-        // every attempt draw a 0ms delay, silently turning a tiny configured
-        // backoff into a tight retry loop (Codex review).
-        let entropy = crate::entropy::SeededEntropy::new(3);
+    fn job_retry_delay_obeys_the_configured_cap() {
+        let state = seeded_state(2);
+        state.insert_extension(JobMaxBackoff(1_000));
         for _ in 0..256 {
-            assert_eq!(jittered_retry_delay_ms(&entropy, 1), 1);
+            assert!(job_retry_delay_ms(&state, 250, 30) <= 1_000);
         }
     }
 
+    #[tokio::test]
+    async fn start_runtime_installs_the_configured_cap() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        let state = AppState::for_test();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            max_backoff_ms: 1_234,
+            ..Default::default()
+        };
+        start_runtime(Vec::new(), &state, &shutdown, &config, false).expect("local runtime");
+        assert_eq!(
+            state.extension::<JobMaxBackoff>().map(|cap| cap.0),
+            Some(1_234)
+        );
+        assert_eq!(
+            crate::config::JobConfig::default().max_backoff_ms,
+            3_600_000
+        );
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
     #[test]
-    fn jittered_retry_delay_never_exceeds_the_unjittered_delay() {
-        // The fix must never make a retry wait *longer* than the un-jittered
-        // exponential delay — only spread the herd within it — so it changes
-        // no existing retry-timeout budget.
-        let entropy = crate::entropy::SeededEntropy::new(7);
-        for base in [0, 1, 2, 3, 100, 250, 1_000, 60_000] {
-            for _ in 0..64 {
-                let delay = jittered_retry_delay_ms(&entropy, base);
-                assert!(delay <= base, "delay {delay} exceeded base {base}");
-            }
+    fn job_retry_delay_replays_from_the_seed() {
+        let a = seeded_state(42);
+        let b = seeded_state(42);
+        let delays_a: Vec<u64> = (0..8).map(|_| job_retry_delay_ms(&a, 1_000, 1)).collect();
+        let delays_b: Vec<u64> = (0..8).map(|_| job_retry_delay_ms(&b, 1_000, 1)).collect();
+        assert_eq!(delays_a, delays_b);
+    }
+
+    /// Issue #3054: N jobs that fail at the same attempt at the same instant
+    /// get different delays on every backend. Before the fix the durable
+    /// backends returned `initial_backoff_ms * 2^(attempt-1)` for all N.
+    #[test]
+    fn job_retry_delays_differ_for_jobs_that_fail_together() {
+        const JOBS: usize = 12;
+        let state = seeded_state(0x3054);
+        let delays: std::collections::BTreeSet<u64> = (0..JOBS)
+            .map(|_| job_retry_delay_ms(&state, 1_000, 1))
+            .collect();
+        assert!(
+            delays.len() > JOBS / 2,
+            "{JOBS} jobs got only {} distinct delays: {delays:?}",
+            delays.len()
+        );
+        #[cfg(feature = "db")]
+        {
+            let sql: std::collections::BTreeSet<u64> = (0..JOBS)
+                .map(|_| sql_row_retry_delay_ms(&state, 1_000, 1))
+                .collect();
+            assert!(sql.len() > JOBS / 2, "SQL rows: {sql:?}");
         }
     }
 
@@ -13457,12 +13511,13 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[test]
-    fn redis_failed_job_schedules_next_attempt_with_exponential_backoff() {
+    fn redis_failed_job_schedules_next_attempt_after_the_given_delay() {
         let mut record = redis_test_record(2, 4);
         record.claimed_by = Some("worker-a".to_string());
         record.claimed_at_ms = Some(20_000);
 
-        let action = prepare_redis_failure_action(record, "stripe timed out".to_string(), 50_000);
+        let action =
+            prepare_redis_failure_action(record, "stripe timed out".to_string(), 50_000, 500);
 
         let RedisFailureAction::Retry(schedule) = action else {
             panic!("second attempt below max should be scheduled for retry");
@@ -13484,7 +13539,8 @@ mod tests {
         record.claimed_by = Some("worker-a".to_string());
         record.claimed_at_ms = Some(20_000);
 
-        let action = prepare_redis_failure_action(record, "permanent failure".to_string(), 50_000);
+        let action =
+            prepare_redis_failure_action(record, "permanent failure".to_string(), 50_000, 500);
 
         let RedisFailureAction::DeadLetter(record) = action else {
             panic!("max attempt failure should dead-letter");
@@ -14315,6 +14371,22 @@ mod tests {
         assert_eq!(status.dead_letters, 1);
     }
 
+    /// Entropy whose draws are all 0, so every jittered retry delay is 0 ms.
+    /// IDs still come from the OS.
+    #[cfg(feature = "redis")]
+    #[derive(Debug)]
+    struct ZeroBackoffEntropy;
+
+    #[cfg(feature = "redis")]
+    impl crate::entropy::Entropy for ZeroBackoffEntropy {
+        fn next_u64(&self) -> u64 {
+            0
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            crate::entropy::OsEntropy.fill_bytes(dest);
+        }
+    }
+
     #[cfg(feature = "redis")]
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Docker (testcontainers)"]
@@ -14339,7 +14411,11 @@ mod tests {
         assert_eq!(claimed.attempt, 1);
 
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let state = AppState::for_test().with_profile("dev");
+        // A recovered claim waits a jittered delay (issue #3054). A draw of 0
+        // makes that delay 0 ms, so the job goes straight back to the queue.
+        let state = AppState::for_test()
+            .with_profile("dev")
+            .with_entropy(Arc::new(ZeroBackoffEntropy));
         let job_admin = JobAdminMemoryBackend::new_for_test(32);
         state.job_registry().register("send_email");
         recover_stale_redis_jobs(&mut connection, &worker_b, &state, &job_admin)
@@ -17112,11 +17188,13 @@ mod tests {
         }
 
         #[test]
-        fn pg_retry_delay_grows_exponentially() {
-            assert_eq!(pg_retry_delay_ms(250, 1), 250);
-            assert_eq!(pg_retry_delay_ms(250, 2), 500);
-            assert_eq!(pg_retry_delay_ms(250, 3), 1_000);
-            assert_eq!(pg_retry_delay_ms(250, 4), 2_000);
+        fn sql_row_retry_delay_is_capped_and_safe_for_bad_columns() {
+            let state = AppState::for_test();
+            for attempt in [i32::MIN, -1, 0, 1, 4, i32::MAX] {
+                let delay = sql_row_retry_delay_ms(&state, 250, attempt);
+                assert!(delay <= crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS);
+            }
+            assert_eq!(sql_row_retry_delay_ms(&state, -5, 3), 0);
         }
 
         /// `enqueue_in` (a relative delay) must reach the INSERT as
@@ -18553,9 +18631,17 @@ mod tests {
                 .await
                 .expect("first claim should succeed");
             assert_eq!(job.attempt, 1);
-            pg_nack_failure(&pool, &job_id, "worker-1", "first failure", &job, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &job_id,
+                "worker-1",
+                "first failure",
+                &job,
+                None,
+                u64::try_from(job.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             let after_first = pg_fetch_by_id(&pool, &job_id).await.unwrap();
             assert_eq!(after_first.status, PG_STATUS_ENQUEUED);
@@ -18573,9 +18659,17 @@ mod tests {
                 .await
                 .expect("second claim should succeed");
             assert_eq!(job2.attempt, 2);
-            pg_nack_failure(&pool, &job_id, "worker-1", "second failure", &job2, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &job_id,
+                "worker-1",
+                "second failure",
+                &job2,
+                None,
+                u64::try_from(job2.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             let final_row = pg_fetch_by_id(&pool, &job_id).await.unwrap();
             assert_eq!(final_row.status, PG_STATUS_FAILED);
@@ -18722,9 +18816,17 @@ mod tests {
             let job_f = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
                 .await
                 .expect("failed job to claim");
-            pg_nack_failure(&pool, &job_f.id, "w1", "server down", &job_f, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &job_f.id,
+                "w1",
+                "server down",
+                &job_f,
+                None,
+                u64::try_from(job_f.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             let backend = PgJobAdminBackend {
                 pool: pool.clone(),
@@ -18779,9 +18881,17 @@ mod tests {
             let jf = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
                 .await
                 .unwrap();
-            pg_nack_failure(&pool, &jf.id, "w", "boom", &jf, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &jf.id,
+                "w",
+                "boom",
+                &jf,
+                None,
+                u64::try_from(jf.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             backend.retry("fail-r").await.expect("retry should succeed");
             let row = pg_fetch_by_id(&pool, "fail-r").await.unwrap();
@@ -18809,9 +18919,17 @@ mod tests {
             let jd = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
                 .await
                 .unwrap();
-            pg_nack_failure(&pool, &jd.id, "w", "boom", &jd, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &jd.id,
+                "w",
+                "boom",
+                &jd,
+                None,
+                u64::try_from(jd.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             backend
                 .discard("fail-d")
@@ -19133,9 +19251,17 @@ mod tests {
             let claimed = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
                 .await
                 .unwrap();
-            pg_nack_failure(&pool, &claimed.id, "w", "boom", &claimed, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &claimed.id,
+                "w",
+                "boom",
+                &claimed,
+                None,
+                u64::try_from(claimed.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             backend
                 .retry("pg-retry-tracked")
@@ -19702,9 +19828,17 @@ mod tests {
                 .await
                 .expect("claim");
             assert!(
-                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, None)
-                    .await
-                    .unwrap()
+                pg_nack_failure(
+                    &pool,
+                    &row.id,
+                    "w1",
+                    "boom",
+                    &row,
+                    None,
+                    u64::try_from(row.initial_backoff_ms).unwrap_or(0),
+                )
+                .await
+                .unwrap()
             );
 
             // The key is free after dead-letter, so a twin can be enqueued.
@@ -22315,13 +22449,31 @@ mod uniqueness_concurrency_tests {
         })
     }
 
+    /// Entropy that makes every retry wait its full 400 ms backoff (the
+    /// largest full-jitter draw), so the test can act during the wait. IDs
+    /// still come from the OS.
+    #[derive(Debug)]
+    struct FullBackoffEntropy;
+
+    impl crate::entropy::Entropy for FullBackoffEntropy {
+        fn next_u64(&self) -> u64 {
+            400
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            crate::entropy::OsEntropy.fill_bytes(dest);
+        }
+    }
+
     #[tokio::test]
     async fn local_pending_window_key_is_reacquired_while_retry_waits_out_backoff() {
         let _guard = global_job_runtime_test_lock().lock().await;
         clear_global_job_client();
         PENDING_RETRY_CALLS.store(0, Ordering::SeqCst);
 
-        let state = AppState::for_test().with_profile("dev");
+        // Full jitter can draw a 0 ms wait (issue #3054). Pin the full wait.
+        let state = AppState::for_test()
+            .with_profile("dev")
+            .with_entropy(Arc::new(FullBackoffEntropy));
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {

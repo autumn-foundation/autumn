@@ -40,11 +40,14 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_web::cache::{Cache, FillLockStatus, RawCacheBytes};
+use autumn_web::cache::{
+    Cache, CacheFuture, FillLockStatus, InvalidationError, RawCacheBytes, jittered_ttl,
+    record_invalidation_failure,
+};
 use redis::AsyncCommands as _;
 use redis::aio::ConnectionManager;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Lua script for a compare-and-delete fill-lock release: only deletes the
 /// lock key if it still holds the caller's token, so a caller can never
@@ -67,6 +70,70 @@ pub enum RedisCacheError {
     MissingUrl,
 }
 
+/// Retry policy for invalidation (`DEL` and the namespace sweep).
+///
+/// A failed attempt sleeps, then tries again. The sleep starts at
+/// `base_backoff`, doubles after each attempt, and stops at `max_backoff`.
+/// Each sleep gets ±50 % jitter, so replicas do not retry at the same time.
+/// If all attempts fail, the async methods return the error. The sync methods
+/// log it with `warn!` and count it in `autumn_cache_invalidation_failures_total`.
+///
+/// Make one with [`InvalidationRetry::new`] or [`Default`]. The type is
+/// `#[non_exhaustive]`, so new fields can come later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InvalidationRetry {
+    /// Total attempts, including the first. `0` counts as `1`.
+    pub max_attempts: u32,
+    /// Sleep before the second attempt.
+    pub base_backoff: Duration,
+    /// Upper limit for each sleep.
+    pub max_backoff: Duration,
+}
+
+impl Default for InvalidationRetry {
+    /// 3 attempts, 20 ms base, 200 ms cap. The two sleeps total at most about
+    /// 90 ms.
+    fn default() -> Self {
+        Self::new(3, Duration::from_millis(20), Duration::from_millis(200))
+    }
+}
+
+impl InvalidationRetry {
+    /// A policy with `max_attempts` tries, a first sleep of `base_backoff`,
+    /// and no sleep longer than `max_backoff`.
+    #[must_use]
+    pub const fn new(max_attempts: u32, base_backoff: Duration, max_backoff: Duration) -> Self {
+        Self {
+            max_attempts,
+            base_backoff,
+            max_backoff,
+        }
+    }
+
+    /// Total attempts. Always at least 1.
+    #[must_use]
+    pub const fn attempts(&self) -> u32 {
+        if self.max_attempts == 0 {
+            1
+        } else {
+            self.max_attempts
+        }
+    }
+
+    /// Sleep after failed attempt number `attempt` (0-based).
+    ///
+    /// The result is between half the nominal sleep and `max_backoff`.
+    #[must_use]
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        let nominal = self
+            .base_backoff
+            .saturating_mul(1_u32 << attempt.min(20))
+            .min(self.max_backoff);
+        jittered_ttl(nominal, 0.5).min(self.max_backoff)
+    }
+}
+
 /// A [`Cache`] implementation backed by Redis.
 ///
 /// Values are stored as JSON blobs. Multiple replicas share the same Redis
@@ -82,15 +149,27 @@ pub enum RedisCacheError {
 ///
 /// # Runtime requirement
 ///
-/// `RedisCache` bridges the synchronous [`Cache`] trait to async Redis
-/// operations via [`tokio::task::block_in_place`]. This requires a
-/// **multi-thread** Tokio runtime. Using `RedisCache` from a single-thread
-/// runtime (e.g. the default `#[tokio::test]` flavor) will panic. In tests,
-/// use `#[tokio::test(flavor = "multi_thread")]`.
+/// The sync [`Cache`] methods bridge to async Redis calls with
+/// [`tokio::task::block_in_place`]. They need a **multi-thread** Tokio
+/// runtime, and panic on a current-thread runtime (for example the default
+/// `#[tokio::test]` flavor).
+///
+/// [`Cache::invalidate_async`] and [`Cache::invalidate_namespace_async`] are
+/// real async calls. They work on any runtime and do not hold a worker.
+/// Framework invalidation (generated repositories,
+/// `coherence::invalidate_namespace_async`) uses them.
+///
+/// # Invalidation errors
+///
+/// Invalidation retries with [`InvalidationRetry`]. The async methods return
+/// the final error. The sync `invalidate` and `clear` cannot return it, so
+/// they log it with `warn!` and count it in
+/// `autumn_cache_invalidation_failures_total`.
 #[derive(Clone)]
 pub struct RedisCache {
     manager: ConnectionManager,
     key_prefix: String,
+    invalidation_retry: InvalidationRetry,
 }
 
 fn ttl_millis_for_redis(ttl: std::time::Duration) -> u64 {
@@ -139,6 +218,7 @@ impl RedisCache {
         Ok(Self {
             manager,
             key_prefix: key_prefix.into(),
+            invalidation_retry: InvalidationRetry::default(),
         })
     }
 
@@ -153,6 +233,13 @@ impl RedisCache {
     ) -> Result<Self, RedisCacheError> {
         let url = config.url.as_deref().ok_or(RedisCacheError::MissingUrl)?;
         Self::connect(url, &config.key_prefix).await
+    }
+
+    /// Set the retry policy for invalidation. See [`InvalidationRetry`].
+    #[must_use]
+    pub const fn with_invalidation_retry(mut self, retry: InvalidationRetry) -> Self {
+        self.invalidation_retry = retry;
+        self
     }
 
     fn prefixed(&self, key: &str) -> String {
@@ -209,49 +296,112 @@ impl RedisCache {
     /// Shared by [`Cache::clear`] and [`Cache::invalidate_namespace`], which
     /// differ only in how many segments of the key they pin.
     ///
-    /// Returns whether the whole sweep succeeded. A `SCAN` error used to
-    /// degrade into "cursor 0, no keys" — indistinguishable from a finished
-    /// sweep — and a `DEL` error was dropped on the floor. That was survivable
-    /// while the only caller returned `()`; it is not survivable for
-    /// [`Cache::invalidate_namespace`], whose `bool` tells a caller whether
-    /// stale data may still be served. An error stops the walk and reports
-    /// `false`: a partial sweep is not a complete one.
-    fn scan_and_delete(&self, pattern: &str) -> bool {
-        let pattern = pattern.to_owned();
+    /// The first `SCAN` or `DEL` error stops the walk and is returned. A
+    /// partial sweep is not a complete one. The sweep is idempotent, so a
+    /// retry starts again from cursor 0.
+    async fn sweep(&self, pattern: &str) -> Result<(), redis::RedisError> {
         let mut conn = self.manager.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let mut cursor: u64 = 0;
-                loop {
-                    let scanned: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
-                        .arg(cursor)
-                        .arg("MATCH")
-                        .arg(&pattern)
-                        .arg("COUNT")
-                        .arg(100u32)
-                        .query_async(&mut conn)
-                        .await;
-                    let (next_cursor, keys) = match scanned {
-                        Ok(page) => page,
-                        Err(e) => {
-                            debug!(pattern, error = %e, "RedisCache: SCAN failed");
-                            return false;
-                        }
-                    };
-                    if !keys.is_empty()
-                        && let Err(e) = conn.del::<_, ()>(keys).await
-                    {
-                        debug!(pattern, error = %e, "RedisCache: DEL failed");
-                        return false;
-                    }
-                    cursor = next_cursor;
-                    if cursor == 0 {
-                        return true;
-                    }
-                }
-            })
-        })
+        let mut cursor: u64 = 0;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(100u32)
+                .query_async(&mut conn)
+                .await?;
+            if !keys.is_empty() {
+                conn.del::<_, ()>(keys).await?;
+            }
+            cursor = next_cursor;
+            if cursor == 0 {
+                return Ok(());
+            }
+        }
     }
+
+    /// Run `op` until it succeeds or the retry budget is spent.
+    ///
+    /// Each failed attempt is logged at `debug`. The caller decides what to do
+    /// with the final error: return it, or log it and count it.
+    async fn retry_invalidation<F, Fut>(
+        &self,
+        target: &str,
+        mut op: F,
+    ) -> Result<(), InvalidationError>
+    where
+        F: FnMut() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<(), redis::RedisError>> + Send,
+    {
+        let attempts = self.invalidation_retry.attempts();
+        let mut last_error = String::new();
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(self.invalidation_retry.backoff(attempt - 1)).await;
+            }
+            match op().await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    debug!(
+                        target,
+                        attempt = attempt + 1,
+                        attempts,
+                        error = %error,
+                        "RedisCache: invalidation attempt failed"
+                    );
+                    last_error = error.to_string();
+                }
+            }
+        }
+        Err(InvalidationError::new(attempts, last_error))
+    }
+
+    /// `DEL` one key, with retries.
+    async fn delete_key(&self, key: &str) -> Result<(), InvalidationError> {
+        let prefixed = self.prefixed(key);
+        self.retry_invalidation(key, || {
+            let mut conn = self.manager.clone();
+            let prefixed = prefixed.clone();
+            async move { conn.del::<_, ()>(prefixed).await }
+        })
+        .await
+    }
+
+    /// Sweep every key that matches `pattern`, with retries.
+    async fn sweep_with_retry(&self, pattern: &str) -> Result<(), InvalidationError> {
+        self.retry_invalidation(pattern, || self.sweep(pattern))
+            .await
+    }
+
+    /// The `SCAN MATCH` pattern for one namespace.
+    ///
+    /// Cache keys are `{key_prefix}:{namespace}:{hash}`, so
+    /// `{key_prefix}:{namespace}:*` drops exactly one cached read's entries.
+    /// Both parts are escaped: an unescaped `*` or `[` would widen the sweep.
+    fn namespace_pattern(&self, namespace: &str) -> String {
+        format!(
+            "{}:{}:*",
+            escape_redis_glob(&self.key_prefix),
+            escape_redis_glob(namespace)
+        )
+    }
+}
+
+/// Run an async invalidation from a sync [`Cache`] method. Needs a
+/// multi-thread runtime, like every sync method here.
+fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+}
+
+/// Log and count an invalidation error that a sync method cannot return.
+fn report_dropped_invalidation_error(target: &str, error: &InvalidationError) {
+    warn!(
+        target,
+        error = %error,
+        "RedisCache: invalidation failed; stale data can be served until its TTL"
+    );
+    record_invalidation_failure();
 }
 
 impl Cache for RedisCache {
@@ -318,54 +468,57 @@ impl Cache for RedisCache {
         debug!(key, "RedisCache: inserted via insert_raw_bytes");
     }
 
+    /// Sync `DEL` with retries. The final error is logged with `warn!` and
+    /// counted, because this method cannot return it. Prefer
+    /// [`Cache::invalidate_async`].
     fn invalidate(&self, key: &str) {
-        let prefixed = self.prefixed(key);
-        let mut conn = self.manager.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let _: Result<(), _> = conn.del(&prefixed).await;
-            });
-        });
-        debug!(key, "RedisCache: invalidated");
+        match block_on(self.delete_key(key)) {
+            Ok(()) => debug!(key, "RedisCache: invalidated"),
+            Err(error) => report_dropped_invalidation_error(key, &error),
+        }
     }
 
+    /// Sync namespace sweep. Returns `false` when the sweep failed after all
+    /// retries. The caller owns that `false`, so it is not counted here.
     fn invalidate_namespace(&self, namespace: &str) -> bool {
-        // The same SCAN sweep as `clear`, one segment narrower: cache keys are
-        // `{key_prefix}:{namespace}:{hash}`, so scoping the pattern to
-        // `{key_prefix}:{namespace}:*` drops exactly one cached read's entries
-        // and nothing else. This is what makes a declared invalidation edge
-        // (issue #1716) actually complete on a shared, cross-replica backend —
-        // the deployment shape where a per-process store cannot help.
-        //
-        // `namespace` is escaped for the same reason `key_prefix` is: it comes
-        // from `module_path!()`, but an unescaped `*` or `[` anywhere in a
-        // MATCH pattern would widen the sweep beyond the namespace it names.
-        //
-        // The sweep's success is the return value, not a side note: the caller
-        // uses it to decide whether stale data may still be served, so a Redis
-        // error must surface as `false` rather than as a silent "done".
-        let swept = self.scan_and_delete(&format!(
-            "{}:{}:*",
-            escape_redis_glob(&self.key_prefix),
-            escape_redis_glob(namespace)
-        ));
-        if !swept {
-            debug!(
-                namespace,
-                "RedisCache: namespace sweep failed, reporting incomplete"
-            );
+        // Issue #1716: a declared invalidation edge must be complete on a
+        // shared, cross-replica backend. The `bool` tells the caller whether
+        // stale data can still be served.
+        match block_on(self.sweep_with_retry(&self.namespace_pattern(namespace))) {
+            Ok(()) => true,
+            Err(error) => {
+                debug!(namespace, error = %error, "RedisCache: namespace sweep failed");
+                false
+            }
         }
-        swept
     }
 
     fn clear(&self) {
-        // Use SCAN instead of KEYS to avoid blocking the Redis server on large
-        // keyspaces. SCAN is O(1) per call and processes the keyspace in batches.
-        //
-        // `clear` returns `()`, so a failure has nowhere to go and is logged by
-        // the sweep rather than reported — unchanged from before namespace
-        // invalidation existed.
-        let _ = self.scan_and_delete(&format!("{}:*", escape_redis_glob(&self.key_prefix)));
+        // SCAN, not KEYS, so a large keyspace never blocks the server.
+        let pattern = format!("{}:*", escape_redis_glob(&self.key_prefix));
+        if let Err(error) = block_on(self.sweep_with_retry(&pattern)) {
+            report_dropped_invalidation_error(&pattern, &error);
+        }
+    }
+
+    /// Async `DEL` with retries. No `block_in_place`, so it works on a
+    /// current-thread runtime. Returns the final error.
+    fn invalidate_async<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> CacheFuture<'a, Result<(), InvalidationError>> {
+        Box::pin(self.delete_key(key))
+    }
+
+    /// Async namespace sweep with retries. Returns the final error.
+    fn invalidate_namespace_async<'a>(
+        &'a self,
+        namespace: &'a str,
+    ) -> CacheFuture<'a, Result<(), InvalidationError>> {
+        Box::pin(async move {
+            self.sweep_with_retry(&self.namespace_pattern(namespace))
+                .await
+        })
     }
 
     /// Acquires a cross-replica fill lock via `SET NX PX`. Redis errors are
@@ -638,6 +791,266 @@ mod tests {
             "the `redis` crate must be built with a TLS feature (tokio-rustls-comp) \
              so `rediss://` URLs actually connect: {message}"
         );
+    }
+
+    // ── #3056: invalidation errors are retried, then surfaced ──────────
+
+    /// A plain connection for test set-up and fault injection.
+    async fn admin_conn(url: &str) -> redis::aio::MultiplexedConnection {
+        autumn_web::redis_tls::open_client(url)
+            .expect("client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("admin connection")
+    }
+
+    /// Make the server a replica of a master that does not exist. A replica
+    /// is read-only, so each `DEL` gets a `READONLY` error. The data stays.
+    async fn reject_writes(admin: &mut redis::aio::MultiplexedConnection) {
+        redis::cmd("REPLICAOF")
+            .arg("127.0.0.1")
+            .arg(1)
+            .query_async::<()>(admin)
+            .await
+            .expect("REPLICAOF");
+    }
+
+    /// Make the server a master again, so writes succeed.
+    async fn accept_writes(admin: &mut redis::aio::MultiplexedConnection) {
+        redis::cmd("REPLICAOF")
+            .arg("NO")
+            .arg("ONE")
+            .query_async::<()>(admin)
+            .await
+            .expect("REPLICAOF NO ONE");
+    }
+
+    async fn key_exists(admin: &mut redis::aio::MultiplexedConnection, key: &str) -> bool {
+        admin.exists::<_, bool>(key).await.expect("EXISTS")
+    }
+
+    const FAST_RETRY: InvalidationRetry = InvalidationRetry {
+        max_attempts: 3,
+        base_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(5),
+    };
+
+    #[test]
+    fn default_retry_policy_is_bounded() {
+        let retry = InvalidationRetry::default();
+        assert_eq!(retry.max_attempts, 3);
+        assert!(retry.base_backoff <= retry.max_backoff);
+        assert!(retry.max_backoff <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retry_backoff_grows_and_never_passes_the_cap() {
+        let retry = InvalidationRetry {
+            max_attempts: 10,
+            base_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(80),
+        };
+        for _ in 0..200 {
+            for attempt in 0..10 {
+                let nominal = retry
+                    .base_backoff
+                    .saturating_mul(1 << attempt.min(20))
+                    .min(retry.max_backoff);
+                let delay = retry.backoff(attempt);
+                assert!(delay <= retry.max_backoff, "{delay:?} passes the cap");
+                assert!(delay >= nominal / 2, "{delay:?} below half of {nominal:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_attempt_policy_still_tries_once() {
+        let retry = InvalidationRetry {
+            max_attempts: 0,
+            ..InvalidationRetry::default()
+        };
+        assert_eq!(retry.attempts(), 1);
+    }
+
+    /// The async path must not use `block_in_place`, so this test uses the
+    /// default current-thread runtime. `block_in_place` panics there.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_invalidate_async_surfaces_readonly_del_failure() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut admin = admin_conn(&url).await;
+        let cache = RedisCache::connect(&url, "inv-fail")
+            .await
+            .unwrap()
+            .with_invalidation_retry(FAST_RETRY);
+
+        admin.set::<_, _, ()>("inv-fail:k", "1").await.unwrap();
+        reject_writes(&mut admin).await;
+
+        let err = cache
+            .invalidate_async("k")
+            .await
+            .expect_err("a rejected DEL must surface as an error");
+        assert_eq!(err.attempts(), 3, "all attempts must run: {err}");
+        assert!(
+            err.reason().to_ascii_lowercase().contains("read only"),
+            "the reason must carry the Redis error: {err}"
+        );
+        assert!(
+            key_exists(&mut admin, "inv-fail:k").await,
+            "the key must still exist, so the error is true"
+        );
+
+        accept_writes(&mut admin).await;
+        cache
+            .invalidate_async("k")
+            .await
+            .expect("DEL succeeds once Redis accepts writes");
+        assert!(!key_exists(&mut admin, "inv-fail:k").await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_invalidate_retries_until_del_succeeds() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut admin = admin_conn(&url).await;
+        // At least 49 sleeps of 5 ms or more: the fault clears long before
+        // the budget ends.
+        let cache = RedisCache::connect(&url, "inv-retry")
+            .await
+            .unwrap()
+            .with_invalidation_retry(InvalidationRetry {
+                max_attempts: 50,
+                base_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+            });
+
+        admin.set::<_, _, ()>("inv-retry:k", "1").await.unwrap();
+        reject_writes(&mut admin).await;
+
+        let mut healer = admin.clone();
+        let heal = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            accept_writes(&mut healer).await;
+        });
+
+        cache
+            .invalidate_async("k")
+            .await
+            .expect("a transient DEL failure must be retried, not dropped");
+        heal.await.unwrap();
+        assert!(!key_exists(&mut admin, "inv-retry:k").await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_invalidate_namespace_async_surfaces_failure() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut admin = admin_conn(&url).await;
+        let cache = RedisCache::connect(&url, "inv-ns")
+            .await
+            .unwrap()
+            .with_invalidation_retry(FAST_RETRY);
+
+        admin.set::<_, _, ()>("inv-ns:reads:1", "1").await.unwrap();
+        reject_writes(&mut admin).await;
+
+        let err = cache
+            .invalidate_namespace_async("reads")
+            .await
+            .expect_err("a rejected sweep must surface as an error");
+        assert_eq!(err.attempts(), 3, "{err}");
+        assert!(key_exists(&mut admin, "inv-ns:reads:1").await);
+
+        accept_writes(&mut admin).await;
+        cache
+            .invalidate_namespace_async("reads")
+            .await
+            .expect("the sweep succeeds once Redis accepts writes");
+        assert!(!key_exists(&mut admin, "inv-ns:reads:1").await);
+    }
+
+    /// Serializes tests that read the process-global failure counter or set
+    /// the global cache.
+    static GLOBAL_STATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The path a generated repository write takes: the framework sweep with a
+    /// `RedisCache` as the global backend, on a current-thread runtime.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn coherence_async_invalidation_reaches_redis_and_reports_failure() {
+        let _guard = GLOBAL_STATE.lock().await;
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut admin = admin_conn(&url).await;
+        let cache = RedisCache::connect(&url, "e2e")
+            .await
+            .unwrap()
+            .with_invalidation_retry(FAST_RETRY);
+        autumn_web::cache::set_global_cache(Arc::new(cache));
+        let namespace = "e2e::reads::count";
+
+        admin
+            .set::<_, _, ()>(format!("e2e:{namespace}:a"), "1")
+            .await
+            .unwrap();
+        let complete = autumn_web::cache::coherence::invalidate_namespace_async(namespace).await;
+        let gone = !key_exists(&mut admin, &format!("e2e:{namespace}:a")).await;
+
+        admin
+            .set::<_, _, ()>(format!("e2e:{namespace}:b"), "1")
+            .await
+            .unwrap();
+        reject_writes(&mut admin).await;
+        let before = autumn_web::cache::invalidation_failures_total();
+        let refused = autumn_web::cache::coherence::invalidate_namespace_async(namespace).await;
+        let after = autumn_web::cache::invalidation_failures_total();
+        let kept = key_exists(&mut admin, &format!("e2e:{namespace}:b")).await;
+        accept_writes(&mut admin).await;
+        autumn_web::cache::clear_global_cache();
+
+        assert!(complete && gone, "a healthy Redis drops the namespace");
+        assert!(!refused, "a rejected sweep must report incomplete");
+        assert_eq!(after, before + 1, "and count one failure");
+        assert!(kept, "the key is still there, so the report is true");
+    }
+
+    /// The sync `invalidate` returns `()`, so it cannot surface the error. It
+    /// must log it and count it instead of dropping it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_sync_invalidate_counts_final_failure() {
+        let _guard = GLOBAL_STATE.lock().await;
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut admin = admin_conn(&url).await;
+        let cache = RedisCache::connect(&url, "inv-sync")
+            .await
+            .unwrap()
+            .with_invalidation_retry(FAST_RETRY);
+
+        admin.set::<_, _, ()>("inv-sync:k", "1").await.unwrap();
+        reject_writes(&mut admin).await;
+
+        let before = autumn_web::cache::invalidation_failures_total();
+        autumn_web::cache::Cache::invalidate(&cache, "k");
+        let after = autumn_web::cache::invalidation_failures_total();
+        assert_eq!(
+            after,
+            before + 1,
+            "a final DEL failure must increment autumn_cache_invalidation_failures_total once"
+        );
+        assert!(key_exists(&mut admin, "inv-sync:k").await);
+
+        accept_writes(&mut admin).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

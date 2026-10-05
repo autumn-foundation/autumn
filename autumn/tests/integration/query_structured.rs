@@ -189,7 +189,7 @@ async fn conflicting_shapes_for_one_key_are_rejected() {
 /// recursion during tree construction.
 #[tokio::test]
 async fn excessive_nesting_depth_is_rejected() {
-    let deep = "filter".to_owned() + &"[x]".repeat(64);
+    let deep = format!("filter{}", "[x]".repeat(64));
     let resp = client().get(&format!("/search?q=x&{deep}=1")).send().await;
     resp.assert_status(400);
 }

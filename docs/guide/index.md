@@ -188,7 +188,7 @@ Looking for the API reference instead? That is
 
 ## Developer tools
 
-- [The Data Playground](console.md) — `autumn console`, the pre-wired edit-and-run REPL
+- [The Data Playground](console.md) — `autumn console`, the pre-wired edit-and-run playground, and `--repl`, an interactive Rhai prompt
 - [Dev Request Inspector](dev-inspector.md) — the in-browser view of recent requests
 - [Dev Error Overlay](dev-error-overlay.md) — the error page that shows the failing source line
 - [The Architecture Graph](architecture-graph.md) — `autumn graph impact Post`: what a change touches, as a query
