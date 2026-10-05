@@ -3117,9 +3117,13 @@ previous_secrets = []
                 "the new containers must set `{field}`: {containers}"
             );
         }
+        // A Key Vault secret stays a ref; only an inline secret has a value.
+        assert!(patch.contains("map(secret_ref)"), "{patch}");
         assert!(
-            patch.contains("keyVaultUrl"),
-            "secrets must stay Key Vault secret refs, never plain values: {patch}"
+            script.contains(
+                "def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;"
+            ),
+            "secrets must stay Key Vault secret refs: {script}"
         );
     }
 
@@ -3990,13 +3994,14 @@ esac
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
         assert!(
-            main_tf.contains("A sidecar in this file must not refer to"),
+            main_tf.contains("A sidecar in this file must not"),
             "{main_tf}"
         );
         let docs = fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/guide/deployment.md"),
         )
         .unwrap();
+        let docs = docs.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             docs.contains("remove that env var from `main.tf` first"),
             "the Redis off steps must cover a sidecar ref in main.tf"

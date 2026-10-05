@@ -71,16 +71,26 @@ API="api-version=2024-03-01"
 # argument (visible in /proc/*/cmdline).
 BODY=$(mktemp)
 APP_SECRETS=$(mktemp)
-trap 'rm -f "$BODY" "$APP_SECRETS"' EXIT
+JOB_SECRETS=$(mktemp)
+trap 'rm -f "$BODY" "$APP_SECRETS" "$JOB_SECRETS"' EXIT
 
 JOB=$(az containerapp job show \
   --name "$AZURE_MIGRATE_JOB_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
   --output json)
+# GET omits secret values. The job can have an inline secret (a name and a
+# value), so the script reads the job's secrets with their values too.
+az containerapp job secret list \
+  --name "$AZURE_MIGRATE_JOB_NAME" \
+  --resource-group "$AZURE_RESOURCE_GROUP" \
+  --show-values \
+  --output json > "$JOB_SECRETS"
 # To turn Redis off, the app stops using it first, while the cache still
 # exists. Then terraform apply deletes the cache and the job's redis-url.
 if [ -n "$WITHOUT_REDIS" ]; then
   JOB=$(jq -c '.properties.configuration.secrets |= map(select(.name != "redis-url"))' <<< "$JOB")
+  jq -c 'map(select(.name != "redis-url"))' "$JOB_SECRETS" > "$JOB_SECRETS.new"
+  mv "$JOB_SECRETS.new" "$JOB_SECRETS"
 fi
 APP=$(az containerapp show \
   --name "$AZURE_APP_NAME" \
@@ -564,10 +574,10 @@ if jq -en --argjson app "$APP" --argjson containers "$CONTAINERS" \
 fi
 
 # The secrets, registries and identities that you add to the app stay.
-PATCH=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
+PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slurpfile job_secrets "$JOB_SECRETS" \
   --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" --argjson containers "$CONTAINERS" \
   "$SECRET_REF"'
-  ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
+  ($job_secrets[0] | map(secret_ref)) as $job_secrets
   | if $id == "" or ($job_secrets | length) == 0
     then error("the migration job has no identity or secrets to copy")
     else . end
@@ -701,9 +711,9 @@ if [ -n "$STALE_REDIS" ]; then
     # No new revision: the current env has no Redis reference.
     ACTIVE=false
   fi
-  CLEANUP=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
+  CLEANUP=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slurpfile job_secrets "$JOB_SECRETS" \
     "$SECRET_REF"'
-    ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
+    ($job_secrets[0] | map(secret_ref)) as $job_secrets
     | ($job_secrets | map(.name) + ["redis-url"]) as $drop
     | {location: $app.location,
        properties: {configuration: {secrets: (($app_secrets[0]

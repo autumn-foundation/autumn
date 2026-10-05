@@ -388,7 +388,10 @@ resource "azurerm_container_app" "this" {
 
     # Keep the app container first. The lifecycle block below refers to
     # container[0], and azure-cutover.sh stops if the app container is not
-    # first. Add a sidecar after this block.
+    # first. Add a sidecar after this block. A sidecar in this file must not
+    # refer to database-url, signing-secret or redis-url: Terraform does not
+    # manage these app secrets, and `azure-cutover.sh --without-redis`
+    # removes redis-url. Set such an env var with `az containerapp update`.
     container {
       name = local.app_name_safe
       # Terraform only ever sets the bootstrap placeholder here — see the
