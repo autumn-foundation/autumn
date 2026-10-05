@@ -4264,8 +4264,14 @@ impl Analyzer {
     fn output_of(&self, e: &Expr) -> Option<Kind> {
         match peel_parens(e) {
             Expr::Async(a) => Some(self.async_output(&a.block)),
-            // `(|| async { &repo })()`: what its `async` block gives.
-            Expr::Call(call) => self.invoked(call, true),
+            // `(|| async { &repo })()`: what its `async` block gives. A stored
+            // callee (`let make = move || async move { repo }; make()`) gives
+            // at most what it holds.
+            Expr::Call(call) => self.invoked(call, true).or_else(|| {
+                path_ident(&call.func)
+                    .map(|name| self.env.binding(&name).kind)
+                    .filter(|kind| *kind != Kind::Plain)
+            }),
             Expr::Path(_) => path_ident(e).and_then(|name| self.env.binding(&name).output),
             other @ (Expr::If(_)
             | Expr::Match(_)
@@ -11679,6 +11685,25 @@ mod tests {
                  let mut slots = vec![None]; for target in &mut slots { *target = Some(repo.clone()); } \
                  render(slots); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn stored_async_closures_keep_their_output() {
+        check_handlers(&[
+            (
+                "guard: a stored async closure keeps its output",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let make = move || async move { repo }; let alias = make().await; \
+                 let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a stored closure of plain values stays plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let make = || async { 1 }; let n = make().await; render(n); let _ = repo; Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
