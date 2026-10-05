@@ -185,10 +185,14 @@ The `prod` profile also changes these defaults. Each has a one-line opt-out:
 Every profile also gets a migration `lock_timeout` of `5s` with `5` jittered
 retries, in each transactional migration. Opt out with
 `database.migration_lock_timeout = "0s"`. The `autumn migrate` CLI passes the
-timeout to `diesel` in `PGOPTIONS`. Run migrations against Postgres directly.
+timeout to `diesel` in `PGOPTIONS`. Run migrations against Postgres directly,
+not through a transaction pooler.
 
 A long report query that runs inside a request now stops at `30s`. Give that
 route a `StatementTimeout` extension, or raise the global value.
+
+**Automation:** `manual` — this is a configuration and behaviour change, and no
+code rewrite applies.
 
 ### Capacity: `AdmissionLimit` is `#[non_exhaustive]` and has a new variant
 
@@ -212,9 +216,6 @@ let ceiling: Option<usize> = limit.limit();
 
 **Automation:** `manual` — a new enum variant needs a new match arm, and no
 safe rewrite can choose its body.
-
-**Automation:** `manual` — this is a configuration and behaviour change, and no
-code rewrite applies.
 
 ---
 
