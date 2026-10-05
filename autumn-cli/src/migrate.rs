@@ -735,40 +735,8 @@ fn run_single_target(
         return false;
     }
 
-    eprintln!("  Running pending migrations...\n");
-    // `lock_timeout` makes a DDL statement that waits on a long transaction
-    // fail fast, then the jittered retry runs it again (#3057).
-    let pgoptions = diesel_pgoptions(
-        std::env::var("PGOPTIONS").ok().as_deref(),
-        lock_policy.lock_timeout,
-    );
-    let outcome = autumn_web::migrate::retry_on_lock_timeout(
-        lock_policy,
-        |delay| {
-            eprintln!(
-                "  A migration timed out waiting for a table lock; retrying in {}ms\u{2026}",
-                delay.as_millis()
-            );
-            std::thread::sleep(delay);
-        },
-        || run_diesel_migrations_once(database_url, dir, pgoptions.as_deref()),
-    );
-
-    match outcome {
-        Ok(()) => {
-            eprintln!("\n\u{2713} Migrations applied successfully.");
-        }
-        Err(MigrationError::Migration(_)) => {
-            eprintln!(
-                "\n\u{274C} Migration failed in {}. Check the error output above.",
-                dir.display()
-            );
-            return false;
-        }
-        Err(e) => {
-            eprintln!("\u{274C} {e}");
-            return false;
-        }
+    if !run_user_migrations(database_url, dir, lock_policy) {
+        return false;
     }
 
     // Record the USER-migration checksums NOW — immediately after the user
@@ -1642,6 +1610,7 @@ where
         });
     let env_timeout = env_var("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT")
         .ok()
+        .filter(|text| !text.trim().is_empty())
         .and_then(|text| {
             let parsed = autumn_web::config::parse_duration_str(text.trim()).ok();
             if parsed.is_none() {
@@ -1695,6 +1664,113 @@ fn diesel_pgoptions(existing: Option<&str>, lock_timeout: std::time::Duration) -
     })
 }
 
+/// Run the user migrations through the `diesel` CLI, with `lock_timeout` and
+/// a jittered retry (#3057). Returns whether they applied.
+fn run_user_migrations(
+    database_url: &str,
+    dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> bool {
+    eprintln!("  Running pending migrations...\n");
+    // `lock_timeout` makes a DDL statement that waits on a long transaction
+    // fail fast, then the jittered retry runs it again (#3057).
+    // `PGOPTIONS` sets the timeout for the whole session, so it stays off when
+    // a pending migration is non-transactional (`CREATE INDEX CONCURRENTLY`).
+    let mut pgoptions = if pending_non_transactional(database_url, dir) {
+        eprintln!(
+            "  A pending migration has run_in_transaction = false; running without lock_timeout."
+        );
+        None
+    } else {
+        diesel_pgoptions(
+            std::env::var("PGOPTIONS").ok().as_deref(),
+            lock_policy.lock_timeout,
+        )
+    };
+    let outcome = autumn_web::migrate::retry_on_lock_timeout(
+        lock_policy,
+        |delay| {
+            eprintln!(
+                "  A migration timed out waiting for a table lock; retrying in {}ms\u{2026}",
+                delay.as_millis()
+            );
+            std::thread::sleep(delay);
+        },
+        || match run_diesel_migrations_once(database_url, dir, pgoptions.as_deref()) {
+            Err(MigrationError::Migration(text))
+                if pgoptions.is_some() && startup_options_rejected(&text) =>
+            {
+                eprintln!(
+                    "  The server refused PGOPTIONS (a pooler such as PgBouncer?); \
+                     running without lock_timeout."
+                );
+                pgoptions = None;
+                run_diesel_migrations_once(database_url, dir, None)
+            }
+            other => other,
+        },
+    );
+
+    match outcome {
+        Ok(()) => {
+            eprintln!("\n\u{2713} Migrations applied successfully.");
+            true
+        }
+        Err(MigrationError::Migration(_)) => {
+            eprintln!(
+                "\n\u{274C} Migration failed in {}. Check the error output above.",
+                dir.display()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("\u{274C} {e}");
+            false
+        }
+    }
+}
+
+/// Versions of the migrations in `dir` with `run_in_transaction = false`.
+///
+/// `lock_timeout` must not reach these. `CREATE INDEX CONCURRENTLY` waits for
+/// older transactions, and a timeout would cancel it and leave an INVALID
+/// index.
+fn non_transactional_versions(dir: &Path) -> Vec<String> {
+    let Ok(source) = diesel_migrations::FileBasedMigrations::from_path(dir) else {
+        return Vec::new();
+    };
+    let Ok(migrations) = diesel::migration::MigrationSource::<diesel::pg::Pg>::migrations(&source)
+    else {
+        return Vec::new();
+    };
+    migrations
+        .iter()
+        .filter(|m| !m.metadata().run_in_transaction())
+        .map(|m| m.name().version().to_string())
+        .collect()
+}
+
+/// Whether a pending migration in `dir` is non-transactional. Unknown counts
+/// as yes, so the timeout stays off when in doubt.
+fn pending_non_transactional(database_url: &str, dir: &Path) -> bool {
+    let non_transactional = non_transactional_versions(dir);
+    if non_transactional.is_empty() {
+        return false;
+    }
+    let Ok(source) = diesel_migrations::FileBasedMigrations::from_path(dir) else {
+        return true;
+    };
+    autumn_web::migrate::pending_migrations(database_url, source).map_or(true, |pending| {
+        pending.iter().any(|v| non_transactional.contains(v))
+    })
+}
+
+/// Whether the server (or a pooler such as `PgBouncer`) refused the
+/// `options` startup parameter that `PGOPTIONS` sends.
+fn startup_options_rejected(stderr: &str) -> bool {
+    stderr.contains("unsupported startup parameter")
+}
+
 /// Run `diesel migration run` once. Its stderr goes to this process's stderr
 /// and is also kept, so the caller can tell a lock timeout from other errors.
 fn run_diesel_migrations_once(
@@ -1717,13 +1793,20 @@ fn run_diesel_migrations_once(
     })?;
     let mut captured = String::new();
     if let Some(stderr) = child.stderr.take() {
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            let _ = writeln!(std::io::stderr(), "{line}");
-            captured.push_str(&line);
-            captured.push('\n');
+        // Read bytes, not `lines()`: a localized server message can be invalid
+        // UTF-8, and the pipe must be drained to the end.
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&line);
+                    let _ = write!(std::io::stderr(), "{text}");
+                    captured.push_str(&text);
+                }
+            }
         }
     }
     match child.wait() {
@@ -4454,14 +4537,48 @@ primary_url = "postgres://prod-s0:5432/app"
         ]);
         let policy = resolve_migration_lock_policy_from_sources(
             |key| match key {
-                "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT" => Ok("0".to_owned()),
-                "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES" => Ok("0".to_owned()),
+                "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT"
+                | "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES" => Ok("0".to_owned()),
                 _ => Err(std::env::VarError::NotPresent),
             },
             Some(&table),
         );
         assert_eq!(policy.lock_timeout, std::time::Duration::ZERO);
         assert_eq!(policy.retries, 0);
+    }
+
+    #[test]
+    fn non_transactional_versions_reads_metadata() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, metadata) in [
+            ("2026-01-01-000000_plain", None),
+            (
+                "2026-01-02-000000_concurrent_index",
+                Some("run_in_transaction = false\n"),
+            ),
+        ] {
+            let migration = dir.path().join(name);
+            std::fs::create_dir_all(&migration).unwrap();
+            std::fs::write(migration.join("up.sql"), "SELECT 1;").unwrap();
+            std::fs::write(migration.join("down.sql"), "SELECT 1;").unwrap();
+            if let Some(metadata) = metadata {
+                std::fs::write(migration.join("metadata.toml"), metadata).unwrap();
+            }
+        }
+        assert_eq!(
+            non_transactional_versions(dir.path()),
+            vec!["20260102000000".to_owned()]
+        );
+    }
+
+    #[test]
+    fn rejected_startup_options_are_detected() {
+        assert!(startup_options_rejected(
+            "FATAL:  unsupported startup parameter: options"
+        ));
+        assert!(!startup_options_rejected(
+            "canceling statement due to lock timeout"
+        ));
     }
 
     #[test]

@@ -5235,17 +5235,17 @@ fn apply_middleware(
 
     // `SET LOCAL` timeouts for transactions a handler opens on a connection of
     // its own, such as a generated repository (#3057). `Db::tx` scopes its own
-    // values, so a route's `StatementTimeout` override still wins there.
+    // values. A route's `StatementTimeout` reaches this scope through the
+    // extractors (`db::note_route_statement_timeout`), so the layer is on even
+    // when no global timeout is set.
     #[cfg(all(feature = "db", not(feature = "sqlite")))]
     let tx_timeouts_layer = {
         let timeouts = crate::db::TxTimeouts::from_config(&config.database);
-        timeouts.set_local_sql().is_some().then(|| {
-            axum::middleware::from_fn(
-                move |req: axum::extract::Request, next: axum::middleware::Next| {
-                    timeouts.scope(next.run(req))
-                },
-            )
-        })
+        Some(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                timeouts.scope_request(next.run(req))
+            },
+        ))
     };
     #[cfg(not(all(feature = "db", not(feature = "sqlite"))))]
     let tx_timeouts_layer: Option<tower::layer::util::Identity> = None;
@@ -6844,6 +6844,35 @@ mod tests {
         AppState {
             profile: Some("test".into()),
             ..AppState::test_default()
+        }
+    }
+
+    // ── #3057: the prod profile turns load shedding on ───────────────────────
+
+    #[test]
+    fn prod_profile_installs_the_load_shed_layer() {
+        let mut config = AutumnConfig {
+            profile: Some("prod".into()),
+            ..AutumnConfig::default()
+        };
+        assert!(build_load_shed_layer(&config, &test_state()).is_some());
+
+        // `0` turns it off.
+        config.server.max_concurrent_requests = Some(0);
+        assert!(build_load_shed_layer(&config, &test_state()).is_none());
+    }
+
+    #[test]
+    fn other_profiles_leave_load_shedding_off() {
+        for profile in ["dev", "staging"] {
+            let config = AutumnConfig {
+                profile: Some(profile.into()),
+                ..AutumnConfig::default()
+            };
+            assert!(
+                build_load_shed_layer(&config, &test_state()).is_none(),
+                "{profile}"
+            );
         }
     }
 

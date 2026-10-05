@@ -2684,12 +2684,13 @@ null git provenance because the Docker build context excludes `.git` (tracked in
 ## Resilience: load shedding (0.6.0)
 
 Admission control caps concurrent in-flight requests; excess is shed
-immediately with `503` + `Retry-After` before the handler runs. Disabled by
-default:
+immediately with `503` + `Retry-After` before the handler runs. Off by
+default, except in the `prod` profile: there the ceiling is primary pool
+size × 32, at least 256 (#3057):
 
 ```toml
 [server]
-max_concurrent_requests = 256   # unset/0 = unlimited
+max_concurrent_requests = 256   # 0 = unlimited; unset = profile default
 ```
 
 Probes (`/health`, `/live`, `/ready`, `/startup`, actuator) are never shed;

@@ -999,7 +999,7 @@ one-line opt-out.
 
 | Protection | `prod` default | Opt-out |
 | --- | --- | --- |
-| Load shedding | primary pool size × 32 in-flight requests, then `503` | `server.max_concurrent_requests = 0` |
+| Load shedding | primary pool size × 32 in-flight requests (at least 256), then `503` | `server.max_concurrent_requests = 0` |
 | Statement timeout | `database.statement_timeout = "30s"` | `"0s"` |
 | Idle in transaction | `database.idle_in_transaction_timeout = "60s"` | `"0s"` |
 | Strict config | `server.strict_config = true` | `false` |
@@ -1016,11 +1016,15 @@ Notes:
   statement_timeout` and `SET LOCAL idle_in_transaction_session_timeout`. A
   transaction pooler (`PgBouncer` in transaction mode) keeps these. It drops
   the session `SET` that applies outside a transaction. To bound those
-  statements too, set the timeout on the database role:
-  `ALTER ROLE app SET statement_timeout = '30s'`. SQLite builds do not get
-  these defaults.
-- **Migrations.** A DDL statement that waits more than `5s` for a table lock
-  fails. The migrator retries it after a jittered delay. Run migrations against
+  statements too, set the timeout on the app's database role:
+  `ALTER ROLE app SET statement_timeout = '30s'`. Run migrations with a
+  different role, because the migrator does not change `statement_timeout`.
+  A route's `StatementTimeout` applies to the transactions of that request.
+  SQLite builds do not get these defaults.
+- **Migrations.** In each transactional migration, a DDL statement that waits
+  more than `5s` for a table lock fails. The migrator retries it after a
+  jittered delay. A `run_in_transaction = false` migration (for example
+  `CREATE INDEX CONCURRENTLY`) waits with no limit. Run migrations against
   Postgres directly, not through `PgBouncer`.
 - **Rate limiting.** `prod` does not turn it on. A shared limit can block
   clients behind one proxy address. Configure

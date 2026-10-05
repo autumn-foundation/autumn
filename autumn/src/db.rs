@@ -135,59 +135,106 @@ tokio::task_local! {
 ///
 /// A transaction pooler (`PgBouncer` in transaction mode) drops a session
 /// `SET`, but keeps a `SET LOCAL` for the transaction that issued it. The
-/// values are milliseconds. `0` means "off" in Postgres.
+/// values are milliseconds. `Some(0)` turns the limit off. `None` keeps the
+/// server or role default (`SET LOCAL ... = DEFAULT`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TxTimeouts {
+pub(crate) struct TxTimeouts {
     /// `statement_timeout`, in milliseconds.
-    pub statement_ms: u64,
+    pub(crate) statement_ms: Option<u64>,
     /// `idle_in_transaction_session_timeout`, in milliseconds.
-    pub idle_in_transaction_ms: u64,
+    pub(crate) idle_in_transaction_ms: Option<u64>,
 }
 
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
 impl TxTimeouts {
-    /// Build from the configured durations. `None` is `0`. Each value is
-    /// capped at `i32::MAX` milliseconds, the Postgres maximum.
-    #[must_use]
-    pub fn new(
+    /// Build from the configured durations. Each value is capped at
+    /// `i32::MAX` milliseconds, the Postgres maximum.
+    pub(crate) fn new(
         statement: Option<std::time::Duration>,
         idle_in_transaction: Option<std::time::Duration>,
     ) -> Self {
         Self {
-            statement_ms: pg_timeout_ms(statement),
-            idle_in_transaction_ms: pg_timeout_ms(idle_in_transaction),
+            statement_ms: statement.map(|d| pg_timeout_ms(Some(d))),
+            idle_in_transaction_ms: idle_in_transaction.map(|d| pg_timeout_ms(Some(d))),
         }
     }
 
     /// The timeouts from an app's `[database]` config.
-    #[must_use]
-    pub fn from_config(config: &crate::config::DatabaseConfig) -> Self {
+    pub(crate) fn from_config(config: &crate::config::DatabaseConfig) -> Self {
         Self::new(config.statement_timeout, config.idle_in_transaction_timeout)
     }
 
-    /// The `SET LOCAL` batch, or `None` when both values are `0`. Then
+    /// The `SET LOCAL` batch, or `None` when neither value is set. Then
     /// nothing is sent, and a transaction costs no extra round trip.
-    #[must_use]
-    pub fn set_local_sql(self) -> Option<String> {
-        (self.statement_ms != 0 || self.idle_in_transaction_ms != 0).then(|| {
+    ///
+    /// The batch always has both statements, in this order. The capsule
+    /// recorder matches that exact form (`capsule::wire`).
+    pub(crate) fn set_local_sql(self) -> Option<String> {
+        fn value(ms: Option<u64>) -> String {
+            ms.map_or_else(|| "DEFAULT".to_owned(), |ms| ms.to_string())
+        }
+        (self.statement_ms.is_some() || self.idle_in_transaction_ms.is_some()).then(|| {
             format!(
                 "SET LOCAL statement_timeout = {}; \
                  SET LOCAL idle_in_transaction_session_timeout = {}",
-                self.statement_ms, self.idle_in_transaction_ms
+                value(self.statement_ms),
+                value(self.idle_in_transaction_ms)
             )
         })
     }
 
     /// Run `fut` with these timeouts in scope. Each outermost transaction
     /// that [`scoped_transaction`] opens in `fut` sets them with `SET LOCAL`.
-    pub async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
+    pub(crate) async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
         TX_TIMEOUTS.scope(self, fut).await
     }
 
-    /// The timeouts in scope for this task, if any.
-    #[must_use]
-    pub fn current() -> Option<Self> {
-        TX_TIMEOUTS.try_with(|t| *t).ok()
+    /// Run a request `fut` with these timeouts as its defaults. A route's
+    /// [`StatementTimeout`] replaces the statement value when an extractor
+    /// sees it (see [`note_route_statement_timeout`]).
+    pub(crate) async fn scope_request<F: std::future::Future>(self, fut: F) -> F::Output {
+        REQUEST_TX_TIMEOUTS
+            .scope(Arc::new(Mutex::new(self)), fut)
+            .await
     }
+
+    /// The timeouts in scope for this task: the innermost `Db` scope, else
+    /// the request defaults, else `None`.
+    pub(crate) fn current() -> Option<Self> {
+        TX_TIMEOUTS.try_with(|t| *t).ok().or_else(|| {
+            REQUEST_TX_TIMEOUTS
+                .try_with(|cell| {
+                    *cell
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                })
+                .ok()
+        })
+    }
+}
+
+/// Record a route's [`StatementTimeout`] for the request's transactions.
+///
+/// The request layer sits outside the route layer that adds the extension,
+/// so an extractor that sees it reports it here. `Db` does this itself.
+/// Generated repositories call it through `__private`.
+#[doc(hidden)]
+pub fn note_route_statement_timeout(parts: &axum::http::request::Parts) {
+    let Some(timeout) = parts.extensions.get::<StatementTimeout>() else {
+        return;
+    };
+    let ms = pg_timeout_ms(Some(timeout.0));
+    let _ = REQUEST_TX_TIMEOUTS.try_with(|cell| {
+        cell.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .statement_ms = Some(ms);
+    });
 }
 
 /// A Postgres timeout setting in milliseconds, capped at `i32::MAX`.
@@ -201,10 +248,15 @@ fn pg_timeout_ms(timeout: Option<std::time::Duration>) -> u64 {
 }
 
 tokio::task_local! {
-    /// The [`TxTimeouts`] that [`scoped_transaction`] applies. Set by
-    /// [`Db::tx`] and its siblings, and by the request layer for code that
-    /// opens a transaction on its own connection (generated repositories).
+    /// The [`TxTimeouts`] of one `Db`: set by [`Db::tx`] and its siblings.
     static TX_TIMEOUTS: TxTimeouts;
+}
+
+tokio::task_local! {
+    /// The request's [`TxTimeouts`], for code that opens a transaction on a
+    /// connection of its own (generated repositories). Set by the request
+    /// layer. Mutable so that a route override can replace the default.
+    static REQUEST_TX_TIMEOUTS: Arc<Mutex<TxTimeouts>>;
 }
 
 /// Issue the in-scope [`TxTimeouts`] as `SET LOCAL`, at transaction depth 1
@@ -213,27 +265,35 @@ tokio::task_local! {
 /// # Errors
 ///
 /// Returns the database error from the `SET LOCAL` batch.
-#[cfg_attr(feature = "sqlite", allow(clippy::unused_async))]
+#[cfg(not(feature = "sqlite"))]
 async fn apply_tx_timeouts<C>(conn: &mut C) -> Result<(), diesel::result::Error>
 where
     C: diesel_async::AsyncConnection + Send,
 {
-    // `SET LOCAL` is Postgres syntax. SQLite has no such settings.
-    #[cfg(not(feature = "sqlite"))]
-    {
-        use diesel_async::TransactionManager as _;
-        let Some(sql) = TxTimeouts::current().and_then(TxTimeouts::set_local_sql) else {
-            return Ok(());
-        };
-        let depth = C::TransactionManager::transaction_manager_status_mut(conn)
-            .transaction_depth()?
-            .map(std::num::NonZeroU32::get);
-        if depth == Some(1) {
-            conn.batch_execute(&sql).await?;
-        }
+    use diesel_async::TransactionManager as _;
+    let Some(sql) = TxTimeouts::current().and_then(TxTimeouts::set_local_sql) else {
+        return Ok(());
+    };
+    let depth = C::TransactionManager::transaction_manager_status_mut(conn)
+        .transaction_depth()?
+        .map(std::num::NonZeroU32::get);
+    if depth == Some(1) {
+        conn.batch_execute(&sql).await?;
     }
-    #[cfg(feature = "sqlite")]
-    let _ = conn;
+    Ok(())
+}
+
+/// `SET LOCAL` is Postgres syntax. SQLite has no such settings.
+#[cfg(feature = "sqlite")]
+#[allow(
+    clippy::unused_async,
+    clippy::needless_pass_by_ref_mut,
+    reason = "same signature as the Postgres version"
+)]
+async fn apply_tx_timeouts<C>(_conn: &mut C) -> Result<(), diesel::result::Error>
+where
+    C: diesel_async::AsyncConnection + Send,
+{
     Ok(())
 }
 
@@ -3767,6 +3827,7 @@ pub(crate) struct RequestDbContext {
 
 impl RequestDbContext {
     pub(crate) fn from_parts<S: DbState>(parts: &axum::http::request::Parts, state: &S) -> Self {
+        note_route_statement_timeout(parts);
         let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
         let matched_path = parts
             .extensions

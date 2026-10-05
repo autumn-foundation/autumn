@@ -148,10 +148,11 @@ A DDL statement such as `ALTER TABLE` needs a strong table lock. If a long
 transaction holds a lock on that table, the DDL waits. Every new query on the
 table then waits behind the DDL, and the app stalls (issue #3057).
 
-To prevent this, the migrator sets `lock_timeout` on its session. A migration
-that waits longer fails, its transaction rolls back, and the migrator tries
-again after a jittered, exponential delay (`500ms`, then `1s`, `2s`, … up to
-`10s`, each scaled by a random 50–100%). The retries happen under the advisory
+To prevent this, each transactional migration starts with
+`SET LOCAL lock_timeout`. A migration that waits longer fails, and its
+transaction rolls back. The migrator then tries again after a delay. The
+delay starts at `500ms` and doubles each time, to at most `10s`. A random
+factor of 50–100% scales each delay. The retries happen under the advisory
 lock.
 
 ```toml
@@ -171,8 +172,11 @@ WHERE pid IN (SELECT pid FROM pg_locks WHERE relation = 'users'::regclass);
 ```
 
 Only a lock timeout is retried. A migration with `run_in_transaction = false`
-(for example `CREATE INDEX CONCURRENTLY`) can leave work behind when it fails.
-Check it before the next run.
+(for example `CREATE INDEX CONCURRENTLY`) gets no `lock_timeout`. It must wait
+for older transactions, and a timeout would leave an INVALID index.
+
+The check reads the English Postgres message. With a different `lc_messages`,
+a lock timeout still stops the migration, but it is not retried.
 
 The Rust API takes the policy explicitly:
 
@@ -180,13 +184,21 @@ The Rust API takes the policy explicitly:
 use autumn_web::migrate::{run_pending_locked_with_policy, MigrationLockPolicy};
 use std::time::Duration;
 
-let policy = MigrationLockPolicy { lock_timeout: Duration::from_secs(2), retries: 3 };
+let policy = MigrationLockPolicy::new(Duration::from_secs(2), 3);
 run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
 ```
 
 `autumn migrate` passes the timeout to its `diesel` subprocess as
-`PGOPTIONS=-c lock_timeout=<ms>`. `PgBouncer` refuses that startup option, so
-run migrations against Postgres directly, or set the timeout to `"0s"`.
+`PGOPTIONS=-c lock_timeout=<ms>`. This sets it for the whole session, so:
+
+- When a pending migration has `run_in_transaction = false`, the CLI sends no
+  timeout.
+- When the server refuses the option (`PgBouncer` can), the CLI runs again
+  without it.
+- An `options` parameter in `DATABASE_URL` replaces `PGOPTIONS`. Then the
+  timeout does not apply.
+
+Run migrations against Postgres directly.
 
 ---
 

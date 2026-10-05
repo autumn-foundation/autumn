@@ -959,6 +959,8 @@ pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::db::maybe_immediate_transaction;
     #[cfg(feature = "db")]
+    pub use crate::db::note_route_statement_timeout;
+    #[cfg(feature = "db")]
     pub use crate::db::scoped_immediate_transaction;
     #[cfg(feature = "db")]
     pub use crate::db::scoped_transaction;

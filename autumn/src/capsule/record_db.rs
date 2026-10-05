@@ -1809,6 +1809,10 @@ mod tests {
             "SET LOCAL statement_timeout = 30000; \
              SET LOCAL idle_in_transaction_session_timeout = 60000"
         ));
+        assert!(is_session_housekeeping(
+            "SET LOCAL statement_timeout = 5000; \
+             SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
+        ));
         assert!(
             !is_session_housekeeping(
                 "SET LOCAL statement_timeout = 30000; \

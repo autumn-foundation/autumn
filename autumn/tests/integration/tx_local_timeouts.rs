@@ -8,6 +8,7 @@
 //! Requires Docker, or set `AUTUMN_TEST_PG_URL` to use an existing Postgres.
 
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[allow(clippy::module_inception)]
 mod tx_local_timeouts {
     use autumn_web::db::{Db, TxOptions};
     use autumn_web::prelude::*;
@@ -144,8 +145,11 @@ mod tx_local_timeouts {
     /// connection of its own, not on `Db`.
     #[get("/scoped-settings")]
     async fn scoped_settings(
+        parts: axum::http::request::Parts,
         axum::Extension(pool): axum::Extension<Pool<AsyncPgConnection>>,
     ) -> AutumnResult<Json<serde_json::Value>> {
+        // What a generated repository extractor does.
+        autumn_web::__private::note_route_statement_timeout(&parts);
         let mut conn = pool
             .get()
             .await
@@ -161,6 +165,23 @@ mod tx_local_timeouts {
         Ok(Json(serde_json::json!({ "statement": statement })))
     }
 
+    /// An idle open transaction ends once `idle_in_transaction_timeout` passes.
+    #[get("/tx-idle")]
+    async fn tx_idle(mut db: Db) -> AutumnResult<Json<serde_json::Value>> {
+        clear_session_timeouts(&mut db).await?;
+        let outcome = db
+            .tx(|conn| {
+                async move {
+                    show(conn, "statement_timeout").await?;
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    show(conn, "statement_timeout").await
+                }
+                .scope_boxed()
+            })
+            .await;
+        Ok(Json(serde_json::json!({ "ended": outcome.is_err() })))
+    }
+
     async fn client(
         statement: Option<Duration>,
         idle: Option<Duration>,
@@ -169,12 +190,33 @@ mod tx_local_timeouts {
         let mut config = autumn_web::config::AutumnConfig::default();
         config.database.statement_timeout = statement;
         config.database.idle_in_transaction_timeout = idle;
-        let mut routes = routes![tx_settings, tx_with_settings, tx_sleep, scoped_settings];
+        let mut routes = routes![
+            tx_settings,
+            tx_with_settings,
+            tx_sleep,
+            scoped_settings,
+            tx_idle
+        ];
         for route in &mut routes {
             if route.name == "scoped_settings" {
                 route.handler = route.handler.clone().layer(axum::Extension(pool.clone()));
             }
         }
+        // The same handler again, with a route override, at its own path.
+        let mut overridden = routes![scoped_settings];
+        for route in &mut overridden {
+            route.path = "/scoped-settings-override";
+            route.name = "scoped_settings_override";
+            route.handler = route.handler.clone().layer(axum::Extension(pool.clone()));
+            route.handler =
+                route
+                    .handler
+                    .clone()
+                    .layer(axum::Extension(autumn_web::db::StatementTimeout(
+                        Duration::from_millis(1500),
+                    )));
+        }
+        routes.extend(overridden);
         TestApp::new()
             .routes(routes)
             .config(config)
@@ -239,6 +281,36 @@ mod tx_local_timeouts {
             .assert_status(200)
             .assert_json::<serde_json::Value, _>(|body| {
                 assert_eq!(body["statement"], "300ms");
+            });
+    }
+
+    /// A route's `StatementTimeout` also reaches transactions that a
+    /// repository opens on its own connection.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn route_override_reaches_scoped_transaction() {
+        let client = client(Some(STATEMENT_TIMEOUT), None).await;
+        client
+            .get("/scoped-settings-override")
+            .send()
+            .await
+            .assert_status(200)
+            .assert_json::<serde_json::Value, _>(|body| {
+                assert_eq!(body["statement"], "1500ms");
+            });
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn idle_in_transaction_timeout_ends_an_idle_transaction() {
+        let client = client(None, Some(Duration::from_millis(300))).await;
+        client
+            .get("/tx-idle")
+            .send()
+            .await
+            .assert_status(200)
+            .assert_json::<serde_json::Value, _>(|body| {
+                assert_eq!(body["ended"], true);
             });
     }
 

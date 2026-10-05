@@ -624,6 +624,7 @@ pub fn route_graph_digest(routes: &[RouteShape]) -> String {
 /// *which* source won, and so a reviewer reading
 /// `router::build_load_shed_layer` can see the precedence at a glance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AdmissionLimit {
     /// An explicit `[server] max_concurrent_requests`. Always wins: an
     /// operator who set a number by hand outranks a committed artifact.

@@ -71,7 +71,7 @@
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_DATABASE__STATEMENT_TIMEOUT` | `database.statement_timeout` | duration (`"30s"`, ms); empty clears |
 //! | `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT` | `database.idle_in_transaction_timeout` | duration; empty clears |
-//! | `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` | `database.migration_lock_timeout` | duration |
+//! | `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` | `database.migration_lock_timeout` | duration; empty is ignored |
 //! | `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES` | `database.migration_lock_retries` | `u32` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
@@ -4125,16 +4125,16 @@ impl AutumnConfig {
     /// applies (#3057).
     ///
     /// `prod` returns the primary pool size times
-    /// [`PROD_REQUESTS_PER_POOL_CONNECTION`]. Other profiles return `None`
-    /// (no ceiling). Set `server.max_concurrent_requests = 0` to turn
-    /// shedding off.
+    /// [`PROD_REQUESTS_PER_POOL_CONNECTION`], and at least
+    /// [`PROD_MIN_ADMISSION_LIMIT`]. Other profiles return `None` (no
+    /// ceiling). Set `server.max_concurrent_requests = 0` to turn shedding off.
     #[must_use]
     pub fn profile_admission_default(&self) -> Option<usize> {
         matches!(self.profile.as_deref(), Some("prod" | "production")).then(|| {
             self.database
                 .effective_primary_pool_size()
-                .max(1)
                 .saturating_mul(PROD_REQUESTS_PER_POOL_CONNECTION)
+                .max(PROD_MIN_ADMISSION_LIMIT)
         })
     }
 }
@@ -5915,14 +5915,16 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT",
             &mut self.database.idle_in_transaction_timeout,
         );
+        // An empty value is ignored here, as `autumn migrate` ignores it.
         let mut lock_timeout = Some(self.database.migration_lock_timeout);
         parse_env_option_duration(
             env,
             "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT",
             &mut lock_timeout,
         );
-        self.database.migration_lock_timeout =
-            lock_timeout.unwrap_or_else(default_migration_lock_timeout);
+        if let Some(timeout) = lock_timeout {
+            self.database.migration_lock_timeout = timeout;
+        }
         parse_env(
             env,
             "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES",
@@ -10234,13 +10236,19 @@ const fn default_migration_lock_retries() -> u32 {
 }
 
 /// Admitted requests per primary pool connection in the `prod` load-shedding
-/// ceiling (#3057). The ceiling is `primary pool size × this value`.
+/// ceiling (#3057). The ceiling is `primary pool size × this value`, and at
+/// least [`PROD_MIN_ADMISSION_LIMIT`].
 ///
 /// Requests above the pool size wait for a connection, and a long queue only
 /// adds latency before the `connect_timeout_secs` failure. 32 waiters per
 /// connection is a high, safe ceiling. Tune it with
 /// `server.max_concurrent_requests` or a capacity contract.
 pub const PROD_REQUESTS_PER_POOL_CONNECTION: usize = 32;
+
+/// The lowest `prod` load-shedding ceiling (#3057). A small primary pool (a
+/// sharded app, or an app that does not use its database much) must not shed
+/// normal traffic.
+pub const PROD_MIN_ADMISSION_LIMIT: usize = 256;
 
 const fn default_max_connections_warn_threshold() -> usize {
     100
@@ -19392,6 +19400,11 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         let db = load_3057("prod", "", &env).database;
         assert_eq!(db.migration_lock_timeout, std::time::Duration::from_secs(2));
         assert_eq!(db.migration_lock_retries, 1);
+        // An empty env value keeps the file value, as `autumn migrate` does.
+        let toml = "[database]\nmigration_lock_timeout = \"0s\"\n";
+        let env = [("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT", "")];
+        let db = load_3057("prod", toml, &env).database;
+        assert_eq!(db.migration_lock_timeout, std::time::Duration::ZERO);
     }
 
     #[test]
@@ -19404,12 +19417,18 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         // The primary role size wins over the shared default.
         let config = load_3057(
             "prod",
-            "[database]\npool_size = 20\nprimary_pool_size = 4\n",
+            "[database]\npool_size = 20\nprimary_pool_size = 9\n",
             &[],
         );
         assert_eq!(
             config.profile_admission_default(),
-            Some(4 * PROD_REQUESTS_PER_POOL_CONNECTION)
+            Some(9 * PROD_REQUESTS_PER_POOL_CONNECTION)
+        );
+        // A small pool still gets the floor.
+        let config = load_3057("prod", "[database]\nprimary_pool_size = 2\n", &[]);
+        assert_eq!(
+            config.profile_admission_default(),
+            Some(PROD_MIN_ADMISSION_LIMIT)
         );
         assert_eq!(load_3057("dev", "", &[]).profile_admission_default(), None);
         assert_eq!(
