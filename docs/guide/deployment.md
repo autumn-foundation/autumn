@@ -2053,7 +2053,9 @@ disables ingress (also the internal route) and waits until the placeholder
 runs no replica. Then nothing can start the placeholder again. Keep
 `min_replicas = 0` until then. If a replica does not stop, the script sends
 the saved ingress back and stops. The script treats only a revision that runs
-the bootstrap image as the placeholder. If you changed `bootstrap_image`, set
+the bootstrap image as the placeholder. While a placeholder revision is
+active, the first cutover is not done, also when a real revision is active
+too. If you changed `bootstrap_image`, set
 `AZURE_BOOTSTRAP_IMAGE` (a repository variable for the workflow) to that
 image. If the first cutover fails, the script removes the credentials. The
 job also has them, but runs only after you set the real image on it. External

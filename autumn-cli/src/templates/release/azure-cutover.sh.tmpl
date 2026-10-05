@@ -115,18 +115,26 @@ OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 # not enough: after a canceled first cutover, the template has the real
 # image while the placeholder revision stays active. Only the bootstrap
 # image is the placeholder; a release from any registry is a real release.
+# The app is released only when no placeholder revision is active: during a
+# handoff, the placeholder and the new revision are both active, and the
+# first-cutover safeguards and rollback still apply.
 ACTIVE=$(az containerapp revision list \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
   --query "[?properties.active].[name, $APP_IMAGE]" \
   --output tsv)
 RELEASED=""
-ACTIVE_REVISIONS=""
+REAL_ACTIVE=""
+PLACEHOLDER_REVISIONS=""
 while IFS=$'\t' read -r name image; do
   [ -n "$name" ] || continue
-  ACTIVE_REVISIONS="$ACTIVE_REVISIONS $name"
-  [ "$image" = "$BOOTSTRAP_IMAGE" ] || RELEASED=1
+  if [ "$image" = "$BOOTSTRAP_IMAGE" ]; then
+    PLACEHOLDER_REVISIONS="$PLACEHOLDER_REVISIONS $name"
+  else
+    REAL_ACTIVE=1
+  fi
 done <<< "$ACTIVE"
+[ -n "$REAL_ACTIVE" ] && [ -z "$PLACEHOLDER_REVISIONS" ] && RELEASED=1
 # The identity of the job's ACR registry entry. The job can list other
 # registries too, so the script selects the entry by server.
 JOB_IDENTITY=$(jq -r --arg acr "$ACR_LOGIN_SERVER" \
@@ -276,7 +284,7 @@ remove_credentials() {
   # first cutover, the app template has the real image, which cannot start
   # without its secrets; the active revision still runs the placeholder.
   source=$(jq -c '.properties.template.containers' <<< "$APP")
-  read -r first _ <<< "$ACTIVE_REVISIONS"
+  read -r first _ <<< "$PLACEHOLDER_REVISIONS"
   if [ -n "${first:-}" ]; then
     source=$(az containerapp revision show \
       --name "$AZURE_APP_NAME" \
@@ -453,7 +461,7 @@ if [ -z "$RELEASED" ]; then
     CUSTOM_RULE='[(. // []) | .[] | select(.http == null)] | length > 0'
     RULE_AT=""
     jq -e ".properties.template.scale.rules | $CUSTOM_RULE" <<< "$APP" > /dev/null && RULE_AT="the template"
-    for revision in $ACTIVE_REVISIONS; do
+    for revision in $PLACEHOLDER_REVISIONS; do
       RULES=$(az containerapp revision show \
         --name "$AZURE_APP_NAME" \
         --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -485,7 +493,7 @@ if [ -z "$RELEASED" ]; then
       --output none
     for _ in $(seq 1 60); do
       REPLICAS=0
-      for revision in $ACTIVE_REVISIONS; do
+      for revision in $PLACEHOLDER_REVISIONS; do
         COUNT=$(az containerapp replica list \
           --name "$AZURE_APP_NAME" \
           --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -630,6 +638,11 @@ done
 # same-tag retry: an earlier run can stop before the revision took over.
 sole_active "$REVISION" || fail "revision $REVISION did not become the only active revision"
 
+# The sole active revision runs the real image, so external ingress can
+# open now. It opens before a restart: a revision scaled to zero needs a
+# request through ingress to start a replica.
+open_ingress || fail "cannot open external ingress"
+
 # No new revision: secrets are application-scope, and the running revision
 # reads them only when it starts.
 # A restart replaces the replicas. The deploy is done when no replica from
@@ -637,7 +650,11 @@ sole_active "$REVISION" || fail "revision $REVISION did not become the only acti
 # that the app starts with the new secrets. A revision scaled to zero
 # starts no replica, so the script sends a request to start one.
 if [ -n "$RESTART" ]; then
-  FQDN=$(jq -r '.properties.configuration.ingress.fqdn // ""' <<< "$APP")
+  FQDN=$(az containerapp show \
+    --name "$AZURE_APP_NAME" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --query properties.configuration.ingress.fqdn \
+    --output tsv) || FQDN=""
   replicas() {
     az containerapp replica list \
       --name "$AZURE_APP_NAME" \
@@ -669,9 +686,6 @@ if [ -n "$RESTART" ]; then
   done
   [ -n "$STARTED" ] || fail "revision $REVISION has no ready replica after the restart. If ingress is internal and min_replicas = 0, the script cannot start one: set min_replicas to 1 or more, and try again."
 fi
-
-# The new revision runs the real image. Open external ingress now.
-open_ingress || fail "cannot open external ingress"
 
 # Remove the unused redis-url secret when no other revision is active. The
 # release runs already, so a failure here is only a warning.
