@@ -521,8 +521,10 @@ impl CircuitBreaker {
         self.lock_inner().slow_calls_total
     }
 
+    /// Admits one call, or refuses it. Gives the generation of the state
+    /// that admitted the call.
     #[allow(clippy::significant_drop_tightening)]
-    pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
+    pub(crate) fn before_call(&self) -> Result<u64, CircuitBreakerError<()>> {
         let mut inner = self.lock_inner();
         inner.half_open_if_due(&self.name, self.now());
 
@@ -534,11 +536,19 @@ impl CircuitBreaker {
                     Err(CircuitBreakerError::Open)
                 } else {
                     inner.half_open_in_flight += 1;
-                    Ok(())
+                    Ok(inner.generation)
                 }
             }
-            CircuitState::Closed => Ok(()),
+            CircuitState::Closed => Ok(inner.generation),
         }
+    }
+
+    /// Admits one call and gives its guard. The guard keeps the generation
+    /// that admitted the call, so a state change after the admission does
+    /// not move the call into the new state.
+    pub(crate) fn admit(&self) -> Result<CircuitBreakerGuard, CircuitBreakerError<()>> {
+        let generation = self.before_call()?;
+        Ok(CircuitBreakerGuard::admitted(self.clone(), generation))
     }
 
     /// Counts a finished call that was not slow.
@@ -579,8 +589,7 @@ impl CircuitBreaker {
     where
         F: Future<Output = Result<T, E>>,
     {
-        self.before_call().map_err(|_| CircuitBreakerError::Open)?;
-        let guard = CircuitBreakerGuard::new(self.clone());
+        let guard = self.admit().map_err(|_| CircuitBreakerError::Open)?;
 
         let res = fut.await;
 
@@ -624,9 +633,14 @@ pub struct CircuitBreakerGuard {
 
 impl CircuitBreakerGuard {
     pub fn new(breaker: CircuitBreaker) -> Self {
+        let generation = breaker.generation();
+        Self::admitted(breaker, generation)
+    }
+
+    fn admitted(breaker: CircuitBreaker, generation: u64) -> Self {
         Self {
             started: breaker.now(),
-            generation: breaker.generation(),
+            generation,
             breaker,
             completed: false,
         }
@@ -832,11 +846,10 @@ where
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
-        match self.breaker.before_call() {
-            Ok(()) => {
-                // Make the guard first: if `call` panics, its drop frees a
+        match self.breaker.admit() {
+            Ok(guard) => {
+                // The guard comes first: if `call` panics, its drop frees a
                 // half-open slot.
-                let guard = CircuitBreakerGuard::new(self.breaker.clone());
                 let fut = self.inner.call(req);
                 CircuitBreakerServiceFuture::Executing {
                     fut,
@@ -1414,6 +1427,26 @@ mod tests {
         assert_eq!(state, CircuitState::HalfOpen, "not reopened");
         assert_eq!(in_flight, 1, "the trial keeps its slot");
         assert_eq!(breaker.slow_calls_total(), 1, "still a slow call");
+    }
+
+    #[test]
+    fn admission_generation_is_kept_across_a_state_change() {
+        let policy = CircuitBreakerPolicy {
+            minimum_sample_count: 1,
+            half_open_trial_count: 1,
+            open_duration: Duration::ZERO,
+            ..slow_policy(Duration::from_secs(5))
+        };
+        let breaker = CircuitBreaker::new("admit_gap", policy);
+        // Admitted while closed. The guard is made after two state changes.
+        let generation = breaker.before_call().expect("closed");
+        breaker.after_call(false);
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        breaker.before_call().expect("trial slot");
+        let mut late = CircuitBreakerGuard::admitted(breaker.clone(), generation);
+        late.started = late.started.checked_sub(Duration::from_secs(10)).unwrap();
+        late.success();
+        assert_eq!(breaker.trial_view(), (CircuitState::HalfOpen, 1));
     }
 
     #[test]

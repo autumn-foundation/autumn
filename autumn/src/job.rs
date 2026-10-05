@@ -4076,78 +4076,80 @@ impl JobClient {
                     // shared health signal, for every other enqueuer to
                     // read.
                     let breaker = self.job_queue_breaker();
-                    if breaker.before_call().is_err() {
-                        for row in batch {
-                            if row.due_at.is_some() {
-                                self.registry.record_cancel_scheduled(name);
-                            } else {
-                                self.registry.record_cancel(name);
-                            }
-                            self.registry.forget_pg_job_mark(&row.id);
-                            self.job_admin.record_cancelled(&row.id);
-                            let row_error = AutumnError::service_unavailable(
-                                std::io::Error::other("job queue circuit breaker is open"),
-                            );
-                            fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
-                            resolved.push((row.result_index, Err(row_error)));
-                        }
-                    } else {
-                        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
-                        let insert_result = pg_insert_jobs_many(
-                            pool,
-                            name,
-                            &job_queue,
-                            job_max_attempts,
-                            job_backoff_ms,
-                            unique_window_tag,
-                            concurrency_limit,
-                            &batch,
-                        )
-                        .await;
-                        if insert_result.is_ok() {
-                            guard.success();
-                        } else {
-                            guard.failure();
-                        }
-                        match insert_result {
-                            Ok(inserted_ids) => {
-                                let inserted: std::collections::HashSet<&str> =
-                                    inserted_ids.iter().map(String::as_str).collect();
-                                for row in batch {
-                                    let outcome = if inserted.contains(row.id.as_str()) {
-                                        EnqueueOutcome::Queued
-                                    } else {
-                                        self.record_deduplicated_enqueue(
-                                            name,
-                                            &row.id,
-                                            row.due_at.is_some(),
-                                        );
-                                        EnqueueOutcome::Deduplicated
-                                    };
-                                    fill_enqueue(row.slot, name, row.due_at, row.now, None);
-                                    resolved.push((row.result_index, Ok(outcome)));
+                    match breaker.admit() {
+                        Err(_) => {
+                            for row in batch {
+                                if row.due_at.is_some() {
+                                    self.registry.record_cancel_scheduled(name);
+                                } else {
+                                    self.registry.record_cancel(name);
                                 }
+                                self.registry.forget_pg_job_mark(&row.id);
+                                self.job_admin.record_cancelled(&row.id);
+                                let row_error = AutumnError::service_unavailable(
+                                    std::io::Error::other("job queue circuit breaker is open"),
+                                );
+                                fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
+                                resolved.push((row.result_index, Err(row_error)));
                             }
-                            Err(error) => {
-                                let message = error.to_string();
-                                for row in batch {
-                                    if row.due_at.is_some() {
-                                        self.registry.record_cancel_scheduled(name);
-                                    } else {
-                                        self.registry.record_cancel(name);
+                        }
+                        Ok(guard) => {
+                            let insert_result = pg_insert_jobs_many(
+                                pool,
+                                name,
+                                &job_queue,
+                                job_max_attempts,
+                                job_backoff_ms,
+                                unique_window_tag,
+                                concurrency_limit,
+                                &batch,
+                            )
+                            .await;
+                            if insert_result.is_ok() {
+                                guard.success();
+                            } else {
+                                guard.failure();
+                            }
+                            match insert_result {
+                                Ok(inserted_ids) => {
+                                    let inserted: std::collections::HashSet<&str> =
+                                        inserted_ids.iter().map(String::as_str).collect();
+                                    for row in batch {
+                                        let outcome = if inserted.contains(row.id.as_str()) {
+                                            EnqueueOutcome::Queued
+                                        } else {
+                                            self.record_deduplicated_enqueue(
+                                                name,
+                                                &row.id,
+                                                row.due_at.is_some(),
+                                            );
+                                            EnqueueOutcome::Deduplicated
+                                        };
+                                        fill_enqueue(row.slot, name, row.due_at, row.now, None);
+                                        resolved.push((row.result_index, Ok(outcome)));
                                     }
-                                    self.registry.forget_pg_job_mark(&row.id);
-                                    self.job_admin.record_cancelled(&row.id);
-                                    let row_error =
-                                        AutumnError::internal_server_error_msg(message.clone());
-                                    fill_enqueue(
-                                        row.slot,
-                                        name,
-                                        row.due_at,
-                                        row.now,
-                                        Some(&row_error),
-                                    );
-                                    resolved.push((row.result_index, Err(row_error)));
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    for row in batch {
+                                        if row.due_at.is_some() {
+                                            self.registry.record_cancel_scheduled(name);
+                                        } else {
+                                            self.registry.record_cancel(name);
+                                        }
+                                        self.registry.forget_pg_job_mark(&row.id);
+                                        self.job_admin.record_cancelled(&row.id);
+                                        let row_error =
+                                            AutumnError::internal_server_error_msg(message.clone());
+                                        fill_enqueue(
+                                            row.slot,
+                                            name,
+                                            row.due_at,
+                                            row.now,
+                                            Some(&row_error),
+                                        );
+                                        resolved.push((row.result_index, Err(row_error)));
+                                    }
                                 }
                             }
                         }
@@ -4410,12 +4412,11 @@ impl JobClient {
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.job_queue_breaker();
 
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(AutumnError::service_unavailable(std::io::Error::other(
                 "job queue circuit breaker is open",
             )));
-        }
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+        };
 
         let res = self
             .enqueue_durable_inner(
@@ -4697,12 +4698,11 @@ impl JobClient {
                 },
             );
 
-            if breaker.before_call().is_err() {
+            let Ok(guard) = breaker.admit() else {
                 return Err(AutumnError::service_unavailable(std::io::Error::other(
                     "job queue circuit breaker is open",
                 )));
-            }
-            let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+            };
 
             let id_for_enqueue = id.clone();
             let payload_for_enqueue = payload.clone();
