@@ -9,13 +9,15 @@
 //! - **Room** — a small (mesh, no SFU) multi-participant call capped at
 //!   [`config::DEFAULT_ROOM_MAX_PARTICIPANTS`] participants.
 //!
-//! # Status: skeleton (slice 0)
+//! Both primitives are off by default. Enable each one on the builder:
 //!
-//! This slice ships the crate skeleton, the [`MediaPlugin`] builder, the
-//! [`MediaConfig`](config::MediaConfig) surface + `[media]` parsing, and the
-//! [`from_arroyo_env`](config::MediaConfig::from_arroyo_env) compatibility shim.
-//! It has **no runtime behavior beyond configuration and registration** —
-//! storage, encode, transport, and rooms land in later slices.
+//! | Builder call | Installs |
+//! |---|---|
+//! | [`with_broadcast`](MediaPlugin::with_broadcast) | [`MediaMtxClient`] and [`MediaUrls`] extensions |
+//! | [`with_rooms`](MediaPlugin::with_rooms) | Room routes, [`RoomService`] and the room reaper |
+//! | Either one | [`MediaStorage`], [`MediaWorkflows`], the encode jobs and the retention sweep |
+//!
+//! With neither, the plugin installs nothing and logs a warning.
 //!
 //! Because Autumn resolves config *after* [`Plugin::build`] runs, the plugin
 //! cannot read `[media]` from inside `build`; the application loads a
@@ -139,10 +141,7 @@ use crate::workflows::MediaWorkflowDelegate as MediaWorkflowDelegateHook;
 /// [`MediaConfig`](config::MediaConfig) with [`config`](Self::config), then
 /// install with `app.plugin(...)`.
 ///
-/// When [`with_rooms`](Self::with_rooms) is enabled, [`build`](Plugin::build)
-/// nests the [`rooms::room_router`] under the API prefix and installs a
-/// [`rooms::RoomService`] extension; the broadcast surface installs the storage
-/// / encode wiring.
+/// See the crate docs for what each primitive installs.
 pub struct MediaPlugin {
     /// Resolved `[media]` configuration.
     config: MediaConfig,
@@ -154,7 +153,7 @@ pub struct MediaPlugin {
     room_max_participants: usize,
     /// Job queue name the built-in media encode jobs are registered on.
     queue: String,
-    /// URL prefix for the plugin's API routes (later slices).
+    /// URL prefix for the plugin's API routes.
     api_prefix: String,
     /// App-supplied artifact completion callback (parallels the
     /// `OutboundWebhookHandler` store).
@@ -250,6 +249,10 @@ impl MediaPlugin {
     }
 
     /// Enable the broadcast primitive (ingest → fan-out playback → VOD).
+    ///
+    /// Installs [`MediaMtxClient`] and [`MediaUrls`] extensions, built from
+    /// `config.mediamtx`. They install also when the storage config is not
+    /// valid.
     #[must_use]
     pub const fn with_broadcast(mut self) -> Self {
         self.enable_broadcast = true;
@@ -257,6 +260,8 @@ impl MediaPlugin {
     }
 
     /// Enable the rooms primitive (small mesh calls).
+    ///
+    /// Mounts the room routes and installs [`RoomService`].
     #[must_use]
     pub const fn with_rooms(mut self) -> Self {
         self.enable_rooms = true;
@@ -380,8 +385,8 @@ impl Plugin for MediaPlugin {
     /// Declares the plugin-owned `[media]` top-level config section (via
     /// [`AppBuilder::config_section`]) so a host app with
     /// `server.strict_config = true` boots without core rejecting `[media]` as
-    /// an unknown key, then mounts the room/broadcast routers, installs the
-    /// service extensions, and spawns the retention/background loops.
+    /// an unknown key, then installs the surface of each enabled primitive
+    /// (see the crate docs).
     // `build` is a long, linear plugin-assembly routine (config validation,
     // room wiring + reaper, storage/workflow install, retention loop); it reads
     // best as one top-to-bottom sequence rather than fragmented across helpers.
@@ -471,6 +476,15 @@ impl Plugin for MediaPlugin {
             "🍂 Autumn Media configured"
         );
 
+        // Both primitives are off by default. With neither, install nothing.
+        if !enable_broadcast && !enable_rooms {
+            tracing::warn!(
+                "🍂 Autumn Media: no primitive enabled; call `with_broadcast()` or \
+                 `with_rooms()`. The plugin installs nothing."
+            );
+            return app;
+        }
+
         // Rooms are storage-independent, so mount the room signaling router and
         // install the `RoomService` extension up front — they must stay
         // available even if the storage backend below fails to resolve. The
@@ -536,9 +550,21 @@ impl Plugin for MediaPlugin {
                 });
         }
 
+        // The broadcast transport does not need storage, so install it before
+        // the storage check below.
+        if enable_broadcast {
+            let mtx_client = transport::MediaMtxClient::new(&config.mediamtx);
+            let urls = transport::MediaUrls::from_config(&config.mediamtx);
+            app = app.state_initializer(move |state| {
+                state.insert_extension(mtx_client);
+                state.insert_extension(urls);
+            });
+        }
+
         // Resolve the storage backend up front so a misconfiguration surfaces
         // as one error line here rather than inside a job. On failure the plugin
-        // still serves any mounted room routes, but installs no encode wiring.
+        // keeps the room routes and the broadcast transport, but installs no encode
+        // wiring.
         let storage = match storage::MediaStorage::from_config(&config.storage) {
             Ok(storage) => storage,
             Err(error) => {
@@ -1142,5 +1168,145 @@ mod config_section_tests {
             builder.has_config_section("media"),
             "MediaPlugin::build must declare the [media] config section for strict_config"
         );
+    }
+}
+
+// Each primitive installs only its own surface (#1974).
+#[cfg(test)]
+mod primitive_surface_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use autumn_web::AppState;
+    use autumn_web::test::TestApp;
+
+    use super::MediaPlugin;
+    use crate::config::{MediaConfig, MediaStorageBackend};
+    use crate::{MediaMtxClient, MediaStorage, MediaUrls, MediaWorkflows, RoomService};
+
+    /// The extensions a built app holds.
+    #[allow(clippy::struct_excessive_bools)] // one flag per extension
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct Installed {
+        storage: bool,
+        workflows: bool,
+        mtx_client: bool,
+        urls: bool,
+        rooms: bool,
+    }
+
+    const NOTHING: Installed = Installed {
+        storage: false,
+        workflows: false,
+        mtx_client: false,
+        urls: false,
+        rooms: false,
+    };
+
+    /// Build `plugin` in a test app and return what `read` sees in its state.
+    fn probe<T: Send + 'static>(
+        plugin: MediaPlugin,
+        read: impl Fn(&AppState) -> T + Send + Sync + 'static,
+    ) -> T {
+        let seen = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let _client = TestApp::new()
+            .plugin(plugin)
+            .state_initializer(move |state| *sink.lock().unwrap() = Some(read(state)))
+            .build();
+        seen.lock().unwrap().take().expect("probe ran")
+    }
+
+    /// The extensions `plugin` installs.
+    fn installed(plugin: MediaPlugin) -> Installed {
+        probe(plugin, |state| Installed {
+            storage: state.extension::<MediaStorage>().is_some(),
+            workflows: state.extension::<MediaWorkflows>().is_some(),
+            mtx_client: state.extension::<MediaMtxClient>().is_some(),
+            urls: state.extension::<MediaUrls>().is_some(),
+            rooms: state.extension::<RoomService>().is_some(),
+        })
+    }
+
+    #[tokio::test]
+    async fn no_primitive_installs_nothing() {
+        assert_eq!(installed(MediaPlugin::new()), NOTHING);
+    }
+
+    #[tokio::test]
+    async fn broadcast_installs_transport_and_encode() {
+        let got = installed(MediaPlugin::new().with_broadcast());
+        assert_eq!(
+            got,
+            Installed {
+                storage: true,
+                workflows: true,
+                mtx_client: true,
+                urls: true,
+                rooms: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rooms_install_rooms_and_encode_but_no_broadcast_transport() {
+        let got = installed(MediaPlugin::new().with_rooms());
+        assert_eq!(
+            got,
+            Installed {
+                storage: true,
+                workflows: true,
+                mtx_client: false,
+                urls: false,
+                rooms: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn both_primitives_install_everything() {
+        let got = installed(MediaPlugin::new().with_broadcast().with_rooms());
+        assert_eq!(
+            got,
+            Installed {
+                storage: true,
+                workflows: true,
+                mtx_client: true,
+                urls: true,
+                rooms: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn arroyo_shim_installs_broadcast_transport() {
+        let got = installed(MediaPlugin::from_arroyo_env_pairs(&HashMap::new()));
+        assert!(got.mtx_client && got.urls, "{got:?}");
+        assert!(!got.rooms, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn broadcast_transport_survives_a_storage_error() {
+        // S3 without a bucket fails `MediaStorage::from_config`.
+        let mut config = MediaConfig::default();
+        config.storage.backend = MediaStorageBackend::S3;
+        let got = installed(MediaPlugin::new().config(config).with_broadcast());
+        assert!(got.mtx_client && got.urls, "{got:?}");
+        assert!(!got.storage && !got.workflows, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn transport_uses_the_configured_api_base() {
+        let mut config = MediaConfig::default();
+        config.mediamtx.api_base = "http://mediamtx.internal:9997".to_owned();
+        let api_base = probe(
+            MediaPlugin::new().config(config).with_broadcast(),
+            |state| {
+                state
+                    .extension::<MediaMtxClient>()
+                    .map(|client| client.api_base().to_owned())
+            },
+        );
+        assert_eq!(api_base.as_deref(), Some("http://mediamtx.internal:9997"));
     }
 }

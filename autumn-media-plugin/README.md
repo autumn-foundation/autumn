@@ -90,6 +90,15 @@ autumn_web::app()
     .await;
 ```
 
+Both primitives are off by default. With neither, the plugin installs nothing
+and logs a warning.
+
+| Builder call | Installs |
+|---|---|
+| `with_broadcast()` | `MediaMtxClient` and `MediaUrls` extensions |
+| `with_rooms()` | Room routes, `RoomService` and the room reaper |
+| Either one | `MediaStorage`, `MediaWorkflows`, the encode jobs and the retention sweep |
+
 ### Migrating from Arroyo
 
 `MediaConfig::from_arroyo_env()` maps an existing Arroyo deployment's `ARROYO_*`

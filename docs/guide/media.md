@@ -58,9 +58,15 @@ async fn main() {
 ```
 
 Both primitives are **off by default** — `MediaPlugin::new()` with neither
-`with_broadcast()` nor `with_rooms()` mounts nothing. A rooms-only app calls
-just `.with_rooms()`; a broadcast-only app (e.g. a one-to-many streaming site)
-calls just `.with_broadcast()`.
+`with_broadcast()` nor `with_rooms()` installs nothing and logs a warning. A
+rooms-only app calls just `.with_rooms()`; a broadcast-only app (e.g. a
+one-to-many streaming site) calls just `.with_broadcast()`.
+
+| Builder call | Installs |
+|---|---|
+| `with_broadcast()` | `MediaMtxClient` and `MediaUrls` extensions |
+| `with_rooms()` | Room routes, `RoomService` and the room reaper |
+| Either one | `MediaStorage`, `MediaWorkflows`, the encode jobs and the retention sweep |
 
 ### Builder options
 
@@ -279,8 +285,10 @@ heartbeats nor polls for a full idle TTL loses its signaling record (its live
 
 ### `MediaMtxClient` and `MediaUrls`
 
-`with_broadcast()` wires the storage/encode surface. Two transport helpers
-resolve from a `MediaMtxConfig`:
+`with_broadcast()` installs both transport helpers as `AppState` extensions,
+built from `config.mediamtx`. Resolve them in a handler with
+`state.extension::<MediaMtxClient>()`. You can also build them yourself from a
+`MediaMtxConfig`:
 
 - **`MediaUrls::from_config(&config.mediamtx)`** builds every browser-facing and
   server-side URL a broadcast needs — `rtmp_ingest_url(key)`,
