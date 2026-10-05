@@ -88,7 +88,7 @@
 //!
 //! **Documented divergence** (consistent with the RFC §12 scope): a green sim
 //! proves the *orchestration, timing, and ordering* of the local scheduler + job
-//! paths. It does **not** validate the Postgres advisory-lock scheduler leasing
+//! paths. It does **not** validate the Postgres tick-table scheduler leasing
 //! or the durable Postgres `LISTEN`/`NOTIFY` + `SKIP LOCKED` job-queue
 //! claim/lock semantics — those are compiled out under `sqlite` and remain the
 //! province of the Postgres-backed integration tests. The sim is a determinism /

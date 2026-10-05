@@ -195,6 +195,7 @@ jobs.postgres
 jobs.postgres.visibility_timeout_ms
 jobs.queues
 jobs.redis
+jobs.redis.dead_letter_limit
 jobs.redis.key_prefix
 jobs.redis.url
 jobs.redis.visibility_timeout_ms
