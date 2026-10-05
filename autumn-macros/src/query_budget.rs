@@ -1719,7 +1719,10 @@ impl Analyzer {
             }
             Pat::Slice(p) => {
                 for elem in &p.elems {
-                    self.bind_pat(elem, kind.element());
+                    // `tail @ ..` binds a subslice, not one element.
+                    let rest = matches!(elem, Pat::Ident(id)
+                        if matches!(id.subpat.as_ref().map(|(_, p)| &**p), Some(Pat::Rest(_))));
+                    self.bind_pat(elem, if rest { kind } else { kind.element() });
                 }
             }
             Pat::TupleStruct(p) => {
@@ -3197,6 +3200,45 @@ impl Analyzer {
         }
     }
 
+    /// Does the closure `c` capture a handle: a tracked name, or a handle
+    /// accessor (`state.repo`, `self.db()`) on a value it did not get as a
+    /// parameter? Its own parameters are not captures (`|repo| repo.len()`).
+    fn closure_captures_handle(&self, c: &syn::ExprClosure) -> bool {
+        /// Finds an accessor whose root is not a closure parameter.
+        struct Accessors<'p> {
+            params: &'p [String],
+            found: bool,
+        }
+        impl Accessors<'_> {
+            fn outside(&self, base: &Expr) -> bool {
+                place_root(base).is_none_or(|root| !self.params.contains(&root))
+            }
+        }
+        impl<'a> Visit<'a> for Accessors<'_> {
+            fn visit_expr_field(&mut self, f: &'a syn::ExprField) {
+                self.found |= member_is_handle_accessor(&f.member) && self.outside(&f.base);
+                syn::visit::visit_expr_field(self, f);
+            }
+            fn visit_expr_method_call(&mut self, m: &'a ExprMethodCall) {
+                self.found |= HANDLE_ACCESSORS.contains(&m.method.to_string().as_str())
+                    && self.outside(&m.receiver);
+                syn::visit::visit_expr_method_call(self, m);
+            }
+        }
+        let params = pattern_names(c.inputs.iter());
+        if tokens_mention_any(&c.body.to_token_stream(), &|name| {
+            !params.iter().any(|p| p == name) && self.env.is_tracked(name)
+        }) {
+            return true;
+        }
+        let mut accessors = Accessors {
+            params: &params,
+            found: false,
+        };
+        accessors.visit_expr(&c.body);
+        accessors.found
+    }
+
     /// Is `e` a user value that holds a handle (`Ctx { repo }`)? Its methods
     /// are the user's, so none of them is a known container method.
     fn expr_is_holder(&self, e: &Expr) -> bool {
@@ -3225,13 +3267,7 @@ impl Analyzer {
                 break_results(e).into_iter().any(|v| self.expr_is_holder(v))
             }
             // A closure that captures a handle holds it, like a user value.
-            // Its own parameters are not captures (`|repo| repo.len()`).
-            Expr::Closure(c) => {
-                let params = pattern_names(c.inputs.iter());
-                tokens_mention_any(&c.body.to_token_stream(), &|name| {
-                    !params.iter().any(|p| p == name) && self.env.is_tracked(name)
-                })
-            }
+            Expr::Closure(c) => self.closure_captures_handle(c),
             Expr::Reference(r) => self.expr_is_holder(&r.expr),
             Expr::Paren(p) => self.expr_is_holder(&p.expr),
             Expr::Group(g) => self.expr_is_holder(&g.expr),
@@ -7661,6 +7697,46 @@ mod tests {
                 "async fn h(repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> { \
                  let r = repos.values().next().unwrap(); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn rest_slices_and_accessor_captures_keep_their_handles() {
+        check_handlers(&[
+            (
+                "a rest binding is a subslice",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let [tail @ ..] = repos.as_slice() else { return Ok(0) }; \
+                 tail.refresh_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a closure that captures a handle through a field",
+                "async fn h(state: AppState) -> AutumnResult<usize> { \
+                 drive(|| state.repo.clone()).await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a closure that captures a handle through an accessor call",
+                "async fn h(state: AppState) -> AutumnResult<usize> { \
+                 drive(|| state.db()).await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            // Guards: one element of a slice is a handle, and a closure
+            // parameter's field is not a capture.
+            (
+                "a slice element is a handle",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let [first, ..] = repos.as_slice() else { return Ok(0) }; \
+                 let _ = first.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a closure parameter's field",
+                "async fn h(rows: Vec<Row>) -> AutumnResult<usize> { \
+                 let ids: Vec<i64> = rows.iter().map(|row| row.id).collect(); render(ids); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
