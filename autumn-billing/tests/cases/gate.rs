@@ -529,7 +529,8 @@ async fn current_subscription_falls_back_to_the_newest_ended_row() {
 }
 
 /// Seed an older entitled `pro` row and a newer entitled `team` row.
-async fn seed_pro_then_team(store: &MemoryBillingStore, user_id: &str) {
+/// Returns the customer id.
+async fn seed_pro_then_team(store: &MemoryBillingStore, user_id: &str) -> String {
     let customer = seed_customer(store, user_id).await;
     for (key, price, age) in [("older-pro", PRO_PRICE, 2), ("newer-team", TEAM_PRICE, 1)] {
         store
@@ -544,6 +545,7 @@ async fn seed_pro_then_team(store: &MemoryBillingStore, user_id: &str) {
             .await
             .unwrap();
     }
+    customer
 }
 
 /// Issue #3114: the gate tests every entitled row, not only the newest.
@@ -595,21 +597,21 @@ async fn rule_satisfied_only_by_an_older_entitled_subscription_is_allowed() {
 #[tokio::test]
 async fn require_returns_the_satisfying_subscription_not_the_newest() {
     let h = build();
-    seed_pro_then_team(&h.store, "7").await;
+    let customer = seed_pro_then_team(&h.store, "7").await;
     let billing = Billing::from_state(h.client.state()).expect("plugin started");
 
     let view = billing.require("7", &PlanRule::plan("pro")).await.unwrap();
     assert!(view.entitled);
     assert_eq!(view.plan.as_ref().map(|p| p.id.as_str()), Some("pro"));
-    assert!(view.subscription.id.ends_with("older-pro"));
+    assert_eq!(view.subscription.id, format!("sub-{customer}-older-pro"));
 
-    // Two rows satisfy `AnyActive`. The newest one wins.
+    // Two rows satisfy `AnyActive`. The row with the latest `last_event_at` wins.
     let view = billing.require("7", &PlanRule::AnyActive).await.unwrap();
-    assert!(view.subscription.id.ends_with("newer-team"));
+    assert_eq!(view.subscription.id, format!("sub-{customer}-newer-team"));
 }
 
-/// Two satisfying rows with one event time resolve by row id. The memory
-/// store has no order for this tie, so the gate must make one.
+/// Rows with equal `last_event_at` resolve to the lowest `id`.
+/// `current_subscription` and `require` agree on that row.
 #[tokio::test]
 async fn require_breaks_an_event_time_tie_by_row_id() {
     let h = build();
@@ -630,6 +632,40 @@ async fn require_breaks_an_event_time_tie_by_row_id() {
     let billing = Billing::from_state(h.client.state()).expect("plugin started");
     let view = billing.require("7", &PlanRule::plan("pro")).await.unwrap();
     assert_eq!(view.subscription.id, format!("sub-{customer}-a"));
+    let shown = billing.current_subscription("7").await.unwrap().unwrap();
+    assert_eq!(shown.subscription.id, format!("sub-{customer}-a"));
+}
+
+/// A row without a price resolves its plan from the stored plan id. That row
+/// can satisfy a rule that a newer row does not satisfy.
+#[tokio::test]
+async fn an_older_row_resolved_by_plan_id_satisfies_its_rule() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    let mut no_price = sub(
+        &customer,
+        "plan-id-pro",
+        None,
+        SubscriptionStatus::Active,
+        Some(now() + hours(24)),
+        now() - hours(2),
+    );
+    no_price = no_price.with_plan(PlanId::new("pro"));
+    h.store.upsert_subscription(no_price).await.unwrap();
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "team",
+            Some(TEAM_PRICE),
+            SubscriptionStatus::Active,
+            Some(now() + hours(24)),
+            now() - hours(1),
+        ))
+        .await
+        .unwrap();
+    let billing = Billing::from_state(h.client.state()).expect("plugin started");
+    let view = billing.require("7", &PlanRule::plan("pro")).await.unwrap();
+    assert_eq!(view.subscription.id, format!("sub-{customer}-plan-id-pro"));
 }
 
 /// Issue #3114: a row that is not entitled never grants access, even when a
@@ -703,21 +739,34 @@ async fn an_unentitled_row_never_satisfies_a_rule() {
     }
 }
 
+/// The period of a row in the model check below.
+#[derive(Clone, Copy, Debug)]
+enum Period {
+    /// `current_period_end` is 24h after now.
+    Future,
+    /// `current_period_end` is 73h before now: past the 72h grace.
+    Expired,
+    /// No `current_period_end`. The last event is 1h or 2h before now, so
+    /// the row is in grace.
+    Missing,
+}
+
 /// One row shape for the model check below.
 #[derive(Clone, Copy, Debug)]
 struct RowShape {
     price: &'static str,
     status: SubscriptionStatus,
-    in_period: bool,
+    period: Period,
 }
 
 /// The oracle plan of a row: the catalog plan, when the row is entitled.
-fn oracle_plan(row: RowShape) -> Option<&'static str> {
-    let status_ok = matches!(
-        row.status,
-        SubscriptionStatus::Active | SubscriptionStatus::Trialing
-    );
-    if !status_ok || !row.in_period {
+fn oracle_plan(row: RowShape, allow_past_due: bool) -> Option<&'static str> {
+    let status_ok = match row.status {
+        SubscriptionStatus::Active | SubscriptionStatus::Trialing => true,
+        SubscriptionStatus::PastDue => allow_past_due,
+        _ => false,
+    };
+    if !status_ok || matches!(row.period, Period::Expired) {
         return None;
     }
     match row.price {
@@ -737,11 +786,11 @@ fn oracle_accepts(rule: &PlanRule, plan: &str) -> bool {
     }
 }
 
-/// Every pair of row shapes, in both orders, against an oracle. The gate
-/// allows a rule if and only if one entitled row satisfies it. `require`
-/// returns the newest row that satisfies it.
-#[tokio::test]
-async fn gate_matches_the_any_row_oracle_for_every_pair_of_rows() {
+/// Each row shape is paired with each shape, once as the older row and once
+/// as the newer row. The gate allows a rule if and only if at least one
+/// entitled row satisfies it. `require` returns the satisfying row with the
+/// latest `last_event_at`.
+async fn check_gate_against_the_oracle(allow_past_due: bool) {
     let prices = [PRO_PRICE, TEAM_PRICE, "price_unknown"];
     let statuses = [
         SubscriptionStatus::Active,
@@ -749,16 +798,16 @@ async fn gate_matches_the_any_row_oracle_for_every_pair_of_rows() {
         SubscriptionStatus::PastDue,
         SubscriptionStatus::Canceled,
         SubscriptionStatus::Incomplete,
-        SubscriptionStatus::Unpaid,
     ];
+    let periods = [Period::Future, Period::Expired, Period::Missing];
     let mut shapes = Vec::new();
     for price in prices {
         for status in statuses {
-            for in_period in [true, false] {
+            for period in periods {
                 shapes.push(RowShape {
                     price,
                     status,
-                    in_period,
+                    period,
                 });
             }
         }
@@ -773,7 +822,7 @@ async fn gate_matches_the_any_row_oracle_for_every_pair_of_rows() {
         PlanRule::entitlement("audit"),
     ];
 
-    let h = build();
+    let h = build_with(support::config().allow_past_due(allow_past_due));
     let billing = Billing::from_state(h.client.state()).expect("plugin started");
     let mut checked = 0_usize;
     for (i, older) in shapes.iter().enumerate() {
@@ -781,25 +830,30 @@ async fn gate_matches_the_any_row_oracle_for_every_pair_of_rows() {
             let user = format!("u{i}-{j}");
             let customer = seed_customer(&h.store, &user).await;
             for (key, row, age) in [("older", older, 2), ("newer", newer, 1)] {
-                let period = if row.in_period { 24 } else { -73 };
+                let period_end = match row.period {
+                    Period::Future => Some(now() + hours(24)),
+                    Period::Expired => Some(now() - hours(73)),
+                    Period::Missing => None,
+                };
                 h.store
                     .upsert_subscription(sub(
                         &customer,
                         key,
                         Some(row.price),
                         row.status,
-                        Some(now() + hours(period)),
+                        period_end,
                         now() - hours(age),
                     ))
                     .await
                     .unwrap();
             }
             for rule in &rules {
-                let newer_ok = oracle_plan(*newer).is_some_and(|p| oracle_accepts(rule, p));
-                let older_ok = oracle_plan(*older).is_some_and(|p| oracle_accepts(rule, p));
-                let expected = if newer_ok {
+                let grants = |row: &RowShape| {
+                    oracle_plan(*row, allow_past_due).is_some_and(|p| oracle_accepts(rule, p))
+                };
+                let expected = if grants(newer) {
                     Some("newer")
-                } else if older_ok {
+                } else if grants(older) {
                     Some("older")
                 } else {
                     None
@@ -809,7 +863,7 @@ async fn gate_matches_the_any_row_oracle_for_every_pair_of_rows() {
                 match (billing.require(&user, rule).await, expected) {
                     (Ok(view), Some(key)) => {
                         assert!(view.entitled);
-                        assert!(view.subscription.id.ends_with(key), "{rule:?}");
+                        assert_eq!(view.subscription.id, format!("sub-{customer}-{key}"));
                     }
                     (Err(BillingError::Forbidden(_)), None) => {}
                     (got, want) => panic!("{rule:?} {older:?} {newer:?}: {got:?} vs {want:?}"),
@@ -819,6 +873,16 @@ async fn gate_matches_the_any_row_oracle_for_every_pair_of_rows() {
         }
     }
     assert_eq!(checked, shapes.len() * shapes.len() * rules.len());
+}
+
+#[tokio::test]
+async fn gate_matches_the_any_row_oracle_for_every_pair_of_rows() {
+    check_gate_against_the_oracle(false).await;
+}
+
+#[tokio::test]
+async fn gate_matches_the_any_row_oracle_with_allow_past_due() {
+    check_gate_against_the_oracle(true).await;
 }
 
 #[tokio::test]

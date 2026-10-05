@@ -118,8 +118,10 @@ async fn reports(_pro: Entitled<Pro>) -> &'static str { "ok" }
 ```
 
 `Entitled<R>` runs before the body is read: 401 without a session user, 403
-without an entitled subscription. Inside a handler or a `Policy`, use the
-service form:
+when no entitled subscription satisfies the rule. The gate checks every
+subscription of the customer, so a second, newer plan does not hide an older
+plan that satisfies the rule. Inside a handler or a `Policy`, use the service
+form:
 
 ```rust,ignore
 async fn export(billing: Billing, session: Session) -> AutumnResult<&'static str> {
@@ -131,7 +133,8 @@ async fn export(billing: Billing, session: Session) -> AutumnResult<&'static str
 
 `Billing::current_user` reads the user id with the app's configured auth
 session key and answers 401 when nobody is logged in. `Billing::require`
-returns the newest subscription that satisfies the rule.
+returns the subscription that satisfies the rule and has the latest
+`last_event_at`.
 `Billing::current_subscription` picks one subscription to show and is not a
 gate.
 
