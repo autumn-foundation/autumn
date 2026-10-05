@@ -1483,15 +1483,32 @@ struct StoreHealth {
     errors: AtomicU64,
     /// `true` after a failed read, until a read succeeds.
     failing: AtomicBool,
+    /// Increments on each successful write through the service.
+    writes: AtomicU64,
 }
 
 impl StoreHealth {
-    /// Keep the value that the store returned for `key`.
+    /// The write generation to pass to [`remember`](Self::remember). Take it
+    /// before the read.
+    fn read_started(&self) -> u64 {
+        self.writes.load(Ordering::Acquire)
+    }
+
+    /// Start a write's read-back: reads that started earlier can no longer
+    /// replace a last-known value. Returns the new generation.
+    fn begin_write(&self) -> u64 {
+        let _known = self
+            .last_known
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.writes.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Keep the value that the store returned for `key`, unless a write came
+    /// after generation `started`: that read can be older than the write.
     ///
-    /// Two reads that see a flag change can store their values out of order.
-    /// The next good read corrects it, so the hot path takes no write lock
-    /// when the value is the same.
-    fn remember(&self, key: &str, flag: Option<&FlagConfig>) {
+    /// The hot path takes no write lock when the value is the same.
+    fn remember(&self, key: &str, flag: Option<&FlagConfig>, started: u64) {
         if self.failing.load(Ordering::Relaxed) && self.failing.swap(false, Ordering::AcqRel) {
             tracing::info!("feature flag store recovered");
         }
@@ -1507,6 +1524,9 @@ impl StoreHealth {
             .last_known
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        if self.writes.load(Ordering::Acquire) != started {
+            return;
+        }
         match flag {
             Some(flag) => {
                 known.insert(key.to_owned(), flag.clone());
@@ -1610,9 +1630,10 @@ impl FeatureFlagService {
     /// gets the last-known value (see [Store failures](Self#store-failures)).
     #[must_use]
     pub fn is_enabled(&self, flag_key: &str, actor_id: Option<&str>) -> bool {
+        let started = self.health.read_started();
         let flag = match self.store.get(flag_key) {
             Ok(flag) => {
-                self.health.remember(flag_key, flag.as_ref());
+                self.health.remember(flag_key, flag.as_ref(), started);
                 flag
             }
             Err(error) => self.health.recall(flag_key, &error),
@@ -1666,8 +1687,9 @@ impl FeatureFlagService {
     /// When the store cannot read the flag back, a disable keeps the flag
     /// off, and any other write drops the last-known value.
     fn after_write(&self, flag_key: &str, disabled: bool) {
+        let started = self.health.begin_write();
         match self.store.get(flag_key) {
-            Ok(flag) => self.health.remember(flag_key, flag.as_ref()),
+            Ok(flag) => self.health.remember(flag_key, flag.as_ref(), started),
             Err(_) => self.health.forget(flag_key, disabled),
         }
     }
@@ -2532,6 +2554,26 @@ mod tests {
         svc.disable("kill", None).unwrap();
         store.fail(true);
         assert!(!svc.is_enabled("kill", None));
+    }
+
+    #[test]
+    fn read_started_before_a_write_does_not_replace_its_value() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        svc.enable("kill", None).unwrap();
+
+        // A read starts and sees the flag on. Then a disable succeeds.
+        let started = svc.health.read_started();
+        let stale = store.get("kill").unwrap();
+        svc.disable("kill", None).unwrap();
+        // The old read ends last.
+        svc.health.remember("kill", stale.as_ref(), started);
+
+        store.fail(true);
+        assert!(
+            !svc.is_enabled("kill", None),
+            "a read that started before a write must not replace its value"
+        );
     }
 
     #[test]
