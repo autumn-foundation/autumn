@@ -12624,7 +12624,7 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let hidden: custom::Vec<i64> = custom::Vec { inner: repo, value: 0 }; \
                  hidden.inner.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
                 "a std path annotation stays plain",
