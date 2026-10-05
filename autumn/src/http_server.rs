@@ -324,6 +324,9 @@ enum Scan {
         have: usize,
         skip: usize,
         ends_block: bool,
+        /// The header timer started at the first byte of a frame header that
+        /// is not complete yet. Control traffic cancels it.
+        provisional: bool,
     },
 }
 
@@ -352,6 +355,7 @@ impl PhaseState {
                             have: 0,
                             skip: 0,
                             ends_block: false,
+                            provisional: false,
                         };
                     }
                 }
@@ -360,6 +364,7 @@ impl PhaseState {
                     have,
                     skip,
                     ends_block,
+                    provisional,
                 } => {
                     if *skip > 0 {
                         let n = (*skip).min(bytes.len());
@@ -376,6 +381,11 @@ impl PhaseState {
                     *have += n;
                     bytes = &bytes[n..];
                     if *have < 9 {
+                        // The frame type is not known yet. It can be a head.
+                        if self.header_block_since.is_none() {
+                            self.header_block_since = Some(Instant::now());
+                            *provisional = true;
+                        }
                         return;
                     }
                     *have = 0;
@@ -384,12 +394,15 @@ impl PhaseState {
                         | usize::from(header[2]);
                     let (kind, flags) = (header[3], header[4]);
                     if kind == H2_FRAME_HEADERS || kind == H2_FRAME_CONTINUATION {
+                        *provisional = false;
                         self.header_block_since.get_or_insert_with(Instant::now);
                         *ends_block = flags & H2_FLAG_END_HEADERS != 0;
                         if *ends_block && *skip == 0 {
                             *ends_block = false;
                             self.header_block_since = None;
                         }
+                    } else if std::mem::take(provisional) {
+                        self.header_block_since = None;
                     }
                 }
             }
@@ -621,17 +634,18 @@ where
     }
 
     fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
-        let guard = self.timers.as_ref().and_then(|timers| {
-            timers.request_started();
-            let mark = InFlight(Arc::clone(timers));
+        let guard = self.timers.as_ref().map(|timers| {
+            // A CONNECT stream gets two marks: one on the response body, as
+            // for every request, and one for the tunnel, which can outlive
+            // the response.
             if req.method() == axum::http::Method::CONNECT {
+                timers.request_started();
                 req.extensions_mut().insert(TunnelGuard {
-                    _mark: Arc::new(mark),
+                    _mark: Arc::new(InFlight(Arc::clone(timers))),
                 });
-                None
-            } else {
-                Some(mark)
             }
+            timers.request_started();
+            InFlight(Arc::clone(timers))
         });
         TrackedFuture {
             inner: self.inner.call(req),
@@ -833,6 +847,59 @@ mod tests {
         assert_eq!(expiry(&timers), None, "the tunnel is still open");
         drop(guard);
         assert_eq!(expiry(&timers), Some(Expiry::Idle));
+    }
+
+    #[tokio::test]
+    async fn a_connect_response_body_stays_in_flight() {
+        use tower::Service as _;
+        let timers = idle_timers();
+        let mut service = Tracked {
+            // A CONNECT handler that is not a WebSocket: it drops the guard
+            // and streams a body.
+            inner: tower::service_fn(|_req: axum::extract::Request| async {
+                Ok::<_, Infallible>(axum::response::Response::new(axum::body::Body::from(
+                    "tunnel bytes",
+                )))
+            }),
+            timers: Some(Arc::clone(&timers)),
+        };
+        let response = service.call(connect_request()).await.unwrap();
+        assert_eq!(expiry(&timers), None, "the response body is still open");
+        drop(response);
+        assert_eq!(expiry(&timers), Some(Expiry::Idle));
+    }
+
+    #[tokio::test]
+    async fn a_partial_frame_header_starts_the_head_timer() {
+        let mut state = state();
+        state.scan(H2_PREFACE);
+        let headers = frame(H2_FRAME_HEADERS, 0, &[0x82]);
+        state.scan(&headers[..3]);
+        let since = state
+            .header_block_since
+            .expect("timer starts at the first byte");
+        state.scan(&headers[3..]);
+        assert_eq!(
+            state.header_block_since,
+            Some(since),
+            "a HEADERS frame keeps the time of its first byte"
+        );
+
+        let mut state = state_after_preface();
+        let ping = frame(0x6, 0, &[0; 8]);
+        state.scan(&ping[..5]);
+        assert!(state.header_block_since.is_some());
+        state.scan(&ping[5..]);
+        assert!(
+            state.header_block_since.is_none(),
+            "control traffic cancels the timer"
+        );
+    }
+
+    fn state_after_preface() -> PhaseState {
+        let mut state = state();
+        state.scan(H2_PREFACE);
+        state
     }
 
     #[tokio::test]
