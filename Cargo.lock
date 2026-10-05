@@ -590,6 +590,7 @@ dependencies = [
 name = "autumn-cli"
 version = "0.8.0"
 dependencies = [
+ "autumn-edge",
  "autumn-schema-core",
  "autumn-web",
  "base64 0.23.1",
@@ -649,8 +650,11 @@ dependencies = [
  "base64 0.23.1",
  "futures",
  "http 1.5.0",
+ "http-body 1.1.0",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "tokio",
  "tower",
  "wasmi",
  "wat",
@@ -3375,6 +3379,7 @@ dependencies = [
  "autumn-web",
  "axum",
  "http 1.5.0",
+ "reqwest 0.13.4",
  "serde_json",
  "tokio",
  "tower",

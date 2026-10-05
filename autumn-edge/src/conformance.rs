@@ -57,6 +57,17 @@ pub const SECURITY_HEADERS: &[&str] = &[
     "x-xss-protection",
 ];
 
+/// CORS headers a CORS layer can send on every response.
+///
+/// The edge node copies them from the origin when they do not change (see
+/// `node::origin_static_headers`). A policy that answers each request
+/// `Origin` differently cannot be copied.
+pub const CORS_HEADERS: &[&str] = &[
+    "access-control-allow-credentials",
+    "access-control-allow-origin",
+    "access-control-expose-headers",
+];
+
 /// What a conformance case expects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expectation {
@@ -221,17 +232,18 @@ pub fn compare(native: &EdgeResponse, edge: &EdgeResponse) -> Verdict {
 
 /// Compare an origin response with a raw capsule response.
 ///
-/// The same as [`compare`], but [`SECURITY_HEADERS`] are dropped from both
-/// sides first: the host sets them, not the capsule. Every header that is not
-/// volatile must match in both directions.
+/// The same as [`compare`], but [`SECURITY_HEADERS`] and [`CORS_HEADERS`]
+/// are dropped from both sides first: the host sets them, not the capsule.
+/// Every header that is not volatile must match in both directions.
 #[must_use]
 pub fn compare_capsule(origin: &EdgeResponse, capsule: &EdgeResponse) -> Verdict {
+    let host_set = |name: &str| SECURITY_HEADERS.contains(&name) || CORS_HEADERS.contains(&name);
     let without_security = |response: &EdgeResponse| EdgeResponse {
         status: response.status,
         headers: response
             .headers
             .iter()
-            .filter(|(name, _)| !SECURITY_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
+            .filter(|(name, _)| !host_set(name.to_ascii_lowercase().as_str()))
             .cloned()
             .collect(),
         body: response.body.clone(),
@@ -410,6 +422,31 @@ mod tests {
             panic!("a header only the origin sends must diverge");
         };
         assert!(detail.contains("x-other"), "{detail}");
+    }
+
+    #[test]
+    fn the_capsule_comparison_excuses_the_cors_headers_the_host_sets() {
+        let origin = response(
+            &[
+                ("content-type", "text/plain"),
+                ("access-control-allow-origin", "*"),
+            ],
+            "hi",
+        );
+        let capsule = response(&[("content-type", "text/plain")], "hi");
+        assert_eq!(compare_capsule(&origin, &capsule), Verdict::Reproduced);
+    }
+
+    #[test]
+    fn the_cors_set_is_lowercase_sorted_and_disjoint_from_the_others() {
+        let mut sorted = CORS_HEADERS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(CORS_HEADERS, sorted);
+        for name in CORS_HEADERS {
+            assert_eq!(*name, name.to_ascii_lowercase());
+            assert!(!VOLATILE_HEADERS.contains(name), "{name}");
+            assert!(!SECURITY_HEADERS.contains(name), "{name}");
+        }
     }
 
     #[test]

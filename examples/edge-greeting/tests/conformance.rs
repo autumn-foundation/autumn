@@ -1409,3 +1409,159 @@ async fn tier_d_a_generated_corpus_shows_zero_divergence_across_every_lane() {
         "too few requests reached the edge lane to prove byte-identity: {lanes:?}"
     );
 }
+
+// ── Tier E: the edge node over real HTTP (the TTFB success metric) ───
+
+/// The delay the test origin adds to each answer. It stands for the round
+/// trip from a far client to the origin. CI cannot put a client far away.
+const SIMULATED_ORIGIN_RTT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Edge-served paths for the TTFB probe.
+const TTFB_PATHS: &[&str] = &["/greet/ada", "/note/greeting", "/stats?tag=one&tag=two"];
+
+/// Requests per path and side.
+const TTFB_ROUNDS: usize = 20;
+
+/// Serve `service` on `127.0.0.1` with the peer address. Returns the URL.
+async fn listen<S>(service: S) -> String
+where
+    S: tower::Service<
+            http::Request<axum::body::Body>,
+            Response = http::Response<axum::body::Body>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(autumn_edge::node::serve(
+        listener,
+        service,
+        std::future::pending(),
+    ));
+    url
+}
+
+/// The whole origin app over HTTP. Each answer waits
+/// [`SIMULATED_ORIGIN_RTT`] first.
+async fn distant_origin() -> String {
+    let router = origin().into_router();
+    listen(tower::service_fn(move |request| {
+        let router = router.clone();
+        async move {
+            tokio::time::sleep(SIMULATED_ORIGIN_RTT).await;
+            tower::ServiceExt::oneshot(router, request).await
+        }
+    }))
+    .await
+}
+
+/// The CLI's `autumn edge serve`, in process: the real capsule, the `kv`
+/// store, and the security headers read from the origin.
+async fn edge_node(origin: &str) -> String {
+    let headers = autumn_edge::node::origin_static_headers(origin, "/")
+        .await
+        .expect("the origin answers the security header probe");
+    assert!(
+        !headers.is_empty(),
+        "the origin sets security headers; the node must copy them"
+    );
+    let gateway = EdgeGateway::new(
+        Arc::clone(artifact()),
+        autumn_edge::node::HttpOrigin::new(origin).expect("valid origin URL"),
+    )
+    .with_kv(edge_greeting::demo_kv())
+    .with_response_headers(headers);
+    listen(autumn_edge::node::EdgeNode::new(gateway)).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires wasm32-wasip1 target (edge-conformance CI job)"]
+async fn tier_e_the_edge_node_halves_ttfb_with_zero_divergence() {
+    use autumn_edge::node::ttfb::{Probe, measure};
+
+    let origin = distant_origin().await;
+    let edge = edge_node(&origin).await;
+
+    let report = measure(&Probe {
+        edge: edge.clone(),
+        origin: origin.clone(),
+        paths: TTFB_PATHS.iter().map(|path| (*path).to_owned()).collect(),
+        rounds: TTFB_ROUNDS,
+    })
+    .await
+    .expect("both sides answer");
+
+    println!(
+        "\n  Tier E — edge node vs origin over HTTP (origin RTT simulated: {SIMULATED_ORIGIN_RTT:?})\n"
+    );
+    for (side, summary) in [("edge", &report.edge), ("origin", &report.origin)] {
+        println!(
+            "    {side:<8} median {:>10.1?}  p90 {:>10.1?}  ({} requests)",
+            summary.median(),
+            summary.p90(),
+            summary.samples.len()
+        );
+    }
+    println!(
+        "    reduction {:.1}%, divergences {}",
+        report.reduction_percent(),
+        report.divergences.len()
+    );
+
+    assert!(
+        report.divergences.is_empty(),
+        "the edge node and the origin sent different bytes:\n{}",
+        report.divergences.join("\n")
+    );
+    assert!(
+        report.passes(50.0),
+        "the success metric needs a >= 50% lower median TTFB at the edge: edge {:?}, origin {:?}",
+        report.edge.median(),
+        report.origin.median()
+    );
+
+    // A fallthrough over HTTP returns the origin's answer.
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client");
+    for (method, path) in [("POST", "/feedback"), ("GET", "/no/such/route")] {
+        let send = |base: &str| {
+            client
+                .request(method.parse().expect("method"), format!("{base}{path}"))
+                .body("nice")
+                .send()
+        };
+        let (direct, through) = (
+            send(&origin).await.expect("origin answers"),
+            send(&edge).await.expect("node answers"),
+        );
+        let read = |response: reqwest::Response| async move {
+            EdgeResponse {
+                status: response.status().as_u16(),
+                headers: response
+                    .headers()
+                    .iter()
+                    .map(|(n, v)| {
+                        (
+                            n.as_str().to_owned(),
+                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect(),
+                body: response.bytes().await.expect("body").to_vec(),
+            }
+        };
+        let (direct, through) = (read(direct).await, read(through).await);
+        if let Verdict::Diverged { detail } = compare(&direct, &through) {
+            panic!("{method} {path}: the node changed the origin's answer — {detail}");
+        }
+        println!("    {method:<4} {path:<44} origin {}", through.status);
+    }
+}

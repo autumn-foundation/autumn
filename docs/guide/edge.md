@@ -227,8 +227,8 @@ forwards the original request upstream:
 | `missing_capability` | the route needs a seam this host did not provide | serves it, because the origin has the seam |
 | `capsule_error` | a trap (a panic), a malformed frame, an unsupported wire version | its normal error handling — a panicking handler becomes the origin's 500 page, not a broken edge response |
 
-None of these require author-written glue. `EdgeGateway` (below) is a host
-that does the forwarding. A handler can also decline
+None of these require author-written glue. `autumn edge serve` (below) is a
+host that does the forwarding. A handler can also decline
 explicitly by setting the `x-autumn-edge-fallthrough` response header to one of
 those reasons; the runtime converts it and never lets the header — or that
 response's body — reach the wire.
@@ -264,11 +264,19 @@ permissions-policy · referrer-policy · strict-transport-security
 x-content-type-options · x-frame-options · x-xss-protection
 ```
 
+A CORS layer can also set static headers. The host sets them too —
+`conformance::CORS_HEADERS`:
+
+```text
+access-control-allow-credentials · access-control-allow-origin
+access-control-expose-headers
+```
+
 So there are two comparisons:
 
 | Comparison | Excused | Function |
 | --- | --- | --- |
-| raw capsule vs origin | volatile and security headers | `compare_capsule` |
+| raw capsule vs origin | volatile, security and CORS headers | `compare_capsule` |
 | what the client gets from the host vs origin | volatile headers only | `compare` |
 
 Both check headers in both directions. A header only one side sends is a
@@ -454,6 +462,105 @@ deliverable is a portable artifact and a documented protocol, so no Autumn
 release is coupled to a CDN vendor's SDK cadence. `autumn-edge`'s reference host
 is the worked specification a shim implements against.
 
+Autumn ships one reference target that you can run: the edge node.
+
+### The edge node: `autumn edge serve`
+
+The edge node is an HTTP server. It runs the capsule in front of your origin.
+Run it on a host near your users. Keep the origin where it is.
+
+```sh
+autumn build
+autumn edge serve --origin https://origin.example.com --listen 0.0.0.0:8787
+```
+
+```text
+🍂 Edge node on http://0.0.0.0:8787 → origin https://origin.example.com (capsule target/wasm32-wasip1/release/edge-capsule.wasm, 312 KB; kv: off; 6 response header(s))
+GET /greet/ada 200 edge 3.1ms
+POST /feedback 200 origin (method_not_edge_eligible) 151.4ms
+```
+
+The node does these steps for each request:
+
+1. It offers a `GET` or `HEAD` to the capsule.
+2. When the capsule serves it, the node sends those bytes.
+3. When the capsule declines, the node sends the original request to the
+   origin over HTTP. It returns the origin's answer unchanged.
+4. It writes one line: method, path, status, lane, time.
+
+| Option | Default | Use |
+| --- | --- | --- |
+| `--capsule` | `target/wasm32-wasip1/release/edge-capsule.wasm` | the artifact from `autumn build` |
+| `--origin` | (required) | the origin base URL; a path prefixes each forwarded path |
+| `--listen` | `127.0.0.1:8787` | the address to listen on |
+| `--kv` | off | a JSON object of string values; it gives the `kv` capability |
+| `--probe-path` | `/` | the origin path to read the security headers from |
+| `--no-probe` | off | do not read the security headers from the origin |
+| `--response-header` | none | add `name: value` to each edge response; repeat it |
+| `--quiet` | off | no line for each request |
+
+Rules:
+
+- At start, the node reads the origin's static headers: each header in
+  `conformance::SECURITY_HEADERS` and `conformance::CORS_HEADERS`, and the
+  CSP, that two probes send unchanged. It sets them on each edge response.
+  A CSP nonce or a CORS policy per request `Origin` is not copied. If the
+  origin does not answer, the node does not start.
+- It does not follow redirects. It does not use `HTTP_PROXY` or
+  `HTTPS_PROXY`.
+- It removes hop-by-hop headers in both directions.
+- It appends the client address to `x-forwarded-for` and sets
+  `x-forwarded-host`. Configure the origin to trust the node as a proxy.
+- It streams bodies. It runs the capsule on a blocking thread.
+- An origin that does not answer gives a `502`.
+- Without `--kv`, a `needs(kv)` route goes to the origin.
+
+In Rust, the same node is `autumn_edge::node::EdgeNode` (feature `node`).
+
+### Measuring TTFB: `autumn edge ttfb`
+
+The issue's success metric is a 50% lower median time to first byte at the
+edge, for a client far from the origin, with zero divergence. Run the probe
+from such a client:
+
+```sh
+autumn edge ttfb --edge https://edge.example.com --origin https://origin.example.com \
+  --path /greet/ada --path /note/greeting --rounds 100
+```
+
+```text
+TTFB: 200 request(s) per side
+
+             median        p90
+  edge           4.0 ms       5.6 ms
+  origin       153.8 ms     155.0 ms
+
+  reduction  97.4% (minimum 50.0%)
+  divergences 0
+
+✓ pass
+```
+
+The probe sends the same `GET`s to both sides. It alternates which side goes
+first. It compares each pair with `conformance::compare`. One divergence
+fails the run.
+
+Give paths that the edge serves. Two cases diverge by design:
+
+- A `needs(kv)` route, when the node's `--kv` value is not the origin's.
+  Edge KV is a replica, and staleness is expected.
+- A fallthrough answer that echoes request headers (for example a debug
+  error page). The origin sees `x-forwarded-*` from the node.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | zero divergence, and the reduction is at least `--min-reduction` (default 50) |
+| 1 | a pair diverged, or the reduction is too small |
+| 2 | the probe could not run (bad URL, a side does not answer) |
+
+`--divergence-only` checks the bytes and not the reduction. Use it when the
+client is near the origin.
+
 ### The reference gateway
 
 `autumn_edge::gateway::EdgeGateway` (feature `host`) is that specification as
@@ -554,9 +661,27 @@ Tier D sends 10,000 seeded requests through Tiers A to C. The requests include
 unicode and invalid percent-encoding, repeated query keys, `HEAD`, writes,
 credentials, and `kv` on and off. No request may diverge.
 
+```text
+  Tier E — edge node vs origin over HTTP (origin RTT simulated: 150ms)
+
+    edge     median      3.9ms  p90      5.5ms  (60 requests)
+    origin   median    153.7ms  p90    154.4ms  (60 requests)
+    reduction 97.5%, divergences 0
+    POST /feedback                                    origin 200
+    GET  /no/such/route                               origin 404
+```
+
+Tier E runs the edge node over real HTTP. The origin is the full app, and it
+waits 150 ms before each answer. That delay is the round trip from a far
+client. CI cannot put a client far from the origin, so it simulates the
+distance. The probe must show a 50% lower median TTFB and zero divergence.
+A fallthrough over HTTP must return the origin's answer. The real metric
+needs `autumn edge ttfb` from a real distant client.
+
 CI runs it on every push in the `edge-conformance` job. The same job runs the
 real `autumn build --debug --edge` on the example and checks that the `.wasm`
-exists. It is not path-filtered:
+exists. Then it starts the origin and `autumn edge serve`, and runs
+`autumn edge ttfb --divergence-only` against them. It is not path-filtered:
 byte-identity is a property of the whole framework, and a change to the router,
 a middleware, a macro or a dependency is exactly what could break it.
 
@@ -567,11 +692,13 @@ a middleware, a macro or a dependency is exactly what could break it.
 - **No compression, no i18n locale prefix, no sessions** in the edge lane. The
   origin's middleware stack does not run there — the capsule serves exactly what
   the handler produced.
-- **No vendor shim ships with Autumn.** Artifact, protocol and a reference
-  gateway; see above.
-- **Response time at a real CDN is not measured in CI.** The
-  time-to-first-byte target in issue #1790 needs a deployed shim and a remote
-  client.
+- **No vendor shim ships with Autumn.** Artifact, protocol, a reference
+  gateway and a reference edge node; see above.
+- **CI simulates the distance.** Tier E proves the speed-up against a
+  simulated origin round trip. For your deployment, run `autumn edge ttfb`
+  from a distant client.
+- **One capsule per node.** The node does not reload the capsule. Restart it
+  after `autumn build`.
 - **`paths::*` helpers are unavailable inside a capsule.**
 - **`autumn build --embed` refuses to combine with edge routes.**
 - **The wire protocol and the host API are experimental.** They will change; the

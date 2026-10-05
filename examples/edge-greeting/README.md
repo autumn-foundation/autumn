@@ -21,6 +21,7 @@ narrative is `docs/guide/edge.md`, the design record is
 | Origin-only code | `src/origin.rs` | A `POST` route the edge declines and the origin answers, with no glue |
 | Conformance | `tests/conformance.rs` | Runs one request corpus through the native lane, a real wasm artifact, the full origin app, and a gateway |
 | `EdgeGateway` | `tests/conformance.rs` | The capsule in front of the origin: a declined request goes to the origin unchanged |
+| `autumn edge serve` / `EdgeNode` | `tests/conformance.rs` | The edge node over real HTTP; Tier E measures TTFB |
 
 The module split is the whole trick:
 
@@ -84,10 +85,9 @@ autumn build --edge     # force the edge step in a debug build
 🍂 Edge capsule: 5 route(s) (greet, note, stats, count, boom) → target/wasm32-wasip1/release/edge-capsule.wasm (553 KB)
 ```
 
-(This app registers no `#[static_get]` routes, so the static-render step that
-runs *after* the edge step reports "No static routes registered" and `autumn
-build` exits non-zero — the same thing it does for any app without pre-rendered
-pages. The capsule above is already written by then.)
+This app registers no `#[static_get]` routes. The static-render step reports
+"No static routes registered", and `autumn build` exits 0: the capsule is the
+build's output.
 
 The equivalent by hand, which is exactly what the CLI runs:
 
@@ -99,6 +99,38 @@ ls -la target/wasm32-wasip1/release/edge-capsule.wasm
 The artifact is **never** copied into `dist/` or `static/`. It is not an asset a
 browser fetches; it is a program the CDN runs.
 
+## Running the edge node
+
+Start the origin, then the edge node in front of it. From this directory:
+
+```bash
+cargo run -p edge-greeting &                     # the origin, on :3000
+autumn edge serve \
+  --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+  --origin http://127.0.0.1:3000                 # the edge node, on :8787
+
+curl http://127.0.0.1:8787/greet/ada             # served by the capsule
+curl -X POST http://127.0.0.1:8787/feedback -d x # sent to the origin
+```
+
+The node writes one line for each request, with the lane:
+
+```text
+GET /greet/ada 200 edge 3.1ms
+POST /feedback 200 origin (method_not_edge_eligible) 4.1ms
+```
+
+Compare the bytes of both sides:
+
+```bash
+autumn edge ttfb --divergence-only --edge http://127.0.0.1:8787 \
+  --origin http://127.0.0.1:3000 --path /greet/ada --path '/stats?tag=a'
+```
+
+On one machine there is no distance, so the edge is not faster. Run
+`autumn edge ttfb` without `--divergence-only` from a client far from the
+origin to measure the speed-up.
+
 ## Running the conformance suite
 
 This is the interesting part. Every test builds a real capsule from these
@@ -107,10 +139,11 @@ app over a shared request corpus — percent-encoding, `%2F` inside a segment,
 trailing slashes, repeated query keys, float and integer rendering, a stripped
 credential, and each of the four ways the edge can decline.
 
-Two more tiers follow. The gateway tier puts the capsule in front of the
+Three more tiers follow. The gateway tier puts the capsule in front of the
 origin and checks that the client gets the origin's bytes from either lane.
 The generated tier sends 10,000 seeded requests through every lane and
-requires zero divergence.
+requires zero divergence. The edge node tier runs the node over real HTTP
+against an origin that waits 150 ms, and requires a 50% lower median TTFB.
 
 ```bash
 cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture

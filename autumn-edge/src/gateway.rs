@@ -142,10 +142,11 @@ where
         headers: impl IntoIterator<Item = (HeaderName, HeaderValue)>,
     ) -> Self {
         for (name, value) in headers {
+            let checked = check_response_header(&name);
             assert!(
-                !is_unsafe_response_header(&name) && name != http::header::CONTENT_LENGTH,
-                "with_response_headers cannot set `{name}`: it changes framing, session or \
-                 hop state, which the gateway checks on the capsule's response"
+                checked.is_ok(),
+                "with_response_headers: {}",
+                checked.err().unwrap_or_default()
             );
             self.response_headers.push((name, value));
         }
@@ -159,7 +160,7 @@ where
     pub fn handle(
         &self,
         request: Request<Body>,
-    ) -> impl Future<Output = Response<Body>> + Send + 'static {
+    ) -> impl Future<Output = Response<Body>> + Send + 'static + use<O> {
         let lane = if is_edge_method(request.method().as_str()) {
             edge_request(&request).map_or(Err(Lane::OriginOnly), |edge| {
                 self.ask_capsule(&edge).map_err(Lane::Fallthrough)
@@ -261,7 +262,7 @@ fn edge_request<B>(request: &Request<B>) -> Option<EdgeRequest> {
 /// Headers that describe one connection or hop, not the response (RFC 9110
 /// sections 7.6.1 and 11.7, plus the legacy `keep-alive` and
 /// `proxy-connection`). A capsule must not set them.
-const HOP_BY_HOP: &[&str] = &[
+pub(crate) const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -280,6 +281,23 @@ fn is_unsafe_response_header(name: &HeaderName) -> bool {
     *name == http::header::SET_COOKIE
         || name.as_str() == FALLTHROUGH_SENTINEL
         || HOP_BY_HOP.contains(&name.as_str())
+}
+
+/// Whether [`EdgeGateway::with_response_headers`] accepts `name`. `Err`
+/// names the header and the reason.
+///
+/// # Errors
+///
+/// On `content-length`, `set-cookie`, the fallthrough sentinel, or a
+/// hop-by-hop header.
+pub fn check_response_header(name: &HeaderName) -> Result<(), String> {
+    if is_unsafe_response_header(name) || name == http::header::CONTENT_LENGTH {
+        return Err(format!(
+            "cannot set `{name}`: it changes framing, session or hop state, which the \
+             gateway checks on the capsule's response"
+        ));
+    }
+    Ok(())
 }
 
 /// Statuses that have no body in HTTP.

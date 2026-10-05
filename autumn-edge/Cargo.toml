@@ -40,6 +40,13 @@ tower = { workspace = true, features = ["util"] }
 # verified: wasmi 0.40 declares `rust-version = "1.86"`, below this workspace's
 # 1.88 floor. Licensed MIT OR Apache-2.0, matching the workspace policy.
 wasmi = { version = "0.40", optional = true }
+# The edge node (feature `node`, native only). The HTTP server and the origin
+# client. Same reqwest line as `autumn-cli`. `http-body` (already in the graph
+# through axum) lets the node send a request body to the origin without a
+# buffer.
+http-body = { version = "1", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
@@ -55,6 +62,10 @@ default = []
 # Native-only reference host. NEVER enable this for a `wasm32-*` target: it is
 # the harness that *runs* capsules, not part of a capsule.
 host = ["dep:wasmi"]
+# Native-only edge node: an HTTP server that runs a capsule and sends each
+# fallthrough to a remote origin. `autumn edge serve` uses it. NEVER enable
+# this for a `wasm32-*` target.
+node = ["host", "dep:http-body", "dep:tokio", "dep:reqwest", "axum/tokio", "axum/http1"]
 
 [package.metadata.docs.rs]
 all-features = true
