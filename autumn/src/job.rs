@@ -5666,7 +5666,8 @@ async fn execute_local_job(
     // high. It has not started, so it holds no slot and uses no attempt, and
     // its queued gauge does not change. One task waits for it and puts it back
     // on the queue when the signal falls. A canceled job goes back at once, so
-    // the cancel branch below settles it. A canceled job does not wait.
+    // the cancel branch below settles it. A canceled job does not wait. The
+    // task stops when the runtime shuts down.
     if !job_admin.is_canceled(&job.id)
         && let Some(signal) =
             crate::cost::deferral_signal(state, crate::cost::WorkKind::Job, &job.name)
@@ -5677,7 +5678,12 @@ async fn execute_local_job(
         let job_admin = job_admin.clone();
         tokio::spawn(async move {
             while signal.is_high() && !job_admin.is_canceled(&job.id) {
-                tokio::time::sleep(signal.recheck()).await;
+                tokio::select! {
+                    // The runtime stopped: its queue is gone, as for any
+                    // queued local job.
+                    () = sender.closed() => return,
+                    () = tokio::time::sleep(signal.recheck()) => {}
+                }
             }
             tracing::info!(job = %job.name, "job goes back on the queue");
             let _ = sender.send(job).await;

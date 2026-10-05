@@ -257,16 +257,14 @@ pub fn snapshot() -> Option<LogFields> {
     current().map(|ctx| ctx.snapshot())
 }
 
-/// Call `f` with the tenant id of the current request context, if any.
-///
-/// Cheaper than [`snapshot`]: it copies nothing.
-pub(crate) fn with_tenant_id<R>(f: impl Fn(Option<&str>) -> R) -> R {
-    CURRENT
-        .try_with(|ctx| {
-            let guard = ctx.inner.read().ok();
-            f(guard.as_ref().and_then(|g| g.tenant_id.as_deref()))
-        })
-        .unwrap_or_else(|_| f(None))
+impl LogContext {
+    /// Call `f` with the tenant id of this context, if any.
+    ///
+    /// Cheaper than [`LogContext::snapshot`]: it copies nothing.
+    pub(crate) fn with_tenant_id<R>(&self, f: impl FnOnce(Option<&str>) -> R) -> R {
+        let guard = self.inner.read().ok();
+        f(guard.as_ref().and_then(|g| g.tenant_id.as_deref()))
+    }
 }
 
 /// Attach a custom field to the current request context.

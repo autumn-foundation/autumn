@@ -99,6 +99,9 @@ where
         CostFuture {
             inner,
             cell,
+            // Hold the request's log context: tenancy writes the tenant into
+            // it, and a dropped request is recorded outside its scope.
+            log: crate::log::context::current(),
             probe: self.accountant.allocation_probe().cloned(),
             cpu,
             allocated: 0,
@@ -139,6 +142,7 @@ pin_project! {
         #[pin]
         inner: crate::cost::ScopedRequest<F>,
         cell: Arc<RequestCostCell>,
+        log: Option<crate::log::context::LogContext>,
         probe: Option<Arc<dyn AllocationProbe>>,
         cpu: std::time::Duration,
         allocated: u64,
@@ -153,22 +157,27 @@ pin_project! {
             let this = this.project();
             // A request dropped before it completed still used CPU.
             if !*this.recorded {
-                record(this.accountant, *this.cpu, *this.allocated, this.cell);
+                record(this.accountant, this.log.as_ref(), *this.cpu, *this.allocated, this.cell);
             }
         }
     }
 }
 
-/// Add one request to `accountant`, with the tenant of the log context.
+/// Add one request to `accountant`, with the tenant of its log context.
 fn record(
     accountant: &CostAccountant,
+    log: Option<&crate::log::context::LogContext>,
     cpu: std::time::Duration,
     allocated: u64,
     cell: &RequestCostCell,
 ) {
-    crate::log::context::with_tenant_id(|tenant| {
+    let record = |tenant: Option<&str>| {
         accountant.record_parts(cpu, allocated, cell.db_queries(), tenant);
-    });
+    };
+    match log {
+        Some(log) => log.with_tenant_id(record),
+        None => record(None),
+    }
 }
 
 impl<F, ResBody, E> Future for CostFuture<F>
@@ -187,7 +196,13 @@ where
         match out {
             Poll::Ready(Ok(mut response)) => {
                 *this.recorded = true;
-                record(this.accountant, *this.cpu, *this.allocated, this.cell);
+                record(
+                    this.accountant,
+                    this.log.as_ref(),
+                    *this.cpu,
+                    *this.allocated,
+                    this.cell,
+                );
                 if *this.emit_header {
                     let cost = RequestCost::new(*this.cpu, *this.allocated, this.cell.db_queries());
                     let value = build_header_value(&cost, this.probe.is_some());
@@ -199,7 +214,13 @@ where
             }
             Poll::Ready(Err(error)) => {
                 *this.recorded = true;
-                record(this.accountant, *this.cpu, *this.allocated, this.cell);
+                record(
+                    this.accountant,
+                    this.log.as_ref(),
+                    *this.cpu,
+                    *this.allocated,
+                    this.cell,
+                );
                 Poll::Ready(Err(error))
             }
             Poll::Pending => Poll::Pending,
@@ -317,6 +338,40 @@ mod tests {
         ));
         service.oneshot(Request::new(())).await.expect("infallible");
         assert_eq!(accountant.snapshot().total.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_keeps_its_tenant() {
+        use crate::log::context::{LogContext, scoped};
+
+        let accountant = CostAccountant::new(4);
+        let mut service = CostLayer::new(accountant.clone(), false).layer(tower::service_fn(
+            |_req: Request<()>| async {
+                // Tenancy writes the tenant, then the handler never ends.
+                if let Some(ctx) = crate::log::context::current() {
+                    ctx.set_tenant_id("acme");
+                }
+                std::future::pending::<()>().await;
+                Ok::<_, std::convert::Infallible>(Response::new(()))
+            },
+        ));
+        let ctx = LogContext::new(None);
+        let mut future = Box::pin(scoped(ctx, async move {
+            // Poll the request one time inside the scope, then hand it out.
+            let mut request = Box::pin(service.call(Request::new(())));
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            request
+        }));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let Poll::Ready(request) = future.as_mut().poll(&mut cx) else {
+            panic!("the scope body completes in one poll");
+        };
+        // Drop the request outside the log-context scope.
+        drop(request);
+        assert_eq!(accountant.tenant("acme").map(|t| t.requests), Some(1));
     }
 
     #[tokio::test]
