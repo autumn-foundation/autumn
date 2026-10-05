@@ -2237,10 +2237,10 @@ impl Analyzer {
             Expr::Path(_) => path_ident(init)
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
-            // `if flag { &mut left } else { &mut right }`: every tail.
-            Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
-                let mut all: Vec<String> = branch_tails(init)
-                    .unwrap_or_default()
+            // `if flag { &mut left } else { &mut right }`: every tail, and
+            // every `break` value of a loop or labeled block.
+            Expr::If(_) | Expr::Match(_) | Expr::Block(_) | Expr::Loop(_) => {
+                let mut all: Vec<String> = value_tails(init)
                     .into_iter()
                     .flat_map(|tail| self.referents_of(tail))
                     .collect();
@@ -5351,7 +5351,12 @@ fn patterns_disjoint(a: &Pat, b: &Pat) -> bool {
         (Pat::Lit(x), Pat::Lit(y)) => {
             matches!((literal_value(&x.lit), literal_value(&y.lit)), (Some(x), Some(y)) if x != y)
         }
-        _ => matches!((pattern_variant(a), pattern_variant(b)), (Some(x), Some(y)) if x != y),
+        // Two owner paths may name one re-exported enum, so only variants
+        // of one written owner are disjoint.
+        _ => matches!(
+            (pattern_variant(a), pattern_variant(b)),
+            (Some((owner_a, a)), Some((owner_b, b))) if owner_a == owner_b && a != b
+        ),
     }
 }
 
@@ -5471,6 +5476,73 @@ fn constructor_type(e: &Expr) -> Option<Type> {
         }
         _ => None,
     }
+}
+
+/// The values an `if`, `match`, block or loop can give: [`branch_tails`],
+/// and every `break` value that leaves a loop or a labeled block.
+fn value_tails(e: &Expr) -> Vec<&Expr> {
+    match peel_parens(e) {
+        Expr::Loop(l) => break_values(&l.body, l.label.as_ref(), true),
+        Expr::Block(b) => {
+            let mut tails: Vec<&Expr> = block_tail(&b.block).into_iter().collect();
+            if b.label.is_some() {
+                tails.extend(break_values(&b.block, b.label.as_ref(), false));
+            }
+            tails
+        }
+        other => branch_tails(other).unwrap_or_default(),
+    }
+}
+
+/// The values of the `break`s in `body` that leave its loop (`unlabeled`)
+/// or the frame with `label`. A `break` in a closure or `async` block
+/// cannot leave it.
+fn break_values<'a>(body: &'a Block, label: Option<&syn::Label>, unlabeled: bool) -> Vec<&'a Expr> {
+    struct Breaks<'a> {
+        label: Option<String>,
+        unlabeled: bool,
+        nested: usize,
+        found: Vec<&'a Expr>,
+    }
+    impl Breaks<'_> {
+        fn nested_loop(&mut self, f: impl FnOnce(&mut Self)) {
+            self.nested += 1;
+            f(self);
+            self.nested -= 1;
+        }
+    }
+    impl<'a> Visit<'a> for Breaks<'a> {
+        fn visit_expr_break(&mut self, b: &'a syn::ExprBreak) {
+            let hits = match &b.label {
+                Some(l) => self.label.as_deref() == Some(l.ident.to_string().as_str()),
+                None => self.unlabeled && self.nested == 0,
+            };
+            if hits && let Some(value) = &b.expr {
+                self.found.push(value);
+            }
+            syn::visit::visit_expr_break(self, b);
+        }
+        fn visit_expr_loop(&mut self, l: &'a syn::ExprLoop) {
+            self.nested_loop(|s| syn::visit::visit_expr_loop(s, l));
+        }
+        fn visit_expr_while(&mut self, w: &'a syn::ExprWhile) {
+            self.nested_loop(|s| syn::visit::visit_expr_while(s, w));
+        }
+        fn visit_expr_for_loop(&mut self, f: &'a syn::ExprForLoop) {
+            self.nested_loop(|s| syn::visit::visit_expr_for_loop(s, f));
+        }
+        fn visit_expr_closure(&mut self, _: &'a syn::ExprClosure) {}
+        fn visit_expr_async(&mut self, _: &'a syn::ExprAsync) {}
+        fn visit_item(&mut self, _: &'a syn::Item) {}
+    }
+    let mut breaks = Breaks {
+        label: label.map(|l| l.name.ident.to_string()),
+        unlabeled,
+        nested: 0,
+        found: Vec::new(),
+    };
+    breaks.visit_block(body);
+    breaks.found
 }
 
 /// The values an `if`, `match` or block can give: each branch tail. `None`
@@ -10981,6 +11053,41 @@ mod tests {
                 "a for iterable that returns skips the body",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  for _ in { return repo.a().await; } { repo.b().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn loop_break_aliases_and_qualified_variants() {
+        check_handlers(&[
+            (
+                "guard: an alias a loop breaks with aliases its place",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); \
+                 { let target: &mut Vec<PgPostRepository> = loop { break &mut left; }; target.push(repo); } \
+                 let _ = left[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an alias a labeled block breaks with aliases its place",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut left = Vec::new(); let mut right = Vec::new(); \
+                 { let target: &mut Vec<PgPostRepository> = 'pick: { if flag { break 'pick &mut left; } &mut right }; \
+                 target.push(repo); } \
+                 let _ = left[0].find_all().await?; let _ = right; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: differently qualified variants may be the same",
+                "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
+                 let _ = match x { a::E::V(_) if repo.a().await? => plain(), b::E::V(_) => repo.b().await?, _ => plain() }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "variants of one owner are disjoint",
+                "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
+                 let _ = match x { E::V(_) if repo.a().await? => plain(), E::W(_) => repo.b().await?, _ => plain() }; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
