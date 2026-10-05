@@ -2746,7 +2746,7 @@ previous_secrets = []
             "the cutover must select the Redis backend and wire its URL: {script}"
         );
         assert!(
-            script.contains(r#"any($secrets[]; .name == "redis-url")"#),
+            script.contains(r#"any($job_secrets[]; .name == "redis-url")"#),
             "the cutover must set the Redis env vars only when the job has redis-url: {script}"
         );
         assert!(
@@ -2982,10 +2982,10 @@ previous_secrets = []
         // The cutover attaches these outside Terraform. A later
         // `terraform apply` must not strip them from the live app.
         let lifecycle = app
-            .split("ignore_changes = [")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    ]").next())
-            .expect("the app must declare lifecycle.ignore_changes");
+            .split_once("ignore_changes = [")
+            .and_then(|(_, rest)| rest.split_once("\n    ]"))
+            .expect("the app must declare lifecycle.ignore_changes")
+            .0;
         for ignored in [
             "identity",
             "registry",
@@ -3009,10 +3009,10 @@ previous_secrets = []
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join("main.tf")).unwrap();
         let job = content
-            .split("resource \"azurerm_container_app_job\" \"migrate\"")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("main.tf must declare the migration job");
+            .split_once("resource \"azurerm_container_app_job\" \"migrate\"")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .expect("main.tf must declare the migration job")
+            .0;
         for secret in [
             "azurerm_key_vault_secret.database_url.versionless_id",
             "azurerm_key_vault_secret.signing_secret.versionless_id",
@@ -3066,14 +3066,14 @@ previous_secrets = []
         }
         assert_eq!(
             script.matches("az rest --method patch").count(),
-            2,
-            "one PATCH for the cutover and one for the rollback: {script}"
+            1,
+            "every write must go through patch_app(): {script}"
         );
         let patch = script
-            .split("PATCH=$(")
-            .nth(1)
-            .and_then(|rest| rest.split("\n')").next())
-            .expect("the script must build the cutover PATCH body");
+            .split_once("PATCH=$(")
+            .and_then(|(_, rest)| rest.split_once("\n  ')"))
+            .expect("the script must build the cutover PATCH body")
+            .0;
         for field in [
             "userAssignedIdentities",
             "registries:",
@@ -3102,15 +3102,18 @@ previous_secrets = []
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
         let patch_at = script
-            .find("az rest --method patch --url \"$APP_ID?$API\" --body \"$PATCH\"")
+            .find("patch_app \"$PATCH\"")
             .expect("the script must send the cutover PATCH");
         let provisioned_at = script
             .find("Provisioned)")
             .expect("the script must wait for the new revision");
+        let ready_at = script
+            .find("[ -n \"$READY\" ] || fail")
+            .expect("a timeout must fail the cutover");
         let enable_at = script
             .find("az containerapp ingress enable")
             .expect("the script must open external ingress");
-        assert!(patch_at < provisioned_at && provisioned_at < enable_at);
+        assert!(patch_at < provisioned_at && provisioned_at < ready_at && ready_at < enable_at);
         assert!(script.contains("--type external"));
         assert!(
             script.contains("\"$REVISION_IMAGE\" = \"$IMAGE\""),
@@ -3127,15 +3130,15 @@ previous_secrets = []
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
         let rollback = script
-            .split("rollback() {")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("the script must define rollback()");
+            .split_once("rollback() {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .expect("the script must define rollback()")
+            .0;
         for field in [
             "type: \"None\"",
             "registries: []",
             "secrets: []",
-            "az rest --method patch",
+            "patch_app",
         ] {
             assert!(
                 rollback.contains(field),
@@ -3145,6 +3148,10 @@ previous_secrets = []
         assert!(
             rollback.contains("\"$ACR_LOGIN_SERVER\"/*) return"),
             "rollback must skip a later deploy, whose old revision is a real release: {rollback}"
+        );
+        assert!(
+            script.contains("fail() {\n  echo \"::error::$1\" >&2\n  rollback\n  exit 1\n}"),
+            "fail() must roll back, then exit non-zero: {script}"
         );
     }
 
@@ -3159,7 +3166,7 @@ tsv() { case "$query" in "[["*) local IFS=$'\t'; echo "$*" ;; *) printf '%s\n' "
 prev=""; query=""; body=""
 for arg in "$@"; do
   [ "$prev" = "--query" ] && query="$arg"
-  [ "$prev" = "--body" ] && body="$arg"
+  [ "$prev" = "--body" ] && body="$(cat "${arg#@}")"
   prev="$arg"
 done
 case "$1 $2" in
@@ -3177,6 +3184,7 @@ case "$1 $2" in
     fi
     ;;
   "containerapp revision") tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
+  "containerapp secret") echo '[{"name":"api-key","value":"user-value"}]' ;;
   "rest --method") echo "$body" >> "$STUB_LOG.bodies" ;;
   "containerapp ingress") ;;
   *) echo "unexpected az call: $*" >&2; exit 2 ;;
@@ -3268,6 +3276,7 @@ esac
             "\"acr.azurecr.io/app:t1\"",
             "\"AUTUMN_PROFILE\"",
             "\"AUTUMN_CACHE__BACKEND\"",
+            "\"api-key\"",
         ] {
             assert!(
                 bodies.contains(field),
@@ -3340,6 +3349,18 @@ esac
             .split("\n      - name:")
             .next()
             .unwrap_or(cutover_step);
+        for split in [
+            "az containerapp identity assign",
+            "az containerapp registry set",
+            "az containerapp secret set",
+            "az containerapp update \\",
+            "az containerapp ingress enable",
+        ] {
+            assert!(
+                !workflow.contains(split),
+                "only azure-cutover.sh may write the app: {split}"
+            );
+        }
         for var in [
             "AZURE_APP_NAME:",
             "AZURE_RESOURCE_GROUP:",

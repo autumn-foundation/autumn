@@ -14,9 +14,9 @@
 # (#2312) only when that revision runs the real image. If the FIRST cutover
 # fails, the script removes the credentials from the app again.
 #
-# azure-deploy.yml runs this script after migrations. To run it by hand, set
-# these variables (all from `terraform output`, except IMAGE_TAG) and run
-# `bash azure-cutover.sh`:
+# azure-deploy.yml runs this script after migrations. To run it manually, set
+# these variables. All except IMAGE_TAG come from `terraform output`. Then run
+# `bash azure-cutover.sh`.
 #
 #   AZURE_APP_NAME, AZURE_RESOURCE_GROUP, AZURE_MIGRATE_JOB_NAME,
 #   ACR_LOGIN_SERVER, IMAGE_TAG (the tag you pushed to ACR)
@@ -33,6 +33,8 @@ set -euo pipefail
 
 IMAGE="$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG"
 API="api-version=2024-03-01"
+BODY=$(mktemp)
+trap 'rm -f "$BODY"' EXIT
 
 JOB=$(az containerapp job show \
   --name "$AZURE_MIGRATE_JOB_NAME" \
@@ -42,47 +44,44 @@ APP=$(az containerapp show \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
   --output json)
+# GET omits secret values. Send the app's own secrets back with their values,
+# because the PATCH replaces the whole secrets array.
+APP_SECRETS=$(az containerapp secret list \
+  --name "$AZURE_APP_NAME" \
+  --resource-group "$AZURE_RESOURCE_GROUP" \
+  --show-values \
+  --output json)
 APP_ID=$(jq -r '.id' <<< "$APP")
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 OLD_IMAGE=$(jq -r '.properties.template.containers[0].image' <<< "$APP")
 
-# The PATCH body. Arrays (registries, secrets, containers) replace the app's
-# arrays. The secret refs come from the job. The env keeps every variable
-# that this script does not own, and sets the owned ones again.
-PATCH=$(jq -n --argjson job "$JOB" --argjson app "$APP" \
-  --arg acr "$ACR_LOGIN_SERVER" --arg image "$IMAGE" '
-  ($job.properties.configuration.registries[0].identity // "") as $id
-  | ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $secrets
-  | if $id == "" or ($secrets | length) == 0
-    then error("the migration job has no identity or secrets to copy")
-    else . end
-  | ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
-      {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
-     + if any($secrets[]; .name == "redis-url")
-       then [{name: "AUTUMN_CACHE__BACKEND", value: "redis"},
-             {name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}]
-       else [] end) as $env
-  | {identity: {type: "UserAssigned", userAssignedIdentities: {($id): {}}},
-     properties: {
-       configuration: {registries: [{server: $acr, identity: $id}], secrets: $secrets},
-       template: {containers: [$app.properties.template.containers[0]
-         | .image = $image
-         | .env = ([(.env // [])[] | select(.name | IN(
-             "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
-             "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)] + $env)]}}}
-')
+# A PATCH body goes in a file, not on the command line: it can hold secret
+# values. `--body @file` reads it.
+patch_app() {
+  printf '%s' "$1" > "$BODY"
+  az rest --method patch --url "$APP_ID?$API" --body "@$BODY" --output none
+}
 
-# Only the first cutover has the placeholder as the old revision. A later
-# deploy keeps its old revision, which is a real release.
+# Only the first cutover rolls back. On a later deploy, the old image is a
+# real release, so the script keeps the credentials.
 rollback() {
   case "$OLD_IMAGE" in "$ACR_LOGIN_SERVER"/*) return ;; esac
   echo "::warning::removing the credentials from the placeholder app" >&2
-  local body
-  body=$(jq -c '{identity: {type: "None", userAssignedIdentities: null},
-    properties: {configuration: {registries: [], secrets: []},
-      template: {containers: .properties.template.containers}}}' <<< "$APP")
-  az rest --method patch --url "$APP_ID?$API" --body "$body" --output none \
-    || echo "::error::rollback failed: remove the identity and secrets from $AZURE_APP_NAME by hand" >&2
+  if patch_app "$(jq -c '{identity: {type: "None", userAssignedIdentities: null},
+      properties: {configuration: {registries: [], secrets: []},
+        template: {containers: .properties.template.containers}}}' <<< "$APP")"; then
+    for _ in $(seq 1 30); do
+      sleep 10
+      STATE=$(az containerapp show --name "$AZURE_APP_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --query properties.provisioningState --output tsv) || break
+      case "$STATE" in
+        Succeeded) return ;;
+        Failed|Canceled) break ;;
+      esac
+    done
+  fi
+  echo "::error::rollback failed: remove the identity and secrets from $AZURE_APP_NAME manually" >&2
 }
 
 fail() {
@@ -91,20 +90,63 @@ fail() {
   exit 1
 }
 
-az rest --method patch --url "$APP_ID?$API" --body "$PATCH" --output none \
-  || fail "the cutover PATCH failed"
+if [ "$OLD_IMAGE" = "$IMAGE" ]; then
+  # A re-run with the same tag. The template does not change, so Azure makes
+  # no new revision. Check the current revision instead.
+  OLD_REVISION=""
+else
+  # The env keeps the variables that this script does not set. The script
+  # replaces the four variables that it sets. The secrets, registries and
+  # identities that you add to the app stay.
+  PATCH=$(jq -n --argjson job "$JOB" --argjson app "$APP" --argjson app_secrets "$APP_SECRETS" \
+    --arg acr "$ACR_LOGIN_SERVER" --arg image "$IMAGE" '
+    ($job.properties.configuration.registries[0].identity // "") as $id
+    | ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
+    | if $id == "" or ($job_secrets | length) == 0
+      then error("the migration job has no identity or secrets to copy")
+      else . end
+    | ($app_secrets
+       | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not)
+             | if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end)
+       + $job_secrets) as $secrets
+    | ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
+        {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
+       + if any($job_secrets[]; .name == "redis-url")
+         then [{name: "AUTUMN_CACHE__BACKEND", value: "redis"},
+               {name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}]
+         else [] end) as $env
+    | {identity: {
+         type: (if ($app.identity.type // "None" | test("SystemAssigned"))
+                then "SystemAssigned,UserAssigned" else "UserAssigned" end),
+         userAssignedIdentities: {($id): {}}},
+       properties: {
+         configuration: {
+           registries: ([($app.properties.configuration.registries // [])[]
+                         | select(.server != $acr)] + [{server: $acr, identity: $id}]),
+           secrets: $secrets},
+         template: {containers: [$app.properties.template.containers[0]
+           | .image = $image
+           | .env = ([(.env // [])[] | select(.name | IN(
+               "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
+               "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)] + $env)]}}}
+  ')
+  patch_app "$PATCH" || fail "the cutover PATCH failed"
+fi
 
-# Wait for the new revision. 60 x 10s.
+# Wait for the new revision. The script checks 60 times, 10 seconds apart.
 READY=""
 for _ in $(seq 1 60); do
   sleep 10
+  # The nested list makes `--output tsv` print one tab-separated row.
   STATUS=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
-    --query "[properties.provisioningState, properties.latestRevisionName]" \
+    --query "[[properties.provisioningState, properties.latestRevisionName]]" \
     --output tsv) || fail "cannot read the app state"
   read -r STATE REVISION <<< "$STATUS"
-  if [ "$STATE" = "Failed" ]; then fail "the app update failed"; fi
+  case "$STATE" in
+    Failed|Canceled) fail "the app update ended as $STATE" ;;
+  esac
   if [ "$STATE" != "Succeeded" ] || [ -z "$REVISION" ] || [ "$REVISION" = "$OLD_REVISION" ]; then
     continue
   fi
@@ -112,7 +154,7 @@ for _ in $(seq 1 60); do
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --revision "$REVISION" \
-    --query "[properties.provisioningState, properties.template.containers[0].image]" \
+    --query "[[properties.provisioningState, properties.template.containers[0].image]]" \
     --output tsv) || fail "cannot read revision $REVISION"
   read -r REVISION_STATE REVISION_IMAGE <<< "$REVISION_STATUS"
   case "$REVISION_STATE" in
@@ -126,8 +168,8 @@ for _ in $(seq 1 60); do
 done
 [ -n "$READY" ] || fail "the new revision was not provisioned in time"
 
-# Open external ingress now. The real image serves. A later run does not
-# change this setting.
+# The new revision runs the real image. Open external ingress now. On a
+# later run, this command changes nothing.
 az containerapp ingress enable \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
