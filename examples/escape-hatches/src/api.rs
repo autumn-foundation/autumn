@@ -180,13 +180,15 @@ async fn replay(
     conn: &mut autumn_web::RuntimeConnection,
     requested: Receipt,
 ) -> AutumnResult<(StatusCode, Receipt)> {
-    let stored: Vec<(String, i32)> = order_lines::table
+    let mut stored: Vec<(String, i32)> = order_lines::table
         .inner_join(orders::table)
         .filter(orders::order_ref.eq(&requested.order_ref))
-        .order(order_lines::sku.asc())
         .select((order_lines::sku, order_lines::quantity))
         .load(conn)
         .await?;
+    // Sort in Rust (byte order), as the cart is. The database collation can
+    // put SKUs in another order.
+    stored.sort();
     let same = stored.len() == requested.lines.len()
         && stored
             .iter()

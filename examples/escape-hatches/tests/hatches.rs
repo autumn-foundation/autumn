@@ -1209,3 +1209,28 @@ async fn password_file_covers_the_replica_and_migrations() {
     assert!(replica.get().await.is_ok(), "the replica reads the file");
     assert_eq!(topology.migration_url(), Some(db.url()));
 }
+
+/// H1: a replay compares lines in byte order. Mixed-case SKUs sort one way
+/// in bytes and another way in a locale collation.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn checkout_replay_ignores_the_database_collation() {
+    let (db, _tables) = fresh_db().await;
+    seed(
+        db,
+        &[
+            product("a-1", "tools", 5, 100),
+            product("B-1", "tools", 5, 100),
+        ],
+    )
+    .await;
+    let client = db_client(db);
+    let body = cart("o-1", &[("a-1", 1), ("B-1", 1)]);
+
+    post_api(&client, "/api/checkout", &body)
+        .await
+        .assert_status(201);
+    post_api(&client, "/api/checkout", &body)
+        .await
+        .assert_status(200);
+}
