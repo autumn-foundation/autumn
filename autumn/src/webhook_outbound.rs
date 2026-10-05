@@ -573,14 +573,8 @@ pub fn deliver_webhook_job(
             )
             .map_err(|e| AutumnError::bad_request_msg(format!("failed to parse log: {e}")))?;
 
-            // If this log has already been attempted (i.e. is running a retry from the job runner),
-            // increment the attempt counter and write the pre-send log.
-            if log.response_status.is_some() || log.last_error.is_some() {
-                log.attempt = log.attempt.saturating_add(1);
-                log.response_status = None;
-                log.response_body = None;
-                log.last_error = None;
-                manager.store().log_delivery(log.clone()).await?;
+            if !begin_attempt(&manager, &mut log, is_replay).await? {
+                return Ok(());
             }
 
             let sub = load_current_subscription(&manager, &log).await?;
@@ -598,14 +592,8 @@ pub fn deliver_webhook_job(
                 AutumnError::not_found_msg(format!("delivery log {log_id} not found"))
             })?;
 
-            // If this log has already been attempted (i.e. is running a retry from the job runner),
-            // increment the attempt counter and write the pre-send log.
-            if log.response_status.is_some() || log.last_error.is_some() {
-                log.attempt = log.attempt.saturating_add(1);
-                log.response_status = None;
-                log.response_body = None;
-                log.last_error = None;
-                manager.store().log_delivery(log.clone()).await?;
+            if !begin_attempt(&manager, &mut log, is_replay).await? {
+                return Ok(());
             }
 
             // Load latest subscription state to respect emergency rotations/disable
@@ -732,6 +720,40 @@ pub fn deliver_webhook_job(
 /// out of job attempts (2 per delivery attempt).
 fn attempts_remain(manager: &WebhookOutboundManager, log: &WebhookDeliveryLog) -> bool {
     log.attempt < log.max_attempts.min(manager.max_attempts)
+}
+
+/// Prepares the log for this run of the delivery job. Returns `false` when
+/// the delivery must not be sent.
+///
+/// A log that was already attempted (it has a status or an error) is a retry
+/// from the job engine. The retry gets the next attempt number, and the
+/// pre-send log is written. But first the limit is checked: a deploy can lower
+/// the limit while a retry waits, and that retry must go to the DLQ without a
+/// further request. A manual DLQ replay is not limited.
+async fn begin_attempt(
+    manager: &WebhookOutboundManager,
+    log: &mut WebhookDeliveryLog,
+    is_replay: bool,
+) -> AutumnResult<bool> {
+    if log.response_status.is_none() && log.last_error.is_none() {
+        return Ok(true);
+    }
+    if !is_replay && !attempts_remain(manager, log) {
+        log.is_dlq = true;
+        manager.store().log_delivery(log.clone()).await?;
+        tracing::warn!(
+            subscription_id = %log.subscription_id,
+            attempt = log.attempt,
+            "Webhook delivery reached its lowered attempt limit; sent to DLQ"
+        );
+        return Ok(false);
+    }
+    log.attempt = log.attempt.saturating_add(1);
+    log.response_status = None;
+    log.response_body = None;
+    log.last_error = None;
+    manager.store().log_delivery(log.clone()).await?;
+    Ok(true)
 }
 
 async fn load_current_subscription(
@@ -1328,6 +1350,90 @@ mod tests {
             .unwrap()
             .expect("delivery log should exist");
         assert!(stored.is_dlq, "attempt 2 of a limit of 2 goes to the DLQ");
+    }
+
+    /// A retry that waits while a deploy lowers the limit goes to the DLQ
+    /// without another request. Attempt 2 failed under a limit of 10; the
+    /// manager's limit is now 2, so attempt 3 must not be sent.
+    #[tokio::test]
+    async fn a_lowered_limit_stops_a_waiting_retry_before_it_is_sent() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/waiting")
+            .post("/webhooks/waiting")
+            .respond_with(500, serde_json::json!({}));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1, 2);
+
+        let sub = sample_subscription(
+            "sub_waiting",
+            "http://mock-receiver/webhooks/waiting",
+            WebhookSubscriptionStatus::Active,
+        );
+        store.create_subscription(sub.clone()).await.unwrap();
+        let mut log = sample_log("log_waiting", "sub_waiting");
+        log.attempt = 2;
+        log.max_attempts = 10;
+        log.last_error = Some("HTTP 500".to_owned());
+
+        deliver_webhook_job(
+            state,
+            serde_json::json!({ "subscription": sub, "log": log }),
+        )
+        .await
+        .expect("the exhausted retry settles the job");
+
+        assert_eq!(mock.call_count(), 0, "attempt 3 must not be sent");
+        let stored = store
+            .get_delivery_log("log_waiting")
+            .await
+            .unwrap()
+            .expect("delivery log should exist");
+        assert!(stored.is_dlq, "the waiting retry goes to the DLQ");
+        assert_eq!(stored.attempt, 2, "no attempt 3 is started");
+        assert_eq!(
+            stored.last_error.as_deref(),
+            Some("HTTP 500"),
+            "the last real error is kept"
+        );
+    }
+
+    /// A manual DLQ replay is not limited: an exhausted log is sent again.
+    #[tokio::test]
+    async fn a_replay_of_an_exhausted_log_is_still_sent() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/exhausted")
+            .post("/webhooks/exhausted")
+            .respond_with(200, serde_json::json!({}));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1, 2);
+
+        store
+            .create_subscription(sample_subscription(
+                "sub_exhausted",
+                "http://mock-receiver/webhooks/exhausted",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let mut log = sample_log("log_exhausted", "sub_exhausted");
+        log.attempt = 2;
+        log.max_attempts = 2;
+        log.last_error = Some("HTTP 500".to_owned());
+        log.is_dlq = true;
+        store.replace_delivery_log(log).await.unwrap();
+
+        deliver_webhook_job(
+            state,
+            serde_json::json!({ "log_id": "log_exhausted", "replay": true }),
+        )
+        .await
+        .expect("the replay is delivered");
+
+        assert_eq!(mock.call_count(), 1, "the replay sends the request");
     }
 
     struct CountingReplacementStore {
