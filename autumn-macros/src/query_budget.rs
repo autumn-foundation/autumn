@@ -222,8 +222,27 @@ const HANDLE_TYPES: &[&str] = &[
 /// `checkout()` (Codex review, PR #2762, round 7).
 const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Extension", "State"];
 
-/// Container methods whose result holds what their closure returns.
-const MAPPING_ADAPTERS: &[&str] = &["map", "filter_map", "flat_map", "and_then", "scan"];
+/// Methods whose result is a container of what their callback returns:
+/// `ids.iter().map(|_| &repo)`, `flag.then(|| &repo)`.
+const WRAPPING_CALLBACKS: &[&str] = &["map", "then"];
+
+/// Methods whose result is what their callback returns, or what their other
+/// arguments hold: `fold(init, f)`, `unwrap_or_else(f)`, `find_map(f)`.
+const DIRECT_CALLBACKS: &[&str] = &[
+    "and_then",
+    "or_else",
+    "filter_map",
+    "flat_map",
+    "map_while",
+    "scan",
+    "find_map",
+    "fold",
+    "try_fold",
+    "reduce",
+    "unwrap_or_else",
+    "map_or",
+    "map_or_else",
+];
 
 /// Methods whose result has the receiver's type.
 const SAME_TYPE_METHODS: &[&str] = &["clone", "to_owned"];
@@ -1512,6 +1531,27 @@ struct Pass {
     leave: Option<Cost>,
 }
 
+/// The cost of the paths that end a loop and reach the next statement: every
+/// pass goes on until the loop ends, or a pass `break`s out of it. A
+/// `return` or an exit to an outer label does not reach the next statement.
+fn loop_fall(
+    again: Option<Cost>,
+    brk: Option<Cost>,
+    exhausts: bool,
+    bound: Option<u32>,
+    total: &Cost,
+) -> Cost {
+    if matches!(total, Cost::Unbounded(_)) {
+        return total.clone();
+    }
+    let again = again.unwrap_or(Cost::ZERO);
+    // With no bound, `again` is zero here: else `total` is unbounded.
+    let times = bound.unwrap_or(1);
+    let ended = exhausts.then(|| again.clone().repeated(times));
+    let broke = brk.map(|b| again.clone().repeated(times.saturating_sub(1)).then(b));
+    worst(ended, broke).unwrap_or(Cost::ZERO)
+}
+
 /// What a loop is, for [`Analyzer::loop_flow`].
 struct LoopShape<'a> {
     /// The compile-time number of passes, when there is one.
@@ -1564,6 +1604,8 @@ struct Analyzer {
     ledger: Vec<String>,
     /// Errors raised by malformed `#[query_cost]` / `#[query_exempt]`.
     errors: Vec<syn::Error>,
+    /// What every `return` read so far gives. A closure probe reads it.
+    returned: Kind,
 }
 
 impl Analyzer {
@@ -1574,6 +1616,7 @@ impl Analyzer {
             exits: Vec::new(),
             ledger: Vec::new(),
             errors: Vec::new(),
+            returned: Kind::Plain,
         };
         for arg in &input_fn.sig.inputs {
             if let syn::FnArg::Typed(typed) = arg {
@@ -2174,6 +2217,9 @@ impl Analyzer {
             Expr::Binary(b) => self.expr(&b.left).then(self.expr(&b.right)),
             Expr::Return(r) => {
                 let value = r.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
+                if let Some(e) = r.expr.as_deref() {
+                    self.returned = self.returned.max(self.result_value(e));
+                }
                 self.exit_body();
                 value.then(Flow::RETURN)
             }
@@ -2370,19 +2416,21 @@ impl Analyzer {
             .take_exits(shape.label, true)
             .into_iter()
             .partition(|(exit, _)| exit.breaks);
-        let breaks_here = !breaks.is_empty();
+        let brk = worst_of(breaks);
         let outer = std::mem::take(&mut flow.exits);
         let pass = Pass {
             again: worst(flow.fall, worst_of(continues)),
-            leave: worst(worst(flow.ret, worst_of(breaks)), worst_of(outer.clone())),
+            leave: worst(worst(flow.ret, brk.clone()), worst_of(outer.clone())),
         };
         // Only a `break` to this loop ends a `loop`; a `continue` does not.
         // A loop known to run, whose every pass leaves, never ends by itself.
-        let always_leaves = shape.bound.is_some_and(|n| n > 0) && pass.again.is_none();
-        let ends = breaks_here || (shape.ends && !always_leaves);
+        let exhausts = shape.ends && !(shape.bound.is_some_and(|n| n > 0) && pass.again.is_none());
+        let again = pass.again.clone();
         let total = self.bound_loop(pass, shape.bound, shape.span, before);
+        let fall = (exhausts || brk.is_some())
+            .then(|| loop_fall(again, brk, exhausts, shape.bound, &total));
         Flow {
-            fall: ends.then(|| total.clone()),
+            fall,
             exits: outer
                 .into_iter()
                 .map(|(exit, _)| (exit, total.clone()))
@@ -2860,6 +2908,12 @@ impl Analyzer {
         let held = args
             .iter()
             .map(|a| match a {
+                // A std callback method gives its callback's result back.
+                Expr::Closure(_)
+                    if CALLBACK_METHODS.contains(&method) && !STORE_METHODS.contains(&method) =>
+                {
+                    Kind::Plain
+                }
                 Expr::Closure(_) => self.closure_output(a, Kind::Plain),
                 _ => self.value_of(a),
             })
@@ -2935,10 +2989,7 @@ impl Analyzer {
                         || (self.expr_is_holder(&mc.receiver)
                             && !SAME_TYPE_METHODS.contains(&method.as_str())
                             && !HANDLE_ACCESSORS.contains(&method.as_str()))
-                        || matches!(
-                            self.mapped_kind(mc),
-                            Kind::Carrier | Kind::Holder | Kind::Nested
-                        ))
+                        || self.callback_result(mc) == Kind::Nested)
             }
             Expr::Array(a) => a.elems.iter().any(container),
             Expr::Tuple(t) => t.elems.iter().any(container),
@@ -2963,19 +3014,32 @@ impl Analyzer {
         }
     }
 
-    /// What a mapping adapter's closure returns for each part
-    /// (`ids.iter().map(|_| &repo)`). Plain for any other method.
-    fn mapped_kind(&self, mc: &ExprMethodCall) -> Kind {
-        if !MAPPING_ADAPTERS.contains(&mc.method.to_string().as_str()) {
+    /// What a callback method's result holds, from what its callback
+    /// returns and its other arguments hold. Plain for any other method.
+    fn callback_result(&self, mc: &ExprMethodCall) -> Kind {
+        let method = mc.method.to_string();
+        let wraps = WRAPPING_CALLBACKS.contains(&method.as_str());
+        if !wraps && !DIRECT_CALLBACKS.contains(&method.as_str()) {
             return Kind::Plain;
         }
         let param = match self.value_of(&mc.receiver) {
             Kind::Plain => Kind::Plain,
             kind => kind.element(),
         };
-        mc.args
-            .last()
-            .map_or(Kind::Plain, |f| self.closure_output(f, param))
+        let out = mc
+            .args
+            .iter()
+            .map(|a| match a {
+                Expr::Closure(_) => self.closure_output(a, param),
+                _ => self.value_of(a),
+            })
+            .max()
+            .unwrap_or(Kind::Plain);
+        match out {
+            Kind::Handle | Kind::LazyDb if wraps => Kind::Carrier,
+            Kind::Carrier | Kind::Holder if wraps => Kind::Nested,
+            kind => kind,
+        }
     }
 
     /// What the closure `f` returns when its parameters hold `param`. It is
@@ -2993,15 +3057,21 @@ impl Analyzer {
             exits: Vec::new(),
             ledger: Vec::new(),
             errors: Vec::new(),
+            returned: Kind::Plain,
         };
         probe.env.push();
         for input in &closure.inputs {
             probe.bind_pat(input, param);
         }
-        match &*closure.body {
+        let tail = match &*closure.body {
             Expr::Block(b) => probe.block_value(&b.block),
-            body => probe.value_of(body),
-        }
+            body => {
+                // Run the body for its `return`s, then read its value.
+                let _ = probe.expr(body);
+                probe.result_value(body)
+            }
+        };
+        tail.max(probe.returned)
     }
 
     /// Run a block's statements, then give what its tail expression holds.
@@ -3010,7 +3080,11 @@ impl Analyzer {
             let mut kind = Kind::Plain;
             for (i, stmt) in block.stmts.iter().enumerate() {
                 match stmt {
-                    Stmt::Expr(tail, None) if i + 1 == block.stmts.len() => kind = s.value_of(tail),
+                    Stmt::Expr(tail, None) if i + 1 == block.stmts.len() => {
+                        // Run the tail for its `return`s, then read its value.
+                        let _ = s.expr(tail);
+                        kind = s.result_value(tail);
+                    }
                     _ => {
                         s.stmt(stmt);
                     }
@@ -3018,6 +3092,16 @@ impl Analyzer {
             }
             kind
         })
+    }
+
+    /// What a callback gives back in `e`. A query built there is counted
+    /// there, so its result is plain, not a handle.
+    fn result_value(&self, e: &Expr) -> Kind {
+        if self.is_counted_query_future(e) {
+            Kind::Plain
+        } else {
+            self.value_of(e)
+        }
     }
 
     /// Is `e` a user value that holds a handle (`Ctx { repo }`)? Its methods
@@ -3033,8 +3117,9 @@ impl Analyzer {
             Expr::Field(f) => self.part_kind(f) == Some(Kind::Holder),
             // `ctx.clone()` has the type of `ctx`.
             Expr::MethodCall(mc) => {
-                SAME_TYPE_METHODS.contains(&mc.method.to_string().as_str())
-                    && self.expr_is_holder(&mc.receiver)
+                (SAME_TYPE_METHODS.contains(&mc.method.to_string().as_str())
+                    && self.expr_is_holder(&mc.receiver))
+                    || self.callback_result(mc) == Kind::Holder
             }
             // `Ctx(repo)`: a user tuple struct that holds the handle.
             Expr::Call(c) => {
@@ -3141,7 +3226,7 @@ impl Analyzer {
     /// Does this method call evaluate to a handle?
     fn method_is_handle(&self, mc: &ExprMethodCall) -> bool {
         let method = mc.method.to_string();
-        if HANDLE_ACCESSORS.contains(&method.as_str()) {
+        if HANDLE_ACCESSORS.contains(&method.as_str()) || self.callback_result(mc) == Kind::Handle {
             return true;
         }
         // A method on a carrier that returns a part: `repos.remove(0)`.
@@ -3275,7 +3360,7 @@ impl Analyzer {
                     || self.gives_option_of_part(mc))
                     && self.expr_is_carrier(&mc.receiver))
                     // `ids.iter().map(|_| &repo)` gives handles.
-                    || matches!(self.mapped_kind(mc), Kind::Handle | Kind::LazyDb)
+                    || self.callback_result(mc) == Kind::Carrier
             }
             Expr::If(i) => {
                 block_tail(&i.then_branch).is_some_and(|e| self.expr_is_carrier(e))
@@ -7172,6 +7257,119 @@ mod tests {
                 "for _ in 0..1 { let _ = repo.a().await?; if flag { return Ok(0); } } \
                  let _ = repo.b().await?;",
                 Expect::Exact(2),
+            ),
+        ];
+        check_cases(cases);
+    }
+
+    #[test]
+    fn every_callback_output_keeps_its_handle() {
+        let over = |body: &str| {
+            format!(
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>, flag: bool) \
+                 -> AutumnResult<usize> {{ {body} Ok(0) }}"
+            )
+        };
+        let each = "for r in &repos { let _ = r.find_all().await?; }";
+        let cases = [
+            (
+                "map_while",
+                format!(
+                    "let repos: Vec<_> = ids.iter().map_while(|_| Some(&repo)).collect(); {each}"
+                ),
+                Expect::Unbounded,
+            ),
+            (
+                "find_map",
+                "let found = ids.iter().find_map(|_| Some(&repo)); \
+                 let _ = found.unwrap().find_all().await?;"
+                    .to_string(),
+                Expect::Exact(1),
+            ),
+            (
+                "fold",
+                format!(
+                    "let repos = ids.iter().fold(Vec::new(), |mut v, _| {{ v.push(&repo); v }}); {each}"
+                ),
+                Expect::Unbounded,
+            ),
+            (
+                // `unwrap` on a container of unknown shape is reported.
+                "bool::then",
+                "let maybe = flag.then(|| &repo); let _ = maybe.unwrap().find_all().await?;"
+                    .to_string(),
+                Expect::Unbounded,
+            ),
+            (
+                "unwrap_or_else on a plain Option",
+                "let r = None.unwrap_or_else(|| &repo); let _ = r.find_all().await?;".to_string(),
+                Expect::Exact(1),
+            ),
+            (
+                "explicit return in a map closure",
+                format!(
+                    "let repos: Vec<_> = ids.iter().map(|_| {{ if flag {{ return &repo; }} \
+                     panic!() }}).collect(); {each}"
+                ),
+                Expect::Unbounded,
+            ),
+            (
+                "explicit return from an inner scope",
+                format!(
+                    "let repos: Vec<_> = ids.iter().map(|_| {{ if flag {{ let r = &repo; return r; }} \
+                     panic!() }}).collect(); {each}"
+                ),
+                Expect::Unbounded,
+            ),
+            // Guard: a plain fold stays plain.
+            (
+                "plain fold",
+                "let n = ids.iter().fold(0, |acc, id| acc + id); render(n);".to_string(),
+                Expect::Exact(0),
+            ),
+        ];
+        let failures: Vec<String> = cases
+            .iter()
+            .filter_map(|(name, body, expect)| {
+                let handler = over(body);
+                check(&handler, *expect).map(|why| format!("{name}: {why}\n  {handler}"))
+            })
+            .collect();
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_return_in_a_loop_does_not_reach_the_code_after_it() {
+        let cases: &[(&str, &str, Expect)] = &[
+            (
+                "return in a loop over rows",
+                "for _id in &ids { if flag { return Ok(repo.a().await?.len()); } } \
+                 let _ = repo.b().await?;",
+                Expect::Exact(1),
+            ),
+            (
+                "return in a bounded loop",
+                "for _ in 0..2 { if flag { let _ = repo.a().await?; return Ok(0); } } \
+                 let _ = repo.b().await?;",
+                Expect::Exact(1),
+            ),
+            // Guards: a `break` and every pass still reach the code after.
+            (
+                "break in a bounded loop",
+                "for _ in 0..3 { if flag { let _ = repo.a().await?; break; } } \
+                 let _ = repo.b().await?;",
+                Expect::Exact(2),
+            ),
+            (
+                "every pass of a bounded loop",
+                "for _ in 0..3 { let _ = repo.a().await?; } let _ = repo.b().await?;",
+                Expect::Exact(4),
+            ),
+            (
+                "passes before a break",
+                "for _ in 0..3 { let _ = repo.a().await?; if flag { break; } } \
+                 let _ = repo.b().await?;",
+                Expect::Exact(4),
             ),
         ];
         check_cases(cases);

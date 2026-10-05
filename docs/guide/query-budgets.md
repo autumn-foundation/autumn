@@ -117,7 +117,7 @@ Both halves are compiled in CI as trybuild fixtures — see
 |---|---|
 | Straight-line statements | **sum** |
 | `if` / `match` arms | **maximum** — only one arm runs, so the bound is the worst one |
-| `return`, `break`, `continue` | the early path does not include the cost of the code it skips. `if cached { return repo.find_cached().await; } repo.find_fresh().await` is **1**. A `return` inside a loop still counts as reaching the code after the loop |
+| `return`, `break`, `continue` | the early path does not include the cost of the code it skips. `if cached { return repo.find_cached().await; } repo.find_fresh().await` is **1**. A `return` inside a loop does not reach the code after the loop. A `break` does |
 | A loop whose body issues a query on a path that starts another pass | **unbounded** (rejected under a finite budget) |
 | A loop with a literal bound (`for _ in 0..3`) | **× 3** for a path that starts another pass. A path that leaves the loop (`break`, `return`) is paid once: `for _ in 0..3 { repo.a().await?; break; }` is **1** |
 | A loop whose body issues nothing | **0** — loops are free until they query |
@@ -176,8 +176,10 @@ The analysis follows the handle through every name that holds it:
     callback stores what it returns (`slot.get_or_insert_with(|| &repo)`).
     Every method on a user struct that holds a handle (`ctx.clear()` on
     `Ctx { repo }`) is reported too.
-  - A `map` closure gives what it returns, whatever it maps over:
-    `ids.iter().map(|_| &repo)` gives handles.
+  - A callback's result holds what the callback returns, whatever the
+    receiver holds: `ids.iter().map(|_| &repo)` gives handles, and so do
+    `fold`, `find_map`, `then` and `unwrap_or_else`. A `return` in the
+    callback counts too.
   - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
     `Option<Vec<…>>`, `[ctx]`, `repos.chunks(2)`, or
     `repos.iter().map(|r| Ctx { repo: r })`) keeps that shape for all its
