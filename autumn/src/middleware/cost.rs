@@ -45,9 +45,22 @@ pub struct CostLayer {
     fallback: bool,
 }
 
-/// Response marker: a primary [`CostLayer`] recorded this response.
-#[derive(Clone, Copy, Debug)]
-struct CostMetered;
+/// Shared flag between a fallback [`CostLayer`] and the primary one. The
+/// fallback puts it in the request, and the primary sets it when it records.
+/// It is in the request, not the response, because an error filter can build
+/// a new response.
+#[derive(Clone, Debug, Default)]
+struct CostMetered(Arc<std::sync::atomic::AtomicBool>);
+
+impl CostMetered {
+    fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_marked(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
 
 impl CostLayer {
     /// Make a layer that records into `accountant`.
@@ -112,7 +125,15 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+        // The fallback plants the flag; the primary sets it when it records.
+        let metered = if self.fallback {
+            let metered = CostMetered::default();
+            req.extensions_mut().insert(metered.clone());
+            Some(metered)
+        } else {
+            req.extensions().get::<CostMetered>().cloned()
+        };
         let cell = Arc::new(RequestCostCell::default());
         // Measure the CPU time of the call too: some services do their work
         // here. The probe measures only the polls.
@@ -134,6 +155,7 @@ where
             // the primary, so only a response that it sees is recorded.
             recorded: self.fallback,
             fallback: self.fallback,
+            metered,
         }
     }
 }
@@ -177,6 +199,7 @@ pin_project! {
         // `true` after the cost is in the accountant.
         recorded: bool,
         fallback: bool,
+        metered: Option<CostMetered>,
     }
 
     impl<F> PinnedDrop for CostFuture<F> {
@@ -185,6 +208,9 @@ pin_project! {
             // A request dropped before it completed still used CPU.
             if !*this.recorded {
                 record(this.accountant, this.log.as_ref(), *this.cpu, *this.allocated, this.cell);
+                if let Some(metered) = this.metered.as_ref() {
+                    metered.mark();
+                }
             }
         }
     }
@@ -223,13 +249,15 @@ where
         match out {
             Poll::Ready(Ok(mut response)) => {
                 *this.recorded = true;
-                if *this.fallback {
-                    // A primary layer recorded this response already.
-                    if response.extensions().get::<CostMetered>().is_some() {
-                        return Poll::Ready(Ok(response));
+                if let Some(metered) = this.metered.as_ref() {
+                    if *this.fallback {
+                        // A primary layer recorded this request already.
+                        if metered.is_marked() {
+                            return Poll::Ready(Ok(response));
+                        }
+                    } else {
+                        metered.mark();
                     }
-                } else {
-                    response.extensions_mut().insert(CostMetered);
                 }
                 record(
                     this.accountant,
@@ -248,11 +276,16 @@ where
                 Poll::Ready(Ok(response))
             }
             Poll::Ready(Err(error)) => {
-                // An error has no marker; only the primary layer records it.
-                if *this.fallback {
-                    return Poll::Ready(Err(error));
-                }
                 *this.recorded = true;
+                if let Some(metered) = this.metered.as_ref() {
+                    if *this.fallback {
+                        if metered.is_marked() {
+                            return Poll::Ready(Err(error));
+                        }
+                    } else {
+                        metered.mark();
+                    }
+                }
                 record(
                     this.accountant,
                     this.log.as_ref(),
@@ -428,6 +461,15 @@ mod tests {
             .layer(CostLayer::new(accountant.clone(), false).layer(handler()));
         both.call(Request::new(())).await.unwrap();
         assert_eq!(accountant.snapshot().total.requests, 2);
+
+        // An error filter between them builds a new response: still one count.
+        let rebuild = tower::layer::layer_fn(|inner| {
+            tower::util::MapResponse::new(inner, |_old: Response<()>| Response::new(()))
+        });
+        let mut through_filter = CostLayer::fallback(accountant.clone(), false)
+            .layer(rebuild.layer(CostLayer::new(accountant.clone(), false).layer(handler())));
+        through_filter.call(Request::new(())).await.unwrap();
+        assert_eq!(accountant.snapshot().total.requests, 3);
     }
 
     #[tokio::test]
