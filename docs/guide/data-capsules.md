@@ -167,8 +167,8 @@ directory to a link after the open, the reads do not follow it.
   record.
 - Import skips generated columns.
 - Import moves each serial or identity sequence past the largest key.
-- Import writes blobs before records. If a blob key holds different bytes,
-  import stops and writes no blob.
+- Import writes blobs before records. If a blob key holds different bytes or a
+  different MIME type, import stops and writes no blob.
 
 ## Data accuracy
 

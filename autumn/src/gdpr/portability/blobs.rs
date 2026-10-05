@@ -63,14 +63,14 @@ pub async fn collect_blobs(
 
 /// Write the blobs of `capsule` to `store`, each under its original key.
 ///
-/// The function first checks all keys. A key that holds different bytes is a
-/// conflict, and then the function writes nothing. A key with the same bytes is
-/// not written again. Call it before [`import_capsule`](super::import_capsule):
+/// The function first checks all keys. A key that holds different bytes, or the
+/// same bytes with a different MIME type, is a conflict, and then the function
+/// writes nothing. A key with the same bytes and MIME type is not written again. Call it before [`import_capsule`](super::import_capsule):
 /// then no imported record points at a blob that is not there.
 ///
 /// # Errors
 ///
-/// [`DataCapsuleError::Conflict`] for a key with different bytes, or
+/// [`DataCapsuleError::Conflict`] for a key with different bytes or MIME type, or
 /// [`DataCapsuleError::Blob`] when the capsule has no bytes for an entry or
 /// `store` fails.
 pub async fn restore_blobs(
@@ -84,7 +84,25 @@ pub async fn restore_blobs(
             .get(&entry.sha256)
             .ok_or_else(|| DataCapsuleError::Blob(format!("no bytes for blob {:?}", entry.key)))?;
         match store.get(&entry.key).await {
-            Ok(existing) if hex::encode(Sha256::digest(&existing)) == entry.sha256 => {}
+            Ok(existing) if hex::encode(Sha256::digest(&existing)) == entry.sha256 => {
+                // Export writes `application/octet-stream` when a blob has no
+                // metadata, so compare with the same default.
+                let content_type = match store.head(&entry.key).await {
+                    Ok(Some(meta)) => meta.content_type,
+                    Ok(None) | Err(BlobStoreError::NotFound(_)) => {
+                        "application/octet-stream".to_owned()
+                    }
+                    Err(e) => {
+                        return Err(DataCapsuleError::Blob(format!("head {:?}: {e}", entry.key)));
+                    }
+                };
+                if content_type != entry.content_type {
+                    return Err(DataCapsuleError::Conflict(format!(
+                        "blob {:?} exists with MIME type {content_type:?}, not {:?}",
+                        entry.key, entry.content_type
+                    )));
+                }
+            }
             Ok(_) => {
                 return Err(DataCapsuleError::Conflict(format!(
                     "blob {:?} exists with different bytes",

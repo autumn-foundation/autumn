@@ -761,6 +761,23 @@ mod blobs {
         .await
         .unwrap();
         assert_eq!(restore_blobs(&capsule, &same).await.unwrap(), 1);
+
+        // The same bytes with a different MIME type are a conflict too.
+        let other_type = blob_store(&tmp.path().join("d"));
+        other_type
+            .put(
+                "avatars/ada.png",
+                "text/plain",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        let err = restore_blobs(&capsule, &other_type)
+            .await
+            .expect_err("same bytes, different MIME type");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+        let head = other_type.head("avatars/ada.png").await.unwrap().unwrap();
+        assert_eq!(head.content_type, "text/plain");
     }
 
     #[tokio::test]
