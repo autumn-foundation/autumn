@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use autumn_schema_core::{Index, Table};
+use autumn_schema_core::{Backend, Index, Table};
 
 use crate::schema::diff::SchemaChange;
 use crate::schema::parse::{ParsedSchema, RenameHint};
@@ -91,7 +91,8 @@ fn table_renames(
     managed: &BTreeMap<&str, &Table>,
     out: &mut Vec<SchemaChange>,
 ) -> Vec<(String, String)> {
-    let base_tables: BTreeSet<&str> = baseline.iter().map(|t| t.name.as_str()).collect();
+    let fold = baseline.iter().any(|t| t.backend == Backend::Sqlite);
+    let base_tables: Vec<&str> = baseline.iter().map(|t| t.name.as_str()).collect();
     let declared: BTreeSet<&str> = desired.tables.iter().map(|t| t.name.as_str()).collect();
     let hints: Vec<&RenameHint> = desired
         .renames
@@ -100,7 +101,7 @@ fn table_renames(
         .collect();
     select(
         &hints,
-        |name| base_tables.contains(name),
+        |name| spelled(&base_tables, name, fold),
         |h| declared.contains(h.from.as_str()),
         "table",
         out,
@@ -120,7 +121,8 @@ fn column_renames(
         let Some(base) = work.iter().find(|t| t.name == *name) else {
             continue;
         };
-        let base_cols: BTreeSet<&str> = base.columns.iter().map(|c| c.name.as_str()).collect();
+        let fold = base.backend == Backend::Sqlite;
+        let base_cols: Vec<&str> = base.columns.iter().map(|c| c.name.as_str()).collect();
         let want_cols: BTreeSet<&str> = want.columns.iter().map(|c| c.name.as_str()).collect();
         let (hints, unread): (Vec<&RenameHint>, Vec<&RenameHint>) = desired
             .renames
@@ -136,7 +138,7 @@ fn column_renames(
                 .diagnostics
                 .iter()
                 .any(|d| d.table == *name && d.field == field);
-            if skipped && base_cols.contains(h.from.as_str()) {
+            if skipped && spelled(&base_cols, &h.from, fold).is_some() {
                 out.push(SchemaChange::RenameConflict {
                     table: (*name).to_owned(),
                     reason: format!(
@@ -148,7 +150,7 @@ fn column_renames(
         }
         let selected = select(
             &hints,
-            |col| base_cols.contains(col),
+            |col| spelled(&base_cols, col, fold),
             |h| want_cols.contains(h.from.as_str()),
             "column",
             out,
@@ -274,7 +276,7 @@ fn index_renames(
 ///   while another hint renames its new name away.
 fn select(
     hints: &[&RenameHint],
-    in_base: impl Fn(&str) -> bool,
+    in_base: impl Fn(&str) -> Option<String>,
     still_declared: impl Fn(&RenameHint) -> bool,
     kind: &str,
     out: &mut Vec<SchemaChange>,
@@ -286,7 +288,10 @@ fn select(
     };
     for h in hints {
         let to = target(h);
-        if in_base(&h.from) && in_base(&to) && hints.iter().any(|o| o.from == to) {
+        if in_base(&h.from).is_some()
+            && in_base(&to).is_some()
+            && hints.iter().any(|o| o.from == to)
+        {
             out.push(conflict(
                 h,
                 format!(
@@ -297,17 +302,19 @@ fn select(
             ));
         }
     }
-    let active: Vec<&RenameHint> = hints
+    // Each active hint with the baseline spelling of its old name.
+    let active: Vec<(&RenameHint, String)> = hints
         .iter()
         .copied()
-        .filter(|h| in_base(&h.from) && !in_base(&target(h)))
+        .filter(|h| in_base(&target(h)).is_none())
+        .filter_map(|h| in_base(&h.from).map(|from| (h, from)))
         .collect();
     let mut by_from: BTreeMap<&str, usize> = BTreeMap::new();
-    for h in &active {
+    for (h, _) in &active {
         *by_from.entry(h.from.as_str()).or_default() += 1;
     }
     let mut picked = Vec::new();
-    for h in &active {
+    for (h, from) in &active {
         let to = target(h);
         if still_declared(h) {
             out.push(conflict(
@@ -323,10 +330,19 @@ fn select(
                 format!("more than one {kind} is renamed from `{}`", h.from),
             ));
         } else {
-            picked.push((h.from.clone(), to));
+            picked.push((from.clone(), to));
         }
     }
     picked
+}
+
+/// The baseline spelling of `name` in `names`. `SQLite` resolves names ignoring
+/// case (`fold`); Postgres reads a mixed-case name as a quoted, other name.
+fn spelled(names: &[&str], name: &str, fold: bool) -> Option<String> {
+    names
+        .iter()
+        .find(|n| **n == name || (fold && n.eq_ignore_ascii_case(name)))
+        .map(|n| (*n).to_owned())
 }
 
 /// Apply `change` to `work` and record it.
@@ -814,6 +830,62 @@ mod tests {
             down.trim(),
             "ALTER TABLE posts RENAME COLUMN headline TO title;"
         );
+    }
+
+    #[test]
+    fn sqlite_matches_a_rename_source_ignoring_case() {
+        let base = vec![table(
+            "Users",
+            Backend::Sqlite,
+            &[("Email", ColumnType::Text)],
+        )];
+        let want = desired(
+            vec![table(
+                "accounts",
+                Backend::Sqlite,
+                &[("mail", ColumnType::Text)],
+            )],
+            vec![
+                table_hint("accounts", "users"),
+                col_hint("accounts", "mail", "email"),
+            ],
+        );
+        let (plan, up, _) = render(&base, &want);
+        assert_eq!(
+            plan.changes,
+            vec![
+                SchemaChange::RenameTable {
+                    from: "Users".to_owned(),
+                    to: "accounts".to_owned(),
+                },
+                SchemaChange::RenameColumn {
+                    table: "accounts".to_owned(),
+                    from: "Email".to_owned(),
+                    to: "mail".to_owned(),
+                },
+            ]
+        );
+        assert!(up.contains("RENAME COLUMN Email TO mail"), "{up}");
+    }
+
+    #[test]
+    fn postgres_matches_a_rename_source_exactly() {
+        // On Postgres `"Email"` is a quoted name, not `email`.
+        let base = vec![table(
+            "users",
+            Backend::Postgres,
+            &[("Email", ColumnType::Text)],
+        )];
+        let want = desired(
+            vec![table(
+                "users",
+                Backend::Postgres,
+                &[("mail", ColumnType::Text)],
+            )],
+            vec![col_hint("users", "mail", "email")],
+        );
+        let changes = rename_changes(&base, &want);
+        assert!(changes.is_empty(), "{changes:?}");
     }
 
     #[test]
