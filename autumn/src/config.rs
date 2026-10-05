@@ -3527,8 +3527,9 @@ impl OutboxConfig {
     /// # Errors
     ///
     /// Returns [`ConfigError::Validation`] when `batch_size`, `max_attempts`
-    /// or `lease_ms` is zero. With a zero lease, a claim ends at once and
-    /// the relay sends nothing.
+    /// or `lease_ms` is zero, or `max_backoff_ms` is smaller than
+    /// `initial_backoff_ms`. With a zero lease, a claim ends at once and the
+    /// relay sends nothing.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (key, value) in [
             (
@@ -3543,6 +3544,12 @@ impl OutboxConfig {
                     "outbox.{key} must be greater than zero"
                 )));
             }
+        }
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(ConfigError::Validation(
+                "outbox.max_backoff_ms must not be smaller than outbox.initial_backoff_ms"
+                    .to_owned(),
+            ));
         }
         Ok(())
     }
@@ -14970,6 +14977,15 @@ path = "/healthz"
             let error = config.validate().unwrap_err().to_string();
             assert!(error.contains("must be greater than zero"), "{error}");
         }
+        let error = OutboxConfig {
+            initial_backoff_ms: 300_000,
+            max_backoff_ms: 1_000,
+            ..OutboxConfig::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("max_backoff_ms"), "{error}");
     }
 
     #[test]

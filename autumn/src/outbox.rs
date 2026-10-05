@@ -962,8 +962,8 @@ pub fn current_message_id() -> Option<String> {
     CURRENT_MESSAGE_ID.try_with(Clone::clone).ok()
 }
 
-/// Send up to `max` ready messages now. Returns how many the relay handled
-/// (sent or failed).
+/// Send up to `max` ready messages from each relay pool (the app pool and
+/// each shard) now. Returns how many the relay handled (sent or failed).
 ///
 /// The relay worker calls this in a loop. Tests and `Sim::run_to_idle` call
 /// it to drain the outbox without a worker.
@@ -987,13 +987,11 @@ async fn drain_until(
             "outbox relay is not installed; set outbox.enabled = true",
         )
     })?;
-    let pools = relay_pools(state)?;
+    // Each pool gets its own budget, so a busy app pool cannot starve a
+    // shard.
     let mut handled = 0;
-    for pool in &pools {
-        if handled >= max {
-            break;
-        }
-        handled += drain_pool(state, &relay, pool, max - handled, shutdown).await?;
+    for pool in &relay_pools(state)? {
+        handled += drain_pool(state, &relay, pool, max, shutdown).await?;
     }
     Ok(handled)
 }
@@ -1278,7 +1276,7 @@ fn retry_delay_ms(config: &OutboxConfig, attempt: u32, entropy: &dyn Entropy) ->
     let delay = config
         .initial_backoff_ms
         .saturating_mul(1_u64 << exponent)
-        .min(config.max_backoff_ms.max(config.initial_backoff_ms));
+        .min(config.max_backoff_ms);
     let half = delay / 2;
     half + entropy.next_u64() % (delay - half + 1)
 }

@@ -40,6 +40,19 @@ fn retry_delay_doubles_with_jitter_and_a_cap() {
 }
 
 #[test]
+fn retry_delay_never_exceeds_a_small_max() {
+    let config = OutboxConfig {
+        initial_backoff_ms: 300_000,
+        max_backoff_ms: 1_000,
+        ..OutboxConfig::default()
+    };
+    let entropy = crate::entropy::SeededEntropy::new(5);
+    for attempt in 1..5 {
+        assert!(retry_delay_ms(&config, attempt, &entropy) <= 1_000);
+    }
+}
+
+#[test]
 #[should_panic(expected = "reserved")]
 fn reserved_topic_prefix_is_refused() {
     OutboxHandlers::default().insert("autumn.mine", |_, _| async { Ok(()) });
@@ -668,6 +681,37 @@ mod sqlite {
 
         assert_eq!(drain(&state, 10).await.unwrap(), 1);
         assert_eq!(*log.lock().unwrap(), ["shard"]);
+
+        // A full app pool does not starve the shard: each pool has its own
+        // budget.
+        let mut conn = main.pool().get().await.unwrap();
+        for _ in 0..3 {
+            Outbox::new(&state)
+                .write(&mut conn, "m", "t", &serde_json::json!({ "n": "main" }))
+                .await
+                .unwrap();
+        }
+        drop(conn);
+        let mut conn = shard.pool().get().await.unwrap();
+        Outbox::new(&state)
+            .write(&mut conn, "s", "t", &serde_json::json!({ "n": "shard" }))
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(drain(&state, 1).await.unwrap(), 2, "one from each pool");
+        let sent = log.lock().unwrap().clone();
+        assert_eq!(
+            sent.iter().filter(|n| *n == "shard").count(),
+            2,
+            "the earlier shard message and this one: {sent:?}"
+        );
+        assert_eq!(
+            drain(&state, 10).await.unwrap(),
+            2,
+            "the rest of the app pool"
+        );
+        assert_eq!(log.lock().unwrap().len(), 5);
     }
 
     #[tokio::test]

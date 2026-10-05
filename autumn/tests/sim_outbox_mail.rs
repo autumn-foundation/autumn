@@ -35,8 +35,10 @@ async fn signup(mailer: Mailer) -> &'static str {
 }
 
 fn app(pool: SqlitePool) -> TestApp {
-    let mut config = AutumnConfig::default();
-    config.profile = Some("test".to_owned());
+    let mut config = AutumnConfig {
+        profile: Some("test".to_owned()),
+        ..AutumnConfig::default()
+    };
     config.security.csrf.enabled = false;
     config.mail.transport = Transport::Log;
     config.mail.from = Some("noreply@example.com".to_owned());

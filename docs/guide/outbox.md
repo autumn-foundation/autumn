@@ -205,6 +205,7 @@ The relay claims ready messages, calls their handlers, and marks them sent.
 | `outbox.retention_ms` | `604800000` | `AUTUMN_OUTBOX__RETENTION_MS` |
 
 `batch_size`, `max_attempts` and `lease_ms` must be greater than zero.
+`max_backoff_ms` must not be smaller than `initial_backoff_ms`.
 
 ## Tables
 

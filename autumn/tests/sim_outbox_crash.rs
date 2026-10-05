@@ -37,11 +37,9 @@ type SqlitePool = Pool<autumn_web::db::RuntimeConnection>;
 
 const LEASE: Duration = Duration::from_secs(30);
 
-async fn setup(substrate: &SqliteSubstrate) {
-    outbox::ensure_schema(&substrate.pool())
-        .await
-        .expect("outbox tables");
-    let mut conn = substrate.pool().get().await.expect("connection");
+async fn setup(pool: &SqlitePool) {
+    outbox::ensure_schema(pool).await.expect("outbox tables");
+    let mut conn = pool.get().await.expect("connection");
     diesel::sql_query("CREATE TABLE orders (id TEXT PRIMARY KEY)")
         .execute(&mut conn)
         .await
@@ -173,8 +171,8 @@ async fn sim_outbox_crash_between_commit_and_dispatch_delivers_exactly_once() {
     let mut index = 0;
     loop {
         let substrate = SqliteSubstrate::new().expect("substrate");
-        setup(&substrate).await;
         let pool = substrate.pool();
+        setup(&pool).await;
         let calls = Arc::new(AtomicU64::new(0));
 
         let mut sim = Sim::from_seed(0x3062);
