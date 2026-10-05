@@ -1042,6 +1042,29 @@ impl Drop for LeaseHeartbeat {
     }
 }
 
+/// Record that a durable worker starts `attempt`. When it replaces an
+/// earlier attempt this process still showed as running, balance that
+/// attempt's start here: recovery and the old worker's lease loss then see a
+/// newer attempt and count nothing (see `record_lease_lost`).
+#[cfg(any(feature = "db", feature = "redis"))]
+fn record_attempt_start(
+    name: &str,
+    id: &str,
+    attempt: u32,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) -> JobAdminStartDecision {
+    let decision = job_admin.try_record_start(id, attempt);
+    if decision == JobAdminStartDecision::Superseded {
+        state.job_registry.record_retry(
+            name,
+            "visibility timeout expired",
+            attempt.saturating_sub(1),
+        );
+    }
+    decision
+}
+
 /// Record a row that Postgres or `SQLite` stale recovery requeued at
 /// `new_attempt`. When this process was running the previous attempt, this
 /// balances its start, so a later lease loss of either attempt is counted
@@ -1086,6 +1109,9 @@ fn record_lease_lost(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobAdminStartDecision {
     Started,
+    /// Started, and replaced an earlier attempt this process still showed as
+    /// running. The caller balances that attempt's start.
+    Superseded,
     Canceled,
     Missing,
     AlreadyTransitioned,
@@ -1521,6 +1547,21 @@ impl JobAdminMemoryBackend {
                 record.finished_at = None;
                 record.attempt = attempt;
                 JobAdminStartDecision::Started
+            }
+            // A newer attempt starts while this process still shows an older
+            // one as running (stale recovery requeued it here or elsewhere)
+            // or as retrying (its lease was lost). Durable backends only.
+            JobAdminStatus::Running | JobAdminStatus::Retrying if record.attempt < attempt => {
+                let superseded = record.status == JobAdminStatus::Running;
+                record.status = JobAdminStatus::Running;
+                record.started_at = Some(self.clock.now());
+                record.finished_at = None;
+                record.attempt = attempt;
+                if superseded {
+                    JobAdminStartDecision::Superseded
+                } else {
+                    JobAdminStartDecision::Started
+                }
             }
             JobAdminStatus::Canceled => JobAdminStartDecision::Canceled,
             _ => JobAdminStartDecision::AlreadyTransitioned,
@@ -8940,7 +8981,9 @@ async fn process_redis_job_record(
     job_admin: &JobAdminMemoryBackend,
     worker_config: &RedisWorkerConfig,
 ) {
-    if job_admin.try_record_start(&record.id, record.attempt) == JobAdminStartDecision::Canceled {
+    if record_attempt_start(&record.name, &record.id, record.attempt, state, job_admin)
+        == JobAdminStartDecision::Canceled
+    {
         state.job_registry.record_cancel(&record.name);
         job_admin.record_cancelled(&record.id);
         let _ = ack_redis_success(connection, worker_config, &record).await;
@@ -10895,7 +10938,9 @@ async fn pg_execute_job(
     let attempt = u32::try_from(row.attempt).unwrap_or(0);
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
 
-    if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
+    if record_attempt_start(&row.name, &row.id, attempt, state, job_admin)
+        == JobAdminStartDecision::Canceled
+    {
         let delay_ms = sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt);
         let ack = pg_nack_failure(
             pool,
@@ -24327,6 +24372,76 @@ mod lease_tests {
         );
         record_lease_lost("leased", &id, 2, &state, &admin);
         assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    /// The replacement attempt starts after recovery's database requeue but
+    /// before its bookkeeping, or recovery ran in another process. Each start
+    /// must still be balanced exactly once.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn replacement_start_before_recovery_bookkeeping_balances_both_starts() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Superseded);
+        state.job_registry.record_start("leased"); // attempt 2
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Running);
+        assert_eq!(record.attempt, 2);
+        assert_eq!(
+            in_flight(&state),
+            1,
+            "attempt 1 is balanced, attempt 2 runs"
+        );
+
+        #[cfg(feature = "db")]
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(
+            in_flight(&state),
+            1,
+            "late bookkeeping for attempt 1 counts nothing"
+        );
+
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn replacement_start_after_an_old_lease_loss_is_recorded() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(in_flight(&state), 0);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Started);
+        state.job_registry.record_start("leased"); // attempt 2
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    #[test]
+    fn a_start_for_the_same_or_an_older_attempt_changes_nothing() {
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        let id = admin.record_enqueue_for_test("leased", serde_json::json!({}), 2, 3);
+        admin.record_start_for_test(&id, 2);
+        assert_eq!(
+            admin.try_record_start(&id, 2),
+            JobAdminStartDecision::AlreadyTransitioned
+        );
+        assert_eq!(
+            admin.try_record_start(&id, 1),
+            JobAdminStartDecision::AlreadyTransitioned
+        );
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.attempt, 2);
     }
 
     #[cfg(feature = "db")]

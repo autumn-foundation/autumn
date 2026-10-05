@@ -55,7 +55,8 @@ use serde_json::Value;
 
 use super::{
     DEFAULT_JOB_ADMIN_HISTORY_LIMIT, ExecutionBounds, JobExecutionOutcome, LeaseHeartbeat,
-    LeaseRenewal, QueueLimits, record_lease_lost, runtime_visibility_timeout_ms,
+    LeaseRenewal, QueueLimits, record_attempt_start, record_lease_lost,
+    runtime_visibility_timeout_ms,
 };
 use super::{
     EnqueueOutcome, JobAdminBackend, JobAdminBackendEntry, JobAdminFuture, JobAdminMemoryBackend,
@@ -1222,7 +1223,9 @@ async fn execute_job(
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
     let payload = row.payload_value();
 
-    if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
+    if record_attempt_start(&row.name, &row.id, attempt, state, job_admin)
+        == JobAdminStartDecision::Canceled
+    {
         let ack = nack_failure(
             pool,
             now_ms(state),
