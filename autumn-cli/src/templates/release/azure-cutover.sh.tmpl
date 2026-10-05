@@ -89,8 +89,12 @@ az containerapp job secret list \
 # exists. Then terraform apply deletes the cache and the job's redis-url.
 if [ -n "$WITHOUT_REDIS" ]; then
   JOB=$(jq -c '.properties.configuration.secrets |= map(select(.name != "redis-url"))' <<< "$JOB")
-  jq -c 'map(select(.name != "redis-url"))' "$JOB_SECRETS" > "$JOB_SECRETS.new"
-  mv "$JOB_SECRETS.new" "$JOB_SECRETS"
+  # The filtered list goes back into the same private file (mode 0600 from
+  # mktemp). printf is a builtin, so the values are not in a process
+  # argument either.
+  FILTERED=$(jq -c 'map(select(.name != "redis-url"))' "$JOB_SECRETS")
+  printf '%s' "$FILTERED" > "$JOB_SECRETS"
+  unset FILTERED
 fi
 APP=$(az containerapp show \
   --name "$AZURE_APP_NAME" \
@@ -128,11 +132,23 @@ OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 # The app is released only when no placeholder revision is active: during a
 # handoff, the placeholder and the new revision are both active, and the
 # first-cutover safeguards and rollback still apply.
-ACTIVE=$(az containerapp revision list \
-  --name "$AZURE_APP_NAME" \
-  --resource-group "$AZURE_RESOURCE_GROUP" \
-  --query "[?properties.active].[name, $APP_IMAGE]" \
-  --output tsv)
+# During a handoff, Azure can list no active revision. That does not tell a
+# placeholder from a real release, so the script reads the list again, and
+# stops before any write if it stays empty.
+ACTIVE=""
+for _ in $(seq 1 30); do
+  ACTIVE=$(az containerapp revision list \
+    --name "$AZURE_APP_NAME" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --query "[?properties.active].[name, $APP_IMAGE]" \
+    --output tsv)
+  [ -n "$(cut -f1 <<< "$ACTIVE" | sed '/^$/d')" ] && break
+  sleep 10
+done
+if [ -z "$(cut -f1 <<< "$ACTIVE" | sed '/^$/d')" ]; then
+  echo "::error::$AZURE_APP_NAME has no active revision. The script cannot tell if a real release runs. Try again when a revision is active." >&2
+  exit 1
+fi
 RELEASED=""
 REAL_ACTIVE=""
 PLACEHOLDER_REVISIONS=""
