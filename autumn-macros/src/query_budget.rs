@@ -1829,18 +1829,7 @@ impl Analyzer {
             if let syn::FnArg::Typed(typed) = arg {
                 analyzer.bind_pat(&typed.pat, type_kind(&typed.ty));
                 if let Pat::Ident(id) = &*typed.pat {
-                    let name = id.ident.to_string();
-                    analyzer.env.set_shape(&name, type_shape(&typed.ty));
-                    let mut binding = analyzer.env.binding(&name);
-                    binding.inner = type_inner_shape(&typed.ty);
-                    analyzer.env.declare(name.clone(), binding);
-                    // A `Result` records each side: `Err(e)` on a
-                    // `Result<Repo, Error>` is not a handle.
-                    if let Some(sides) = result_sides(&typed.ty) {
-                        let mut binding = analyzer.env.binding(&name);
-                        binding.parts = Some(sides);
-                        analyzer.env.declare(name, binding);
-                    }
+                    analyzer.record_type(id.ident.to_string(), &typed.ty);
                 }
             }
         }
@@ -1858,6 +1847,19 @@ impl Analyzer {
     }
 
     // ── Bindings ─────────────────────────────────────────────────────
+
+    /// Record what the declared type `ty` of `name` tells: its shape, the
+    /// shape of its part (`Db` in `Option<Db>`), and each side of a `Result`
+    /// (`Err(e)` on a `Result<Repo, Error>` is not a handle).
+    fn record_type(&mut self, name: String, ty: &Type) {
+        self.env.set_shape(&name, type_shape(ty));
+        let mut binding = self.env.binding(&name);
+        binding.inner = type_inner_shape(ty);
+        if let Some(sides) = result_sides(ty) {
+            binding.parts = Some(sides);
+        }
+        self.env.declare(name, binding);
+    }
 
     /// Bind the names in `pat` to the parts of a value that holds `kind`.
     fn bind_pat(&mut self, pat: &Pat, kind: Kind) {
@@ -1879,7 +1881,7 @@ impl Analyzer {
             Pat::Type(p) => {
                 self.bind_pat(&p.pat, kind.max(type_kind(&p.ty)));
                 if let Pat::Ident(id) = &*p.pat {
-                    self.env.set_shape(&id.ident.to_string(), type_shape(&p.ty));
+                    self.record_type(id.ident.to_string(), &p.ty);
                 }
             }
             Pat::Reference(p) => self.bind_pat(&p.pat, kind),
@@ -1965,23 +1967,21 @@ impl Analyzer {
                     self.bind_pat(&field.pat, kind);
                 }
             }
-            // `Ok(x)` / `Err(e)` over a `Result` with recorded sides.
+            // `Ok(x)` / `Err(e)` over a `Result` with recorded sides:
+            // `result`, `&result`, `result.as_ref()`.
             (Pat::TupleStruct(p), _)
-                if path_ident(peel_refs(init)).is_some_and(|name| {
-                    p.path
-                        .segments
-                        .last()
-                        .is_some_and(|s| self.env.part(&name, &s.ident.to_string()).is_some())
-                }) =>
+                if p.path
+                    .segments
+                    .last()
+                    .is_some_and(|s| self.side_kind(init, &s.ident.to_string()).is_some()) =>
             {
-                let name = path_ident(peel_refs(init)).unwrap_or_default();
                 let side = p
                     .path
                     .segments
                     .last()
                     .map(|s| s.ident.to_string())
                     .unwrap_or_default();
-                let kind = self.env.part(&name, &side).unwrap_or(Kind::Nested);
+                let kind = self.side_kind(init, &side).unwrap_or(Kind::Nested);
                 for elem in &p.elems {
                     self.bind_pat(elem, kind);
                 }
@@ -9259,6 +9259,36 @@ mod tests {
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
                  let alias = result; let _ = alias.map(|r| render(r)); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn patterns_and_typed_locals_keep_result_sides() {
+        check_handlers(&[
+            (
+                "a match over as_ref keeps the error side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 match result.as_ref() { Ok(_) => {} Err(e) => render(e) } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a match over as_ref keeps the handle side",
+                "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
+                 match result.as_ref() { Ok(r) => render(r), Err(_) => {} } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a typed local Result records its sides",
+                "async fn h(x: i64) -> AutumnResult<usize> { \
+                 let result: Result<PgPostRepository, Error> = make(x); let error = result.unwrap_err(); render(error); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a typed local Option of Db records its inner shape",
+                "async fn h(x: i64) -> AutumnResult<usize> { \
+                 let maybe: Option<Db> = make(x); let db = maybe.unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
+                Expect::Exact(2),
             ),
         ]);
     }
