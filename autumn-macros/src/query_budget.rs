@@ -1847,10 +1847,7 @@ impl Analyzer {
         };
         for arg in &input_fn.sig.inputs {
             if let syn::FnArg::Typed(typed) = arg {
-                analyzer.bind_pat(&typed.pat, type_kind(&typed.ty));
-                if let Pat::Ident(id) = &*typed.pat {
-                    analyzer.record_type(id.ident.to_string(), &typed.ty);
-                }
+                analyzer.bind_typed(&typed.pat, &typed.ty, Kind::Plain);
             }
         }
         analyzer
@@ -10119,6 +10116,24 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let result = factory::Ok(repo); let _ = result.map_err(|e| e.run()); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn typed_tuple_parameters_pair_parts_with_types() {
+        check_handlers(&[
+            (
+                "a typed tuple parameter gives each part its own type",
+                "async fn h((repo, n): (PgPostRepository, i64)) -> AutumnResult<usize> { \
+                 render(n); let _ = repo; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a typed tuple parameter keeps the handle part",
+                "async fn h((repo, n): (PgPostRepository, i64)) -> AutumnResult<usize> { \
+                 let _ = n; let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
