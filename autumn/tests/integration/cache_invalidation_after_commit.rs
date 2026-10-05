@@ -391,12 +391,6 @@ async fn a_reader_inside_the_transaction_window_cannot_keep_the_old_value() {
     repo.delete_by_label(label).await.expect("clean up");
 }
 
-#[derive(diesel::QueryableByName)]
-struct AgedId {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    id: i64,
-}
-
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn the_retention_sweep_invalidates_after_it_deletes_rows() {
@@ -417,9 +411,9 @@ async fn the_retention_sweep_invalidates_after_it_deletes_rows() {
         .await
         .expect("empty after_commit_aged");
     diesel::sql_query(
-        "INSERT INTO after_commit_aged (created_at) VALUES (NOW() - INTERVAL '90 days') RETURNING id",
+        "INSERT INTO after_commit_aged (created_at) VALUES (NOW() - INTERVAL '90 days')",
     )
-    .get_result::<AgedId>(&mut *conn)
+    .execute(&mut *conn)
     .await
     .expect("seed an expired row");
     drop(conn);
