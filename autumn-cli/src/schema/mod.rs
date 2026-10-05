@@ -874,6 +874,7 @@ fn replay_baseline(
     desired: &parse::ParsedSchema,
 ) -> Result<shadow::Replay, String> {
     let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"))?;
+    shadow::adopt_model_spelling(&mut replayed.tables, desired);
     if let Some(snapshot) = snapshot {
         warn_snapshot_drift(&snapshot.tables, &replayed.tables);
     }
@@ -950,8 +951,8 @@ fn relation_clash(
             .into_iter()
             .find(|n| taken(n) || !seen.insert(key(n)))?;
         Some(format!(
-            "`{name}` is already a table, index, view, sequence or other relation in \
-             the schema; choose another name"
+            "`{name}` is already a table, index, view, sequence, type or other relation \
+             in the schema; choose another name"
         ))
     })
 }
@@ -1545,6 +1546,41 @@ mod tests {
             err.contains("127.0.0.1") && !err.contains("pw_do_not_leak"),
             "{err}"
         );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_dev_url_reads_names_that_differ_only_in_case_as_the_model_names() {
+        let root = scaffold_project(POST_MODEL, "unused");
+        std::fs::remove_file(root.path().join(".autumn/schema-snapshot.json")).expect("rm");
+        let init = root.path().join("migrations/20000101000000_init");
+        std::fs::create_dir_all(&init).expect("mkdir");
+        std::fs::write(
+            init.join("up.sql"),
+            "CREATE TABLE \"Posts\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             \"Title\" TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+        )
+        .expect("up.sql");
+        std::fs::write(init.join("down.sql"), "DROP TABLE \"Posts\";").expect("down.sql");
+        diff_at(
+            root.path(),
+            &DiffArgs {
+                backend: Some(BackendArg::Sqlite),
+                dev_url: Some("sqlite::memory:"),
+                write_migration: true,
+                ..DiffArgs::default()
+            },
+        )
+        .expect("`Posts` and `Title` are the model's `posts` and `title`");
+        let written: Vec<String> = std::fs::read_dir(root.path().join("migrations"))
+            .expect("migrations")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (!p.ends_with("20000101000000_init"))
+                    .then(|| std::fs::read_to_string(p.join("up.sql")).unwrap_or_default())
+            })
+            .collect();
+        assert!(written.is_empty(), "no new migration: {written:?}");
     }
 
     #[test]

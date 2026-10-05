@@ -367,4 +367,17 @@ async fn schema_dev_url_refuses_a_new_table_named_like_a_replayed_view() {
     );
     assert_ne!(code, Some(0), "{err}");
     assert!(err.contains("`audit_rows` is already a"), "{err}");
+
+    // A table makes a row type of its own name, so a type name is taken too.
+    std::fs::write(
+        raw.join("up.sql"),
+        "CREATE TYPE audit_rows AS ENUM ('a', 'b');\n",
+    )
+    .expect("up.sql");
+    let (_, err, code) = run_autumn(
+        dir,
+        &["schema", "diff", "--backend", "pg", "--dev-url", &url],
+    );
+    assert_ne!(code, Some(0), "{err}");
+    assert!(err.contains("`audit_rows` is already a"), "{err}");
 }

@@ -204,8 +204,11 @@ hand-written migration or with a `#[belongs_to]` foreign key.
   table.
 - `--write-migration` writes the migration and the snapshot, as usual.
 - The command refuses a new or renamed table or index whose name is already a
-  table, an index, a view, a sequence or another relation in the migrated
-  schema.
+  table, an index, a view, a sequence, a data type or another relation in the
+  migrated schema.
+- On SQLite, a replayed table or column name that differs from the model name
+  only in case (`Users` and `users`) is read as the model name, as SQLite
+  does.
 - The URL backend must match the schema backend. A `sqlite:` URL needs a CLI
   built with `--features sqlite`.
 - The replay applies your migrations only, not the framework migrations.

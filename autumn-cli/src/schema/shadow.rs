@@ -95,6 +95,59 @@ pub fn adopt_managed_flags(
     }
 }
 
+/// Give each `SQLite` table and column name the spelling of the model that
+/// declares it, when the two differ only in case (`Users` and `users`).
+/// `SQLite` reads them as one name, so the diff must too. Foreign keys, indexes
+/// and the primary key follow. Postgres names do not change: there a
+/// mixed-case name is quoted and is a different name.
+pub fn adopt_model_spelling(replayed: &mut [Table], models: &crate::schema::parse::ParsedSchema) {
+    use crate::schema::diff::SchemaChange;
+    use crate::schema::rename::apply_rename;
+    let mut changes = Vec::new();
+    for table in replayed.iter().filter(|t| t.backend == Backend::Sqlite) {
+        if models.tables.iter().any(|m| m.name == table.name) {
+            continue;
+        }
+        if let Some(to) = respelled(&table.name, models.tables.iter().map(|m| m.name.as_str())) {
+            changes.push(SchemaChange::RenameTable {
+                from: table.name.clone(),
+                to,
+            });
+        }
+    }
+    for change in &changes {
+        apply_rename(replayed, change);
+    }
+    let mut changes = Vec::new();
+    for table in replayed.iter().filter(|t| t.backend == Backend::Sqlite) {
+        let Some(model) = models.tables.iter().find(|m| m.name == table.name) else {
+            continue;
+        };
+        for col in &table.columns {
+            if model.columns.iter().any(|c| c.name == col.name) {
+                continue;
+            }
+            if let Some(to) = respelled(&col.name, model.columns.iter().map(|c| c.name.as_str())) {
+                changes.push(SchemaChange::RenameColumn {
+                    table: table.name.clone(),
+                    from: col.name.clone(),
+                    to,
+                });
+            }
+        }
+    }
+    for change in &changes {
+        apply_rename(replayed, change);
+    }
+}
+
+/// The name in `names` that is `have` in another case, if any.
+fn respelled<'a>(have: &str, mut names: impl Iterator<Item = &'a str>) -> Option<String> {
+    names
+        .find(|n| *n != have && n.eq_ignore_ascii_case(have))
+        .map(str::to_owned)
+}
+
 const fn backend_label(backend: Backend) -> &'static str {
     match backend {
         Backend::Postgres => "Postgres",
@@ -170,11 +223,17 @@ fn replay_postgres(url: &str, migrations_dir: &Path) -> Result<Replay, String> {
         other_relations: relation_names(
             &mut conn,
             // Indexes too: one on a view or a table that introspection
-            // skips is not in `tables`.
+            // skips is not in `tables`. And data types: a table makes a row
+            // type of its own name, so it cannot use a type name. An array
+            // type does not block it (Postgres moves the array type).
             "SELECT c.relname AS name FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = 'public' \
-             AND c.relkind IN ('v', 'm', 'S', 'f', 'c', 'i', 'I')",
+             AND c.relkind IN ('v', 'm', 'S', 'f', 'c', 'i', 'I') \
+             UNION SELECT t.typname AS name FROM pg_type t \
+             JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE n.nspname = 'public' AND t.typtype IN ('b', 'd', 'e', 'r', 'm') \
+             AND t.typcategory <> 'A'",
         )?,
     })
 }
@@ -275,6 +334,37 @@ mod tests {
         adopt_managed_flags(&mut replayed, None, &models);
         let flags: Vec<bool> = replayed.iter().map(|t| t.managed).collect();
         assert_eq!(flags, vec![false, false, false, true, true]);
+    }
+
+    #[test]
+    fn sqlite_replayed_names_take_the_model_spelling() {
+        use autumn_schema_core::{Column, ColumnType, ForeignKey};
+        let mut users = Table::new("Users", Backend::Sqlite);
+        users.columns.push(Column::new("Email", ColumnType::Text));
+        users.primary_key.push("Email".to_owned());
+        let mut posts = Table::new("posts", Backend::Sqlite);
+        let mut author = Column::new("author", ColumnType::Text);
+        author.references = Some(ForeignKey::new("Users", "Email"));
+        posts.columns.push(author);
+        let mut model = Table::new("users", Backend::Sqlite);
+        model.columns.push(Column::new("email", ColumnType::Text));
+        model.managed = true;
+        let models = crate::schema::parse::ParsedSchema::from_tables(vec![model]);
+
+        let mut replayed = vec![users, posts];
+        adopt_model_spelling(&mut replayed, &models);
+        assert_eq!(replayed[0].name, "users");
+        assert_eq!(replayed[0].columns[0].name, "email");
+        assert_eq!(replayed[0].primary_key, vec!["email".to_owned()]);
+        let fk = replayed[1].columns[0].references.as_ref().expect("fk");
+        assert_eq!((fk.table.as_str(), fk.column.as_str()), ("users", "email"));
+        adopt_managed_flags(&mut replayed, None, &models);
+        assert!(replayed[0].managed);
+
+        // Postgres keeps a mixed-case (quoted) name as it is.
+        let mut pg = vec![Table::new("Users", Backend::Postgres)];
+        adopt_model_spelling(&mut pg, &models);
+        assert_eq!(pg[0].name, "Users");
     }
 
     #[test]
