@@ -132,8 +132,9 @@ CREATE TRIGGER posts_delete_comments
 
 This runs for **every** hard delete of a `posts` row: through the
 repository, a raw `DELETE`, or an admin tool. An ordinary soft delete does
-not fire it — the row is only marked deleted, not removed. `add_comment`'s
-own check already refuses a soft-deleted parent. A later `purge`, though,
+not fire it — the row is only marked deleted, not removed. Through a
+`soft_delete` repository, `add_comment` refuses a soft-deleted parent (see
+[Soft-deleted parents](#soft-deleted-parents)). A later `purge`, though,
 issues a real hard `DELETE`. It fires the trigger, and the parent's
 comments go with it.
 
