@@ -2118,7 +2118,7 @@ impl RequestBuilder {
         // ── Real network request with retries ───────────────────────────────
         let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
-        let gate = self.retry_gate(url_host(&self.url).as_deref());
+        let mut gate = self.retry_gate(url_host(&self.url).as_deref());
         let mut last_retry = None;
         let mut delay = Duration::ZERO;
 
@@ -2159,8 +2159,10 @@ impl RequestBuilder {
                     let url_used = resp.url().clone();
 
                     // 429 and 502-504: retry while attempts, time and budget
-                    // remain.
+                    // remain. The HTTP stack may have followed a redirect, so
+                    // charge the host that answered.
                     if is_retryable_response(status.as_u16()) && !last {
+                        gate.rekey(url_used.as_str());
                         let wait = self.retry_policy.retry_delay(
                             &*self.entropy,
                             attempt,
@@ -2897,6 +2899,8 @@ struct RetryGate {
     budgets: Option<Arc<RetryBudgets>>,
     /// The budget of the current host.
     budget: Option<Arc<RetryBudget>>,
+    /// The key of the current host's budget.
+    host: Option<String>,
     send_header: bool,
 }
 
@@ -2928,7 +2932,17 @@ impl RetryGate {
             deadline,
             budgets,
             budget,
+            host: host.map(str::to_owned),
             send_header,
+        }
+    }
+
+    /// Move to the budget of `url`'s host when it is not the current host,
+    /// for example after the HTTP stack followed a redirect.
+    fn rekey(&mut self, url: &str) {
+        let host = url_host(url);
+        if host.is_some() && host != self.host {
+            *self = self.for_hop(url);
         }
     }
 
@@ -6342,6 +6356,28 @@ mod tests {
             ));
         }
 
+        #[test]
+        fn rekey_moves_to_the_budget_of_the_answering_host() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let mut gate = RetryGate::with_deadline(
+                None,
+                Some(Arc::clone(&budgets)),
+                Some("origin:443"),
+                true,
+            );
+            let origin = Arc::clone(gate.budget.as_ref().unwrap());
+            gate.rekey("https://origin/x");
+            assert!(
+                Arc::ptr_eq(gate.budget.as_ref().unwrap(), &origin),
+                "same host"
+            );
+            gate.rekey("https://target/x");
+            assert!(Arc::ptr_eq(
+                gate.budget.as_ref().unwrap(),
+                &budgets.for_host("target:443")
+            ));
+        }
+
         #[tokio::test(start_paused = true)]
         async fn an_expired_deadline_reclassifies_a_hop_error() {
             let gate = Deadline::at(tokio::time::Instant::now())
@@ -6389,6 +6425,7 @@ mod tests {
                 deadline: None,
                 budgets: None,
                 budget: Some(Arc::clone(&budget)),
+                host: None,
                 send_header: true,
             };
             assert!(gate.allow(RetryKind::Transient, Duration::ZERO));
