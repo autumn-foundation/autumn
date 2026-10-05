@@ -2738,7 +2738,9 @@ previous_secrets = []
         // Autumn keeps its in-memory cache and never reads the URL.
         let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
         assert!(
-            workflow.contains("AUTUMN_CACHE__BACKEND=redis AUTUMN_CACHE__REDIS__URL=secretref:redis-url"),
+            workflow.contains(
+                "AUTUMN_CACHE__BACKEND=redis AUTUMN_CACHE__REDIS__URL=secretref:redis-url"
+            ),
             "the cutover must select the Redis backend and wire its URL: {workflow}"
         );
         assert!(
@@ -3022,7 +3024,10 @@ previous_secrets = []
             "azurerm_key_vault_secret.signing_secret.id",
             "azurerm_key_vault_secret.redis_url[0].id",
         ] {
-            assert!(job.contains(secret), "the migration job must reference {secret}: {job}");
+            assert!(
+                job.contains(secret),
+                "the migration job must reference {secret}: {job}"
+            );
         }
         assert!(
             job.contains("manual_trigger_config"),
@@ -3066,7 +3071,10 @@ previous_secrets = []
             "AUTUMN_CACHE__REDIS__URL=secretref:redis-url",
             "--remove-env-vars AUTUMN_CACHE__BACKEND AUTUMN_CACHE__REDIS__URL",
         ] {
-            assert!(workflow.contains(env), "the cutover must handle `{env}`: {workflow}");
+            assert!(
+                workflow.contains(env),
+                "the cutover must handle `{env}`: {workflow}"
+            );
         }
         assert!(
             workflow.contains("keyvaultref:") && workflow.contains("identityref:"),

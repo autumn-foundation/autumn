@@ -261,14 +261,14 @@ jobs:
             SECRETS+=("$NAME=keyvaultref:$URL,identityref:$IDENTITY")
           done <<< "$JOB_SECRETS"
 
-          ENV_VARS=(
+          ENV_ARGS=(--set-env-vars
             AUTUMN_DATABASE__PRIMARY_URL=secretref:database-url
-            AUTUMN_SECURITY__SIGNING_SECRET=secretref:signing-secret
-          )
-          if printf '%s\n' "$JOB_SECRETS" | cut -f1 | grep -qx redis-url; then
-            ENV_ARGS=(--set-env-vars "${ENV_VARS[@]}" AUTUMN_CACHE__BACKEND=redis AUTUMN_CACHE__REDIS__URL=secretref:redis-url)
+            AUTUMN_SECURITY__SIGNING_SECRET=secretref:signing-secret)
+          # The job holds redis-url only when enable_redis_cache is true.
+          if cut -f1 <<< "$JOB_SECRETS" | grep -qx redis-url; then
+            ENV_ARGS+=(AUTUMN_CACHE__BACKEND=redis AUTUMN_CACHE__REDIS__URL=secretref:redis-url)
           else
-            ENV_ARGS=(--set-env-vars "${ENV_VARS[@]}" --remove-env-vars AUTUMN_CACHE__BACKEND AUTUMN_CACHE__REDIS__URL)
+            ENV_ARGS+=(--remove-env-vars AUTUMN_CACHE__BACKEND AUTUMN_CACHE__REDIS__URL)
           fi
 
           az containerapp identity assign \
