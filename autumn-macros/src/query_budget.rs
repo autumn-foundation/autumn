@@ -2120,7 +2120,15 @@ impl Analyzer {
                     || HANDLE_TRANSITIONS.contains(&method.as_str())
             }
             Expr::Call(call) => !is_handle_constructor(call),
-            Expr::Async(_) | Expr::Macro(_) => true,
+            // A path that diverges gives no value.
+            Expr::Async(_)
+            | Expr::Macro(_)
+            | Expr::Return(_)
+            | Expr::Break(_)
+            | Expr::Continue(_) => true,
+            Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
+                branch_tails(e).is_some_and(|tails| tails.iter().all(|t| self.is_known_future(t)))
+            }
             other => path_ident(other).is_some_and(|name| self.env.binding(&name).future),
         }
     }
@@ -2132,6 +2140,9 @@ impl Analyzer {
         match e {
             Expr::MethodCall(mc) => {
                 is_handle_builder(&mc.method.to_string()) && self.chain_root_is_handle(e)
+            }
+            Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
+                branch_tails(e).is_some_and(|tails| tails.iter().any(|t| self.is_pending_query(t)))
             }
             other => path_ident(other).is_some_and(|name| self.env.binding(&name).pending_query),
         }
@@ -2235,28 +2246,31 @@ impl Analyzer {
         self.env.assign(name, binding);
     }
 
-    /// Is `e` a value whose contents the analysis cannot see: a call that
-    /// is not a known constructor, a method call, an `.await`, a `?`, or a
-    /// macro other than `vec!`?
+    /// Is `e` a value whose contents the analysis cannot see? Only a value
+    /// whose syntax shows what it holds is known: a literal, `None`, a
+    /// known constructor, `vec!`, or a tuple, array or struct literal, each
+    /// of known values, or a closure. Anything else (a call, an operator, a
+    /// name) has the place's type, so it may hold what the old value held.
     fn is_opaque_value(&self, e: &Expr) -> bool {
+        let known = |e: &Expr| !self.is_opaque_value(e);
         match peel_parens(e) {
+            Expr::Lit(_) | Expr::Closure(_) => false,
+            Expr::Path(p) => !p.path.is_ident("None"),
             Expr::Call(c) => {
-                !(is_container_constructor(c)
+                !((is_container_constructor(c)
                     || is_smart_pointer_new(c)
                     || is_handle_constructor(c)
                     || self.shape_of(e).is_some())
+                    && c.args.iter().all(known))
             }
-            Expr::MethodCall(_) | Expr::Await(_) | Expr::Try(_) => true,
-            Expr::Macro(m) => vec_elems(&m.mac).is_none(),
-            Expr::If(i) => {
-                block_tail(&i.then_branch).is_none_or(|t| self.is_opaque_value(t))
-                    || i.else_branch
-                        .as_ref()
-                        .is_none_or(|(_, e)| self.is_opaque_value(e))
+            Expr::Macro(m) => vec_elems(&m.mac).is_none_or(|elems| !elems.iter().all(known)),
+            Expr::Tuple(t) => !t.elems.iter().all(known),
+            Expr::Array(a) => !a.elems.iter().all(known),
+            Expr::Struct(st) => st.rest.is_some() || !st.fields.iter().all(|f| known(&f.expr)),
+            Expr::If(_) | Expr::Match(_) | Expr::Block(_) => {
+                branch_tails(e).is_none_or(|tails| !tails.iter().all(|t| known(t)))
             }
-            Expr::Match(m) => m.arms.iter().any(|arm| self.is_opaque_value(&arm.body)),
-            Expr::Block(b) => block_tail(&b.block).is_none_or(|t| self.is_opaque_value(t)),
-            _ => false,
+            _ => true,
         }
     }
 
@@ -2943,8 +2957,18 @@ impl Analyzer {
             return Flow::ZERO;
         }
         let before = self.ledger.len();
-        let mut flow =
-            self.repeated(|s| s.framed(Target::Loop, shape.label, |s| s.scoped(&mut body)));
+        // A pass that never falls through brings no bindings to the next
+        // pass or past the loop. Its `break` and `continue` record their own.
+        let mut flow = self.repeated(|s| {
+            s.framed(Target::Loop, shape.label, |s| {
+                let start = s.env.clone();
+                let flow = s.scoped(&mut body);
+                if flow.fall.is_none() {
+                    s.env = start;
+                }
+                flow
+            })
+        });
         let (breaks, continues): (Vec<_>, Vec<_>) = flow
             .take_exits(shape.label, true)
             .into_iter()
@@ -5134,6 +5158,23 @@ impl<'a> Visit<'a> for FreeNames<'_> {
     fn visit_expr_closure(&mut self, c: &'a syn::ExprClosure) {
         let names = c.inputs.iter().flat_map(bound_names).collect();
         self.scoped(names, |s| s.visit_expr(&c.body));
+    }
+}
+
+/// The values an `if`, `match` or block can give: each branch tail. `None`
+/// when one has no tail (an `if` with no `else`, a block that ends in a
+/// statement).
+fn branch_tails(e: &Expr) -> Option<Vec<&Expr>> {
+    match peel_parens(e) {
+        Expr::If(i) => {
+            let (_, els) = i.else_branch.as_ref()?;
+            let mut tails = vec![block_tail(&i.then_branch)?];
+            tails.extend(branch_tails(els)?);
+            Some(tails)
+        }
+        Expr::Match(m) => Some(m.arms.iter().map(|arm| &*arm.body).collect()),
+        Expr::Block(b) => Some(vec![block_tail(&b.block)?]),
+        _ => None,
     }
 }
 
@@ -10302,6 +10343,78 @@ mod tests {
                 "a smart-pointer new that is not awaited stays free",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let shared = Arc::new(repo); let _ = shared; Ok(0) }",
+                Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn branch_futures_returning_loops_and_overloaded_assignments() {
+        check_handlers(&[
+            (
+                "an if that picks a query future is a known future",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let pending = if flag { repo.find(1) } else { repo.find(2) }; pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a match that picks a query future is a known future",
+                "async fn h(repo: PgPostRepository, n: i64) -> AutumnResult<usize> { \
+                 let pending = match n { 0 => repo.find(1), _ => repo.find(2) }; pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an if that picks a builder chain costs 1 when awaited",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let pending = if flag { repo.scoped() } else { repo.scoped() }; pending.await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an if that picks an opaque value is not a known future",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let pending = if flag { repo.find(1) } else { Wrapper::of(&repo) }; pending.await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a loop pass that returns does not bind after the loop",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mut slot = None; for _ in &ids { slot = Some(&repo); return Ok(0); } render(slot); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a loop pass that breaks binds after the loop",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mut slot = None; for _ in &ids { slot = Some(&repo); break; } render(slot); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a loop pass that continues binds after the loop",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let mut slot = None; for _ in &ids { slot = Some(&repo); continue; } render(slot); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an overloaded operator keeps the handle kind",
+                "async fn h(repo: PgPostRepository, factory: Factory, key: i64) -> AutumnResult<usize> { \
+                 let mut alias = repo; alias = factory + key; let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a name of unknown kind keeps the handle kind",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut alias = repo; let other = make(); alias = other; let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a constructor of an opaque value keeps the handle kind",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = Some(repo); slot = Some(make()); let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a literal still clears",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = Some(&repo); slot = None; render(slot); Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);
