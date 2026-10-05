@@ -100,6 +100,7 @@ autumn schema diff --write-migration --name add_body
 | `--write-migration` | Write `migrations/<timestamp>_<name>/{up,down}.sql` instead of printing. |
 | `--name <NAME>` | Migration directory suffix when writing. Defaults to `schema_update`. |
 | `--allow-destructive` | Permit destructive drops / an independent drop+add (a tier-2 guard; otherwise refused). |
+| `--dev-url <URL>` | Use an empty dev database as the baseline, not the snapshot. See [below](#shadow-database-baseline---dev-url). |
 
 **The snapshot advances at generation time (#2042).** When you pass
 `--write-migration`, the snapshot is moved forward to the state the generated
@@ -115,6 +116,73 @@ plan the guards actually allowed. Two consequences:
 The migration files and the snapshot advance together: if the snapshot write
 fails after the migration is on disk, the migration directory is rolled back so a
 retry regenerates a single migration rather than a duplicate.
+
+### Renames: `#[renamed_from]`
+
+Without a hint, a renamed field is a drop plus an add. The diff refuses it as a
+possible rename. Put `#[renamed_from("old_name")]` on the new field, or on the
+model (after `#[model]`) for a table rename:
+
+```rust
+#[autumn_web::model(managed)]
+#[renamed_from("articles")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[renamed_from("title")]
+    pub headline: String,
+}
+```
+
+```sql
+-- up.sql
+ALTER TABLE articles RENAME TO posts;
+
+ALTER TABLE posts RENAME COLUMN title TO headline;
+```
+
+- A rename keeps the data, so it does not need `--allow-destructive`.
+- `down.sql` renames back.
+- An index with a convention name (`idx_<table>_<field>`,
+  `idx_<table>_<field>_unique`) gets its new name too. Postgres uses
+  `ALTER INDEX ... RENAME`. SQLite drops the index and creates it again.
+- A hint is used only when the old name is in the baseline and the new name
+  is not. After the migration, the hint has no effect, so you can keep it or
+  remove it.
+- The diff refuses a hint, with no override, when the old name is still
+  declared, when two hints use one old name, or when the hints make a chain or
+  a swap. Do each of those renames in its own migration.
+- The macro accepts only one snake_case name. It removes the hint from the
+  generated code.
+
+### Shadow-database baseline: `--dev-url`
+
+`--dev-url <URL>` uses a database, not the snapshot, as the baseline:
+
+```sh
+autumn schema diff --dev-url postgres://localhost/myapp_shadow
+```
+
+1. The dev database must be empty. If it has a table, the command stops.
+2. The command applies every migration in `migrations/` to it, in one
+   transaction.
+3. It reads the schema back, and then rolls the transaction back. The dev
+   database stays empty.
+4. It diffs the models against that schema.
+
+Use it when the snapshot cannot see the full schema, for example after a
+hand-written migration or with a `#[belongs_to]` foreign key.
+
+- The snapshot is optional. When it is present and does not match the
+  migrations, the command writes a warning to stderr.
+- A replayed table is managed only when the snapshot records it as managed.
+  Thus the diff never drops a table that a hand-written migration made.
+- `--write-migration` writes the migration and the snapshot, as usual.
+- The URL backend must match the schema backend. A `sqlite:` URL needs a CLI
+  built with `--features sqlite`.
+- A migration that cannot run in a transaction (for example
+  `CREATE INDEX CONCURRENTLY`) makes the replay fail.
+- Errors never show the URL or its password.
 
 ### SQLite ALTER support via table-recreate (#2035)
 
@@ -197,21 +265,21 @@ autumn schema migrate --profile prod
 > `autumn migrate` up/down CLI documented in [Migrations](./migrations.md). The
 > classic verb is currently Postgres-only; `autumn schema migrate` can apply on
 > both backends, but — as noted above — the SQLite path needs a CLI built
-> `--features sqlite` (the default binary is Postgres-only). `schema pull` remains
-> Postgres-only in this slice, and `schema doctor`'s database-touching checks
-> (pending-migrations, database-schema-drift) are likewise Postgres-only.
+> `--features sqlite` (the default binary is Postgres-only). `schema pull` and
+> `schema doctor`'s database-schema-drift check have the same rule. The
+> pending-migrations check is Postgres-only.
 
 ---
 
 ## `autumn schema pull`
 
-Introspect a live **Postgres** database and write (or, with `--dry-run`,
-describe) a snapshot of its actual shape — the DB-derived counterpart to
+Introspect a live **Postgres** or **SQLite** database and write (or, with
+`--dry-run`, describe) a snapshot of its actual shape — the DB-derived counterpart to
 `schema snapshot`. Use it to adopt a brownfield schema, or to re-baseline a
 snapshot that drifted from the database.
 
 ```sh
-# Introspect the profile-resolved Postgres DB into .autumn/schema-snapshot.json.
+# Introspect the profile-resolved DB into .autumn/schema-snapshot.json.
 autumn schema pull
 
 # Show what pulling would change without writing anything.
@@ -231,9 +299,9 @@ keys, unique constraints, and indexes into the **same** IR the model parser
 produces. Before overwriting, a **provider-lock** guard refuses to clobber a
 snapshot tagged for another backend.
 
-> **Postgres only in this slice.** A resolved SQLite URL is **refused loudly** —
-> SQLite database introspection is a future slice of #1975, so no partial
-> snapshot is written. A `--dry-run` reports bidirectionally so a manually-dropped
+> **SQLite needs the `sqlite` build.** A CLI built with `--features sqlite`
+> introspects a SQLite database. The default binary refuses a SQLite URL and
+> writes no snapshot. A `--dry-run` reports bidirectionally so a manually-dropped
 > default / FK / CHECK in the live DB (which the forward pass cannot express) is
 > still surfaced as a removal.
 
@@ -267,9 +335,10 @@ checks are:
   database URL's backend.
 - **pending-migrations** — whether generated migration files are still unapplied
   (Postgres).
-- **database-schema-drift** (#2045) — when a Postgres database is reachable, the
+- **database-schema-drift** (#2045) — when the database is reachable, the
   snapshot is introspected against the live schema bidirectionally; drift is an
-  actionable **WARN**. Offline, it stays a non-failing WARN.
+  actionable **WARN**. Offline, it stays a non-failing WARN. SQLite needs the
+  `sqlite` build.
 
 ---
 

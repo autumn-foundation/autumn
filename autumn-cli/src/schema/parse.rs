@@ -45,6 +45,10 @@
 //! - `#[unique]` — a `UNIQUE` column + unique index. Also **parser-recognized**:
 //!   generator output records uniqueness only in the migration (a `CREATE UNIQUE
 //!   INDEX`), not on the struct field (see the slice-3+ limitation below).
+//! - `#[renamed_from("old")]` — a rename hint, on a field (column) or on the
+//!   struct (table). It does not change the [`Table`]; it goes to
+//!   [`ParsedSchema::renames`] for the diff engine (see
+//!   [`crate::schema::rename`]). A malformed hint is ignored.
 //!
 //! Every other field attribute the `#[model]` macro accepts (`#[searchable]`,
 //! `#[validate]`, `#[encrypted]`, `#[private]`, `#[normalize]`, `#[lock_version]`,

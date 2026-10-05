@@ -11,6 +11,9 @@
 //! JSON; `snapshot` writes the canonical, checked-in [`snapshot`] baseline the
 //! later diff engine consumes. These are the first actions of the eventual full
 //! `autumn schema` group.
+//!
+//! [`rename`] applies `#[renamed_from]` hints in the diff. [`shadow`] replays
+//! the migrations on an empty dev database for `schema diff --dev-url`.
 
 pub mod diff;
 pub mod doctor;
@@ -18,6 +21,7 @@ pub mod introspect;
 pub mod migrate;
 pub mod parse;
 pub mod rename;
+pub mod shadow;
 pub mod snapshot;
 
 use std::collections::BTreeMap;
@@ -106,6 +110,11 @@ pub enum SchemaAction {
         /// Permit destructive drops / an independent drop+add (tier-2 guard).
         #[arg(long)]
         allow_destructive: bool,
+        /// Use an empty dev database as the baseline. The command applies the
+        /// migrations to it in one transaction, reads the schema, and rolls
+        /// back. The snapshot becomes optional.
+        #[arg(long, value_name = "URL")]
+        dev_url: Option<String>,
     },
     /// Introspect the configured Postgres database and write a canonical,
     /// dialect-tagged snapshot of its live shape — the DB-derived diff baseline.
@@ -177,14 +186,16 @@ pub fn run(action: SchemaAction) {
             write_migration,
             name,
             allow_destructive,
-        } => run_diff(
-            from.as_deref(),
-            snapshot.as_deref(),
+            dev_url,
+        } => run_diff(&DiffArgs {
+            from: from.as_deref(),
+            snapshot: snapshot.as_deref(),
             backend,
             write_migration,
-            name.as_deref(),
+            name: name.as_deref(),
             allow_destructive,
-        ),
+            dev_url: dev_url.as_deref(),
+        }),
         SchemaAction::Pull {
             profile,
             out,
@@ -655,45 +666,51 @@ fn reverse_only_removals(reverse: &MigrationPlan) -> Vec<String> {
 /// parsed or diffed, so a dialect-mismatched snapshot fails cleanly with
 /// [`snapshot::SnapshotError::BackendMismatch`] and no diff work runs. This is
 /// the first caller of [`SchemaSnapshot::ensure_backend_matches`].
-fn run_diff(
-    from: Option<&Path>,
-    snapshot_path: Option<&Path>,
+/// The inputs of `autumn schema diff`.
+#[derive(Debug, Default, Clone, Copy)]
+struct DiffArgs<'a> {
+    /// `--from`: the models source.
+    from: Option<&'a Path>,
+    /// `--snapshot`: the baseline snapshot path.
+    snapshot: Option<&'a Path>,
+    /// `--backend`: the dialect.
     backend: Option<BackendArg>,
+    /// `--write-migration`.
     write_migration: bool,
-    name: Option<&str>,
+    /// `--name`: the migration directory suffix.
+    name: Option<&'a str>,
+    /// `--allow-destructive`.
     allow_destructive: bool,
-) -> Result<(), String> {
+    /// `--dev-url`: replay the migrations on this database and use the result
+    /// as the baseline (see [`shadow`]).
+    dev_url: Option<&'a str>,
+}
+
+fn run_diff(args: &DiffArgs<'_>) -> Result<(), String> {
     let project_root = std::env::current_dir()
         .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
-    diff_at(
-        &project_root,
-        from,
-        snapshot_path,
-        backend,
-        write_migration,
-        name,
-        allow_destructive,
-    )
+    diff_at(&project_root, args)
 }
 
 /// The body of [`run_diff`], taking an explicit `project_root` (rather than the
 /// process CWD) so the command wiring is testable without mutating the current
 /// directory.
-fn diff_at(
-    project_root: &Path,
-    from: Option<&Path>,
-    snapshot_path: Option<&Path>,
-    backend: Option<BackendArg>,
-    write_migration: bool,
-    name: Option<&str>,
-    allow_destructive: bool,
-) -> Result<(), String> {
+fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
+    let DiffArgs {
+        from,
+        snapshot: snapshot_path,
+        backend,
+        write_migration,
+        name,
+        allow_destructive,
+        dev_url,
+    } = *args;
     // When any input falls back to a project-relative default (the models
-    // source, the default snapshot path, or the auto-detected backend), the
-    // command needs the current directory to be the project root — mirroring
-    // `run_snapshot`.
+    // source, the default snapshot path, the auto-detected backend, or the
+    // `migrations/` directory a `--dev-url` replays), the command needs the
+    // current directory to be the project root — mirroring `run_snapshot`.
     let backend_given = backend.is_some();
-    if (from.is_none() || snapshot_path.is_none() || backend.is_none())
+    if (from.is_none() || snapshot_path.is_none() || backend.is_none() || dev_url.is_some())
         && crate::generate::ensure_project_root(project_root).is_err()
     {
         return Err(project_root_required_error(!backend_given));
@@ -707,27 +724,46 @@ fn diff_at(
     );
 
     // (b) Load the baseline snapshot (default `SNAPSHOT_DEFAULT_PATH`). A missing
-    //     file is a friendly "run `autumn schema snapshot` first" error.
+    //     file is a friendly "run `autumn schema snapshot` first" error, except
+    //     with `--dev-url`, where the snapshot is optional.
+    // (c) PROVIDER-LOCK GUARD — before parsing/diffing.
     let snapshot_path = snapshot_path.map_or_else(
         || project_root.join(SNAPSHOT_DEFAULT_PATH),
         Path::to_path_buf,
     );
-    let baseline = snapshot::load_snapshot(&snapshot_path).map_err(|e| match e {
-        snapshot::SnapshotError::Io { source, .. }
+    let snapshot = match snapshot::load_snapshot(&snapshot_path) {
+        Ok(snapshot) => {
+            snapshot
+                .ensure_backend_matches(backend)
+                .map_err(|e| e.to_string())?;
+            Some(snapshot)
+        }
+        Err(snapshot::SnapshotError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound && dev_url.is_some() =>
+        {
+            None
+        }
+        Err(snapshot::SnapshotError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
-            format!(
+            return Err(format!(
                 "no schema snapshot at {} — run `autumn schema snapshot` first to create the diff baseline",
                 snapshot_path.display()
-            )
+            ));
         }
-        other => other.to_string(),
-    })?;
-
-    // (c) PROVIDER-LOCK GUARD — before parsing/diffing.
-    baseline
-        .ensure_backend_matches(backend)
-        .map_err(|e| e.to_string())?;
+        Err(other) => return Err(other.to_string()),
+    };
+    let baseline_tables = match dev_url {
+        Some(url) => {
+            let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"))?;
+            if let Some(snapshot) = &snapshot {
+                warn_snapshot_drift(&snapshot.tables, &replayed);
+            }
+            shadow::adopt_managed_flags(&mut replayed, snapshot.as_ref().map(|s| &s.tables[..]));
+            replayed
+        }
+        None => snapshot.map(|s| s.tables).unwrap_or_default(),
+    };
 
     // (d) Parse the desired state with the SAME backend tag.
     let models_path = match from {
@@ -744,9 +780,9 @@ fn diff_at(
         allow_destructive,
         ..Default::default()
     };
-    let plan = diff::diff_schema(&baseline.tables, &desired, opts);
+    let plan = diff::diff_schema(&baseline_tables, &desired, opts);
     if plan.is_empty() {
-        println!("No schema changes — models match the snapshot baseline.");
+        println!("No schema changes — models match the baseline.");
         return Ok(());
     }
     diff::guard_plan(&plan, opts).map_err(|e| e.to_string())?;
@@ -758,7 +794,7 @@ fn diff_at(
     // use the new names.
     let ctx = diff::SchemaContext::from_tables(
         &desired.tables,
-        &rename::renamed_baseline(&baseline.tables, &plan.changes),
+        &rename::renamed_baseline(&baseline_tables, &plan.changes),
     );
     let up = diff::emit_up_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
     let down = diff::emit_down_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
@@ -789,7 +825,7 @@ fn diff_at(
     // regenerate the same SQL as a second migration (baseline never advanced)
     // and applying both would fail on duplicate DDL. Roll the migration dir back
     // on a snapshot-write failure so the pre-command state is left intact.
-    let target_tables = project_plan_target(&baseline.tables, &plan);
+    let target_tables = project_plan_target(&baseline_tables, &plan);
     if let Err(e) =
         snapshot::write_snapshot(&snapshot_path, &SchemaSnapshot::new(backend, target_tables))
     {
@@ -804,6 +840,26 @@ fn diff_at(
     );
     println!("advanced schema snapshot at {}", snapshot_path.display());
     Ok(())
+}
+
+/// Warn on stderr when the snapshot does not match the schema the migrations
+/// make (the `--dev-url` replay). The diff still uses the replayed schema.
+fn warn_snapshot_drift(snapshot: &[Table], replayed: &[Table]) {
+    let drift = diff::diff_schema(
+        snapshot,
+        &parse::ParsedSchema::from_tables(replayed.to_vec()),
+        diff::DiffOptions {
+            definitions_authoritative: true,
+            ..Default::default()
+        },
+    );
+    if !drift.is_empty() {
+        eprintln!(
+            "warning: the snapshot does not match the migrations. The replayed \
+             migrations differ from the snapshot by:\n{}",
+            diff::describe_plan(&drift)
+        );
+    }
 }
 
 /// Project the guarded migration `plan` onto the `baseline` tables to compute the
@@ -1109,12 +1165,10 @@ mod tests {
         let root = scaffold_project(POST_MODEL, &posts_snapshot("Sqlite"));
         let err = diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            false,
-            None,
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                ..DiffArgs::default()
+            },
         )
         .unwrap_err();
         assert!(
@@ -1134,12 +1188,10 @@ mod tests {
         // No snapshot file written.
         let err = diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            false,
-            None,
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                ..DiffArgs::default()
+            },
         )
         .unwrap_err();
         assert!(
@@ -1158,12 +1210,11 @@ mod tests {
         let before = std::fs::read_to_string(&snapshot_path).expect("snapshot before");
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            None,
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                ..DiffArgs::default()
+            },
         )
         .expect("no-op diff ok");
         assert!(
@@ -1192,12 +1243,12 @@ mod tests {
         let root = scaffold_project(models, &posts_snapshot("Postgres"));
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("rename_posts"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("rename_posts"),
+                ..DiffArgs::default()
+            },
         )
         .expect("a rename needs no --allow-destructive");
 
@@ -1228,15 +1279,35 @@ mod tests {
         // The hints stay in the source; the next diff is a no-op.
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("again"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("again"),
+                ..DiffArgs::default()
+            },
         )
         .expect("second diff");
         assert_eq!(std::fs::read_dir(&migrations).expect("read").count(), 1);
+    }
+
+    #[test]
+    fn dev_url_makes_the_snapshot_optional() {
+        let root = scaffold_project(POST_MODEL, "unused");
+        std::fs::remove_file(root.path().join(".autumn/schema-snapshot.json")).expect("rm");
+        let err = diff_at(
+            root.path(),
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                dev_url: Some("postgres://user:pw_do_not_leak@127.0.0.1:1/dev"),
+                ..DiffArgs::default()
+            },
+        )
+        .unwrap_err();
+        assert!(!err.contains("autumn schema snapshot"), "{err}");
+        assert!(
+            err.contains("127.0.0.1") && !err.contains("pw_do_not_leak"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1254,12 +1325,12 @@ mod tests {
         let root = scaffold_project(models, &posts_snapshot("Postgres"));
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_body"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_body"),
+                ..DiffArgs::default()
+            },
         )
         .expect("write migration ok");
 
@@ -1347,12 +1418,12 @@ mod tests {
 
         let result = diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_body"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_body"),
+                ..DiffArgs::default()
+            },
         );
 
         // Restore permissions so the tempdir can be cleaned up (and the migrations
@@ -1404,12 +1475,12 @@ mod tests {
         // Generate change A. The snapshot advances to include `body`.
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_body"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_body"),
+                ..DiffArgs::default()
+            },
         )
         .expect("write migration A ok");
 
@@ -1433,12 +1504,12 @@ mod tests {
         // migration directory is written (the snapshot already matches).
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_body_again"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_body_again"),
+                ..DiffArgs::default()
+            },
         )
         .expect("second (converged) diff ok");
         let dir_count = std::fs::read_dir(root.path().join("migrations"))
@@ -1470,12 +1541,12 @@ mod tests {
 
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_draft"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_draft"),
+                ..DiffArgs::default()
+            },
         )
         .expect("write migration B (draft) ok");
 
@@ -1623,12 +1694,10 @@ mod tests {
         let root = scaffold_project(models, &posts_snapshot("Postgres"));
         let err = diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            false,
-            None,
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                ..DiffArgs::default()
+            },
         )
         .unwrap_err();
         assert!(
@@ -1639,12 +1708,11 @@ mod tests {
         // With the flag it succeeds (prints the plan).
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            false,
-            None,
-            true,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                allow_destructive: true,
+                ..DiffArgs::default()
+            },
         )
         .expect("allowed with --allow-destructive");
     }

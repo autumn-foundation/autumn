@@ -30,9 +30,9 @@
 //! [`SchemaDiagnostic`](crate::schema::parse::SchemaDiagnostic)) is likewise not
 //! dropped. The **accepted trade-off** is that the diff is intentionally
 //! conservative and will *miss* a genuine removal of one of those facets; that is
-//! preferable to ever destroying parser-invisible or hand-written state, and the
-//! genuine-removal case is recovered by later slices (`#[renamed_from]`, richer
-//! parsing, a shadow-DB oracle).
+//! preferable to ever destroying parser-invisible or hand-written state. A
+//! rename is not a removal: `#[renamed_from]` turns it into a `Rename*` change
+//! (see [`crate::schema::rename`]).
 //!
 //! # Invisible `#[belongs_to(...)]` association foreign keys (offline limitation)
 //!
@@ -67,8 +67,8 @@
 //!    `Column.references` and no diagnostic, so it cannot be detected offline —
 //!    the resulting `DROP TABLE` (already `--allow-destructive`-gated) may fail to
 //!    apply because the real `<retained>_<col>_fkey` constraint still depends on
-//!    the dropped table. A precise guard is impossible without schema introspection
-//!    (a future slice's shadow-DB / `--dev-url` oracle); a blanket "refuse every
+//!    the dropped table. A precise guard needs schema introspection (the
+//!    `--dev-url` replay gives a baseline that has these FKs); a blanket "refuse every
 //!    table drop" would make the common case useless and is deliberately **not**
 //!    done. Instead every emitted `DROP TABLE` carries an advisory
 //!    `-- autumn-safety:` comment naming this exact gap so the operator verifies

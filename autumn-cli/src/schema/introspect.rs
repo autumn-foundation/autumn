@@ -211,23 +211,41 @@ pub fn introspect_postgres(url: &str) -> Result<Vec<Table>, IntrospectError> {
     // `PgConnection::establish` accepts both URL and libpq key-value DSNs; defer
     // URL parsing to the error path so a valid key-value string still connects
     // (host/port are only needed for a credential-safe message). Mirrors db_pull.
-    let mut conn = PgConnection::establish(url).map_err(|_| {
+    let mut conn = connect_postgres(url)?;
+    introspect_postgres_conn(&mut conn)
+}
+
+/// Open a Postgres connection. The error carries only the host and port.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Connection`] if the database is unreachable.
+pub fn connect_postgres(url: &str) -> Result<PgConnection, IntrospectError> {
+    PgConnection::establish(url).map_err(|_| {
         let (host, port) = parse_host_port(url).unwrap_or_else(|| ("localhost".to_owned(), 5432));
         IntrospectError::Connection { host, port }
-    })?;
+    })
+}
 
-    let table_names = list_tables(&mut conn)?;
+/// [`introspect_postgres`] on an open connection (for example one inside the
+/// `--dev-url` replay transaction).
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Query`] if a catalog query fails.
+pub fn introspect_postgres_conn(conn: &mut PgConnection) -> Result<Vec<Table>, IntrospectError> {
+    let table_names = list_tables(conn)?;
     if table_names.is_empty() {
         return Ok(Vec::new());
     }
 
     // Batched catalog reads — a constant number of queries regardless of table
     // count (never one query per table).
-    let columns_by_table = fetch_columns(&mut conn, &table_names)?;
-    let pks_by_table = fetch_primary_keys(&mut conn, &table_names)?;
-    let indexes_by_table = fetch_indexes(&mut conn, &table_names)?;
-    let fks_by_table = fetch_foreign_keys(&mut conn, &table_names)?;
-    let checks_by_table = fetch_checks(&mut conn, &table_names)?;
+    let columns_by_table = fetch_columns(conn, &table_names)?;
+    let pks_by_table = fetch_primary_keys(conn, &table_names)?;
+    let indexes_by_table = fetch_indexes(conn, &table_names)?;
+    let fks_by_table = fetch_foreign_keys(conn, &table_names)?;
+    let checks_by_table = fetch_checks(conn, &table_names)?;
 
     let mut tables = Vec::with_capacity(table_names.len());
     for name in &table_names {
@@ -1441,7 +1459,7 @@ fn serial_kind_for(
 /// own `normalize_sqlite_target` (kept in lock-step so the pull connects to the same
 /// file `schema migrate` does). An empty or `:memory:` target stays `:memory:`.
 #[cfg(feature = "sqlite")]
-fn sqlite_target(url: &str) -> String {
+pub(crate) fn sqlite_target(url: &str) -> String {
     if url.starts_with("file:") {
         return url.to_owned();
     }
@@ -1582,6 +1600,19 @@ pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
     let mut conn = SqliteConnection::establish(&target)
         .map_err(|_| IntrospectError::ConnectionSqlite { path: target })?;
     sqlite::introspect(&mut conn)
+}
+
+/// [`introspect_sqlite`] on an open connection (for example one inside the
+/// `--dev-url` replay transaction).
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Query`] if a catalog query or PRAGMA fails.
+#[cfg(feature = "sqlite")]
+pub fn introspect_sqlite_conn(
+    conn: &mut diesel::SqliteConnection,
+) -> Result<Vec<Table>, IntrospectError> {
+    sqlite::introspect(conn)
 }
 
 /// `SQLite` catalog probes + IR assembly. All row DTOs and helpers live here so the
