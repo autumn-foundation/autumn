@@ -129,3 +129,20 @@ async fn redis_readiness_config_makes_redis_gate_ready() {
 
     client.get("/ready").send().await.assert_status(503);
 }
+
+/// `TestApp` always uses in-process channels, so a Redis channels config is
+/// not a dependency there and gets no indicator. No Docker: nothing connects.
+#[cfg(feature = "ws")]
+#[tokio::test]
+async fn test_app_with_redis_channels_config_has_no_channels_indicator() {
+    let mut config = AutumnConfig::default();
+    config.health.detailed = true;
+    config.channels.backend = autumn_web::config::ChannelBackend::Redis;
+    config.channels.redis.url = Some("redis://127.0.0.1:1".to_owned());
+    let client = TestApp::new().config(config).build();
+
+    let health = client.get("/actuator/health").send().await;
+    health.assert_json::<serde_json::Value, _>(|body| {
+        assert!(body["components"].get("redis:channels").is_none(), "{body}");
+    });
+}

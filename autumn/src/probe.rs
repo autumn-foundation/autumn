@@ -269,6 +269,22 @@ impl ProbeState {
         }
     }
 
+    /// A probe state whose primary and replica pings are fakes. For tests.
+    #[cfg(all(test, feature = "db"))]
+    pub(crate) fn with_db_pings(
+        primary: Arc<dyn crate::db_ping::DbPing>,
+        replica: Arc<dyn crate::db_ping::DbPing>,
+    ) -> Self {
+        Self {
+            db_checks: Arc::new(DbChecks {
+                primary: DbPingCheck::with_ping("primary", primary),
+                replica: DbPingCheck::with_ping("replica", replica),
+                ..DbChecks::default()
+            }),
+            ..Self::default()
+        }
+    }
+
     /// Ping the primary of `pool`, or return the cached result.
     #[cfg(feature = "db")]
     pub(crate) async fn check_primary_db(&self, pool: &DbPool) -> DbPingStatus {
@@ -633,13 +649,6 @@ fn probe_response<S: ProvideProbeState>(
     (status_code, Json(body))
 }
 
-/// Return `true` when `/ready` is `503` for a reason other than the checks.
-/// In that case, the probe does not run them.
-fn already_degraded<S: ProvideProbeState>(state: &S) -> bool {
-    let probes = state.probes();
-    !probes.is_startup_complete() || probes.is_shutting_down() || !dependency_readiness(state).0
-}
-
 /// Run all readiness-group [`HealthIndicator`]s and return `false` if any are
 /// `Down` or `OutOfService`.
 ///
@@ -663,17 +672,24 @@ async fn check_primary_db<S: ProvideProbeState + Sync>(state: &S) -> Option<DbPi
 
 /// Build the readiness response for `/ready` and `/health`.
 async fn readiness<S: ProvideProbeState + Sync>(state: &S) -> (StatusCode, Json<ProbeResponse>) {
-    #[cfg(feature = "db")]
-    refresh_replica_readiness(state).await;
-    // Do not run slow checks when the probe is `503` anyway.
-    if already_degraded(state) {
+    // Before startup completes and while draining, `/ready` is `503` whatever
+    // the checks report. Do not run the slow ones.
+    let probes = state.probes();
+    if !probes.is_startup_complete() || probes.is_shutting_down() {
+        #[cfg(feature = "db")]
+        refresh_replica_readiness(state).await;
         return probe_response(state, ProbeKind::Ready, true);
     }
 
     #[cfg(feature = "db")]
     {
-        let (primary, indicators_ready) =
-            tokio::join!(check_primary_db(state), check_readiness_indicators(state));
+        // Run all checks at the same time: the wall time is one ping budget,
+        // not the sum.
+        let ((), primary, indicators_ready) = tokio::join!(
+            refresh_replica_readiness(state),
+            check_primary_db(state),
+            check_readiness_indicators(state)
+        );
         let primary_ready = !state.probes().primary_gates_readiness()
             || primary.as_ref().is_none_or(|status| status.up);
         let (code, Json(mut body)) =
@@ -1143,6 +1159,7 @@ mod tests {
         struct DbProbeState {
             probes: ProbeState,
             pool: DbPool,
+            replica: Option<DbPool>,
         }
 
         impl ProvideProbeState for DbProbeState {
@@ -1164,6 +1181,10 @@ mod tests {
 
             fn pool(&self) -> Option<&DbPool> {
                 Some(&self.pool)
+            }
+
+            fn replica_pool(&self) -> Option<&DbPool> {
+                self.replica.as_ref()
             }
         }
 
@@ -1192,6 +1213,7 @@ mod tests {
             DbProbeState {
                 probes,
                 pool: idle_pool("postgres://autumn@127.0.0.1:1/unused"),
+                replica: None,
             }
         }
 
@@ -1294,6 +1316,29 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
+        async fn primary_and_replica_pings_run_at_the_same_time() {
+            let primary = FakePing::new(Duration::from_millis(400), Ok(()));
+            let replica = FakePing::new(Duration::from_millis(400), Ok(()));
+            let probes = ProbeState::with_db_pings(primary.clone(), replica.clone());
+            probes.mark_startup_complete();
+            probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+            let state = DbProbeState {
+                probes,
+                pool: idle_pool("postgres://autumn@127.0.0.1:1/unused"),
+                replica: Some(idle_pool("postgres://autumn@127.0.0.1:1/replica")),
+            };
+
+            let started = tokio::time::Instant::now();
+            let (status, _) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(primary.calls(), 1);
+            assert_eq!(replica.calls(), 1);
+            // One ping budget, not two: the pings do not wait for each other.
+            assert_eq!(started.elapsed(), Duration::from_millis(400));
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn ready_does_not_ping_primary_while_draining() {
             let ping = FakePing::new(Duration::ZERO, Ok(()));
             let state = state_with(ping.clone());
@@ -1325,6 +1370,7 @@ mod tests {
             let clone = DbProbeState {
                 probes: state.probes.clone(),
                 pool: state.pool.clone(),
+                replica: None,
             };
 
             let _ = readiness_response(&state).await;
@@ -1341,6 +1387,7 @@ mod tests {
             let state = DbProbeState {
                 probes,
                 pool: idle_pool("sqlite::memory:"),
+                replica: None,
             };
 
             let (status, _) = readiness_response(&state).await;
@@ -1382,6 +1429,7 @@ mod tests {
             let state = DbProbeState {
                 probes,
                 pool: idle_pool(&format!("postgres://autumn@{addr}/autumn")),
+                replica: None,
             };
             let holders: Vec<_> = (0..2)
                 .map(|_| {
@@ -1416,6 +1464,7 @@ mod tests {
             let state = DbProbeState {
                 probes,
                 pool: idle_pool(&format!("postgres://autumn@{addr}/autumn")),
+                replica: None,
             };
 
             let started = std::time::Instant::now();
@@ -1442,6 +1491,7 @@ mod tests {
             let state = DbProbeState {
                 probes,
                 pool: idle_pool(&format!("postgres://autumn@{addr}/autumn")),
+                replica: None,
             };
 
             let (status, _) = readiness_response(&state).await;
