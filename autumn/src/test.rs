@@ -1227,12 +1227,19 @@ impl TestApp {
     ///
     /// Mirrors [`crate::app::AppBuilder::with_flag_store`].
     #[must_use]
-    pub fn with_flag_store<S>(mut self, store: S) -> Self
+    pub fn with_flag_store<S>(self, store: S) -> Self
     where
         S: crate::feature_flags::FlagStore,
     {
         use std::sync::Arc;
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.with_flag_service(service)
+    }
+
+    /// Mirrors [`crate::app::AppBuilder::with_flag_service`]. It does not
+    /// preload the store.
+    #[must_use]
+    pub fn with_flag_service(mut self, service: crate::feature_flags::FeatureFlagService) -> Self {
         self.state_initializers.push(Box::new(move |state| {
             state.insert_extension(service);
         }));

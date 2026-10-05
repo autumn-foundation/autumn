@@ -2473,9 +2473,9 @@ impl AppBuilder {
     /// in production use the Postgres-backed
     /// `autumn_web::feature_flags::pg::PgFlagStore`.
     ///
-    /// At startup the app starts [`FlagStore::preload`](crate::feature_flags::FlagStore::preload)
-    /// once on the blocking pool and does not wait for it. A failed preload
-    /// logs a warning; it does not stop startup.
+    /// At startup the app calls [`FlagStore::preload`](crate::feature_flags::FlagStore::preload)
+    /// once on the blocking pool and waits up to 5 seconds for it. A failed
+    /// preload logs a warning; it does not stop startup.
     ///
     /// # Sharing the store with the poll listener
     ///
@@ -2496,7 +2496,7 @@ impl AppBuilder {
     /// ```
     ///
     /// `Arc<PgFlagStore>` implements `FlagStore`, so the same `Arc` is
-    /// accepted directly without creating a separate cache instance.
+    /// accepted directly without creating a separate snapshot.
     ///
     /// # Basic example
     ///
@@ -2515,11 +2515,25 @@ impl AppBuilder {
         S: crate::feature_flags::FlagStore,
     {
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
-        self.install_flag_service(service)
+        self.with_flag_service(service)
     }
 
-    /// Put `service` into the app state and preload its store at startup.
-    fn install_flag_service(self, service: crate::feature_flags::FeatureFlagService) -> Self {
+    /// Register a configured [`FeatureFlagService`](crate::feature_flags::FeatureFlagService),
+    /// for example one with declared defaults.
+    ///
+    /// Like [`with_flag_store`](Self::with_flag_store), it preloads the store
+    /// at startup.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::feature_flags::{FeatureFlagService, InMemoryFlagStore};
+    /// use std::sync::Arc;
+    ///
+    /// let flags = FeatureFlagService::new(Arc::new(InMemoryFlagStore::new()))
+    ///     .with_default("checkout_v2", true);
+    /// autumn_web::app().with_flag_service(flags).run().await;
+    /// ```
+    #[must_use]
+    pub fn with_flag_service(self, service: crate::feature_flags::FeatureFlagService) -> Self {
         let preload = service.clone();
         self.state_initializer(move |state| {
             state.insert_extension(service);
@@ -2559,7 +2573,7 @@ impl AppBuilder {
     {
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>)
             .with_group_resolver(resolver);
-        self.install_flag_service(service)
+        self.with_flag_service(service)
     }
 
     /// Register an experiment store, enabling the [`Experiments`] extractor.
@@ -18159,15 +18173,30 @@ mod tests {
             run_startup_hooks(&builder.startup_hooks, state)
                 .await
                 .expect("a failed flag preload must not stop startup");
-            // The preload runs detached on the blocking pool.
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while store.preloads.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("store was not preloaded (fail = {fail})"));
+            // Startup waits for a fast preload.
+            assert_eq!(
+                store.preloads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "fail = {fail}"
+            );
         }
+    }
+
+    #[test]
+    fn with_flag_service_keeps_declared_defaults() {
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(
+            crate::feature_flags::InMemoryFlagStore::new(),
+        ))
+        .with_default("checkout_v2", true);
+        let builder = app().with_flag_service(service);
+        let state = AppState::for_test();
+        run_state_initializers(builder.state_initializers, &state);
+
+        let installed = state
+            .extension::<crate::feature_flags::FeatureFlagService>()
+            .expect("service registered");
+        assert!(installed.is_enabled("checkout_v2", None));
+        assert_eq!(builder.startup_hooks.len(), 1, "the store is preloaded");
     }
 
     fn startup_noop_job_handler(

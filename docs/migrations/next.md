@@ -151,6 +151,40 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Feature flags: `PgFlagStore::get` errors before the first load
+
+**Why:** `get` connected to the database on the request thread, and a store
+error turned every flag off (issue #3063). Now `get` reads an in-memory
+snapshot and never connects on a Tokio worker.
+
+**Before (`{X.Y}`):** `get` on a new store read the database. A read error
+looked like an absent flag to code that used `.ok().flatten()`:
+
+```rust
+let store = PgFlagStore::new(url);
+if store.get("beta").ok().flatten().is_none() {
+    store.disable("beta", Some("init")).ok(); // also ran on a read error
+}
+```
+
+**After (`{(X+1).0}`):** on a Tokio runtime, `get` returns an error until the
+first load ends. Load first, and seed only on `Ok(None)`:
+
+```rust
+let store = PgFlagStore::new(url);
+store.refresh()?; // blocks: call it at startup
+if matches!(store.get("beta"), Ok(None)) {
+    store.disable("beta", Some("init"))?;
+}
+```
+
+An app that registers the store with `with_flag_store` needs no change: the
+app loads the store at startup. `with_cache_ttl(url, Duration::ZERO)` now
+means "refresh at each read", not "read the database at each read".
+
+**Automation:** `manual` - it is a behaviour change, and no code rewrite
+applies.
+
 ---
 
 ## Plugin authors

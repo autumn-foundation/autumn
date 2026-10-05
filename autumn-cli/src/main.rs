@@ -1796,9 +1796,8 @@ enum Commands {
 
     /// Inspect and toggle feature flags at runtime without redeploying.
     ///
-    /// Feature flags control which actors see a feature. Mutations propagate
-    /// to all running replicas within seconds via Postgres LISTEN/NOTIFY cache
-    /// invalidation.
+    /// Feature flags control which actors see a feature. Running replicas
+    /// poll the database and see a change within one poll interval.
     ///
     /// The database URL is resolved from `autumn.toml`, profile overrides, or
     /// the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` /

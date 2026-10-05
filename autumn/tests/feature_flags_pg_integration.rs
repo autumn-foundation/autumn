@@ -175,11 +175,11 @@ async fn pg_store_cache_hit_avoids_second_db_call() {
     store.refresh().unwrap();
     store.enable("cached_flag", None).unwrap();
 
-    // First read populates the cache.
+    // The write put the row into the snapshot.
     let v1 = store.get("cached_flag").unwrap();
     assert!(v1.is_some());
 
-    // Second read should hit the in-process cache (same result).
+    // A second read serves the same snapshot value.
     let v2 = store.get("cached_flag").unwrap();
     assert_eq!(v1, v2);
 }
@@ -210,7 +210,8 @@ async fn pg_store_serves_last_known_flags_when_the_database_stops() {
     assert!(!svc.is_enabled("payments", None));
 
     container.stop().await.expect("stop postgres");
-    // A refresh now fails. The flags keep their last-known values.
+    // A refresh now fails. The snapshot keeps the flags as they were, so the
+    // declared default (`true`) does not replace the kill switch.
     assert!(store.refresh().is_err());
     assert!(svc.is_enabled("kill_switch_target", None));
     assert!(!svc.is_enabled("payments", None), "a kill switch stays off");

@@ -274,14 +274,14 @@ impl FlagStore for Box<dyn FlagStore> {
 /// `Arc<T>` delegates every method to the inner `T`.
 ///
 /// This allows sharing the **same** store instance — and therefore the same
-/// cache — between `with_flag_store` and `PgFlagStore::spawn_poll_listener`:
+/// snapshot — between `with_flag_store` and `PgFlagStore::spawn_poll_listener`:
 ///
 /// ```rust,ignore
 /// use std::sync::Arc;
 /// use autumn_web::feature_flags::pg::PgFlagStore;
 ///
 /// let store = Arc::new(PgFlagStore::new(&db_url));
-/// // Listener and app service share the same Arc → same cache.
+/// // Listener and app service share the same Arc → same snapshot.
 /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
 /// app.with_flag_store(Arc::clone(&store)).run().await;
 /// ```
@@ -464,15 +464,50 @@ impl FlagStore for InMemoryFlagStore {
 #[cfg(feature = "db")]
 pub mod pg {
     use super::{FlagChangeRecord, FlagConfig, FlagStore, FlagStoreError};
+    use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicU32;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, PoisonError, RwLock};
+    use std::sync::{Arc, Mutex, PoisonError, RwLock};
     use std::time::{Duration, Instant};
 
     /// Columns that `FlagRow` reads.
     const FLAG_COLUMNS: &str =
         "key, description, enabled, rollout_pct, actor_allowlist, group_allowlist";
+
+    /// Connect timeout that the store adds when the URL sets none.
+    const CONNECT_TIMEOUT_SECS: u64 = 5;
+
+    /// Statement timeout on each store connection.
+    const STATEMENT_TIMEOUT_MS: u64 = 5_000;
+
+    /// Longest wait between refresh attempts while refreshes fail.
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+    /// Add `connect_timeout` to `url` when it sets none, so that a refresh
+    /// cannot hang on a connect.
+    fn with_connect_timeout(url: &str) -> String {
+        if url.contains("connect_timeout") {
+            url.to_owned()
+        } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            let separator = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{separator}connect_timeout={CONNECT_TIMEOUT_SECS}")
+        } else {
+            // A `key=value` connection string.
+            format!("{url} connect_timeout={CONNECT_TIMEOUT_SECS}")
+        }
+    }
+
+    /// Wait before the next refresh attempt after `failures` failed attempts
+    /// in a row: `base`, doubled for each failure, up to `MAX_RETRY_DELAY`.
+    fn retry_delay(base: Duration, failures: u32) -> Duration {
+        if failures == 0 {
+            return base;
+        }
+        base.saturating_mul(2_u32.saturating_pow(failures.min(16)))
+            .min(base.max(MAX_RETRY_DELAY))
+    }
 
     /// All flags, as the last refresh and local writes left them.
     #[derive(Debug, Default)]
@@ -485,21 +520,35 @@ pub mod pg {
     }
 
     /// State that a background refresh shares with the store.
-    #[derive(Debug)]
     struct Shared {
         database_url: String,
+        /// `database_url` with a connect timeout.
+        connect_url: String,
         cache_ttl: Duration,
         snapshot: RwLock<Snapshot>,
         /// Increments on each local write. A refresh that started before a
         /// write does not replace the snapshot.
         generation: AtomicU64,
-        /// `true` while a refresh runs. Only one refresh runs at a time.
+        /// `true` while a background refresh runs. Only one runs at a time.
         refreshing: AtomicBool,
+        /// The refresh connection, kept between refreshes. Loads hold this
+        /// lock, so they run and install in order.
+        refresh_conn: Mutex<Option<diesel::PgConnection>>,
         refresh_errors: AtomicU64,
-        /// `true` after a failed refresh, until a refresh succeeds.
-        failing: AtomicBool,
+        /// Failed refreshes in a row. Zero after a good refresh.
+        failures: AtomicU32,
         #[cfg(test)]
-        connect_threads: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+        connect_threads: Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    impl std::fmt::Debug for Shared {
+        /// Leaves out the URL: it can hold a password.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PgFlagStore")
+                .field("cache_ttl", &self.cache_ttl)
+                .field("refresh_errors", &self.refresh_errors)
+                .finish_non_exhaustive()
+        }
     }
 
     /// Holds the single refresh slot. Drop releases it, also when a spawned
@@ -519,16 +568,22 @@ pub mod pg {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(std::thread::current().id());
-            diesel::PgConnection::establish(&self.database_url)
-                .map_err(|e| FlagStoreError::Backend(e.to_string()))
+            let mut conn = diesel::PgConnection::establish(&self.connect_url)
+                .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
+            conn.batch_execute(&format!("SET statement_timeout = {STATEMENT_TIMEOUT_MS}"))
+                .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
+            Ok(conn)
         }
 
+        /// `true` when the last refresh attempt is older than the TTL, or
+        /// older than the retry delay while refreshes fail.
         fn is_stale(&self) -> bool {
+            let wait = retry_delay(self.cache_ttl, self.failures.load(Ordering::Relaxed));
             let snapshot = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
             snapshot.checked_at.is_none_or(|checked| {
                 checked
-                    .checked_add(self.cache_ttl)
-                    .is_some_and(|due| crate::time::ambient_instant() >= due)
+                    .checked_add(wait)
+                    .is_some_and(|due| crate::time::system_instant() >= due)
             })
         }
 
@@ -551,30 +606,53 @@ pub mod pg {
                 .map(|_| RefreshSlot(Arc::clone(self)))
         }
 
-        /// Load all flags on this thread. This blocks.
+        /// Load all flags on this thread and install them. This blocks.
         fn reload(&self) -> Result<(), FlagStoreError> {
+            self.load().map(drop)
+        }
+
+        /// Load all flags on this thread, install them, and return them.
+        /// This blocks.
+        fn load(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
+            let mut conn = self
+                .refresh_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let started = self.generation.load(Ordering::Acquire);
             self.snapshot
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
-                .checked_at = Some(crate::time::ambient_instant());
-            match self.connect().and_then(|mut conn| load_all(&mut conn)) {
+                .checked_at = Some(crate::time::system_instant());
+            let loaded = conn
+                .take()
+                .map_or_else(|| self.connect(), Ok)
+                .and_then(|mut open| {
+                    let flags = load_all(&mut open)?;
+                    // Keep the connection only after a good load.
+                    *conn = Some(open);
+                    Ok(flags)
+                });
+            if let Ok(flags) = &loaded {
+                // Install before the lock drops, so loads install in order.
+                self.install(flags.clone(), started);
+            }
+            drop(conn);
+            match loaded {
                 Ok(flags) => {
-                    self.install(flags, started);
-                    if self.failing.swap(false, Ordering::AcqRel) {
+                    if self.failures.swap(0, Ordering::AcqRel) > 0 {
                         tracing::info!("feature flag refresh recovered");
                     }
-                    Ok(())
+                    Ok(flags)
                 }
                 Err(error) => {
                     self.refresh_errors.fetch_add(1, Ordering::Relaxed);
-                    if self.failing.swap(true, Ordering::AcqRel) {
-                        tracing::debug!(%error, "feature flag refresh failed again");
-                    } else {
+                    if self.failures.fetch_add(1, Ordering::AcqRel) == 0 {
                         tracing::warn!(
                             %error,
                             "feature flag refresh failed; serving the last-known snapshot"
                         );
+                    } else {
+                        tracing::debug!(%error, "feature flag refresh failed again");
                     }
                     Err(error)
                 }
@@ -599,6 +677,9 @@ pub mod pg {
         }
 
         /// Put a flag that this process wrote into the snapshot.
+        ///
+        /// Two writes to one key can apply out of order, so this also marks
+        /// the snapshot stale: the next read starts a refresh.
         fn apply_local(&self, flag: FlagConfig) {
             let mut snapshot = self
                 .snapshot
@@ -606,6 +687,7 @@ pub mod pg {
                 .unwrap_or_else(PoisonError::into_inner);
             self.generation.fetch_add(1, Ordering::AcqRel);
             snapshot.flags.insert(flag.key.clone(), flag);
+            snapshot.checked_at = None;
         }
     }
 
@@ -661,17 +743,20 @@ pub mod pg {
         /// each `get` starts a refresh.
         #[must_use]
         pub fn with_cache_ttl(database_url: impl Into<String>, cache_ttl: Duration) -> Self {
+            let database_url = database_url.into();
             Self {
                 shared: Arc::new(Shared {
-                    database_url: database_url.into(),
+                    connect_url: with_connect_timeout(&database_url),
+                    database_url,
                     cache_ttl,
                     snapshot: RwLock::new(Snapshot::default()),
                     generation: AtomicU64::new(0),
                     refreshing: AtomicBool::new(false),
+                    refresh_conn: Mutex::new(None),
                     refresh_errors: AtomicU64::new(0),
-                    failing: AtomicBool::new(false),
+                    failures: AtomicU32::new(0),
                     #[cfg(test)]
-                    connect_threads: std::sync::Mutex::new(Vec::new()),
+                    connect_threads: Mutex::new(Vec::new()),
                 }),
             }
         }
@@ -785,11 +870,16 @@ pub mod pg {
             std::thread::spawn(move || {
                 while let Some(shared) = shared.upgrade() {
                     if let Some(slot) = shared.begin_refresh() {
-                        // `reload` logs and counts its errors.
-                        let _ = slot.0.reload();
+                        // `reload` logs and counts its errors. A panic must
+                        // not stop the polls.
+                        let reload = std::panic::AssertUnwindSafe(|| slot.0.reload());
+                        if std::panic::catch_unwind(reload).is_err() {
+                            tracing::warn!("feature flag refresh panicked");
+                        }
                     }
+                    let wait = retry_delay(poll_interval, shared.failures.load(Ordering::Relaxed));
                     drop(shared);
-                    std::thread::sleep(poll_interval);
+                    std::thread::sleep(wait);
                 }
             })
         }
@@ -801,7 +891,7 @@ pub mod pg {
                 .snapshot
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
-                .checked_at = Some(crate::time::ambient_instant());
+                .checked_at = Some(crate::time::system_instant());
         }
 
         #[cfg(test)]
@@ -902,10 +992,7 @@ pub mod pg {
         }
 
         fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
-            let started = self.shared.generation.load(Ordering::Acquire);
-            let flags = load_all(&mut self.shared.connect()?)?;
-            self.shared.install(flags.clone(), started);
-            Ok(flags)
+            self.shared.load()
         }
 
         fn preload(&self) -> Result<(), FlagStoreError> {
@@ -1168,6 +1255,51 @@ pub mod pg {
         }
 
         #[test]
+        fn connect_url_gets_a_connect_timeout() {
+            assert_eq!(
+                with_connect_timeout("postgres://h/db"),
+                "postgres://h/db?connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("postgresql://h/db?sslmode=require"),
+                "postgresql://h/db?sslmode=require&connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("host=db dbname=app"),
+                "host=db dbname=app connect_timeout=5"
+            );
+            // A timeout in the URL stays as it is.
+            assert_eq!(DEAD_URL, with_connect_timeout(DEAD_URL));
+        }
+
+        #[test]
+        fn retry_delay_doubles_up_to_the_cap() {
+            let second = Duration::from_secs(1);
+            assert_eq!(retry_delay(second, 0), second);
+            assert_eq!(retry_delay(second, 1), Duration::from_secs(2));
+            assert_eq!(retry_delay(second, 3), Duration::from_secs(8));
+            assert_eq!(retry_delay(second, 40), MAX_RETRY_DELAY);
+            assert_eq!(retry_delay(Duration::ZERO, 5), Duration::ZERO);
+            // A base longer than the cap stays the base.
+            let minute = Duration::from_secs(60);
+            assert_eq!(retry_delay(minute, 4), minute);
+        }
+
+        #[test]
+        fn pg_store_debug_hides_the_database_password() {
+            let store = PgFlagStore::new("postgres://app:s3cret@db/app");
+            assert!(!format!("{store:?}").contains("s3cret"));
+        }
+
+        #[test]
+        fn pg_list_serves_nothing_new_when_the_database_fails() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![enabled("beta")]);
+            assert!(store.list().is_err());
+            assert_eq!(store.get("beta").unwrap(), Some(enabled("beta")));
+        }
+
+        #[test]
         fn pg_store_exposes_database_url() {
             let store = PgFlagStore::new("postgres://localhost/myapp");
             assert_eq!(store.shared.database_url, "postgres://localhost/myapp");
@@ -1268,6 +1400,10 @@ struct StoreHealth {
 
 impl StoreHealth {
     /// Keep the value that the store returned for `key`.
+    ///
+    /// Two reads that see a flag change can store their values out of order.
+    /// The next good read corrects it, so the hot path takes no write lock
+    /// when the value is the same.
     fn remember(&self, key: &str, flag: Option<&FlagConfig>) {
         if self.failing.load(Ordering::Relaxed) && self.failing.swap(false, Ordering::AcqRel) {
             tracing::info!("feature flag store recovered");
@@ -1504,22 +1640,28 @@ impl FeatureFlagService {
     }
 }
 
-/// Start a preload of the store of `service` on the blocking pool.
+/// Longest time that startup waits for [`FlagStore::preload`].
+const PRELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Preload the store of `service` on the blocking pool.
 ///
-/// The hook does not wait for the load, so a slow database does not delay
-/// later startup hooks. A failure logs a warning. Until the store loads, reads
-/// use declared defaults.
-///
-/// Call it on a Tokio runtime.
-pub(crate) fn preload_at_startup(
-    service: FeatureFlagService,
-) -> std::future::Ready<crate::AutumnResult<()>> {
-    drop(crate::time::spawn_blocking(move || {
-        if let Err(error) = service.preload() {
+/// Startup waits up to [`PRELOAD_WAIT`], so the first requests see stored
+/// flags. After that, the load continues and startup continues. A failure
+/// logs a warning; it does not stop startup.
+pub(crate) async fn preload_at_startup(service: FeatureFlagService) -> crate::AutumnResult<()> {
+    let load = crate::time::spawn_blocking(move || service.preload());
+    match tokio::time::timeout(PRELOAD_WAIT, load).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
             tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
         }
-    }));
-    std::future::ready(Ok(()))
+        Ok(Err(error)) => tracing::warn!(%error, "feature flag preload task failed"),
+        Err(_) => tracing::warn!(
+            wait = ?PRELOAD_WAIT,
+            "feature flag preload is slow; startup continues with declared defaults"
+        ),
+    }
+    Ok(())
 }
 
 // ── AppState extractor ───────────────────────────────────────────────────────

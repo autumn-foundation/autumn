@@ -119,7 +119,7 @@ For a given `(flag, actor)` pair, rules are checked in this order:
 | 3        | **Actor allowlist**    | `enabled = true` AND the actor's ID is in `actor_allowlist` → on for that actor    |
 | 4        | **Group allowlist**    | `enabled = true` AND the actor belongs to a group in `group_allowlist` → on        |
 | 5        | **Percent rollout**    | `enabled = true` AND actor's deterministic bucket < `rollout_pct` → on             |
-| 6        | **Default**            | Returns `false` (fail-closed)                                                      |
+| 6        | **Default**            | Returns `false` (fail-closed). An unknown flag gets its declared default.          |
 
 A flag that the store does not hold gets its declared default
 (`FeatureFlagService::with_default`), or `false`.
@@ -170,11 +170,21 @@ When the database fails, flags do not change:
 let service = FeatureFlagService::new(store)
     // Stay on if the store cannot answer at startup.
     .with_default("checkout_v2", true);
+
+autumn_web::app()
+    .with_flag_service(service)
+    .run()
+    .await;
 ```
 
-At startup, `with_flag_store` calls `FlagStore::preload` once on the blocking
-pool. A request that arrives before this load ends gets the declared default.
-Outside an app, call `PgFlagStore::refresh` to load the flags.
+At startup, the app calls `FlagStore::preload` once on the blocking pool and
+waits up to 5 seconds for it. Until startup ends, requests get `503`. If the
+load takes longer, startup continues and reads get declared defaults until the
+load ends. Outside an app, call `PgFlagStore::refresh` to load the flags.
+
+Each store connection has a 5 second statement timeout. The store adds a 5
+second `connect_timeout` when the URL sets none. While refreshes fail, the wait
+between attempts doubles, up to 30 seconds.
 
 ---
 
