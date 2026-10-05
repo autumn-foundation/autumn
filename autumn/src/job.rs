@@ -1033,6 +1033,26 @@ impl Drop for LeaseHeartbeat {
     }
 }
 
+/// Record a row that Postgres or `SQLite` stale recovery requeued at
+/// `new_attempt`. When this process was running the previous attempt, this
+/// balances its start, so a later lease loss of either attempt is counted
+/// once (see `record_lease_lost`).
+#[cfg(feature = "db")]
+fn record_recovered_requeue(
+    name: &str,
+    id: &str,
+    new_attempt: u32,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    const ERROR: &str = "visibility timeout expired";
+    if job_admin.settle_recovered_requeue(id, new_attempt, ERROR) {
+        state
+            .job_registry
+            .record_retry(name, ERROR, new_attempt.saturating_sub(1));
+    }
+}
+
 /// Record a run that stopped because its worker lost the claim. The job is
 /// not settled: the worker that holds the claim now owns that.
 ///
@@ -1544,6 +1564,34 @@ impl JobAdminMemoryBackend {
         }
         record.status = JobAdminStatus::Retrying;
         record.finished_at = Some(self.clock.now());
+        record.last_error = Some(error.to_owned());
+        true
+    }
+
+    /// Move a record that stale recovery requeued to `Enqueued` at
+    /// `new_attempt`, so the replacement attempt can start.
+    ///
+    /// Returns `true` when the record showed the previous attempt as running:
+    /// this process started it, so the caller balances the registry. A
+    /// missing record, or one already moved on, returns `false`.
+    #[cfg(feature = "db")]
+    fn settle_recovered_requeue(&self, id: &str, new_attempt: u32, error: &str) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return false;
+        };
+        if record.status != JobAdminStatus::Running
+            || record.attempt.saturating_add(1) != new_attempt
+        {
+            return false;
+        }
+        record.status = JobAdminStatus::Enqueued;
+        record.enqueued_at = Some(self.clock.now());
+        record.started_at = None;
+        record.finished_at = None;
+        record.attempt = new_attempt;
         record.last_error = Some(error.to_owned());
         true
     }
@@ -10642,6 +10690,8 @@ struct PgStaleRecoveryRow {
     payload: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     status: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
 }
 
 /// Recover jobs whose visibility timeout has expired.
@@ -10717,7 +10767,7 @@ async fn pg_recover_stale_claims(
            FOR UPDATE SKIP LOCKED \
            LIMIT 100 \
          ) \
-         RETURNING id, name, payload::TEXT AS payload, status",
+         RETURNING id, name, payload::TEXT AS payload, status, attempt",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
     .bind::<diesel::sql_types::BigInt, _>(stale_requeue_cap_ms(state))
@@ -10731,6 +10781,12 @@ async fn pg_recover_stale_claims(
     // expiry even though it will never run again.
     match rows {
         Ok(rows) => {
+            for row in &rows {
+                if row.status != "failed" {
+                    let attempt = u32::try_from(row.attempt).unwrap_or(0);
+                    record_recovered_requeue(&row.name, &row.id, attempt, state, job_admin);
+                }
+            }
             for row in rows.into_iter().filter(|row| row.status == "failed") {
                 // A crashed worker never resumes to observe its ack returning
                 // `Ok(false)`, so `record_pg_lifecycle_after_ack` never fires the
@@ -24199,6 +24255,50 @@ mod lease_tests {
         record_lease_lost("leased", &id, 1, &state, &admin);
         let record = admin.snapshot_record_for_test(&id).expect("record");
         assert_eq!(record.status, JobAdminStatus::Failed);
+    }
+
+    /// Stale recovery requeues a job this process was running; the old
+    /// worker then loses its lease; the replacement starts here and also
+    /// loses its lease. Each start must be balanced exactly once.
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_then_two_lease_losses_balance_in_flight() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued);
+        assert_eq!(record.attempt, 2);
+        assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the old worker does not count again");
+
+        state.job_registry.record_start("leased"); // attempt 2
+        assert_eq!(
+            admin.try_record_start(&id, 2),
+            JobAdminStartDecision::Started
+        );
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_leaves_counts_alone_for_a_job_started_elsewhere() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // some other job of this name
+        let (admin, id) = admin_with_running_job(1);
+        admin.record_retrying(&id, "earlier failure"); // not running here
+
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+        record_recovered_requeue("leased", "unknown-id", 2, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
     }
 
     #[cfg(any(feature = "db", feature = "redis"))]

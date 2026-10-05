@@ -843,7 +843,7 @@ async fn recover_stale_claims(
            SELECT id FROM autumn_jobs \
            WHERE status = '{STATUS_RUNNING}' AND claimed_at IS NOT NULL AND claimed_at <= ? \
            LIMIT {STALE_RECOVERY_BATCH}) \
-         RETURNING id, name, status, payload"
+         RETURNING id, name, status, payload, attempt"
     );
     // A per-row jitter, so claims that expire together do not all run again
     // at once (issue #3054). See `stale_requeue_cap_ms`.
@@ -902,6 +902,8 @@ async fn recover_stale_claims(
             // No gauge write here: the row is back in the table and the depth
             // survey publishes it absolutely on its next pass. Postgres does
             // the same.
+            let attempt = u32::try_from(row.attempt).unwrap_or(0);
+            super::record_recovered_requeue(&row.name, &row.id, attempt, state, job_admin);
         }
     }
 }
@@ -918,6 +920,9 @@ struct RecoveredRow {
     /// Needed to settle the tracked record of a row this sweep dead-letters.
     #[diesel(sql_type = diesel::sql_types::Text)]
     payload: String,
+    /// The attempt a requeued row runs next.
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
 }
 
 /// Wait until the queue schema exists, then hand back the pool.
