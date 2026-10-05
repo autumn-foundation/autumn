@@ -1254,10 +1254,11 @@ pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
 /// missing, malformed, or ambiguous (issue #2278).
 ///
 /// The redeploy path cannot prove the port, so it refuses this host. Only a
-/// `HostMode::Redeploy` host gets this reason. A `First` host does not read the
-/// port, and `Absent` is the correct shape before the first deploy.
+/// `HostMode::Redeploy` host gets this reason. The first-deploy path does not
+/// read the port. `InstalledProxyPort::Absent` is the correct state before the
+/// first deploy.
 pub(crate) const DRIFT_PROXY_PORT_UNREADABLE: &str = "the installed proxy unit's `--http-port` is unreadable — the NEXT deploy of this host \
-     will refuse (repair the kamal-proxy unit or re-provision the host)";
+     will refuse (re-provision the host or repair its proxy unit)";
 
 /// State drift: this host has a `current` symlink, but it does not point to a
 /// release (issue #1621, review round 2; #2277).
@@ -1571,9 +1572,9 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         if matches!(status.proxy_options, exec::ProxyOptionsMarker::Unreadable) {
             state_drift.push((status.host.clone(), DRIFT_PROXY_OPTIONS_UNREADABLE));
         }
-        // `Absent` is never drift: no unit is the shape before the first deploy.
-        // `Unreadable` is drift only on a deployed host, because only the redeploy
-        // path reads the port and refuses (#2278).
+        // `Absent` is never drift. A host has no proxy unit before its first deploy.
+        // `Unreadable` is drift only on a deployed host. Only the redeploy path reads
+        // the port, and it refuses (#2278).
         match status.installed_proxy_port {
             exec::InstalledProxyPort::Port(port) if port != status.public_port => {
                 state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
@@ -4138,33 +4139,58 @@ mod tests {
             rendered.contains(DRIFT_PROXY_PORT_UNREADABLE),
             "the row must name the reason:\n{rendered}"
         );
+        assert!(
+            rendered.contains("proxy ?"),
+            "the port cell must not guess:\n{rendered}"
+        );
 
         // A lone damaged host is drift too. The damage is on the host itself.
-        assert!(fleet_drift(&[damaged]).drifted());
+        let alone = fleet_drift(std::slice::from_ref(&damaged));
+        assert!(alone.drifted(), "{:?}", alone.state_drift);
 
-        // A `First` host does not read the port, so `Unreadable` there is not
-        // drift. Next to a deployed peer, it gets only `DRIFT_HOST_NOT_DEPLOYED`.
+        // The mode sets the gate, not the release. A damaged `current` adds its
+        // own reason.
+        let mut both = status("web-b", None);
+        both.installed_proxy_port = exec::InstalledProxyPort::Unreadable;
+        assert_eq!(
+            fleet_drift(&[both]).state_drift,
+            vec![
+                ("web-b".to_owned(), DRIFT_RELEASE_UNREADABLE),
+                ("web-b".to_owned(), DRIFT_PROXY_PORT_UNREADABLE),
+            ],
+        );
+
+        // The first-deploy path does not read the port, so `Unreadable` on a
+        // `First` host is not drift. Next to a deployed peer, that host gets only
+        // `DRIFT_HOST_NOT_DEPLOYED`.
         let mut first = status("web-b", None);
         first.mode = Some(HostMode::First);
         first.installed_proxy_port = exec::InstalledProxyPort::Unreadable;
-        assert!(!fleet_drift(std::slice::from_ref(&first)).drifted());
+        let lone_first = fleet_drift(std::slice::from_ref(&first));
+        assert!(!lone_first.drifted(), "{:?}", lone_first.state_drift);
         assert_eq!(
             fleet_drift(&[status("web-a", Some("r1")), first.clone()]).state_drift,
             vec![("web-b".to_owned(), DRIFT_HOST_NOT_DEPLOYED)],
         );
 
-        // `Absent` is the correct shape before the first deploy. It is never drift.
+        // `Absent` is the correct state before the first deploy. It is never drift.
         let mut deployed_absent = status("web-a", Some("r1"));
         deployed_absent.installed_proxy_port = exec::InstalledProxyPort::Absent;
         first.installed_proxy_port = exec::InstalledProxyPort::Absent;
-        assert!(!fleet_drift(&[deployed_absent]).drifted());
-        assert!(!fleet_drift(&[first]).drifted());
+        for host in [deployed_absent, first] {
+            let report = fleet_drift(std::slice::from_ref(&host));
+            assert!(!report.drifted(), "{:?}", report.state_drift);
+        }
 
         // An unreachable host was not probed, so it gives no drift.
-        let mut outage = HostStatus::unreachable("web-b");
-        outage.mode = Some(HostMode::Redeploy);
-        outage.installed_proxy_port = exec::InstalledProxyPort::Unreadable;
-        assert!(fleet_drift(&[outage]).state_drift.is_empty());
+        let mut outage = damaged;
+        outage.reachable = false;
+        let outage_report = fleet_drift(&[outage]);
+        assert!(
+            outage_report.state_drift.is_empty(),
+            "{:?}",
+            outage_report.state_drift
+        );
     }
 
     #[test]

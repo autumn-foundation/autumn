@@ -1079,9 +1079,9 @@ Two kinds of drift are reported, and they are deliberately separate:
   next redeploy would restart the *serving* slot); the `shared/proxy-options`
   marker is unreadable (the next deploy of that host will refuse); the installed
   proxy unit binds a different public port than `[server] port` configures; a
-  deployed host's installed proxy unit has no readable `--http-port` (the next
-  deploy of that host will refuse; the row shows `proxy ?`); no
-  release is deployed on this host while the rest of the fleet is serving one;
+  deployed host's installed proxy unit has no readable `--http-port` (the row
+  shows `proxy ?`, and the next deploy of that host will refuse); no release is
+  deployed on this host while the rest of the fleet is serving one;
   the host has a `current` symlink but the release behind it could not be read
   (the link is dangling, or its target is not a directory directly in
   `releases/`);
