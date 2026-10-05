@@ -218,7 +218,8 @@ negative ships an N+1 to production.
   number of queries. Put `#[query_cost(1)]` on the statement that calls a
   one-query finder. An awaited constructor of a handle type
   (`PgPostRepository::new(&mut db).await`) is reported too: an `async fn` can
-  run queries.
+  run queries. This is also true when the `.await` comes later
+  (`let pending = PgPostRepository::new(&mut db); pending.await`).
 - **A macro body that `await`s while naming the handle** — `html! { …
   (fetch(&mut db).await?) … }`. A macro body is token soup to `syn`. A template
   that merely *passes* the handle to a render helper is fine: only an `await`

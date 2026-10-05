@@ -1419,6 +1419,10 @@ struct Binding {
     /// The name a `&mut` binding points to: `slot` in `let slot = &mut
     /// repos;` points to `repos`.
     referent: Option<String>,
+    /// A handle constructor handed the handle and not awaited yet: `let
+    /// pending = PgPostRepository::new(&mut db);`. An `async fn new` can run
+    /// queries, so `pending.await` is reported.
+    deferred: bool,
 }
 
 impl Binding {
@@ -1428,6 +1432,7 @@ impl Binding {
             parts: None,
             shape: None,
             referent: None,
+            deferred: false,
         }
     }
 
@@ -1467,6 +1472,7 @@ impl Binding {
             parts,
             shape,
             referent: self.referent.clone().or_else(|| other.referent.clone()),
+            deferred: self.deferred || other.deferred,
         }
     }
 }
@@ -1982,6 +1988,17 @@ impl Analyzer {
             parts,
             shape: self.shape_of(init),
             referent: self.referent_of(init),
+            deferred: self.is_deferred(init),
+        }
+    }
+
+    /// Is `e` a handle constructor handed the handle, or a name bound to one?
+    fn is_deferred(&self, e: &Expr) -> bool {
+        match peel_parens(e) {
+            Expr::Call(call) => {
+                is_handle_constructor(call) && call.args.iter().any(|a| self.expr_carries_handle(a))
+            }
+            other => path_ident(other).is_some_and(|name| self.env.binding(&name).deferred),
         }
     }
 
@@ -2305,6 +2322,18 @@ impl Analyzer {
     #[allow(clippy::too_many_lines)]
     fn expr_in(&mut self, expr: &Expr, awaited: bool) -> Flow {
         match expr {
+            // `pending.await` on `let pending = Repo::new(&mut db);`. A direct
+            // `Repo::new(&mut db).await` is reported by `call`.
+            Expr::Await(e)
+                if matches!(peel_parens(&e.base), Expr::Path(_)) && self.is_deferred(&e.base) =>
+            {
+                Flow::cost(Cost::unbounded(
+                    e.span(),
+                    "this awaits a constructor that was handed the database handle, and an \
+                     `async` constructor can run any number of queries",
+                    DECLARE_HINT,
+                ))
+            }
             Expr::Await(e) => self.expr_in(&e.base, true),
             Expr::Try(e) => {
                 let flow = self.expr_in(&e.expr, awaited);
@@ -3430,6 +3459,8 @@ impl Analyzer {
             Expr::Group(g) => self.produced(&g.expr),
             Expr::Call(call) => self.invoked(call, false),
             Expr::Await(a) => match peel_parens(&a.base) {
+                // `pending.await` on `let pending = Repo::new(&mut db);`.
+                base @ Expr::Path(_) if self.is_deferred(base) => Some(Kind::Handle),
                 Expr::Async(block) => {
                     let mut probe = self.probe();
                     let tail = probe.block_value(&block.block);
@@ -8678,6 +8709,18 @@ mod tests {
                 "guard: a plain store through a mutable alias is free",
                 "async fn h(ids: Vec<i64>) -> AutumnResult<usize> { \
                  let mut out = Vec::new(); let slot = &mut out; slot.push(1); for i in out { let _ = i; } Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a deferred constructor future is opaque when awaited",
+                "async fn h(db: Db) -> AutumnResult<usize> { \
+                 let pending = PgPostRepository::new(&mut db); let repo = pending.await; let _ = repo.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a deferred accessor future stays free",
+                "async fn h(ctx: Ctx) -> AutumnResult<usize> { \
+                 let pending = ctx.conn(); let db = pending.await?; let _ = db; Ok(0) }",
                 Expect::Exact(0),
             ),
             (
