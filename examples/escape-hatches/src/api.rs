@@ -335,16 +335,17 @@ fn check_cart(cart: &Cart) -> AutumnResult<BTreeMap<String, i32>> {
     if cart.lines.is_empty() {
         return Err(AutumnError::unprocessable_msg("cart is empty"));
     }
-    if cart.lines.len() > MAX_LINES {
-        return Err(AutumnError::unprocessable_msg(format!(
-            "a cart has at most {MAX_LINES} lines"
-        )));
-    }
     let mut lines = BTreeMap::new();
     for line in &cart.lines {
         let quantity = check_quantity(line.quantity)?;
         let total: &mut i32 = lines.entry(line.sku.clone()).or_default();
         *total = check_quantity(total.saturating_add(quantity))?;
+    }
+    // The cap counts distinct SKUs, after the merge.
+    if lines.len() > MAX_LINES {
+        return Err(AutumnError::unprocessable_msg(format!(
+            "a cart has at most {MAX_LINES} distinct SKUs"
+        )));
     }
     Ok(lines)
 }

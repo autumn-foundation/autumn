@@ -44,7 +44,14 @@ pub const DIR_ENV: &str = "STOCKROOM_EXPORTS_DIR";
 /// project folder, which Autumn finds the same way it finds `static/`.
 #[must_use]
 pub fn dir_from_env() -> PathBuf {
-    if let Some(dir) = std::env::var_os(DIR_ENV) {
+    dir_from(std::env::var_os(DIR_ENV))
+}
+
+/// The exports folder for a value of [`DIR_ENV`]. An empty value counts as
+/// unset: an empty path serves the process's working folder.
+#[must_use]
+pub fn dir_from(value: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(dir) = value.filter(|dir| !dir.is_empty()) {
         return dir.into();
     }
     OsEnv.var("AUTUMN_MANIFEST_DIR").map_or_else(

@@ -549,6 +549,18 @@ async fn password_file_refuses_shards() {
     assert!(result.is_err(), "shards must be refused");
 }
 
+/// H8: an empty `STOCKROOM_EXPORTS_DIR` counts as unset. An empty path
+/// would serve the process's working folder.
+#[test]
+fn exports_dir_ignores_an_empty_setting() {
+    assert_eq!(exports::dir_from(Some("".into())), exports::dir_from(None));
+    assert_ne!(exports::dir_from(None), std::path::PathBuf::new());
+    assert_eq!(
+        exports::dir_from(Some("/srv/exports".into())),
+        std::path::PathBuf::from("/srv/exports")
+    );
+}
+
 // ── Postgres tier (Docker) ──────────────────────────────────────────────
 
 /// Why `with_lock` exists. Two callers read the same row. Each writes an
@@ -1233,4 +1245,20 @@ async fn checkout_replay_ignores_the_database_collation() {
     post_api(&client, "/api/checkout", &body)
         .await
         .assert_status(200);
+}
+
+/// H1: the line cap counts distinct SKUs, after the merge. Many entries for
+/// one SKU are one line.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn checkout_line_cap_counts_distinct_skus() {
+    let (db, _tables) = fresh_db().await;
+    seed(db, &[product("A-1", "tools", 200, 100)]).await;
+    let client = db_client(db);
+    let lines = vec![("A-1", 1); 101];
+
+    post_api(&client, "/api/checkout", &cart("o-1", &lines))
+        .await
+        .assert_status(201);
+    assert_eq!(stock_of(db, "A-1").await, 99);
 }
