@@ -892,20 +892,22 @@ fn relation_clash(
     others: &std::collections::BTreeSet<String>,
 ) -> Option<String> {
     plan.changes.iter().find_map(|c| {
-        let name = match c {
-            SchemaChange::CreateTable(t) => &t.name,
-            SchemaChange::RenameTable { to, .. } => to,
+        let names: Vec<&String> = match c {
+            // A new table brings its own indexes.
+            SchemaChange::CreateTable(t) => std::iter::once(&t.name)
+                .chain(t.indexes.iter().map(|i| &i.name))
+                .collect(),
+            SchemaChange::RenameTable { to, .. } => vec![to],
             SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
-                &index.name
+                vec![&index.name]
             }
             _ => return None,
         };
-        others.contains(name).then(|| {
-            format!(
-                "`{name}` is already a view, sequence or other relation in the migrated \
+        let name = names.into_iter().find(|n| others.contains(*n))?;
+        Some(format!(
+            "`{name}` is already a view, sequence or other relation in the migrated \
                  schema; choose another name"
-            )
-        })
+        ))
     })
 }
 
@@ -1404,6 +1406,13 @@ mod tests {
             to: "posts_id_seq".to_owned(),
         });
         assert!(relation_clash(&rename, &others).is_some());
+        let mut with_index = autumn_schema_core::Table::new("new_table", Backend::Postgres);
+        with_index.indexes.push(autumn_schema_core::Index::new(
+            "report",
+            vec!["id".to_owned()],
+            false,
+        ));
+        assert!(relation_clash(&plan(SchemaChange::CreateTable(with_index)), &others).is_some());
         let fine = plan(SchemaChange::RenameTable {
             from: "old".to_owned(),
             to: "new".to_owned(),

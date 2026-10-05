@@ -164,9 +164,9 @@ override this.
 - Two hints use the same old name.
 - The parser cannot read the field (an unsupported type).
 - The hints make a chain or a swap. Do each rename in its own migration.
-- An index definition or a `CHECK` names the old column in a position the
-  engine cannot classify offline (for example an operator class with the same
-  name). Write that rename as a manual migration.
+- An index definition or a `CHECK` names the old column in a position that is
+  not clearly a column (for example an operator class or an `EXTRACT` field
+  with the same name). Write that rename as a manual migration.
 - A new name is a table or index name that is already in use.
 
 On Postgres, a new name longer than 63 bytes is refused too. The offline

@@ -530,72 +530,28 @@ fn replace_word(sql: &str, from: &str, to: &str) -> String {
     rewrite_word(sql, from, to).0
 }
 
-/// Words after which a name is in a normal expression position.
-const SQL_KEYWORDS: &[&str] = &[
-    "ADD",
-    "ALL",
-    "ALTER",
-    "AND",
-    "ANY",
-    "ARRAY",
-    "AS",
-    "ASC",
-    "BETWEEN",
-    "BY",
-    "CASE",
-    "CHECK",
-    "COLLATE",
-    "CONSTRAINT",
-    "CREATE",
-    "DESC",
-    "DISTINCT",
-    "ELSE",
-    "END",
-    "ESCAPE",
-    "EXCLUDE",
-    "EXISTS",
-    "FALSE",
-    "FIRST",
-    "FROM",
-    "GLOB",
-    "ILIKE",
-    "IN",
-    "INCLUDE",
-    "INDEX",
-    "INTERVAL",
-    "IS",
-    "ISNULL",
-    "LAST",
-    "LIKE",
-    "MATCH",
-    "NOT",
-    "NOTNULL",
-    "NULL",
-    "NULLS",
-    "ON",
-    "ONLY",
-    "OR",
-    "OVERLAPS",
-    "REGEXP",
-    "ROW",
-    "SELECT",
-    "SIMILAR",
-    "SOME",
-    "TABLE",
-    "THEN",
-    "TO",
-    "TRUE",
-    "UNIQUE",
-    "USING",
-    "WHEN",
-    "WHERE",
-    "WITH",
+/// Keywords after which a name is in a column position.
+const COLUMN_AFTER: &[&str] = &[
+    "AND", "BETWEEN", "BY", "CASE", "DISTINCT", "ELSE", "FROM", "ILIKE", "IN", "IS", "LIKE", "NOT",
+    "ON", "OR", "SELECT", "THEN", "WHEN", "WHERE",
 ];
 
+/// Keywords before which a name is in a column position.
+const COLUMN_BEFORE: &[&str] = &[
+    "AND", "ASC", "BETWEEN", "COLLATE", "DESC", "ELSE", "END", "ESCAPE", "GLOB", "ILIKE", "IN",
+    "IS", "ISNULL", "LIKE", "MATCH", "NOT", "NOTNULL", "NULLS", "OR", "REGEXP", "SIMILAR", "THEN",
+    "WHEN", "WITH",
+];
+
+/// The operator characters around a column in an expression.
+const OPERATOR_CHARS: &str = "=<>!+-*/%|&^~";
+
 /// [`replace_word`], plus whether an occurrence of `from` was in an ambiguous
-/// position: right after another identifier, as an operator class or an alias
-/// is (`(slug text_pattern_ops)`). The engine cannot tell that from a column
-/// offline, so it leaves such an occurrence as it is and reports it.
+/// position. Offline, the engine rewrites an occurrence only in a position that
+/// is clearly a column: after the start, `(`, `,`, an operator or a keyword in
+/// [`COLUMN_AFTER`], and before the end, `)`, `,`, `::`, `[`, an operator or a
+/// keyword in [`COLUMN_BEFORE`]. Any other occurrence (an operator class, an
+/// `EXTRACT` field, a qualified name, ...) stays as it is and is reported.
 fn rewrite_word(sql: &str, from: &str, to: &str) -> (String, bool) {
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
     let mut out = String::with_capacity(sql.len());
@@ -605,8 +561,8 @@ fn rewrite_word(sql: &str, from: &str, to: &str) -> (String, bool) {
     // `expect_name`: after one of those or a `.` in that name; `in_name`: after
     // a part.
     let (mut expect_name, mut in_name) = (false, false);
-    // The previous significant token was an identifier (not a keyword).
-    let (mut prev_ident, mut ambiguous) = (false, false);
+    // The previous significant token allows a column after it.
+    let (mut column_may_follow, mut ambiguous) = (true, false);
     while let Some(c) = rest.chars().next() {
         let close = match c {
             '\'' | '"' | '`' => Some(c),
@@ -635,7 +591,15 @@ fn rewrite_word(sql: &str, from: &str, to: &str) -> (String, bool) {
             && &token[1..token.len() - 1] == from;
         let plain_match =
             close.is_none() && token.eq_ignore_ascii_case(from) && !is_call && !in_cast;
-        if (plain_match || quoted_match) && prev_ident {
+        let column_may_precede = next.is_empty()
+            || next.starts_with([')', ',', ':', '['])
+            || next.starts_with(|n: char| OPERATOR_CHARS.contains(n))
+            || COLUMN_BEFORE.iter().any(|k| {
+                next.get(..k.len())
+                    .is_some_and(|w| w.eq_ignore_ascii_case(k))
+                    && !next[k.len()..].starts_with(is_word)
+            });
+        if (plain_match || quoted_match) && !(column_may_follow && column_may_precede) {
             ambiguous = true;
             out.push_str(token);
         } else if plain_match {
@@ -659,11 +623,9 @@ fn rewrite_word(sql: &str, from: &str, to: &str) -> (String, bool) {
             (expect_name && c.is_whitespace(), false)
         };
         if !c.is_whitespace() {
-            prev_ident = matches!(close, Some('"' | '`' | ']'))
-                || (close.is_none()
-                    && is_word(c)
-                    && !c.is_ascii_digit()
-                    && !SQL_KEYWORDS.iter().any(|k| token.eq_ignore_ascii_case(k)));
+            column_may_follow = matches!(c, '(' | ',')
+                || OPERATOR_CHARS.contains(c)
+                || (close.is_none() && COLUMN_AFTER.iter().any(|k| token.eq_ignore_ascii_case(k)));
         }
         rest = &rest[len..];
     }
@@ -1429,9 +1391,15 @@ mod tests {
     }
 
     #[test]
-    fn word_rewrite_flags_only_identifier_after_identifier() {
-        let (_, ambiguous) = rewrite_word("(slug text_pattern_ops)", "text_pattern_ops", "code");
-        assert!(ambiguous);
+    fn word_rewrite_flags_positions_that_are_not_clearly_a_column() {
+        for (sql, col) in [
+            ("(slug text_pattern_ops)", "text_pattern_ops"),
+            ("EXTRACT(year FROM created_at) >= 2000", "year"),
+            ("posts.title <> ''", "title"),
+        ] {
+            let (_, ambiguous) = rewrite_word(sql, col, "x");
+            assert!(ambiguous, "{sql}");
+        }
         for sql in [
             "lower(title) WHERE title IS NOT NULL AND NOT title = ''",
             "length(title) > 0 OR title IN ('a') AND CASE WHEN title THEN 1 END = 1",
