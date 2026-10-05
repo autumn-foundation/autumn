@@ -201,7 +201,9 @@ impl HealthIndicator for RedisHealthIndicator {
     }
 }
 
-/// Each enabled Redis-backed subsystem and its URL, in a stable order.
+/// Each Redis-backed subsystem that the app uses, and its URL, in a stable
+/// order. A subsystem counts only when it runs with the Redis backend, by the
+/// same rule the subsystem itself uses.
 pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, String)> {
     use crate::config::IdempotencyBackend;
 
@@ -214,8 +216,10 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
             &config.channels.redis.url,
         ),
         (
+            // The router installs the middleware only for `Some(true)`. The
+            // `idempotent()` builder flag sets it before registration.
             "idempotency",
-            idempotency_redis && config.idempotency.enabled != Some(false),
+            idempotency_redis && config.idempotency.enabled == Some(true),
             &config.idempotency.redis.url,
         ),
         (
@@ -246,8 +250,15 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
             &config.idempotency.redis.url,
         ),
         (
+            // The replay store is built only for a replay-protected endpoint.
             "webhook_replay",
-            config.security.webhooks.replay.backend == crate::webhook::WebhookReplayBackend::Redis,
+            config.security.webhooks.replay.backend == crate::webhook::WebhookReplayBackend::Redis
+                && config
+                    .security
+                    .webhooks
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.replay_protection),
             &config.security.webhooks.replay.redis.url,
         ),
     ];
@@ -336,8 +347,14 @@ mod tests {
         config.security.rate_limit.enabled = true;
         config.security.rate_limit.backend = crate::security::config::RateLimitBackend::Redis;
         config.security.rate_limit.redis.url = Some("redis://rate:6379".to_owned());
+        config.idempotency.enabled = Some(true);
         config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
         config.idempotency.redis.url = Some("redis://idem:6379".to_owned());
+        config
+            .security
+            .webhooks
+            .endpoints
+            .push(crate::webhook::WebhookEndpointConfig::default());
         config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
         config.security.webhooks.replay.redis.url = Some("redis://hooks:6379".to_owned());
         config.cache.backend = crate::config::CacheBackend::Redis;
@@ -386,6 +403,30 @@ mod tests {
         config.session.redis.url = Some("   ".to_owned());
 
         assert!(redis_subsystems(&config).is_empty());
+    }
+
+    #[test]
+    fn redis_that_no_subsystem_uses_is_skipped() {
+        let mut config = AutumnConfig::default();
+        // The idempotency middleware is installed only for `enabled = true`
+        // (the `idempotent()` builder flag sets it before registration).
+        config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
+        config.idempotency.redis.url = Some("redis://idem:6379".to_owned());
+        config.security.submit_token.backend = Some(crate::config::IdempotencyBackend::Memory);
+        // The replay store is built only for a replay-protected endpoint.
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
+        config.security.webhooks.replay.redis.url = Some("redis://hooks:6379".to_owned());
+        config
+            .security
+            .webhooks
+            .endpoints
+            .push(crate::webhook::WebhookEndpointConfig::default().without_replay_protection());
+
+        assert!(
+            redis_subsystems(&config).is_empty(),
+            "{:?}",
+            redis_subsystems(&config)
+        );
     }
 
     #[tokio::test]
@@ -640,6 +681,7 @@ mod tests {
         let redis = FakeRedis::start(Duration::from_millis(400)).await;
         let mut config = AutumnConfig::default();
         config.health.ping_timeout_ms = 1_000;
+        config.idempotency.enabled = Some(true);
         config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
         config.idempotency.redis.url = Some(redis.url());
         config.session.backend = crate::session::SessionBackend::Redis;
@@ -679,6 +721,7 @@ mod tests {
     async fn subsystems_on_one_url_share_one_connection() {
         let redis = FakeRedis::start(Duration::ZERO).await;
         let mut config = AutumnConfig::default();
+        config.idempotency.enabled = Some(true);
         config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
         config.idempotency.redis.url = Some(redis.url());
         config.session.backend = crate::session::SessionBackend::Redis;

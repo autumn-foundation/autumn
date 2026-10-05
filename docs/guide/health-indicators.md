@@ -239,9 +239,11 @@ dedicated-connection ping.
 
 ### `redis:<subsystem>`
 
-The framework registers one indicator for each subsystem whose config selects
-Redis: `cache`, `channels`, `idempotency`, `jobs`, `rate_limit`, `sessions`,
-`submit_token` and `webhook_replay`. Each sends `PING` with the
+The framework registers one indicator for each subsystem that runs on Redis:
+`cache`, `channels`, `idempotency`, `jobs`, `rate_limit`, `sessions`,
+`submit_token` and `webhook_replay`. A subsystem that is off gets none (for
+example, idempotency without `enabled = true`, or webhook replay with no
+replay-protected endpoint). Each sends `PING` with the
 `health.ping_timeout_ms` limit. A failed or late `PING` is `DOWN`, not
 `UNKNOWN`. Subsystems on one URL share one connection, and checks that run at
 the same time share one `PING`. A subsystem whose backend you install with the
