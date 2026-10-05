@@ -756,6 +756,8 @@ a middleware, a macro or a dependency is exactly what could break it.
   from a distant client.
 - **One capsule per node.** The node does not reload the capsule. Restart it
   after `autumn build`.
+- **No `OPTIONS *`.** The node answers the asterisk form with `501`. Its
+  HTTP client cannot send it, and `OPTIONS /` is a different request.
 - **The node adds `accept: */*`** to a forwarded request that has no
   `accept` header. The HTTP client does this.
 - **`paths::*` helpers are unavailable inside a capsule.**

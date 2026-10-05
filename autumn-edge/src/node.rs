@@ -624,14 +624,22 @@ where
         let started = Instant::now();
         let method = request.method().as_str().to_owned();
         let path = request.uri().path().to_owned();
-        let safe = request
+        let target = request
             .uri()
             .path_and_query()
-            .is_some_and(|target| is_safe_path(target.as_str()));
+            .map_or("", http::uri::PathAndQuery::as_str);
+        // The origin client cannot send the asterisk form (`OPTIONS *`).
+        let asterisk = target == "*";
+        let safe = is_safe_path(target);
         // An upgrade never runs the capsule, so it does not wait for a slot.
         let runs_capsule = matches!(method.as_str(), "GET" | "HEAD") && upgrade.is_none();
         Box::pin(async move {
-            let response = if !safe {
+            let response = if asterisk {
+                plain_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "Not Implemented: the edge node does not forward `OPTIONS *`\n",
+                )
+            } else if !safe {
                 bad_request()
             } else if runs_capsule {
                 // A closed semaphore cannot happen: the node never closes it.

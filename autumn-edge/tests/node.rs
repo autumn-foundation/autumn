@@ -1150,3 +1150,29 @@ fn an_ipv4_mapped_trusted_proxy_matches_the_ipv4_peer() {
     // A mapped range wider than the IPv4 space is not valid.
     assert!(TrustedProxy::parse("::ffff:0.0.0.0/95").is_err());
 }
+
+#[tokio::test]
+async fn an_asterisk_form_options_is_not_implemented() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (origin, log) = origin_with(Answer::created).await;
+    let edge = node(declining_guest(), &origin).await;
+    let address = edge.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    stream
+        .write_all(
+            format!("OPTIONS * HTTP/1.1\r\nhost: {address}\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("write");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).await.expect("read");
+
+    // The origin client cannot send the asterisk form; `OPTIONS /` would ask
+    // another question.
+    assert!(answer.starts_with("HTTP/1.1 501"), "{answer}");
+    assert!(seen(&log).is_empty());
+}
