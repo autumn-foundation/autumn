@@ -1,9 +1,10 @@
 ### Fixed
 
 - **`#[commentable]`:** the `{Model}Comments` helpers now use the soft-delete
-  rule of the repository you call them on (issue #2284). Before, if any
-  repository of the model was `soft_delete`, every helper returned `404` for a
-  soft-deleted parent, also through a plain repository that returns the row.
+  rule of the repository you call them on (issue #2284). Before, one
+  `soft_delete` repository made every helper return `404` for a soft-deleted
+  parent. This also occurred through a plain repository whose finders return
+  that row.
   The generic router has no repository, so it keeps the old rule.
 
 ### Breaking Changes

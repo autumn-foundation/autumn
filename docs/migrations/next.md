@@ -81,8 +81,8 @@ full commit-level picture.
 ### Commentable: the runtime helpers take `soft_delete: Option<bool>`
 
 **Why:** a model can have a `soft_delete` repository and a plain one. The
-helpers could not tell which one called them, so they returned `404` for a
-soft-deleted parent through both (#2284). The caller now tells them.
+helpers did not know the calling repository. Thus they returned `404` for a
+soft-deleted parent through both (#2284). The caller now gives the fact.
 
 This affects only direct calls to the `autumn_web::commentable` functions. The
 generated `{Model}Comments` methods (`repo.add_comment(...)` and so on) do not
@@ -110,8 +110,8 @@ let thread =
 Do the same for `add_comment`, `delete_comment` and
 `recompute_comment_count`: add `None` as the last argument.
 
-**Automation:** `manual` — it adds an argument whose value depends on the
-calling repository, which a codemod cannot see.
+**Automation:** `manual` — the new argument depends on the calling
+repository. A codemod cannot know that repository.
 
 Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
@@ -174,6 +174,7 @@ single most valuable section of the guide — keep it factual and short.
 |---------------------------|------------------|-----|
 | `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
+| `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
 
 ## Configuration changes
 
@@ -192,6 +193,12 @@ Changes that still compile but behave differently at runtime. Examples:
 - A scheduled task now runs on a different worker.
 
 If nothing changed, delete this section.
+
+- **Commentable (#2284):** a model can have a `soft_delete` repository and a
+  plain one. Through the plain repository, the `{Model}Comments` helpers now
+  accept a soft-deleted parent. Before, they returned `404`. Through the
+  `soft_delete` repository and through the router, a soft-deleted parent is
+  still `404`.
 
 ## Deprecations retained from `{X.Y}`
 
@@ -235,6 +242,9 @@ commands with expected output, not "make sure everything works". Required by
 3. `autumn doctor --strict` — no findings.
 4. {one step per breaking change: the observable behaviour that proves the fix
    was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
+5. Commentable (#2284): soft-delete a parent row. Call `comment_thread` on it
+   through a plain repository of the model. Make sure that it returns the
+   thread, not `404`.
 
 ### Guide-only upgrade walkthrough
 

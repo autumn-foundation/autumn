@@ -206,6 +206,32 @@ async fn seed_hard(pool: &SqlitePool, title: &str) -> i64 {
     .await
 }
 
+/// Insert one `sqc_duals` row that is already soft-deleted.
+async fn seed_soft_deleted_dual(pool: &SqlitePool) -> i64 {
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO sqc_duals (title, deleted_at) VALUES ('gone', CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("seed a soft-deleted parent");
+    }
+    count(
+        pool,
+        "SELECT id AS n FROM sqc_duals ORDER BY id DESC LIMIT 1",
+    )
+    .await
+}
+
+async fn dual_counter(pool: &SqlitePool, id: i64) -> i64 {
+    count(
+        pool,
+        &format!("SELECT comment_count AS n FROM sqc_duals WHERE id = {id}"),
+    )
+    .await
+}
+
 async fn counter(pool: &SqlitePool, id: i64) -> i64 {
     count(
         pool,
@@ -338,7 +364,7 @@ async fn a_hard_delete_refuses_a_cross_record_graft_on_sqlite() {
 }
 
 /// #2284: a model with a `soft_delete` repository and a plain one. Before,
-/// every helper filtered `deleted_at` if ANY repository soft-deleted, so the
+/// every helper filtered `deleted_at` if one repository soft-deleted, so the
 /// plain repository got `404` for rows its own finders return. Now each
 /// repository applies its own rule.
 #[tokio::test]
@@ -347,22 +373,14 @@ async fn each_repository_applies_its_own_soft_delete_rule_on_sqlite() {
     let soft = PgSqcDualRepository::with_pool_untracked(pool.clone());
     let plain = PgSqcDualAdminRepository::with_pool_untracked(pool.clone());
     let author = seed_user(&pool, "ada").await;
-    {
-        let mut conn = pool.get().await.expect("conn");
-        diesel::sql_query(
-            "INSERT INTO sqc_duals (title, deleted_at) VALUES ('gone', CURRENT_TIMESTAMP)",
-        )
-        .execute(&mut *conn)
-        .await
-        .expect("seed a soft-deleted parent");
-    }
-    let target = count(&pool, "SELECT MAX(id) AS n FROM sqc_duals").await;
+    let target = seed_soft_deleted_dual(&pool).await;
 
     // The plain repository sees the row, so its helpers do too.
     let comment = plain
         .add_comment(target, author, "still here", None)
         .await
         .expect("the plain repository comments on its own row");
+    assert_eq!(dual_counter(&pool, target).await, 1);
     let thread = plain
         .comment_thread(target)
         .await
@@ -401,4 +419,5 @@ async fn each_repository_applies_its_own_soft_delete_rule_on_sqlite() {
             .expect("the plain repository deletes"),
         1
     );
+    assert_eq!(dual_counter(&pool, target).await, 0);
 }

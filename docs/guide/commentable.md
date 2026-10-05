@@ -409,7 +409,7 @@ column's presence alone.
 A model can have a `soft_delete` repository and a plain one. The helpers then
 follow the repository you call them on. Through the `soft_delete` repository,
 a soft-deleted parent is `404`. Through the plain repository, it accepts
-comments, the same as that repository's finders return it.
+comments. This agrees with the finders of that repository.
 
 The generic router has no repository. It hides a soft-deleted parent if any
 repository of the model soft-deletes.

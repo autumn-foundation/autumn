@@ -324,8 +324,8 @@ diesel::table! {
 
 /// #2284: one model, two repositories. Only the first soft-deletes. Each
 /// repository's helpers apply that repository's own rule. The router has no
-/// repository in hand, so it keeps the conservative rule: filter if any
-/// repository soft-deletes.
+/// repository. It uses the registry rule: filter if one repository
+/// soft-deletes.
 #[autumn_web::model(table = "cmt_duals")]
 #[commentable(by = CmtUser, table = cmt_comments)]
 pub struct CmtDual {
@@ -642,7 +642,7 @@ fn commentable_spec_uses_the_documented_conventions() {
 #[test]
 fn every_commentable_model_registers_itself() {
     let types = registered_commentable_types();
-    for expected in ["CmtPost", "CmtPhoto", "CmtShallow", "CmtCapped"] {
+    for expected in ["CmtPost", "CmtPhoto", "CmtShallow", "CmtCapped", "CmtDual"] {
         assert!(
             types.contains(&expected),
             "{expected} missing from the commentable registry: {types:?}"
@@ -683,6 +683,12 @@ fn repository_opt_in_not_column_presence_decides_tenant_and_soft_delete_scope() 
     // `CmtSoft` is the correctly-configured case: still a tombstone.
     assert_eq!(
         model_soft_deletes(core::any::type_name::<CmtSoft>()),
+        Some(true)
+    );
+    // #2284: `CmtDual` has a `soft_delete` repository and a plain one. The
+    // registry rule (used by the router) filters if one soft-deletes.
+    assert_eq!(
+        model_soft_deletes(core::any::type_name::<CmtDual>()),
         Some(true)
     );
 }
@@ -1930,15 +1936,25 @@ async fn router_reports_not_found_for_a_soft_deleted_parent() {
     assert_eq!(status, 404);
 }
 
-/// #2284: the router has no repository in hand. For a model with a
-/// `soft_delete` repository and a plain one, it keeps the conservative rule
-/// and hides the soft-deleted parent.
+/// #2284: the router has no repository. For a model with a `soft_delete`
+/// repository and a plain one, it uses the registry rule and hides the
+/// soft-deleted parent.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn router_hides_a_soft_deleted_parent_when_any_repository_soft_deletes() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
     let target = seed_one_col(&mut conn, "cmt_duals", "title", "gone").await;
+    let app = comment_app(
+        pool.clone(),
+        autumn_web::commentable::CommentsConfig::default(),
+    );
+    let path = format!("/comments/CmtDual/{target}");
+
+    // A live parent is served, so the `404` below is not "unknown type".
+    let (status, body) = call(app.clone(), get(&path)).await;
+    assert_eq!(status, 200, "{body}");
+
     diesel::sql_query("UPDATE cmt_duals SET deleted_at = NOW() WHERE id = $1")
         .bind::<BigInt, _>(target)
         .execute(&mut *conn)
@@ -1946,8 +1962,7 @@ async fn router_hides_a_soft_deleted_parent_when_any_repository_soft_deletes() {
         .expect("soft delete the parent");
     drop(conn);
 
-    let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
-    let (status, _) = call(app, get(&format!("/comments/CmtDual/{target}"))).await;
+    let (status, _) = call(app, get(&path)).await;
     assert_eq!(status, 404);
 }
 

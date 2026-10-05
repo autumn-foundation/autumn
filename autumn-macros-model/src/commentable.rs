@@ -1607,7 +1607,7 @@ mod tests {
     }
 
     /// #2284: each helper passes the calling repository's own soft-delete
-    /// fact, so the runtime does not guess it from every repository.
+    /// fact. The runtime then does not read the facts of all repositories.
     #[test]
     fn every_helper_passes_the_repositorys_soft_delete_fact() {
         let emitted = emit(&quote! { (by = User) });

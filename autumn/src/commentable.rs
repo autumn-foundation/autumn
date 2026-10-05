@@ -585,17 +585,17 @@ pub fn model_soft_deletes(model: &str) -> Option<bool> {
 /// The aggregation behind [`model_soft_deletes`], split out so the choice it
 /// makes across MULTIPLE repositories can be tested directly.
 ///
-/// ANY repository soft-deleting makes the model soft-deleting here.
+/// If one repository of the model soft-deletes, this returns `Some(true)`.
 ///
 /// Only a caller with no repository uses this rule: the router, or a direct
 /// call that passes `soft_delete: None`. The generated `{Model}Comments`
 /// helpers pass their repository's own fact instead (#2284).
 ///
 /// For a model with a `soft_delete` repository and a plain one, this rule
-/// gives `404` for a soft-deleted row. The opposite rule (all must opt in)
-/// lets the plain repository switch the filter off for the other, so comments
-/// attach to rows the app treats as gone. A `404` is recoverable. A wrong
-/// write is not.
+/// gives `404` for a soft-deleted row. The other rule (all repositories opt
+/// in) is not safe. The plain repository then removes the filter for the
+/// `soft_delete` repository, and a comment can attach to a deleted row. A
+/// `404` changes no data. A wrong write does.
 #[cfg(feature = "db")]
 fn soft_deletes_from<'a>(facts: impl Iterator<Item = &'a RepositoryFacts>) -> Option<bool> {
     let mut any = false;
@@ -784,9 +784,9 @@ pub fn duplicate_commentable_storage() -> Option<&'static str> {
 ///   `max_depth`.
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
 /// - Any database error.
-#[allow(clippy::too_many_arguments)] // The polymorphic key is two values, and
-// the caller scope (tenant, soft-delete) is two more: collapsing them into a
-// struct would hide the association's actual shape at every call site.
+#[allow(clippy::too_many_arguments)] // The polymorphic key is two values.
+// `tenant` and `soft_delete` are two more. A struct hides them at each call
+// site.
 pub async fn add_comment(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -1300,7 +1300,7 @@ fn build_nodes(
 ///
 /// Call this with the spec reference the `#[commentable]` registry holds.
 /// `commentable_model_for_spec` compares pointers (`std::ptr::eq`), so a copy
-/// of the spec never matches and step 2 is skipped (#2263). Every public entry
+/// of the spec never matches, and the function skips step 2 (#2263). Every public entry
 /// point resolves this **before** it copies `spec`.
 fn resolve_soft_deletes(spec: &CommentableSpec, soft_delete: Option<bool>) -> bool {
     soft_delete
@@ -2087,8 +2087,8 @@ mod tests {
         assert_eq!(soft_deletes_from(std::iter::empty()), None);
     }
 
-    /// #2284: the caller's own repository fact wins. `None` falls back to the
-    /// registry, then to the spec.
+    /// #2284: the caller's own repository fact wins. With `None` and no
+    /// registered repository, the spec's column decides.
     #[test]
     fn the_callers_soft_delete_fact_wins() {
         let mut spec = sample_spec();
@@ -2098,11 +2098,11 @@ mod tests {
             !resolve_soft_deletes(&spec, Some(false)),
             "plain repository"
         );
-        assert!(resolve_soft_deletes(&spec, None), "no repository in hand");
+        assert!(resolve_soft_deletes(&spec, None), "the column decides");
 
         spec.parent_soft_delete = false;
         assert!(resolve_soft_deletes(&spec, Some(true)), "soft repository");
-        assert!(!resolve_soft_deletes(&spec, None), "no repository in hand");
+        assert!(!resolve_soft_deletes(&spec, None), "the column decides");
     }
 
     /// A model may have more than one repository. Taking the FIRST registration
@@ -2629,7 +2629,7 @@ async fn show_thread(
         &commentable_type,
         parent_id,
         tenant.as_deref(),
-        // No repository in hand: use the registry rule (#2284).
+        // The router has no repository. Use the registry rule (#2284).
         None,
     )
     .await?;
@@ -2720,7 +2720,7 @@ async fn post_comment(
         &submission.body,
         reply_to,
         tenant.as_deref(),
-        // No repository in hand: use the registry rule (#2284).
+        // The router has no repository. Use the registry rule (#2284).
         None,
     )
     .await;
@@ -2759,6 +2759,7 @@ async fn post_comment(
             &commentable_type,
             parent_id,
             tenant.as_deref(),
+            // The router has no repository. Use the registry rule (#2284).
             None,
         )
         .await
