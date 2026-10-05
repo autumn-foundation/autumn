@@ -144,7 +144,7 @@ pub enum ConsoleError {
         "`{0}` has no `autumn_web::console_repl!(ctx.pool());` line, so `--repl` \
          cannot open the prompt. Add that line after `SeedContext::build()`, or \
          run `autumn console --force` to regenerate the file (this replaces \
-         your edits). Nothing has been changed.\n\
+         your edits). Autumn changed nothing.\n\
          See: docs/guide/console.md"
     )]
     PlaygroundLacksReplHook(String),
@@ -266,13 +266,11 @@ pub fn playground_cargo_args(package: Option<&str>, repl: bool) -> Vec<String> {
     args
 }
 
-/// Whether `source` calls `console_repl!` outside a line comment.
+/// Whether `source` calls `console_repl!` in code, not in a comment or a
+/// string.
 #[must_use]
 pub fn has_repl_hook(source: &str) -> bool {
-    source.lines().any(|line| {
-        let code = line.split("//").next().unwrap_or_default();
-        code.contains(REPL_HOOK)
-    })
+    crate::rust_source::mask_non_code(source).contains(REPL_HOOK)
 }
 
 /// Decide what to do with the playground source file.
@@ -1270,7 +1268,12 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     }
 
     if scaffold_only {
-        eprintln!("\n\u{2713} Playground ready. Edit {playground_rel}, then run `autumn console`.");
+        let next = if repl {
+            "autumn console --repl"
+        } else {
+            "autumn console"
+        };
+        eprintln!("\n\u{2713} Playground ready. Edit {playground_rel}, then run `{next}`.");
         return;
     }
 
@@ -1395,6 +1398,13 @@ mod tests {
         assert!(!has_repl_hook("// autumn_web::console_repl!(ctx.pool());"));
         assert!(!has_repl_hook("    //! console_repl! opens the prompt"));
         assert!(!has_repl_hook("fn main() {}"));
+        assert!(!has_repl_hook(
+            "/* autumn_web::console_repl!(ctx.pool()); */"
+        ));
+        assert!(!has_repl_hook("let s = \"console_repl!(pool)\";"));
+        assert!(has_repl_hook(
+            "let u = \"http://x\"; autumn_web::console_repl!(ctx.pool());"
+        ));
     }
 
     #[test]

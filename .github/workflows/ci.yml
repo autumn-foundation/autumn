@@ -1449,10 +1449,10 @@ jobs:
       - name: Run REPL-gated tests (console Rhai prompt)
         if: matrix.lane == 'repl'
         # `repl` (#2148) is off by default, so the `test` job compiles none of
-        # its suites. Building `integration_tests` with it also proves every
-        # `#[model]` and `#[repository]` in that binary registers. The one
-        # Docker test reads a live Postgres table; the bare Docker sweep does
-        # not build `repl`, so it runs here only.
+        # its suites. Building `integration_tests` with it also compiles the
+        # REPL registration of every `#[model]` and `#[repository]` in that
+        # binary. The Docker tests read a live Postgres table; the bare Docker
+        # sweep does not build `repl`, so they run here only.
         run: |
           set -euo pipefail
           assert_ran() {

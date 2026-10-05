@@ -782,8 +782,8 @@ macro_rules! __autumn_register_fake_seeder {
 /// Register a model with the console REPL (internal; invoked by `#[model]`).
 ///
 /// `serde` projects a row through its `Serialize` impl. `fields [...]` projects
-/// the listed fields only (a model with `#[classified]` columns has no
-/// `Serialize` impl).
+/// the listed fields through a view struct that keeps their serde attributes
+/// (a model with `#[classified]` columns has no `Serialize` impl).
 #[cfg(feature = "repl")]
 #[macro_export]
 #[doc(hidden)]
@@ -802,7 +802,7 @@ macro_rules! __autumn_register_repl_model {
     };
     (
         $model:ty, $name:expr, $table:expr, [$($field:literal),* $(,)?],
-        fields [$($key:literal => $ident:ident),* $(,)?]
+        fields [$($(#[$attr:meta])* $ident:ident : $ty:ty),* $(,)?]
     ) => {
         $crate::__autumn_register_repl_model!(@entry $name, $table, [$($field),*]);
         impl $crate::repl::ReplRow for $model {
@@ -810,22 +810,26 @@ macro_rules! __autumn_register_repl_model {
                 &self,
             ) -> ::core::result::Result<$crate::reexports::serde_json::Value, ::std::string::String>
             {
-                #[allow(unused_mut)]
-                let mut map = $crate::reexports::serde_json::Map::new();
-                $(
-                    map.insert(
-                        ::std::string::ToString::to_string($key),
-                        $crate::reexports::serde_json::to_value(&self.$ident)
-                            .map_err(|err| ::std::string::ToString::to_string(&err))?,
-                    );
-                )*
-                ::core::result::Result::Ok($crate::reexports::serde_json::Value::Object(map))
+                #[derive(::serde::Serialize)]
+                struct __AutumnReplView {
+                    $($(#[$attr])* $ident: $ty,)*
+                }
+                let view = __AutumnReplView {
+                    $($ident: ::core::clone::Clone::clone(&self.$ident),)*
+                };
+                $crate::reexports::serde_json::to_value(&view)
+                    .map_err(|err| ::std::string::ToString::to_string(&err))
             }
         }
     };
     (@entry $name:expr, $table:expr, [$($field:literal),*]) => {
         $crate::reexports::inventory::submit! {
-            $crate::repl::ReplModel { name: $name, table: $table, fields: &[$($field),*] }
+            $crate::repl::ReplModel {
+                name: $name,
+                module_path: ::core::module_path!(),
+                table: $table,
+                fields: &[$($field),*],
+            }
         }
     };
 }
@@ -840,6 +844,9 @@ macro_rules! __autumn_register_repl_model {
 
 /// Register a repository with the console REPL (internal; invoked by
 /// `#[repository]`). Registers `find_all`, `find_by_id` and `count`.
+///
+/// It expands in the repository's own module, so it can set the private
+/// statement timeout: a call the prompt gives up on also stops on the server.
 #[cfg(feature = "repl")]
 #[macro_export]
 #[doc(hidden)]
@@ -848,23 +855,30 @@ macro_rules! __autumn_register_repl_repository {
         $crate::reexports::inventory::submit! {
             $crate::repl::ReplRepository {
                 name: $name,
+                module_path: ::core::module_path!(),
                 model: $model_name,
-                find_all: |__pool| ::std::boxed::Box::pin(async move {
-                    let __repo = <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                find_all: |__pool, __timeout_ms| ::std::boxed::Box::pin(async move {
+                    let mut __repo =
+                        <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    __repo.__autumn_statement_timeout_ms = __timeout_ms;
                     $crate::repl::__project_all(
                         <$pg as $repository>::find_all(&__repo).await,
                         $crate::__autumn_repl_projector!($model),
                     )
                 }),
-                find_by_id: |__pool, __id| ::std::boxed::Box::pin(async move {
-                    let __repo = <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                find_by_id: |__pool, __timeout_ms, __id| ::std::boxed::Box::pin(async move {
+                    let mut __repo =
+                        <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    __repo.__autumn_statement_timeout_ms = __timeout_ms;
                     $crate::repl::__project_one(
                         <$pg as $repository>::find_by_id(&__repo, __id).await,
                         $crate::__autumn_repl_projector!($model),
                     )
                 }),
-                count: |__pool| ::std::boxed::Box::pin(async move {
-                    let __repo = <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                count: |__pool, __timeout_ms| ::std::boxed::Box::pin(async move {
+                    let mut __repo =
+                        <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    __repo.__autumn_statement_timeout_ms = __timeout_ms;
                     $crate::repl::__count(<$pg as $repository>::count(&__repo).await)
                 }),
             }

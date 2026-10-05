@@ -24,8 +24,6 @@ on:
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/console.rs"
-      # The `autumn console --repl` prompt (#2148).
-      - "autumn/src/repl.rs"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/src/migrate.rs"
       - "autumn-cli/Cargo.toml"
@@ -108,8 +106,6 @@ on:
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/console.rs"
-      # The `autumn console --repl` prompt (#2148).
-      - "autumn/src/repl.rs"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/src/migrate.rs"
       - "autumn-cli/Cargo.toml"
@@ -482,7 +478,7 @@ jobs:
           assert_ran "$RUNNER_TEMP/conformance-generated_webhook_tests_pass.log" generated_webhook_tests_pass
       # ── `autumn console` (#1039) ────────────────────────────────────────
       #
-      # These four are the ONLY machine proof of the console's central
+      # These five are the ONLY machine proof of the console's central
       # acceptance criterion — that the scaffolded playground compiles and
       # runs against the resolved environment with no wiring by hand. They
       # live in the consolidated `cli_tests` binary, whose only other CI

@@ -34,15 +34,24 @@ diesel::table! {
     repl_people (id) {
         id -> Int8,
         name -> Text,
+        token -> Text,
         email -> Text,
     }
+}
+
+#[allow(clippy::ptr_arg, reason = "serde `serialize_with` passes `&String`")]
+fn mask<S: serde::Serializer>(_: &String, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("***")
 }
 
 #[model(table = "repl_people")]
 pub struct ReplPerson {
     #[id]
     pub id: i64,
+    #[serde(rename = "displayName")]
     pub name: String,
+    #[serde(serialize_with = "mask")]
+    pub token: String,
     #[classified]
     pub email: String,
 }
@@ -91,12 +100,18 @@ fn a_classified_column_never_reaches_the_prompt() {
     let person = ReplPerson {
         id: 7,
         name: "Ada".into(),
+        token: "secret-token".into(),
         email: "ada@example.com".to_string().into(),
     };
     let value = person.to_repl_value().expect("projection");
-    assert_eq!(value, serde_json::json!({ "id": 7, "name": "Ada" }));
+    // The visible fields keep their own serde attributes.
+    assert_eq!(
+        value,
+        serde_json::json!({ "id": 7, "displayName": "Ada", "token": "***" })
+    );
     assert!(!value.to_string().contains("ada@example.com"));
-    assert_eq!(model("ReplPerson").fields, &["id", "name"]);
+    assert!(!value.to_string().contains("secret-token"));
+    assert_eq!(model("ReplPerson").fields, &["id", "displayName", "token"]);
 }
 
 /// A pool to a closed port: every call fails fast.
@@ -191,5 +206,68 @@ mod docker {
             panic!("find_all: {:?}", lines[4]);
         };
         assert!(all.contains("\"First\"") && !all.contains("s1"), "{all}");
+    }
+
+    /// A call the prompt gives up on also stops on the server, so the next
+    /// call does not wait behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn repl_timeout_stops_the_statement_on_the_server() {
+        let container = Postgres::default().start().await.expect("start Postgres");
+        let host = container.get_host().await.expect("host");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let pool = autumn_web::db::create_pool(&DatabaseConfig {
+            primary_url: Some(format!(
+                "postgres://postgres:postgres@{host}:{port}/postgres"
+            )),
+            ..DatabaseConfig::default()
+        })
+        .expect("pool builds")
+        .expect("pool");
+        let mut holder = pool.get().await.expect("connection");
+        for statement in SETUP.split(';').filter(|s| !s.trim().is_empty()) {
+            diesel::sql_query(statement)
+                .execute(&mut *holder)
+                .await
+                .expect("setup");
+        }
+        for statement in ["BEGIN", "LOCK TABLE repl_posts IN ACCESS EXCLUSIVE MODE"] {
+            diesel::sql_query(statement)
+                .execute(&mut *holder)
+                .await
+                .expect("lock");
+        }
+
+        let count = |pool: repl::ReplPool| {
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let bridge = Bridge::new(handle, pool).with_timeout(Duration::from_secs(1));
+                Repl::new(bridge).eval_line("ReplPostRepository::count()")
+            })
+        };
+
+        let blocked = count(pool.clone()).await.expect("prompt thread");
+        let Outcome::Error(text) = blocked else {
+            panic!("a locked read must fail: {blocked:?}");
+        };
+        assert!(
+            text.contains("statement timeout"),
+            "server cancels it: {text}"
+        );
+
+        diesel::sql_query("ROLLBACK")
+            .execute(&mut *holder)
+            .await
+            .expect("unlock");
+        drop(holder);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            count(pool).await.expect("prompt thread"),
+            Outcome::Value("2".into())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the next call is not stuck"
+        );
     }
 }

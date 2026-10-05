@@ -22,7 +22,7 @@ use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize
 use autumn_macros_support::schema::{
     apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
     field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
-    field_serde_serialize_rename, has_attr, is_option_type, serde_bare_word,
+    field_serde_serialize_rename, has_attr, is_option_type, schema_property_name, serde_bare_word,
     serde_rename_all_serialize_rule, serde_valued_key, type_name_str,
 };
 
@@ -10257,16 +10257,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .copied()
         .collect();
     // #2148: the console REPL shows the same fields a JSON response carries.
-    // A model with classified columns has no `Serialize` impl, so it lists
-    // its visible fields one by one.
+    // A model with classified columns has no `Serialize` impl, so it projects
+    // its visible fields through a view struct that keeps their serde
+    // attributes (`rename`, `serialize_with`, ...).
     let repl_registration = {
-        let visible: Vec<&syn::Ident> = serializable_field_refs
+        let names: Vec<String> = serializable_field_refs
             .iter()
-            .filter_map(|f| f.ident.as_ref())
+            .filter_map(|f| schema_property_name(f, schema_rename_all_rule))
             .collect();
-        let names: Vec<String> = visible.iter().map(|ident| unraw_ident(ident)).collect();
         let projection = if has_classified {
-            quote! { fields [#(#names => #visible),*] }
+            let view_fields = serializable_field_refs.iter().filter_map(|f| {
+                let ident = f.ident.as_ref()?;
+                let ty = &f.ty;
+                let serde_attrs = f.attrs.iter().filter(|a| a.path().is_ident("serde"));
+                Some(quote! { #(#serde_attrs)* #ident: #ty })
+            });
+            quote! { fields [#(#view_fields),*] }
         } else {
             quote! { serde }
         };

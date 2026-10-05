@@ -22,14 +22,14 @@
 
 use std::fmt::Write as _;
 use std::future::Future;
+use std::io::Write as _;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::time::Duration;
 
 use diesel_async::pooled_connection::deadpool::Pool;
 use futures::future::BoxFuture;
-use rhai::{Dynamic, Engine, EvalAltResult, Module, Scope};
+use rhai::{Dynamic, Engine, EvalAltResult, Module, Scope, Shared};
 use serde_json::Value;
 use tokio::runtime::Handle;
 
@@ -44,8 +44,13 @@ pub type ReplFuture<'a, T> = BoxFuture<'a, Result<T, String>>;
 /// The prompt text.
 pub const PROMPT: &str = "autumn> ";
 
-/// The time limit for one repository call.
+/// The time limit for one repository call. The server stops the statement
+/// at this limit.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Extra time the prompt waits after the call timeout, so the server error
+/// arrives before the prompt gives up.
+const CLIENT_GRACE: Duration = Duration::from_secs(1);
 
 /// The history file, relative to the project directory.
 pub const HISTORY_FILE: &str = "target/autumn/repl_history.txt";
@@ -54,9 +59,11 @@ pub const HISTORY_FILE: &str = "target/autumn/repl_history.txt";
 pub struct ReplModel {
     /// The model type name, e.g. `"Post"`.
     pub name: &'static str,
+    /// The module that declares the model.
+    pub module_path: &'static str,
     /// The database table.
     pub table: &'static str,
-    /// The fields a row shows at the prompt.
+    /// The keys a row shows at the prompt.
     pub fields: &'static [&'static str],
 }
 
@@ -67,14 +74,16 @@ pub struct ReplRepository {
     /// The repository trait name, e.g. `"PostRepository"`. It is also the
     /// Rhai module name.
     pub name: &'static str,
+    /// The module that declares the repository.
+    pub module_path: &'static str,
     /// The model type name.
     pub model: &'static str,
-    /// Read all rows.
-    pub find_all: for<'a> fn(&'a ReplPool) -> ReplFuture<'a, Vec<Value>>,
+    /// Read all rows. The `u64` is the statement timeout in milliseconds.
+    pub find_all: for<'a> fn(&'a ReplPool, u64) -> ReplFuture<'a, Vec<Value>>,
     /// Read one row by id.
-    pub find_by_id: for<'a> fn(&'a ReplPool, i64) -> ReplFuture<'a, Option<Value>>,
+    pub find_by_id: for<'a> fn(&'a ReplPool, u64, i64) -> ReplFuture<'a, Option<Value>>,
     /// Count the rows.
-    pub count: for<'a> fn(&'a ReplPool) -> ReplFuture<'a, i64>,
+    pub count: for<'a> fn(&'a ReplPool, u64) -> ReplFuture<'a, i64>,
 }
 
 inventory::collect!(ReplRepository);
@@ -102,22 +111,34 @@ pub enum ReplError {
     Thread(String),
 }
 
-/// All registered models, sorted by name.
+/// All registered models, sorted by name, then module.
 #[must_use]
 pub fn registered_models() -> Vec<&'static ReplModel> {
     let mut models: Vec<_> = inventory::iter::<ReplModel>.into_iter().collect();
-    models.sort_unstable_by_key(|m| m.name);
-    models.dedup_by_key(|m| m.name);
+    models.sort_unstable_by_key(|m| (m.name, m.module_path));
     models
 }
 
-/// All registered repositories, sorted by name.
+/// All registered repositories, sorted by name, then module.
 #[must_use]
 pub fn registered_repositories() -> Vec<&'static ReplRepository> {
     let mut repositories: Vec<_> = inventory::iter::<ReplRepository>.into_iter().collect();
-    repositories.sort_unstable_by_key(|r| r.name);
-    repositories.dedup_by_key(|r| r.name);
+    repositories.sort_unstable_by_key(|r| (r.name, r.module_path));
     repositories
+}
+
+/// Repository names that two or more modules declare. The prompt cannot tell
+/// them apart, so it registers none of them.
+#[must_use]
+pub fn clashing_repository_names() -> Vec<&'static str> {
+    let repositories = registered_repositories();
+    let mut names: Vec<_> = repositories
+        .windows(2)
+        .filter(|pair| pair[0].name == pair[1].name)
+        .map(|pair| pair[0].name)
+        .collect();
+    names.dedup();
+    names
 }
 
 /// Runs async repository calls from the synchronous Rhai engine.
@@ -155,13 +176,19 @@ impl Bridge {
         &self.pool
     }
 
+    /// The server statement timeout for one call, in milliseconds.
+    #[must_use]
+    pub fn statement_timeout_ms(&self) -> u64 {
+        u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// Blocks on `call` and returns its result.
     ///
     /// # Errors
     ///
     /// Returns a message when the call fails, times out, or panics.
     pub fn call<T>(&self, call: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-        let timeout = self.timeout;
+        let timeout = self.timeout.saturating_add(CLIENT_GRACE);
         // `block_on` panics inside an async context. `catch_unwind` turns that,
         // and a panic in the call, into a message.
         let blocked = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -170,7 +197,7 @@ impl Bridge {
         }));
         match blocked {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(format!("call timed out after {}", humanize(timeout))),
+            Ok(Err(_)) => Err(format!("call timed out after {}", humanize(self.timeout))),
             Err(payload) => Err(format!(
                 "call panicked: {}",
                 panic_message(payload.as_ref())
@@ -202,9 +229,13 @@ impl Repl {
     /// Makes an engine with every registered repository.
     #[must_use]
     pub fn new(bridge: Bridge) -> Self {
-        let bridge = Rc::new(bridge);
+        let bridge = Shared::new(bridge);
         let mut engine = Engine::new();
-        for repository in registered_repositories() {
+        let clashes = clashing_repository_names();
+        for repository in registered_repositories()
+            .into_iter()
+            .filter(|r| !clashes.contains(&r.name))
+        {
             engine.register_static_module(
                 repository.name,
                 repository_module(repository, &bridge).into(),
@@ -222,16 +253,30 @@ impl Repl {
     /// The text shown when the prompt opens.
     #[must_use]
     pub fn banner(&self) -> String {
-        let names: Vec<_> = registered_repositories().iter().map(|r| r.name).collect();
+        let clashes = clashing_repository_names();
+        let mut names: Vec<_> = registered_repositories()
+            .iter()
+            .map(|r| r.name)
+            .filter(|name| !clashes.contains(name))
+            .collect();
+        names.dedup();
         let names = if names.is_empty() {
             "(none registered)".to_owned()
         } else {
             names.join(", ")
         };
-        format!(
+        let mut banner = format!(
             "Autumn REPL (Rhai). Repositories: {names}.\n\
              Type help() for the commands, exit to stop."
-        )
+        );
+        if !clashes.is_empty() {
+            let _ = write!(
+                banner,
+                "\nNot registered (two modules use the name): {}.",
+                clashes.join(", ")
+            );
+        }
+        banner
     }
 
     /// Evaluates one line. Variables stay for later lines.
@@ -256,6 +301,8 @@ impl Repl {
 /// Renders a value for the prompt: text as is, other values as JSON.
 #[must_use]
 pub fn render(value: &Dynamic) -> String {
+    // A value a closure captured is shared; serde reads only plain values.
+    let value = &value.flatten_clone();
     if value.is_unit() {
         return "()".to_owned();
     }
@@ -307,7 +354,7 @@ pub fn drive(
 /// Returns [`ReplError`] when the line editor or the prompt thread fails.
 pub async fn run(pool: &ReplPool) -> Result<(), ReplError> {
     let bridge = Bridge::new(Handle::current(), pool.clone());
-    tokio::task::spawn_blocking(move || run_blocking(bridge))
+    crate::time::spawn_blocking(move || run_blocking(bridge))
         .await
         .map_err(|err| ReplError::Thread(err.to_string()))?
 }
@@ -321,7 +368,8 @@ fn run_blocking(bridge: Bridge) -> Result<(), ReplError> {
     let history = PathBuf::from(HISTORY_FILE);
     // History is a convenience: a missing or unreadable file is not an error.
     let _ = editor.load_history(&history);
-    println!("{}", repl.banner());
+    // A closed stdout must not stop the prompt; the write result is dropped.
+    let _ = writeln!(std::io::stdout(), "{}", repl.banner());
 
     let result = drive(
         &mut repl,
@@ -446,27 +494,32 @@ pub fn __count(count: crate::AutumnResult<i64>) -> Result<i64, String> {
 }
 
 /// Builds the Rhai module for one repository.
-fn repository_module(repository: &'static ReplRepository, bridge: &Rc<Bridge>) -> Module {
+fn repository_module(repository: &'static ReplRepository, bridge: &Shared<Bridge>) -> Module {
     let mut module = Module::new();
 
-    let b = Rc::clone(bridge);
+    let b = Shared::clone(bridge);
     module.set_native_fn("find_all", move || {
         let rows = b
-            .call((repository.find_all)(b.pool()))
+            .call((repository.find_all)(b.pool(), b.statement_timeout_ms()))
             .map_err(script_error)?;
         to_dynamic(&rows)
     });
 
-    let b = Rc::clone(bridge);
+    let b = Shared::clone(bridge);
     module.set_native_fn("find_by_id", move |id: rhai::INT| {
-        b.call((repository.find_by_id)(b.pool(), id))
-            .map_err(script_error)?
-            .map_or(Ok(Dynamic::UNIT), |row| to_dynamic(&row))
+        b.call((repository.find_by_id)(
+            b.pool(),
+            b.statement_timeout_ms(),
+            i64::from(id),
+        ))
+        .map_err(script_error)?
+        .map_or(Ok(Dynamic::UNIT), |row| to_dynamic(&row))
     });
 
-    let b = Rc::clone(bridge);
+    let b = Shared::clone(bridge);
     module.set_native_fn("count", move || {
-        b.call((repository.count)(b.pool())).map_err(script_error)
+        b.call((repository.count)(b.pool(), b.statement_timeout_ms()))
+            .map_err(script_error)
     });
 
     module
@@ -494,7 +547,11 @@ fn help_text() -> String {
          Type exit (or quit, :q, Ctrl-D) to stop.\n\
          Repositories:",
     );
-    let repositories = registered_repositories();
+    let clashes = clashing_repository_names();
+    let repositories: Vec<_> = registered_repositories()
+        .into_iter()
+        .filter(|r| !clashes.contains(&r.name))
+        .collect();
     if repositories.is_empty() {
         text.push_str("\n  (none registered)");
     }
@@ -512,7 +569,14 @@ fn help_text() -> String {
 fn models_value() -> Result<Dynamic, Box<EvalAltResult>> {
     let models: Vec<Value> = registered_models()
         .into_iter()
-        .map(|m| serde_json::json!({ "name": m.name, "table": m.table, "fields": m.fields }))
+        .map(|m| {
+            serde_json::json!({
+                "name": m.name,
+                "module": m.module_path,
+                "table": m.table,
+                "fields": m.fields,
+            })
+        })
         .collect();
     to_dynamic(&models)
 }
@@ -520,7 +584,7 @@ fn models_value() -> Result<Dynamic, Box<EvalAltResult>> {
 fn repositories_value() -> Result<Dynamic, Box<EvalAltResult>> {
     let repositories: Vec<Value> = registered_repositories()
         .into_iter()
-        .map(|r| serde_json::json!({ "name": r.name, "model": r.model }))
+        .map(|r| serde_json::json!({ "name": r.name, "module": r.module_path, "model": r.model }))
         .collect();
     to_dynamic(&repositories)
 }
@@ -556,51 +620,95 @@ mod tests {
     }
 
     inventory::submit! {
-        ReplModel { name: "ReplFixture", table: "repl_fixtures", fields: &["id", "title"] }
+        ReplModel {
+            name: "ReplFixture",
+            module_path: module_path!(),
+            table: "repl_fixtures",
+            fields: &["id", "title"],
+        }
     }
 
     inventory::submit! {
         ReplRepository {
             name: "ReplFixtureRepository",
+            module_path: module_path!(),
             model: "ReplFixture",
-            find_all: |_pool| Box::pin(async { Ok(fixture_rows()) }),
-            find_by_id: |_pool, id| Box::pin(async move {
+            find_all: |_pool, _ms| Box::pin(async { Ok(fixture_rows()) }),
+            find_by_id: |_pool, _ms, id| Box::pin(async move {
                 Ok(fixture_rows().into_iter().find(|r| r["id"] == id))
             }),
-            count: |_pool| Box::pin(async { Ok(3) }),
+            count: |_pool, _ms| Box::pin(async { Ok(3) }),
         }
     }
 
     inventory::submit! {
         ReplRepository {
             name: "FailingFixtureRepository",
+            module_path: module_path!(),
             model: "ReplFixture",
-            find_all: |_pool| Box::pin(async { Err("connection refused".to_owned()) }),
-            find_by_id: |_pool, _id| Box::pin(async { Err("connection refused".to_owned()) }),
-            count: |_pool| Box::pin(async { Err("connection refused".to_owned()) }),
+            find_all: |_pool, _ms| Box::pin(async { Err("connection refused".to_owned()) }),
+            find_by_id: |_pool, _ms, _id| Box::pin(async { Err("connection refused".to_owned()) }),
+            count: |_pool, _ms| Box::pin(async { Err("connection refused".to_owned()) }),
         }
     }
 
     inventory::submit! {
         ReplRepository {
             name: "PanickingFixtureRepository",
+            module_path: module_path!(),
             model: "ReplFixture",
-            find_all: |_pool| Box::pin(async { panic!("fixture panic") }),
-            find_by_id: |_pool, _id| Box::pin(async { panic!("fixture panic") }),
-            count: |_pool| Box::pin(async { panic!("fixture panic") }),
+            find_all: |_pool, _ms| Box::pin(async { panic!("fixture panic") }),
+            find_by_id: |_pool, _ms, _id| Box::pin(async { panic!("fixture panic") }),
+            count: |_pool, _ms| Box::pin(async { panic!("fixture panic") }),
         }
     }
 
     inventory::submit! {
         ReplRepository {
             name: "SlowFixtureRepository",
+            module_path: module_path!(),
             model: "ReplFixture",
-            find_all: |_pool| Box::pin(async { std::future::pending().await }),
-            find_by_id: |_pool, _id| Box::pin(async { std::future::pending().await }),
-            count: |_pool| Box::pin(async {
+            find_all: |_pool, _ms| Box::pin(async { std::future::pending().await }),
+            find_by_id: |_pool, _ms, _id| Box::pin(async { std::future::pending().await }),
+            count: |_pool, _ms| Box::pin(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 Ok(0)
             }),
+        }
+    }
+
+    // Returns the statement timeout it gets, so a test can read it.
+    inventory::submit! {
+        ReplRepository {
+            name: "TimeoutEchoRepository",
+            module_path: module_path!(),
+            model: "ReplFixture",
+            find_all: |_pool, _ms| Box::pin(async { Ok(Vec::new()) }),
+            find_by_id: |_pool, _ms, _id| Box::pin(async { Ok(None) }),
+            count: |_pool, ms| Box::pin(async move { Ok(i64::try_from(ms).unwrap_or(-1)) }),
+        }
+    }
+
+    // Two modules declare the same repository name.
+    inventory::submit! {
+        ReplRepository {
+            name: "ClashRepository",
+            module_path: "app::admin",
+            model: "ReplFixture",
+            find_all: |_pool, _ms| Box::pin(async { Ok(Vec::new()) }),
+            find_by_id: |_pool, _ms, _id| Box::pin(async { Ok(None) }),
+            count: |_pool, _ms| Box::pin(async { Ok(1) }),
+        }
+    }
+
+    inventory::submit! {
+        ReplRepository {
+            name: "ClashRepository",
+            module_path: "app::accounts",
+            model: "ReplFixture",
+            find_all: |_pool, _ms| Box::pin(async { Ok(Vec::new()) }),
+            find_by_id: |_pool, _ms, _id| Box::pin(async { Ok(None) }),
+            count: |_pool, _ms| Box::pin(async { Ok(2) }),
         }
     }
 
@@ -771,6 +879,41 @@ mod tests {
         assert!(ran.load(Ordering::SeqCst));
     }
 
+    #[test]
+    fn calls_carry_the_bridge_timeout_to_the_server() {
+        let outcome = with_repl(Duration::from_millis(1500), |repl| {
+            repl.eval_line("TimeoutEchoRepository::count()")
+        });
+        assert_eq!(outcome, Outcome::Value("1500".into()));
+    }
+
+    #[test]
+    fn a_name_two_modules_use_is_not_registered_and_is_reported() {
+        assert_eq!(clashing_repository_names(), ["ClashRepository"]);
+        assert!(matches!(
+            eval("ClashRepository::count()"),
+            Outcome::Error(_)
+        ));
+        let banner = with_repl(DEFAULT_CALL_TIMEOUT, |repl| repl.banner());
+        assert!(
+            banner.contains("Not registered") && banner.contains("ClashRepository"),
+            "{banner}"
+        );
+    }
+
+    #[test]
+    fn a_captured_value_renders_as_json() {
+        with_repl(DEFAULT_CALL_TIMEOUT, |repl| {
+            repl.eval_line("let r = ReplFixtureRepository::find_by_id(1);");
+            repl.eval_line("let f = || r;");
+            let Outcome::Value(text) = repl.eval_line("r") else {
+                panic!("expected a value");
+            };
+            let row: Value = serde_json::from_str(&text).expect("JSON output");
+            assert_eq!(row["title"], "Hello");
+        });
+    }
+
     // ── built-ins and control lines ────────────────────────────────────
     #[test]
     fn exit_and_blank_lines() {
@@ -885,6 +1028,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::needless_borrow,
+        reason = "the macro always calls on `&&&__Probe`; the test does the same"
+    )]
     fn probe_picks_row_then_serde_then_an_error() {
         let row = (&&&__Probe::<Row>::new()).__projector();
         assert_eq!(row(&Row(1)), Ok(serde_json::json!({ "id": 1 })));

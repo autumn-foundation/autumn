@@ -14,8 +14,8 @@ it. Every invocation after that just builds and runs whatever you last edited.
 
 ## Two modes: edit-and-run, or a prompt
 
-Rust has no stable `eval`. Thus every console is a trade. Autumn gives you two,
-on the same scaffolded binary:
+Rust has no stable `eval`. Each console mode has a cost. Autumn gives you two
+modes on the same scaffolded binary:
 
 | | `autumn console` (edit and run) | `autumn console --repl` (prompt) |
 | --- | --- | --- |
@@ -95,28 +95,31 @@ Second
 - `exit`, `quit`, `:q` or Ctrl-D stops the prompt. At the prompt, Ctrl-C
   clears the line. While a line runs, Ctrl-C stops the process.
 - Variables stay between lines.
-- History is in `target/autumn/repl_history.txt`.
+- History is in `target/autumn/repl_history.txt`, in the package directory.
 
 ### How it works
 
 - `--repl` builds with `--features playground,autumn-web/repl`. It does
   **not** change `Cargo.toml`. A normal `cargo build` never gets Rhai.
 - `#[model]` and `#[repository]` register themselves through `inventory`.
-  You write no glue for each model. The modules come in through the same
-  `#[path]` lines the playground uses.
+  You write no glue for each model.
+- Only the modules that the playground declares with `#[path]` are compiled
+  in: `schema`, `models`, `repositories` and `policies`. A repository in a
+  different module is not at the prompt. Add a `#[path]` line for it.
 - The template line `autumn_web::console_repl!(ctx.pool());` opens the
   prompt. Without `--repl`, that line does nothing.
 - Repository methods are `async`. Rhai is synchronous. Each call blocks on the
-  runtime handle, with a 30-second limit.
+  runtime handle, with a 30-second limit. The database server stops the
+  statement at that limit too.
 - A failed call, a time-out, or a panic is a script error. The prompt stays
-  open.
+  open. A panic also prints the Rust panic message first.
 
 ### What you see
 
-A row is the JSON that `Json(model)` sends. Thus `#[private]` and
-`#[serde(skip)]` fields do not show. A model with `#[classified]` columns
-shows its other columns only. A repository over a hand-written model uses
-that model's `Serialize` impl.
+A row is the JSON that `Json(model)` sends. `#[private]` and `#[serde(skip)]`
+fields do not show. A model with `#[classified]` columns shows its other
+columns only, with their serde attributes. A repository over a hand-written
+model uses that model's `Serialize` impl.
 
 ### Limits
 
@@ -124,10 +127,12 @@ that model's `Serialize` impl.
   your own functions are not available.
 - `find_by_id` returns `()` when no row has that id.
 - A tenant-scoped or sharded repository needs request context. At the prompt,
-  its reads return a script error.
-- Rhai uses `smartstring`. It adds `impl Add<SmartString> for String`. Thus
-  `String + &String` in code that the playground compiles does not infer.
-  Write `s + other.as_str()` or `format!` instead.
+  its reads can return a script error.
+- If two modules declare a repository with the same name, the prompt registers
+  neither. The banner names them.
+- With `--repl`, `String + &String` in your app code does not compile. Write
+  `s + other.as_str()` or use `format!`. (Rhai uses `smartstring`, which adds
+  `impl Add<SmartString> for String`.)
 
 ### A playground from before `--repl`
 
