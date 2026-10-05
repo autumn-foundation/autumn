@@ -18,7 +18,7 @@ variable "location" {
 }
 
 variable "image_tag" {
-  description = "Tag of the {{project_name}} image in Azure Container Registry to deploy. Documents the tag scheme used by `az containerapp update`/CI after bootstrap — Terraform itself only ever sets `bootstrap_image` (see below) and never manages the image after the first apply."
+  description = "Tag of the {{project_name}} image in Azure Container Registry to deploy. Documents the tag scheme used by azure-cutover.sh/CI after bootstrap — Terraform itself only ever sets `bootstrap_image` (see below) and never manages the image after the first apply."
   type        = string
   default     = "latest"
 }
@@ -27,12 +27,12 @@ variable "image_tag" {
 # job's) first revision, but a brand-new ACR has none yet — so Terraform
 # points both at this public placeholder on the first apply, then ignores
 # further image drift (see the `lifecycle.ignore_changes` blocks in main.tf)
-# once `az containerapp update`/the migration job start in azure-deploy.yml
+# once azure-cutover.sh/the migration job start in azure-deploy.yml
 # take over managing the real image. The placeholder app gets no identity or
 # secret refs (#2314). Keep min_replicas at 0 until after the first real
-# deploy so the placeholder does not run at all.
+# deploy so the placeholder does not run.
 variable "bootstrap_image" {
-  description = "Public placeholder image Terraform uses only to create inactive first revisions before any real image has been pushed to ACR. It never gets production secrets. Keep min_replicas at 0 until after the first real deploy so it does not run."
+  description = "Public placeholder image Terraform uses only to create inactive first revisions before any real image has been pushed to ACR. The placeholder app gets no production secrets. The migration job has them, but runs only after CI sets the real image. Keep min_replicas at 0 until after the first real deploy."
   type        = string
   default     = "mcr.microsoft.com/k8se/quickstart:latest"
 }
@@ -62,7 +62,7 @@ variable "max_replicas" {
 }
 
 variable "enable_redis_cache" {
-  description = "Provision an optional Azure Redis Cache and wire its URL into the app. Infrastructure only: your app must ALSO depend on the autumn-cache-redis crate and register RedisCachePlugin in main.rs for this to take effect — see docs/guide/cloud-native.md. Off by default to avoid the extra cost."
+  description = "Provision an optional Azure Redis Cache. The cutover (azure-cutover.sh) sets its URL on the app. Infrastructure only: your app must ALSO depend on the autumn-cache-redis crate and register RedisCachePlugin in main.rs for this to take effect — see docs/guide/cloud-native.md. Off by default to avoid the extra cost."
   type        = bool
   default     = false
 }

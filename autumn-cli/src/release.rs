@@ -19,6 +19,7 @@ mod templates {
     pub const AZURE_TFVARS_EXAMPLE: &str =
         include_str!("templates/release/terraform.tfvars.example.tmpl");
     pub const AZURE_DEPLOY_WORKFLOW: &str = include_str!("templates/release/azure-deploy.yml.tmpl");
+    pub const AZURE_CUTOVER_SCRIPT: &str = include_str!("templates/release/azure-cutover.sh.tmpl");
 
     pub const AWS_APP_RUNNER_MAIN_TF: &str =
         include_str!("templates/release/aws-app-runner-main.tf.tmpl");
@@ -751,6 +752,7 @@ fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
                 ".github/workflows/azure-deploy.yml",
                 templates::AZURE_DEPLOY_WORKFLOW,
             ));
+            files.push(("azure-cutover.sh", templates::AZURE_CUTOVER_SCRIPT));
         }
         Target::AwsAppRunner => {
             files.push(("main.tf", templates::AWS_APP_RUNNER_MAIN_TF));
@@ -3135,7 +3137,10 @@ previous_secrets = []
             "secrets: []",
             "az rest --method patch",
         ] {
-            assert!(rollback.contains(field), "rollback must set `{field}`: {rollback}");
+            assert!(
+                rollback.contains(field),
+                "rollback must set `{field}`: {rollback}"
+            );
         }
         assert!(
             rollback.contains("\"$ACR_LOGIN_SERVER\"/*) return"),
@@ -3436,9 +3441,8 @@ previous_secrets = []
             "azure-deploy.yml must push to the Azure Container Registry: {content}"
         );
         assert!(
-            content.contains("az containerapp update")
-                || content.contains("containerapps-deploy-action"),
-            "azure-deploy.yml must deploy the new image to the Container App: {content}"
+            content.contains("run: bash azure-cutover.sh"),
+            "azure-deploy.yml must deploy the new image with the cutover script: {content}"
         );
     }
 
@@ -3593,15 +3597,12 @@ previous_secrets = []
             "azure-deploy.yml must reference the migration job by its Terraform output: {content}"
         );
 
-        // Match the actual invocations (with their line-continuation
-        // backslash), not just the bare phrase — an explanatory comment
-        // elsewhere (e.g. about concurrency) may legitimately mention
-        // "az containerapp update" in prose without a trailing "\".
+        // Match the actual invocations, not prose in a comment.
         let job_pos = content
             .find("az containerapp job start \\")
             .expect("migration job start must be present");
         let deploy_pos = content
-            .find("az containerapp update \\")
+            .find("run: bash azure-cutover.sh")
             .expect("deploy step must be present");
         assert!(
             job_pos < deploy_pos,
@@ -3820,7 +3821,7 @@ previous_secrets = []
             .find("az containerapp job start \\")
             .expect("migration job start must be present");
         let deploy_pos = content
-            .find("az containerapp update \\")
+            .find("run: bash azure-cutover.sh")
             .expect("deploy step must be present");
         assert!(
             guard_pos < job_pos && job_pos < deploy_pos,

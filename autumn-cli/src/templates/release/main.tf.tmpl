@@ -19,14 +19,15 @@
 # (`var.bootstrap_image`): Container Apps must pull an image to create a
 # job's/app's first revision, and a brand-new ACR has none yet. CI
 # (azure-deploy.yml) swaps in the real image on every deploy via
-# `az containerapp update`/`az containerapp job start --image`, and Terraform
+# azure-cutover.sh/`az containerapp job update --image`, and Terraform
 # is told to ignore that drift (see the `lifecycle` blocks below) so a later
 # `terraform apply` doesn't revert a live deploy back to the placeholder.
 #
 # The app starts with no managed identity, registry or secret refs (#2314),
-# so the public placeholder never gets production credentials. The deploy
-# step copies them from the migration job, which runs only when CI starts
-# it, in the same step that sets the real image.
+# so the public placeholder never gets production credentials. The cutover
+# script (azure-cutover.sh) copies them from the migration job and sets the
+# real image in one write. The job also has them, but it runs only when CI
+# starts it, after CI sets the real image on it.
 
 terraform {
   required_version = ">= 1.5"
@@ -317,10 +318,9 @@ resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
 # Optional Redis Cache, gated behind the `enable_redis_cache` flag — off by
 # default so a plain deploy incurs no extra cost.
 #
-# This provisions the infrastructure, and the deploy step wires
-# AUTUMN_CACHE__BACKEND / AUTUMN_CACHE__REDIS__URL into the Container App
-# (#2314), but that alone does NOT
-# make the app use it: Autumn's cache subsystem has no built-in Redis
+# This block makes the infrastructure. The cutover (azure-cutover.sh) sets
+# AUTUMN_CACHE__BACKEND and AUTUMN_CACHE__REDIS__URL on the Container App
+# (#2314). That alone does NOT make the app use Redis: Autumn's cache subsystem has no built-in Redis
 # implementation (unlike sessions/channels/jobs, which activate from config
 # alone once compiled with the `redis` Cargo feature). Your application must
 # ALSO depend on the separate `autumn-cache-redis` crate and register
@@ -341,9 +341,8 @@ resource "azurerm_redis_cache" "this" {
   minimum_tls_version  = "1.2"
 }
 
-# Stored in Key Vault only when Redis is enabled — mirrors how the database
-# URL and signing secret are bound in as Container App secret refs, never as
-# plain env values.
+# Stored in Key Vault only when Redis is enabled. The cutover gives it to
+# the app as a secret ref, never as a plain env value.
 resource "azurerm_key_vault_secret" "redis_url" {
   count        = var.enable_redis_cache ? 1 : 0
   name         = "AUTUMN-CACHE-REDIS-URL"
@@ -364,8 +363,8 @@ resource "azurerm_container_app" "this" {
   revision_mode                = "Single"
 
   # No identity, registry or secret refs here (#2314). The public bootstrap
-  # image must not get production credentials. The deploy step attaches them
-  # from the migration job when it swaps in the real image.
+  # image must not get production credentials. azure-cutover.sh attaches them
+  # from the migration job when it sets the real image.
 
   # External ingress stays DISABLED until the first real image is deployed
   # (#2312), so no inbound request wakes the placeholder. `min_replicas = 0`
@@ -390,8 +389,8 @@ resource "azurerm_container_app" "this" {
     container {
       name = local.app_name_safe
       # Terraform only ever sets the bootstrap placeholder here — see the
-      # header comment. Real deploys land via `az containerapp update
-      # --image ...` (azure-deploy.yml / the manual walkthrough in
+      # header comment. Real deploys land via azure-cutover.sh
+      # (azure-deploy.yml / the manual walkthrough in
       # docs/guide/deployment.md), which the `lifecycle` block below stops
       # a later `terraform apply` from reverting.
       image  = var.bootstrap_image
@@ -477,18 +476,19 @@ resource "azurerm_container_app_job" "migrate" {
     identity = azurerm_user_assigned_identity.this.id
   }
 
-  # The deploy step copies these secret refs to the app (#2314). Keep the
-  # full app set here. The identity can read the whole vault, so this does
-  # not give the job more access.
+  # azure-cutover.sh copies these secret refs to the app (#2314). Keep every
+  # secret the app needs here. The identity can read the whole vault, so
+  # this does not give the job more access. Versionless IDs let the app get
+  # a rotated secret without a new deploy.
   secret {
     name                = "database-url"
-    key_vault_secret_id = azurerm_key_vault_secret.database_url.id
+    key_vault_secret_id = azurerm_key_vault_secret.database_url.versionless_id
     identity            = azurerm_user_assigned_identity.this.id
   }
 
   secret {
     name                = "signing-secret"
-    key_vault_secret_id = azurerm_key_vault_secret.signing_secret.id
+    key_vault_secret_id = azurerm_key_vault_secret.signing_secret.versionless_id
     identity            = azurerm_user_assigned_identity.this.id
   }
 
@@ -496,7 +496,7 @@ resource "azurerm_container_app_job" "migrate" {
     for_each = var.enable_redis_cache ? [1] : []
     content {
       name                = "redis-url"
-      key_vault_secret_id = azurerm_key_vault_secret.redis_url[0].id
+      key_vault_secret_id = azurerm_key_vault_secret.redis_url[0].versionless_id
       identity            = azurerm_user_assigned_identity.this.id
     }
   }

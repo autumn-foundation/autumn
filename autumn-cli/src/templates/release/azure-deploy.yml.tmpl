@@ -13,7 +13,7 @@
 #       the Container App: this workflow also starts the sibling migration
 #       Container Apps Job, and Azure RBAC granted on one resource does not
 #       inherit to another, even a sibling in the same environment. The
-#       same scope lets the deploy step assign the app's user-assigned
+#       same scope lets azure-cutover.sh assign the app's user-assigned
 #       identity (#2314). No
 #       client secret is needed: `permissions.id-token: write` below plus
 #       azure/login's client-id/tenant-id/subscription-id inputs is enough
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     # Two overlapping runs (e.g. two rapid tag pushes, or a tag push racing
     # a manual dispatch) must not interleave: the older run's later
-    # `az containerapp update` could execute after the newer one and roll
+    # cutover (azure-cutover.sh) could execute after the newer one and roll
     # production back, or leave stale code serving against a schema the
     # newer run just migrated. One queue per repo, `cancel-in-progress:
     # false` so a run is never killed mid-migration/mid-cutover — it waits
@@ -238,83 +238,16 @@ jobs:
           AZURE_MIGRATE_JOB_NAME: ${{ vars.AZURE_MIGRATE_JOB_NAME }}
 
       # Terraform creates the app with no identity, registry or secret refs
-      # (#2314), so the public placeholder never gets production
-      # credentials. Attach them here, from the migration job, in the step
-      # that sets the trusted image. Every command is idempotent.
+      # (#2314). azure-cutover.sh copies them from the migration job and sets
+      # the real image in one write. Then it opens external ingress (#2312).
       - name: Deploy new image to Azure Container Apps
-        run: |
-          set -euo pipefail
-          IDENTITY=$(az containerapp job show \
-            --name "$AZURE_MIGRATE_JOB_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --query "keys(identity.userAssignedIdentities)[0]" -o tsv)
-          JOB_SECRETS=$(az containerapp job show \
-            --name "$AZURE_MIGRATE_JOB_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --query "properties.configuration.secrets[].[name, keyVaultUrl]" -o tsv)
-          if [ -z "$IDENTITY" ] || [ -z "$JOB_SECRETS" ]; then
-            echo "::error::migration job $AZURE_MIGRATE_JOB_NAME has no identity or secrets to copy" >&2
-            exit 1
-          fi
-          SECRETS=()
-          while IFS=$'\t' read -r NAME URL; do
-            SECRETS+=("$NAME=keyvaultref:$URL,identityref:$IDENTITY")
-          done <<< "$JOB_SECRETS"
-
-          ENV_ARGS=(--set-env-vars
-            AUTUMN_DATABASE__PRIMARY_URL=secretref:database-url
-            AUTUMN_SECURITY__SIGNING_SECRET=secretref:signing-secret)
-          # The job holds redis-url only when enable_redis_cache is true.
-          if cut -f1 <<< "$JOB_SECRETS" | grep -qx redis-url; then
-            ENV_ARGS+=(AUTUMN_CACHE__BACKEND=redis AUTUMN_CACHE__REDIS__URL=secretref:redis-url)
-          else
-            ENV_ARGS+=(--remove-env-vars AUTUMN_CACHE__BACKEND AUTUMN_CACHE__REDIS__URL)
-          fi
-
-          az containerapp identity assign \
-            --name "$AZURE_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --user-assigned "$IDENTITY" \
-            --output none
-          az containerapp registry set \
-            --name "$AZURE_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --server "$ACR_LOGIN_SERVER" \
-            --identity "$IDENTITY" \
-            --output none
-          az containerapp secret set \
-            --name "$AZURE_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --secrets "${SECRETS[@]}" \
-            --output none
-          az containerapp update \
-            --name "$AZURE_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --image "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG" \
-            "${ENV_ARGS[@]}"
+        run: bash azure-cutover.sh
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
           AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
           AZURE_MIGRATE_JOB_NAME: ${{ vars.AZURE_MIGRATE_JOB_NAME }}
-
-      - name: Enable external ingress
-        run: |
-          # Terraform boots the app with external ingress DISABLED so no
-          # inbound request can wake the bootstrap placeholder revision
-          # (#2312). Open it now that the real image is serving; the
-          # command is idempotent, so later deploys leave the setting
-          # untouched.
-          az containerapp ingress enable \
-            --name "$AZURE_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --type external \
-            --target-port 3000 \
-            --transport http
-        env:
-          AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
-          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
 
       # ── Supply chain (issue #1615) ──────────────────────────────────────
       # Deliberately the LAST steps in the job. The image is already in the
