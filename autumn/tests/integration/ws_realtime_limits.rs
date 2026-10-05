@@ -35,12 +35,22 @@ async fn limited() -> impl WsHandler {
     }
 }
 
+/// A handler on the axum socket. It keeps the hold for the socket's life.
+#[get("/raw")]
+async fn raw(ws: autumn_web::ws::WebSocketUpgrade) -> axum::response::Response {
+    let (upgrade, hold) = ws.into_parts();
+    upgrade.on_upgrade(move |mut socket| async move {
+        let _hold = hold;
+        while let Some(Ok(_)) = socket.recv().await {}
+    })
+}
+
 async fn serve_with(configure: impl FnOnce(&mut AutumnConfig)) -> SocketAddr {
     let mut config = AutumnConfig::default();
     configure(&mut config);
     let router = TestApp::new()
         .config(config)
-        .routes(routes![limited])
+        .routes(routes![limited, raw])
         .build()
         .into_router();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -177,4 +187,21 @@ async fn no_limits_set_keeps_large_messages_working() {
     let big = "y".repeat(256 * 1024);
     client.send(TMessage::text(big.clone())).await.unwrap();
     assert_eq!(client.next().await.unwrap().unwrap(), TMessage::text(big));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn into_parts_keeps_the_connection_slot() {
+    let addr = serve_with(|c| c.realtime.max_connections = Some(1)).await;
+    let (_first, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/raw"))
+        .await
+        .expect("first socket");
+    let err = tokio_tungstenite::connect_async(format!("ws://{addr}/raw"))
+        .await
+        .expect_err("the axum socket still holds the only slot");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status().as_u16(), 503);
+        }
+        other => panic!("expected an HTTP rejection, got {other}"),
+    }
 }

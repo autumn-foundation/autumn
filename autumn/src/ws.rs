@@ -363,13 +363,42 @@ impl WebSocketUpgrade {
             Some(bytes) => inner.max_message_size(bytes),
             None => inner,
         };
-        inner.on_upgrade(move |socket| callback(WebSocket::new(socket, limits, (permit, tunnel))))
+        let hold = ConnectionHold {
+            _permit: permit,
+            _tunnel: tunnel,
+        };
+        inner.on_upgrade(move |socket| callback(WebSocket::new(socket, limits, hold)))
     }
 
     /// The axum upgrade, without the `[realtime]` limits. The connection slot
-    /// is released.
+    /// is released. To keep it, use [`into_parts`](Self::into_parts).
     pub fn into_inner(self) -> axum::extract::ws::WebSocketUpgrade {
         self.inner
+    }
+
+    /// The axum upgrade, without the `[realtime]` limits, and the
+    /// [`ConnectionHold`]. Keep the hold for the life of the socket, for
+    /// example by moving it into the `on_upgrade` callback.
+    pub fn into_parts(self) -> (axum::extract::ws::WebSocketUpgrade, ConnectionHold) {
+        let hold = ConnectionHold {
+            _permit: self.permit,
+            _tunnel: self.tunnel,
+        };
+        (self.inner, hold)
+    }
+}
+
+/// The resources an open WebSocket holds: its `realtime.max_connections`
+/// slot and, on HTTP/2, the mark that keeps the connection out of its idle
+/// timer. Dropping the hold releases both.
+pub struct ConnectionHold {
+    _permit: Option<SocketPermit>,
+    _tunnel: Option<crate::http_server::TunnelGuard>,
+}
+
+impl std::fmt::Debug for ConnectionHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionHold").finish_non_exhaustive()
     }
 }
 
@@ -418,12 +447,8 @@ pub struct WebSocket {
     /// one inside tungstenite. So after each such send, the read side wakes
     /// it. Without this, a `split()` writer task can wait forever.
     writer_waker: Option<std::task::Waker>,
-    /// The `max_connections` slot and the HTTP/2 tunnel mark. Both are
-    /// released when the socket drops.
-    _hold: (
-        Option<SocketPermit>,
-        Option<crate::http_server::TunnelGuard>,
-    ),
+    /// Released when the socket drops.
+    hold: ConnectionHold,
 }
 
 impl std::fmt::Debug for WebSocket {
@@ -454,10 +479,7 @@ impl WebSocket {
     fn new(
         inner: axum::extract::ws::WebSocket,
         limits: SocketLimits,
-        hold: (
-            Option<SocketPermit>,
-            Option<crate::http_server::TunnelGuard>,
-        ),
+        hold: ConnectionHold,
     ) -> Self {
         Self {
             inner,
@@ -468,7 +490,7 @@ impl WebSocket {
             closing: None,
             done: false,
             writer_waker: None,
-            _hold: hold,
+            hold,
         }
     }
 
@@ -502,10 +524,17 @@ impl WebSocket {
     }
 
     /// The axum socket, without the `[realtime]` limits. The connection slot
-    /// is released.
+    /// is released. To keep it, use [`into_parts`](Self::into_parts).
     #[must_use]
     pub fn into_inner(self) -> axum::extract::ws::WebSocket {
         self.inner
+    }
+
+    /// The axum socket, without the `[realtime]` limits, and the
+    /// [`ConnectionHold`]. Keep the hold for the life of the socket.
+    #[must_use]
+    pub fn into_parts(self) -> (axum::extract::ws::WebSocket, ConnectionHold) {
+        (self.inner, self.hold)
     }
 
     fn start_close(&mut self, frame: Message, then: AfterClose) {

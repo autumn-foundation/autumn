@@ -218,6 +218,7 @@ where
             reason = "the connection must live until the task ends"
         )]
         let connection = async move {
+            let _close_timers = CloseOnDrop(timers.clone());
             let conn = builder.serve_connection_with_upgrades(io, hyper_service);
             let mut conn = std::pin::pin!(conn);
             let mut signal_closed = std::pin::pin!(signal_tx.closed());
@@ -266,6 +267,17 @@ where
     drop(listener);
     close_tx.closed().await;
     Ok(())
+}
+
+/// Closes the timers when the connection task ends, also on abort.
+struct CloseOnDrop(Option<Arc<ConnTimers>>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(timers) = &self.0 {
+            timers.close();
+        }
+    }
 }
 
 /// Resolves when the connection phase changes. Never without timers.
@@ -349,8 +361,6 @@ struct H1Scan {
     line: Vec<u8>,
     content_length: u64,
     chunked: bool,
-    /// `CONNECT` or `Upgrade`: after the head the bytes are not HTTP/1.
-    upgrade: bool,
     position: HeadPosition,
 }
 
@@ -375,7 +385,7 @@ enum H1State {
     ChunkData(u64),
     ChunkDataEnd(u8),
     Trailers,
-    /// Not HTTP/1 any more (an upgrade), or a head this scan cannot read.
+    /// A head this scan cannot read. hyper rejects it.
     Stopped,
 }
 
@@ -428,7 +438,6 @@ impl H1Scan {
     const fn next_message(&mut self) -> H1State {
         self.content_length = 0;
         self.chunked = false;
-        self.upgrade = false;
         self.position = HeadPosition::Before;
         H1State::Head
     }
@@ -441,9 +450,10 @@ impl H1Scan {
         match self.state {
             H1State::Head if line.is_empty() => {
                 *head_since = None;
-                self.state = if self.upgrade {
-                    H1State::Stopped
-                } else if self.chunked {
+                // An upgrade (`Upgrade`, `CONNECT`) needs no special case:
+                // a rejected one stays HTTP/1, and an accepted one ends the
+                // connection task, which closes the timers.
+                self.state = if self.chunked {
                     H1State::ChunkSize
                 } else if self.content_length > 0 {
                     H1State::Body(self.content_length)
@@ -453,7 +463,6 @@ impl H1Scan {
             }
             H1State::Head if self.position == HeadPosition::RequestLine => {
                 self.position = HeadPosition::Fields;
-                self.upgrade = line.starts_with(b"CONNECT ");
             }
             H1State::Head => {
                 line.make_ascii_lowercase();
@@ -469,8 +478,6 @@ impl H1Scan {
                     }
                 } else if let Some(v) = value(b"transfer-encoding:") {
                     self.chunked |= v.contains("chunked");
-                } else if value(b"upgrade:").is_some() {
-                    self.upgrade = true;
                 }
             }
             H1State::ChunkSize => {
@@ -573,6 +580,9 @@ impl PhaseState {
 
 #[derive(Debug)]
 struct ConnTimers {
+    /// Set when the connection task ends. After an upgrade the IO lives on
+    /// (a WebSocket), but no timer applies, so reads skip the scan.
+    closed: std::sync::atomic::AtomicBool,
     state: Mutex<PhaseState>,
     changed: Notify,
     header_read_timeout: Option<Duration>,
@@ -582,6 +592,7 @@ struct ConnTimers {
 impl ConnTimers {
     fn new(limits: &HttpLimits) -> Self {
         Self {
+            closed: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(PhaseState {
                 phase: Phase::Head {
                     since: Instant::now(),
@@ -609,6 +620,9 @@ impl ConnTimers {
     /// Bytes arrived. On HTTP/1, the first byte after an idle period starts
     /// the head timer. On HTTP/2, an open header block starts it.
     fn on_read(&self, bytes: &[u8]) {
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let mut state = self
             .state
             .lock()
@@ -620,6 +634,12 @@ impl ConnTimers {
         if changed {
             self.changed.notify_one();
         }
+    }
+
+    /// The connection task ended. Stop scanning reads.
+    fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn request_started(&self) {
@@ -929,13 +949,27 @@ mod tests {
     }
 
     #[test]
-    fn http1_upgrade_stops_the_scan() {
+    fn a_rejected_http1_upgrade_keeps_the_scan() {
         let mut state = state();
         state.scan(b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\n\r\n");
-        state.scan(b"\x81\x05hello");
+        // The server answered 400, so the next bytes are a new request.
+        state.scan(b"GET /next");
+        assert!(state.header_block_since.is_some(), "the next head is timed");
+    }
+
+    #[test]
+    fn a_closed_connection_stops_reading_bytes() {
+        let timers = ConnTimers::new(&HttpLimits {
+            header_read_timeout: Some(Duration::from_secs(10)),
+            ..HttpLimits::default()
+        });
+        timers.request_started();
+        timers.close();
+        // After an upgrade, WebSocket frames are not scanned.
+        timers.on_read(b"GET /not-a-head");
         assert!(
-            state.header_block_since.is_none(),
-            "WebSocket frames are not heads"
+            timers.state.lock().unwrap().header_block_since.is_none(),
+            "a closed connection ignores the bytes"
         );
     }
 

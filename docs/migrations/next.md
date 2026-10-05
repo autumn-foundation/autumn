@@ -195,20 +195,22 @@ takes_axum(socket); // `socket` from a `#[ws]` handler
 **After (`{(X+1).0}`):** they are Autumn wrappers. `recv`, `send`,
 `protocol`, `Stream`, `Sink` and `split()` work as before. A `#[ws]` handler
 (the `ws` feature) does not change. Code that needs the axum type calls
-`into_inner()`. That
-also removes the `[realtime]` limits from that socket.
+`into_parts()` and keeps the returned `ConnectionHold` for the life of the
+socket. That socket has no `[realtime]` limits.
 
 Other changes on `WebSocketUpgrade`:
 
 - It has no type parameter, and no `on_failed_upgrade`,
-  `requested_protocols` or `set_selected_protocol`. Use `into_inner()`.
+  `requested_protocols` or `set_selected_protocol`. Use `into_parts()`.
 - Its rejection type is `axum::response::Response`, not
   `WebSocketUpgradeRejection`.
 - It extracts only where `AppState: FromRef<S>`. A plain `Router<()>`
   needs axum's own `WebSocketUpgrade`.
 
 ```rust
-takes_axum(socket.into_inner());
+let (socket, hold) = socket.into_parts();
+takes_axum(socket); // keep `hold` until the socket closes
+drop(hold);
 ```
 
 **Automation:** `manual`. Only code that gives the socket to an API that uses

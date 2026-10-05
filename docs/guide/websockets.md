@@ -169,8 +169,10 @@ The actuator `tasks/stream` socket does not use these limits.
 `autumn_web::ws::WebSocket` is an Autumn type. It has the `recv`, `send` and
 `protocol` methods of the axum socket, and a new `close` method. It
 implements `Stream`, `FusedStream` and `Sink`, so `split()` works. To get the
-axum socket, call `into_inner()`. That socket has no limits, and it does not
-count toward `max_connections`.
+axum socket, call `into_parts()`. It returns the axum socket and a
+`ConnectionHold`. Keep the hold for the life of the socket: it holds the
+`max_connections` slot and keeps an HTTP/2 connection out of its idle timer.
+`into_inner()` drops the hold.
 
 To set a different message limit on one route, write the upgrade yourself:
 
