@@ -201,12 +201,20 @@ mod manifest_guard {
             .skip_while(|line| line.trim() != "[features]")
             .skip(1)
             .take_while(|line| !line.trim_start().starts_with('['))
-            .filter(|line| line.contains("dep:tokio") || line.contains("dep:reqwest"))
+            .filter(|line| {
+                ["dep:tokio", "dep:reqwest", "tokio/", "reqwest/", "\"node\""]
+                    .iter()
+                    .any(|needle| line.contains(needle))
+            })
             .collect();
         assert_eq!(features.len(), 1, "{features:?}");
         assert!(
             features[0].trim_start().starts_with("node = "),
             "{features:?}"
+        );
+        assert!(
+            MANIFEST.contains("default = []"),
+            "no default feature may pull in a runtime"
         );
     }
 

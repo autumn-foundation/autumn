@@ -2,7 +2,7 @@
 //!
 //! [`EdgeNode`] is an HTTP server. It puts a capsule in front of a remote
 //! origin. It serves what the capsule serves. It sends each fallthrough to
-//! the origin over HTTP and returns the origin's answer. `autumn edge serve`
+//! the origin over HTTP and returns the origin's response. `autumn edge serve`
 //! runs it. The app needs no extra code.
 //!
 //! [`ttfb::measure`] measures time to first byte at the node and at the
@@ -12,16 +12,17 @@
 //!
 //! - **The origin is the authority.** Writes, declines and capsule errors go
 //!   to the origin. The node keeps no state.
-//! - **The node is a proxy, not a client.** It does not follow redirects. It
-//!   does not use `HTTP(S)_PROXY`. It removes hop-by-hop headers in both
-//!   directions.
-//! - **The origin sees the client.** The node appends the peer address to
-//!   `x-forwarded-for` and sets `x-forwarded-host` when it is not set.
-//!   `host` is the origin's host.
-//! - **Bodies stream.** The node does not hold a body in memory.
-//! - **The capsule runs on a blocking thread.** A slow capsule does not stop
-//!   the async runtime.
-//! - **An unreachable origin is a 502.**
+//! - **The node forwards requests exactly.** It does not follow redirects.
+//!   It does not use `HTTP(S)_PROXY`. It removes hop-by-hop headers in both
+//!   directions. It refuses a path with a dot segment (400).
+//! - **The node is the first proxy.** It replaces the client's
+//!   `x-forwarded-*` headers and removes `forwarded`. `host` is the
+//!   origin's host.
+//! - **Origin bodies stream.** The node does not hold a request or origin
+//!   body in memory.
+//! - **The capsule runs on a blocking thread**, at most one for each CPU at
+//!   the same time. A slow capsule does not stop the async runtime.
+//! - **An origin that does not connect or stops sending gives a 502.**
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -35,6 +36,7 @@ use axum::body::{Body, HttpBody};
 use axum::extract::ConnectInfo;
 use http::header::{CONNECTION, CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode};
+use tokio::sync::Semaphore;
 use tower::Service;
 
 use crate::conformance::{CORS_HEADERS, SECURITY_HEADERS};
@@ -43,8 +45,14 @@ use crate::gateway::{EdgeGateway, HOP_BY_HOP, Lane};
 /// How long the node waits for a TCP connection to the origin.
 pub const ORIGIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the node waits for the next bytes from the origin. A stalled
+/// origin then gives a 502 (before the response head) or a cut body.
+pub const ORIGIN_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
+const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
+const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 
 /// A failure of the node or the probe. A capsule failure is not one of
 /// these: it is a fallthrough.
@@ -74,6 +82,7 @@ fn http_client() -> Result<reqwest::Client, NodeError> {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(ORIGIN_CONNECT_TIMEOUT)
+        .read_timeout(ORIGIN_READ_TIMEOUT)
         .build()
         .map_err(|err| NodeError::Config(format!("could not build the HTTP client: {err}")))
 }
@@ -85,6 +94,11 @@ fn base_url(raw: &str) -> Result<String, NodeError> {
         .map_err(|err| NodeError::Config(format!("`{raw}` is not a URL: {err}")))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(NodeError::Config(format!("`{raw}` must use http or https")));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(NodeError::Config(
+            "the URL must not contain a user name or a password".into(),
+        ));
     }
     if url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
         return Err(NodeError::Config(format!(
@@ -139,7 +153,7 @@ impl Service<Request<Body>> for HttpOrigin {
     }
 }
 
-/// Send `request` to the origin and return its answer, or a 502.
+/// Send `request` to the origin and return its response, or a 502 (400 for an unsafe path).
 async fn forward(client: &reqwest::Client, base: &str, request: Request<Body>) -> Response<Body> {
     let peer = request
         .extensions()
@@ -150,6 +164,9 @@ async fn forward(client: &reqwest::Client, base: &str, request: Request<Body>) -
         .uri
         .path_and_query()
         .map_or("/", http::uri::PathAndQuery::as_str);
+    if !is_safe_path(path) {
+        return bad_request();
+    }
     let mut outgoing = client
         .request(parts.method, format!("{base}{path}"))
         .headers(forwarded_headers(&parts.headers, peer));
@@ -196,30 +213,46 @@ impl HttpBody for SyncBody {
     }
 }
 
-/// The request headers the origin gets: no hop-by-hop headers, no `host`,
-/// the client added to `x-forwarded-for`, and `x-forwarded-host` set.
+/// The request headers the origin gets. The node is the first proxy, so it
+/// replaces the client's forwarded headers: `x-forwarded-for` is the peer,
+/// `x-forwarded-host` is the request `host`, `x-forwarded-proto` is `http`.
+/// It removes `forwarded`, `host` and the hop-by-hop headers.
 fn forwarded_headers(incoming: &HeaderMap, peer: Option<IpAddr>) -> HeaderMap {
     let mut headers = incoming.clone();
     remove_hop_by_hop(&mut headers);
-    let host = headers.remove(HOST);
-    if !headers.contains_key(X_FORWARDED_HOST)
-        && let Some(host) = host
-    {
+    for name in [
+        X_FORWARDED_FOR,
+        X_FORWARDED_HOST,
+        X_FORWARDED_PROTO,
+        FORWARDED,
+    ] {
+        headers.remove(name);
+    }
+    if let Some(host) = headers.remove(HOST) {
         headers.insert(X_FORWARDED_HOST, host);
     }
-    if let Some(peer) = peer {
-        let mut chain: Vec<String> = headers
-            .get_all(X_FORWARDED_FOR)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .map(str::to_owned)
-            .collect();
-        chain.push(peer.to_string());
-        if let Ok(value) = HeaderValue::from_str(&chain.join(", ")) {
-            headers.insert(X_FORWARDED_FOR, value);
-        }
+    headers.insert(X_FORWARDED_PROTO, HeaderValue::from_static("http"));
+    if let Some(peer) = peer
+        && let Ok(value) = HeaderValue::from_str(&peer.to_canonical().to_string())
+    {
+        headers.insert(X_FORWARDED_FOR, value);
     }
     headers
+}
+
+/// True when `path_and_query` starts with `/` and has no `.` or `..`
+/// segment (also as `%2e`) and no `\`. An HTTP client resolves those
+/// segments, so the origin would get another path than the capsule.
+fn is_safe_path(path_and_query: &str) -> bool {
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path);
+    path.starts_with('/')
+        && !path.contains('\\')
+        && path.split('/').all(|segment| {
+            let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+            decoded != "." && decoded != ".."
+        })
 }
 
 /// Remove the hop-by-hop headers, and each header that `connection` names.
@@ -249,6 +282,10 @@ fn plain_response(status: StatusCode, body: &'static str) -> Response<Body> {
     response
 }
 
+fn bad_request() -> Response<Body> {
+    plain_response(StatusCode::BAD_REQUEST, "Bad Request: unsafe path\n")
+}
+
 fn bad_gateway() -> Response<Body> {
     plain_response(
         StatusCode::BAD_GATEWAY,
@@ -262,7 +299,7 @@ fn bad_gateway() -> Response<Body> {
 pub struct AccessEntry {
     /// The request method.
     pub method: String,
-    /// The request path and query.
+    /// The request path, without the query: a query can hold a token.
     pub path: String,
     /// The response status.
     pub status: u16,
@@ -274,11 +311,16 @@ pub struct AccessEntry {
 
 type AccessLog = Arc<dyn Fn(&AccessEntry) + Send + Sync>;
 
-/// An [`EdgeGateway`] as an HTTP service. The capsule runs on a blocking
-/// thread.
+/// An [`EdgeGateway`] as an HTTP service.
+///
+/// The capsule runs on a blocking thread. At most [`EdgeNode::max_capsules`]
+/// capsules run at the same time; other `GET`s wait. A write does not wait:
+/// it goes to the origin without the capsule. A path with a `.` or `..`
+/// segment, or a `\`, gets a 400.
 pub struct EdgeNode<O> {
     gateway: EdgeGateway<O>,
     access_log: Option<AccessLog>,
+    capsules: Arc<Semaphore>,
 }
 
 impl<O: Clone> Clone for EdgeNode<O> {
@@ -286,6 +328,7 @@ impl<O: Clone> Clone for EdgeNode<O> {
         Self {
             gateway: self.gateway.clone(),
             access_log: self.access_log.clone(),
+            capsules: Arc::clone(&self.capsules),
         }
     }
 }
@@ -300,12 +343,28 @@ impl<O> std::fmt::Debug for EdgeNode<O> {
 }
 
 impl<O> EdgeNode<O> {
-    /// A node that serves through `gateway`.
-    pub const fn new(gateway: EdgeGateway<O>) -> Self {
+    /// A node that serves through `gateway`. It runs as many capsules at
+    /// the same time as the machine has CPUs.
+    pub fn new(gateway: EdgeGateway<O>) -> Self {
+        let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         Self {
             gateway,
             access_log: None,
+            capsules: Arc::new(Semaphore::new(cpus)),
         }
+    }
+
+    /// Run at most `max` capsules at the same time (at least 1).
+    #[must_use]
+    pub fn with_max_capsules(mut self, max: usize) -> Self {
+        self.capsules = Arc::new(Semaphore::new(max.max(1)));
+        self
+    }
+
+    /// How many capsules can run at the same time now.
+    #[must_use]
+    pub fn max_capsules(&self) -> usize {
+        self.capsules.available_permits()
     }
 
     /// Call `log` once for each request, after the response head is ready.
@@ -337,21 +396,35 @@ where
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let gateway = self.gateway.clone();
         let access_log = self.access_log.clone();
+        let capsules = Arc::clone(&self.capsules);
         let started = Instant::now();
         let method = request.method().as_str().to_owned();
-        let path = request
+        let path = request.uri().path().to_owned();
+        let safe = request
             .uri()
             .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str)
-            .to_owned();
+            .is_some_and(|target| is_safe_path(target.as_str()));
+        let runs_capsule = matches!(method.as_str(), "GET" | "HEAD");
         Box::pin(async move {
-            let answer = tokio::task::spawn_blocking(move || gateway.handle(request)).await;
-            let response = match answer {
-                Ok(origin_or_edge) => origin_or_edge.await,
-                Err(_) => plain_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error: the edge node failed\n",
-                ),
+            let response = if !safe {
+                bad_request()
+            } else if runs_capsule {
+                // A closed semaphore cannot happen: the node never closes it.
+                let permit = capsules.acquire_owned().await.ok();
+                let answer = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    gateway.handle(request)
+                })
+                .await;
+                match answer {
+                    Ok(origin_or_edge) => origin_or_edge.await,
+                    Err(_) => plain_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal Server Error: the edge node failed\n",
+                    ),
+                }
+            } else {
+                gateway.handle(request).await
             };
             if let Some(log) = access_log {
                 log(&AccessEntry {
@@ -400,7 +473,7 @@ where
 /// The origin's static middleware headers, read from two `GET`s of `path`.
 ///
 /// It copies each header in [`SECURITY_HEADERS`], [`CORS_HEADERS`] and
-/// `content-security-policy` that both answers send with the same values.
+/// `content-security-policy` that both responses send with the same values.
 /// A header that changes (a CSP nonce, a CORS policy per request) is not
 /// copied. Give the result to [`EdgeGateway::with_response_headers`].
 ///
@@ -412,6 +485,11 @@ pub async fn origin_static_headers(
     origin: &str,
     path: &str,
 ) -> Result<Vec<(HeaderName, HeaderValue)>, NodeError> {
+    if !path.starts_with('/') {
+        return Err(NodeError::Config(format!(
+            "path `{path}` must start with `/`"
+        )));
+    }
     let url = format!("{}{path}", base_url(origin)?);
     let client = http_client()?;
     let get = || async {
@@ -449,11 +527,10 @@ pub async fn origin_static_headers(
 /// Time to first byte, edge against origin (the issue #1790 success metric).
 ///
 /// [`measure`](ttfb::measure) sends the same `GET`s to the edge node and to
-/// the origin. It
-/// alternates the order, so neither side always goes first. It records the
-/// time to the response head, then reads the body and compares the pair with
-/// [`conformance::compare`](crate::conformance::compare). A pair that is not
-/// equal is a divergence.
+/// the origin. For each path, it changes which side goes first on each
+/// round. It records the time to the response head, then reads the body. It
+/// compares the pair with [`conformance::compare`](crate::conformance::compare),
+/// without the hop-by-hop headers. A pair that is not equal is a divergence.
 pub mod ttfb {
     use std::time::{Duration, Instant};
 
@@ -572,9 +649,10 @@ pub mod ttfb {
         }
 
         let mut report = Report::default();
-        let mut edge_first = true;
-        for _ in 0..probe.rounds {
-            for path in &probe.paths {
+        for round in 0..probe.rounds {
+            for (index, path) in probe.paths.iter().enumerate() {
+                // Each path changes its order on each round.
+                let edge_first = round.wrapping_add(index) % 2 == 0;
                 let (edge_answer, origin_answer) = if edge_first {
                     let e = fetch(&client, &edge, path).await?;
                     (e, fetch(&client, &origin, path).await?)
@@ -582,7 +660,6 @@ pub mod ttfb {
                     let o = fetch(&client, &origin, path).await?;
                     (fetch(&client, &edge, path).await?, o)
                 };
-                edge_first = !edge_first;
                 report.edge.samples.push(edge_answer.0);
                 report.origin.samples.push(origin_answer.0);
                 if let Verdict::Diverged { detail } = compare(&origin_answer.1, &edge_answer.1) {
@@ -605,8 +682,10 @@ pub mod ttfb {
         let answer = client.get(&url).send().await.map_err(failed)?;
         let ttfb = started.elapsed();
         let status = answer.status().as_u16();
-        let headers = answer
-            .headers()
+        // Hop-by-hop headers belong to one connection, not to the response.
+        let mut end_to_end = answer.headers().clone();
+        super::remove_hop_by_hop(&mut end_to_end);
+        let headers = end_to_end
             .iter()
             .map(|(name, value)| {
                 (

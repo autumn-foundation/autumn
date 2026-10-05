@@ -107,7 +107,7 @@ Start the origin, then the edge node in front of it. From this directory:
 cargo run -p edge-greeting &                     # the origin, on :3000
 autumn edge serve \
   --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
-  --origin http://127.0.0.1:3000                 # the edge node, on :8787
+  --origin http://127.0.0.1:3000 &               # the edge node, on :8787
 
 curl http://127.0.0.1:8787/greet/ada             # served by the capsule
 curl -X POST http://127.0.0.1:8787/feedback -d x # sent to the origin
@@ -143,7 +143,8 @@ Three more tiers follow. The gateway tier puts the capsule in front of the
 origin and checks that the client gets the origin's bytes from either lane.
 The generated tier sends 10,000 seeded requests through every lane and
 requires zero divergence. The edge node tier runs the node over real HTTP
-against an origin that waits 150 ms, and requires a 50% lower median TTFB.
+against an origin that waits 150 ms, and requires an at least 50% lower
+median TTFB.
 
 ```bash
 cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture

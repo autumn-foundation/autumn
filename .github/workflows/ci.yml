@@ -2477,18 +2477,31 @@ jobs:
         # AC-3 with no glue: the real CLI puts the capsule in front of the
         # real origin binary. One host has no distance, so the probe checks
         # the bytes only (--divergence-only). Tier E checks the speed-up.
+        # The access log must show the edge lane for each probed path: a
+        # fallthrough also sends the origin's bytes.
         working-directory: examples/edge-greeting
         run: |
+          wait_for() {
+            for _ in $(seq 1 120); do curl -sf -o /dev/null "$1" && return 0; sleep 1; done
+            echo "::error::$1 did not answer"; return 1
+          }
           cargo build -q -p edge-greeting --bin edge-greeting
           ../../target/debug/edge-greeting &
-          for i in $(seq 1 120); do curl -sf -o /dev/null http://127.0.0.1:3000/greet/ci && break; sleep 1; done
-          ../../target/debug/autumn edge serve --quiet \
+          wait_for http://127.0.0.1:3000/greet/ci
+          ../../target/debug/autumn edge serve \
             --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
-            --origin http://127.0.0.1:3000 --listen 127.0.0.1:8787 &
-          for i in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:8787/greet/ci && break; sleep 1; done
+            --origin http://127.0.0.1:3000 --listen 127.0.0.1:8787 > edge-node.log &
+          wait_for http://127.0.0.1:8787/greet/ci
           ../../target/debug/autumn edge ttfb --divergence-only --rounds 20 \
             --edge http://127.0.0.1:8787 --origin http://127.0.0.1:3000 \
             --path /greet/ada --path '/stats?tag=one&tag=two' --path /stats/count
+          for path in /greet/ada /stats /stats/count; do
+            if [ "$(grep -c "^GET $path 200 edge " edge-node.log)" -lt 20 ]; then
+              cat edge-node.log
+              echo "::error::the capsule did not serve GET $path"
+              exit 1
+            fi
+          done
 
   windows-tier1:
     name: Windows Tier 1 journey

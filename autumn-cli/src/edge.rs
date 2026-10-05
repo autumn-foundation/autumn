@@ -73,6 +73,14 @@ fn parse_kv(json: &str) -> Result<BTreeMap<String, String>, String> {
         .collect()
 }
 
+/// A finite number of percent, for `--min-reduction`.
+pub fn parse_percent(raw: &str) -> Result<f64, String> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("`{raw}` is not a finite number"))
+}
+
 /// The lane as a short word for the access log.
 fn lane_label(lane: Option<Lane>) -> String {
     match lane {
@@ -94,7 +102,8 @@ fn runtime() -> tokio::runtime::Runtime {
         .unwrap_or_else(|err| fail(EXIT_ERROR, &format!("could not start the runtime: {err}")))
 }
 
-/// Run `autumn edge serve`. Exits 1 on a setup error.
+/// Run `autumn edge serve`. Exits 1 on a setup error, 2 when the runtime
+/// does not start. Stops on Ctrl-C or SIGTERM.
 pub fn serve(options: &ServeOptions<'_>) {
     let wasm = std::fs::read(options.capsule).unwrap_or_else(|err| {
         fail(
@@ -194,13 +203,42 @@ pub fn serve(options: &ServeOptions<'_>) {
             options.capsule,
             wasm.len() / 1024,
         );
-        let shutdown = async {
-            let _ = tokio::signal::ctrl_c().await;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = node::serve(listener, edge_node, async {
+            let _ = stopped.await;
+        });
+        tokio::pin!(server);
+        let result = tokio::select! {
+            result = &mut server => result,
+            () = shutdown_signal() => {
+                let _ = stop.send(());
+                println!("Stopping: open requests have {} s to finish.", DRAIN.as_secs());
+                tokio::time::timeout(DRAIN, server).await.unwrap_or(Ok(()))
+            }
         };
-        if let Err(err) = node::serve(listener, edge_node, shutdown).await {
+        if let Err(err) = result {
             fail(EXIT_FAIL, &format!("the edge node stopped: {err}"));
         }
     });
+}
+
+/// How long open requests can run after a stop signal.
+const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ctrl-C, or SIGTERM on Unix.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn load_kv(path: &Path) -> Result<BTreeMap<String, String>, String> {

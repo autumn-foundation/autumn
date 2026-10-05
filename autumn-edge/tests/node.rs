@@ -12,7 +12,7 @@ use autumn_edge::EdgeResponse;
 use autumn_edge::gateway::EdgeGateway;
 use autumn_edge::host::EdgeArtifact;
 use autumn_edge::node::ttfb::{Probe, Report, Summary, measure};
-use autumn_edge::node::{EdgeNode, HttpOrigin, origin_static_headers, serve};
+use autumn_edge::node::{EdgeNode, HttpOrigin, NodeError, origin_static_headers, serve};
 use autumn_edge::wire::{FallthroughReason, GuestFrame, to_line};
 use axum::body::Body;
 use http::{Request, Response, StatusCode};
@@ -237,20 +237,23 @@ async fn the_origin_sees_the_client_and_the_original_host() {
     let (origin, log) = origin_with(Answer::created).await;
     let edge = node(declining_guest(), &origin).await;
 
+    // A client cannot set the forwarded headers: the node is the first proxy.
     client()
         .get(format!("{edge}/who"))
         .header("x-forwarded-for", "203.0.113.9")
+        .header("x-forwarded-host", "evil.example")
+        .header("x-forwarded-proto", "https")
+        .header("forwarded", "for=203.0.113.9;host=evil.example")
         .send()
         .await
         .expect("node answers");
 
     let [request] = seen(&log).try_into().expect("the origin is asked once");
-    assert_eq!(
-        request.header("x-forwarded-for"),
-        Some("203.0.113.9, 127.0.0.1")
-    );
+    assert_eq!(request.header("x-forwarded-for"), Some("127.0.0.1"));
     let edge_host = edge.trim_start_matches("http://");
     assert_eq!(request.header("x-forwarded-host"), Some(edge_host));
+    assert_eq!(request.header("x-forwarded-proto"), Some("http"));
+    assert_eq!(request.header("forwarded"), None);
     let origin_host = origin.trim_start_matches("http://");
     assert_eq!(request.header("host"), Some(origin_host));
 }
@@ -347,6 +350,10 @@ fn an_origin_url_must_be_http_without_a_query() {
     assert!(HttpOrigin::new("http://origin.example/?a=1").is_err());
     assert!(HttpOrigin::new("http://origin.example/#top").is_err());
     assert!(HttpOrigin::new("origin.example").is_err());
+    assert!(
+        HttpOrigin::new("https://user:secret@origin.example").is_err(),
+        "credentials in the URL would go to the origin on each request"
+    );
 }
 
 #[tokio::test]
@@ -405,11 +412,10 @@ async fn an_unreachable_origin_fails_the_security_header_probe() {
             .expect("bind");
         listener.local_addr().expect("address")
     };
-    assert!(
-        origin_static_headers(&format!("http://{closed}"), "/")
-            .await
-            .is_err()
-    );
+    assert!(matches!(
+        origin_static_headers(&format!("http://{closed}"), "/").await,
+        Err(NodeError::Request(_))
+    ));
 }
 
 // ── TTFB probe ───────────────────────────────────────────────────────
@@ -428,7 +434,8 @@ async fn slow_origin(delay: Duration, body: &'static str) -> String {
 
 #[tokio::test]
 async fn the_probe_shows_the_edge_is_faster_with_zero_divergence() {
-    let origin = slow_origin(Duration::from_millis(100), EDGE_BODY).await;
+    // A large delay: the check must hold on slow CI runners too.
+    let origin = slow_origin(Duration::from_millis(300), EDGE_BODY).await;
     let edge = node(serving_guest(), &origin).await;
 
     let report = measure(&Probe {
@@ -480,7 +487,7 @@ async fn the_probe_reports_an_unreachable_target() {
         paths: vec!["/greet".into()],
         rounds: 1,
     };
-    assert!(measure(&probe).await.is_err());
+    assert!(matches!(measure(&probe).await, Err(NodeError::Request(_))));
 }
 
 #[test]
@@ -548,7 +555,7 @@ async fn the_access_log_records_the_lane_of_each_request() {
         .clone();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].method, "GET");
-    assert_eq!(entries[0].path, "/greet?a=1");
+    assert_eq!(entries[0].path, "/greet", "the log must not keep the query");
     assert_eq!(entries[0].status, 200);
     assert_eq!(entries[0].lane, Some(Lane::Edge));
     assert_eq!(entries[1].method, "POST");
@@ -617,4 +624,160 @@ async fn a_large_write_body_reaches_the_origin_intact() {
     assert_eq!(request.method, "PUT");
     assert_eq!(request.header("content-length"), Some("2000000"));
     assert!(request.body == payload, "the body changed on the way");
+}
+
+/// Send `target` as written, over raw TCP. An HTTP client would resolve the
+/// dot segments first. Returns the status code.
+async fn raw_status(edge: &str, target: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let address = edge.trim_start_matches("http://");
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    let request = format!("GET {target} HTTP/1.1\r\nhost: {address}\r\nconnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.expect("write");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).await.expect("read");
+    answer
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line: {answer}"))
+}
+
+#[tokio::test]
+async fn a_dot_segment_or_backslash_path_is_refused() {
+    let (origin, log) = origin_with(Answer::created).await;
+    let edge = node(declining_guest(), &format!("{origin}/app")).await;
+
+    for target in [
+        "/../secret",
+        "/a/%2e%2E/b",
+        "/a/./b",
+        "/a\\..\\b",
+        "http://other.example/../x",
+    ] {
+        assert_eq!(raw_status(&edge, target).await, 400, "{target}");
+    }
+    assert!(seen(&log).is_empty(), "the origin must not be asked");
+
+    // A safe path still reaches the origin, under the base path.
+    assert_eq!(raw_status(&edge, "/a/b..c/d?x=../y").await, 201);
+    let [request] = seen(&log).try_into().expect("the origin is asked once");
+    assert_eq!(request.uri, "/app/a/b..c/d?x=../y");
+}
+
+#[tokio::test]
+async fn a_header_named_in_connection_does_not_cross_the_node() {
+    let (origin, log) = origin_with(Answer::created).await;
+    let edge = node(declining_guest(), &origin).await;
+
+    client()
+        .get(format!("{edge}/c"))
+        .header("connection", "x-hop")
+        .header("x-hop", "1")
+        .header("x-kept", "1")
+        .send()
+        .await
+        .expect("node answers");
+
+    let [request] = seen(&log).try_into().expect("the origin is asked once");
+    assert_eq!(request.header("x-hop"), None);
+    assert_eq!(request.header("x-kept"), Some("1"));
+}
+
+#[tokio::test]
+async fn a_head_without_content_length_does_not_get_a_false_zero() {
+    let (origin, _) = origin_with(Answer::created).await;
+    let edge = node(declining_guest(), &origin).await;
+
+    // The origin sets content-length on HEAD too; the node keeps it.
+    let response = client()
+        .head(format!("{edge}/h"))
+        .send()
+        .await
+        .expect("node answers");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.headers()["content-length"], "6");
+}
+
+#[tokio::test]
+async fn a_head_of_a_chunked_resource_does_not_get_a_false_zero() {
+    // An origin with a body of unknown length: no content-length.
+    let router = axum::Router::new().fallback(|| async {
+        let chunks = futures::stream::iter([Ok::<_, std::io::Error>("chunked body")]);
+        Body::from_stream(chunks)
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let origin = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    let edge = node(declining_guest(), &origin).await;
+
+    let direct = client()
+        .head(format!("{origin}/x"))
+        .send()
+        .await
+        .expect("origin");
+    let through = client()
+        .head(format!("{edge}/x"))
+        .send()
+        .await
+        .expect("node");
+
+    assert_eq!(
+        through.headers().get("content-length"),
+        direct.headers().get("content-length"),
+        "the node must not invent a length"
+    );
+}
+
+#[tokio::test]
+async fn the_probe_ignores_hop_by_hop_headers() {
+    let origin = origin_with(|| Answer {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type", "text/plain".into()),
+            ("keep-alive", "timeout=5".into()),
+        ],
+        body: EDGE_BODY.into(),
+        delay: Duration::ZERO,
+    })
+    .await
+    .0;
+    let edge = node(declining_guest(), &origin).await;
+
+    let report = measure(&Probe {
+        edge,
+        origin,
+        paths: vec!["/greet".into()],
+        rounds: 1,
+    })
+    .await
+    .expect("probe runs");
+
+    assert!(report.divergences.is_empty(), "{:?}", report.divergences);
+}
+
+#[tokio::test]
+async fn the_probe_refuses_a_bad_configuration() {
+    let probe = |paths: Vec<String>, rounds| Probe {
+        edge: "http://127.0.0.1:9".into(),
+        origin: "http://127.0.0.1:9".into(),
+        paths,
+        rounds,
+    };
+    for bad in [
+        probe(vec![], 1),
+        probe(vec!["/a".into()], 0),
+        probe(vec!["a".into()], 1),
+    ] {
+        assert!(matches!(measure(&bad).await, Err(NodeError::Config(_))));
+    }
+    assert!(matches!(
+        origin_static_headers("http://127.0.0.1:9", "no-slash").await,
+        Err(NodeError::Config(_))
+    ));
 }

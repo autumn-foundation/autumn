@@ -1461,12 +1461,16 @@ async fn distant_origin() -> String {
     .await
 }
 
+/// The lane of each request the edge node served, in order.
+type Lanes = Arc<Mutex<Vec<(String, Lane)>>>;
+
 /// The CLI's `autumn edge serve`, in process: the real capsule, the `kv`
-/// store, and the security headers read from the origin.
-async fn edge_node(origin: &str) -> String {
+/// store, and the static headers read from the origin. `lanes` gets the
+/// lane of each request.
+async fn edge_node(origin: &str, lanes: &Lanes) -> String {
     let headers = autumn_edge::node::origin_static_headers(origin, "/")
         .await
-        .expect("the origin answers the security header probe");
+        .expect("the origin answers the header requests");
     assert!(
         !headers.is_empty(),
         "the origin sets security headers; the node must copy them"
@@ -1477,7 +1481,16 @@ async fn edge_node(origin: &str) -> String {
     )
     .with_kv(edge_greeting::demo_kv())
     .with_response_headers(headers);
-    listen(autumn_edge::node::EdgeNode::new(gateway)).await
+    let lanes = Arc::clone(lanes);
+    let node = autumn_edge::node::EdgeNode::new(gateway).with_access_log(move |entry| {
+        if let Some(lane) = entry.lane {
+            lanes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((entry.path.clone(), lane));
+        }
+    });
+    listen(node).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1486,7 +1499,8 @@ async fn tier_e_the_edge_node_halves_ttfb_with_zero_divergence() {
     use autumn_edge::node::ttfb::{Probe, measure};
 
     let origin = distant_origin().await;
-    let edge = edge_node(&origin).await;
+    let lanes = Lanes::default();
+    let edge = edge_node(&origin, &lanes).await;
 
     let report = measure(&Probe {
         edge: edge.clone(),
@@ -1519,6 +1533,24 @@ async fn tier_e_the_edge_node_halves_ttfb_with_zero_divergence() {
         "the edge node and the origin sent different bytes:\n{}",
         report.divergences.join("\n")
     );
+    // Each probed request must come from the capsule. A fallthrough would
+    // send the origin's bytes too, so the byte check alone cannot see it.
+    let served = std::mem::take(&mut *lanes.lock().unwrap_or_else(PoisonError::into_inner));
+    assert_eq!(
+        served.len(),
+        TTFB_PATHS.len() * TTFB_ROUNDS + 1,
+        "{served:?}"
+    );
+    let not_edge: Vec<_> = served
+        .iter()
+        .filter(|(_, lane)| *lane != Lane::Edge)
+        .collect();
+    assert!(not_edge.is_empty(), "the origin served these: {not_edge:?}");
+    for path in TTFB_PATHS {
+        let path = path.split('?').next().unwrap_or(path);
+        let count = served.iter().filter(|(served, _)| served == path).count();
+        assert!(count >= TTFB_ROUNDS, "{path}: {count} edge answers");
+    }
     assert!(
         report.passes(50.0),
         "the success metric needs a >= 50% lower median TTFB at the edge: edge {:?}, origin {:?}",

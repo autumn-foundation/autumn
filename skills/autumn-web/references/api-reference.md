@@ -1632,12 +1632,12 @@ An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
 | `gateway::EdgeGateway::new(artifact, origin)` (feature `host`) | Reference host: runs the capsule in front of any origin `tower::Service`. A decline forwards the original request; the origin's response returns unchanged |
 | `.with_kv(kv)` / `.with_response_headers(headers)` | Provide the `kv` capability; set the origin's static security headers (and a static CSP) on edge responses |
 | `gateway::Lane` | In the response extensions: `Edge`, `Fallthrough(reason)`, `OriginOnly` |
-| `node::EdgeNode::new(gateway)` (feature `node`) | HTTP edge node; runs the capsule on a blocking thread; `.with_access_log(f)` gets the lane of each request |
-| `node::HttpOrigin::new(url)` | The origin over HTTP for the gateway; no redirects, no proxy, hop-by-hop headers removed, `x-forwarded-for`/`x-forwarded-host` set; unreachable origin is a 502 |
-| `node::origin_static_headers(url, path)` | Security, CORS and CSP headers that two probes of the origin send unchanged |
-| `node::serve(listener, service, shutdown)` | Serve the node with the peer address |
+| `node::EdgeNode::new(gateway)` (feature `node`) | HTTP edge node; capsule on a blocking thread, at most one per CPU (`.with_max_capsules(n)`); 400 on a dot-segment path; `.with_access_log(f)` gets the lane of each request |
+| `node::HttpOrigin::new(url)` | The origin over HTTP for the gateway; no redirects, no proxy, no credentials in the URL, hop-by-hop headers removed, client `x-forwarded-*` replaced; 502 when the origin does not connect in 10 s or stops for 60 s |
+| `node::origin_static_headers(url, path)` | Security, CORS and CSP headers with the same value in two origin responses |
+| `node::serve(listener, service, shutdown)` | Serves `service` until `shutdown`; gives the peer address to `HttpOrigin` |
 | `node::ttfb::measure(&Probe)` | TTFB edge vs origin and a byte compare of each pair; `Report::passes(min_percent)` |
-| `autumn edge serve --origin URL` | CLI edge node; `--capsule`, `--listen`, `--kv FILE`, `--response-header`, `--no-probe` |
+| `autumn edge serve --origin URL` | CLI edge node; `--capsule`, `--listen`, `--kv FILE`, `--probe-path`, `--no-probe`, `--response-header`, `--quiet`; stops on Ctrl-C or SIGTERM |
 | `autumn edge ttfb --edge URL --origin URL --path P` | CLI probe; exit 0 pass, 1 divergence or reduction < `--min-reduction` (50), 2 error; `--divergence-only` |
 | `conformance::compare_capsule(origin, capsule)` | Raw capsule vs origin; excuses `VOLATILE_HEADERS`, `SECURITY_HEADERS` and `CORS_HEADERS` only |
 | `conformance::compare(origin, served)` | What the client gets vs origin; excuses `VOLATILE_HEADERS` only |

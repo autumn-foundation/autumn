@@ -462,109 +462,12 @@ deliverable is a portable artifact and a documented protocol, so no Autumn
 release is coupled to a CDN vendor's SDK cadence. `autumn-edge`'s reference host
 is the worked specification a shim implements against.
 
-Autumn ships one reference target that you can run: the edge node.
-
-### The edge node: `autumn edge serve`
-
-The edge node is an HTTP server. It runs the capsule in front of your origin.
-Run it on a host near your users. Keep the origin where it is.
-
-```sh
-autumn build
-autumn edge serve --origin https://origin.example.com --listen 0.0.0.0:8787
-```
-
-```text
-🍂 Edge node on http://0.0.0.0:8787 → origin https://origin.example.com (capsule target/wasm32-wasip1/release/edge-capsule.wasm, 312 KB; kv: off; 6 response header(s))
-GET /greet/ada 200 edge 3.1ms
-POST /feedback 200 origin (method_not_edge_eligible) 151.4ms
-```
-
-The node does these steps for each request:
-
-1. It offers a `GET` or `HEAD` to the capsule.
-2. When the capsule serves it, the node sends those bytes.
-3. When the capsule declines, the node sends the original request to the
-   origin over HTTP. It returns the origin's answer unchanged.
-4. It writes one line: method, path, status, lane, time.
-
-| Option | Default | Use |
-| --- | --- | --- |
-| `--capsule` | `target/wasm32-wasip1/release/edge-capsule.wasm` | the artifact from `autumn build` |
-| `--origin` | (required) | the origin base URL; a path prefixes each forwarded path |
-| `--listen` | `127.0.0.1:8787` | the address to listen on |
-| `--kv` | off | a JSON object of string values; it gives the `kv` capability |
-| `--probe-path` | `/` | the origin path to read the security headers from |
-| `--no-probe` | off | do not read the security headers from the origin |
-| `--response-header` | none | add `name: value` to each edge response; repeat it |
-| `--quiet` | off | no line for each request |
-
-Rules:
-
-- At start, the node reads the origin's static headers: each header in
-  `conformance::SECURITY_HEADERS` and `conformance::CORS_HEADERS`, and the
-  CSP, that two probes send unchanged. It sets them on each edge response.
-  A CSP nonce or a CORS policy per request `Origin` is not copied. If the
-  origin does not answer, the node does not start.
-- It does not follow redirects. It does not use `HTTP_PROXY` or
-  `HTTPS_PROXY`.
-- It removes hop-by-hop headers in both directions.
-- It appends the client address to `x-forwarded-for` and sets
-  `x-forwarded-host`. Configure the origin to trust the node as a proxy.
-- It streams bodies. It runs the capsule on a blocking thread.
-- An origin that does not answer gives a `502`.
-- Without `--kv`, a `needs(kv)` route goes to the origin.
-
-In Rust, the same node is `autumn_edge::node::EdgeNode` (feature `node`).
-
-### Measuring TTFB: `autumn edge ttfb`
-
-The issue's success metric is a 50% lower median time to first byte at the
-edge, for a client far from the origin, with zero divergence. Run the probe
-from such a client:
-
-```sh
-autumn edge ttfb --edge https://edge.example.com --origin https://origin.example.com \
-  --path /greet/ada --path /note/greeting --rounds 100
-```
-
-```text
-TTFB: 200 request(s) per side
-
-             median        p90
-  edge           4.0 ms       5.6 ms
-  origin       153.8 ms     155.0 ms
-
-  reduction  97.4% (minimum 50.0%)
-  divergences 0
-
-✓ pass
-```
-
-The probe sends the same `GET`s to both sides. It alternates which side goes
-first. It compares each pair with `conformance::compare`. One divergence
-fails the run.
-
-Give paths that the edge serves. Two cases diverge by design:
-
-- A `needs(kv)` route, when the node's `--kv` value is not the origin's.
-  Edge KV is a replica, and staleness is expected.
-- A fallthrough answer that echoes request headers (for example a debug
-  error page). The origin sees `x-forwarded-*` from the node.
-
-| Exit code | Meaning |
-| --- | --- |
-| 0 | zero divergence, and the reduction is at least `--min-reduction` (default 50) |
-| 1 | a pair diverged, or the reduction is too small |
-| 2 | the probe could not run (bad URL, a side does not answer) |
-
-`--divergence-only` checks the bytes and not the reduction. Use it when the
-client is near the origin.
+Autumn ships one reference target that you can run: the edge node (below).
 
 ### The reference gateway
 
-`autumn_edge::gateway::EdgeGateway` (feature `host`) is that specification as
-code. It puts a capsule in front of any origin `tower::Service`, for example
+`autumn_edge::gateway::EdgeGateway` (feature `host`) is the reference host's
+specification as code. It puts a capsule in front of any origin `tower::Service`, for example
 your app's `axum::Router`:
 
 ```rust
@@ -606,6 +509,122 @@ The capsule runs on the calling task, before `handle` returns. Thus a
 `tower::timeout` layer around the gateway cannot stop it. Only the fuel budget
 does. A production shim runs the capsule off the request thread and sets a
 time limit.
+
+### The edge node: `autumn edge serve`
+
+The edge node is an HTTP server. It puts the capsule in front of your
+origin. Run it on a server near your users. Keep the origin where it is.
+
+```sh
+autumn build
+autumn edge serve --origin https://origin.example.com --listen 0.0.0.0:8787
+```
+
+```text
+🍂 Edge node on http://0.0.0.0:8787 → origin https://origin.example.com (capsule target/wasm32-wasip1/release/edge-capsule.wasm, 312 KB; kv: off; 6 response header(s))
+GET /greet/ada 200 edge 3.1ms
+POST /feedback 200 origin (method_not_edge_eligible) 151.4ms
+```
+
+For each request, the node does these steps:
+
+1. It gives a `GET` or `HEAD` to the capsule.
+2. When the capsule serves it, the node sends that response.
+3. When the capsule declines, the node sends the original request to the
+   origin over HTTP. It sends the origin's response without change.
+4. It writes one line: method, path (no query), status, lane, time.
+
+| Option | Default | Use |
+| --- | --- | --- |
+| `--capsule` | `target/wasm32-wasip1/release/edge-capsule.wasm` | the artifact from `autumn build` |
+| `--origin` | (required) | the origin base URL, with no user name or password; a path prefixes each forwarded path |
+| `--listen` | `127.0.0.1:8787` | the address to listen on |
+| `--kv` | off | a JSON file with one object of string values; it gives the `kv` capability |
+| `--probe-path` | `/` | the origin path for the header requests at start |
+| `--no-probe` | off | do not send the header requests |
+| `--response-header` | none | add `name: value` to each edge response; repeat it |
+| `--quiet` | off | no line for each request |
+
+Rules:
+
+- At start, the node sends `GET <probe-path>` to the origin two times. It
+  copies each security, CORS and CSP header that has the same value in both
+  responses. It sets these headers on each edge response. It does not copy
+  a CSP nonce or a CORS value that changes for each request.
+- If the origin does not answer at start, the node does not start. Use
+  `--no-probe` to start without the header requests.
+- It does not follow redirects. It does not use `HTTP_PROXY` or
+  `HTTPS_PROXY`.
+- It removes hop-by-hop headers in both directions.
+- It is the first proxy. It replaces the client's forwarded headers:
+  `x-forwarded-for` is the client address, `x-forwarded-host` is the request
+  `host`, and `x-forwarded-proto` is `http`. It removes `forwarded`.
+  Configure the origin to trust the node as a proxy.
+- It refuses a path with a `.` or `..` segment (also `%2e`) or a `\` with
+  a `400`. An HTTP client resolves these segments, so the origin would get
+  a different path.
+- It streams request and response bodies to and from the origin.
+- It runs each capsule on a blocking thread. At most one capsule for each
+  CPU runs at the same time. Other `GET`s wait. Writes do not wait.
+- An origin that does not connect in 10 s, or stops sending for 60 s,
+  gives a `502` (or a cut body).
+- Without `--kv`, a `needs(kv)` route goes to the origin.
+- It stops on Ctrl-C or SIGTERM. Open requests then have 10 s to finish.
+
+The node serves plain HTTP. Put a TLS terminator or a load balancer in
+front of it. That server also limits slow clients and connection counts.
+
+In Rust, the same node is `autumn_edge::node::EdgeNode` (feature `node`).
+
+### Measuring TTFB: `autumn edge ttfb`
+
+The success metric: for a distant client, the median TTFB at the edge node
+is at least 50% lower than at the origin. No pair diverges. Run the probe
+from a distant client:
+
+```sh
+autumn edge ttfb --edge https://edge.example.com --origin https://origin.example.com \
+  --path /greet/ada --path /note/greeting --rounds 100
+```
+
+```text
+TTFB: 200 request(s) per side
+
+             median        p90
+  edge           4.0 ms       5.6 ms
+  origin       153.8 ms     155.0 ms
+
+  reduction  97.4% (minimum 50.0%)
+  divergences 0
+
+✓ pass
+```
+
+The probe sends the same `GET`s to the edge node and to the origin. For
+each path, it changes which side goes first on each round. It compares
+each pair with `conformance::compare`, without the hop-by-hop headers. One
+divergence fails the run.
+
+Give paths that the capsule serves. Three cases diverge by design:
+
+- A `needs(kv)` route, when the node's `--kv` value is not the origin's.
+  Edge KV is a replica. Its values can be old.
+- A response that shows request headers, for example a debug error page.
+  The origin gets `x-forwarded-*` from the node.
+- A response with an absolute URL (`location`, a canonical link), when the
+  origin trusts `x-forwarded-host`.
+
+The probe sends no `Origin` header. Thus it does not check a CORS policy
+that changes for each request `Origin`.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | zero divergence, and the reduction is at least `--min-reduction` (default 50) |
+| 1 | a pair diverged, or the reduction is too small |
+| 2 | the probe could not run (bad URL, a side does not answer) |
+
+`--divergence-only` checks the bytes and not the reduction. Use it when the
+client is near the origin.
 
 ## Proving it, in your own app
 
@@ -671,17 +690,19 @@ credentials, and `kv` on and off. No request may diverge.
     GET  /no/such/route                               origin 404
 ```
 
-Tier E runs the edge node over real HTTP. The origin is the full app, and it
-waits 150 ms before each answer. That delay is the round trip from a far
-client. CI cannot put a client far from the origin, so it simulates the
-distance. The probe must show a 50% lower median TTFB and zero divergence.
-A fallthrough over HTTP must return the origin's answer. The real metric
-needs `autumn edge ttfb` from a real distant client.
+Tier E runs the edge node over real HTTP. The origin is the full app. It
+waits 150 ms before each response. The delay simulates the round trip from
+a distant client, because CI cannot place a distant client. The median TTFB
+at the edge node must be at least 50% lower, with zero divergence. The
+access log must show the edge lane for each probed request. A fallthrough
+over HTTP must return the origin's response. For the real metric, run
+`autumn edge ttfb` from a distant client.
 
 CI runs it on every push in the `edge-conformance` job. The same job runs the
 real `autumn build --debug --edge` on the example and checks that the `.wasm`
-exists. Then it starts the origin and `autumn edge serve`, and runs
-`autumn edge ttfb --divergence-only` against them. It is not path-filtered:
+exists. Then it starts the origin and `autumn edge serve`, runs
+`autumn edge ttfb --divergence-only` against them, and checks that the
+access log shows the edge lane for each probed path. It is not path-filtered:
 byte-identity is a property of the whole framework, and a change to the router,
 a middleware, a macro or a dependency is exactly what could break it.
 
@@ -699,6 +720,8 @@ a middleware, a macro or a dependency is exactly what could break it.
   from a distant client.
 - **One capsule per node.** The node does not reload the capsule. Restart it
   after `autumn build`.
+- **The node adds `accept: */*`** to a forwarded request that has no
+  `accept` header. The HTTP client does this.
 - **`paths::*` helpers are unavailable inside a capsule.**
 - **`autumn build --embed` refuses to combine with edge routes.**
 - **The wire protocol and the host API are experimental.** They will change; the

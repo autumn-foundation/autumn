@@ -257,22 +257,25 @@ read and a protocol to implement.
 ## Amendment (2026-10-05): a runnable reference edge node
 
 The decision above says "Autumn ships no reverse proxy and no origin fetch".
-That is now changed. No CDN speaks the NDJSON protocol. So, to deploy, an
-author had to write a shim. That is the glue AC-3 forbids. The issue also
+That is now changed. No CDN speaks the NDJSON protocol. Thus an author had
+to write a shim to deploy. That is the glue AC-3 forbids. The issue also
 keeps "a single reference target" in scope.
 
 Autumn now ships one reference target: `autumn edge serve`
 (`autumn_edge::node`, feature `node`, native only). It is an HTTP server
 that runs the capsule and sends each fallthrough to the origin over HTTP. It
-is not a vendor binding. Alternative 6 stays rejected.
+is not a vendor binding. Alternative 6 (vendor bindings) is still rejected.
 
 Rules for the node:
 
 - It does not follow redirects and does not use `HTTP(S)_PROXY`.
 - It removes hop-by-hop headers in both directions.
-- It appends the client to `x-forwarded-for`. It sets `x-forwarded-host`.
-- It streams bodies. It runs the capsule on a blocking thread.
-- It copies the origin's static security headers at start.
+- It is the first proxy. It replaces the client's `x-forwarded-*` headers
+  and removes `forwarded`.
+- It refuses a path with a dot segment or a `\`.
+- It streams bodies to and from the origin. It runs the capsule on a
+  blocking thread, at most one for each CPU at the same time.
+- It copies the origin's static security, CORS and CSP headers at start.
 
 `autumn edge ttfb` measures the success metric from any client. CI proves it
 in Tier E with a simulated origin round trip, because CI cannot put a client
