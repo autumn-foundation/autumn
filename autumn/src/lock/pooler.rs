@@ -3,8 +3,8 @@
 //! A transaction-mode pooler (`PgBouncer`, RDS Proxy, and others) can give each
 //! transaction a different server session. Session advisory locks do not
 //! work there: the lock stays on a session that the app no longer owns. The
-//! advisory [`Lock`](crate::lock::Lock), the `PostgreSQL` scheduler and the
-//! migration lock all use session advisory locks.
+//! advisory [`Lock`](crate::lock::Lock) and the migration lock use session
+//! advisory locks.
 //!
 //! A client cannot ask a pooler for its mode. So this module reads the
 //! database target for well-known pooler ports and host names, and the pool
@@ -132,8 +132,8 @@ pub fn warn_if_pooled(target: &str) -> bool {
             target = %redacted,
             pooler = %pooler,
             "the database target points to a connection pooler ({pooler}). In transaction \
-             mode, session advisory locks are not safe: `Lock`, the PostgreSQL scheduler \
-             and the migration lock can leak or lose their lock. Use `LeaseLock` for \
+             mode, session advisory locks are not safe: `Lock` and the migration lock can \
+             leak or lose their lock. Use `LeaseLock` for \
              mutual exclusion, and run migrations on a direct connection. See \
              docs/guide/distributed-locks.md, \"Connection poolers\"."
         );

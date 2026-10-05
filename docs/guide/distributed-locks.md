@@ -7,8 +7,9 @@ critical sections without hand-rolling Postgres advisory locks or reasoning
 about connection lifetimes.
 
 It is the same advisory-lock machinery Autumn already trusts in production to
-gate its own migrations, `#[scheduled]` leader election, and ISR revalidation —
-promoted into a small, safe public API.
+gate its own migrations and ISR revalidation — promoted into a small, safe
+public API. (`#[scheduled]` uses a tick table instead; see
+[scheduled-multi-replica.md](scheduled-multi-replica.md).)
 
 > **Two locks, two jobs.** `Lock` gives mutual exclusion for *efficiency*: it
 > stops duplicate work in the normal case. It does not give *correctness*. If
@@ -276,7 +277,7 @@ session that the app no longer owns: it leaks, or it frees at a random time.
 | --- | --- | --- |
 | `Lock` (advisory) | Works | **Not safe.** Use `LeaseLock`. |
 | `LeaseLock` | Works | Works, if the pooler supports prepared statements (see below) |
-| Postgres `#[scheduled]` coordinator | Works | **Not safe.** See [issue #3052](https://github.com/autumn-foundation/autumn/issues/3052). |
+| Postgres `#[scheduled]` coordinator | Works | Works. Each tick is a row, not a session lock. |
 | Migrations (`autumn migrate`, auto-migrate) | Works | **Not safe.** Run migrations on a direct URL. |
 
 Autumn sends each query as a named prepared statement. In transaction mode,

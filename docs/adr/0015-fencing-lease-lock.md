@@ -61,8 +61,8 @@ Session advisory locks also fail behind a transaction-mode pooler.
 
 - One query per held lease every `ttl / 3`.
 - `generation` is a `BIGINT`, so it cannot overflow in practice.
-- The scheduler (#3052) and job claims (#3051) can reuse the same generation
-  pattern for their own fencing tokens.
+- The scheduler now records each tick as a row with a `generation` (#3052).
+  Job claims (#3051) can reuse the same pattern for their fencing tokens.
 - With asynchronous replication, a failover can lose the last grant and give
   its token again. Strict fencing then needs synchronous replication.
 - Dropping or truncating the table resets tokens to 1. Resources then reject
