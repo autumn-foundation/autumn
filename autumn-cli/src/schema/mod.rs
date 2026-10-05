@@ -53,6 +53,9 @@ impl From<BackendArg> for Backend {
     }
 }
 
+/// The environment variable that `schema diff --dev-url` also reads.
+const DEV_URL_ENV: &str = "AUTUMN_DEV_URL";
+
 /// The `autumn schema` subcommand actions (experimental). Slices 2–3 ship
 /// `parse` and `snapshot`; `diff`/… arrive in later slices.
 #[derive(clap::Subcommand, Debug)]
@@ -117,7 +120,7 @@ pub enum SchemaAction {
         #[arg(
             long,
             value_name = "URL",
-            env = "AUTUMN_DEV_URL",
+            env = DEV_URL_ENV,
             hide_env_values = true
         )]
         dev_url: Option<String>,
