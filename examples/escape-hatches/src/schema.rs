@@ -22,6 +22,7 @@ diesel::table! {
         id -> Int8,
         order_id -> Int8,
         product_id -> Int8,
+        sku -> Text,
         quantity -> Int4,
     }
 }

@@ -3588,6 +3588,7 @@ version = "0.1.0"
 dependencies = [
  "autumn-web",
  "axum",
+ "deadpool",
  "diesel",
  "diesel-async",
  "diesel_migrations",

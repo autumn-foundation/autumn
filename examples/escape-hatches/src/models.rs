@@ -38,6 +38,7 @@ pub struct OrderLine {
     #[indexed]
     pub order_id: i64,
     pub product_id: i64,
+    pub sku: String,
     pub quantity: i32,
 }
 

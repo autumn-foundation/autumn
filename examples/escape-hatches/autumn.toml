@@ -9,3 +9,10 @@ statement_timeout = "5s"
 [log]
 level = "info"
 format = "Pretty"
+
+# H6: CSRF is on in `prod`. It checks a cookie that a browser sends. Scanner
+# devices call `/api/` with a bearer token and keep no cookie, so CSRF would
+# refuse each call. A browser never sends the bearer token on its own, so the
+# token is the CSRF defense on `/api/`. Browser routes stay protected.
+[security.csrf]
+exempt_paths = ["/api/"]

@@ -16,10 +16,12 @@ CREATE TABLE orders (
     order_ref  TEXT   NOT NULL UNIQUE
 );
 
+-- A line keeps the SKU it sold. The order reads back with no join.
 CREATE TABLE order_lines (
     id         BIGSERIAL PRIMARY KEY,
     order_id   BIGINT NOT NULL REFERENCES orders (id) ON DELETE CASCADE,
     product_id BIGINT NOT NULL REFERENCES products (id),
+    sku        TEXT   NOT NULL,
     quantity   INT    NOT NULL CHECK (quantity > 0)
 );
 

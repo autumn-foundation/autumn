@@ -150,16 +150,22 @@ async fn exports_refuses_path_traversal() {
     let root = tempfile::tempdir().expect("tempdir");
     let exports_dir = root.path().join("exports");
     std::fs::create_dir(&exports_dir).expect("mkdir");
-    std::fs::write(root.path().join("secret.txt"), "secret").expect("write secret");
+    std::fs::write(root.path().join("secret.txt"), "TOP-SECRET-BYTES").expect("write secret");
     let client = client(None, &exports_dir);
 
-    let response = client.get("/exports/../secret.txt").send().await;
-    assert_ne!(
-        response.status,
-        StatusCode::OK,
-        "path traversal must not serve a file"
-    );
-    assert!(!response.text().contains("secret"));
+    for path in [
+        "/exports/../secret.txt",
+        "/exports/%2e%2e/secret.txt",
+        "/exports/..%2fsecret.txt",
+    ] {
+        let response = client.get(path).send().await;
+        assert_ne!(
+            response.status,
+            StatusCode::OK,
+            "{path} must not serve a file"
+        );
+        assert!(!response.text().contains("TOP-SECRET-BYTES"), "{path}");
+    }
 }
 
 /// H8: the nested exports router is declared, so `autumn routes audit` sees it.
