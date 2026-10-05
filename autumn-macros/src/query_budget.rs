@@ -3764,8 +3764,9 @@ impl Analyzer {
             cost = cost.then(next);
         }
         // `fill(&mut repos, &repo)` or `fill(slot, &repo)`: a `&mut`
-        // argument may receive a handle from another argument. The arguments
-        // ran first, so what they hold is known.
+        // argument may receive a handle from another argument, or from a
+        // stored closure that captures one. The arguments ran first, so what
+        // they hold is known.
         for (i, arg) in call.args.iter().enumerate() {
             let place = match arg {
                 Expr::Reference(r) if r.mutability.is_some() => &*r.expr,
@@ -3778,6 +3779,7 @@ impl Analyzer {
                 .enumerate()
                 .filter(|(j, _)| *j != i)
                 .map(|(_, a)| a)
+                .chain(std::iter::once(&*call.func))
                 .collect();
             self.store_into(place, "", &others);
         }
@@ -12300,6 +12302,36 @@ mod tests {
                 "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
                  let _ = match x { Option::Some(_) if repo.a().await? => (), Option::None if repo.b().await? => (), _ => () }; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn stored_closures_store_their_captures() {
+        check_handlers(&[
+            (
+                "guard: a capturing closure fills a mutable argument",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut list = Vec::new(); \
+                 let mut fill = |slot: &mut Vec<PgPostRepository>| slot.push(repo.clone()); \
+                 fill(&mut list); list[0].find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a capturing closure fills a borrowed argument",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut list = Vec::new(); let target = &mut list; \
+                 let mut fill = |slot: &mut Vec<PgPostRepository>| slot.push(repo.clone()); \
+                 fill(target); list[0].find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a closure without a handle leaves its argument plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut list: Vec<i64> = Vec::new(); \
+                 let mut fill = |slot: &mut Vec<i64>| slot.push(1); \
+                 fill(&mut list); render(list); let _ = repo; Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
