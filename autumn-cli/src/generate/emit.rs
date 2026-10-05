@@ -1461,17 +1461,17 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // surface, so over-retaining on them is harmless.
         "multipart" => &["Multipart"],
         // The prelude does not re-export storage types (`Blob`,
-        // `BlobStoreState`, …), so all usage starts with `autumn_web::storage`.
-        // No trailing `::` (issue #2186): a module import
-        // (`use autumn_web::storage;` or `… as blobs;`) ends at the module
-        // name. A doc comment that names the module now also keeps the
-        // feature. That is the safe direction, as for `multipart` and `csv`.
+        // `BlobStoreState`, …), so each use starts with `autumn_web::storage`.
+        // The marker has no trailing `::` (issue #2186). A module import
+        // (`use autumn_web::storage;` or `… as blobs;`) ends at the module name.
+        // A doc comment that names the module now also keeps the feature.
+        // This extra match is safe. `multipart` and `csv` accept the same risk.
         "storage" => &["autumn_web::storage"],
         // A `richtext` scaffold (issue #1255) enables `markdown` for
         // `render_user_content`. Hand-written code can also use `render` or
-        // `MarkdownRegistry`. The prelude re-exports none of them, so all
-        // usage starts with `autumn_web::markdown`. No trailing `::`, for the
-        // same module-import reason as `storage` (issue #2186).
+        // `MarkdownRegistry`. The prelude re-exports none of them, so each use
+        // starts with `autumn_web::markdown`. The marker has no trailing `::`,
+        // for the same reason as `storage` (issue #2186).
         "markdown" => &["autumn_web::markdown"],
         // A scaffolded CSV export (issue #1315) enables `csv` for the
         // `CsvSchema` impl and `export_csv` call its `export.csv` route emits,
@@ -3645,7 +3645,7 @@ mod tests {
         let storage = autumn_web_feature_markers("storage");
         assert!(
             storage.contains(&"autumn_web::storage"),
-            "storage marker must catch `autumn_web::storage` usage, got {storage:?}"
+            "storage marker must match `autumn_web::storage`, got {storage:?}"
         );
     }
 
@@ -3709,6 +3709,31 @@ mod tests {
             &overrides
         ));
     }
+
+    /// A module import has no trailing `::`. It must still keep the feature
+    /// (issue #2186).
+    #[test]
+    fn storage_and_markdown_markers_match_module_imports() {
+        let cases = [
+            ("storage", "use autumn_web::storage;\n"),
+            ("storage", "use autumn_web::storage as blobs;\n"),
+            ("markdown", "use autumn_web::markdown;\n"),
+            ("markdown", "use autumn_web::markdown as md;\n"),
+        ];
+        for (feature, source) in cases {
+            let tmp = tempfile::TempDir::new().unwrap();
+            fs::create_dir_all(tmp.path().join("src")).unwrap();
+            let file = tmp.path().join("src/handwritten.rs");
+            fs::write(&file, source).unwrap();
+            let still_needed = || {
+                autumn_web_feature_still_needed_elsewhere(feature, tmp.path(), &[], &HashMap::new())
+            };
+            assert!(still_needed(), "{feature} must stay for {source:?}");
+            fs::remove_file(&file).unwrap();
+            assert!(!still_needed(), "{feature} must go when no file uses it");
+        }
+    }
+
     /// Every spelling that reaches a crate by name is a marker; a dependency
     /// used only through an `extern crate … as` alias must not read as unused
     /// (issue #1631 review).

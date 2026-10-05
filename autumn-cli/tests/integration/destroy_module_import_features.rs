@@ -2,12 +2,15 @@
 //!
 //! `destroy` keeps an `autumn-web` feature when the remaining source contains
 //! its marker. A module import (`use autumn_web::storage;`) does not have a
-//! trailing `::`. A marker that has `::` does not find it, and `destroy`
-//! removes a feature that the code needs.
+//! trailing `::`. A marker that ends in `::` does not match it. Then
+//! `destroy` removes a feature that the code needs.
 //!
 //! Each hand-written file is in `src/`, not in the `owner_dir` of the feature
 //! (`src/models` for `storage`, `src/routes` for `markdown`). In `owner_dir`,
-//! the sibling check keeps the feature, and the test cannot fail.
+//! the sibling-file check keeps the feature. Then the test cannot fail.
+//!
+//! No `mod` line declares the hand-written files. The scan reads text only, so
+//! the files do not have to compile.
 
 use std::fs;
 use std::path::Path;
@@ -37,8 +40,19 @@ fn scaffold_args(feature: &str) -> &'static [&'static str] {
     }
 }
 
-/// Make a project, scaffold the resource for `feature`, write `handwritten`
-/// (if given) to `src/<file>`, destroy the scaffold, and return `Cargo.toml`.
+/// Whether the `autumn-web` dependency line enables `feature`. Other text in
+/// `Cargo.toml` (comments, `[features]`) does not count.
+fn enables(cargo: &str, feature: &str) -> bool {
+    let line = cargo
+        .lines()
+        .find(|l| l.starts_with("autumn-web ="))
+        .unwrap_or_else(|| panic!("no autumn-web dependency line:\n{cargo}"));
+    line.contains(&format!("\"{feature}\""))
+}
+
+/// Runs `new`, `generate scaffold` and `destroy scaffold` for `feature`.
+/// Before `destroy`, writes `handwritten` (if given) to `src/<file>`.
+/// Returns the final `Cargo.toml` text.
 fn destroy_with(feature: &str, name: &str, handwritten: Option<(&str, &str)>) -> String {
     let tmp = tempfile::tempdir().expect("tempdir");
     run_autumn_ok(tmp.path(), &["new", name]);
@@ -49,7 +63,7 @@ fn destroy_with(feature: &str, name: &str, handwritten: Option<(&str, &str)>) ->
     run_autumn_ok(&project, &generate);
     let before = fs::read_to_string(project.join("Cargo.toml")).unwrap();
     assert!(
-        before.contains(&format!("\"{feature}\"")),
+        enables(&before, feature),
         "premise: the scaffold enables `{feature}`:\n{before}"
     );
 
@@ -66,7 +80,7 @@ fn destroy_with(feature: &str, name: &str, handwritten: Option<(&str, &str)>) ->
 
 fn assert_kept(feature: &str, cargo: &str) {
     assert!(
-        cargo.contains(&format!("\"{feature}\"")),
+        enables(cargo, feature),
         "hand-written code still uses `{feature}`; destroy must keep it:\n{cargo}"
     );
 }
@@ -105,7 +119,7 @@ fn destroy_keeps_storage_for_a_renamed_module_import() {
 fn destroy_removes_storage_when_nothing_uses_it() {
     let cargo = destroy_with("storage", "storage-unused", None);
     assert!(
-        !cargo.contains("\"storage\""),
+        !enables(&cargo, "storage"),
         "no code uses `storage`; destroy must remove it:\n{cargo}"
     );
 }
@@ -144,7 +158,7 @@ fn destroy_keeps_markdown_for_a_renamed_module_import() {
 fn destroy_removes_markdown_when_nothing_uses_it() {
     let cargo = destroy_with("markdown", "markdown-unused", None);
     assert!(
-        !cargo.contains("\"markdown\""),
+        !enables(&cargo, "markdown"),
         "no code uses `markdown`; destroy must remove it:\n{cargo}"
     );
 }
