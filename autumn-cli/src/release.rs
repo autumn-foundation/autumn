@@ -3628,6 +3628,32 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_forces_a_fresh_revision_after_a_failed_one() {
+        // A later deploy's revision failed: the old revision still serves,
+        // but the template has the failed image and env. A retry with the
+        // same tag must make a fresh revision, not wait on the failed one.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_LATEST_FAILED", "app--old"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(bodies.contains("AUTUMN_FORCE_REVISION"), "{bodies}");
+        assert!(
+            !calls.contains("revision restart"),
+            "a fresh revision needs no restart: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_waits_for_a_new_revision_when_same_tag_config_changes() {
         // The env changes, so Azure makes a new revision. While Azure still
         // reports the old revision, the cutover must not succeed.
