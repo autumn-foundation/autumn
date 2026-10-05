@@ -3235,21 +3235,34 @@ case "$1 $2" in
     if [ -z "$query" ]; then
       env='{"name":"AUTUMN_PROFILE","value":"prod"}'
       [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && env="$env"',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
+      [ -n "$STUB_APP_REDIS" ] && env="$env"',{"name":"AUTUMN_CACHE__BACKEND","value":"redis"},{"name":"AUTUMN_CACHE__REDIS__URL","secretRef":"redis-url"}'
       # A placeholder app made by the old template has the job's credentials.
       legacy=""
       [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
       registries=""
       [ -n "$STUB_APP_LEGACY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
-      echo "{\"id\":\"/subscriptions/s/app\",$legacy\"properties\":{\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
-    elif [ "$query" = properties.provisioningState ]; then
-      echo Succeeded
+      app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"registries\":[$registries]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},{\"name\":\"sidecar\",\"image\":\"busybox\"}]}}}"
+      # After a PATCH, a GET shows the merged result. Like ARM after a 202,
+      # the first STUB_PATCH_PENDING reads still show the old state.
+      pending="$STUB_LOG.pending"
+      [ -f "$pending" ] || echo "${STUB_PATCH_PENDING:-0}" > "$pending"
+      if [ -s "$STUB_LOG.bodies" ] && [ "$(cat "$pending")" -le 0 ]; then
+        jq -cs '.[0] * .[1]' <(echo "$app") <(tail -n 1 "$STUB_LOG.bodies")
+      else
+        [ -s "$STUB_LOG.bodies" ] && echo $(( $(cat "$pending") - 1 )) > "$pending"
+        echo "$app"
+      fi
     else
       tsv Succeeded "${STUB_LATEST:-app--new}"
     fi
     ;;
-  "containerapp revision") tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
+  "containerapp revision")
+    if [ "$query" = properties.active ]; then echo false; else tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1; fi
+    ;;
   "containerapp secret")
-    if [ -n "$STUB_APP_LEGACY" ]; then
+    if [ -n "$STUB_APP_REDIS" ]; then
+      echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"redis-url\",\"keyVaultUrl\":\"https://kv/secrets/redis-url\",\"identity\":\"$id\"}]"
+    elif [ -n "$STUB_APP_LEGACY" ]; then
       echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}]"
     else
       echo '[{"name":"api-key","value":"user-value"}]'
@@ -3336,7 +3349,9 @@ esac
         command
             .env_remove("STUB_LATEST")
             .env_remove("STUB_APP_ENV_FULL")
-            .env_remove("STUB_APP_LEGACY");
+            .env_remove("STUB_APP_LEGACY")
+            .env_remove("STUB_APP_REDIS")
+            .env_remove("STUB_PATCH_PENDING");
         if !args.is_empty() {
             command.env_remove("IMAGE_TAG");
         }
@@ -3391,6 +3406,7 @@ esac
             "\"AUTUMN_CACHE__BACKEND\"",
             "\"api-key\"",
             "\"sidecar\"",
+            "\"location\":\"westeurope\"",
         ] {
             assert!(
                 bodies.contains(field),
@@ -3573,7 +3589,12 @@ esac
         assert!(!calls.contains("ingress enable"), "{calls}");
         assert!(bodies.contains("\"type\":\"None\""), "{bodies}");
         assert!(bodies.contains("\"registries\":[]"), "{bodies}");
-        for kept in ["\"api-key\"", "\"AUTUMN_PROFILE\"", "\"sidecar\""] {
+        for kept in [
+            "\"api-key\"",
+            "\"AUTUMN_PROFILE\"",
+            "\"sidecar\"",
+            "\"location\":\"westeurope\"",
+        ] {
             assert!(
                 bodies.contains(kept),
                 "the PATCH must keep {kept}: {bodies}"
@@ -3590,6 +3611,88 @@ esac
                 "the PATCH must remove {removed}: {bodies}"
             );
         }
+    }
+
+    /// The `az` calls after the first PATCH that read the full app.
+    #[cfg(unix)]
+    fn full_reads_after_patch(calls: &str) -> usize {
+        let patch_at = calls.find("az rest --method patch").unwrap_or(calls.len());
+        calls[patch_at..]
+            .matches("az containerapp show --name app --resource-group rg --output json")
+            .count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_until_the_credentials_are_gone() {
+        // A PATCH can return 202 Accepted, and a GET can still show the old
+        // Succeeded state. The script must check that the change applied.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_PATCH_PENDING", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(full_reads_after_patch(&calls) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restarts_only_after_the_patch_applies() {
+        // A restart before the PATCH applies would keep the old secrets.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_PATCH_PENDING", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(full_reads_after_patch(&calls[..restart_at]) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_redis_url_after_the_old_revision_stops() {
+        // Redis is off now. The old revision still refers to redis-url, so
+        // the secret stays until that revision is inactive.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_REDIS", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(patches[0].contains("\"redis-url\""), "{}", patches[0]);
+        assert!(
+            !patches[0].contains("AUTUMN_CACHE__REDIS__URL"),
+            "{}",
+            patches[0]
+        );
+        assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
+        assert!(patches[1].contains("\"signing-secret\""), "{}", patches[1]);
+        let active_at = calls
+            .find("--query properties.active")
+            .unwrap_or_else(|| panic!("the script must check the old revision: {calls}"));
+        let second_patch_at = calls.rfind("az rest --method patch").unwrap();
+        assert!(active_at < second_patch_at, "{calls}");
     }
 
     #[cfg(unix)]
