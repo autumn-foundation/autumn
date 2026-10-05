@@ -3256,6 +3256,7 @@ done
   # have a custom domain that the cutover must keep.
   external=false
   case "$STUB_OLD_IMAGE" in acr.azurecr.io/*) external=true ;; esac
+  [ -n "$STUB_INGRESS_INTERNAL" ] && external=false
   ingress="{\"external\":$external,\"targetPort\":3000,\"transport\":\"http\",\"fqdn\":\"app.example.internal\",\"customDomains\":[{\"name\":\"www.example.com\"}]}"
   app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
 case "$1 $2" in
@@ -3459,6 +3460,7 @@ esac
             .env_remove("STUB_ACTIVE_HAS_REFS")
             .env_remove("STUB_SIDECAR_REDIS_REF")
             .env_remove("STUB_LATEST_FAILED")
+            .env_remove("STUB_INGRESS_INTERNAL")
             .env_remove("STUB_PATCH_PENDING");
         if args.contains(&"--remove-credentials") {
             command.env_remove("IMAGE_TAG");
@@ -3813,6 +3815,52 @@ esac
         };
         assert!(status.success(), "{calls}");
         assert!(!bodies.contains("\"ingress\""), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_until_the_ingress_is_external() {
+        // The ingress is internal-only. A stale GET still shows it after the
+        // PATCH, so the script must wait until it shows external = true.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_INGRESS_INTERNAL", "1"), ("STUB_PATCH_PENDING", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let ingress_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            calls[ingress_at..]
+                .matches("az containerapp show --name app --resource-group rg --output json")
+                .count()
+                >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_on_a_custom_scale_rule_before_the_first_cutover() {
+        // Without ingress, only a custom scale rule can start the placeholder
+        // again. Then zero replicas is no proof, so the script stops first.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_SCALE_SECRET_REF", "queue-connection")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
     }
 
     #[cfg(unix)]
