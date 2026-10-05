@@ -124,6 +124,19 @@ if ! jq -e "$APP_C"' .properties.template.containers | app_i == 0' <<< "$APP" > 
   exit 1
 fi
 SAVED_INGRESS=$(jq -c '.properties.configuration.ingress // null | if . then del(.fqdn) else . end' <<< "$APP")
+# Before the first cutover disables ingress, the script also saves the
+# snapshot in the app's tags (base64 JSON, in parts of 256 characters, the
+# tag value limit). If a run stops after the disable (a canceled run, a lost
+# runner), the retry finds no ingress and reads the snapshot from the tags.
+# shellcheck disable=SC2016 # a jq program, not a shell expression
+INGRESS_TAG_NAMES='[.tags // {} | to_entries[] | select(.key | startswith("autumn-ingress-")) | .key]'
+if [ "$SAVED_INGRESS" = null ]; then
+  SAVED_INGRESS=$(jq -c 'try ([.tags // {} | to_entries[]
+      | select((.key | startswith("autumn-ingress-")) and .value != null)
+      | {i: (.key | ltrimstr("autumn-ingress-") | tonumber), v: .value}]
+    | if length == 0 then null
+      else sort_by(.i) | map(.v) | join("") | @base64d | fromjson end) catch null' <<< "$APP")
+fi
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
 # The active revisions decide if a real release runs. The template image is
 # not enough: after a canceled first cutover, the template has the real
@@ -264,6 +277,61 @@ set_ingress() {
     app_shows "$check" && return 0
   done
   return 1
+}
+
+# Waits until the app's tags show the given values (null: no tag).
+tags_show() {
+  local now
+  for _ in $(seq 1 30); do
+    now=$(az containerapp show \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --output json) || return 1
+    jq -e --argjson want "$1" '(.tags // {}) as $t | $want | to_entries | all(.value == $t[.key])' \
+      <<< "$now" > /dev/null && return 0
+    sleep 10
+  done
+  return 1
+}
+
+# Saves the ingress snapshot in the app's tags. Parts that an earlier,
+# longer snapshot left are removed.
+save_ingress_tags() {
+  local tags
+  [ "$SAVED_INGRESS" = null ] && return 0
+  tags=$(jq -cn --argjson app "$APP" --argjson saved "$SAVED_INGRESS" '($app | '"$INGRESS_TAG_NAMES"') as $old
+    | ($saved | tojson | @base64) as $b
+    | [range(0; $b | length; 256) as $i | $b[$i:$i + 256]]
+    | if length > 40 then error("the ingress is too large for the tags") else . end
+    | (to_entries | map({key: ("autumn-ingress-" + (.key | tostring)), value}) | from_entries) as $new
+    | ($old | map(select(in($new) | not) | {(.): null}) | add // {}) + $new') || return 1
+  patch_app "$(jq -cn --argjson app "$APP" --argjson tags "$tags" '{location: $app.location, tags: $tags}')" \
+    || return 1
+  tags_show "$tags"
+}
+
+# Removes the snapshot tags after the ingress is back.
+clear_ingress_tags() {
+  local tags now
+  now=$(az containerapp show \
+    --name "$AZURE_APP_NAME" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --output json) || return 1
+  tags=$(jq -c "$INGRESS_TAG_NAMES"' | map({(.): null}) | add // {}' <<< "$now")
+  [ "$tags" = "{}" ] && return 0
+  patch_app "$(jq -cn --argjson app "$APP" --argjson tags "$tags" '{location: $app.location, tags: $tags}')" \
+    && tags_show "$tags" \
+    || echo "::warning::remove the autumn-ingress-* tags from $AZURE_APP_NAME" >&2
+}
+
+# Sends the saved ingress back, as it was, then removes the snapshot tags.
+restore_ingress() {
+  [ "$SAVED_INGRESS" = null ] && return 0
+  if set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")"; then
+    clear_ingress_tags
+  else
+    echo "::warning::restore the ingress of $AZURE_APP_NAME manually. Its autumn-ingress-* tags hold the saved ingress (base64 JSON)." >&2
+  fi
 }
 
 # Opens external ingress. On a later deploy with open ingress, nothing
@@ -452,8 +520,7 @@ rollback() {
   if remove_credentials; then
     # The first cutover disabled ingress. Bring the saved ingress back, as
     # it was, now that the placeholder has no credentials.
-    [ "$SAVED_INGRESS" = null ] || set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")" \
-      || echo "::warning::restore the ingress of $AZURE_APP_NAME manually" >&2
+    restore_ingress
     return
   fi
   echo "::error::rollback failed: remove the identity and secrets from $AZURE_APP_NAME manually" >&2
@@ -518,10 +585,11 @@ if [ -z "$RELEASED" ]; then
     # again.
     stop_before_patch() {
       echo "::error::$1" >&2
-      [ "$SAVED_INGRESS" = null ] || set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")" \
-        || echo "::warning::restore the ingress of $AZURE_APP_NAME manually" >&2
+      restore_ingress
       exit 1
     }
+    save_ingress_tags \
+      || { echo "::error::cannot save the ingress of $AZURE_APP_NAME in its tags. The script stops before it disables ingress." >&2; exit 1; }
     az containerapp ingress disable \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -677,6 +745,7 @@ sole_active "$REVISION" || fail "revision $REVISION did not become the only acti
 # open now. It opens before a restart: a revision scaled to zero needs a
 # request through ingress to start a replica.
 open_ingress || fail "cannot open external ingress"
+clear_ingress_tags
 
 # No new revision: secrets are application-scope, and the running revision
 # reads them only when it starts.

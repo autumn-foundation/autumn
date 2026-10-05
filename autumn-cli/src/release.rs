@@ -3233,7 +3233,6 @@ previous_secrets = []
     /// value per line, and a nested list prints one tab-separated row.
     #[cfg(unix)]
     const AZ_STUB: &str = r#"#!/usr/bin/env bash
-echo "az $*" >> "$STUB_LOG"
 id=/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id
 tsv() { case "$query" in "[["*) local IFS=$'\t'; echo "$*" ;; *) printf '%s\n' "$@" ;; esac; }
 prev=""; query=""; body=""
@@ -3242,6 +3241,15 @@ for arg in "$@"; do
   [ "$prev" = "--body" ] && body="$(cat "${arg#@}")"
   prev="$arg"
 done
+# A PATCH that sets only tags (the ingress snapshot) logs as tags-patch
+# with its body, and stays out of the PATCH bodies.
+tags_only=""
+if [ "$1 $2" = "rest --method" ] && jq -e 'keys - ["location", "tags"] == []' <<< "$body" > /dev/null 2>&1; then
+  tags_only=1
+  echo "az tags-patch $body" >> "$STUB_LOG"
+else
+  echo "az $*" >> "$STUB_LOG"
+fi
 # The app as the GET shows it before any PATCH.
   env='{"name":"AUTUMN_PROFILE","value":"prod"}'
   refs=',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
@@ -3494,7 +3502,7 @@ case "$1 $2" in
     if grep -q '"ingress"' <<< "$body"; then
       echo "az ingress-patch external=$(jq -r '.properties.configuration.ingress.external' <<< "$body")" >> "$STUB_LOG"
     fi
-    echo "$body" >> "$STUB_LOG.bodies"
+    [ -n "$tags_only" ] || echo "$body" >> "$STUB_LOG.bodies"
     echo "$body" > "$STUB_LOG.unapplied"
     echo "${STUB_PATCH_PENDING:-0}" > "$STUB_LOG.pending"
     ;;
@@ -4182,14 +4190,19 @@ esac
             return;
         };
         assert!(status.success(), "{calls}");
-        let first = bodies.lines().next().unwrap_or_default();
-        assert!(first.contains("\"autumn-ingress-0\""), "{bodies}");
+        let tags: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.starts_with("az tags-patch "))
+            .collect();
+        assert!(tags.len() >= 2, "{calls}");
+        assert!(tags[0].contains("\"autumn-ingress-0\":\""), "{calls}");
         let disable_at = calls.find("ingress disable").expect("disable");
-        let patch_at = calls.find("az rest --method patch").expect("patch");
-        assert!(patch_at < disable_at, "{calls}");
-        let last = bodies.lines().last().unwrap_or_default();
-        assert!(last.contains("\"autumn-ingress-0\":null"), "{bodies}");
-        assert!(!last.contains("team"), "{bodies}");
+        let save_at = calls.find("az tags-patch ").unwrap();
+        assert!(save_at < disable_at, "{calls}");
+        let last = tags.last().unwrap();
+        assert!(last.contains("\"autumn-ingress-0\":null"), "{calls}");
+        assert!(!last.contains("team"), "{calls}");
+        assert!(!bodies.contains("autumn-ingress"), "{bodies}");
     }
 
     #[cfg(unix)]
@@ -4213,8 +4226,11 @@ esac
             .find(|line| line.contains("\"external\":true"))
             .unwrap_or_else(|| panic!("the script must open ingress: {bodies}"));
         assert!(open.contains("www.example.com"), "{open}");
-        let last = bodies.lines().last().unwrap_or_default();
-        assert!(last.contains("\"autumn-ingress-0\":null"), "{bodies}");
+        let last = calls
+            .lines()
+            .rfind(|line| line.starts_with("az tags-patch "))
+            .unwrap_or_default();
+        assert!(last.contains("\"autumn-ingress-0\":null"), "{calls}");
     }
 
     #[cfg(unix)]
