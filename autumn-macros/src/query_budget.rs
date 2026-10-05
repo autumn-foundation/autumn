@@ -2337,6 +2337,9 @@ impl Analyzer {
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
             Expr::Cast(c) => self.referents_of(&c.expr),
+            // `refs.0`, `refs[i]`: a part may be any borrow of the whole.
+            Expr::Field(f) => self.referents_of(&f.base),
+            Expr::Index(i) => self.referents_of(&i.expr),
             // `(&mut left, 1)`, `[&mut left, &mut right]`: a part may borrow.
             Expr::Tuple(_) | Expr::Array(_) | Expr::Struct(_) => {
                 let parts: Vec<&Expr> = match init {
@@ -12502,6 +12505,20 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut a = None; let mut b = None; let refs = [&mut a, &mut b]; \
                  *refs[1] = Some(repo); drop(refs); b.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a field taken from a tuple keeps its borrow",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let refs = (&mut slot,); let target = refs.0; \
+                 *target = Some(repo); drop(target); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a field taken from a struct keeps its borrow",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let refs = Refs { a: &mut slot }; let target = refs.a; \
+                 *target = Some(repo); drop(target); slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
