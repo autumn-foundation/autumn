@@ -1720,6 +1720,14 @@ jobs:
           # migrated table. Only its Chromium smoke runs elsewhere (the
           # publish-gate fleet e2e), so without this line the tier never runs.
           cargo test -p react-graphql --test graphql_api -- --ignored --test-threads=1
+          # examples/escape-hatches: the Docker tests in `hatches` (H1, H2, H3,
+          # H12, H13) and `boot`. `boot` starts the real binary to check the
+          # wiring that `TestApp` cannot reach (pool provider, error pages,
+          # exception filter, env-driven hatches). Testcontainer-managed. The
+          # `hatches` tests share tables; a lock in their `fresh_db` helper
+          # runs them one at a time.
+          cargo test -p escape-hatches --test hatches -- --ignored
+          cargo test -p escape-hatches --test boot -- --ignored
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored

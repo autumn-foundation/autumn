@@ -839,19 +839,23 @@ transaction commits or rolls back.
 
 ### Cache invalidation after writes
 
-`after_update` hooks receive a `MutationContext` that accepts
-`ctx.invalidate("key")` calls to declare cache keys that should be evicted
-after the write commits. This is coordinated with the shared-cache integration
-(#535) so that the correct backend — Moka or Redis — is targeted regardless of
-which replica processed the write:
+Declare which cached reads a repository's writes make stale. Each generated
+write then drops them **after it commits**, on the configured backend
+(in-process Moka, or shared Redis). You do not need to call anything:
 
 ```rust
-async fn after_update(&self, ctx: &mut MutationContext, page: &Page) -> AutumnResult<()> {
-    ctx.invalidate(format!("pages:{}", page.id));
-    ctx.invalidate("pages:all");
-    Ok(())
-}
+#[repository(Page, invalidates(crate::views::page_list))]
+pub trait PageRepository {}
 ```
+
+A failed backend sweep is retried, then logged and counted in
+`autumn_cache_invalidation_failures_total`. See
+[Cache Coherence](cache-coherence.md#commit-bound-invalidation).
+
+`MutationContext::invalidate("key")` only records a key in
+`ctx.invalidate_keys`. The generated repository does not evict these keys.
+Use `invalidates(...)`, or call `Cache::invalidate_async` from an
+`after_*_commit` hook.
 
 ## Rolling Deploy Lifecycle
 

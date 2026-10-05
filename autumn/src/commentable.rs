@@ -608,23 +608,41 @@ pub fn commentable_spec_for(type_name: &str) -> Option<&'static CommentableSpec>
         .map(|descriptor| descriptor.spec)
 }
 
-/// The model type name registered for `spec`, matched by IDENTITY.
+/// The model type name registered for `spec`, matched by address, then by
+/// value.
 ///
 /// Not by discriminator: two models sharing a `commentable_type` while pointing
 /// at different comment tables is a supported helper-only shape (the router
-/// still refuses it), so a name lookup could return the other model's identity
+/// still refuses it), so a name lookup could return the other model's name
 /// — and with it the other model's repository facts, applying one model's
 /// soft-delete rule to the other's table.
 ///
-/// The registered specs are `&'static`, so address equality is exactly the
-/// question being asked. A hand-built spec matches nothing and the caller falls
-/// back to what the spec itself declares.
+/// The lookup first compares addresses, which finds the registered reference
+/// itself. A copy has a new address (issue #2286), so the lookup then compares
+/// values. An equal hand-built spec matches the same way. If two models
+/// register an equal value, the lookup returns `None`. On `None`, the caller
+/// uses what the spec itself declares.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn commentable_model_for_spec(spec: &CommentableSpec) -> Option<&'static str> {
-    inventory::iter::<CommentableDescriptor>()
-        .find(|descriptor| std::ptr::eq(descriptor.spec, spec))
+    match models_for_spec(spec).as_slice() {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// Every model that `spec` can be: the registered reference itself, else each
+/// model that registers an equal value. Empty when nothing matches.
+#[cfg(feature = "db")]
+fn models_for_spec(spec: &CommentableSpec) -> Vec<&'static str> {
+    let registry = || inventory::iter::<CommentableDescriptor>();
+    if let Some(descriptor) = registry().find(|descriptor| std::ptr::eq(descriptor.spec, spec)) {
+        return vec![(descriptor.model)()];
+    }
+    registry()
+        .filter(|descriptor| descriptor.spec == spec)
         .map(|descriptor| (descriptor.model)())
+        .collect()
 }
 
 /// The model type name registered for `type_name`, or `None` when no
@@ -800,9 +818,8 @@ pub async fn add_comment(
         )));
     }
 
-    // Resolved from THIS `spec` reference, before it is copied below:
-    // `commentable_model_for_spec` (inside `resolve_soft_deletes`) matches the
-    // registry by pointer identity, which an owned copy would not carry.
+    // Resolve this from the caller's reference, before the copy below. When
+    // two models register equal specs, only the address finds the model.
     let soft_deletes = resolve_soft_deletes(spec);
 
     // Owned copies so the transaction closure — which must be `'static`-ish
@@ -886,8 +903,7 @@ pub async fn delete_comment(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    // See `add_comment`'s comment: resolved before the copy below, from the
-    // spec reference the registry actually holds.
+    // Before the copy: see `add_comment`.
     let soft_deletes = resolve_soft_deletes(spec);
     let spec = *spec;
     let parent_type = parent_type.to_owned();
@@ -987,8 +1003,7 @@ pub async fn recompute_comment_count(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    // See `add_comment`'s comment: resolved before either branch below copies
-    // or otherwise loses this reference's identity.
+    // Before the copy: see `add_comment`.
     let soft_deletes = resolve_soft_deletes(spec);
     let Some(counter_column) = spec.counter_column else {
         probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
@@ -1290,17 +1305,17 @@ fn build_nodes(
 /// serves deliberately. Only when no repository is registered does the
 /// column get to decide.
 ///
-/// Call this with the spec reference the `#[commentable]` registry actually
-/// holds. `commentable_model_for_spec` matches it by pointer identity
-/// (`std::ptr::eq`); a copy of the `Copy` `CommentableSpec` value lives at a
-/// new address and would never match, silently falling back to the column
-/// alone (issue #2263). Every public entry point in this module resolves
-/// this **before** it copies `spec` for its transaction closure, then passes
-/// the answer down explicitly — never re-derives it after the copy.
+/// A copy of a registered spec finds its model by value (issue #2286). If two
+/// models register equal specs, a copy can be either model. Then the parent
+/// hides if one of the models hides it, the same rule as for two repositories.
 fn resolve_soft_deletes(spec: &CommentableSpec) -> bool {
-    commentable_model_for_spec(spec)
-        .and_then(model_soft_deletes)
-        .unwrap_or(spec.parent_soft_delete)
+    let models = models_for_spec(spec);
+    if models.is_empty() {
+        return spec.parent_soft_delete;
+    }
+    models
+        .into_iter()
+        .any(|model| model_soft_deletes(model).unwrap_or(spec.parent_soft_delete))
 }
 
 /// One parent-visibility rule, evaluated two ways (issue #2281).
@@ -1380,8 +1395,8 @@ fn parent_visibility(
 /// this caller's tenant". Everything else in this module keys on `parent_id`
 /// having passed through here.
 ///
-/// `soft_deletes` is resolved by the caller via [`resolve_soft_deletes`],
-/// not derived here — see that function's doc for why.
+/// The caller resolves `soft_deletes` with [`resolve_soft_deletes`] before it
+/// copies `spec`, and passes it in.
 async fn probe_parent(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
