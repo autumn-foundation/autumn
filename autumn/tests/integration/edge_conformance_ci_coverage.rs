@@ -11,6 +11,9 @@
 //!
 //! This test pins the CI step's `CARGO_TARGET_DIR` so a future edit cannot
 //! silently reintroduce the double build.
+//!
+//! The job's last step, "autumn build emits the capsule", builds the capsule
+//! again on purpose. It tests the CLI path (AC-1 of #1790), not the suite.
 
 use std::path::{Path, PathBuf};
 
@@ -108,4 +111,30 @@ fn conformance_suite_uses_the_same_target_dir_suffix() {
          `EDGE_CONFORMANCE_TARGET_DIR` and ci.yml's `CARGO_TARGET_DIR` to match wherever it \
          builds now"
     );
+}
+
+/// AC-1 of #1790: one `autumn build` makes the capsule. The job must run the
+/// real CLI on the example and check that the artifact exists.
+#[test]
+fn edge_conformance_job_runs_autumn_build_and_checks_the_artifact() {
+    let ci = std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
+        .expect("read .github/workflows/ci.yml")
+        .replace('\r', "");
+    let job = edge_conformance_job_block(&ci);
+    let step_start = job
+        .find("- name: autumn build emits the capsule")
+        .expect("edge-conformance job has no \"autumn build emits the capsule\" step");
+    let step = &job[step_start..];
+    let step = step[1..].find("- name:").map_or(step, |at| &step[..=at]);
+
+    for needle in [
+        "working-directory: examples/edge-greeting",
+        "-p autumn-cli --bin autumn -- build --debug --edge",
+        "test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm",
+    ] {
+        assert!(
+            step.contains(needle),
+            "the step must contain `{needle}`:\n{step}"
+        );
+    }
 }

@@ -1199,6 +1199,7 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
         "integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks",
         "integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks",
         "integration::scaffold_validation::documented_scaffold_example_builds_without_warnings",
+        "integration::console::console_repl_runs_and_reports_errors_as_script_errors",
     ] {
         assert!(
             invocations.contains(&format!("{test_name} -- --ignored --exact")),

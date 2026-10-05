@@ -204,6 +204,9 @@ inbound-ses = ["inbound-mail", "http-client", "dep:rsa", "dep:sha1"]
 # Enables `autumn_web::seed::SeedContext` for use in `src/bin/seed.rs`.
 # Depends on `db`; off by default so apps that don't seed pay zero compile cost.
 seed = ["db"]
+# Interactive Rhai prompt for `autumn console --repl` (issue #2148). Off by
+# default: the CLI turns it on for the playground run only.
+repl = ["db", "dep:rhai", "dep:rustyline"]
 system-info = []
 # First-class CSV import and export for `#[repository]` models.
 # Adds `autumn_web::data::csv` (streaming export, row-by-row import with
@@ -432,6 +435,8 @@ serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 ammonia = { workspace = true, optional = true }
+rhai = { workspace = true, optional = true }
+rustyline = { workspace = true, optional = true }
 subtle = "2.6.1"
 base64 = "0.23"
 url = "2.5.8"
@@ -541,7 +546,7 @@ rustls-pki-types = { version = "1", features = ["std"] }
 features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
-  "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
+  "redis", "i18n", "storage", "variants", "mail", "seed", "repl", "system-info", "markdown",
   "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
   "plugin-sandbox",
   # Generated UI. Pure Rust over dependencies already in the graph, so it
@@ -1097,7 +1102,8 @@ path = "tests/sqlite_statement_timeout_fail_closed.rs"
 name = "sqlite_dependent_destroy"
 path = "tests/sqlite_dependent_destroy.rs"
 
-# `#[commentable]` hard-delete on SQLite (Snag charter, issue #2275 follow-up).
+# `#[commentable]` on SQLite: hard-delete (Snag charter, issue #2275
+# follow-up), and a copied spec that finds its repository (issue #2286).
 # `docs/guide/commentable.md` claims "Both backends are supported", but the
 # feature's only live-DB suite is Postgres-only (testcontainers). Runs
 # explicitly: `cargo test -p autumn-web --features sqlite --test

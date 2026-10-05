@@ -753,6 +753,83 @@ async fn sqlite_job_backend_recovers_a_crashed_claim() {
     job::clear_global_job_client();
 }
 
+/// (6b) Issue #3054: claims that expire together (handlers that hung on one
+/// dependency) must not all run again at once. Before the fix the recovery
+/// set `run_at = now` for every row. Now each row gets a jitter in
+/// `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]`.
+#[tokio::test]
+async fn sqlite_job_backend_spreads_recovered_claims() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![job_info("sqlite_stale_storm_job", 3, |_state, _payload| {
+            Box::pin(async move { Ok(()) })
+        })],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    eventually(400, "the queue schema to be created", async || {
+        queue_table_exists(&pool).await
+    })
+    .await;
+
+    // Forge the rows a dead worker would have left behind, each with a 60 s
+    // backoff.
+    {
+        use diesel_async::RunQueryDsl as _;
+        let mut conn = pool.get().await.expect("sqlite connection");
+        for n in 0..STORM_JOBS {
+            diesel::sql_query(format!(
+                "INSERT INTO autumn_jobs \
+                 (id, name, queue, payload, status, attempt, max_attempts, initial_backoff_ms, \
+                  enqueued_at, run_at, started_at, claimed_by, claimed_at) \
+                 VALUES ('stale-{n}', 'sqlite_stale_storm_job', 'default', '{{}}', 'running', \
+                         1, 3, 60000, 0, 0, 0, 'dead-worker', 0)"
+            ))
+            .execute(&mut *conn)
+            .await
+            .expect("insert a stale claim");
+        }
+    }
+
+    eventually(400, "every stale claim to be recovered", async || {
+        usize::try_from(
+            count(
+                &pool,
+                "SELECT COUNT(*) AS value FROM autumn_jobs WHERE attempt = 2",
+            )
+            .await,
+        )
+        .unwrap_or(0)
+            == STORM_JOBS
+    })
+    .await;
+
+    let spread_ms = count(
+        &pool,
+        "SELECT MAX(run_at) - MIN(run_at) AS value FROM autumn_jobs WHERE attempt = 2",
+    )
+    .await;
+    assert!(
+        spread_ms > 10_000,
+        "{STORM_JOBS} recovered claims are due within {spread_ms} ms of each other"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
 static FAILING_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 /// (7) A failing job retries with backoff and dead-letters on the final
@@ -812,6 +889,70 @@ async fn sqlite_job_backend_retries_then_dead_letters() {
     assert!(
         error.contains("always fails"),
         "the dead-lettered row keeps the last error; got: {error}"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}
+
+/// Jobs in the retry-storm test below.
+const STORM_JOBS: usize = 8;
+
+/// (7b) Issue #3054: jobs that fail together must not retry together.
+///
+/// Each job fails once with a 60 s backoff. Before #3054 every retry was due
+/// at `failure + 60 s`, so all `run_at` values fell in the short window in
+/// which the jobs failed. Full jitter puts each one in `[0, 60 s]`.
+///
+/// A retry can be due at once and fail again (its last attempt). Its row then
+/// is `failed`, but it keeps `attempt = 2` and its `run_at`, so the test
+/// counts rows by `attempt` only.
+#[tokio::test]
+async fn sqlite_job_backend_retries_spread_out() {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone())
+        .with_entropy(autumn_web::entropy::SeededEntropy::shared(0x3054));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    let mut info = job_info("sqlite_storm_job", 2, |_state, _payload| {
+        Box::pin(async move { Err(autumn_web::AutumnError::internal_server_error_msg("blip")) })
+    });
+    info.initial_backoff_ms = 60_000;
+    job::start_runtime(vec![info], &state, &shutdown, &sqlite_job_config(2), true)
+        .expect("the durable sqlite job runtime starts");
+
+    for n in 0..STORM_JOBS {
+        job::enqueue("sqlite_storm_job", serde_json::json!({ "n": n }))
+            .await
+            .expect("enqueue");
+    }
+
+    eventually(400, "every job to schedule its retry", async || {
+        usize::try_from(
+            count(
+                &pool,
+                "SELECT COUNT(*) AS value FROM autumn_jobs WHERE attempt = 2",
+            )
+            .await,
+        )
+        .unwrap_or(0)
+            == STORM_JOBS
+    })
+    .await;
+
+    let spread_ms = count(
+        &pool,
+        "SELECT MAX(run_at) - MIN(run_at) AS value FROM autumn_jobs WHERE attempt = 2",
+    )
+    .await;
+    assert!(
+        spread_ms > 10_000,
+        "{STORM_JOBS} retries are due within {spread_ms} ms of each other: they retry together"
     );
 
     shutdown.cancel();

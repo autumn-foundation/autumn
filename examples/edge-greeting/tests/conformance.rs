@@ -1,27 +1,27 @@
-//! Origin/edge conformance: the proof behind AC-2 of issue #1790.
+//! Origin/edge conformance: the proof behind AC-2 and AC-3 of issue #1790.
 //!
 //! Every test here builds a **real** `wasm32-wasip1` capsule from this
-//! example's own sources and runs a shared request corpus through three lanes:
+//! example's own sources and sends requests through these lanes:
 //!
 //! | Lane | What runs | Driven by |
 //! | --- | --- | --- |
 //! | Native edge | `autumn_edge::serve_io` — the capsule's `main`, compiled for the host | the in-process host below |
 //! | Wasm edge | the same code, compiled to `wasm32-wasip1` | `autumn_edge::host::EdgeArtifact` (wasmi) |
 //! | Origin | the whole app: `TestApp` + the full middleware stack | `autumn_web::test` |
+//! | Gateway | the capsule in front of the origin | `autumn_edge::gateway::EdgeGateway` |
 //!
-//! **Tier A** (native edge vs wasm edge) is byte-exact: same status, same
-//! headers, same body bytes, and the same fallthrough reason when the edge
-//! declines. Nothing is excused — if these two disagree, compiling to wasm
-//! changed the answer.
-//!
-//! **Tier B** (origin vs wasm edge) is where the projection earns its keep. The
-//! origin stamps a `Date`, a request id and server-timing spans that the edge
-//! lane structurally cannot emit, so headers are compared after
-//! [`project_headers`]: every header the edge *did* emit must be present at the
-//! origin with an identical value, and the body bytes must match exactly. For
-//! the cases the edge declines, the origin is asked the same question and has
-//! to answer it — that is what makes fallthrough transparent rather than a
-//! 404 with extra steps.
+//! - **Tier A** (native edge vs wasm edge): byte-exact. Status, headers, body
+//!   and fallthrough reason must be equal. Nothing is excused.
+//! - **Tier B** (origin vs wasm edge): status and body exact. Headers are
+//!   compared in both directions after projection. Only
+//!   `VOLATILE_HEADERS` and `SECURITY_HEADERS` (which the host sets) are
+//!   excused. For a declined case the origin must give its canonical answer.
+//! - **Tier C** (gateway vs origin): for an edge-served request the client
+//!   gets the origin's bytes, with only `VOLATILE_HEADERS` excused. For a
+//!   declined request the gateway returns the origin's response unchanged.
+//! - **Tier D**: Tiers A to C over 10,000 generated requests (fixed seed).
+//!   This is the issue's success metric: zero divergence across >= 10k
+//!   requests.
 //!
 //! Every test is `#[ignore]`d because it needs the `wasm32-wasip1` target
 //! installed. CI runs them in the dedicated `edge-conformance` job:
@@ -42,7 +42,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use autumn_edge::conformance::{ConformanceCase, Expectation, Verdict, compare, project_headers};
+use autumn_edge::conformance::{
+    ConformanceCase, Expectation, SECURITY_HEADERS, Verdict, compare, compare_capsule,
+    project_headers,
+};
+use autumn_edge::gateway::{EdgeGateway, Lane};
 use autumn_edge::host::EdgeArtifact;
 use autumn_edge::wire::{
     EdgeOutcome, EdgeRequest, EdgeResponse, FallthroughReason, GuestFrame, HostFrame, from_line,
@@ -238,11 +242,13 @@ fn origin_status_for_fallthrough(uri: &str) -> u16 {
 ///
 /// `EdgeArtifact::from_bytes` compiles the module once; `run` instantiates a
 /// fresh store per request, so nothing leaks between corpus entries.
-fn artifact() -> &'static EdgeArtifact {
-    static ARTIFACT: OnceLock<EdgeArtifact> = OnceLock::new();
+fn artifact() -> &'static Arc<EdgeArtifact> {
+    static ARTIFACT: OnceLock<Arc<EdgeArtifact>> = OnceLock::new();
     ARTIFACT.get_or_init(|| {
         let wasm = build_capsule();
-        EdgeArtifact::from_bytes(&wasm).expect("the built artifact is a valid wasm module")
+        Arc::new(
+            EdgeArtifact::from_bytes(&wasm).expect("the built artifact is a valid wasm module"),
+        )
     })
 }
 
@@ -677,34 +683,10 @@ async fn tier_b_the_origin_agrees_with_the_capsule_and_answers_every_decline() {
                     panic!("[{}] the edge declined a case it should serve", case.name);
                 };
 
-                assert_eq!(
-                    origin.status, edge.status,
-                    "[{}] origin answered {} and the edge answered {}",
-                    case.name, origin.status, edge.status
-                );
-                assert_eq!(
-                    body_text(&origin),
-                    body_text(&edge),
-                    "[{}] origin and edge bodies differ",
-                    case.name
-                );
-                assert_eq!(
-                    origin.body, edge.body,
-                    "[{}] origin and edge body bytes differ",
-                    case.name
-                );
-
-                // Every header the edge emitted must be present at the origin
-                // with the same value. The origin may add more (it has a
-                // middleware stack); it may not contradict.
-                let origin_headers = project_headers(&origin.headers);
-                for (name, value) in project_headers(&edge.headers) {
-                    assert!(
-                        origin_headers.contains(&(name.clone(), value.clone())),
-                        "[{}] the edge emitted `{name}: {value}` and the origin did not \
-                         (origin headers: {origin_headers:?})",
-                        case.name
-                    );
+                // Status, body and headers in both directions. Only the
+                // headers the host sets (`SECURITY_HEADERS`) are excused.
+                if let Verdict::Diverged { detail } = compare_capsule(&origin, &edge) {
+                    panic!("[{}] origin and capsule diverged — {detail}", case.name);
                 }
 
                 println!(
@@ -825,5 +807,605 @@ fn the_corpus_exercises_every_fallthrough_reason() {
     assert!(
         CORPUS.iter().any(|case| case.expect == Expectation::Served),
         "a corpus with nothing served proves nothing about byte-identity"
+    );
+}
+
+// ── Tier C: the gateway in front of the origin (AC-3) ────────────────
+
+/// What the origin returned behind the gateway: status, headers, body.
+type Recorded = Arc<Mutex<Vec<EdgeResponse>>>;
+
+/// The origin `Router`, wrapped to record each response it gives.
+///
+/// The gateway must return that response unchanged. Recording it at the
+/// origin is what lets the test prove "unchanged" byte for byte.
+fn recording_origin(
+    router: &axum::Router,
+    recorded: &Recorded,
+) -> impl tower::Service<
+    http::Request<axum::body::Body>,
+    Response = http::Response<axum::body::Body>,
+    Error = std::convert::Infallible,
+    Future = impl Send,
+> + Clone
++ Send
++ 'static {
+    let router = router.clone();
+    let recorded = Arc::clone(recorded);
+    tower::service_fn(move |request: http::Request<axum::body::Body>| {
+        let router = router.clone();
+        let recorded = Arc::clone(&recorded);
+        async move {
+            let response = tower::ServiceExt::oneshot(router, request)
+                .await
+                .unwrap_or_else(|never| match never {});
+            let (parts, bytes) = buffer(response).await;
+            recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(bytes.clone());
+            Ok(http::Response::from_parts(
+                parts,
+                axum::body::Body::from(bytes.body),
+            ))
+        }
+    })
+}
+
+/// Read a response into an [`EdgeResponse`], keeping its parts.
+async fn buffer(
+    response: http::Response<axum::body::Body>,
+) -> (http::response::Parts, EdgeResponse) {
+    let (parts, body) = response.into_parts();
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .expect("an in-memory body reads");
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let response = EdgeResponse {
+        status: parts.status.as_u16(),
+        headers,
+        body: body.to_vec(),
+    };
+    (parts, response)
+}
+
+/// The HTTP request a case describes. `accept-encoding: identity` for the
+/// same reason as [`origin_response`].
+fn http_request(
+    method: &str,
+    uri: &str,
+    headers: &[(String, String)],
+) -> http::Request<axum::body::Body> {
+    let mut builder = http::Request::builder().method(method).uri(uri);
+    if !headers.iter().any(|(name, _)| name == "accept-encoding") {
+        builder = builder.header("accept-encoding", "identity");
+    }
+    for (name, value) in headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder
+        .body(axum::body::Body::empty())
+        .expect("a generated request is valid HTTP")
+}
+
+/// The origin router, and the security headers it sets on every response.
+struct Origin {
+    router: axum::Router,
+    security_headers: Vec<(http::HeaderName, http::HeaderValue)>,
+}
+
+impl Origin {
+    /// Build the origin. Read its security headers from one response, as an
+    /// operator copies them into the CDN configuration.
+    async fn new() -> Self {
+        let router = origin().into_router();
+        let probe = || async {
+            tower::ServiceExt::oneshot(router.clone(), http_request("GET", "/stats/count", &[]))
+                .await
+                .unwrap_or_else(|never| match never {})
+        };
+        let (first, second) = (probe().await, probe().await);
+        let mut security_headers: Vec<_> = first
+            .headers()
+            .iter()
+            .filter(|(name, _)| SECURITY_HEADERS.contains(&name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        // The CSP is static when the nonce is off. Then the host sets it too.
+        let csp = http::header::CONTENT_SECURITY_POLICY;
+        if let Some(value) = first.headers().get(&csp)
+            && second.headers().get(&csp) == Some(value)
+        {
+            security_headers.push((csp, value.clone()));
+        }
+        assert!(
+            !security_headers.is_empty(),
+            "the origin sets security headers; the gateway must copy them"
+        );
+        Self {
+            router,
+            security_headers,
+        }
+    }
+}
+
+/// The gateway the guide describes: the real capsule, the real origin.
+fn gateway(
+    origin: &Origin,
+    recorded: &Recorded,
+    capabilities: &[EdgeCapability],
+) -> EdgeGateway<
+    impl tower::Service<
+        http::Request<axum::body::Body>,
+        Response = http::Response<axum::body::Body>,
+        Error = std::convert::Infallible,
+        Future = impl Send,
+    > + Clone
+    + Send
+    + 'static,
+> {
+    let gateway = EdgeGateway::new(
+        Arc::clone(artifact()),
+        recording_origin(&origin.router, recorded),
+    )
+    .with_response_headers(origin.security_headers.clone());
+    if capabilities.contains(&EdgeCapability::Kv) {
+        gateway.with_kv(edge_greeting::demo_kv())
+    } else {
+        gateway
+    }
+}
+
+/// Check one request through the gateway. `Ok` is the lane and the status the
+/// client got.
+///
+/// - Edge lane: the client gets what the origin would send (`direct`), with
+///   only [`VOLATILE_HEADERS`](autumn_edge::conformance::VOLATILE_HEADERS)
+///   excused. A static CSP must match too. The origin is not asked.
+/// - Fallthrough: the gateway returns, unchanged, the response the origin
+///   gave it — and the origin was asked exactly once.
+async fn check_gateway(
+    case: &Generated,
+    origin: &Origin,
+    edge: &EdgeOutcome,
+    direct: Option<&EdgeResponse>,
+) -> Result<(Lane, u16), String> {
+    let recorded = Recorded::default();
+    let name = &case.name;
+    let response = gateway(origin, &recorded, case.capabilities)
+        .handle(http_request(case.method, &case.uri, &case.headers))
+        .await;
+    let lane = *response
+        .extensions()
+        .get::<Lane>()
+        .ok_or("no lane recorded")?;
+    let (_, got) = buffer(response).await;
+    let origin_calls =
+        std::mem::take(&mut *recorded.lock().unwrap_or_else(PoisonError::into_inner));
+
+    match (edge, lane) {
+        (EdgeOutcome::Served(edge), Lane::Edge) => {
+            if !origin_calls.is_empty() {
+                return Err(format!(
+                    "[{name}] the edge served it, but the origin was asked too"
+                ));
+            }
+            if got.body != edge.body {
+                return Err(format!("[{name}] the gateway changed the edge body"));
+            }
+            let direct = direct.ok_or_else(|| format!("[{name}] no origin answer to compare"))?;
+            if let Verdict::Diverged { detail } = compare(direct, &got) {
+                return Err(format!(
+                    "[{name}] the client got different bytes from the edge — {detail}"
+                ));
+            }
+            // `compare` excuses the CSP as volatile. A static one must match.
+            let csp = |response: &EdgeResponse| {
+                response
+                    .headers
+                    .iter()
+                    .find(|(header, _)| header == "content-security-policy")
+                    .map(|(_, value)| value.clone())
+            };
+            if csp(direct) != csp(&got) {
+                return Err(format!(
+                    "[{name}] CSP differs: origin {:?}, edge {:?}",
+                    csp(direct),
+                    csp(&got)
+                ));
+            }
+        }
+        (EdgeOutcome::Fallthrough { reason, .. }, Lane::Fallthrough(lane_reason))
+            if *reason == lane_reason =>
+        {
+            let [origin] = origin_calls.as_slice() else {
+                return Err(format!(
+                    "[{name}] a `{reason}` fallthrough asked the origin {} time(s), not once",
+                    origin_calls.len()
+                ));
+            };
+            if got != *origin {
+                return Err(format!(
+                    "[{name}] the gateway changed the origin response (origin {}, gateway {})",
+                    origin.status, got.status
+                ));
+            }
+        }
+        (edge, lane) => {
+            return Err(format!(
+                "[{name}] the capsule answered {:?} but the gateway used lane {lane:?}",
+                edge.fallthrough_reason()
+            ));
+        }
+    }
+    Ok((lane, got.status))
+}
+
+#[tokio::test]
+#[ignore = "requires wasm32-wasip1 target (edge-conformance CI job)"]
+async fn tier_c_the_gateway_serves_from_the_edge_or_forwards_to_the_origin_unchanged() {
+    let kv = edge_greeting::demo_kv();
+    let origin = Origin::new().await;
+    println!("\n  Tier C — gateway (capsule + origin) vs the lanes behind it\n");
+
+    for case in CORPUS {
+        let edge = run_wasm(&case.request(), case.provided_capabilities, &kv);
+        // The origin's panic for `/boom` is expected; silence its report.
+        let previous = (case.uri == TRAPPING_URI).then(|| {
+            let previous = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            previous
+        });
+        let case_request = Generated::from(case);
+        let direct = match edge {
+            EdgeOutcome::Served(_) => Some(origin_answer(&origin.router, &case_request).await),
+            EdgeOutcome::Fallthrough { .. } => None,
+        };
+        let checked = check_gateway(&case_request, &origin, &edge, direct.as_ref()).await;
+        if let Some(previous) = previous {
+            std::panic::set_hook(previous);
+        }
+        let (lane, _) = checked.unwrap_or_else(|failure| panic!("{failure}"));
+
+        let expected = match case.expect {
+            Expectation::Served => Lane::Edge,
+            Expectation::Fallthrough(reason) => Lane::Fallthrough(reason),
+        };
+        assert_eq!(lane, expected, "[{}] wrong lane", case.name);
+        println!("    {:<52} {lane:?}", case.name);
+    }
+}
+
+// ── Tier D: a generated corpus (the >= 10k success metric) ───────────
+
+/// How many generated requests one run drives through every lane.
+const GENERATED_REQUESTS: usize = 10_000;
+
+/// Fixed, so a failure replays. Print it on failure; change it to explore.
+const GENERATOR_SEED: u64 = 0x1790_0000_0000_0001;
+
+/// `splitmix64`: small, fast, and the same on every platform.
+struct Generator(u64);
+
+impl Generator {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A value in `0..bound`.
+    fn below(&mut self, bound: usize) -> usize {
+        usize::try_from(self.next() % u64::try_from(bound).expect("bound fits u64"))
+            .expect("a value below a usize bound fits usize")
+    }
+
+    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+        &items[self.below(items.len())]
+    }
+
+    /// `true` with probability `percent / 100`.
+    fn chance(&mut self, percent: usize) -> bool {
+        self.below(100) < percent
+    }
+
+    /// One path segment or query value: plain, reserved, and percent-encoded
+    /// characters, including multi-byte UTF-8 and invalid UTF-8.
+    fn segment(&mut self) -> String {
+        const PIECES: &[&str] = &[
+            "a",
+            "b",
+            "z",
+            "A",
+            "Q",
+            "0",
+            "7",
+            "-",
+            "_",
+            "~",
+            ".",
+            "!",
+            "$",
+            "'",
+            "(",
+            ")",
+            "*",
+            "+",
+            ",",
+            ";",
+            ":",
+            "@",
+            "%20",
+            "%2F",
+            "%25",
+            "%3F",
+            "%23",
+            "%C3%A9",
+            "%E2%9C%93",
+            "%F0%9F%8D%82",
+            "%FF",
+            "%00",
+        ];
+        let len = 1 + self.below(10);
+        let mut out: String = (0..len).map(|_| *self.pick(PIECES)).collect();
+        // `.` and `..` are path syntax, not data.
+        if out == "." || out == ".." {
+            out.push('a');
+        }
+        out
+    }
+
+    fn query(&mut self) -> String {
+        const KEYS: &[&str] = &["tag", "tag", "a", "b", "x%20y", "t%C3%A9"];
+        let pairs = self.below(6);
+        let mut parts = Vec::with_capacity(pairs);
+        for _ in 0..pairs {
+            let key = *self.pick(KEYS);
+            if self.chance(10) {
+                parts.push(key.to_owned());
+            } else {
+                parts.push(format!("{key}={}", self.segment()));
+            }
+        }
+        parts.join("&")
+    }
+
+    fn uri(&mut self) -> String {
+        match self.below(9) {
+            0 | 1 => format!("/greet/{}", self.segment()),
+            2 => format!("/note/{}", self.pick(&["greeting", "release", "missing"])),
+            3 => format!("/note/{}", self.segment()),
+            4 => format!("/stats?{}", self.query()),
+            5 => "/stats/count".to_owned(),
+            6 => "/whoami".to_owned(),
+            7 => format!("/greet/{}/", self.segment()),
+            _ => format!("/{}", self.segment()),
+        }
+    }
+
+    fn method(&mut self) -> &'static str {
+        match self.below(20) {
+            0..=13 => "GET",
+            14 | 15 => "HEAD",
+            16 => "POST",
+            17 => "PUT",
+            18 => "DELETE",
+            _ => "PATCH",
+        }
+    }
+
+    fn headers(&mut self) -> Vec<(String, String)> {
+        const HEADERS: &[(&str, &str)] = &[
+            ("accept", "text/html"),
+            ("accept", "*/*"),
+            ("accept-language", "fr-CA, en;q=0.8"),
+            ("user-agent", "conformance/1"),
+            ("x-forwarded-for", "203.0.113.7"),
+            ("if-none-match", "\"abc\""),
+            ("cookie", "session=super-secret"),
+            ("authorization", "Bearer super-secret"),
+            ("proxy-authorization", "Basic super-secret"),
+        ];
+        let count = self.below(4);
+        (0..count)
+            .map(|_| {
+                let (name, value) = *self.pick(HEADERS);
+                (name.to_owned(), value.to_owned())
+            })
+            .collect()
+    }
+}
+
+/// One generated request.
+struct Generated {
+    name: String,
+    method: &'static str,
+    uri: String,
+    headers: Vec<(String, String)>,
+    capabilities: &'static [EdgeCapability],
+}
+
+impl From<&ConformanceCase> for Generated {
+    fn from(case: &ConformanceCase) -> Self {
+        Self {
+            name: case.name.to_owned(),
+            method: case.method,
+            uri: case.uri.to_owned(),
+            headers: case.request().headers,
+            capabilities: case.provided_capabilities,
+        }
+    }
+}
+
+fn generate(seed: u64, count: usize) -> Vec<Generated> {
+    let mut generator = Generator(seed);
+    (0..count)
+        .map(|index| {
+            let method = generator.method();
+            let uri = generator.uri();
+            let mut headers = generator.headers();
+            // Every lane sees the same headers, the gateway's included.
+            headers.push(("accept-encoding".to_owned(), "identity".to_owned()));
+            let capabilities: &'static [EdgeCapability] = if generator.chance(80) {
+                &[EdgeCapability::Kv]
+            } else {
+                &[]
+            };
+            Generated {
+                name: format!("#{index} {method} {uri}"),
+                method,
+                uri,
+                headers,
+                capabilities,
+            }
+        })
+        .collect()
+}
+
+/// Send one request straight to the origin router.
+async fn origin_answer(router: &axum::Router, case: &Generated) -> EdgeResponse {
+    let request = http_request(case.method, &case.uri, &case.headers);
+    let response = tower::ServiceExt::oneshot(router.clone(), request)
+        .await
+        .unwrap_or_else(|never| match never {});
+    buffer(response).await.1
+}
+
+/// Every way one generated request can diverge. `Ok` is the lane it took.
+async fn check_generated(
+    case: &Generated,
+    origin: &Origin,
+    kv: &Arc<dyn EdgeKv>,
+) -> Result<Lane, String> {
+    let request = EdgeRequest {
+        method: case.method.to_owned(),
+        uri: case.uri.clone(),
+        headers: case.headers.clone(),
+        body: Vec::new(),
+        identity: None,
+    };
+
+    // Tier A: native edge lane vs wasm capsule, raw and exact.
+    let native = run_native(&request, case.capabilities, kv);
+    let edge = run_wasm(&request, case.capabilities, kv);
+    if native != edge {
+        return Err(format!(
+            "[{}] native and wasm lanes differ:\n  native {native:?}\n  wasm   {edge:?}",
+            case.name
+        ));
+    }
+
+    // The decline reason is the one the rules give.
+    let write = !matches!(case.method, "GET" | "HEAD");
+    if let EdgeOutcome::Fallthrough { reason, detail } = &edge {
+        // A write declines on its method. A read never does, and no request
+        // here traps.
+        let expected = (*reason == FallthroughReason::MethodNotEdgeEligible) == write
+            && *reason != FallthroughReason::CapsuleError;
+        if !expected {
+            return Err(format!("[{}] unexpected `{reason}`: {detail}", case.name));
+        }
+    } else if write {
+        return Err(format!("[{}] the edge served a write", case.name));
+    }
+
+    // Tier B: the origin agrees with every response the edge serves, in both
+    // directions. Only the headers the host sets are excused.
+    let direct = match &edge {
+        EdgeOutcome::Served(served) => {
+            let direct = origin_answer(&origin.router, case).await;
+            if let Verdict::Diverged { detail } = compare_capsule(&direct, served) {
+                return Err(format!(
+                    "[{}] origin and capsule diverged — {detail}",
+                    case.name
+                ));
+            }
+            Some(direct)
+        }
+        EdgeOutcome::Fallthrough { .. } => None,
+    };
+
+    // Tier C: the gateway takes the lane the capsule chose, and the client gets
+    // the origin's bytes either way.
+    let (lane, status) = check_gateway(case, origin, &edge, direct.as_ref()).await?;
+
+    // A declined read gets the origin's canonical answer. For a missing
+    // capability, that is what the edge answers when the host provides it.
+    let expected = match lane {
+        Lane::Fallthrough(FallthroughReason::UnknownRoute) => Some(404),
+        Lane::Fallthrough(FallthroughReason::MissingCapability) => {
+            run_wasm(&request, &[EdgeCapability::Kv], kv)
+                .served()
+                .map(|served| served.status)
+        }
+        _ => None,
+    };
+    if expected.is_some_and(|expected| expected != status) {
+        return Err(format!(
+            "[{}] the origin answered a `{lane:?}` decline with {status}, not {expected:?}",
+            case.name
+        ));
+    }
+    if status >= 500 {
+        return Err(format!("[{}] the client got a {status}", case.name));
+    }
+    Ok(lane)
+}
+
+#[tokio::test]
+#[ignore = "requires wasm32-wasip1 target (edge-conformance CI job)"]
+async fn tier_d_a_generated_corpus_shows_zero_divergence_across_every_lane() {
+    let kv = edge_greeting::demo_kv();
+    let origin = Origin::new().await;
+    let corpus = generate(GENERATOR_SEED, GENERATED_REQUESTS);
+    assert!(
+        corpus.len() >= 10_000,
+        "the success metric is >= 10k conformance-tested requests"
+    );
+
+    let started = std::time::Instant::now();
+    let mut lanes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut failures = Vec::new();
+    for case in &corpus {
+        match check_generated(case, &origin, &kv).await {
+            Ok(lane) => *lanes.entry(format!("{lane:?}")).or_default() += 1,
+            Err(failure) => failures.push(failure),
+        }
+    }
+
+    println!(
+        "\n  Tier D — {} generated requests (seed {GENERATOR_SEED:#x}) in {:.1?}\n",
+        corpus.len(),
+        started.elapsed()
+    );
+    for (lane, count) in &lanes {
+        println!("    {lane:<52} {count}");
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} generated requests diverged (seed {GENERATOR_SEED:#x}). First 20:\n{}",
+        failures.len(),
+        corpus.len(),
+        failures
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        lanes.get("Edge").copied().unwrap_or_default() >= corpus.len() / 3,
+        "too few requests reached the edge lane to prove byte-identity: {lanes:?}"
     );
 }

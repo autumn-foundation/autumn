@@ -138,6 +138,188 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 /// `#[edge]` macro rejects each of these on the same handler.
 pub const EDGE_GUARD_ATTRS: &[&str] = &["secured", "authorize", "step_up", "throttle", "intercept"];
 
+/// Capabilities the edge host can mediate. `needs(...)` may name only these.
+pub const EDGE_CAPABILITIES: &[&str] = &["kv", "identity"];
+
+/// Route attributes for methods the edge lane does not serve.
+const EDGE_WRITE_METHOD_ATTRS: &[&str] = &["post", "put", "delete", "patch"];
+
+/// Attributes the `#[edge]` macro refuses for a reason other than the method.
+const EDGE_REFUSED_ATTRS: &[&str] = &["static_get", "ws", "oauth2_callback", "agent_operable"];
+
+/// Route attributes. Only a routed function has an edge companion, so only a
+/// routed function has its extractors checked.
+const ROUTE_ATTRS: &[&str] = &[
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "static_get",
+    "ws",
+    "oauth2_callback",
+];
+
+/// Extractors that need a capability only the origin has, and that capability.
+///
+/// This is a denylist. Each name also fails the `EdgeHandler` allowlist at
+/// compile time. A name the module defines itself (`type Request = ...`) is
+/// skipped. A type alias in another module can still confuse the scan, so
+/// doctor only warns. The compiler stops every real case.
+const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
+    ("Db", "a database"),
+    ("LazyDb", "a database"),
+    ("Session", "a session"),
+    ("Flash", "a session"),
+    ("CsrfToken", "a session"),
+    ("CsrfTokenHeader", "a session"),
+    ("CsrfFormField", "a session"),
+    ("Consent", "a session"),
+    ("Auth", "auth state"),
+    ("ApiToken", "auth state"),
+    ("RequestPrincipal", "auth state"),
+    ("Clock", "the clock"),
+    ("Rng", "randomness"),
+    ("Mailer", "mail"),
+    ("Extension", "app state"),
+    ("State", "app state"),
+    ("Form", "a request body"),
+    ("Json", "a request body"),
+    ("Valid", "a request body"),
+    ("Csv", "a request body"),
+    ("Multipart", "a request body"),
+    ("Request", "the whole request"),
+    // axum's own extractors. The edge passes only `Path`, `Query` and
+    // `HeaderMap` from the request.
+    ("Bytes", "a request body"),
+    ("String", "a request body"),
+    ("Body", "a request body"),
+    ("RawForm", "a request body"),
+    ("OriginalUri", "request data the edge does not pass"),
+    ("MatchedPath", "request data the edge does not pass"),
+    ("NestedPath", "request data the edge does not pass"),
+    ("RawQuery", "request data the edge does not pass"),
+    ("RawPathParams", "request data the edge does not pass"),
+    ("Method", "request data the edge does not pass"),
+    ("Uri", "request data the edge does not pass"),
+    ("Version", "request data the edge does not pass"),
+    ("Host", "request data the edge does not pass"),
+    ("ConnectInfo", "the client connection"),
+    ("TypedHeader", "a typed header (use `HeaderMap`)"),
+    ("CookieJar", "cookies"),
+    ("SignedCookieJar", "cookies"),
+    ("PrivateCookieJar", "cookies"),
+    ("WebSocketUpgrade", "a WebSocket"),
+    // The rest of `autumn-web`'s own extractors. A guard test keeps this
+    // list complete.
+    ("ShardedDb", "a database"),
+    ("ShardedReadDb", "a database"),
+    ("Shards", "a database"),
+    ("CrossShard", "a database"),
+    ("Events", "app state"),
+    ("Notifications", "app state"),
+    ("Presence", "app state"),
+    ("CollabHub", "app state"),
+    ("Experiments", "app state"),
+    ("Flags", "app state"),
+    ("AutumnConfig", "app state"),
+    ("Tenant", "app state"),
+    ("Sla", "app state"),
+    ("WebPush", "app state"),
+    ("Client", "app state"),
+    ("Impersonation", "a session"),
+    ("AuthorizedComment", "auth state"),
+    ("SubmitToken", "a session"),
+    ("SubmitFormField", "a session"),
+    ("CspNonce", "origin middleware"),
+    ("RequestInspector", "origin middleware"),
+    ("CanaryRoute", "origin middleware"),
+    ("SeoMeta", "origin middleware"),
+    ("Locale", "origin middleware"),
+    ("TimeZone", "origin middleware"),
+    ("ClientAddr", "the client connection"),
+    ("ClientHost", "the client connection"),
+    ("ClientScheme", "the client connection"),
+    ("ClientCert", "the client connection"),
+    ("OptionalClientCert", "the client connection"),
+    ("CurrentPath", "request data the edge does not pass"),
+    ("HxRequest", "request data the edge does not pass"),
+    ("LastEventId", "request data the edge does not pass"),
+    ("CursorRequest", "request data the edge does not pass"),
+    ("PageRequest", "request data the edge does not pass"),
+    ("ListQuery", "request data the edge does not pass"),
+    ("Negotiate", "request data the edge does not pass"),
+    ("SyncScope", "request data the edge does not pass"),
+    ("ChangesetForm", "a request body"),
+    ("NestedChangesetForm", "a request body"),
+    ("SignedWebhook", "a request body"),
+    ("TaskArgs", "a request body"),
+];
+
+/// One reason an `#[edge]` route needs something the edge cannot provide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeUnsupported {
+    /// `needs(name)` names a capability not in [`EDGE_CAPABILITIES`].
+    Need(String),
+    /// A write-method route attribute, such as `post`.
+    Method(String),
+    /// Another attribute the `#[edge]` macro refuses, such as `static_get`.
+    Refused(String),
+    /// A parameter whose extractor needs an origin-only capability.
+    Extractor {
+        /// The extractor's type name.
+        name: String,
+        /// What it needs.
+        capability: &'static str,
+        /// Written as a path (`autumn_web::Db`, `crate::origin::Db`), so a
+        /// local type of the same name is not assumed.
+        external: bool,
+    },
+    /// An `EdgeIdentity` parameter without `needs(identity)`.
+    UndeclaredIdentity,
+}
+
+/// How to fix an [`EdgeUnsupported`] route. Shared by doctor and `autumn build`.
+pub const EDGE_UNSUPPORTED_HINT: &str = "Remove #[edge] from the route, or use only what the \
+     edge provides: GET, needs(kv) or needs(identity), and the Path, Query, HeaderMap, \
+     EdgeCache and EdgeIdentity extractors. See docs/guide/edge.md.";
+
+/// One line per route: `name @ file:line: reason; reason`.
+#[must_use]
+pub fn format_unsupported(functions: &[&EdgeFn]) -> String {
+    functions
+        .iter()
+        .map(|f| {
+            let reasons: Vec<String> = f.unsupported.iter().map(ToString::to_string).collect();
+            format!("{}: {}", f.location(), reasons.join("; "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl std::fmt::Display for EdgeUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Need(name) => write!(f, "needs({name}) is not an edge capability"),
+            Self::Method(method) => {
+                write!(
+                    f,
+                    "#[{method}] is a write method; the edge serves only GET and HEAD"
+                )
+            }
+            Self::Refused(name) => write!(f, "#[{name}] cannot be an edge route"),
+            Self::Extractor {
+                name, capability, ..
+            } => {
+                write!(f, "takes `{name}`, which needs {capability}")
+            }
+            Self::UndeclaredIdentity => {
+                write!(f, "takes `EdgeIdentity` without needs(identity)")
+            }
+        }
+    }
+}
+
 /// One `#[edge]`-marked handler function found in the project's sources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeFn {
@@ -150,6 +332,9 @@ pub struct EdgeFn {
     /// Guard attributes carried by the same function, in source order
     /// (a subset of [`EDGE_GUARD_ATTRS`]).
     pub guards: Vec<String>,
+    /// Capabilities the function needs that the edge cannot provide, in
+    /// source order. Empty for a route the edge can serve.
+    pub unsupported: Vec<EdgeUnsupported>,
     /// Names of the modules the function is declared under, outermost first
     /// (`mod a { mod b { ... } }` gives `["a", "b"]`; an out-of-line `mod a;`
     /// backed by `src/a.rs` gives the same, derived from the file's own
@@ -243,6 +428,16 @@ impl EdgeScan {
         self.functions
             .iter()
             .filter(|f| !f.guards.is_empty())
+            .collect()
+    }
+
+    /// Marked functions that need a capability the edge cannot provide — a
+    /// route the `#[edge]` macro or the `EdgeHandler` bound rejects.
+    #[must_use]
+    pub fn unsupported(&self) -> Vec<&EdgeFn> {
+        self.functions
+            .iter()
+            .filter(|f| !f.unsupported.is_empty())
             .collect()
     }
 }
@@ -1967,10 +2162,11 @@ fn scan_items(
     default_features: &BTreeSet<String>,
     scan: &mut EdgeScan,
 ) {
+    let local_types = local_type_names(items);
     for item in items {
         match item {
             syn::Item::Fn(item_fn) => {
-                if let Some(found) = edge_fn(
+                if let Some(mut found) = edge_fn(
                     &item_fn.attrs,
                     &item_fn.sig,
                     file,
@@ -1978,6 +2174,13 @@ fn scan_items(
                     module_path,
                     default_features,
                 ) {
+                    // A name this module defines is not the framework's
+                    // extractor of that name: `type Request = HeaderMap;`.
+                    // A path into another crate (`autumn_web::Db`) still is.
+                    found.unsupported.retain(|reason| {
+                        !matches!(reason, EdgeUnsupported::Extractor { name, external: false, .. }
+                            if local_types.contains(name))
+                    });
                     scan.functions.push(found);
                 }
             }
@@ -2774,6 +2977,7 @@ fn edge_fn(
     if cfg_excludes {
         return None;
     }
+    let unsupported = unsupported_capabilities(attrs, &names, sig, default_features);
     let guards: Vec<String> = names
         .into_iter()
         .filter(|n| EDGE_GUARD_ATTRS.contains(&n.as_str()))
@@ -2783,9 +2987,240 @@ fn edge_fn(
         file: file.to_owned(),
         line: sig.ident.span().start().line,
         guards,
+        unsupported,
         module_path: module_path.to_vec(),
         crate_root: crate_root.to_owned(),
     })
+}
+
+/// Every capability an `#[edge]` function needs that the edge cannot provide.
+///
+/// `names` are the function's attribute names, `cfg_attr` payloads included.
+/// Each reason is one the macro or the `EdgeHandler` bound also gives, so a
+/// valid app gets none.
+fn unsupported_capabilities(
+    attrs: &[syn::Attribute],
+    names: &[String],
+    sig: &syn::Signature,
+    default_features: &BTreeSet<String>,
+) -> Vec<EdgeUnsupported> {
+    let needs = edge_needs(attrs, default_features);
+    let mut found: Vec<EdgeUnsupported> = needs
+        .iter()
+        .flatten()
+        .filter(|need| !EDGE_CAPABILITIES.contains(&need.as_str()))
+        .map(|need| EdgeUnsupported::Need(need.clone()))
+        .collect();
+    for name in names {
+        if EDGE_WRITE_METHOD_ATTRS.contains(&name.as_str()) {
+            found.push(EdgeUnsupported::Method(name.clone()));
+        } else if EDGE_REFUSED_ATTRS.contains(&name.as_str()) {
+            found.push(EdgeUnsupported::Refused(name.clone()));
+        }
+    }
+    // Without a route macro there is no edge companion, and rustc accepts
+    // any extractor.
+    if !names.iter().any(|n| ROUTE_ATTRS.contains(&n.as_str())) {
+        return found;
+    }
+    let mut extractors = Vec::new();
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = input {
+            extractor_names(&pat_type.ty, &mut extractors);
+        }
+    }
+    for (name, external) in extractors {
+        if name == "EdgeIdentity" {
+            // Unknown needs (`None`) add no reason: the macro reports those.
+            if needs
+                .as_ref()
+                .is_some_and(|needs| !needs.iter().any(|need| need == "identity"))
+            {
+                found.push(EdgeUnsupported::UndeclaredIdentity);
+            }
+        } else if let Some((_, capability)) = ORIGIN_ONLY_EXTRACTORS
+            .iter()
+            .find(|(known, _)| *known == name)
+        {
+            found.push(EdgeUnsupported::Extractor {
+                name,
+                capability,
+                external,
+            });
+        }
+    }
+    found
+}
+
+/// The capabilities every `#[edge(...)]` on the function declares, from
+/// direct attributes and from active `cfg_attr` payloads. `None` when an
+/// argument list does not parse: the macro reports that one, and the scan
+/// cannot tell what it declares.
+fn edge_needs(
+    attrs: &[syn::Attribute],
+    default_features: &BTreeSet<String>,
+) -> Option<Vec<String>> {
+    let mut metas = Vec::new();
+    for attr in attrs {
+        match attr_name(attr).as_deref() {
+            Some("edge") => metas.push(attr.meta.clone()),
+            Some("cfg_attr") => {
+                if let syn::Meta::List(list) = &attr.meta {
+                    active_edge_metas(list, default_features, &mut metas);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut needs = Vec::new();
+    for meta in &metas {
+        match meta {
+            syn::Meta::Path(_) => {}
+            syn::Meta::List(list) => {
+                needs
+                    .extend(syn::parse::Parser::parse2(parse_edge_args, list.tokens.clone()).ok()?);
+            }
+            syn::Meta::NameValue(_) => return None,
+        }
+    }
+    Some(needs)
+}
+
+/// The `edge` metas in an active `cfg_attr(condition, ...)` payload, nested
+/// `cfg_attr` included.
+fn active_edge_metas(
+    list: &syn::MetaList,
+    default_features: &BTreeSet<String>,
+    out: &mut Vec<syn::Meta>,
+) {
+    let Some((condition, metas)) = cfg_attr_payload(list, default_features) else {
+        return;
+    };
+    if condition == Some(false) {
+        return;
+    }
+    for meta in metas {
+        match meta
+            .path()
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .as_deref()
+        {
+            Some("edge") => out.push(meta),
+            Some("cfg_attr") => {
+                if let syn::Meta::List(inner) = &meta {
+                    active_edge_metas(inner, default_features, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The macro's `#[edge(...)]` grammar: `needs(a, b)` and `crate = "path"`, in
+/// any order, with an optional trailing comma. Returns the `needs` names, with
+/// any `r#` prefix removed.
+fn parse_edge_args(input: syn::parse::ParseStream) -> syn::Result<Vec<String>> {
+    let mut needs = Vec::new();
+    while !input.is_empty() {
+        let key: syn::Ident = syn::ext::IdentExt::parse_any(input)?;
+        if key == "crate" {
+            input.parse::<syn::Token![=]>()?;
+            input.parse::<syn::LitStr>()?;
+        } else if key == "needs" {
+            let content;
+            syn::parenthesized!(content in input);
+            let names =
+                syn::punctuated::Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated(
+                    &content,
+                )?;
+            needs.extend(names.iter().map(|name| {
+                let name = name.to_string();
+                name.strip_prefix("r#").unwrap_or(&name).to_owned()
+            }));
+        } else {
+            return Err(syn::Error::new(key.span(), "unknown `#[edge]` option"));
+        }
+        if input.is_empty() {
+            break;
+        }
+        input.parse::<syn::Token![,]>()?;
+    }
+    Ok(needs)
+}
+
+/// The type names a module defines itself: `type`, `struct`, `enum`, `union`,
+/// and the new name of a `use ... as Name`.
+fn local_type_names(items: &[syn::Item]) -> BTreeSet<String> {
+    fn renames(tree: &syn::UseTree, out: &mut BTreeSet<String>) {
+        match tree {
+            syn::UseTree::Rename(rename) => {
+                out.insert(rename.rename.to_string());
+            }
+            syn::UseTree::Path(path) => renames(&path.tree, out),
+            syn::UseTree::Group(group) => {
+                for tree in &group.items {
+                    renames(tree, out);
+                }
+            }
+            syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+        }
+    }
+    let mut names = BTreeSet::new();
+    for item in items {
+        match item {
+            syn::Item::Type(item) => {
+                names.insert(item.ident.to_string());
+            }
+            syn::Item::Struct(item) => {
+                names.insert(item.ident.to_string());
+            }
+            syn::Item::Enum(item) => {
+                names.insert(item.ident.to_string());
+            }
+            syn::Item::Union(item) => {
+                names.insert(item.ident.to_string());
+            }
+            syn::Item::Use(item) => renames(&item.tree, &mut names),
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The extractor type names in one parameter type, each with whether it is
+/// written as a path: its last path segment, the
+/// elements of a tuple, and the inner type of `Option`/`Result`.
+fn extractor_names(ty: &syn::Type, out: &mut Vec<(String, bool)>) {
+    match ty {
+        syn::Type::Path(path) => {
+            let Some(last) = path.path.segments.last() else {
+                return;
+            };
+            // Only a bare `Db` may name a local type. Any path, also
+            // `crate::origin::Db`, can be a re-export of the framework's.
+            let external = path.path.segments.len() > 1 || path.path.leading_colon.is_some();
+            let name = last.ident.to_string();
+            if name == "Option" || name == "Result" {
+                if let syn::PathArguments::AngleBracketed(args) = &last.arguments
+                    && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+                {
+                    extractor_names(inner, out);
+                }
+            } else {
+                out.push((name, external));
+            }
+        }
+        syn::Type::Tuple(tuple) => {
+            for elem in &tuple.elems {
+                extractor_names(elem, out);
+            }
+        }
+        syn::Type::Paren(inner) => extractor_names(&inner.elem, out),
+        syn::Type::Group(inner) => extractor_names(&inner.elem, out),
+        _ => {}
+    }
 }
 
 /// A `#[cfg(...)]` predicate this scan can fully resolve: built only from
@@ -9597,5 +10032,263 @@ mod tests {
             module_paths.contains(&vec!["alias".to_owned()]),
             "{module_paths:?}"
         );
+    }
+
+    // ── Capability check (#1790 AC-5) ────────────────────────────────
+
+    fn unsupported_of(src: &str) -> Vec<String> {
+        let scan = scan_one(src);
+        assert_eq!(scan.functions.len(), 1, "{:?}", scan.functions);
+        scan.functions[0]
+            .unsupported
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_well_formed_edge_route_has_no_unsupported_capability() {
+        let found = unsupported_of(
+            r#"
+            #[get("/note/{key}")]
+            #[edge(needs(kv, identity))]
+            pub async fn note(
+                Path(key): Path<String>,
+                Query(q): Query<Vec<(String, String)>>,
+                headers: HeaderMap,
+                cache: EdgeCache,
+                who: EdgeIdentity,
+                both: (Path<String>, HeaderMap),
+            ) -> String { key }
+            "#,
+        );
+        assert!(found.is_empty(), "{found:?}");
+        assert!(scan_one("#[edge]\nfn f() {}").unsupported().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_needs_capability_is_unsupported() {
+        let found = unsupported_of("#[get(\"/x\")]\n#[edge(needs(kv, db))]\nfn f() {}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("needs(db)"), "{found:?}");
+    }
+
+    #[test]
+    fn a_write_method_is_unsupported() {
+        let found = unsupported_of("#[post(\"/x\")]\n#[edge]\nfn f() {}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("#[post]"), "{found:?}");
+    }
+
+    #[test]
+    fn an_origin_only_extractor_is_unsupported() {
+        let found = unsupported_of(
+            r#"
+            #[get("/x")]
+            #[edge]
+            pub async fn f(db: autumn_web::Db, s: Option<Session>, pair: (Path<u32>, Clock)) {}
+            "#,
+        );
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found[0].contains("`Db`"), "{found:?}");
+        assert!(found[1].contains("`Session`"), "{found:?}");
+        assert!(found[2].contains("`Clock`"), "{found:?}");
+    }
+
+    #[test]
+    fn a_name_the_module_defines_itself_is_not_flagged() {
+        for definition in [
+            "type Request = HeaderMap;",
+            "use axum::http::HeaderMap as Session;",
+            "struct Db;",
+        ] {
+            let name = ["Request", "Session", "Db"]
+                .into_iter()
+                .find(|name| definition.contains(name))
+                .expect("a name");
+            let scan = scan_one(&format!(
+                "{definition}\n#[get(\"/x\")]\n#[edge]\nasync fn f(x: {name}) {{}}"
+            ));
+            assert!(
+                scan.unsupported().is_empty(),
+                "{definition}: {:?}",
+                scan.functions
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_framework_extractor_is_flagged_despite_a_local_name() {
+        // Only a bare `Db` can mean the local type. A path, also one into this
+        // crate, can be a re-export of the framework's `Db`.
+        let scan = scan_one(
+            "struct Db;\n#[get(\"/x\")]\n#[edge]\nasync fn f(a: autumn_web::Db, b: crate::origin::Db, mine: Db) {}",
+        );
+        let found: Vec<String> = scan.functions[0]
+            .unsupported
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found.iter().all(|reason| reason.contains("`Db`")),
+            "{found:?}"
+        );
+    }
+
+    /// Every extractor `autumn-web` defines is on the denylist, so a new one
+    /// cannot slip past doctor. `Path` and `Query` share their names with
+    /// the edge-safe axum extractors.
+    #[test]
+    fn the_denylist_covers_every_autumn_web_extractor() {
+        const EDGE_SAFE_NAMES: &[&str] = &["Path", "Query"];
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../autumn/src");
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
+        let mut missing = BTreeSet::new();
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(parsed) = syn::parse_file(&text) else {
+                continue;
+            };
+            collect_extractor_impls(&parsed.items, &mut missing);
+        }
+        missing.retain(|name: &String| {
+            !EDGE_SAFE_NAMES.contains(&name.as_str())
+                && !ORIGIN_ONLY_EXTRACTORS
+                    .iter()
+                    .any(|(known, _)| known == name)
+        });
+        assert!(
+            missing.is_empty(),
+            "add to ORIGIN_ONLY_EXTRACTORS: {missing:?}"
+        );
+    }
+
+    /// The `Self` type name of every `FromRequest`/`FromRequestParts` impl,
+    /// test modules excluded.
+    fn collect_extractor_impls(items: &[syn::Item], out: &mut BTreeSet<String>) {
+        for item in items {
+            match item {
+                syn::Item::Impl(item_impl) => {
+                    let is_extractor = item_impl.trait_.as_ref().is_some_and(|(path, _)| {
+                        path.segments.last().is_some_and(|s| {
+                            s.ident == "FromRequest" || s.ident == "FromRequestParts"
+                        })
+                    });
+                    if is_extractor
+                        && let syn::Type::Path(ty) = &*item_impl.self_ty
+                        && let Some(last) = ty.path.segments.last()
+                    {
+                        out.insert(last.ident.to_string());
+                    }
+                }
+                syn::Item::Mod(item_mod) => {
+                    let test_only = item_mod.attrs.iter().any(|attr| match &attr.meta {
+                        syn::Meta::List(list) => {
+                            list.path.is_ident("cfg") && list.tokens.to_string().contains("test")
+                        }
+                        _ => false,
+                    });
+                    if let (false, Some((_, inner))) = (test_only, &item_mod.content) {
+                        collect_extractor_impls(inner, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn every_axum_extractor_outside_the_edge_list_is_unsupported() {
+        for extractor in [
+            "OriginalUri",
+            "MatchedPath",
+            "RawQuery",
+            "Method",
+            "Uri",
+            "ConnectInfo<std::net::SocketAddr>",
+            "Bytes",
+            "String",
+            "TypedHeader<Host>",
+            "CookieJar",
+            "WebSocketUpgrade",
+        ] {
+            let found = unsupported_of(&format!(
+                "#[get(\"/x\")]\n#[edge]\nasync fn f(x: {extractor}) {{}}"
+            ));
+            assert_eq!(found.len(), 1, "{extractor}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn an_undeclared_identity_is_unsupported() {
+        let found = unsupported_of("#[get(\"/me\")]\n#[edge]\nasync fn f(who: EdgeIdentity) {}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("needs(identity)"), "{found:?}");
+    }
+
+    #[test]
+    fn scan_lists_only_routes_with_an_unsupported_capability() {
+        let scan = scan_one("#[edge]\nfn ok() {}\n#[edge(needs(fs))]\nfn bad() {}");
+        let names: Vec<&str> = scan.unsupported().iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["bad"]);
+    }
+
+    /// Every shape the macro accepts must pass the scan: a false positive
+    /// stops a valid build.
+    #[test]
+    fn every_needs_shape_the_macro_accepts_is_read() {
+        for attr in [
+            "#[edge(needs(identity),)]",
+            "#[edge(crate = \"autumn_web\", needs(identity))]",
+            "#[edge(needs(r#identity))]",
+            "#[cfg_attr(feature = \"edge\", edge(needs(identity)))]",
+            "#[cfg_attr(feature = \"edge\", cfg_attr(feature = \"edge\", edge(needs(identity))))]",
+        ] {
+            let scan = scan_one_with_features(
+                &format!("#[get(\"/me\")]\n{attr}\nasync fn me(who: EdgeIdentity) {{}}"),
+                &["edge"],
+            );
+            assert_eq!(scan.functions.len(), 1, "{attr}");
+            assert!(
+                scan.unsupported().is_empty(),
+                "{attr}: {:?}",
+                scan.functions
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_edge_argument_adds_no_reason() {
+        // The macro reports this one. The scan cannot tell what it declares.
+        let found = unsupported_of(
+            "#[get(\"/me\")]\n#[edge(needs(identity) junk)]\nfn me(who: EdgeIdentity) {}",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_edge_fn_without_a_route_is_not_checked_for_extractors() {
+        // `#[edge]` alone emits no companion, so rustc accepts any extractor.
+        let found = unsupported_of("#[edge]\nasync fn helper(db: Db, who: EdgeIdentity) {}");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_route_kind_the_edge_refuses_is_unsupported() {
+        for attr in [
+            "static_get(\"/x\")",
+            "ws(\"/x\")",
+            "oauth2_callback(\"/x\")",
+            "agent_operable",
+        ] {
+            let found = unsupported_of(&format!("#[{attr}]\n#[edge]\nfn f() {{}}"));
+            assert_eq!(found.len(), 1, "{attr}: {found:?}");
+            let name = attr.split('(').next().unwrap_or(attr);
+            assert!(found[0].contains(&format!("#[{name}]")), "{found:?}");
+        }
     }
 }

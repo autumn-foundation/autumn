@@ -272,7 +272,9 @@ where
         if matches!(
             any_err.downcast_ref::<crate::lock::LockError>(),
             Some(
-                crate::lock::LockError::PoolUnavailable(_) | crate::lock::LockError::Timeout { .. }
+                crate::lock::LockError::PoolUnavailable(_)
+                    | crate::lock::LockError::Timeout { .. }
+                    | crate::lock::LockError::LeaseLost { .. }
             )
         ) {
             status = StatusCode::SERVICE_UNAVAILABLE;
