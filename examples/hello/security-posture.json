@@ -62,6 +62,39 @@
           "provenance": "provable"
         },
         {
+          "path": "/actuator/capsules/export",
+          "method": "POST",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/capsules/import",
+          "method": "POST",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/capsules/verify",
+          "method": "POST",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
           "path": "/actuator/circuitbreakers",
           "method": "GET",
           "name": "actuator",
@@ -478,6 +511,24 @@
       "exempt_paths": [],
       "entries": [
         {
+          "path": "/actuator/capsules/export",
+          "method": "POST",
+          "csrf_enforced": false,
+          "exempt": false
+        },
+        {
+          "path": "/actuator/capsules/import",
+          "method": "POST",
+          "csrf_enforced": false,
+          "exempt": false
+        },
+        {
+          "path": "/actuator/capsules/verify",
+          "method": "POST",
+          "csrf_enforced": false,
+          "exempt": false
+        },
+        {
           "path": "/actuator/loggers/{name}",
           "method": "PUT",
           "csrf_enforced": false,
@@ -567,6 +618,21 @@
         {
           "path": "/actuator/a11y",
           "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/capsules/export",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/capsules/import",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/capsules/verify",
+          "method": "POST",
           "mtls_required": false
         },
         {
