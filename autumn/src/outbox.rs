@@ -229,6 +229,13 @@ const NACK_SQL: &str = "UPDATE autumn_outbox \
          claim_token = NULL, locked_until = NULL \
      WHERE seq = $4 AND claim_token = $5";
 
+/// Dead-letter a message whose attempts crashes used. The claim that found
+/// it counted no attempt, so the count goes back to the limit.
+const EXHAUSTED_SQL: &str = "UPDATE autumn_outbox \
+     SET attempts = $1, last_error = $2, dead_at = $3, \
+         claim_token = NULL, locked_until = NULL \
+     WHERE seq = $4 AND claim_token = $5";
+
 /// Give back the rows of a claim that the relay did not handle. The claim
 /// counted an attempt; this takes it back.
 const RELEASE_SQL: &str = "UPDATE autumn_outbox \
@@ -980,17 +987,58 @@ async fn drain_until(
             "outbox relay is not installed; set outbox.enabled = true",
         )
     })?;
-    let pool = state
-        .pool()
-        .cloned()
-        .ok_or_else(|| AutumnError::internal_server_error_msg("outbox relay needs a database"))?;
+    let pools = relay_pools(state)?;
+    let mut handled = 0;
+    for pool in &pools {
+        if handled >= max {
+            break;
+        }
+        handled += drain_pool(state, &relay, pool, max - handled, shutdown).await?;
+    }
+    Ok(handled)
+}
+
+/// The pools the relay drains: the app pool and the primary pool of each
+/// shard. A write on a shard connection puts its row in that shard.
+fn relay_pools(state: &AppState) -> AutumnResult<Vec<Pool<RuntimeConnection>>> {
+    let mut pools: Vec<Pool<RuntimeConnection>> = state.pool().cloned().into_iter().collect();
+    if pools.is_empty() {
+        return Err(AutumnError::internal_server_error_msg(
+            "outbox relay needs a database",
+        ));
+    }
+    if let Some(shards) = state.shards() {
+        pools.extend(shards.iter().map(|shard| shard.primary_pool().clone()));
+    }
+    Ok(pools)
+}
+
+/// Create the outbox tables on every pool the relay drains.
+///
+/// # Errors
+///
+/// Returns the first error of [`ensure_schema`].
+pub(crate) async fn ensure_relay_schema(state: &AppState) -> AutumnResult<()> {
+    for pool in relay_pools(state)? {
+        ensure_schema(&pool).await?;
+    }
+    Ok(())
+}
+
+async fn drain_pool(
+    state: &AppState,
+    relay: &OutboxRelay,
+    pool: &Pool<RuntimeConnection>,
+    max: usize,
+    shutdown: Option<&CancellationToken>,
+) -> AutumnResult<usize> {
     let lease = duration_millis(Duration::from_millis(relay.config.lease_ms));
     let mut handled = 0;
     while handled < max {
         let batch = (max - handled).min(relay.config.batch_size.max(1));
         let claim_token = state.entropy().uuid_v4().to_string();
         let lease_end = to_millis(state.clock().now()).saturating_add(lease);
-        let mut rows = claim(&relay, &pool, state, &claim_token, batch).await?;
+        let mut rows = claim(relay, pool, state, &claim_token, batch).await?;
         if rows.is_empty() {
             break;
         }
@@ -1005,12 +1053,12 @@ async fn drain_until(
                 break;
             }
             let budget = Duration::from_millis(u64::try_from(remaining).unwrap_or(0));
-            handle_row(&relay, &pool, state, &claim_token, row, budget).await;
+            handle_row(relay, pool, state, &claim_token, row, budget).await;
             done += 1;
         }
         handled += done;
         if done < total {
-            release(&pool, &claim_token).await;
+            release(pool, &claim_token).await;
             break;
         }
     }
@@ -1067,14 +1115,21 @@ async fn handle_row(
     budget: Duration,
 ) {
     let message = row.message();
-    let outcome = if message.attempt > relay.config.max_attempts {
+    if message.attempt > relay.config.max_attempts {
         // Claims that a crash or an expired lease ended used the attempts.
-        Err(AutumnError::internal_server_error_msg(
-            "no attempts left: earlier attempts ended in a crash or an expired lease",
-        ))
-    } else {
-        run_handler(relay, state, &message, budget).await
-    };
+        // This claim is not an attempt: keep the count at the limit.
+        let recorded = dead_letter_exhausted(relay, pool, state, claim_token, row.seq).await;
+        tracing::error!(
+            message_id = %message.id,
+            topic = %message.topic,
+            "outbox message used its attempts in crashes or expired leases; moved to dead letters"
+        );
+        if let Err(error) = recorded {
+            tracing::warn!(message_id = %message.id, %error, "outbox relay could not record the dead letter");
+        }
+        return;
+    }
+    let outcome = run_handler(relay, state, &message, budget).await;
     let recorded = match outcome {
         Ok(()) => mark_sent(pool, state, claim_token, row.seq).await,
         Err(error) => {
@@ -1166,6 +1221,28 @@ async fn mark_sent(
     Ok(())
 }
 
+async fn dead_letter_exhausted(
+    relay: &OutboxRelay,
+    pool: &Pool<RuntimeConnection>,
+    state: &AppState,
+    claim_token: &str,
+    seq: i64,
+) -> AutumnResult<()> {
+    let mut conn = pool.get().await.map_err(|error| {
+        AutumnError::service_unavailable_msg(format!("outbox dead letter: no connection: {error}"))
+    })?;
+    diesel::sql_query(sql(EXHAUSTED_SQL))
+        .bind::<Integer, _>(i32::try_from(relay.config.max_attempts).unwrap_or(i32::MAX))
+        .bind::<Text, _>("no attempts left: earlier attempts ended in a crash or an expired lease")
+        .bind::<BigInt, _>(to_millis(state.clock().now()))
+        .bind::<BigInt, _>(seq)
+        .bind::<Text, _>(claim_token)
+        .execute(&mut conn)
+        .await
+        .map_err(|error| sql_error("outbox dead letter", &error))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn nack(
     relay: &OutboxRelay,
@@ -1219,23 +1296,25 @@ pub async fn purge(state: &AppState) -> AutumnResult<(usize, usize)> {
     let relay = state
         .extension::<OutboxRelay>()
         .ok_or_else(|| AutumnError::internal_server_error_msg("outbox relay is not installed"))?;
-    let pool = state
-        .pool()
-        .ok_or_else(|| AutumnError::internal_server_error_msg("outbox relay needs a database"))?;
     let retention = duration_millis(Duration::from_millis(relay.config.retention_ms));
-    let mut conn = pool.get().await.map_err(|error| {
-        AutumnError::service_unavailable_msg(format!("outbox purge: no connection: {error}"))
-    })?;
-    let outbox = diesel::sql_query(sql(PURGE_OUTBOX_SQL))
-        .bind::<BigInt, _>(to_millis(state.clock().now()).saturating_sub(retention))
-        .execute(&mut conn)
-        .await
-        .map_err(|error| sql_error("outbox purge", &error))?;
-    let inbox = diesel::sql_query(sql(PURGE_INBOX_SQL))
-        .bind::<BigInt, _>(to_millis(crate::time::ambient_now()).saturating_sub(retention))
-        .execute(&mut conn)
-        .await
-        .map_err(|error| sql_error("inbox purge", &error))?;
+    let outbox_cutoff = to_millis(state.clock().now()).saturating_sub(retention);
+    let inbox_cutoff = to_millis(crate::time::ambient_now()).saturating_sub(retention);
+    let (mut outbox, mut inbox) = (0, 0);
+    for pool in relay_pools(state)? {
+        let mut conn = pool.get().await.map_err(|error| {
+            AutumnError::service_unavailable_msg(format!("outbox purge: no connection: {error}"))
+        })?;
+        outbox += diesel::sql_query(sql(PURGE_OUTBOX_SQL))
+            .bind::<BigInt, _>(outbox_cutoff)
+            .execute(&mut conn)
+            .await
+            .map_err(|error| sql_error("outbox purge", &error))?;
+        inbox += diesel::sql_query(sql(PURGE_INBOX_SQL))
+            .bind::<BigInt, _>(inbox_cutoff)
+            .execute(&mut conn)
+            .await
+            .map_err(|error| sql_error("inbox purge", &error))?;
+    }
     Ok((outbox, inbox))
 }
 

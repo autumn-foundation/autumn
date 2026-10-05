@@ -4447,8 +4447,7 @@ impl AppBuilder {
         {
             crate::outbox::install(&state, &config.outbox, outbox_handlers);
             if state.extension::<crate::outbox::OutboxRelay>().is_some()
-                && let Some(pool) = state.pool()
-                && let Err(error) = crate::outbox::ensure_schema(pool).await
+                && let Err(error) = crate::outbox::ensure_relay_schema(&state).await
             {
                 tracing::error!(error = %error, "Failed to create the outbox tables");
                 exit_stop_managed_pg();
@@ -7810,8 +7809,7 @@ impl AppBuilder {
         {
             crate::outbox::install(&state, &config.outbox, outbox_handlers);
             if state.extension::<crate::outbox::OutboxRelay>().is_some()
-                && let Some(pool) = state.pool()
-                && let Err(error) = crate::outbox::ensure_schema(pool).await
+                && let Err(error) = crate::outbox::ensure_relay_schema(&state).await
             {
                 eprintln!("Failed to create the outbox tables: {error}");
                 exit_stop_managed_pg();

@@ -98,6 +98,7 @@ async fn drain_without_relay_is_an_error() {
 /// (`cargo test -p autumn-web --features sqlite --lib`); the Postgres
 /// suite is `tests/integration/outbox_pg.rs`.
 #[cfg(feature = "sqlite")]
+#[allow(clippy::future_not_send, reason = "test helpers run on one task")]
 mod sqlite {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -530,8 +531,13 @@ mod sqlite {
         }
         assert_eq!(drain(&fx.state, 10).await.unwrap(), 1);
         assert_eq!(
-            count(&fx, "dead_at IS NOT NULL AND dispatched_at IS NULL").await,
-            1
+            count(
+                &fx,
+                "dead_at IS NOT NULL AND dispatched_at IS NULL AND attempts = 2"
+            )
+            .await,
+            1,
+            "the count stays at max_attempts"
         );
     }
 
@@ -613,6 +619,55 @@ mod sqlite {
             .await
             .expect("the worker stops")
             .unwrap();
+    }
+
+    /// A write on a shard connection puts its row in the shard. The relay
+    /// drains the shard pools too.
+    #[tokio::test]
+    async fn relay_drains_shard_pools() {
+        let shard = SqliteSubstrate::new().expect("shard substrate");
+        let config = crate::config::DatabaseConfig {
+            shards: vec![crate::config::ShardConfig {
+                name: "s1".to_owned(),
+                primary_url: shard.url().to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shards = crate::sharding::build_shard_set(
+            &config,
+            vec![crate::db::DatabaseTopology::primary_only(shard.pool())],
+            Arc::new(crate::sharding::HashShardRouter),
+        )
+        .expect("shard set");
+        let main = SqliteSubstrate::new().expect("substrate");
+        let log = Log::default();
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert("t", logging_handler(log.clone(), Arc::default()));
+        let state = AppState::for_test()
+            .with_pool(main.pool())
+            .with_shards(shards);
+        install(
+            &state,
+            &OutboxConfig {
+                enabled: true,
+                ..OutboxConfig::default()
+            },
+            handlers,
+        );
+        ensure_relay_schema(&state)
+            .await
+            .expect("schema on every pool");
+
+        let mut conn = shard.pool().get().await.unwrap();
+        Outbox::new(&state)
+            .write(&mut conn, "a", "t", &serde_json::json!({ "n": "shard" }))
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(drain(&state, 10).await.unwrap(), 1);
+        assert_eq!(*log.lock().unwrap(), ["shard"]);
     }
 
     #[tokio::test]
