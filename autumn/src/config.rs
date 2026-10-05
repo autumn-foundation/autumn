@@ -10761,7 +10761,8 @@ pub struct CircuitBreakerPolicyConfig {
     /// A call of this many milliseconds or more is slow. `0` turns slow-call
     /// detection off.
     pub slow_call_duration_threshold_ms: Option<u64>,
-    /// Slow-call ratio (e.g. 0.8) to trip the breaker.
+    /// The breaker opens when the slow-call ratio is this value or more.
+    /// Example: `0.8`.
     pub slow_call_rate_threshold: Option<f64>,
     /// What a call cancelled at or after the slow-call threshold counts as:
     /// `"slow"` or `"failure"`.
@@ -19244,6 +19245,24 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert_eq!(
             defaults.cancelled_call_outcome,
             Some(crate::circuit_breaker::CancelledCallOutcome::Failure)
+        );
+    }
+
+    #[test]
+    fn test_resilience_config_bad_cancelled_call_outcome_env_is_ignored() {
+        let env = MockEnv::new().with(
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__CANCELLED_CALL_OUTCOME",
+            "drop",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_resilience_env_overrides_with_env(&env);
+        assert!(
+            config
+                .resilience
+                .circuit_breaker
+                .defaults
+                .cancelled_call_outcome
+                .is_none()
         );
     }
 

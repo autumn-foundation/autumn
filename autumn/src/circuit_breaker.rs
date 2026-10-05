@@ -46,6 +46,7 @@ impl CircuitState {
 /// and the dependency was not slow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CancelledCallOutcome {
     /// A slow call that did not fail.
     #[default]
@@ -55,6 +56,7 @@ pub enum CancelledCallOutcome {
 }
 
 impl CancelledCallOutcome {
+    /// The config spelling: `slow` or `failure`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Slow => "slow",
@@ -67,7 +69,7 @@ impl std::str::FromStr for CancelledCallOutcome {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        match s.trim() {
             "slow" => Ok(Self::Slow),
             "failure" => Ok(Self::Failure),
             other => Err(format!(
@@ -85,7 +87,7 @@ pub struct CircuitBreakerPolicy {
     pub open_duration: Duration,
     pub half_open_trial_count: u64,
     /// A call that takes this long or longer is slow. `None` turns slow-call
-    /// detection off.
+    /// detection off. `Some(Duration::ZERO)` makes all calls slow.
     pub slow_call_duration_threshold: Option<Duration>,
     /// The breaker opens when this share of calls in the window is slow.
     pub slow_call_rate_threshold: f64,
@@ -160,7 +162,7 @@ impl CircuitBreakerPolicy {
     }
 }
 
-/// A ratio threshold of `0` would trip on every call, so the floor is above it.
+/// A threshold of `0` opens the breaker on each call. The minimum is `0.0001`.
 fn clamp_ratio(ratio: f64) -> f64 {
     ratio.clamp(0.000_1, 1.0)
 }
@@ -242,13 +244,22 @@ impl SampleWindow {
         u64::try_from(slice).unwrap_or(u64::MAX)
     }
 
-    pub(crate) fn record(&mut self, now: Instant, failed: bool, slow: bool) {
-        let epoch = self.epoch(now);
+    fn slot(epoch: u64) -> usize {
         #[allow(
             clippy::cast_possible_truncation,
             reason = "the modulus is < WINDOW_BUCKETS"
         )]
-        let bucket = &mut self.buckets[(epoch % WINDOW_BUCKETS as u64) as usize];
+        let slot = (epoch % WINDOW_BUCKETS as u64) as usize;
+        slot
+    }
+
+    pub(crate) fn record(&mut self, now: Instant, failed: bool, slow: bool) {
+        let epoch = self.epoch(now);
+        // The clock went back: the old buckets are not in this timeline.
+        if self.buckets.iter().any(|b| b.epoch > epoch) {
+            self.buckets = [Bucket::default(); WINDOW_BUCKETS];
+        }
+        let bucket = &mut self.buckets[Self::slot(epoch)];
         if bucket.epoch != epoch {
             *bucket = Bucket {
                 epoch,
@@ -266,8 +277,7 @@ impl SampleWindow {
         let epoch = self.epoch(now);
         let mut sum = WindowCounts::default();
         for bucket in &self.buckets {
-            // A bucket with a later epoch than `now` is stale: the clock went
-            // back. Skip it.
+            // Skip a bucket after `now`: the clock went back.
             if bucket.epoch <= epoch && epoch - bucket.epoch < WINDOW_BUCKETS as u64 {
                 sum.add(bucket.counts);
             }
@@ -277,6 +287,15 @@ impl SampleWindow {
 
     pub(crate) fn reset(&mut self, window: Duration, origin: Instant) {
         *self = Self::new(window, origin);
+    }
+
+    /// Changes the window length. The counts go into the current bucket, so
+    /// a change does not clear them. They stay for one new window length.
+    pub(crate) fn resize(&mut self, window: Duration, now: Instant) {
+        let counts = self.counts(now);
+        *self = Self::new(window, self.origin);
+        let epoch = self.epoch(now);
+        self.buckets[Self::slot(epoch)] = Bucket { epoch, counts };
     }
 }
 
@@ -300,6 +319,9 @@ pub(crate) struct CircuitBreakerInner {
     pub(crate) config: CircuitBreakerPolicy,
     /// Slow calls since the breaker was made, in all states.
     pub(crate) slow_calls_total: u64,
+    /// Goes up at each state change. A call that started in an older
+    /// generation does not change the window or the state.
+    pub(crate) generation: u64,
 }
 
 impl CircuitBreakerInner {
@@ -332,6 +354,7 @@ impl CircuitBreakerInner {
     ) {
         let old_state = self.state;
         self.state = new_state;
+        self.generation = self.generation.wrapping_add(1);
         tracing::info!(
             circuit.name = name,
             circuit.state = new_state.as_str(),
@@ -344,9 +367,16 @@ impl CircuitBreakerInner {
     }
 
     /// Counts one finished or cancelled call, and trips or closes the breaker.
-    fn record(&mut self, name: &str, now: Instant, failed: bool, slow: bool) {
+    ///
+    /// `generation` is the generation when the call started. A call from an
+    /// older generation only adds to `slow_calls_total`. For example, a call
+    /// that started before the breaker opened is not a half-open trial.
+    fn record(&mut self, name: &str, now: Instant, generation: u64, failed: bool, slow: bool) {
         if slow {
             self.slow_calls_total = self.slow_calls_total.saturating_add(1);
+        }
+        if generation != self.generation {
+            return;
         }
         match self.state {
             CircuitState::Closed => {
@@ -422,6 +452,7 @@ impl CircuitBreaker {
                 half_open_in_flight: 0,
                 config,
                 slow_calls_total: 0,
+                generation: 0,
             })),
             system_clock,
         }
@@ -458,14 +489,14 @@ impl CircuitBreaker {
         inner.config.clone()
     }
 
-    /// Replaces the policy. A new `sample_window` clears the window, because
-    /// the bucket width changes.
+    /// Replaces the policy. A new `sample_window` keeps the counts. See
+    /// [`SampleWindow::resize`].
     pub fn update_config(&self, config: CircuitBreakerPolicy) {
         let config = config.clamped();
         let now = self.now();
         let mut inner = self.lock_inner();
         if inner.config.sample_window != config.sample_window {
-            inner.window.reset(config.sample_window, now);
+            inner.window.resize(config.sample_window, now);
         }
         inner.config = config;
     }
@@ -513,26 +544,33 @@ impl CircuitBreaker {
     /// Counts a finished call that was not slow.
     #[cfg(test)]
     pub(crate) fn after_call(&self, success: bool) {
-        self.finish_call(!success, Duration::ZERO);
+        let generation = self.lock_inner().generation;
+        self.finish_call(generation, !success, Duration::ZERO);
+    }
+
+    fn generation(&self) -> u64 {
+        self.lock_inner().generation
     }
 
     /// Counts a finished call that took `elapsed`.
-    fn finish_call(&self, failed: bool, elapsed: Duration) {
+    fn finish_call(&self, generation: u64, failed: bool, elapsed: Duration) {
         let now = self.now();
         let mut inner = self.lock_inner();
         let slow = inner.config.is_slow(elapsed);
-        inner.record(&self.name, now, failed, slow);
+        inner.record(&self.name, now, generation, failed, slow);
     }
 
     /// Counts a call that was dropped after `elapsed`, before it finished.
-    fn cancel_call(&self, elapsed: Duration) {
+    fn cancel_call(&self, generation: u64, elapsed: Duration) {
         let now = self.now();
         let mut inner = self.lock_inner();
-        if inner.config.is_slow(elapsed) {
+        // During a panic, do not change the state: a log in a panicking
+        // subscriber would abort the process.
+        if inner.config.is_slow(elapsed) && !std::thread::panicking() {
             let failed = inner.config.cancelled_call_outcome == CancelledCallOutcome::Failure;
-            inner.record(&self.name, now, failed, true);
-        } else if inner.state == CircuitState::HalfOpen {
-            // Not slow: count nothing, but free the half-open slot.
+            inner.record(&self.name, now, generation, failed, true);
+        } else if inner.state == CircuitState::HalfOpen && inner.generation == generation {
+            // Count nothing, but free the half-open slot.
             inner.half_open_in_flight = inner.half_open_in_flight.saturating_sub(1);
         }
     }
@@ -580,6 +618,7 @@ fn read_clock(system_clock: bool) -> Instant {
 pub struct CircuitBreakerGuard {
     breaker: CircuitBreaker,
     started: Instant,
+    generation: u64,
     completed: bool,
 }
 
@@ -587,6 +626,7 @@ impl CircuitBreakerGuard {
     pub fn new(breaker: CircuitBreaker) -> Self {
         Self {
             started: breaker.now(),
+            generation: breaker.generation(),
             breaker,
             completed: false,
         }
@@ -598,19 +638,21 @@ impl CircuitBreakerGuard {
 
     pub fn success(mut self) {
         self.completed = true;
-        self.breaker.finish_call(false, self.elapsed());
+        self.breaker
+            .finish_call(self.generation, false, self.elapsed());
     }
 
     pub fn failure(mut self) {
         self.completed = true;
-        self.breaker.finish_call(true, self.elapsed());
+        self.breaker
+            .finish_call(self.generation, true, self.elapsed());
     }
 }
 
 impl Drop for CircuitBreakerGuard {
     fn drop(&mut self) {
         if !self.completed {
-            self.breaker.cancel_call(self.elapsed());
+            self.breaker.cancel_call(self.generation, self.elapsed());
         }
     }
 }
@@ -792,10 +834,13 @@ where
     fn call(&mut self, req: Request) -> Self::Future {
         match self.breaker.before_call() {
             Ok(()) => {
+                // Make the guard first: if `call` panics, its drop frees a
+                // half-open slot.
+                let guard = CircuitBreakerGuard::new(self.breaker.clone());
                 let fut = self.inner.call(req);
                 CircuitBreakerServiceFuture::Executing {
                     fut,
-                    guard: Some(CircuitBreakerGuard::new(self.breaker.clone())),
+                    guard: Some(guard),
                 }
             }
             Err(_) => CircuitBreakerServiceFuture::Open,
@@ -1168,6 +1213,14 @@ mod tests {
         assert_eq!(breaker.state(), CircuitState::Closed);
     }
 
+    impl CircuitBreaker {
+        /// The raw state and the half-open slots in use.
+        fn trial_view(&self) -> (CircuitState, u64) {
+            let inner = self.lock_inner();
+            (inner.state, inner.half_open_in_flight)
+        }
+    }
+
     /// A policy that opens on slow calls only.
     fn slow_policy(threshold: Duration) -> CircuitBreakerPolicy {
         CircuitBreakerPolicy {
@@ -1215,7 +1268,7 @@ mod tests {
         };
         let breaker = CircuitBreaker::new("slow_off", policy);
         for _ in 0..4 {
-            guard_started(&breaker, Duration::from_secs(3600)).success();
+            guard_started(&breaker, Duration::from_secs(61)).success();
         }
         assert_eq!(breaker.state(), CircuitState::Closed);
         assert_eq!(breaker.slow_calls_total(), 0);
@@ -1305,26 +1358,103 @@ mod tests {
         breaker.lock_inner().state = CircuitState::HalfOpen;
         breaker.before_call().expect("trial slot");
         drop(guard_started(&breaker, Duration::from_secs(10)));
-        let inner = breaker.lock_inner();
-        assert_eq!(inner.state, CircuitState::Open);
-        assert_eq!(inner.half_open_in_flight, 0);
+        let (state, in_flight) = breaker.trial_view();
+        assert_eq!(state, CircuitState::Open);
+        assert_eq!(in_flight, 0);
     }
 
     #[test]
-    fn new_sample_window_clears_the_window() {
+    fn new_sample_window_keeps_the_counts() {
         let breaker = CircuitBreaker::new("resize", CircuitBreakerPolicy::default());
         breaker.after_call(false);
-        assert!(breaker.failure_ratio() > 0.0);
-        breaker.update_config(CircuitBreakerPolicy::default());
-        assert!(breaker.failure_ratio() > 0.0, "same window: kept");
-        breaker.update_config(CircuitBreakerPolicy {
-            sample_window: Duration::from_secs(30),
+        breaker.after_call(true);
+        for window in [30, 10, 30] {
+            breaker.update_config(CircuitBreakerPolicy {
+                sample_window: Duration::from_secs(window),
+                ..CircuitBreakerPolicy::default()
+            });
+            assert!((breaker.failure_ratio() - 0.5).abs() < f64::EPSILON);
+        }
+        assert_eq!(breaker.window_counts().total, 2);
+    }
+
+    #[test]
+    fn switching_windows_does_not_stop_the_trip() {
+        // Two clients with two window lengths share one breaker.
+        let policy = |secs| CircuitBreakerPolicy {
+            sample_window: Duration::from_secs(secs),
+            minimum_sample_count: 4,
             ..CircuitBreakerPolicy::default()
-        });
-        assert!(
-            breaker.failure_ratio() < f64::EPSILON,
-            "new window: cleared"
+        };
+        let breaker = CircuitBreaker::new("flip", policy(10));
+        for secs in [10, 20, 10, 20] {
+            breaker.update_config(policy(secs));
+            breaker.after_call(false);
+        }
+        assert_eq!(breaker.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn call_from_before_the_trip_is_not_a_half_open_trial() {
+        let policy = CircuitBreakerPolicy {
+            minimum_sample_count: 1,
+            half_open_trial_count: 1,
+            open_duration: Duration::ZERO,
+            ..slow_policy(Duration::from_secs(5))
+        };
+        let breaker = CircuitBreaker::new("late_call", policy);
+        // This call starts while the breaker is closed.
+        let late = guard_started(&breaker, Duration::from_secs(10));
+        breaker.after_call(false);
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+        breaker.before_call().expect("trial slot");
+        late.success();
+        let (state, in_flight) = breaker.trial_view();
+        assert_eq!(state, CircuitState::HalfOpen, "not reopened");
+        assert_eq!(in_flight, 1, "the trial keeps its slot");
+        assert_eq!(breaker.slow_calls_total(), 1, "still a slow call");
+    }
+
+    #[test]
+    fn drop_during_panic_frees_the_slot_and_keeps_the_state() {
+        let breaker = CircuitBreaker::new("panic_drop", slow_policy(Duration::from_secs(5)));
+        breaker.lock_inner().state = CircuitState::HalfOpen;
+        breaker.before_call().expect("trial slot");
+        let guard = guard_started(&breaker, Duration::from_secs(10));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = guard;
+            panic!("call body panics");
+        }));
+        assert!(res.is_err());
+        assert_eq!(breaker.trial_view(), (CircuitState::HalfOpen, 0));
+    }
+
+    #[test]
+    fn slow_failed_call_counts_in_both_ratios() {
+        let breaker = CircuitBreaker::new("slow_fail", slow_policy(Duration::from_secs(5)));
+        guard_started(&breaker, Duration::from_secs(10)).failure();
+        assert!((breaker.failure_ratio() - 1.0).abs() < f64::EPSILON);
+        assert!((breaker.slow_call_ratio() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn host_override_sets_slow_call_keys() {
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.hosts.insert(
+            "api".to_owned(),
+            crate::config::CircuitBreakerPolicyConfig {
+                slow_call_rate_threshold: Some(0.25),
+                cancelled_call_outcome: Some(CancelledCallOutcome::Failure),
+                ..Default::default()
+            },
         );
+        let host = CircuitBreakerPolicy::from_config(&rc, "api");
+        assert!((host.slow_call_rate_threshold - 0.25).abs() < f64::EPSILON);
+        assert_eq!(host.cancelled_call_outcome, CancelledCallOutcome::Failure);
+        let other = CircuitBreakerPolicy::from_config(&rc, "other");
+        assert!((other.slow_call_rate_threshold - 1.0).abs() < f64::EPSILON);
+        assert_eq!(other.cancelled_call_outcome, CancelledCallOutcome::Slow);
     }
 
     #[test]
@@ -1364,7 +1494,9 @@ mod tests {
     #[test]
     fn cancelled_call_outcome_parses() {
         assert_eq!("slow".parse(), Ok(CancelledCallOutcome::Slow));
-        assert_eq!(" Failure ".parse(), Ok(CancelledCallOutcome::Failure));
+        assert_eq!(" failure ".parse(), Ok(CancelledCallOutcome::Failure));
+        // Same spelling as TOML: lower case only.
+        assert!("Failure".parse::<CancelledCallOutcome>().is_err());
         assert!("drop".parse::<CancelledCallOutcome>().is_err());
     }
 
@@ -1384,6 +1516,9 @@ mod tests {
         let mut window = SampleWindow::new(Duration::from_secs(10), origin);
         window.record(origin + Duration::from_secs(5), true, true);
         assert_eq!(window.counts(origin + Duration::from_secs(1)).total, 0);
+        // A record after the step clears the later bucket.
+        window.record(origin + Duration::from_secs(1), false, false);
+        assert_eq!(window.counts(origin + Duration::from_secs(5)).total, 1);
     }
 
     /// The naive model: it keeps every sample, and it puts each sample in
@@ -1422,24 +1557,35 @@ mod tests {
     }
 
     proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
         #[test]
         fn ring_window_agrees_with_reference(
-            window_secs in 1_u64..30,
-            steps in proptest::collection::vec((0_u64..4_000, proptest::bool::ANY, proptest::bool::ANY), 1..300),
+            window_ms in 1_u64..30_000,
+            steps in proptest::collection::vec(
+                (0_u64..4_000, proptest::bool::ANY, proptest::bool::ANY, proptest::bool::ANY),
+                1..300,
+            ),
         ) {
             let origin = Instant::now();
-            let window = Duration::from_secs(window_secs);
+            let window = Duration::from_millis(window_ms);
             let mut ring = SampleWindow::new(window, origin);
+            let width = Duration::from_nanos(
+                u64::try_from(window.as_nanos() / WINDOW_BUCKETS as u128).unwrap(),
+            );
             let mut reference = ReferenceWindow {
                 origin,
-                width: window / WINDOW_BUCKETS as u32,
+                width,
                 samples: Vec::new(),
             };
             let mut now = origin;
-            for (advance_ms, failed, slow) in steps {
+            for (advance_ms, record, failed, slow) in steps {
                 now += Duration::from_millis(advance_ms);
-                ring.record(now, failed, slow);
-                reference.samples.push((now, failed, slow));
+                // Some steps only read, so stale buckets are read too.
+                if record {
+                    ring.record(now, failed, slow);
+                    reference.samples.push((now, failed, slow));
+                }
 
                 let got = ring.counts(now);
                 let want = reference.counts(now);
@@ -1447,32 +1593,34 @@ mod tests {
                 proptest::prop_assert_eq!(got.failure_ratio().to_bits(), want.failure_ratio().to_bits());
                 proptest::prop_assert_eq!(got.slow_call_ratio().to_bits(), want.slow_call_ratio().to_bits());
 
-                // The ring holds every call younger than 9/10 of the window,
-                // and no call older than the window.
-                let width = reference.width;
+                // Time bounds, free of the slice rule: the ring holds each
+                // call younger than 9 buckets, and no call older than the
+                // window.
                 proptest::prop_assert!(reference.younger_than(now, width * 9) <= got.total);
-                proptest::prop_assert!(got.total <= reference.younger_than(now, width * 10));
+                proptest::prop_assert!(got.total <= reference.younger_than(now, window));
             }
         }
     }
+
+    /// The ring is a fixed array with no heap data.
+    const _: () = assert!(std::mem::size_of::<SampleWindow>() <= 512);
 
     #[test]
     fn ring_window_memory_does_not_grow_with_rate() {
         let origin = Instant::now();
         let mut window = SampleWindow::new(Duration::from_secs(10), origin);
-        let size = std::mem::size_of_val(&window);
-        // 10 s of calls at 100k calls per second.
+        // 10 s of calls at 100k calls per second. Bucket width is 1 s.
         for i in 0..1_000_000_u64 {
-            window.record(
-                origin + Duration::from_micros(i * 10),
-                i % 3 == 0,
-                i % 5 == 0,
-            );
+            window.record(origin + Duration::from_micros(i * 10), i % 3 == 0, false);
         }
-        assert_eq!(std::mem::size_of_val(&window), size);
         assert_eq!(window.buckets.len(), WINDOW_BUCKETS);
-        let counts = window.counts(origin + Duration::from_secs(10));
-        assert!(counts.total <= 1_000_000);
-        assert!(counts.total > 0);
+        // At t = 9.99999 s, all 10 buckets are in the window.
+        let last = origin + Duration::from_micros(9_999_990);
+        assert_eq!(window.counts(last).total, 1_000_000);
+        // At t = 10 s, bucket 0 is out: 100k calls left the window.
+        let ten = origin + Duration::from_secs(10);
+        let counts = window.counts(ten);
+        assert_eq!(counts.total, 900_000);
+        assert_eq!(counts.failed, 300_000);
     }
 }

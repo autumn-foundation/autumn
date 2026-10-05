@@ -6557,6 +6557,7 @@ mod tests {
                 .get("slow_call_duration_threshold_ms")
                 .is_none()
         );
+        assert!(item_undetailed.get("cancelled_call_outcome").is_none());
         crate::circuit_breaker::global_registry().clear();
     }
 
@@ -10015,6 +10016,10 @@ mod health_indicator_tests {
         assert_eq!(result.group, IndicatorGroup::HealthOnly);
         assert_eq!(result.output.status, HealthStatus::Up);
         assert_eq!(result.output.details.get("state").unwrap(), "CLOSED");
+        assert_eq!(
+            result.output.details.get("slow_call_ratio").unwrap(),
+            &serde_json::json!(0.0)
+        );
 
         breaker.after_call(false);
         breaker.after_call(false);

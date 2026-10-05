@@ -1,9 +1,8 @@
 ### Breaking Changes
 
-- **Breaking:** `CircuitBreakerPolicy` has three new public fields:
-  `slow_call_duration_threshold`, `slow_call_rate_threshold` and
-  `cancelled_call_outcome` (issue #3060). A struct literal must set them or
-  use `..CircuitBreakerPolicy::default()`
+- **Breaking:** `CircuitBreakerPolicy` and `config::CircuitBreakerPolicyConfig`
+  have three new public fields for slow calls (issue #3060). A struct literal
+  must set them or use `..Default::default()`
   ([migration guide](docs/migrations/next.md)).
 
 ### Added
@@ -17,7 +16,8 @@
 - **resilience:** `/actuator/prometheus` shows
   `autumn_circuit_breaker_slow_calls_total` and
   `autumn_circuit_breaker_slow_call_ratio` for each breaker.
-  `/actuator/circuitbreakers` shows `slow_call_ratio`.
+  `/actuator/circuitbreakers` and the breaker health details show
+  `slow_call_ratio`.
 
 ### Changed
 
@@ -26,4 +26,6 @@
   `slow_call_duration_threshold_ms = 0` to turn it off.
 - **resilience:** the sample window is a ring of 10 counter buckets. Memory is
   constant at all request rates. A call stays in the window for 9/10 to 10/10
-  of `sample_window_secs`.
+  of `sample_window_secs`. A new window length keeps the counts.
+- **resilience:** a call that started before a state change does not change
+  the new state. Before, a late call could count as a half-open trial.

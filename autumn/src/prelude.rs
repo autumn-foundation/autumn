@@ -335,7 +335,7 @@ pub use crate::http_client::Client;
 
 // ── Circuit Breaker ──────────────────────────────────────────────
 pub use crate::circuit_breaker::{
-    CircuitBreaker, CircuitBreakerError, CircuitBreakerPolicy, CircuitState,
+    CancelledCallOutcome, CircuitBreaker, CircuitBreakerError, CircuitBreakerPolicy, CircuitState,
 };
 
 // ── SEO helpers ──────────────────────────────────────────────────
