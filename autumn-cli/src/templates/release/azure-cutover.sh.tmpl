@@ -451,12 +451,16 @@ remove_credentials() {
     return 1
   fi
   # Stage 1 runs when the desired template or the active revision (in a
-  # container, a scale rule or a volume) refers to a managed secret. If only
+  # container, a scale rule or a volume) refers to a managed secret, or
+  # when a scale rule of the active revision uses a job identity. If only
   # the active revision does, the template is clean already (an earlier
   # run, or the operator): the script waits for the clean revision instead.
   if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null \
-    || jq -e "$MANAGED_DEF"'[.. | objects | .secretRef? // empty]
-              | any(IN(managed[]))' <<< "$active" > /dev/null; then
+    || jq -e --argjson uids "$JOB_UIDS" "$MANAGED_DEF"'
+         ($uids | map(ascii_downcase)) as $lids
+         | ([.. | objects | .secretRef? // empty] | any(IN(managed[])))
+           or ([.scale.rules // [] | .. | objects | .identity? // empty | strings | ascii_downcase]
+               | any(IN($lids[])))' <<< "$active" > /dev/null; then
     status=$(az containerapp show \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
