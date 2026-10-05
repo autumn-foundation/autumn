@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod introspect;
 pub mod migrate;
 pub mod parse;
+pub mod rename;
 pub mod snapshot;
 
 use std::collections::BTreeMap;
@@ -753,7 +754,12 @@ fn diff_at(
     // The SQLite table-recreate path needs each affected table's full desired (up)
     // / baseline (down) shape, which the per-change deltas don't carry; thread them
     // in via the context. Postgres ignores it (identical output).
-    let ctx = diff::SchemaContext::from_tables(&desired.tables, &baseline.tables);
+    // The baseline side is the renamed baseline: the plan's non-rename changes
+    // use the new names.
+    let ctx = diff::SchemaContext::from_tables(
+        &desired.tables,
+        &rename::renamed_baseline(&baseline.tables, &plan.changes),
+    );
     let up = diff::emit_up_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
     let down = diff::emit_down_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
 
@@ -812,6 +818,9 @@ fn diff_at(
 /// the migration actually does. Table order is irrelevant here: `write_snapshot`
 /// re-sorts tables by name canonically.
 fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
+    // Renames come first in a plan and depend only on the baseline, so apply
+    // them before the name-keyed working set is built.
+    let baseline = rename::renamed_baseline(baseline, &plan.changes);
     // Name-keyed working set cloned from the baseline.
     let mut tables: BTreeMap<String, Table> = baseline
         .iter()
@@ -899,10 +908,15 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
                     t.checks.push(check.clone());
                 }
             }
+            // Applied above by `renamed_baseline`.
+            SchemaChange::RenameTable { .. }
+            | SchemaChange::RenameColumn { .. }
+            | SchemaChange::RenameIndex { .. } => {}
             // The non-emittable marker variants: `guard_plan` refuses these before
             // we get here (a guarded plan never carries one), so projecting them is
             // a no-op — never a panic.
-            SchemaChange::PrimaryKeyChange { .. }
+            SchemaChange::RenameConflict { .. }
+            | SchemaChange::PrimaryKeyChange { .. }
             | SchemaChange::ForeignKeyChange { .. }
             | SchemaChange::IdentityChange { .. }
             | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -1161,6 +1175,68 @@ mod tests {
             before, after,
             "a no-op diff must leave the snapshot byte-for-byte unchanged"
         );
+    }
+
+    #[test]
+    fn write_migration_with_renamed_from_renames_and_advances_snapshot() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            #[renamed_from("posts")]
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[renamed_from("title")]
+                pub headline: String,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("rename_posts"),
+            false,
+        )
+        .expect("a rename needs no --allow-destructive");
+
+        let migrations = root.path().join("migrations");
+        let dirs: Vec<_> = std::fs::read_dir(&migrations)
+            .expect("read migrations dir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        let up = std::fs::read_to_string(dirs[0].join("up.sql")).expect("up.sql");
+        assert_eq!(
+            up.trim(),
+            "ALTER TABLE posts RENAME TO articles;\n\n\
+             ALTER TABLE articles RENAME COLUMN title TO headline;"
+        );
+
+        let snapshot_path = root.path().join(".autumn/schema-snapshot.json");
+        let advanced = snapshot::load_snapshot(&snapshot_path).expect("load snapshot");
+        let names: Vec<&str> = advanced.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["articles"]);
+        assert!(
+            advanced.tables[0]
+                .columns
+                .iter()
+                .any(|c| c.name == "headline")
+        );
+
+        // The hints stay in the source; the next diff is a no-op.
+        diff_at(
+            root.path(),
+            None,
+            None,
+            Some(BackendArg::Pg),
+            true,
+            Some("again"),
+            false,
+        )
+        .expect("second diff");
+        assert_eq!(std::fs::read_dir(&migrations).expect("read").count(), 1);
     }
 
     #[test]

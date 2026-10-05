@@ -231,7 +231,8 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_dependent_on_through.rs");
 
     // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
-    // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` but
+    // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` /
+    // `#[renamed_from("...")]` but
     // rejects malformed shapes with a clear, actionable `compile_error!`.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_bogus_arg.rs");
@@ -243,6 +244,8 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_namevalue.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_renamed_from_bad_name.rs");
 
     // #1911: `#[state_machine(lifecycle = T)]` where `T` is not a `#[lifecycle]`
     // enum fails with an unsatisfied `T: Lifecycle` trait bound.

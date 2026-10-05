@@ -163,6 +163,20 @@ pub struct ParsedSchema {
     pub tables: Vec<Table>,
     /// Fields that could not be resolved (see [`SchemaDiagnostic`]).
     pub diagnostics: Vec<SchemaDiagnostic>,
+    /// `#[renamed_from("...")]` hints, in source order. Diff input only; a
+    /// snapshot never stores them.
+    pub renames: Vec<RenameHint>,
+}
+
+/// A `#[renamed_from("old")]` hint on a model or a field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameHint {
+    /// The new (desired) table name.
+    pub table: String,
+    /// The new (desired) column name. `None` for a table rename.
+    pub column: Option<String>,
+    /// The old name.
+    pub from: String,
 }
 
 impl ParsedSchema {
@@ -184,6 +198,7 @@ impl ParsedSchema {
         Self {
             tables,
             diagnostics: Vec::new(),
+            renames: Vec::new(),
         }
     }
 }
@@ -199,12 +214,14 @@ pub fn parse_model_source(src: &str, backend: Backend) -> Result<ParsedSchema, S
     let mut out = ParsedSchema {
         tables: Vec::new(),
         diagnostics: Vec::new(),
+        renames: Vec::new(),
     };
     for item in &file.items {
         if let syn::Item::Struct(item_struct) = item
             && let Some(model_attr) = find_model_attr(&item_struct.attrs)
         {
             let table = build_table(item_struct, model_attr, backend, &mut out.diagnostics);
+            out.renames.extend(rename_hints(item_struct, &table.name));
             out.tables.push(table);
         }
     }
@@ -247,6 +264,7 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
     let mut out = ParsedSchema {
         tables: Vec::new(),
         diagnostics: Vec::new(),
+        renames: Vec::new(),
     };
     for path in paths {
         let src = std::fs::read_to_string(&path).map_err(|source| SchemaParseError::Io {
@@ -256,6 +274,7 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
         let mut parsed = parse_model_source(&src, backend)?;
         out.tables.append(&mut parsed.tables);
         out.diagnostics.append(&mut parsed.diagnostics);
+        out.renames.append(&mut parsed.renames);
     }
     Ok(out)
 }
@@ -445,6 +464,49 @@ fn is_deterministic_encrypted(attr: &syn::Attribute) -> bool {
         Ok(())
     });
     deterministic
+}
+
+/// The `#[renamed_from("old")]` hints on one `#[model]` struct: the table hint
+/// first, then the field hints in field order.
+fn rename_hints(item: &syn::ItemStruct, table: &str) -> Vec<RenameHint> {
+    let mut out = Vec::new();
+    if let Some(from) = renamed_from(&item.attrs) {
+        out.push(RenameHint {
+            table: table.to_owned(),
+            column: None,
+            from,
+        });
+    }
+    if let syn::Fields::Named(named) = &item.fields {
+        for field in &named.named {
+            if let (Some(ident), Some(from)) = (&field.ident, renamed_from(&field.attrs)) {
+                out.push(RenameHint {
+                    table: table.to_owned(),
+                    column: Some(ident.to_string()),
+                    from,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The old name in `#[renamed_from("old")]`. `None` unless `attrs` holds exactly
+/// one such attribute with one plain identifier. The macro rejects other shapes
+/// at compile time; the parser ignores them, so a bad name never reaches SQL.
+fn renamed_from(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut found = attrs.iter().filter(|a| a.path().is_ident("renamed_from"));
+    let attr = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let syn::Meta::List(list) = &attr.meta else {
+        return None;
+    };
+    let name = syn::parse2::<syn::LitStr>(list.tokens.clone())
+        .ok()?
+        .value();
+    crate::schema::rename::is_plain_identifier(&name).then_some(name)
 }
 
 /// Find the `#[model]` / `#[autumn_web::model]` attribute on a struct, if any.
@@ -1866,5 +1928,107 @@ mod tests {
             }
             other @ SchemaParseError::Syntax { .. } => panic!("expected Io error, got {other:?}"),
         }
+    }
+
+    // ---- #[renamed_from] hints (#1975, Decision 5) ----
+
+    #[test]
+    fn field_renamed_from_records_a_column_hint() {
+        let parsed = parse_model_source(
+            r#"
+            #[model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[renamed_from("title")]
+                pub headline: String,
+            }
+        "#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed.renames,
+            vec![RenameHint {
+                table: "posts".to_owned(),
+                column: Some("headline".to_owned()),
+                from: "title".to_owned(),
+            }]
+        );
+        // The hint does not change the column shape.
+        assert!(
+            parsed.tables[0]
+                .columns
+                .iter()
+                .any(|c| c.name == "headline")
+        );
+    }
+
+    #[test]
+    fn struct_renamed_from_records_a_table_hint() {
+        let parsed = parse_model_source(
+            r#"
+            #[model(managed)]
+            #[renamed_from("articles")]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+            }
+        "#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed.renames,
+            vec![RenameHint {
+                table: "posts".to_owned(),
+                column: None,
+                from: "articles".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn malformed_renamed_from_is_ignored() {
+        // The macro rejects these at compile time; the parser never trusts them.
+        let parsed = parse_model_source(
+            r#"
+            #[model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[renamed_from("Bad Name")]
+                pub a: String,
+                #[renamed_from = "b_old"]
+                pub b: String,
+                #[renamed_from]
+                pub c: String,
+                #[renamed_from("x; DROP TABLE posts")]
+                pub d: String,
+                #[renamed_from("e_old", "e_other")]
+                pub e: String,
+            }
+        "#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        assert!(parsed.renames.is_empty(), "{:?}", parsed.renames);
+    }
+
+    #[test]
+    fn renamed_from_hints_aggregate_across_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "#[model(managed)] pub struct Post { #[id] pub id: i64, #[renamed_from(\"title\")] pub headline: String }",
+        )
+        .expect("write a");
+        std::fs::write(
+            dir.path().join("b.rs"),
+            "#[model(managed)] #[renamed_from(\"people\")] pub struct User { #[id] pub id: i64 }",
+        )
+        .expect("write b");
+        let parsed = parse_models_dir(dir.path(), Backend::Postgres).expect("parse dir");
+        assert_eq!(parsed.renames.len(), 2, "{:?}", parsed.renames);
     }
 }
