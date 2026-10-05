@@ -1097,7 +1097,8 @@ path = "tests/sqlite_statement_timeout_fail_closed.rs"
 name = "sqlite_dependent_destroy"
 path = "tests/sqlite_dependent_destroy.rs"
 
-# `#[commentable]` hard-delete on SQLite (Snag charter, issue #2275 follow-up).
+# `#[commentable]` on SQLite: hard-delete (Snag charter, issue #2275
+# follow-up), and a copied spec that finds its repository (issue #2286).
 # `docs/guide/commentable.md` claims "Both backends are supported", but the
 # feature's only live-DB suite is Postgres-only (testcontainers). Runs
 # explicitly: `cargo test -p autumn-web --features sqlite --test

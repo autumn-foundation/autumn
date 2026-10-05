@@ -1418,6 +1418,37 @@ async fn a_copied_spec_keeps_the_repository_soft_delete_rule() {
     );
 }
 
+/// Issue #2286, the other side: a copy of the spec of a `soft_delete`
+/// repository must still hide a soft-deleted parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_copied_spec_still_hides_a_soft_deleted_parent() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_softs", "title", "gone").await;
+    diesel::sql_query("UPDATE cmt_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+
+    let spec = *CmtSoft::commentable_spec();
+    let err = autumn_web::commentable::add_comment(
+        &mut conn,
+        &spec,
+        CmtSoft::COMMENTABLE_TYPE,
+        target,
+        author,
+        "hi",
+        None,
+        None,
+    )
+    .await
+    .expect_err("a soft-deleted parent accepts no comment");
+    assert_eq!(err.status().as_u16(), 404, "{err}");
+}
+
 /// The two 404s on the delete path: an unknown comment, and a comment that
 /// belongs to a **different record of the same model**. The second is what
 /// stops any signed-in user deleting any comment by walking ids.

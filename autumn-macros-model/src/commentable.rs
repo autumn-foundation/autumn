@@ -893,10 +893,10 @@ pub fn emit_commentable_items(
         #author_guard
         #author_name_guard
 
-        // Keep this a `static`, not a `const`. The runtime finds the
-        // repository facts of a model by the address of this item first
-        // (`commentable_model_for_spec`). A `const` has no fixed address, and
-        // the value match fails when two models register equal specs.
+        // Keep this a `static`, not a `const`. `commentable_model_for_spec`
+        // first compares the address of this item. A `const` has no fixed
+        // address. Then only the value match is left, and it finds no single
+        // model when two models register equal specs.
         #[doc = #spec_doc]
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
