@@ -2713,7 +2713,8 @@ pub(crate) async fn probe_connection_alive(
 ///   without `pg_read_all_stats` sees `last_msg_receipt_time` as `NULL`. That
 ///   is not proof of freshness, so the branch below applies.
 /// - Else: time since the last replayed transaction. `NULL` when nothing has
-///   been replayed yet, which means "unknown".
+///   been replayed yet, which means "unknown". The `NULL` check comes before
+///   `GREATEST`, because `GREATEST(0, NULL)` is `0` in Postgres.
 #[cfg(not(feature = "sqlite"))]
 const REPLICA_LAG_SQL: &str = "SELECT CASE \
      WHEN NOT pg_is_in_recovery() THEN 0::BIGINT \
@@ -2721,6 +2722,7 @@ const REPLICA_LAG_SQL: &str = "SELECT CASE \
           WHERE last_msg_receipt_time > clock_timestamp() - INTERVAL '60 seconds') \
           AND pg_last_wal_receive_lsn() IS NOT NULL \
           AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0::BIGINT \
+     WHEN pg_last_xact_replay_timestamp() IS NULL THEN NULL \
      ELSE GREATEST(0, FLOOR(EXTRACT(EPOCH FROM \
           (clock_timestamp() - pg_last_xact_replay_timestamp())) * 1000))::BIGINT \
      END AS lag_ms";
@@ -2748,6 +2750,22 @@ pub(crate) async fn measure_replica_lag(
     Ok(std::time::Duration::from_millis(
         u64::try_from(lag_ms).unwrap_or(0),
     ))
+}
+
+#[cfg(all(test, not(feature = "sqlite")))]
+mod replica_lag_sql_tests {
+    #[test]
+    fn unknown_replay_time_stays_null() {
+        let sql = super::REPLICA_LAG_SQL;
+        let null_check = sql
+            .find("pg_last_xact_replay_timestamp() IS NULL THEN NULL")
+            .expect("a replica with no replayed transaction must read as unknown");
+        let greatest = sql.find("GREATEST(").expect("negative lag is clamped");
+        assert!(
+            null_check < greatest,
+            "GREATEST(0, NULL) is 0, so the NULL check must come first"
+        );
+    }
 }
 
 /// `SQLite` has no replicas, so the lag is always `0`.

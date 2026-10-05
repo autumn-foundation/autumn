@@ -249,6 +249,29 @@ async fn http2_settings_advertise_max_concurrent_streams() {
 }
 
 #[tokio::test]
+async fn pipelined_partial_head_hits_the_header_timeout() {
+    let addr = spawn_server(HttpLimits {
+        header_read_timeout: ms(500),
+        keep_alive_timeout: ms(10_000),
+        ..HttpLimits::default()
+    })
+    .await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    // One write: a full request, then the start of a second head.
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\nGET / HTTP/1.1\r\nHo")
+        .await
+        .unwrap();
+    let (head, _) = read_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let closed_after = time_until_closed(&mut stream, Duration::from_secs(5)).await;
+    assert!(
+        closed_after < Duration::from_secs(3),
+        "the 10 s keep-alive must not bound a partial head: {closed_after:?}"
+    );
+}
+
+#[tokio::test]
 async fn silent_client_is_closed_by_keep_alive_timeout_alone() {
     let addr = spawn_server(HttpLimits {
         keep_alive_timeout: ms(500),

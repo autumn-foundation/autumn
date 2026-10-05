@@ -9,18 +9,25 @@
 //!
 //! Each connection is in one of three phases:
 //!
-//! - **Head**: waiting for a request head. `header_read_timeout` applies
-//!   (if it is not set, `keep_alive_timeout`). The timer starts when the
-//!   connection opens, or at the first byte after an idle period. More bytes
-//!   do not restart it, so a slowloris client cannot keep the connection open.
+//! - **Head**: the connection opened and no request arrived yet.
+//!   `header_read_timeout` applies (if it is not set, `keep_alive_timeout`).
 //! - **Busy**: at least one request is in flight. No timer applies. The
 //!   request timeout layer limits handlers.
 //! - **Idle**: no request in flight. `keep_alive_timeout` applies.
 //!
-//! On HTTP/2, control frames between requests (for example `PING`) do not
-//! start a head timer. An open header block does: a `HEADERS` frame without
-//! `END_HEADERS` starts `header_read_timeout`, in any phase, until a frame
-//! with `END_HEADERS` arrives. The timers also run during a graceful drain.
+//! In every phase, an open head also starts `header_read_timeout`, and
+//! suspends the idle timer. The timer starts at the first byte of the head.
+//! More bytes do not restart it, so a slowloris client cannot keep the
+//! connection open. To find heads, the read path scans the client bytes:
+//!
+//! - HTTP/1: a small framer skips bodies (`Content-Length`, chunked). A head
+//!   runs from its first byte to its blank line, also when it is pipelined
+//!   behind another request. CRLF between messages does not open a head.
+//! - HTTP/2: a head is a header block (`HEADERS` and `CONTINUATION` frames,
+//!   up to the payload of the `END_HEADERS` frame). Control frames (for
+//!   example `PING`) do not open one.
+//!
+//! The timers also run during a graceful drain.
 
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -298,7 +305,7 @@ enum Expiry {
 struct PhaseState {
     phase: Phase,
     scan: Scan,
-    /// Set while an HTTP/2 header block is open.
+    /// Set while a request head (HTTP/1) or a header block (HTTP/2) is open.
     header_block_since: Option<Instant>,
 }
 
@@ -315,7 +322,7 @@ enum Scan {
     Preface {
         matched: usize,
     },
-    Http1,
+    Http1(H1Scan),
     /// Between HTTP/2 frames: `have` bytes of the 9-byte frame header, then
     /// `skip` payload bytes. `ends_block` is set while the payload of the
     /// last frame of a header block (`END_HEADERS`) is still to come.
@@ -330,21 +337,175 @@ enum Scan {
     },
 }
 
-impl PhaseState {
-    const fn http2(&self) -> bool {
-        matches!(self.scan, Scan::Frames { .. })
+/// A minimal HTTP/1 framer. It finds where each request head starts and
+/// ends, and skips request bodies (`Content-Length` or chunked). hyper parses
+/// the same bytes; this scan only times the heads, so a pipelined partial
+/// head is timed too.
+#[derive(Debug, Default)]
+struct H1Scan {
+    state: H1State,
+    /// The current line, cut at [`H1_LINE_KEEP`] bytes: only header names
+    /// and short values matter here.
+    line: Vec<u8>,
+    content_length: u64,
+    chunked: bool,
+    /// `CONNECT` or `Upgrade`: after the head the bytes are not HTTP/1.
+    upgrade: bool,
+    position: HeadPosition,
+}
+
+/// Where the scan is inside the current head.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum HeadPosition {
+    /// No byte of the head yet (CRLF between messages does not count).
+    #[default]
+    Before,
+    RequestLine,
+    Fields,
+}
+
+const H1_LINE_KEEP: usize = 256;
+
+#[derive(Debug, Default, Clone, Copy)]
+enum H1State {
+    #[default]
+    Head,
+    Body(u64),
+    ChunkSize,
+    ChunkData(u64),
+    ChunkDataEnd(u8),
+    Trailers,
+    /// Not HTTP/1 any more (an upgrade), or a head this scan cannot read.
+    Stopped,
+}
+
+impl H1Scan {
+    fn scan(&mut self, mut bytes: &[u8], head_since: &mut Option<Instant>) {
+        while !bytes.is_empty() {
+            match self.state {
+                H1State::Stopped => return,
+                H1State::Body(n) | H1State::ChunkData(n) => {
+                    let k = usize::try_from(n).unwrap_or(usize::MAX).min(bytes.len());
+                    bytes = &bytes[k..];
+                    let left = n - k as u64;
+                    self.state = match (self.state, left) {
+                        (H1State::Body(_), 0) => self.next_message(),
+                        (H1State::Body(_), _) => H1State::Body(left),
+                        (_, 0) => H1State::ChunkDataEnd(2),
+                        _ => H1State::ChunkData(left),
+                    };
+                }
+                H1State::ChunkDataEnd(n) => {
+                    let k = usize::from(n).min(bytes.len());
+                    bytes = &bytes[k..];
+                    self.state = match n.saturating_sub(u8::try_from(k).unwrap_or(u8::MAX)) {
+                        0 => H1State::ChunkSize,
+                        left => H1State::ChunkDataEnd(left),
+                    };
+                }
+                H1State::Head | H1State::ChunkSize | H1State::Trailers => {
+                    let byte = bytes[0];
+                    bytes = &bytes[1..];
+                    if matches!(self.state, H1State::Head) && self.position == HeadPosition::Before
+                    {
+                        // hyper skips CRLF between messages.
+                        if byte == b'\r' || byte == b'\n' {
+                            continue;
+                        }
+                        self.position = HeadPosition::RequestLine;
+                        head_since.get_or_insert_with(Instant::now);
+                    }
+                    if byte == b'\n' {
+                        self.on_line(head_since);
+                    } else if self.line.len() < H1_LINE_KEEP {
+                        self.line.push(byte);
+                    }
+                }
+            }
+        }
     }
 
+    const fn next_message(&mut self) -> H1State {
+        self.content_length = 0;
+        self.chunked = false;
+        self.upgrade = false;
+        self.position = HeadPosition::Before;
+        H1State::Head
+    }
+
+    fn on_line(&mut self, head_since: &mut Option<Instant>) {
+        let mut line = std::mem::take(&mut self.line);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        match self.state {
+            H1State::Head if line.is_empty() => {
+                *head_since = None;
+                self.state = if self.upgrade {
+                    H1State::Stopped
+                } else if self.chunked {
+                    H1State::ChunkSize
+                } else if self.content_length > 0 {
+                    H1State::Body(self.content_length)
+                } else {
+                    self.next_message()
+                };
+            }
+            H1State::Head if self.position == HeadPosition::RequestLine => {
+                self.position = HeadPosition::Fields;
+                self.upgrade = line.starts_with(b"CONNECT ");
+            }
+            H1State::Head => {
+                line.make_ascii_lowercase();
+                let value = |name: &[u8]| {
+                    line.strip_prefix(name)
+                        .map(|v| String::from_utf8_lossy(v).trim().to_owned())
+                };
+                if let Some(v) = value(b"content-length:") {
+                    match v.parse() {
+                        Ok(len) => self.content_length = len,
+                        // hyper rejects the request; stop timing heads.
+                        Err(_) => self.state = H1State::Stopped,
+                    }
+                } else if let Some(v) = value(b"transfer-encoding:") {
+                    self.chunked |= v.contains("chunked");
+                } else if value(b"upgrade:").is_some() {
+                    self.upgrade = true;
+                }
+            }
+            H1State::ChunkSize => {
+                let size = line.split(|b| *b == b';').next().unwrap_or_default();
+                let size = String::from_utf8_lossy(size);
+                self.state = match u64::from_str_radix(size.trim(), 16) {
+                    Ok(0) => H1State::Trailers,
+                    Ok(n) => H1State::ChunkData(n),
+                    Err(_) => H1State::Stopped,
+                };
+            }
+            H1State::Trailers if line.is_empty() => self.state = self.next_message(),
+            _ => {}
+        }
+    }
+}
+
+impl PhaseState {
     /// Advance the scan over `bytes`. Opens or closes the HTTP/2 header block.
     fn scan(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() {
             match &mut self.scan {
-                Scan::Http1 => return,
+                Scan::Http1(h1) => {
+                    h1.scan(bytes, &mut self.header_block_since);
+                    return;
+                }
                 Scan::Preface { matched } => {
                     let rest = &H2_PREFACE[*matched..];
                     let n = rest.len().min(bytes.len());
                     if bytes[..n] != rest[..n] {
-                        self.scan = Scan::Http1;
+                        // HTTP/1: replay the bytes that matched the preface.
+                        let mut h1 = H1Scan::default();
+                        h1.scan(&H2_PREFACE[..*matched], &mut self.header_block_since);
+                        h1.scan(bytes, &mut self.header_block_since);
+                        self.scan = Scan::Http1(h1);
                         return;
                     }
                     *matched += n;
@@ -454,13 +615,7 @@ impl ConnTimers {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let block_before = state.header_block_since.is_some();
         state.scan(bytes);
-        let head_starts = matches!(state.phase, Phase::Idle { .. }) && !state.http2();
-        if head_starts {
-            state.phase = Phase::Head {
-                since: Instant::now(),
-            };
-        }
-        let changed = head_starts || block_before != state.header_block_since.is_some();
+        let changed = block_before != state.header_block_since.is_some();
         drop(state);
         if changed {
             self.changed.notify_one();
@@ -734,8 +889,54 @@ mod tests {
     fn http1_bytes_end_the_scan() {
         let mut state = state();
         state.scan(b"GET / HTTP/1.1\r\n");
-        assert!(matches!(state.scan, Scan::Http1));
-        assert!(!state.http2());
+        assert!(matches!(state.scan, Scan::Http1(_)));
+        assert!(!matches!(state.scan, Scan::Frames { .. }));
+    }
+
+    #[test]
+    fn http1_head_opens_at_the_first_byte_and_closes_at_the_blank_line() {
+        let mut state = state();
+        state.scan(b"\r\n"); // a stray CRLF does not start a head
+        assert!(state.header_block_since.is_none());
+        state.scan(b"POST /x HTTP/1.1\r\nHost: t\r\n");
+        assert!(state.header_block_since.is_some());
+        state.scan(b"Content-Length: 12\r\n\r\n");
+        assert!(state.header_block_since.is_none(), "head complete");
+        state.scan(b"GET / HTTP/1"); // the 12-byte body, not a head
+        assert!(state.header_block_since.is_none());
+        state.scan(b"GET /next");
+        assert!(state.header_block_since.is_some(), "a pipelined head");
+    }
+
+    #[test]
+    fn http1_pipelined_partial_head_in_one_read_is_open() {
+        let mut state = state();
+        state.scan(b"GET / HTTP/1.1\r\nHost: t\r\n\r\nGET /2 HTTP/1.1\r\nHo");
+        assert!(state.header_block_since.is_some());
+    }
+
+    #[test]
+    fn http1_chunked_body_is_skipped() {
+        let mut state = state();
+        state.scan(b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        state.scan(b"5\r\nGET /\r\n0\r\n\r\n");
+        assert!(
+            state.header_block_since.is_none(),
+            "chunk data is not a head"
+        );
+        state.scan(b"G");
+        assert!(state.header_block_since.is_some());
+    }
+
+    #[test]
+    fn http1_upgrade_stops_the_scan() {
+        let mut state = state();
+        state.scan(b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\n\r\n");
+        state.scan(b"\x81\x05hello");
+        assert!(
+            state.header_block_since.is_none(),
+            "WebSocket frames are not heads"
+        );
     }
 
     #[tokio::test]
@@ -747,7 +948,7 @@ mod tests {
         for chunk in bytes.chunks(5) {
             state.scan(chunk);
         }
-        assert!(state.http2());
+        assert!(matches!(state.scan, Scan::Frames { .. }));
         assert!(state.header_block_since.is_some(), "block is open");
 
         state.scan(&frame(H2_FRAME_CONTINUATION, H2_FLAG_END_HEADERS, &[0x84]));
