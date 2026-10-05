@@ -236,11 +236,12 @@ fn classify(files: &[String]) -> CommentsTable {
 ///
 /// Emitting anyway writes a second `CREATE TABLE comments`, and `migrate`
 /// stops on "already exists". Skipping is worse: every helper then queries
-/// columns that are not there.
+/// columns that are not there. Adding the missing columns is not offered: the
+/// model that owns the table still inserts rows without them.
 fn conflicting_table_error(missing: &[&str], columns_unknown: bool) -> GenerateError {
     let rename_or_drop = format!(
         "  - Rename or drop the existing `{COMMENTS_TABLE}` table in a new migration. \
-         Then update the model that uses it."
+         Then update or remove the model that uses it."
     );
     let message = if columns_unknown {
         format!(
@@ -260,11 +261,9 @@ fn conflicting_table_error(missing: &[&str], columns_unknown: bool) -> GenerateE
         format!(
             "cannot add the shared `{COMMENTS_TABLE}` table: the project has a \
              `{COMMENTS_TABLE}` table that is not the shared one. These columns are missing: \
-             {missing}. The generator wrote no files. Do one of these steps, then run the \
-             command again:\n\
-             {rename_or_drop}\n\
-             \x20 - Add the missing columns in a new migration. Use the types in \
-             docs/guide/commentable.md, section \"The table\"."
+             {missing}. The generator wrote no files. Do this step, then run the command \
+             again:\n\
+             {rename_or_drop}"
         )
     };
     GenerateError::Config(message)
@@ -3088,7 +3087,10 @@ mod tests {
             assert!(!message.contains(present), "{present} exists:\n{message}");
         }
         assert!(message.contains("Rename or drop"), "{message}");
-        assert!(message.contains("Add the missing columns"), "{message}");
+        // Adding the columns would leave the `Comment` writer inserting rows
+        // without them, so the error does not offer it.
+        assert!(!message.contains("Add the missing columns"), "{message}");
+        assert!(message.contains("update or remove the model"), "{message}");
         assert!(plan.actions.is_empty(), "a refusal plans no file");
     }
 
@@ -3109,10 +3111,10 @@ mod tests {
         assert!(plan.actions.is_empty());
     }
 
-    /// The remedy works: add the missing columns, and generation reuses the
-    /// table.
+    /// Detection is by columns: a table completed by a later `ALTER` is the
+    /// shared one, and generation reuses it.
     #[test]
-    fn adding_the_missing_columns_makes_the_table_reusable() {
+    fn a_table_completed_by_an_alter_is_reused() {
         let tmp = project_with_a_plain_comments_table();
         let dir = tmp.path().join("migrations").join("0002_adopt_comments");
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -3167,7 +3169,7 @@ mod tests {
     }
 
     /// A rename from a table the history never creates hides the columns.
-    /// "Add the missing columns" is then wrong advice: it would ask for `id`.
+    /// The error says so instead of listing columns it cannot see.
     #[test]
     fn a_rename_from_an_unknown_table_says_the_columns_are_unknown() {
         let tmp = tempfile::tempdir().expect("tempdir");

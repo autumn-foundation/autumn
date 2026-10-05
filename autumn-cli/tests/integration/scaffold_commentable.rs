@@ -456,26 +456,22 @@ fn a_scaffolded_comment_resource_blocks_the_shared_table() {
     );
     assert!(!project.join("src/models/post.rs").exists());
 
-    // The remedy: add the missing columns. The generator then reuses the table.
-    let adopt = project.join("migrations/99990101000000_adopt_comments");
-    fs::create_dir_all(&adopt).expect("mkdir");
+    // The remedy: rename the plain table away. The generator then adds the
+    // shared table beside it.
+    let rename = project.join("migrations/99990101000000_rename_comments");
+    fs::create_dir_all(&rename).expect("mkdir");
     fs::write(
-        adopt.join("up.sql"),
-        "ALTER TABLE comments\n    \
-         ADD COLUMN commentable_type TEXT NOT NULL,\n    \
-         ADD COLUMN commentable_id BIGINT NOT NULL,\n    \
-         ADD COLUMN parent_id BIGINT REFERENCES comments(id) ON DELETE CASCADE,\n    \
-         ADD COLUMN author_id BIGINT NOT NULL,\n    \
-         ADD COLUMN deleted_at TIMESTAMP;\n",
+        rename.join("up.sql"),
+        "ALTER TABLE comments RENAME TO notes;\n",
     )
     .expect("write");
     let (ok, output) = run_autumn(&project, &post_scaffold);
     assert!(ok, "the remedy must unblock generation:\n{output}");
-    assert!(
-        output.contains("Reusing the existing `comments` table"),
-        "{output}"
+    assert_eq!(
+        count_migrations_ending_in(&project, "_create_comments"),
+        2,
+        "the shared table is added beside the renamed one"
     );
-    assert_eq!(count_migrations_ending_in(&project, "_create_comments"), 1);
 }
 
 /// `generate model` takes the same token, so it must refuse the same way.
