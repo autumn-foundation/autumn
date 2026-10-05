@@ -3202,7 +3202,7 @@ previous_secrets = []
             );
         }
         assert!(
-            rollback.contains("\"$ACR_LOGIN_SERVER\"/*) return"),
+            rollback.contains("[ -n \"$RELEASED\" ] && return"),
             "rollback must skip a later deploy, whose old revision is a real release: {rollback}"
         );
         assert!(

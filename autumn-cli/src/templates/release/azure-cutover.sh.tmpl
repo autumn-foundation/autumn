@@ -78,7 +78,21 @@ az containerapp secret list \
   --output json > "$APP_SECRETS"
 APP_ID=$(jq -r '.id' <<< "$APP")
 OLD_REVISION=$(jq -r '.properties.latestRevisionName // ""' <<< "$APP")
-OLD_IMAGE=$(jq -r '.properties.template.containers[0].image' <<< "$APP")
+# The active revisions decide if a real release runs. The template image is
+# not enough: after a canceled first cutover, the template has the real
+# image while the placeholder revision stays active.
+ACTIVE=$(az containerapp revision list \
+  --name "$AZURE_APP_NAME" \
+  --resource-group "$AZURE_RESOURCE_GROUP" \
+  --query "[?properties.active].[name, properties.template.containers[0].image]" \
+  --output tsv)
+RELEASED=""
+ACTIVE_REVISIONS=""
+while IFS=$'\t' read -r name image; do
+  [ -n "$name" ] || continue
+  ACTIVE_REVISIONS="$ACTIVE_REVISIONS $name"
+  case "$image" in "$ACR_LOGIN_SERVER"/*) RELEASED=1 ;; esac
+done <<< "$ACTIVE"
 JOB_IDENTITY=$(jq -r '.properties.configuration.registries[0].identity // ""' <<< "$JOB")
 # A secret in PATCH form: a Key Vault ref, or a name and value.
 SECRET_REF='def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;'
@@ -124,6 +138,11 @@ REMOVED='
 REDIS_GONE='
   .properties.provisioningState == "Succeeded"
   and all(.properties.configuration.secrets // [] | .[]; .name != "redis-url")'
+# True when the template (any container, scale rule or volume) refers to a
+# managed secret.
+# shellcheck disable=SC2016 # a jq program, not a shell expression
+REFS_MANAGED='[.properties.template | .. | objects | .secretRef? // empty]
+  | any(IN("database-url", "signing-secret", "redis-url"))'
 app_shows() {
   local now
   now=$(az containerapp show \
@@ -152,25 +171,35 @@ patch_app() {
 # provisioned and the old one is inactive. Stage 2 then removes the
 # identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local live status state latest revision active body
+  local live status state latest revision active body containers
   live=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --output json) || return 1
-  if jq -e '[.properties.template.containers[]?.env[]? | .secretRef // empty]
-            | any(IN("database-url", "signing-secret", "redis-url"))' <<< "$live" > /dev/null; then
+  # The stage 1 containers: no env var that refers to a managed secret (in
+  # any container), and not the four env vars that this script sets.
+  containers=$(jq -c '.properties.template.containers
+    | map(if .env then .env = [.env[] | select((.secretRef // "")
+            | IN("database-url", "signing-secret", "redis-url") | not)] else . end)
+    | .[0].env = [(.[0].env // [])[] | select(.name | IN(
+        "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
+        "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)]' <<< "$APP")
+  # A scale rule or a volume can also refer to a secret. The script cannot
+  # remove that ref without changing what the app does, so it stops.
+  if jq -c --argjson c "$containers" '.properties.template.containers = $c' <<< "$APP" \
+    | jq -e "$REFS_MANAGED" > /dev/null; then
+    echo "::error::a scale rule or volume of $AZURE_APP_NAME uses a managed secret. Remove that reference, then run the script again." >&2
+    return 1
+  fi
+  if jq -e "$REFS_MANAGED" <<< "$live" > /dev/null; then
     status=$(az containerapp show \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
       --query "[[properties.provisioningState, properties.latestRevisionName]]" \
       --output tsv) || return 1
     read -r _ latest <<< "$status"
-    body=$(jq -cn --argjson app "$APP" '
-      {location: $app.location,
-       properties: {template: {containers: ($app.properties.template.containers
-         | .[0].env = [(.[0].env // [])[] | select(.name | IN(
-             "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
-             "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)])}}}')
+    body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" '
+      {location: $app.location, properties: {template: {containers: $containers}}}')
     patch_app "$body" || return 1
     revision=""
     for _ in $(seq 1 30); do
@@ -237,22 +266,20 @@ remove_credentials() {
   return 1
 }
 
-# Only the first cutover rolls back. On a later deploy, the old image is a
-# real release, so the script keeps the credentials.
+# Only the first cutover rolls back. On a later deploy, the active revision
+# is a real release, so the script keeps the credentials.
 rollback() {
-  case "$OLD_IMAGE" in "$ACR_LOGIN_SERVER"/*) return ;; esac
+  [ -n "$RELEASED" ] && return
   echo "::warning::removing the credentials from the placeholder app" >&2
   remove_credentials && return
   echo "::error::rollback failed: remove the identity and secrets from $AZURE_APP_NAME manually" >&2
 }
 
 if [ "$MODE" = remove ]; then
-  case "$OLD_IMAGE" in
-    "$ACR_LOGIN_SERVER"/*)
-      echo "::error::$AZURE_APP_NAME runs $OLD_IMAGE, a real release. It needs its credentials." >&2
-      exit 1
-      ;;
-  esac
+  if [ -n "$RELEASED" ]; then
+    echo "::error::$AZURE_APP_NAME runs a real release. It needs its credentials." >&2
+    exit 1
+  fi
   if [ -z "$JOB_IDENTITY" ]; then
     echo "::error::the migration job has no identity. Run terraform apply first." >&2
     exit 1
@@ -268,9 +295,7 @@ fail() {
   exit 1
 }
 
-case "$OLD_IMAGE" in
-  "$ACR_LOGIN_SERVER"/*) ;;
-  *)
+if [ -z "$RELEASED" ]; then
     # The first cutover. Disable ingress, so no request (internal or
     # external) can start the placeholder. Then wait until no placeholder
     # replica runs. The HTTP scaler stops a replica after a 300-second cool
@@ -280,21 +305,24 @@ case "$OLD_IMAGE" in
       --resource-group "$AZURE_RESOURCE_GROUP" \
       --output none
     for _ in $(seq 1 60); do
-      REPLICAS=$(az containerapp replica list \
-        --name "$AZURE_APP_NAME" \
-        --resource-group "$AZURE_RESOURCE_GROUP" \
-        --revision "$OLD_REVISION" \
-        --query "length(@)" \
-        --output tsv)
+      REPLICAS=0
+      for revision in $ACTIVE_REVISIONS; do
+        COUNT=$(az containerapp replica list \
+          --name "$AZURE_APP_NAME" \
+          --resource-group "$AZURE_RESOURCE_GROUP" \
+          --revision "$revision" \
+          --query "length(@)" \
+          --output tsv)
+        REPLICAS=$((REPLICAS + COUNT))
+      done
       [ "$REPLICAS" = "0" ] && break
       sleep 10
     done
     if [ "$REPLICAS" != "0" ]; then
-      echo "::error::the placeholder revision $OLD_REVISION runs $REPLICAS replica(s). Set min_replicas = 0, run terraform apply, and try again." >&2
+      echo "::error::the placeholder runs $REPLICAS replica(s). Set min_replicas = 0, run terraform apply, and try again." >&2
       exit 1
     fi
-    ;;
-esac
+fi
 
 # The new containers. The script changes only the app container (the first
 # one): it sets the image and the env. Other containers (sidecars) stay. The
