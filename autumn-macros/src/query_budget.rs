@@ -1257,8 +1257,9 @@ fn worst(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
 /// and only the paths that fall through pay for the next statement. So
 /// `if cached { return repo.a().await; } repo.b().await` costs 1, not 2.
 ///
-/// `?` needs no rule. Its exit costs no more than the path that falls
-/// through, so the fall-through path always covers it.
+/// A `?` that leaves the function needs no rule. Its exit costs no more than
+/// the path that falls through, so the fall-through path always covers it. A
+/// `?` in a `try` block lands after the block, so it is an exit.
 struct Flow {
     /// Paths that reach the next statement.
     fall: Option<Cost>,
@@ -1267,6 +1268,10 @@ struct Flow {
     /// Paths that leave by `return`.
     ret: Option<Cost>,
 }
+
+/// The exit label of a failed `?` in a `try` block. No real label can
+/// have it: `try` is a keyword.
+const TRY_EXIT: &str = "try";
 
 /// Where a `break` or `continue` goes.
 #[derive(Clone, PartialEq, Eq)]
@@ -1303,6 +1308,18 @@ impl Flow {
         let exit = Exit {
             label: label.map(|l| l.ident.to_string()),
             breaks,
+        };
+        Self {
+            exits: vec![(exit, Cost::ZERO)],
+            ..Self::NEVER
+        }
+    }
+
+    /// A failed `?` to the nearest `try` block.
+    fn exit_to_try() -> Self {
+        let exit = Exit {
+            label: Some(TRY_EXIT.to_string()),
+            breaks: true,
         };
         Self {
             exits: vec![(exit, Cost::ZERO)],
@@ -1362,6 +1379,15 @@ impl Flow {
                 .collect(),
             ret: set(self.ret),
         }
+    }
+
+    /// Remove and return the exits that land on a `try` block.
+    fn take_try_exits(&mut self) -> Vec<(Exit, Cost)> {
+        let (taken, kept) = std::mem::take(&mut self.exits)
+            .into_iter()
+            .partition(|(exit, _)| exit.label.as_deref() == Some(TRY_EXIT));
+        self.exits = kept;
+        taken
     }
 
     /// Remove and return the exits that land on a target: a loop takes its
@@ -1765,6 +1791,8 @@ enum Target {
     Loop,
     /// A labeled block. A `break` with its label lands here.
     Block,
+    /// A `try` block. A `?` lands here, and `return` crosses it.
+    Try,
 }
 
 /// The cost of one loop pass, split by where it goes next. `None`: no path.
@@ -2300,6 +2328,22 @@ impl Analyzer {
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
             Expr::Cast(c) => self.referents_of(&c.expr),
+            // `(&mut left, 1)`, `[&mut left, &mut right]`: a part may borrow.
+            Expr::Tuple(_) | Expr::Array(_) | Expr::Struct(_) => {
+                let parts: Vec<&Expr> = match init {
+                    Expr::Tuple(t) => t.elems.iter().collect(),
+                    Expr::Array(a) => a.elems.iter().collect(),
+                    Expr::Struct(st) => st.fields.iter().map(|f| &f.expr).collect(),
+                    _ => Vec::new(),
+                };
+                let mut all: Vec<String> = parts
+                    .into_iter()
+                    .flat_map(|p| self.referents_of(p))
+                    .collect();
+                all.sort();
+                all.dedup();
+                all
+            }
             // `pick(&mut left)`, `(|x| x)(&mut left)`, `Some(&mut left)`: the
             // result may borrow any place a `&mut` argument points to.
             Expr::Call(c) => {
@@ -2690,7 +2734,7 @@ impl Analyzer {
         }
     }
 
-    /// Record the bindings at a `return` or `?`.
+    /// Record the bindings at a `return`.
     fn exit_body(&mut self) {
         if let Some(frame) = self
             .exits
@@ -2700,6 +2744,21 @@ impl Analyzer {
         {
             frame.record(&self.env, false);
         }
+    }
+
+    /// Record the bindings at a `?`, in the nearest `try` block or body.
+    /// Is that frame a `try` block?
+    fn exit_question(&mut self) -> bool {
+        let Some(frame) = self
+            .exits
+            .iter_mut()
+            .rev()
+            .find(|f| matches!(f.target, Target::Body | Target::Try))
+        else {
+            return false;
+        };
+        frame.record(&self.env, false);
+        frame.target == Target::Try
     }
 
     /// Run `f` as code that runs zero or one times.
@@ -2918,7 +2977,13 @@ impl Analyzer {
             }
             Expr::Try(e) => {
                 let flow = self.expr_in(&e.expr, awaited);
-                self.exit_body();
+                if self.exit_question() {
+                    // A failed `?` lands after its `try` block.
+                    return flow.then(Flow {
+                        fall: Some(Cost::ZERO),
+                        ..Flow::exit_to_try()
+                    });
+                }
                 flow
             }
             Expr::Paren(e) => self.expr_in(&e.expr, awaited),
@@ -3062,9 +3127,16 @@ impl Analyzer {
                     ..flow
                 }
             }
+            Expr::TryBlock(t) => {
+                let mut flow = self.framed(Target::Try, None, |s| s.block(&t.block));
+                let own = worst_of(flow.take_try_exits());
+                Flow {
+                    fall: worst(flow.fall, own),
+                    ..flow
+                }
+            }
             Expr::Block(syn::ExprBlock { block, .. })
-            | Expr::Unsafe(syn::ExprUnsafe { block, .. })
-            | Expr::TryBlock(syn::ExprTryBlock { block, .. }) => self.block(block),
+            | Expr::Unsafe(syn::ExprUnsafe { block, .. }) => self.block(block),
             // An async block may never be polled. A `return` or `?` in it
             // leaves the block only.
             Expr::Async(a) => Flow::cost(
@@ -12332,6 +12404,55 @@ mod tests {
                  let mut fill = |slot: &mut Vec<i64>| slot.push(1); \
                  fill(&mut list); render(list); let _ = repo; Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn try_blocks_and_aggregate_borrows() {
+        check_handlers(&[
+            (
+                "guard: a question mark leaves the try block only",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; \
+                 let _: Result<(), ()> = try { slot = Some(repo); Err(())?; slot = None; }; \
+                 slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: code after a try block runs after its question mark",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let _: Result<(), ()> = try { Err(())?; loop {} }; \
+                 repo.a().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a return in a try block leaves the function",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let _: Result<(), ()> = try { if flag { return Ok(0); } }; \
+                 repo.a().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a tuple keeps the borrow of its part",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let refs = (&mut slot,); *refs.0 = Some(repo); drop(refs); \
+                 slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an array keeps the borrows of its elements",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut a = None; let mut b = None; let refs = [&mut a, &mut b]; \
+                 *refs[1] = Some(repo); drop(refs); b.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a tuple write does not clear its target",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = Some(repo); let refs = (&mut slot, 1); *refs.0 = None; drop(refs); \
+                 slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
