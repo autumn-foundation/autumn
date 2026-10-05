@@ -109,6 +109,41 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Query budgets: an associated function handed the handle is opaque (#2316)
+
+**Why:** `Post::published(&mut db)` and `ReportBuilder::build(&mut db)` have
+the same shape. The analysis cannot tell a one-query finder from a helper
+that issues many queries. It counted both as 1 query, so a helper could hide
+an N+1. Now both are reported, like a free function handed the handle.
+
+You are affected only if a `#[query_budget(N)]` handler calls `Type::f(…)`
+with the `Db` handle. The build fails with "`f` is handed the database
+handle". Declare the cost of the statement.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[query_budget(1)]
+async fn index(mut db: Db) -> AutumnResult<Markup> {
+    let posts = Post::published(&mut db).await?;
+    Ok(render(&posts))
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[query_budget(1)]
+async fn index(mut db: Db) -> AutumnResult<Markup> {
+    #[query_cost(1)]
+    let posts = Post::published(&mut db).await?;
+    Ok(render(&posts))
+}
+```
+
+**Automation:** `manual` — the cost of each helper is a fact only its author
+knows, so no codemod can write the `N` in `#[query_cost(N)]`.
+
 ---
 
 ## Plugin authors

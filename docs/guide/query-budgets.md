@@ -117,13 +117,14 @@ Both halves are compiled in CI as trybuild fixtures — see
 |---|---|
 | Straight-line statements | **sum** |
 | `if` / `match` arms | **maximum** — only one arm runs, so the bound is the worst one |
+| `return`, `break`, `continue` | the path that leaves early does not pay for the code it skips. `if cached { return repo.find_cached().await; } repo.find_fresh().await` is **1** |
 | A loop whose body issues a query | **unbounded** (rejected under a finite budget) |
 | A loop with a literal bound (`for _ in 0..3`) | body cost **× 3** |
 | A loop whose body issues nothing | **0** — loops are free until they query |
 | A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, `limit()`, …) it carries — splitting the chain across `let` bindings does not change the count |
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
-| A `#[model]` static finder (`Post::published(&mut db)`) | **1** |
+| An associated function handed the handle (`Post::published(&mut db)`) | **reported** — declare it with `#[query_cost(N)]` |
 | `db.tx(\|conn\| …)` / `db.tx_with(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still counted |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
 | An `Option`/`Result` combinator closure (`unwrap_or_else`, `ok_or_else`, …) | counted **once** — it is not an iterator adapter |
@@ -131,6 +132,29 @@ Both halves are compiled in CI as trybuild fixtures — see
 A repository future is counted where it is **built**, not where it is awaited,
 so collecting futures in a `.map(…)` and driving them with `join_all` later is
 caught as the same N+1.
+
+## How a handle is tracked
+
+The analysis follows the handle through every name that holds it:
+
+- **Bindings.** `let`, `let … else`, assignment, `if let`, `while let`,
+  `match` arms, `for` patterns, closure parameters and transaction callback
+  parameters all bind the same way. A type on the binding counts too:
+  `let r: PgPostRepository = …` is a handle.
+- **Scopes.** A `let` in a block ends with the block. An assignment to a name
+  declared outside the block lasts after it.
+- **Branches.** After an `if`, a `match` or a loop, a name holds a handle when
+  it holds one on any path. An early exit carries its bindings to where it
+  lands.
+- **Containers.** A value built from a handle holds it: `[repo]`,
+  `vec![repo]`, `(repo, 1)`, `Some(repo)`, `Ctx { db }`, or a parameter of
+  type `Vec<PgPostRepository>`, `Option<…>`, a tuple, array or slice. An
+  element, a field or an unwrapped value of it is a handle. A method on the
+  container itself (`repos.len()`) is not a query. A helper handed the
+  container is reported.
+
+The container rule can over-count. `ctx.name.len()` on `Ctx { db, name }` is
+counted as a query. Move the value out before the struct is built.
 
 ## What the analysis refuses to guess
 
@@ -140,6 +164,9 @@ negative ships an N+1 to production.
 
 - **A helper function handed the handle** — `load_links(&mut db, id)`. Its body
   is another function; the macro sees only the call.
+- **An associated function handed the handle** — `Post::published(&mut db)`.
+  It has the same shape as `ReportBuilder::build(&mut db)`, which can issue any
+  number of queries. Declare a finder's cost with `#[query_cost(1)]`.
 - **A macro body that `await`s while naming the handle** — `html! { …
   (fetch(&mut db).await?) … }`. A macro body is token soup to `syn`. A template
   that merely *passes* the handle to a render helper is fine: only an `await`
@@ -293,8 +320,7 @@ Within an annotated function, every construct that can issue a query is either
 counted or reported — never silently skipped. Counting rests on two framework
 contracts, both of which the macro states in its diagnostics:
 
-1. One repository-chain call, one `#[model]` static finder, or one `preload`
-   association issues one query.
+1. One repository-chain call or one `preload` association issues one query.
 2. A call site the analysis cannot read declares its own cost with
    `#[query_cost(N)]`, or is excluded with `#[query_exempt(reason = "…")]`.
 
@@ -307,8 +333,9 @@ rather than assumed.
 
 The analysis tracks a handle from where the signature names it (the `Db` /
 repository extractor), through fields and conventionally-named accessors
-(`self.repo`, `state.db`, `app.pool()`), and into transaction callbacks. Two
-things sit outside it, by construction:
+(`self.repo`, `state.db`, `app.pool()`), through every binding and container
+(see [How a handle is tracked](#how-a-handle-is-tracked)), and into transaction
+callbacks. Two things sit outside it, by construction:
 
 - **A handle obtained some other way** — for example a repository pulled off an
   application-state extractor by an application-specific method

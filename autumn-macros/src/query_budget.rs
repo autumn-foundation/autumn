@@ -14,6 +14,8 @@
 //!
 //! * straight-line statements **sum**,
 //! * `if` / `match` arms take the **maximum** (the worst reachable path),
+//! * a path that leaves early (`return`, `break`) does **not** pay for the code
+//!   it skips ([`Flow`]),
 //! * a loop whose body issues a query is **unbounded** unless the iterable has
 //!   a literal, compile-time bound — this is the classic N+1,
 //! * anything the analysis cannot read (a helper function handed the handle, a
@@ -24,9 +26,12 @@
 //! `#[query_budget(unbounded, reason = ...)]` on the handler, and
 //! `#[query_cost(N)]` / `#[query_exempt(reason = ...)]` on a statement.
 //!
+//! A scoped [`Env`] follows each handle through every binding, branch, exit
+//! and container ([`Kind`]).
+//!
 //! See `docs/guide/query-budgets.md` for the user-facing guide.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use proc_macro2::{Span, TokenStream, TokenTree};
@@ -160,23 +165,14 @@ const SAFE_FREE_FNS: &[&str] = &["drop"];
 /// query issued through it is still counted.
 const HANDLE_ACCESSORS: &[&str] = &["db", "repo", "repository", "pool", "conn", "connection"];
 
-/// Async methods that turn an *already-tracked* handle into a fresher one of
-/// a possibly different type, rather than issuing a query — currently only
-/// `LazyDb::checkout` (autumn/src/db.rs, #2264), which turns a prepared-but-
-/// not-taken checkout into a live `Db`. Used two ways: `checkout` on a
-/// tracked receiver both hands its result the handle identity forward
-/// (`awaited_expr_is_fresh_handle`) and costs nothing itself
-/// (`method_chain`) — a connection checkout is plumbing, not a query the
-/// handler asked for, the same reason a plain `HANDLE_ACCESSORS` call never
-/// counts as one.
+/// Methods that turn a known `LazyDb` into a live `Db` without a query:
+/// `LazyDb::checkout` (autumn/src/db.rs, #2264). The call costs nothing and
+/// its result is a handle.
 ///
-/// Deliberately not added to `HANDLE_ACCESSORS`: that list matches a bare
-/// method name on *any* receiver, and "checkout" is also a real domain verb —
-/// `autumn-billing`'s own `self.checkout(&snapshot)` is a Stripe
-/// checkout-completed reconciliation, not a connection checkout. Gating on
-/// `self.expr_is_handle(&mc.receiver)` (see `awaited_expr_is_fresh_handle`)
-/// keeps that call unaffected: its receiver is a plain `&Ctx`, never a
-/// tracked handle, so the `&&` never reaches this list.
+/// Not in `HANDLE_ACCESSORS`, which matches a name on any receiver:
+/// "checkout" is also a domain verb (`autumn-billing`'s
+/// `self.checkout(&snapshot)`). It applies only to a receiver known to be a
+/// `LazyDb` (`expr_is_lazy_db`).
 const HANDLE_TRANSITIONS: &[&str] = &["checkout"];
 
 /// `Result`/`Option`-unwrapping methods that stand in for the `?` operator
@@ -201,16 +197,23 @@ const HANDLE_TYPES: &[&str] = &[
     "PooledConnection",
 ];
 
-/// Wrapper types safe to peer inside when looking for a specifically-`LazyDb`
-/// parameter (`Result<LazyDb, E>`, the shape a handler catching extraction
-/// failure uses; `Option`/`Arc`/`Rc`/`Box` and the common extractor wrappers,
-/// for the same reason `TRANSPARENT_WRAPPERS`/`EXTRACTOR_WRAPPERS` name them
-/// elsewhere in this codebase). Deliberately a *whitelist*, unlike
-/// `type_is_handle`'s own unrestricted generic-argument peering: an
-/// arbitrary, unrecognized wrapper (`Cart<LazyDb>`) must not qualify, since
-/// it may define its own domain `checkout()` (Codex review, PR #2762,
-/// round 7).
+/// Wrappers to look inside for a `LazyDb` parameter (`Result<LazyDb, E>`). An
+/// allowlist: an unknown wrapper (`Cart<LazyDb>`) may have its own domain
+/// `checkout()` (Codex review, PR #2762, round 7).
 const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Extension", "State"];
+
+/// Smart pointers. They deref to what they hold, so `Arc<PgPostRepository>`
+/// is a handle.
+const SMART_POINTERS: &[&str] = &["Box", "Arc", "Rc"];
+
+/// Types that hold values without being them. A `Vec<PgPostRepository>` is a
+/// carrier: a method on it is not a query, and its elements are handles.
+const CARRIER_TYPES: &[&str] = &["Vec", "VecDeque", "Option"];
+
+/// Methods on a carrier that return a number or a `bool`, not a part of it.
+const SCALAR_METHODS: &[&str] = &[
+    "len", "is_empty", "is_some", "is_none", "is_ok", "is_err", "contains", "count",
+];
 
 /// Offered when the fix is to stop issuing a query per row.
 const BATCH_HINT: &str = "Batch the per-row lookup into one query with `preload(...)`, or opt the \
@@ -380,34 +383,274 @@ impl Cost {
     }
 }
 
+/// The worse of two optional costs. `None` is "no path".
+fn worst(a: Option<Cost>, b: Option<Cost>) -> Option<Cost> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.or_worst(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// The cost of a construct, split by where each path goes next (#2316).
+///
+/// `None` means that no path goes there. A block folds its statements with
+/// [`Flow::then`]: an exit costs the statements before it plus its own cost,
+/// and only the paths that fall through pay for the next statement. So
+/// `if cached { return repo.a().await; } repo.b().await` costs 1, not 2.
+///
+/// `?` needs no rule. Its exit costs no more than the path that falls
+/// through, so the fall-through path always covers it.
+#[derive(Clone)]
+struct Flow {
+    /// Paths that reach the next statement.
+    fall: Option<Cost>,
+    /// Paths that leave by `break` or `continue`.
+    brk: Option<Cost>,
+    /// Paths that leave by `return`.
+    ret: Option<Cost>,
+}
+
+impl Flow {
+    const ZERO: Self = Self::cost(Cost::ZERO);
+    const NEVER: Self = Self {
+        fall: None,
+        brk: None,
+        ret: None,
+    };
+    const BREAK: Self = Self {
+        fall: None,
+        brk: Some(Cost::ZERO),
+        ret: None,
+    };
+    const RETURN: Self = Self {
+        fall: None,
+        brk: None,
+        ret: Some(Cost::ZERO),
+    };
+
+    const fn cost(cost: Cost) -> Self {
+        Self {
+            fall: Some(cost),
+            brk: None,
+            ret: None,
+        }
+    }
+
+    /// `self`, then `next` on the paths that fall through.
+    fn then(self, next: Self) -> Self {
+        let Some(fall) = self.fall else {
+            return self;
+        };
+        let after = |cost: Option<Cost>| cost.map(|c| fall.clone().then(c));
+        Self {
+            brk: worst(self.brk, after(next.brk)),
+            ret: worst(self.ret, after(next.ret)),
+            fall: after(next.fall),
+        }
+    }
+
+    /// Only one of `self` and `other` runs.
+    fn or_worst(self, other: Self) -> Self {
+        Self {
+            fall: worst(self.fall, other.fall),
+            brk: worst(self.brk, other.brk),
+            ret: worst(self.ret, other.ret),
+        }
+    }
+
+    /// The worst path, wherever it goes.
+    fn total(self) -> Cost {
+        worst(worst(self.fall, self.brk), self.ret).unwrap_or(Cost::ZERO)
+    }
+}
+
+// ── Binding environment ──────────────────────────────────────────────
+
+/// What a name holds. The order is the join: after a branch, a name holds
+/// the worst of what it holds on each path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    /// No database handle.
+    Plain,
+    /// A value that holds handles without being one: `[repo]`, `Some(repo)`,
+    /// `Vec<PgPostRepository>`. A method on it is not a query. Its elements,
+    /// fields and unwrapped value are handles.
+    Carrier,
+    /// A database handle.
+    Handle,
+    /// A `LazyDb`: a handle whose `checkout` is not a query.
+    LazyDb,
+}
+
+impl Kind {
+    /// What one part of a value of this kind holds.
+    const fn element(self) -> Self {
+        match self {
+            Self::Plain => Self::Plain,
+            Self::Carrier | Self::Handle => Self::Handle,
+            Self::LazyDb => Self::LazyDb,
+        }
+    }
+
+    const fn is_handle(self) -> bool {
+        matches!(self, Self::Handle | Self::LazyDb)
+    }
+}
+
+/// Lexical scopes, innermost last. Each scope maps a name to what it holds.
+#[derive(Clone, PartialEq, Eq)]
+struct Env {
+    scopes: Vec<HashMap<String, Kind>>,
+}
+
+impl Env {
+    fn new() -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
+        }
+    }
+
+    fn push(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn depth(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// What `name` holds, looking from scope `top` outwards.
+    fn get_from(&self, top: usize, name: &str) -> Kind {
+        self.scopes[..=top]
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+            .unwrap_or(Kind::Plain)
+    }
+
+    /// What `name` holds here.
+    fn get(&self, name: &str) -> Kind {
+        self.get_from(self.scopes.len() - 1, name)
+    }
+
+    /// Bind `name` in the innermost scope. This shadows an outer binding.
+    fn declare(&mut self, name: String, kind: Kind) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name, kind);
+        }
+    }
+
+    /// Store into the scope that declared `name`, so the value outlives
+    /// every inner scope. An undeclared name goes to the root scope.
+    fn assign(&mut self, name: String, kind: Kind) {
+        let at = self
+            .scopes
+            .iter()
+            .rposition(|scope| scope.contains_key(&name))
+            .unwrap_or(0);
+        self.scopes[at].insert(name, kind);
+    }
+
+    /// Join `other` into `self`: each name holds the worse of the two. Scopes
+    /// of `other` deeper than `self` are ignored.
+    fn join(&mut self, other: &Self) {
+        for (depth, theirs) in other.scopes.iter().enumerate().take(self.scopes.len()) {
+            for (name, kind) in theirs {
+                let mine = self.get_from(depth, name);
+                self.scopes[depth].insert(name.clone(), mine.max(*kind));
+            }
+        }
+    }
+
+    /// The names that hold a handle or a carrier here.
+    fn tracked(&self) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for scope in &self.scopes {
+            for (name, kind) in scope {
+                if *kind == Kind::Plain {
+                    names.remove(name);
+                } else {
+                    names.insert(name.clone());
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Where an exit lands, and the bindings at the exits that land there.
+struct ExitFrame {
+    /// A function, closure or async body. `return` and `?` land here, and
+    /// `break` does not cross it. Otherwise a loop or a labeled block.
+    body: bool,
+    /// The scope depth when the frame opened.
+    depth: usize,
+    /// The join of the bindings at every exit that landed here.
+    env: Option<Env>,
+}
+
+impl ExitFrame {
+    fn record(&mut self, env: &Env) {
+        let mut env = env.clone();
+        env.scopes.truncate(self.depth);
+        match &mut self.env {
+            Some(joined) => joined.join(&env),
+            None => self.env = Some(env),
+        }
+    }
+}
+
 // ── Analyzer ─────────────────────────────────────────────────────────
 
-/// Walks a function body accumulating [`Cost`] and a human-readable ledger of
-/// every counted call site (which the diagnostic prints back).
+/// Walks a function body. It returns a [`Flow`], keeps an [`Env`] of what
+/// each name holds, and keeps a ledger of every counted call site for the
+/// diagnostic.
+///
+/// Every binding goes through [`Analyzer::write`]. Every scope opens and
+/// closes in [`Analyzer::scoped`]. Every branch joins its bindings, and every
+/// exit records its bindings where it lands.
 struct Analyzer {
-    /// Identifiers currently bound to a database handle.
-    handles: HashSet<String>,
-    /// Identifiers currently bound to a handle known, specifically, to be a
-    /// `LazyDb` — a strict subset of `handles`. `HANDLE_TRANSITIONS`
-    /// (`checkout`) is gated on this, not on `handles`, because `handles`
-    /// also carries `*Repository`/`*Db`-suffixed types whose own `checkout`
-    /// method (a real, potentially query-issuing domain method) must not be
-    /// mistaken for `LazyDb::checkout`'s zero-cost connection handoff.
-    lazy_db_names: HashSet<String>,
+    env: Env,
+    exits: Vec<ExitFrame>,
     /// Counted call sites, in source order, for the diagnostic.
     ledger: Vec<String>,
     /// Errors raised by malformed `#[query_cost]` / `#[query_exempt]`.
     errors: Vec<syn::Error>,
 }
 
+/// How [`Analyzer::write`] stores a name.
+#[derive(Clone, Copy)]
+enum Write {
+    /// `let`, a pattern, or a parameter: a new binding in the innermost scope.
+    Declare,
+    /// `name = value`: the existing binding, wherever it was declared.
+    Assign,
+}
+
 impl Analyzer {
-    const fn new(handles: HashSet<String>, lazy_db_names: HashSet<String>) -> Self {
-        Self {
-            handles,
-            lazy_db_names,
+    /// An analyzer with the handler's parameters bound.
+    fn new(input_fn: &ItemFn) -> Self {
+        let mut analyzer = Self {
+            env: Env::new(),
+            exits: Vec::new(),
             ledger: Vec::new(),
             errors: Vec::new(),
+        };
+        for arg in &input_fn.sig.inputs {
+            if let syn::FnArg::Typed(typed) = arg {
+                analyzer.bind_pat(&typed.pat, type_kind(&typed.ty));
+            }
         }
+        analyzer
+    }
+
+    /// The cost of the handler's body.
+    fn function_body(&mut self, block: &Block) -> Cost {
+        self.framed(true, |s| s.block(block).total())
     }
 
     fn count(&mut self, what: &str) -> Cost {
@@ -415,205 +658,272 @@ impl Analyzer {
         Cost::Exact(1)
     }
 
-    // ── Blocks and statements ────────────────────────────────────────
+    // ── Bindings ─────────────────────────────────────────────────────
 
-    fn block(&mut self, block: &Block) -> Cost {
-        // A block scopes the names its own `let`s introduce (or shadow away),
-        // so `{ let repo = 1; }` must not strip `repo` for the rest of the
-        // function. It does *not* scope an assignment to a name declared
-        // outside it: `if flag { active = repo; }` is how a conditional
-        // initialises an outer binding, and restoring the whole set discarded
-        // that (#1667 review, round five). Restore exactly the declared names.
-        let outer = self.handles.clone();
-        let outer_lazy_db = self.lazy_db_names.clone();
-        let mut declared = HashSet::new();
-        let mut cost = Cost::ZERO;
-        for stmt in &block.stmts {
-            if let Stmt::Local(local) = stmt {
-                collect_pat_idents(&local.pat, &mut declared);
-            }
-            cost = cost.then(self.stmt(stmt));
+    /// Store what `name` holds. Every binding form ends here.
+    fn write(&mut self, name: &syn::Ident, kind: Kind, how: Write) {
+        let name = name.to_string();
+        match how {
+            Write::Declare => self.env.declare(name, kind),
+            Write::Assign => self.env.assign(name, kind),
         }
-        for name in declared {
-            if outer.contains(&name) {
-                self.handles.insert(name.clone());
-            } else {
-                self.handles.remove(&name);
-            }
-            if outer_lazy_db.contains(&name) {
-                self.lazy_db_names.insert(name);
-            } else {
-                self.lazy_db_names.remove(&name);
-            }
-        }
-        cost
     }
 
-    fn stmt(&mut self, stmt: &Stmt) -> Cost {
+    /// Bind the names in `pat` to the parts of a value that holds `kind`.
+    fn bind_pat(&mut self, pat: &Pat, kind: Kind) {
+        match pat {
+            Pat::Ident(p) => {
+                self.write(&p.ident, kind, Write::Declare);
+                if let Some((_, sub)) = &p.subpat {
+                    self.bind_pat(sub, kind);
+                }
+            }
+            Pat::Type(p) => self.bind_pat(&p.pat, kind.max(type_kind(&p.ty))),
+            Pat::Reference(p) => self.bind_pat(&p.pat, kind),
+            Pat::Paren(p) => self.bind_pat(&p.pat, kind),
+            Pat::Guard(p) => self.bind_pat(&p.pat, kind),
+            Pat::Or(p) => {
+                for case in &p.cases {
+                    self.bind_pat(case, kind);
+                }
+            }
+            Pat::Tuple(p) => {
+                for elem in &p.elems {
+                    self.bind_pat(elem, kind.element());
+                }
+            }
+            Pat::Slice(p) => {
+                for elem in &p.elems {
+                    self.bind_pat(elem, kind.element());
+                }
+            }
+            Pat::TupleStruct(p) => {
+                // `Err(e)` binds the error, not the handle of a `Result<Db, E>`.
+                let is_err = p.path.segments.last().is_some_and(|s| s.ident == "Err");
+                let part = if is_err { Kind::Plain } else { kind.element() };
+                for elem in &p.elems {
+                    self.bind_pat(elem, part);
+                }
+            }
+            Pat::Struct(p) => {
+                for field in &p.fields {
+                    self.bind_pat(&field.pat, kind.element());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Bind `pat` to `init`. A tuple or slice pattern over a literal of the
+    /// same shape binds part by part: `let (conn, key) = (db, id);`.
+    fn bind_init(&mut self, pat: &Pat, init: &Expr) {
+        match (pat, init) {
+            (Pat::Tuple(p), Expr::Tuple(t)) if same_shape(&p.elems, &t.elems) => {
+                for (part, value) in p.elems.iter().zip(&t.elems) {
+                    self.bind_init(part, value);
+                }
+            }
+            (Pat::Slice(p), Expr::Array(a)) if same_shape(&p.elems, &a.elems) => {
+                for (part, value) in p.elems.iter().zip(&a.elems) {
+                    self.bind_init(part, value);
+                }
+            }
+            (Pat::Paren(p), _) => self.bind_init(&p.pat, init),
+            (_, Expr::Paren(e)) => self.bind_init(pat, &e.expr),
+            _ => {
+                let kind = self.value_of(init);
+                self.bind_pat(pat, kind);
+            }
+        }
+    }
+
+    /// `place = value`. A tuple or array place over a literal of the same
+    /// shape assigns part by part.
+    fn assign(&mut self, place: &Expr, value: &Expr) {
+        match (place, value) {
+            (Expr::Tuple(p), Expr::Tuple(v)) if p.elems.len() == v.elems.len() => {
+                for (part, value) in p.elems.iter().zip(&v.elems) {
+                    self.assign(part, value);
+                }
+            }
+            (Expr::Array(p), Expr::Array(v)) if p.elems.len() == v.elems.len() => {
+                for (part, value) in p.elems.iter().zip(&v.elems) {
+                    self.assign(part, value);
+                }
+            }
+            (Expr::Paren(p), _) => self.assign(&p.expr, value),
+            _ => {
+                let kind = self.value_of(value);
+                self.assign_kind(place, kind);
+            }
+        }
+    }
+
+    fn assign_kind(&mut self, place: &Expr, kind: Kind) {
+        match place {
+            Expr::Path(p) => {
+                if let Some(ident) = p.path.get_ident() {
+                    self.write(ident, kind, Write::Assign);
+                }
+            }
+            Expr::Paren(p) => self.assign_kind(&p.expr, kind),
+            Expr::Tuple(t) => {
+                for part in &t.elems {
+                    self.assign_kind(part, kind.element());
+                }
+            }
+            Expr::Array(a) => {
+                for part in &a.elems {
+                    self.assign_kind(part, kind.element());
+                }
+            }
+            // A field, an index or `*r`. The environment holds names only.
+            _ => {}
+        }
+    }
+
+    // ── Scopes, branches and exits ───────────────────────────────────
+
+    /// Run `f` in a new innermost scope.
+    fn scoped<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.env.push();
+        let out = f(self);
+        self.env.pop();
+        out
+    }
+
+    /// Run `f` in an exit frame, then join the bindings of every exit that
+    /// landed in it.
+    fn framed<T>(&mut self, body: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.exits.push(ExitFrame {
+            body,
+            depth: self.env.depth(),
+            env: None,
+        });
+        let out = f(self);
+        if let Some(frame) = self.exits.pop()
+            && let Some(env) = frame.env
+        {
+            self.env.join(&env);
+        }
+        out
+    }
+
+    /// Record the bindings at a `break` or `continue`. Labels are not
+    /// resolved, so every loop and labeled block up to the enclosing body
+    /// gets them.
+    fn exit_loop(&mut self) {
+        for frame in self.exits.iter_mut().rev() {
+            if frame.body {
+                break;
+            }
+            frame.record(&self.env);
+        }
+    }
+
+    /// Record the bindings at a `return` or `?`.
+    fn exit_body(&mut self) {
+        if let Some(frame) = self.exits.iter_mut().rev().find(|f| f.body) {
+            frame.record(&self.env);
+        }
+    }
+
+    /// Run `f` as code that runs zero or one times.
+    fn optional<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let entry = self.env.clone();
+        let out = f(self);
+        self.env.join(&entry);
+        out
+    }
+
+    /// Run `f` as code that runs zero or more times: a loop body or a
+    /// closure body. Repeat until the bindings stop changing, so a binding
+    /// made late in one pass reaches the next. Each repeat drops the ledger
+    /// lines and errors of the pass before it.
+    fn repeated<T>(&mut self, mut f: impl FnMut(&mut Self) -> T) -> T {
+        loop {
+            let entry = self.env.clone();
+            let (ledger, errors) = (self.ledger.len(), self.errors.len());
+            let out = f(self);
+            let mut joined = entry.clone();
+            joined.join(&self.env);
+            if joined == entry {
+                self.env = entry;
+                return out;
+            }
+            self.env = joined;
+            self.ledger.truncate(ledger);
+            self.errors.truncate(errors);
+        }
+    }
+
+    /// Run `f` for its bindings only. Drop what it counts and the errors it
+    /// raises.
+    fn bindings_only(&mut self, f: impl FnOnce(&mut Self)) {
+        let (ledger, errors) = (self.ledger.len(), self.errors.len());
+        f(self);
+        self.ledger.truncate(ledger);
+        self.errors.truncate(errors);
+    }
+
+    // ── Blocks and statements ────────────────────────────────────────
+
+    fn block(&mut self, block: &Block) -> Flow {
+        self.scoped(|s| {
+            let mut flow = Flow::ZERO;
+            for stmt in &block.stmts {
+                let next = s.stmt(stmt);
+                flow = flow.then(next);
+            }
+            flow
+        })
+    }
+
+    fn stmt(&mut self, stmt: &Stmt) -> Flow {
         let attrs: &[Attribute] = match stmt {
             Stmt::Local(local) => &local.attrs,
-            Stmt::Expr(expr, _) => expr_attrs(expr),
+            Stmt::Expr(expr, _) => stmt_expr_attrs(expr),
             Stmt::Macro(m) => &m.attrs,
             // A nested `fn`/`struct`/`impl` is a *definition*; nothing runs
             // here. A call to it is analysed at the call site instead.
-            Stmt::Item(_) => return Cost::ZERO,
+            Stmt::Item(_) => return Flow::ZERO,
         };
-
-        // An annotation replaces the statement's *cost*, never its effect on
-        // handle tracking. `#[query_exempt(...)] let shard = repo.for_shard(id);`
-        // still binds `shard` to a handle; forgetting that made a later
-        // `shard.find_all()` — including one inside a loop — invisible (#1667
-        // review).
-        match self.annotation(attrs) {
-            Some(Annotation::Cost(n)) => {
-                if let Stmt::Local(local) = stmt {
-                    self.bind_handles(local);
-                }
-                return Cost::Exact(n);
-            }
-            Some(Annotation::Exempt) => {
-                if let Stmt::Local(local) = stmt {
-                    self.bind_handles(local);
-                }
-                return Cost::ZERO;
-            }
-            None => {}
+        // An annotation replaces the statement's cost, not its bindings.
+        if let Some(annotation) = self.annotation(attrs) {
+            self.bindings_only(|s| {
+                s.stmt_unannotated(stmt);
+            });
+            return Flow::cost(annotation.cost());
         }
+        self.stmt_unannotated(stmt)
+    }
 
+    fn stmt_unannotated(&mut self, stmt: &Stmt) -> Flow {
         match stmt {
             Stmt::Local(local) => self.local(local),
             Stmt::Expr(expr, _) => self.expr(expr),
-            Stmt::Macro(m) => self.mac(&m.mac),
-            Stmt::Item(_) => Cost::ZERO,
+            Stmt::Macro(m) => Flow::cost(self.mac(&m.mac)),
+            Stmt::Item(_) => Flow::ZERO,
         }
     }
 
-    fn local(&mut self, local: &Local) -> Cost {
-        let mut cost = Cost::ZERO;
-        if let Some(init) = &local.init {
-            cost = cost.then(self.expr(&init.expr));
-            if let Some((_, diverge)) = &init.diverge {
-                cost = cost.then(self.expr(diverge));
-            }
-        }
-        self.bind_handles(local);
-        cost
-    }
-
-    /// Propagate handle identity from a `let`'s initialiser to its bindings.
-    ///
-    /// Split out of [`Self::local`] because it must run for an *annotated*
-    /// local too: the annotation declares what the statement costs, not
-    /// whether its bindings are handles.
-    fn bind_handles(&mut self, local: &Local) {
+    fn local(&mut self, local: &Local) -> Flow {
         let Some(init) = &local.init else {
-            // `let repo;` with no initialiser still shadows: the name holds
-            // nothing yet, so it is not a handle.
-            self.rebind(&local.pat, false);
-            self.rebind_lazy_db(&local.pat, false);
-            return;
+            // `let repo;` holds nothing yet.
+            self.bind_pat(&local.pat, Kind::Plain);
+            return Flow::ZERO;
         };
-        // A binding initialised from a handle — or from a chain rooted at one,
-        // so a builder chain split across `let`s keeps its identity — is
-        // itself a handle from here on.
-        if self.expr_is_handle(&init.expr) || self.chain_root_is_handle(&init.expr) {
-            self.rebind(&local.pat, true);
-            self.rebind_lazy_db(&local.pat, self.expr_is_lazy_db(&init.expr));
-        } else if matches!(&local.pat, Pat::Tuple(_)) && matches!(&*init.expr, Expr::Tuple(_)) {
-            let (Pat::Tuple(pat), Expr::Tuple(init_tuple)) = (&local.pat, &*init.expr) else {
-                unreachable!("guarded by the matches! above")
-            };
-            // `let (conn, key) = (db, id);` — pair the pattern against the
-            // initialiser element-wise so the handle keeps its tracking.
-            for (element_pat, element) in pat.elems.iter().zip(init_tuple.elems.iter()) {
-                let is_handle = self.expr_is_handle(element) || self.chain_root_is_handle(element);
-                self.rebind(element_pat, is_handle);
-                self.rebind_lazy_db(element_pat, self.expr_is_lazy_db(element));
-            }
-        } else {
-            // Shadowing. `let repo = repo.find_all().await?;` rebinds the name
-            // to a `Vec`, and the old identity must go with it — otherwise
-            // `repo.len()` is scored as another query and handing the rows to a
-            // renderer is reported as a handle escaping (#1667 review, round
-            // three). `block` restores the outer set, so this cannot leak past
-            // the enclosing scope.
-            self.rebind(&local.pat, false);
-            self.rebind_lazy_db(&local.pat, false);
+        let mut flow = self.expr(&init.expr);
+        if let Some((_, diverge)) = &init.diverge {
+            // The `else` block always leaves, so its bindings do not reach
+            // the next statement. Its exits record their own.
+            let entry = self.env.clone();
+            let diverge = self.expr(diverge);
+            self.env = entry;
+            flow = flow.then(Flow::ZERO.or_worst(diverge));
         }
-    }
-
-    /// Bind `pat` for a nested scope, returning what those names meant before.
-    ///
-    /// Restoring *only* these names matters: a whole-set snapshot would also
-    /// undo an assignment the scope made to an **outer** name, and assignments
-    /// are not lexically scoped (#1667 review, round five).
-    fn enter_binding_scope(&mut self, pat: &Pat, is_handle: bool) -> Vec<(String, bool, bool)> {
-        let mut names = HashSet::new();
-        collect_pat_idents(pat, &mut names);
-        let saved: Vec<(String, bool, bool)> = names
-            .iter()
-            .map(|n| {
-                (
-                    n.clone(),
-                    self.handles.contains(n),
-                    self.lazy_db_names.contains(n),
-                )
-            })
-            .collect();
-        self.rebind(pat, is_handle);
-        // A closure parameter is never known to be specifically `LazyDb`
-        // (deliberately narrow — see `lazy_db_names`'s own doc comment), so
-        // this always clears rather than sets: a name the closure shadows
-        // must not keep an outer scope's `LazyDb` identity for the scope's
-        // duration.
-        self.rebind_lazy_db(pat, false);
-        saved
-    }
-
-    /// Undo an [`Self::enter_binding_scope`], name by name.
-    fn leave_binding_scope(&mut self, saved: Vec<(String, bool, bool)>) {
-        for (name, was_handle, was_lazy_db) in saved {
-            if was_handle {
-                self.handles.insert(name.clone());
-            } else {
-                self.handles.remove(&name);
-            }
-            if was_lazy_db {
-                self.lazy_db_names.insert(name);
-            } else {
-                self.lazy_db_names.remove(&name);
-            }
-        }
-    }
-
-    /// Bind every name in `pat` to a handle, or clear whatever identity those
-    /// names carried. Insertion alone is not enough: a `HashSet` of names has
-    /// no notion of shadowing, so a rebinding must actively remove.
-    fn rebind(&mut self, pat: &Pat, is_handle: bool) {
-        let mut names = HashSet::new();
-        collect_pat_idents(pat, &mut names);
-        if is_handle {
-            self.handles.extend(names);
-        } else {
-            for name in names {
-                self.handles.remove(&name);
-            }
-        }
-    }
-
-    /// `rebind`'s counterpart for `lazy_db_names`: every binding this touches
-    /// is also passed through `rebind`, so a name here is always a subset of
-    /// `handles`.
-    fn rebind_lazy_db(&mut self, pat: &Pat, is_lazy_db: bool) {
-        let mut names = HashSet::new();
-        collect_pat_idents(pat, &mut names);
-        if is_lazy_db {
-            self.lazy_db_names.extend(names);
-        } else {
-            for name in names {
-                self.lazy_db_names.remove(&name);
-            }
-        }
+        self.bind_init(&local.pat, &init.expr);
+        flow
     }
 
     /// Read a `#[query_cost(N)]` / `#[query_exempt(...)]` statement annotation.
@@ -661,235 +971,281 @@ impl Analyzer {
 
     // ── Expressions ──────────────────────────────────────────────────
 
-    fn expr(&mut self, expr: &Expr) -> Cost {
+    fn expr(&mut self, expr: &Expr) -> Flow {
         self.expr_in(expr, false)
+    }
+
+    /// The cost of every path through `expr`. Used for operands, where an
+    /// exit is rare: taking it as a fall-through can only over-count.
+    fn cost_of(&mut self, expr: &Expr) -> Cost {
+        self.expr(expr).total()
     }
 
     /// `awaited` says whether this expression is the base of an enclosing
     /// `.await` — the marker that a chain actually runs.
     #[allow(clippy::too_many_lines)]
-    fn expr_in(&mut self, expr: &Expr, awaited: bool) -> Cost {
+    fn expr_in(&mut self, expr: &Expr, awaited: bool) -> Flow {
         match expr {
             Expr::Await(e) => self.expr_in(&e.base, true),
-            Expr::Try(e) => self.expr_in(&e.expr, awaited),
+            Expr::Try(e) => {
+                let flow = self.expr_in(&e.expr, awaited);
+                self.exit_body();
+                flow
+            }
             Expr::Paren(e) => self.expr_in(&e.expr, awaited),
             Expr::Group(e) => self.expr_in(&e.expr, awaited),
 
-            Expr::MethodCall(mc) => self.method_chain(mc, awaited),
+            Expr::MethodCall(mc) => Flow::cost(self.method_chain(mc, awaited)),
             // `(|| async move { … })()` — the shape `#[cached]` wraps a handler
-            // body in when it expands first. The closure runs exactly once, so
-            // look straight through it rather than reporting a closure the user
-            // never wrote.
+            // body in. It runs exactly once, so it is seen through rather than
+            // reported as a closure the user never wrote.
             Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
                 let closure = immediately_invoked_closure(&call.func)
                     .expect("guarded by the match arm above");
                 let mut cost = Cost::ZERO;
                 for arg in &call.args {
-                    cost = cost.then(self.expr(arg));
+                    cost = cost.then(self.cost_of(arg));
                 }
-                // Bind each parameter from its argument before walking the
-                // body. `(|active| async move { active.find_all().await })(repo)`
-                // otherwise left `active` untracked and the finder free (#1667
-                // review, round five) — the general closure arm scopes
-                // parameters, but this shortcut bypassed it.
-                let mut saved = Vec::new();
-                for (param, arg) in closure.inputs.iter().zip(call.args.iter()) {
-                    let is_handle = self.expr_carries_handle(arg);
-                    saved.extend(self.enter_binding_scope(param, is_handle));
-                }
-                // A parameter with no matching argument still shadows.
-                for param in closure.inputs.iter().skip(call.args.len()) {
-                    saved.extend(self.enter_binding_scope(param, false));
-                }
-                let body = self.expr(&closure.body);
-                self.leave_binding_scope(saved);
-                cost.then(body)
+                let params: Vec<Kind> = call.args.iter().map(|a| self.value_of(a)).collect();
+                Flow::cost(cost.then(self.closure_body(closure, &params, Kind::Plain)))
             }
-            Expr::Call(call) => self.call(call),
-            Expr::Macro(m) => self.mac(&m.mac),
-            Expr::Closure(closure) => {
-                // A parameter shadows whatever the name meant outside:
-                // `rows.iter().map(|repo| repo.len())` binds an element, not
-                // the repository. Analysing the body against the outer
-                // identity scored `len()` as a query and then blamed the
-                // closure for it (#1667 review, round four).
-                let mut saved = Vec::new();
-                for input in &closure.inputs {
-                    saved.extend(self.enter_binding_scope(input, false));
-                }
-                let body = self.expr(&closure.body);
-                self.leave_binding_scope(saved);
-                if body.is_zero() {
-                    Cost::ZERO
-                } else if matches!(body, Cost::Unbounded(_)) {
-                    // The body already explains itself (a nested loop, an
-                    // opaque helper). Don't overwrite a better diagnostic.
-                    body
-                } else {
-                    Cost::unbounded(
-                        closure.span(),
-                        format!(
-                            "a database query ({}) runs inside a closure, which the analysis \
-                             cannot prove runs only once",
-                            self.last_counted()
-                        ),
-                        BATCH_HINT,
-                    )
-                }
-            }
+            Expr::Call(call) => Flow::cost(self.call(call)),
+            Expr::Macro(m) => Flow::cost(self.mac(&m.mac)),
+            Expr::Closure(_) => Flow::cost(self.closure_arg(expr, Kind::Plain)),
 
             Expr::ForLoop(f) => {
-                let iter = self.expr(&f.expr);
-                // The loop variable inherits the iterable's provenance:
-                // `for active in [repo]` yields a handle under a new name, and
-                // leaving it untracked made the body's finder free (#1667
-                // review, round five).
-                let yields_handle = self.expr_carries_handle(&f.expr);
-                let saved = self.enter_binding_scope(&f.pat, yields_handle);
+                let iter = self.cost_of(&f.expr);
+                let element = self.value_of(&f.expr).element();
                 let before = self.ledger.len();
-                let body = self.block(&f.body);
-                self.leave_binding_scope(saved);
-                iter.then(self.bound_loop(body, const_bound(&f.expr), f.span(), before))
+                let body = self.repeated(|s| {
+                    s.framed(false, |s| {
+                        s.scoped(|s| {
+                            s.bind_pat(&f.pat, element);
+                            s.block(&f.body).total()
+                        })
+                    })
+                });
+                let bound = const_bound(&f.expr);
+                Flow::cost(iter.then(self.bound_loop(body, bound, f.span(), before)))
             }
             Expr::While(w) => {
-                // The condition is re-evaluated on every iteration, so a query
-                // in it (`while let Some(job) = repo.next_pending().await?`) is
-                // loop-resident, not a one-off prologue.
+                // The condition runs on every pass, so a query in it
+                // (`while let Some(job) = repo.next_pending().await?`) is
+                // loop-resident.
                 let before = self.ledger.len();
-                let cond = self.expr(&w.cond);
-                let body = self.block(&w.body);
-                self.bound_loop(cond.then(body), None, w.span(), before)
+                let body = self.repeated(|s| {
+                    s.framed(false, |s| {
+                        s.scoped(|s| {
+                            let cond = s.cost_of(&w.cond);
+                            cond.then(s.block(&w.body).total())
+                        })
+                    })
+                });
+                Flow::cost(self.bound_loop(body, None, w.span(), before))
             }
             Expr::Loop(l) => {
                 let before = self.ledger.len();
-                let body = self.block(&l.body);
-                self.bound_loop(body, None, l.span(), before)
+                let body = self.repeated(|s| s.framed(false, |s| s.block(&l.body).total()));
+                Flow::cost(self.bound_loop(body, None, l.span(), before))
             }
 
             Expr::If(i) => {
+                // `if let` binds in a scope that covers the condition and the
+                // then-branch only.
+                self.env.push();
                 let cond = self.expr(&i.cond);
+                let mut else_env = self.env.clone();
+                else_env.pop();
                 let then = self.block(&i.then_branch);
+                self.env.pop();
+                let then_env = std::mem::replace(&mut self.env, else_env);
                 let els = i
                     .else_branch
                     .as_ref()
-                    .map_or(Cost::ZERO, |(_, e)| self.expr(e));
+                    .map_or(Flow::ZERO, |(_, e)| self.expr(e));
+                self.env.join(&then_env);
                 cond.then(then.or_worst(els))
             }
-            Expr::Match(m) => {
-                let mut cost = self.expr(&m.expr);
-                // Exactly one *body* runs, so bodies take the worst arm. Guards
-                // are different: a failing guard falls through to the next
-                // matching arm, so every guard on the path can run. They sum.
-                let mut worst_body = Cost::ZERO;
-                for arm in &m.arms {
-                    if let (_, Some(guard)) = crate::parse::arm_pat_and_guard(arm) {
-                        cost = cost.then(self.expr(guard));
-                    }
-                    let body = match self.annotation(&arm.attrs) {
-                        Some(Annotation::Cost(n)) => Cost::Exact(n),
-                        Some(Annotation::Exempt) => Cost::ZERO,
-                        None => self.expr(&arm.body),
-                    };
-                    worst_body = worst_body.or_worst(body);
-                }
-                cost.then(worst_body)
-            }
+            Expr::Match(m) => self.match_expr(m),
 
+            Expr::Block(b) if b.label.is_some() => {
+                // `break 'label` lands after the block.
+                let flow = self.framed(false, |s| s.block(&b.block));
+                Flow {
+                    fall: worst(flow.fall, flow.brk.clone()),
+                    ..flow
+                }
+            }
             Expr::Block(syn::ExprBlock { block, .. })
-            | Expr::Async(syn::ExprAsync { block, .. })
             | Expr::Unsafe(syn::ExprUnsafe { block, .. })
             | Expr::TryBlock(syn::ExprTryBlock { block, .. }) => self.block(block),
+            // An async block may never be polled. A `return` or `?` in it
+            // leaves the block only.
+            Expr::Async(a) => {
+                Flow::cost(self.optional(|s| s.framed(true, |s| s.block(&a.block).total())))
+            }
+            Expr::Const(c) => Flow::cost(self.block(&c.block).total()),
 
             Expr::Array(a) => self.each(a.elems.iter()),
             Expr::Tuple(t) => self.each(t.elems.iter()),
             Expr::Assign(a) => {
-                let cost = self.expr(&a.left).then(self.expr(&a.right));
-                // `active = repo;` makes `active` a handle just as a `let`
-                // would; without this the queries through it vanish (#1667
-                // review, round three). A non-handle RHS clears it, for the
-                // same reason shadowing does.
-                if let Expr::Path(path) = &*a.left
-                    && let Some(ident) = path.path.get_ident()
-                {
-                    let is_handle =
-                        self.expr_is_handle(&a.right) || self.chain_root_is_handle(&a.right);
-                    if is_handle {
-                        self.handles.insert(ident.to_string());
-                    } else {
-                        self.handles.remove(&ident.to_string());
-                    }
-                    // `lazy_db_names` must track an assignment the same way
-                    // `handles` does: `let selected; selected = lazy_db;` is
-                    // the deferred-initialisation idiom this same file's own
-                    // annotation-preserving code uses elsewhere, and without
-                    // this, `selected.checkout()` would fall back to the
-                    // ordinary "counted call" path — silently reintroducing
-                    // the exact `#[query_budget(1)]` false rejection this
-                    // whole `lazy_db_names` mechanism exists to avoid, just
-                    // reached through `=` instead of `let` (Codex review,
-                    // PR #2762, round 4).
-                    if self.expr_is_lazy_db(&a.right) {
-                        self.lazy_db_names.insert(ident.to_string());
-                    } else {
-                        self.lazy_db_names.remove(&ident.to_string());
-                    }
-                }
-                cost
+                let flow = self.expr(&a.left).then(self.expr(&a.right));
+                self.assign(&a.left, &a.right);
+                flow
             }
             Expr::Binary(b) => self.expr(&b.left).then(self.expr(&b.right)),
-            Expr::Break(b) => b.expr.as_deref().map_or(Cost::ZERO, |e| self.expr(e)),
+            Expr::Return(r) => {
+                let value = r.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
+                self.exit_body();
+                value.then(Flow::RETURN)
+            }
+            Expr::Break(b) => {
+                let value = b.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
+                self.exit_loop();
+                value.then(Flow::BREAK)
+            }
+            Expr::Continue(_) => {
+                self.exit_loop();
+                Flow::BREAK
+            }
             Expr::Cast(c) => self.expr(&c.expr),
             Expr::Field(f) => self.expr(&f.base),
             Expr::Index(i) => self.expr(&i.expr).then(self.expr(&i.index)),
-            Expr::Let(l) => self.expr(&l.expr),
+            Expr::Let(l) => {
+                let flow = self.expr(&l.expr);
+                self.bind_init(&l.pat, &l.expr);
+                flow
+            }
             Expr::Range(r) => {
-                let start = r.start.as_deref().map_or(Cost::ZERO, |e| self.expr(e));
-                let end = r.end.as_deref().map_or(Cost::ZERO, |e| self.expr(e));
+                let start = r.start.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
+                let end = r.end.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
                 start.then(end)
             }
             Expr::RawAddr(r) => self.expr(&r.expr),
             Expr::Reference(r) => self.expr(&r.expr),
             Expr::Repeat(r) => self.expr(&r.expr).then(self.expr(&r.len)),
-            Expr::Return(r) => r.expr.as_deref().map_or(Cost::ZERO, |e| self.expr(e)),
             Expr::Struct(s) => {
-                let mut cost = self.each(s.fields.iter().map(|f| &f.expr));
+                let mut flow = self.each(s.fields.iter().map(|f| &f.expr));
                 if let Some(rest) = &s.rest {
-                    cost = cost.then(self.expr(rest));
+                    flow = flow.then(self.expr(rest));
                 }
-                cost
+                flow
             }
             Expr::Unary(u) => self.expr(&u.expr),
-            Expr::Yield(y) => y.expr.as_deref().map_or(Cost::ZERO, |e| self.expr(e)),
+            Expr::Yield(y) => y.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e)),
 
             // Forms that hold no reachable call at all.
-            Expr::Lit(_) | Expr::Path(_) | Expr::Infer(_) | Expr::Continue(_) => Cost::ZERO,
-            Expr::Const(c) => self.block(&c.block),
+            Expr::Lit(_) | Expr::Path(_) | Expr::Infer(_) => Flow::ZERO,
 
             // `Expr::Verbatim` — syntax this `syn` could not parse — and any
             // variant a future `syn` adds. Assuming those are query-free would
             // make the no-false-negative claim depend on the toolchain, so an
             // unreadable form that names the handle is reported instead.
             other => {
-                if tokens_mention_any(&other.to_token_stream(), &self.handles) {
-                    Cost::unbounded(
+                if tokens_mention_any(&other.to_token_stream(), &self.env.tracked()) {
+                    Flow::cost(Cost::unbounded(
                         other.span(),
                         "an expression form the analysis does not recognise names the database \
                          handle",
                         DECLARE_HINT,
-                    )
+                    ))
                 } else {
-                    Cost::ZERO
+                    Flow::ZERO
                 }
             }
         }
     }
 
-    fn each<'a>(&mut self, exprs: impl Iterator<Item = &'a Expr>) -> Cost {
-        let mut cost = Cost::ZERO;
-        for expr in exprs {
-            cost = cost.then(self.expr(expr));
+    /// A `match`. Each arm starts from the bindings after the scrutinee, and
+    /// the arms' bindings join afterwards. Exactly one body runs, so bodies
+    /// take the worst arm. A failing guard falls through to the next arm, so
+    /// every guard on the path can run: guards sum.
+    fn match_expr(&mut self, m: &syn::ExprMatch) -> Flow {
+        let scrutinee = self.expr(&m.expr);
+        let entry = self.env.clone();
+        let mut guards = Cost::ZERO;
+        let mut bodies = Flow::NEVER;
+        let mut joined: Option<Env> = None;
+        for arm in &m.arms {
+            self.env = entry.clone();
+            let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
+            let body = self.scoped(|s| {
+                s.bind_init(pat, &m.expr);
+                if let Some(guard) = guard {
+                    guards = std::mem::replace(&mut guards, Cost::ZERO).then(s.cost_of(guard));
+                }
+                match s.annotation(&arm.attrs) {
+                    Some(annotation) => {
+                        s.bindings_only(|s| {
+                            s.expr(&arm.body);
+                        });
+                        Flow::cost(annotation.cost())
+                    }
+                    None => s.expr(&arm.body),
+                }
+            });
+            bodies = bodies.or_worst(body);
+            match &mut joined {
+                Some(env) => env.join(&self.env),
+                None => joined = Some(self.env.clone()),
+            }
         }
-        cost
+        self.env = joined.unwrap_or(entry);
+        scrutinee.then(Flow::cost(guards)).then(bodies)
+    }
+
+    fn each<'a>(&mut self, exprs: impl Iterator<Item = &'a Expr>) -> Flow {
+        let mut flow = Flow::ZERO;
+        for expr in exprs {
+            let next = self.expr(expr);
+            flow = flow.then(next);
+        }
+        flow
+    }
+
+    /// A closure's body, with parameter `i` bound to `params[i]`, or to
+    /// `rest` past the end. A `return` inside leaves the closure only.
+    fn closure_body(&mut self, closure: &syn::ExprClosure, params: &[Kind], rest: Kind) -> Cost {
+        self.framed(true, |s| {
+            s.scoped(|s| {
+                for (i, input) in closure.inputs.iter().enumerate() {
+                    s.bind_pat(input, params.get(i).copied().unwrap_or(rest));
+                }
+                s.cost_of(&closure.body)
+            })
+        })
+    }
+
+    /// An argument that may be a closure run any number of times. A query in
+    /// it is unbounded.
+    fn closure_arg(&mut self, arg: &Expr, param: Kind) -> Cost {
+        let Expr::Closure(closure) = arg else {
+            return self.cost_of(arg);
+        };
+        let body = self.repeated(|s| s.closure_body(closure, &[], param));
+        if body.is_zero() || matches!(body, Cost::Unbounded(_)) {
+            // An unbounded body already explains itself (a nested loop, an
+            // opaque helper). Do not overwrite a better diagnostic.
+            return body;
+        }
+        Cost::unbounded(
+            closure.span(),
+            format!(
+                "a database query ({}) runs inside a closure, which the analysis cannot prove \
+                 runs only once",
+                self.last_counted()
+            ),
+            BATCH_HINT,
+        )
+    }
+
+    /// An argument that runs at most once, such as a transaction callback.
+    /// The closure body is a fixed cost.
+    fn callback_arg(&mut self, arg: &Expr, param: Kind) -> Cost {
+        let Expr::Closure(closure) = arg else {
+            return self.cost_of(arg);
+        };
+        self.optional(|s| s.closure_body(closure, &[], param))
     }
 
     /// Turn a loop body's cost into the loop's cost.
@@ -944,17 +1300,17 @@ impl Analyzer {
         };
         methods.reverse();
 
-        let mut cost = self.expr(root);
+        let mut cost = self.cost_of(root);
 
         // Where the handle enters the chain: the root itself, or the first
-        // conventional accessor (`app.db()…`, `ctx.repo()…`). Methods before
-        // it are ordinary; methods after it act on a handle.
+        // method that yields one (`app.db()…`, `slot.unwrap()…`). Methods
+        // before it are ordinary; methods after it act on a handle.
         let handle_from = if self.expr_is_handle(root) {
             Some(0)
         } else {
             methods
                 .iter()
-                .position(|m| HANDLE_ACCESSORS.contains(&m.method.to_string().as_str()))
+                .position(|m| self.method_is_handle(m))
                 .map(|i| i + 1)
         };
 
@@ -1001,19 +1357,9 @@ impl Analyzer {
             let Some(last) = on_handle.last().map(|m| m.method.to_string()) else {
                 return cost;
             };
-            // A `HANDLE_TRANSITIONS` method (`checkout`) never costs a query,
-            // awaited or not: unlike a builder name, it cannot double as a
-            // real finder someone happened to await, so there is no reason to
-            // charge it once the chain runs. Checked ahead of the builder
-            // rule below because it is unconditional, where that one only
-            // applies while `!awaited`.
-            //
-            // Gated on `expr_is_lazy_db(root)`, not just "rooted at *some*
-            // handle": `handles` also covers `*Repository`/`*Db`-suffixed
-            // types via a name-suffix heuristic, and a domain `checkout()`
-            // method on one of those (a real, possibly query-issuing call)
-            // must not be zero-cost just because it shares `LazyDb::checkout`'s
-            // name (Codex review, PR #2762, round 3).
+            // `LazyDb::checkout` hands over a connection and costs nothing,
+            // awaited or not. Only on a known `LazyDb`: a repository's own
+            // `checkout` may be a real query (Codex review, PR #2762).
             if HANDLE_TRANSITIONS.contains(&last.as_str()) && self.expr_is_lazy_db(root) {
                 return cost;
             }
@@ -1030,12 +1376,9 @@ impl Analyzer {
         for method in &methods {
             let is_executor = EXECUTORS.contains(&method.method.to_string().as_str());
             let takes_handle = method.args.iter().any(|a| self.expr_carries_handle(a));
-            // Provenance, not just the name: this chain is *not* rooted at a
-            // handle, so `store.load(id).await` and `client.execute(req).await`
-            // land here with executor-shaped names and no database in sight.
-            // Counting those spent a route's budget on ordinary async APIs
-            // (#1667 review, round three). A real diesel executor is handed the
-            // connection — `query.load(&mut conn).await` — so require that.
+            // A diesel executor is handed the connection
+            // (`query.load(&mut conn)`). Without it, `store.load(id)` is an
+            // ordinary async API (#1667 review, round three).
             if is_executor && takes_handle {
                 let name = method.method.to_string();
                 cost = cost.then(self.count(&name));
@@ -1054,48 +1397,29 @@ impl Analyzer {
         cost
     }
 
-    /// Analyse one method call's arguments, treating a closure that may run per
-    /// element differently from a transaction callback that runs exactly once.
+    /// One method call's arguments. A transaction runs its closure once and
+    /// hands it a connection. An `Option`/`Result` combinator runs its
+    /// closure at most once. Any other closure may run once per element.
     fn method_args(&mut self, method: &ExprMethodCall) -> Cost {
         let name = method.method.to_string();
-        // Both kinds run their closure at most once, so the body is a fixed
-        // cost either way — but only a transaction hands its closure a
-        // *connection*. Promoting an `Option`/`Result` combinator's parameter
-        // to a handle made `result.unwrap_or_else(|error| error.to_string())`
-        // count `error.to_string()` as a query (#1667 review, round two).
         let is_transaction = TRANSACTION_METHODS.contains(&name.as_str());
         let runs_once = is_transaction || AT_MOST_ONCE_CLOSURE_METHODS.contains(&name.as_str());
+        // A closure handed to a method on a carrier takes its elements:
+        // `repos.iter().for_each(|r| …)`.
+        let param = if is_transaction || self.expr_is_carrier(&method.receiver) {
+            Kind::Handle
+        } else {
+            Kind::Plain
+        };
         let mut cost = Cost::ZERO;
         for arg in &method.args {
-            if runs_once {
-                cost = cost.then(self.callback_arg(arg, is_transaction));
-                continue;
-            }
-            cost = cost.then(self.expr(arg));
+            let next = if runs_once {
+                self.callback_arg(arg, param)
+            } else {
+                self.closure_arg(arg, param)
+            };
+            cost = cost.then(next);
         }
-        cost
-    }
-
-    /// An argument to something that invokes it exactly once: the closure body
-    /// is counted as a fixed cost rather than a per-element one.
-    ///
-    /// `binds_handle` says whether the closure's parameter is a database
-    /// connection. It is for a transaction callback (`db.tx(|conn| …)`); it is
-    /// **not** for an `Option`/`Result` combinator, whose parameter is the
-    /// contained value.
-    fn callback_arg(&mut self, arg: &Expr, binds_handle: bool) -> Cost {
-        let Expr::Closure(closure) = arg else {
-            return self.expr(arg);
-        };
-        // Same scoping as the general closure arm: a parameter shadows the
-        // outer meaning of its name. A transaction's parameter *is* a
-        // connection, so it binds; any other parameter clears.
-        let mut saved = Vec::new();
-        for input in &closure.inputs {
-            saved.extend(self.enter_binding_scope(input, binds_handle));
-        }
-        let cost = self.expr(&closure.body);
-        self.leave_binding_scope(saved);
         cost
     }
 
@@ -1127,42 +1451,38 @@ impl Analyzer {
 
     fn call(&mut self, call: &ExprCall) -> Cost {
         let name = call_path_name(call);
+        // `scoped_transaction` / `savepoint` run their closure once and hand
+        // it a connection.
         let runs_once = name
             .as_deref()
             .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n));
 
-        let mut cost = self.expr(&call.func);
+        let mut cost = self.cost_of(&call.func);
         for arg in &call.args {
-            if runs_once {
-                // `scoped_transaction` / `savepoint` — always a connection.
-                cost = cost.then(self.callback_arg(arg, true));
-                continue;
-            }
-            cost = cost.then(self.expr(arg));
+            let next = if runs_once {
+                self.callback_arg(arg, Kind::Handle)
+            } else {
+                self.cost_of(arg)
+            };
+            cost = cost.then(next);
         }
-        if runs_once {
-            // The connection is the callback's, not an escape into opaque code.
+        // The connection is the callback's, not an escape into opaque code.
+        // An unreadable argument already explains itself.
+        if runs_once || matches!(cost, Cost::Unbounded(_)) {
             return cost;
         }
-        // An unreadable argument already explains itself; don't relabel it.
-        if matches!(cost, Cost::Unbounded(_)) {
+        if name.as_deref().is_some_and(|n| SAFE_FREE_FNS.contains(&n)) {
             return cost;
         }
-
-        if let Some(name) = &name
-            && SAFE_FREE_FNS.contains(&name.as_str())
-        {
+        // `Some(repo)`, `Ok(db)`: a constructor runs no code. Its value holds
+        // the handle (see `expr_is_carrier`).
+        if is_constructor_call(call) {
             return cost;
         }
-
+        // Any other callee is opaque, `Post::published(&mut db)` included:
+        // nothing at the call site tells a one-query finder from a helper
+        // that loops (#2316).
         if call.args.iter().any(|a| self.expr_carries_handle(a)) {
-            // `Post::published(&mut db)` / `Todo::page(&page, &mut db)` — a
-            // model-level finder. Same framework contract as a repository
-            // method: one call, one query, declare it if it is more.
-            if is_associated_fn_path(call) {
-                let label = name.unwrap_or_else(|| "finder".to_string());
-                return cost.then(self.count(&label));
-            }
             let label = name.unwrap_or_else(|| "this call".to_string());
             return Cost::unbounded(
                 call.span(),
@@ -1179,7 +1499,7 @@ impl Analyzer {
     /// A macro body is an opaque token soup to `syn`. If it so much as names a
     /// handle, the queries it may hide are reported rather than assumed absent.
     fn mac(&self, mac: &syn::Macro) -> Cost {
-        if !tokens_mention_any(&mac.tokens, &self.handles) {
+        if !tokens_mention_any(&mac.tokens, &self.env.tracked()) {
             return Cost::ZERO;
         }
         let name = mac
@@ -1194,19 +1514,12 @@ impl Analyzer {
             return Self::opaque_macro(mac, &name);
         }
         // A logging, formatting or template macro cannot itself issue a query,
-        // however it names the handle (`tracing::debug!(db = ?db, …)`,
-        // `html! { (render_row(p, &repo)) }`): it does not await, and a sync
-        // helper it hands the handle to cannot run an async query.
+        // however it names the handle: it does not await, and a sync helper it
+        // hands the handle to cannot run an async query. Anything else that
+        // names a handle is reported (#1667 review, round two).
         if INERT_MACROS.contains(&name.as_str()) {
             return Cost::ZERO;
         }
-        // Anything else that names a handle is reported. This is an
-        // allowlist, deliberately: a receiver-shaped test ("does the body call
-        // `repo.method()`?") looked like it separated `tokio::join!` from
-        // `html!`, but it does not — `join!(Post::published(&mut db), …)`
-        // passes the handle as an *argument*, exactly as a template passes it
-        // to a render helper, and slipped through (#1667 review, round two).
-        // Only a name we recognise as inert may be assumed query-free.
         Self::opaque_macro(mac, &name)
     }
 
@@ -1224,7 +1537,20 @@ impl Analyzer {
         )
     }
 
-    // ── Handle tracking ──────────────────────────────────────────────
+    // ── What an expression holds ─────────────────────────────────────
+
+    /// What `expr` evaluates to.
+    fn value_of(&self, expr: &Expr) -> Kind {
+        if self.expr_is_lazy_db(expr) {
+            Kind::LazyDb
+        } else if self.expr_is_handle(expr) || self.chain_root_is_handle(expr) {
+            Kind::Handle
+        } else if self.expr_is_carrier(expr) {
+            Kind::Carrier
+        } else {
+            Kind::Plain
+        }
+    }
 
     /// Does this expression *evaluate to* a database handle (as opposed to
     /// merely mentioning one)?
@@ -1233,85 +1559,29 @@ impl Analyzer {
             Expr::Path(p) => p
                 .path
                 .get_ident()
-                .is_some_and(|i| self.handles.contains(&i.to_string())),
+                .is_some_and(|i| self.env.get(&i.to_string()).is_handle()),
             Expr::Reference(r) => self.expr_is_handle(&r.expr),
             Expr::RawAddr(r) => self.expr_is_handle(&r.expr),
             Expr::Paren(p) => self.expr_is_handle(&p.expr),
             Expr::Group(g) => self.expr_is_handle(&g.expr),
-            // `self.conn().await?` is a common shape for a fallible/async
-            // handle accessor (a pooled connection getter) — without peeling
-            // `.await`/`?`, `conn` in `let mut conn = self.conn().await?;`
-            // silently falls through to "not a handle," and every later
-            // query issued through `conn` goes uncounted with no diagnostic
-            // at all (#2546 review). Deliberately recurses into the
-            // *narrower* `awaited_expr_is_fresh_handle`, not `expr_is_handle`
-            // itself: peeling through to a bare `Expr::Path` here would
-            // re-derive handle-ness from `chain_root_is_handle`'s "deferred
-            // future" tracking (`let pending = repo.find_all(); let rows =
-            // pending.await?;`) and wrongly mark `rows` — the resolved
-            // `Vec<Post>` — as a handle too, miscounting a harmless
-            // `rows.len()` as another query (caught by the existing
-            // `a_deferred_repository_future_is_counted_once` unit test).
-            //
-            // Deliberately has NO matching `Expr::Await` arm here (only
-            // `Expr::Try`, which peels through its own inner `Await` via
-            // `awaited_expr_is_fresh_handle`): a *fallible* accessor's
-            // `.await` alone yields `Result<Conn, E>`, not `Conn` — only the
-            // `?` actually unwraps to the handle. Promoting a bare
-            // `self.conn().await` (no `?`) would treat that `Result` itself
-            // as a handle, so a later `result.is_err()` or `.unwrap()` call
-            // gets miscounted as a query (#2546 review, round 3).
+            // `self.conn().await?`. Only `?` unwraps to the handle: a bare
+            // `.await` on a fallible accessor is a `Result` (#2546 review,
+            // round 3). Recurses into the narrower check so that an awaited
+            // deferred future (`pending.await?`) is not a handle (#2546).
             Expr::Try(t) => self.awaited_expr_is_fresh_handle(&t.expr),
             Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_handle(&u.expr),
-            // A field of a handle is a handle (`db.inner`), and so is a field
-            // that conventionally holds one (`self.repo`, `state.db`) — a
-            // service method's queries would otherwise be invisible.
-            Expr::Field(f) => self.expr_is_handle(&f.base) || member_is_handle_accessor(&f.member),
-            Expr::MethodCall(mc) => {
-                let method = mc.method.to_string();
-                if HANDLE_ACCESSORS.contains(&method.as_str()) {
-                    return true;
-                }
-                // `.expect(...)`/`.unwrap()` stand in for `?` on a fallible
-                // accessor (`ctx.conn().await.expect("connection")`, #2546
-                // review round 5) — the unwrap call itself issues nothing,
-                // so it is never counted, but the value it unwraps can still
-                // be a fresh handle. Recurses into the narrower
-                // `awaited_expr_is_fresh_handle`, not `expr_is_handle`, for
-                // the same reason `Expr::Try` does below: a bare
-                // `Expr::Path` here must not re-derive handle-ness from
-                // `chain_root_is_handle`'s unrelated deferred-future
-                // tracking.
-                //
-                // KNOWN LIMITATION (#2546 review, round 7): splitting the
-                // accessor call and the unwrap across two statements
-                // (`let result = ctx.conn().await; let mut db =
-                // result.unwrap();`) still isn't caught — the receiver here
-                // is `Expr::Path("result")`, which `awaited_expr_is_fresh_handle`
-                // deliberately never matches (that is what keeps round
-                // three's `result.is_err()` case from being miscounted).
-                // Catching the split form soundly would mean tracking a
-                // *third* binding state alongside "is a handle" and "is
-                // not" — "is a `Result` that becomes a handle once
-                // unwrapped" — threaded through every place `handles` is
-                // scoped and restored (`block`, `enter_binding_scope`,
-                // `rebind`, tuple destructuring). That is a real,
-                // structural change to the analyzer's state model, not
-                // another naming-list entry, and this round's evidence is
-                // a constructed example rather than a concrete occurrence
-                // in this codebase (unlike rounds two, five, and six, each
-                // pinned to a real file:line). Left as an acknowledged gap
-                // rather than taken on speculatively.
-                if RESULT_UNWRAP_METHODS.contains(&method.as_str()) {
-                    return self.awaited_expr_is_fresh_handle(&mc.receiver);
-                }
-                HANDLE_BUILDERS.contains(&method.as_str()) && self.expr_is_handle(&mc.receiver)
+            // A field of a handle (`db.inner`), a field that conventionally
+            // holds one (`self.repo`), or a field of a carrier (`pair.0`).
+            Expr::Field(f) => {
+                self.expr_is_handle(&f.base)
+                    || member_is_handle_accessor(&f.member)
+                    || self.expr_is_carrier(&f.base)
             }
-            // A handle selected through a conditional is still a handle:
-            // `let active = if primary { repo } else { replica };`. Every arm
-            // is a candidate and *any* of them being a handle is enough — the
-            // conservative direction, since guessing "not a handle" here loses
-            // every query made through the binding (#1667 review, round four).
+            // An element of a carrier: `repos[0]`.
+            Expr::Index(i) => self.expr_is_carrier(&i.expr) || self.expr_is_handle(&i.expr),
+            Expr::MethodCall(mc) => self.method_is_handle(mc),
+            // A handle selected through a conditional is still a handle. Any
+            // arm is enough (#1667 review, round four).
             Expr::If(i) => {
                 self.block_tail_is_handle(&i.then_branch)
                     || i.else_branch
@@ -1325,12 +1595,29 @@ impl Analyzer {
         }
     }
 
-    /// The peeled target of a `.await`/`?`: does *this* expression freshly
-    /// produce a handle, as opposed to naming a variable that was already
-    /// tracked by `chain_root_is_handle`'s deferred-future provenance?
-    /// Deliberately omits `Expr::Path` (and anything that bottoms out in
-    /// one) — see the comment on `expr_is_handle`'s `Expr::Await`/`Expr::Try`
-    /// arms for why re-deriving handle-ness from a bound name here is wrong.
+    /// Does this method call evaluate to a handle?
+    fn method_is_handle(&self, mc: &ExprMethodCall) -> bool {
+        let method = mc.method.to_string();
+        if HANDLE_ACCESSORS.contains(&method.as_str()) {
+            return true;
+        }
+        // `.expect(...)`/`.unwrap()` stand in for `?`
+        // (`ctx.conn().await.expect("connection")`, #2546 review round 5), or
+        // take the value out of a carrier (`slot.unwrap()`).
+        //
+        // KNOWN LIMITATION (#2546 review, round 7): `let result =
+        // ctx.conn().await; let db = result.unwrap();` is not caught. `result`
+        // would need a fourth kind, "a `Result` that unwraps to a handle".
+        if RESULT_UNWRAP_METHODS.contains(&method.as_str()) {
+            return self.awaited_expr_is_fresh_handle(&mc.receiver)
+                || self.expr_is_carrier(&mc.receiver);
+        }
+        HANDLE_BUILDERS.contains(&method.as_str()) && self.expr_is_handle(&mc.receiver)
+    }
+
+    /// The peeled target of a `.await`/`?`: does *this* expression produce a
+    /// fresh handle? A bare name never does here, so the result of an awaited
+    /// deferred future is not a handle.
     fn awaited_expr_is_fresh_handle(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Reference(r) => self.awaited_expr_is_fresh_handle(&r.expr),
@@ -1340,53 +1627,18 @@ impl Analyzer {
             Expr::Await(a) => self.awaited_expr_is_fresh_handle(&a.base),
             Expr::Try(t) => self.awaited_expr_is_fresh_handle(&t.expr),
             Expr::Field(f) => self.expr_is_handle(&f.base) || member_is_handle_accessor(&f.member),
-            // Deliberately checks only `HANDLE_ACCESSORS`, never
-            // `HANDLE_BUILDERS`: reaching this arm means the call was
-            // *awaited* (peeled through `Expr::Await`/`Expr::Try` above), and
-            // the method-chain cost counter's own rule is that an awaited
-            // builder-named call "really did run" as the terminal query — "a
-            // user finder may share a builder's name." So `let rows =
-            // repo.page(1).await?;` is correctly counted as one query by
-            // that counter, but `rows` itself is the query's *result*, not a
-            // handle; matching `HANDLE_BUILDERS` here as well would promote
-            // `rows` too and miscount a later `rows.len()` as a second query
-            // (#2546 review, round 4). A `HANDLE_ACCESSORS` name is
-            // different: those never issue a query even when awaited — they
-            // only ever produce a handle to query with next.
+            // Accessors only, never `HANDLE_BUILDERS`: an awaited builder name
+            // is counted as the query, so its result is rows, not a handle
+            // (#2546 review, round 4).
             //
-            // KNOWN LIMITATION (#2546 review, round 6): a checkout idiom
-            // like `db.pool().get().await?` (deadpool/bb8-style, and the
-            // shape `autumn-cli`'s own generated scaffold tests emit at
-            // `autumn-cli/src/generate/scaffold.rs:14419`) is *not* caught
-            // here — `get` is not a recognized accessor name, so this falls
-            // through to `false`. A fix was attempted: recurse into the
-            // receiver for any non-accessor terminal name, so `get` would
-            // inherit handle-ness from the `pool` accessor beneath it. That
-            // did catch the checkout idiom, but it is syntactically
-            // indistinguishable from a genuine terminal query made through
-            // an accessor-obtained handle
-            // (`state.db().find_recipients(...).await?`, the exact shape
-            // `query_budget_job_shaped_accessor_batched.rs` already pins as
-            // required to compile clean) — both are "some name, chained off
-            // an accessor call, then awaited." Recursing into the receiver
-            // fixed the former and silently reintroduced round four's exact
-            // regression on the latter, verified with the same fixture and
-            // reverted before landing. There is no reliable syntactic
-            // signal — no type information is available to this proc
-            // macro — that tells "a checkout wrapper" apart from "a named
-            // query" when both share this shape, so this stays a real,
-            // acknowledged boundary of the analysis rather than a bug
-            // fixable by another naming heuristic.
+            // KNOWN LIMITATION (#2546 review, round 6): a pool checkout such
+            // as `db.pool().get().await?` is not caught. It has the same shape
+            // as a real query through an accessor
+            // (`state.db().find_recipients(...).await?`), and no type
+            // information tells them apart.
             //
-            // `HANDLE_TRANSITIONS` (`checkout`) is not the same kind of fix:
-            // it requires the receiver itself to already be a tracked
-            // `LazyDb` (`self.expr_is_lazy_db`, one hop, no recursion), so it
-            // does not reopen the `state.db().find_recipients(...)`
-            // regression above — that receiver (`state.db()`) is a call,
-            // never a bare tracked name. Gating on `expr_is_lazy_db` rather
-            // than the broader `expr_is_handle` matters here too: a
-            // `*Repository`'s own `checkout()` returning some unrelated
-            // value must not have that value inherit handle identity (Codex
+            // `checkout` counts only on a known `LazyDb` receiver, so a
+            // repository's own `checkout` result is not a handle (Codex
             // review, PR #2762, round 3).
             Expr::MethodCall(mc) => {
                 let method = mc.method.to_string();
@@ -1398,55 +1650,29 @@ impl Analyzer {
         }
     }
 
-    /// Is this expression known, specifically, to be a `LazyDb` — as opposed
-    /// to `expr_is_handle`'s broader "some tracked handle, of any kind"?
-    /// Deliberately narrow (see `lazy_db_names`'s doc comment): only a bare,
-    /// possibly-referenced identifier already in `lazy_db_names`. No
-    /// `Expr::Field`/`Expr::MethodCall`/`Expr::If`/`Expr::Match` arms, unlike
-    /// `expr_is_handle` — those all reason from *name conventions*
-    /// (`HANDLE_ACCESSORS`, `member_is_handle_accessor`), which say "this is
-    /// some handle" but never "this is specifically `LazyDb`, not a
-    /// `Repository`." Missing a `LazyDb` reached that way just means its
-    /// `checkout()` is counted like an ordinary call — conservative, not a
-    /// hole — where guessing wrong the other way would let a real query
-    /// dodge the budget or a real handle escape an authority check.
+    /// Is this expression known to be a `LazyDb`, not only some handle?
+    /// Narrow on purpose: a name convention (`HANDLE_ACCESSORS`) says "some
+    /// handle", never "a `LazyDb`". A missed `LazyDb` only makes its
+    /// `checkout` count as a query.
     fn expr_is_lazy_db(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Path(p) => p
                 .path
                 .get_ident()
-                .is_some_and(|i| self.lazy_db_names.contains(&i.to_string())),
+                .is_some_and(|i| self.env.get(&i.to_string()) == Kind::LazyDb),
             Expr::Reference(r) => self.expr_is_lazy_db(&r.expr),
             Expr::RawAddr(r) => self.expr_is_lazy_db(&r.expr),
             Expr::Paren(p) => self.expr_is_lazy_db(&p.expr),
             Expr::Group(g) => self.expr_is_lazy_db(&g.expr),
             Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_lazy_db(&u.expr),
-            // `Result<LazyDb, E>` is a signature shape `type_is_lazy_db`
-            // already recognizes (mirroring how `type_is_handle` treats
-            // `Result<Db, E>`), so a handler catching extraction failure —
-            // `lazy_db: Result<LazyDb, AutumnError>` — must still see
-            // `lazy_db.expect(...).checkout()` as the same zero-cost
-            // transition `lazy_db.checkout()` is. Narrow on purpose, mirroring
-            // `expr_is_handle`'s own `RESULT_UNWRAP_METHODS` arm: only
-            // `.expect(...)`/`.unwrap()` on an already-`LazyDb`-tracked
-            // receiver, not `HANDLE_ACCESSORS`/`HANDLE_BUILDERS` in general —
-            // those recognize a handle from a name convention with no type
-            // behind it, which can say "some handle" but never "specifically
-            // `LazyDb`" (Codex review, PR #2762, round 6).
+            // `lazy_db.expect(...)` on a `Result<LazyDb, E>` (Codex review,
+            // PR #2762, round 6).
             Expr::MethodCall(mc) => {
                 RESULT_UNWRAP_METHODS.contains(&mc.method.to_string().as_str())
                     && self.expr_is_lazy_db(&mc.receiver)
             }
-            // A `LazyDb` selected through a conditional is still a `LazyDb`:
-            // `let selected = if flag { first } else { second };`. Sound for
-            // the same reason `expr_is_handle`'s identical shape is — real
-            // Rust requires every arm of a value-producing `if`/`match` to
-            // share one type, so if any arm is `LazyDb`, every reachable arm
-            // is (Codex review, PR #2762, round 5). Deliberately still omits
-            // `Expr::Try` and `Expr::Field`: those recognize a handle from a
-            // *name convention* with no type behind it (`HANDLE_ACCESSORS`,
-            // `member_is_handle_accessor`), which can say "some handle" but
-            // never "specifically `LazyDb`."
+            // Every arm of a value-producing `if`/`match` has one type, so
+            // one `LazyDb` arm makes them all `LazyDb` (PR #2762, round 5).
             Expr::If(i) => {
                 self.block_tail_is_lazy_db(&i.then_branch)
                     || i.else_branch
@@ -1460,23 +1686,66 @@ impl Analyzer {
         }
     }
 
-    /// Does a block *evaluate to* a handle — i.e. does its tail expression?
-    fn block_tail_is_handle(&self, block: &Block) -> bool {
-        match block.stmts.last() {
-            Some(Stmt::Expr(expr, None)) => self.expr_is_handle(expr),
+    /// Does this expression evaluate to a value that holds handles without
+    /// being one? The container rule (#2316):
+    ///
+    /// * an array, tuple, `vec!`, struct literal or constructor call
+    ///   (`Some(repo)`) that holds a handle is a carrier;
+    /// * a method on a carrier gives a carrier (`repos.iter()`), except a
+    ///   method that returns a number or a `bool` (`repos.len()`);
+    /// * an element, field or unwrapped value of a carrier is a handle (see
+    ///   [`Self::expr_is_handle`]).
+    fn expr_is_carrier(&self, expr: &Expr) -> bool {
+        let holds = |e: &Expr| self.value_of(e) != Kind::Plain;
+        match expr {
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .is_some_and(|i| self.env.get(&i.to_string()) == Kind::Carrier),
+            Expr::Reference(r) => self.expr_is_carrier(&r.expr),
+            Expr::RawAddr(r) => self.expr_is_carrier(&r.expr),
+            Expr::Paren(p) => self.expr_is_carrier(&p.expr),
+            Expr::Group(g) => self.expr_is_carrier(&g.expr),
+            Expr::Array(a) => a.elems.iter().any(holds),
+            Expr::Tuple(t) => t.elems.iter().any(holds),
+            Expr::Repeat(r) => holds(&r.expr),
+            Expr::Struct(s) => {
+                s.fields.iter().any(|f| holds(&f.expr)) || s.rest.as_deref().is_some_and(holds)
+            }
+            Expr::Call(c) => is_constructor_call(c) && c.args.iter().any(holds),
+            Expr::Macro(m) => {
+                m.mac.path.is_ident("vec") && tokens_mention_any(&m.mac.tokens, &self.env.tracked())
+            }
+            Expr::MethodCall(mc) => {
+                !SCALAR_METHODS.contains(&mc.method.to_string().as_str())
+                    && self.expr_is_carrier(&mc.receiver)
+            }
+            Expr::If(i) => {
+                block_tail(&i.then_branch).is_some_and(|e| self.expr_is_carrier(e))
+                    || i.else_branch
+                        .as_ref()
+                        .is_some_and(|(_, e)| self.expr_is_carrier(e))
+            }
+            Expr::Match(m) => m.arms.iter().any(|arm| self.expr_is_carrier(&arm.body)),
+            Expr::Block(b) => block_tail(&b.block).is_some_and(|e| self.expr_is_carrier(e)),
+            Expr::Unsafe(u) => block_tail(&u.block).is_some_and(|e| self.expr_is_carrier(e)),
             _ => false,
         }
     }
 
-    /// [`Self::block_tail_is_handle`]'s `lazy_db_names` counterpart.
+    /// Does a block *evaluate to* a handle — i.e. does its tail expression?
+    fn block_tail_is_handle(&self, block: &Block) -> bool {
+        block_tail(block).is_some_and(|e| self.expr_is_handle(e))
+    }
+
+    /// [`Self::block_tail_is_handle`] for a `LazyDb`.
     fn block_tail_is_lazy_db(&self, block: &Block) -> bool {
-        match block.stmts.last() {
-            Some(Stmt::Expr(expr, None)) => self.expr_is_lazy_db(expr),
-            _ => false,
-        }
+        block_tail(block).is_some_and(|e| self.expr_is_lazy_db(e))
     }
 
     /// Is this a method chain whose root is a handle (`repo.aggregate().order()`)?
+    /// This keeps a deferred future or a split builder chain a handle. It does
+    /// not peel `.await`/`?`: an awaited query's result is rows, not a handle.
     fn chain_root_is_handle(&self, expr: &Expr) -> bool {
         match expr {
             Expr::MethodCall(mc) => {
@@ -1484,30 +1753,14 @@ impl Analyzer {
             }
             Expr::Paren(p) => self.chain_root_is_handle(&p.expr),
             Expr::Group(g) => self.chain_root_is_handle(&g.expr),
-            // Deliberately does NOT peel `Expr::Await`/`Expr::Try` the way
-            // `expr_is_handle` does: this function backs `bind_handles`'
-            // "future built but not yet awaited" tracking (`let fut =
-            // repo.find_all();` — the doc's "a repository future is counted
-            // where it is built, not where it is awaited"), where *any*
-            // chain rooted at a handle should keep provenance even through a
-            // non-accessor terminal call. Peeling here would make an
-            // already-awaited, already-resolved query result (`let posts =
-            // repo.find_all().await?;`) register as a handle too — `posts`
-            // is a `Vec<Post>`, and a bare `.len()` on it was miscounted as
-            // a third query before this comment was added (regression
-            // caught by the existing `query_budget_over_budget.rs`
-            // fixture). `expr_is_handle`'s own `Expr::Await`/`Expr::Try` arms
-            // already cover the real gap (an accessor call like
-            // `self.conn().await?`) without this broader, unawaited-chain
-            // reach.
             _ => false,
         }
     }
 
-    /// Does this expression *carry* a handle into a callee — directly, or
-    /// wrapped one level deep in a context struct, tuple, or slice?
+    /// Does this expression *carry* a handle into a callee — directly, as a
+    /// carrier, or wrapped in a context struct, tuple or slice?
     fn expr_carries_handle(&self, expr: &Expr) -> bool {
-        if self.expr_is_handle(expr) {
+        if self.expr_is_handle(expr) || self.expr_is_carrier(expr) {
             return true;
         }
         match expr {
@@ -1519,13 +1772,8 @@ impl Analyzer {
             Expr::RawAddr(r) => self.expr_carries_handle(&r.expr),
             Expr::Paren(p) => self.expr_carries_handle(&p.expr),
             Expr::Group(g) => self.expr_carries_handle(&g.expr),
-            // No separate `Expr::Await`/`Expr::Try` arms: the `expr_is_handle`
-            // check above already covers them via `awaited_expr_is_fresh_handle`,
-            // which deliberately does not fall through to a bare `Expr::Path`
-            // — recursing into the full `expr_carries_handle` here instead
-            // would reach `Expr::Path` through its own `Expr::Await`/`Expr::Try`
-            // (if added) and reintroduce the same false-positive this file
-            // documents on `expr_is_handle`.
+            // No `Await`/`Try` arms: `expr_is_handle` covers a fresh handle,
+            // and a bare name under them is a resolved result.
             _ => false,
         }
     }
@@ -1543,16 +1791,26 @@ enum Annotation {
     Exempt,
 }
 
+impl Annotation {
+    /// The cost the annotation declares for its statement.
+    const fn cost(&self) -> Cost {
+        match self {
+            Self::Cost(n) => Cost::Exact(*n),
+            Self::Exempt => Cost::ZERO,
+        }
+    }
+}
+
 // ── Free helpers ─────────────────────────────────────────────────────
 //
 // `agent_authority.rs` forked this module's handle tracking (see its module
 // doc comment) and most of its similarly-named helpers have since diverged on
-// purpose — it carries a richer `Handle` enum where this module only needs a
-// flat set of names, and its `INERT_MACROS` deliberately excludes `vec!`/
-// `format!` for a reason specific to that analyser (see its `mac()`).
+// purpose — it carries its own `Handle` enum where this module keeps a
+// scoped `Env` of `Kind`s, and its `INERT_MACROS` deliberately excludes
+// `vec!`/`format!` for a reason specific to that analyser (see its `mac()`).
 //
 // `expr_attrs`, `expr_attrs_mut`, `item_attrs_mut`, `immediately_invoked_closure`,
-// `call_path_name`, `tokens_contain_await`, `collect_pat_idents`, the
+// `call_path_name`, `tokens_contain_await`, `is_constructor_call`, the
 // `StripAnnotations`/`VisitMut` impl, and `EXECUTORS` (above) *are* still
 // byte-for-byte copies — they just enumerate `syn`'s own `Expr`/`Item`
 // variants or do generic token-tree plumbing, owing nothing to either
@@ -1672,19 +1930,48 @@ fn immediately_invoked_closure(func: &Expr) -> Option<&syn::ExprClosure> {
     }
 }
 
-/// Is this call `Type::assoc_fn(…)` — a model-level finder rather than a free
-/// function? The framework's `#[model]` finders take the handle as an argument,
-/// so they are counted like a repository method instead of being reported.
-fn is_associated_fn_path(call: &ExprCall) -> bool {
+/// The attributes written before an expression statement. `syn` puts them
+/// on the left operand of `=`, `+=`, a binary operator or `as`.
+fn stmt_expr_attrs(expr: &Expr) -> &[Attribute] {
+    let own = expr_attrs(expr);
+    if !own.is_empty() {
+        return own;
+    }
+    match expr {
+        Expr::Assign(a) => stmt_expr_attrs(&a.left),
+        Expr::Binary(b) => stmt_expr_attrs(&b.left),
+        Expr::Cast(c) => stmt_expr_attrs(&c.expr),
+        _ => &[],
+    }
+}
+
+/// The tail expression of a block, when the block has one.
+fn block_tail(block: &Block) -> Option<&Expr> {
+    match block.stmts.last() {
+        Some(Stmt::Expr(expr, None)) => Some(expr),
+        _ => None,
+    }
+}
+
+/// Can `pats` bind `exprs` part by part? Same length and no `..`.
+fn same_shape<P, E>(
+    pats: &syn::punctuated::Punctuated<Pat, P>,
+    exprs: &syn::punctuated::Punctuated<Expr, E>,
+) -> bool {
+    pats.len() == exprs.len() && !pats.iter().any(|p| matches!(p, Pat::Rest(_)))
+}
+
+/// Is this call an enum variant or tuple-struct constructor — `Ok(x)`,
+/// `Some(x)`, `Ctx(x)` — rather than a function that *does* something with what
+/// it is handed?
+fn is_constructor_call(call: &ExprCall) -> bool {
     let Expr::Path(path) = &*call.func else {
         return false;
     };
-    let segments = &path.path.segments;
-    segments.len() >= 2
-        && segments
-            .iter()
-            .nth(segments.len() - 2)
-            .is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
+    path.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident.to_string().starts_with(char::is_uppercase))
 }
 
 /// Does this token stream contain an `await` — the marker that something in it
@@ -1764,28 +2051,48 @@ fn tokens_mention_any(tokens: &TokenStream, idents: &HashSet<String>) -> bool {
     })
 }
 
-fn collect_pat_idents(pat: &Pat, out: &mut HashSet<String>) {
-    match pat {
-        Pat::Ident(p) => {
-            out.insert(p.ident.to_string());
-            if let Some((_, sub)) = &p.subpat {
-                collect_pat_idents(sub, out);
-            }
-        }
-        Pat::Type(p) => collect_pat_idents(&p.pat, out),
-        Pat::Reference(p) => collect_pat_idents(&p.pat, out),
-        Pat::Paren(p) => collect_pat_idents(&p.pat, out),
-        Pat::Guard(p) => collect_pat_idents(&p.pat, out),
-        Pat::Tuple(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),
-        Pat::TupleStruct(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),
-        Pat::Slice(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),
-        Pat::Or(p) => p.cases.iter().for_each(|e| collect_pat_idents(e, out)),
-        Pat::Struct(p) => p
-            .fields
-            .iter()
-            .for_each(|f| collect_pat_idents(&f.pat, out)),
-        _ => {}
+/// What a parameter or annotated binding of type `ty` holds.
+fn type_kind(ty: &Type) -> Kind {
+    if type_is_lazy_db(ty) {
+        Kind::LazyDb
+    } else if type_is_handle(ty) {
+        Kind::Handle
+    } else if type_is_carrier(ty) {
+        Kind::Carrier
+    } else {
+        Kind::Plain
     }
+}
+
+/// Does this type hold handles without being one: a collection, `Option`,
+/// tuple, array or slice of a handle type (`Vec<PgPostRepository>`)?
+fn type_is_carrier(ty: &Type) -> bool {
+    let holds = |inner: &Type| type_is_handle(inner) || type_is_carrier(inner);
+    match ty {
+        Type::Reference(r) => type_is_carrier(&r.elem),
+        Type::Paren(p) => type_is_carrier(&p.elem),
+        Type::Group(g) => type_is_carrier(&g.elem),
+        Type::Array(a) => holds(&a.elem),
+        Type::Slice(s) => holds(&s.elem),
+        Type::Tuple(t) => t.elems.iter().any(holds),
+        Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            CARRIER_TYPES.contains(&segment.ident.to_string().as_str())
+                && generic_types(segment).any(holds)
+        }),
+        _ => false,
+    }
+}
+
+/// The type arguments of a path segment: `T` in `Vec<T>`.
+fn generic_types(segment: &syn::PathSegment) -> impl Iterator<Item = &Type> {
+    let args = match &segment.arguments {
+        syn::PathArguments::AngleBracketed(args) => Some(args.args.iter()),
+        _ => None,
+    };
+    args.into_iter().flatten().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    })
 }
 
 /// Does this type name a database handle — directly, behind a reference, or
@@ -1806,16 +2113,13 @@ fn type_is_handle(ty: &Type) -> bool {
             {
                 return true;
             }
-            // Look inside an extractor wrapper (`Extension<Db>`, `State<Db>`)
-            // for an *exact* handle type only. Recursing with the suffix
-            // heuristic would make `Form<NewRepo>` a database handle.
-            if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                return args.args.iter().any(|arg| match arg {
-                    syn::GenericArgument::Type(inner) => type_is_exact_handle(inner),
-                    _ => false,
-                });
-            }
-            false
+            // A smart pointer derefs to what it holds: `Arc<PgPostRepository>`.
+            // Any other wrapper (`Extension<Db>`, `State<Db>`) counts for an
+            // *exact* handle type only, so `Form<NewRepo>` is not a handle.
+            let smart_pointer = SMART_POINTERS.contains(&name.as_str());
+            generic_types(segment).any(|inner| {
+                type_is_exact_handle(inner) || (smart_pointer && type_is_handle(inner))
+            })
         }
         _ => false,
     }
@@ -1836,19 +2140,6 @@ fn type_is_exact_handle(ty: &Type) -> bool {
             .is_some_and(|s| HANDLE_TYPES.contains(&s.ident.to_string().as_str())),
         _ => false,
     }
-}
-
-/// The handle bindings a handler's signature introduces.
-fn signature_handles(input_fn: &ItemFn) -> HashSet<String> {
-    let mut handles = HashSet::new();
-    for arg in &input_fn.sig.inputs {
-        if let syn::FnArg::Typed(typed) = arg
-            && type_is_handle(&typed.ty)
-        {
-            collect_pat_idents(&typed.pat, &mut handles);
-        }
-    }
-    handles
 }
 
 /// Does this type name `LazyDb`, exactly — directly, behind a reference, or
@@ -1890,20 +2181,6 @@ fn type_is_lazy_db(ty: &Type) -> bool {
         }
         _ => false,
     }
-}
-
-/// The `LazyDb` bindings a handler's signature introduces — a strict subset
-/// of [`signature_handles`].
-fn signature_lazy_db_names(input_fn: &ItemFn) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for arg in &input_fn.sig.inputs {
-        if let syn::FnArg::Typed(typed) = arg
-            && type_is_lazy_db(&typed.ty)
-        {
-            collect_pat_idents(&typed.pat, &mut names);
-        }
-    }
-    names
 }
 
 /// Removes `#[query_cost]` / `#[query_exempt]` from the emitted function: they
@@ -2080,11 +2357,8 @@ pub fn query_budget_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         return quote! { #input_fn #err };
     }
 
-    let mut analyzer = Analyzer::new(
-        signature_handles(&input_fn),
-        signature_lazy_db_names(&input_fn),
-    );
-    let cost = analyzer.block(&input_fn.block);
+    let mut analyzer = Analyzer::new(&input_fn);
+    let cost = analyzer.function_body(&input_fn.block);
 
     let mut errors: Vec<syn::Error> = std::mem::take(&mut analyzer.errors);
     let proven = match (&budget, &cost) {
@@ -2585,9 +2859,8 @@ mod tests {
 
     #[test]
     fn shadowing_a_lazy_db_with_a_repository_still_counts_its_checkout() {
-        // `lazy_db_names` must clear on shadowing exactly like `handles`
-        // does: rebinding the name to a different, non-`LazyDb` handle must
-        // not leave the old `LazyDb` identity attached to the new value.
+        // A shadow replaces the `LazyDb` kind. The new value is a plain
+        // handle, so its `checkout` is a query.
         assert_error_contains(
             "0",
             r"
@@ -2603,12 +2876,8 @@ mod tests {
 
     #[test]
     fn a_lazy_db_assigned_through_deferred_initialisation_stays_tracked() {
-        // `Expr::Assign` (`selected = lazy_db;`) must update `lazy_db_names`
-        // exactly like a `let` does: the deferred-initialisation idiom
-        // (`let selected; selected = lazy_db;`) is ordinary Rust, and a gap
-        // here would silently reintroduce the same `#[query_budget(1)]`
-        // false rejection round 2 fixed for `let`, just reached through `=`
-        // instead (Codex review, PR #2762, round 4).
+        // An assignment stores the `LazyDb` kind like a `let` does (Codex
+        // review, PR #2762, round 4).
         assert_clean(
             "1",
             r"
