@@ -229,7 +229,15 @@ const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Ext
 
 /// Methods whose result is a container of what their callback returns:
 /// `ids.iter().map(|_| &repo)`, `flag.then(|| &repo)`.
-const WRAPPING_CALLBACKS: &[&str] = &["map", "map_err", "then", "then_some", "ok_or", "ok_or_else"];
+const WRAPPING_CALLBACKS: &[&str] = &[
+    "map",
+    "map_err",
+    "then",
+    "then_some",
+    "ok_or",
+    "ok_or_else",
+    "reduce",
+];
 
 /// Iterator adapters whose items are the parts of what their callback
 /// returns: `filter_map(|_| Some(&repo))` yields handles.
@@ -246,7 +254,6 @@ const DIRECT_CALLBACKS: &[&str] = &[
     "find_map",
     "fold",
     "try_fold",
-    "reduce",
     "unwrap_or_else",
     "map_or",
     "map_or_else",
@@ -436,6 +443,14 @@ const CARRIER_METHODS: &[&str] = &[
     "pop_front",
     "to_vec",
     "flatten",
+    // An iterator's extrema are an `Option` of an element.
+    "max",
+    "min",
+    "max_by",
+    "min_by",
+    "max_by_key",
+    "min_by_key",
+    "reduce",
 ];
 
 /// Methods on a carrier that return a part of it, which is a handle.
@@ -455,13 +470,6 @@ const ELEMENT_METHODS: &[&str] = &[
     "map_or_else",
     "fold",
     "try_fold",
-    "reduce",
-    "max",
-    "min",
-    "max_by",
-    "min_by",
-    "max_by_key",
-    "min_by_key",
     "get_or_insert_with",
 ];
 
@@ -901,13 +909,15 @@ impl Shape {
             "into_iter" | "drain" | "into_keys" | "into_values" => Some(Self::Iter),
             // An `Option` of a reference: an element in place.
             "first" | "last" | "get" | "get_mut" | "next" | "nth" | "find" | "max" | "min"
+            | "max_by" | "min_by" | "max_by_key" | "min_by_key" | "reduce"
                 if by_ref && self != Self::OptRef =>
             {
                 Some(Self::OptRef)
             }
             "as_ref" | "as_mut" if matches!(self, Self::Opt | Self::OptRef) => Some(Self::OptRef),
             "first" | "last" | "get" | "get_mut" | "pop" | "pop_back" | "pop_front" | "next"
-            | "nth" | "find" | "find_map" | "ok" | "err" => Some(Self::Opt),
+            | "nth" | "find" | "find_map" | "ok" | "err" | "max" | "min" | "max_by" | "min_by"
+            | "max_by_key" | "min_by_key" | "reduce" => Some(Self::Opt),
             // The items are no longer references.
             "map" | "cloned" | "copied" | "enumerate" | "zip" | "filter_map" | "flat_map" => {
                 match self {
@@ -8451,6 +8461,72 @@ mod tests {
                 "async fn h(repos: Vec<PgPostRepository>, first: PgPostRepository) -> AutumnResult<usize> { \
                  let r = repos.into_iter().fold(first, |_, r| r); render(&r); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn iterator_extrema_give_an_option() {
+        check_handlers(&[
+            (
+                "max_by_key gives an Option",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let selected = repos.into_iter().max_by_key(|_| 0); selected.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "min_by_key gives an Option",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let selected = repos.into_iter().min_by_key(|_| 0); selected.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "max_by gives an Option",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let selected = repos.into_iter().max_by(|_, _| Ordering::Equal); selected.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "min_by gives an Option",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let selected = repos.into_iter().min_by(|_, _| Ordering::Equal); selected.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "reduce gives an Option",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let selected = repos.into_iter().reduce(|a, _| a); selected.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "max gives an Option",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let selected = repos.into_iter().max(); selected.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "max by reference gives an Option",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let selected = repos.iter().max_by_key(|_| 0); selected.refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: the Some side of max_by_key is a handle",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 if let Some(r) = repos.into_iter().max_by_key(|_| 0) { let _ = r.find_all().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: max_by_key then unwrap is a handle",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = repos.into_iter().max_by_key(|_| 0).unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: reduce then unwrap is a handle",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = repos.into_iter().reduce(|a, _| a).unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }
