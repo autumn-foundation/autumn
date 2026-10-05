@@ -2067,9 +2067,7 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout, url)?;
-    #[cfg(feature = "sqlite")]
-    reject_sqlite_idle_in_transaction_timeout(config.idle_in_transaction_timeout)?;
+    reject_sqlite_unsupported_timeouts(config, url)?;
 
     let pool = build_pool(
         url,
@@ -2145,6 +2143,22 @@ pub(crate) fn reject_sqlite_statement_timeout(
     )))
 }
 
+/// Reject every timeout `SQLite` cannot enforce: `database.statement_timeout`
+/// and `database.idle_in_transaction_timeout` (#3057). Each pool factory and
+/// provider path calls this one guard, so none can miss a setting.
+///
+/// # Errors
+///
+/// Returns [`PoolError::UnsupportedBackend`] for the first nonzero setting.
+#[cfg(feature = "sqlite")]
+pub(crate) fn reject_sqlite_unsupported_timeouts(
+    config: &DatabaseConfig,
+    target: &str,
+) -> Result<(), PoolError> {
+    reject_sqlite_statement_timeout(config.statement_timeout, target)?;
+    reject_sqlite_idle_in_transaction_timeout(config.idle_in_transaction_timeout)
+}
+
 /// Reject a configured `database.idle_in_transaction_timeout` under the
 /// `SQLite` backend (#3057). `SQLite` has no such setting, so a nonzero value
 /// would look enforced and not be. `None` and zero are allowed.
@@ -2211,9 +2225,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout, primary_url)?;
-    #[cfg(feature = "sqlite")]
-    reject_sqlite_idle_in_transaction_timeout(config.idle_in_transaction_timeout)?;
+    reject_sqlite_unsupported_timeouts(config, primary_url)?;
 
     let primary = build_pool(
         primary_url,
@@ -2257,9 +2269,7 @@ pub fn create_shard_topology(
     // Postgres-only), so the same fail-closed guard applies per shard. The shard
     // inherits the `[database]` `statement_timeout`.
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(defaults.statement_timeout, &shard.primary_url)?;
-    #[cfg(feature = "sqlite")]
-    reject_sqlite_idle_in_transaction_timeout(defaults.idle_in_transaction_timeout)?;
+    reject_sqlite_unsupported_timeouts(defaults, &shard.primary_url)?;
 
     let primary = build_pool(
         &shard.primary_url,
@@ -5471,6 +5481,25 @@ mod tests {
         assert!(sqlite_target_is_shared_cache(
             "file:app.db?cache=private&cache=shared"
         ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_unsupported_timeouts_checks_both_settings() {
+        let idle_only = DatabaseConfig {
+            idle_in_transaction_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        assert!(reject_sqlite_unsupported_timeouts(&idle_only, "file:/srv/app.db").is_err());
+        let statement_only = DatabaseConfig {
+            statement_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert!(reject_sqlite_unsupported_timeouts(&statement_only, "file:/srv/app.db").is_err());
+        assert!(
+            reject_sqlite_unsupported_timeouts(&DatabaseConfig::default(), "file:/srv/app.db")
+                .is_ok()
+        );
     }
 
     #[cfg(feature = "sqlite")]
