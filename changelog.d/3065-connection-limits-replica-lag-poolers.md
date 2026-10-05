@@ -32,5 +32,6 @@
 
 - **Breaking:** `autumn_web::ws::WebSocket` and
   `autumn_web::ws::WebSocketUpgrade` are Autumn wrappers, not axum
-  re-exports. `#[ws]` handlers do not change. Call `into_inner()` for the axum
-  type ([migration guide](docs/migrations/next.md)).
+  re-exports. `#[ws]` handlers do not change. Call `into_parts()` for the
+  axum type and keep the returned `ConnectionHold` for the socket's life
+  ([migration guide](docs/migrations/next.md)).
