@@ -3182,7 +3182,7 @@ impl Analyzer {
             let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
             self.env = entry.clone();
             for (earlier, _, after) in &tried {
-                if !patterns_disjoint(earlier, pat) {
+                if !patterns_disjoint(earlier, pat, &self.shadowed) {
                     self.env.join(after);
                 }
             }
@@ -3203,8 +3203,9 @@ impl Analyzer {
             let prefix = guard_prefix(
                 tried
                     .iter()
-                    .filter(|(earlier, _, _)| !patterns_disjoint(earlier, pat))
+                    .filter(|(earlier, _, _)| !patterns_disjoint(earlier, pat, &self.shadowed))
                     .map(|(earlier, cost, _)| (*earlier, cost)),
+                &self.shadowed,
             );
             let body = Flow::cost(prefix).then(guard).then(body);
             // A later arm runs after this guard falls through, or after
@@ -4316,7 +4317,7 @@ impl Analyzer {
     /// scopes keeps the body's handle parameters out of the real one.
     /// Is `name` defined or imported by the handler body?
     fn is_shadowed(&self, name: &str) -> bool {
-        self.shadowed.iter().any(|n| n == name)
+        shadows(&self.shadowed, name)
     }
 
     /// The elements of a std `vec!`: bare or under a std path, and not
@@ -5741,11 +5742,14 @@ impl<'a> Visit<'a> for FreeNames<'_> {
 /// variant key (`_`, a binding, a constant, a user variant) may always
 /// run. Of the guards on the std variants (`Some(_)`, `None`) or on
 /// literals, a value runs those of one variant or value only.
-fn guard_prefix<'a>(guards: impl Iterator<Item = (&'a Pat, &'a Cost)>) -> Cost {
+fn guard_prefix<'a>(
+    guards: impl Iterator<Item = (&'a Pat, &'a Cost)>,
+    shadowed: &[String],
+) -> Cost {
     let mut keyless = Cost::ZERO;
     let mut variants: Vec<((String, String), Cost)> = Vec::new();
     for (pat, cost) in guards {
-        match pattern_key(pat) {
+        match pattern_key(pat, shadowed) {
             None => keyless = keyless.then(cost.clone()),
             Some(key) => match variants.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, sum)) => *sum = sum.clone().then(cost.clone()),
@@ -5768,11 +5772,11 @@ fn guard_prefix<'a>(guards: impl Iterator<Item = (&'a Pat, &'a Cost)>) -> Cost {
 /// The `(owner, variant)` a pattern names, for grouping guards: a variant
 /// pattern, or a literal under the owner `literal`. `None` for any other
 /// pattern, which may match any value.
-fn pattern_key(pat: &Pat) -> Option<(String, String)> {
+fn pattern_key(pat: &Pat, shadowed: &[String]) -> Option<(String, String)> {
     match pat {
-        Pat::Paren(p) => pattern_key(&p.pat),
+        Pat::Paren(p) => pattern_key(&p.pat, shadowed),
         Pat::Lit(l) => literal_value(&l.lit).map(|v| ("literal".to_string(), v)),
-        other => pattern_variant(other),
+        other => pattern_variant(other, shadowed),
     }
 }
 
@@ -5780,19 +5784,25 @@ fn pattern_key(pat: &Pat) -> Option<(String, String)> {
 /// variants (`Some(_)` and `None`) or are different literals. A constant
 /// (`A`, `Foo::MAX`) or a user variant path (`m::A`) may name the same
 /// value as another, so it is never disjoint.
-fn patterns_disjoint(a: &Pat, b: &Pat) -> bool {
+fn patterns_disjoint(a: &Pat, b: &Pat, shadowed: &[String]) -> bool {
     match (a, b) {
-        (Pat::Paren(p), _) => patterns_disjoint(&p.pat, b),
-        (_, Pat::Paren(p)) => patterns_disjoint(a, &p.pat),
-        (Pat::Or(o), _) => o.cases.iter().all(|case| patterns_disjoint(case, b)),
-        (_, Pat::Or(o)) => o.cases.iter().all(|case| patterns_disjoint(a, case)),
+        (Pat::Paren(p), _) => patterns_disjoint(&p.pat, b, shadowed),
+        (_, Pat::Paren(p)) => patterns_disjoint(a, &p.pat, shadowed),
+        (Pat::Or(o), _) => o
+            .cases
+            .iter()
+            .all(|case| patterns_disjoint(case, b, shadowed)),
+        (_, Pat::Or(o)) => o
+            .cases
+            .iter()
+            .all(|case| patterns_disjoint(a, case, shadowed)),
         (Pat::Lit(x), Pat::Lit(y)) => {
             matches!((literal_value(&x.lit), literal_value(&y.lit)), (Some(x), Some(y)) if x != y)
         }
         // Two owner paths may name one re-exported enum, so only variants
         // of one written owner are disjoint.
         _ => matches!(
-            (pattern_variant(a), pattern_variant(b)),
+            (pattern_variant(a, shadowed), pattern_variant(b, shadowed)),
             (Some((owner_a, a)), Some((owner_b, b))) if owner_a == owner_b && a != b
         ),
     }
@@ -5814,13 +5824,18 @@ fn literal_value(lit: &syn::Lit) -> Option<String> {
 /// The variant a pattern names, as `(owner, variant)`: a std `Some`,
 /// `None`, `Ok` or `Err`. Any other path may be a constant or a re-export
 /// of another variant.
-fn pattern_variant(pat: &Pat) -> Option<(String, String)> {
+fn pattern_variant(pat: &Pat, shadowed: &[String]) -> Option<(String, String)> {
     const STD: &[&str] = &["Some", "None", "Ok", "Err"];
     let path = match pat {
         Pat::TupleStruct(p) => &p.path,
         Pat::Struct(p) => &p.path,
         Pat::Path(p) => &p.path,
-        Pat::Ident(p) if p.ident == "None" && p.subpat.is_none() && p.by_ref.is_none() => {
+        Pat::Ident(p)
+            if p.ident == "None"
+                && p.subpat.is_none()
+                && p.by_ref.is_none()
+                && !shadows(shadowed, "None") =>
+        {
             return Some(("std".to_string(), "None".to_string()));
         }
         _ => return None,
@@ -5834,6 +5849,11 @@ fn pattern_variant(pat: &Pat) -> Option<(String, String)> {
             "std" | "core" | "option" | "result" | "Option" | "Result"
         )
     });
+    // An item in the body may give a std spelling to a user variant:
+    // `use E::V as Some;`, `enum Option { .. }`.
+    if shadows(shadowed, owner.first().unwrap_or(&name)) {
+        return None;
+    }
     // A module may re-export one variant under two names (`m::A`, `m::B`),
     // so only the std variants are known to differ.
     (STD.contains(&name.as_str()) && std_owner).then(|| ("std".to_string(), name))
@@ -5903,6 +5923,7 @@ fn std_owner(path: &syn::Path) -> bool {
 
 /// The names that items in `block` define or import: `macro_rules! vec`,
 /// `fn drop`, `struct Vec`, `use x::format as fmt` (`fmt`).
+/// A glob import gives `*`.
 fn local_names(block: &Block) -> Vec<String> {
     struct Names(Vec<String>);
     impl<'a> Visit<'a> for Names {
@@ -5929,10 +5950,19 @@ fn local_names(block: &Block) -> Vec<String> {
         fn visit_use_rename(&mut self, u: &'a syn::UseRename) {
             self.0.push(u.rename.to_string());
         }
+        // A glob import may define any name.
+        fn visit_use_glob(&mut self, _: &'a syn::UseGlob) {
+            self.0.push("*".to_string());
+        }
     }
     let mut names = Names(Vec::new());
     names.visit_block(block);
     names.0
+}
+
+/// Does an item in the handler body define or import `name`?
+fn shadows(shadowed: &[String], name: &str) -> bool {
+    shadowed.iter().any(|n| n == name || n == "*")
 }
 
 /// The value a place is inside: `x` for `*x`, `x.field`, `x[i]`.
@@ -12230,6 +12260,46 @@ mod tests {
                  let mut source = Some(repo); let mut dest = Vec::new(); \
                  dest.insert(0, source.take().unwrap()).clone_from(&{ source = None; 1 }); render(dest); Ok(0) }",
                 Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn imported_variant_spellings_are_not_std() {
+        check_handlers(&[
+            (
+                "guard: renamed imports of one variant overlap",
+                "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
+                 use E::V as Some; use E::V as Ok; \
+                 let _ = match x { Some(_) if repo.a().await? => (), Ok(_) if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: an imported None spelling is not std",
+                "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
+                 use E::V as None; \
+                 let _ = match x { None if repo.a().await? => (), Some(_) if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: a local Option enum is not std",
+                "async fn h(repo: PgPostRepository, x: Option) -> AutumnResult<usize> { \
+                 enum Option { Some(i64), None } \
+                 let _ = match x { Option::Some(_) if repo.a().await? => (), Option::None if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: a glob import may give a std spelling",
+                "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
+                 use E::*; \
+                 let _ = match x { Some(_) if repo.a().await? => (), None if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "std variants without imports stay exclusive",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let _ = match x { Option::Some(_) if repo.a().await? => (), Option::None if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(1),
             ),
         ]);
     }

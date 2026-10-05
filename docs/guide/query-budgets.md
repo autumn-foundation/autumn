@@ -426,9 +426,9 @@ callbacks. These things sit outside it, by construction:
   standard name that is bare or under a `std` path: the type `Vec`, `vec!`,
   `format!`, `drop`. It does not trust one under another path
   (`custom::Vec`, `custom::vec!`), or one that the handler body defines or
-  imports (`macro_rules! vec`, `fn drop`). It cannot see a module-level `use`
-  or `macro_rules!` that replaces a bare standard name. Do not give an item of
-  yours a standard name.
+  imports (`macro_rules! vec`, `fn drop`, `use E::V as Some`, `use E::*`).
+  It cannot see a module-level `use` or `macro_rules!` that replaces a bare
+  standard name. Do not give an item of yours a standard name.
 
 ### `proven_max` is not `query_count()`
 
