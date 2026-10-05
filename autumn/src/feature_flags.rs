@@ -57,7 +57,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -1495,6 +1495,9 @@ struct StoreHealth {
     failing: AtomicBool,
     /// Increments on each write through the service.
     writes: AtomicU64,
+    /// Held across a service write and its read-back, so generations follow
+    /// the order of the writes.
+    write_order: Mutex<()>,
 }
 
 /// Values and write generations, under one lock.
@@ -1707,16 +1710,29 @@ impl FeatureFlagService {
         false
     }
 
-    /// Update the last-known value of `flag_key` after a successful write.
+    /// Run one store write, then update the last-known value of `flag_key`.
     ///
-    /// When the store cannot read the flag back, a disable keeps the flag
-    /// off, and any other write drops the last-known value.
-    fn after_write(&self, flag_key: &str, disabled: bool) {
+    /// Service writes run one at a time, through their read-back. When the
+    /// store cannot read the flag back, a disable keeps the flag off, and any
+    /// other write drops the last-known value.
+    fn write(
+        &self,
+        flag_key: &str,
+        disabled: bool,
+        op: impl FnOnce(&dyn FlagStore) -> Result<(), FlagStoreError>,
+    ) -> Result<(), FlagStoreError> {
+        let _ordered = self
+            .health
+            .write_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        op(self.store.as_ref())?;
         let started = self.health.begin_write(flag_key);
         match self.store.get(flag_key) {
             Ok(flag) => self.health.remember(flag_key, flag.as_ref(), started),
             Err(_) => self.health.forget(flag_key, disabled, started),
         }
+        Ok(())
     }
 
     /// Enable `flag_key` for all actors.
@@ -1725,9 +1741,7 @@ impl FeatureFlagService {
     ///
     /// Propagates [`FlagStoreError`] from the backing store.
     pub fn enable(&self, flag_key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-        self.store.enable(flag_key, actor)?;
-        self.after_write(flag_key, false);
-        Ok(())
+        self.write(flag_key, false, |store| store.enable(flag_key, actor))
     }
 
     /// Disable `flag_key` globally.
@@ -1736,9 +1750,7 @@ impl FeatureFlagService {
     ///
     /// Propagates [`FlagStoreError`] from the backing store.
     pub fn disable(&self, flag_key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-        self.store.disable(flag_key, actor)?;
-        self.after_write(flag_key, true);
-        Ok(())
+        self.write(flag_key, true, |store| store.disable(flag_key, actor))
     }
 
     /// Set the percent-rollout gate for `flag_key` to `pct` (0–100).
@@ -1752,9 +1764,9 @@ impl FeatureFlagService {
         pct: u8,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.set_rollout(flag_key, pct, actor)?;
-        self.after_write(flag_key, false);
-        Ok(())
+        self.write(flag_key, false, |store| {
+            store.set_rollout(flag_key, pct, actor)
+        })
     }
 
     /// Add `actor_id` to the explicit allowlist for `flag_key`.
@@ -1768,9 +1780,9 @@ impl FeatureFlagService {
         actor_id: &str,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.allow_actor(flag_key, actor_id, actor)?;
-        self.after_write(flag_key, false);
-        Ok(())
+        self.write(flag_key, false, |store| {
+            store.allow_actor(flag_key, actor_id, actor)
+        })
     }
 
     /// Add `group` to the named-group allowlist for `flag_key`.
@@ -1784,9 +1796,9 @@ impl FeatureFlagService {
         group: &str,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.add_group(flag_key, group, actor)?;
-        self.after_write(flag_key, false);
-        Ok(())
+        self.write(flag_key, false, |store| {
+            store.add_group(flag_key, group, actor)
+        })
     }
 
     /// Return all known flags, sorted by key.
@@ -2638,6 +2650,99 @@ mod tests {
 
         let error = FlagStoreError::Backend("down".to_owned());
         assert_eq!(svc.health.recall("k", &error), Some(on));
+    }
+
+    /// `enable` pauses after its write until the test lets it go on.
+    struct PausingStore {
+        inner: ScriptedStore,
+        entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FlagStore for PausingStore {
+        fn get(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
+            self.inner.get(key)
+        }
+        fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
+            self.inner.list()
+        }
+        fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+            self.inner.enable(key, actor)?;
+            self.entered.lock().unwrap().send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(())
+        }
+        fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+            self.inner.disable(key, actor)
+        }
+        fn set_rollout(
+            &self,
+            key: &str,
+            pct: u8,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.set_rollout(key, pct, actor)
+        }
+        fn allow_actor(
+            &self,
+            key: &str,
+            actor_id: &str,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.allow_actor(key, actor_id, actor)
+        }
+        fn add_group(
+            &self,
+            key: &str,
+            group: &str,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.add_group(key, group, actor)
+        }
+        fn history(
+            &self,
+            key: &str,
+            limit: usize,
+        ) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
+            self.inner.history(key, limit)
+        }
+    }
+
+    #[test]
+    fn an_older_write_cannot_undo_a_later_disable() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let store = Arc::new(PausingStore {
+            inner: ScriptedStore::default(),
+            entered: std::sync::Mutex::new(entered_tx),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let svc = FeatureFlagService::new(store.clone()).with_default("kill", true);
+
+        // An enable writes, then pauses before its read-back.
+        let older = {
+            let svc = svc.clone();
+            std::thread::spawn(move || svc.enable("kill", None).unwrap())
+        };
+        entered.recv().unwrap();
+
+        // A later disable starts. Give it time to finish if nothing orders it.
+        let later = {
+            let svc = svc.clone();
+            std::thread::spawn(move || svc.disable("kill", None).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Reads fail from now on. The older enable ends; then the disable.
+        store.inner.fail(true);
+        release.send(()).unwrap();
+        older.join().unwrap();
+        later.join().unwrap();
+
+        assert!(
+            !svc.is_enabled("kill", None),
+            "the later disable must hold during the outage"
+        );
     }
 
     #[test]
