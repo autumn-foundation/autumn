@@ -458,6 +458,7 @@ mod redis_backend {
                 url: Some(url.to_owned()),
                 key_prefix: KEY_PREFIX.to_owned(),
                 visibility_timeout_ms,
+                ..JobRedisConfig::default()
             },
             ..Default::default()
         }
