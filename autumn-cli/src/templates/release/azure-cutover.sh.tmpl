@@ -10,6 +10,10 @@
 # assign` / `secret set` calls apply to all revisions, so the placeholder
 # would hold the identity until the image update completes.
 #
+# The identity applies to all revisions, and Azure keeps the old revision
+# active until the new one is ready. So the first cutover starts only when
+# the placeholder revision has no running replica.
+#
 # Then the script waits for the new revision. It opens external ingress
 # (#2312) only when that revision runs the real image. If the FIRST cutover
 # fails, the script removes the credentials from the app again.
@@ -90,48 +94,68 @@ fail() {
   exit 1
 }
 
-if [ "$OLD_IMAGE" = "$IMAGE" ]; then
-  # A re-run with the same tag. The template does not change, so Azure makes
-  # no new revision. Check the current revision instead.
-  OLD_REVISION=""
-else
-  # The env keeps the variables that this script does not set. The script
-  # replaces the four variables that it sets. The secrets, registries and
-  # identities that you add to the app stay.
-  PATCH=$(jq -n --argjson job "$JOB" --argjson app "$APP" --argjson app_secrets "$APP_SECRETS" \
-    --arg acr "$ACR_LOGIN_SERVER" --arg image "$IMAGE" '
-    ($job.properties.configuration.registries[0].identity // "") as $id
-    | ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
-    | if $id == "" or ($job_secrets | length) == 0
-      then error("the migration job has no identity or secrets to copy")
-      else . end
-    | ($app_secrets
-       | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not)
-             | if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end)
-       + $job_secrets) as $secrets
-    | ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
-        {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
-       + if any($job_secrets[]; .name == "redis-url")
-         then [{name: "AUTUMN_CACHE__BACKEND", value: "redis"},
-               {name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}]
-         else [] end) as $env
-    | {identity: {
-         type: (if ($app.identity.type // "None" | test("SystemAssigned"))
-                then "SystemAssigned,UserAssigned" else "UserAssigned" end),
-         userAssignedIdentities: {($id): {}}},
-       properties: {
-         configuration: {
-           registries: ([($app.properties.configuration.registries // [])[]
-                         | select(.server != $acr)] + [{server: $acr, identity: $id}]),
-           secrets: $secrets},
-         template: {containers: [$app.properties.template.containers[0]
-           | .image = $image
-           | .env = ([(.env // [])[] | select(.name | IN(
-               "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
-               "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)] + $env)]}}}
-  ')
-  patch_app "$PATCH" || fail "the cutover PATCH failed"
-fi
+case "$OLD_IMAGE" in
+  "$ACR_LOGIN_SERVER"/*) ;;
+  *)
+    # The first cutover. Wait until no placeholder replica runs. The
+    # script checks 30 times, 10 seconds apart.
+    for _ in $(seq 1 30); do
+      REPLICAS=$(az containerapp replica list \
+        --name "$AZURE_APP_NAME" \
+        --resource-group "$AZURE_RESOURCE_GROUP" \
+        --revision "$OLD_REVISION" \
+        --query "length(@)" \
+        --output tsv)
+      [ "$REPLICAS" = "0" ] && break
+      sleep 10
+    done
+    if [ "$REPLICAS" != "0" ]; then
+      echo "::error::the placeholder revision $OLD_REVISION runs $REPLICAS replica(s). Set min_replicas = 0, run terraform apply, and try again." >&2
+      exit 1
+    fi
+    ;;
+esac
+
+# A re-run with the same tag makes no new revision. Then the script checks
+# the current revision instead.
+if [ "$OLD_IMAGE" = "$IMAGE" ]; then OLD_REVISION=""; fi
+
+# The env keeps the variables that this script does not set. The script
+# replaces the four variables that it sets. The secrets, registries and
+# identities that you add to the app stay.
+PATCH=$(jq -n --argjson job "$JOB" --argjson app "$APP" --argjson app_secrets "$APP_SECRETS" \
+  --arg acr "$ACR_LOGIN_SERVER" --arg image "$IMAGE" '
+  ($job.properties.configuration.registries[0].identity // "") as $id
+  | ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
+  | if $id == "" or ($job_secrets | length) == 0
+    then error("the migration job has no identity or secrets to copy")
+    else . end
+  | ($app_secrets
+     | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not)
+           | if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end)
+     + $job_secrets) as $secrets
+  | ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
+      {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
+     + if any($job_secrets[]; .name == "redis-url")
+       then [{name: "AUTUMN_CACHE__BACKEND", value: "redis"},
+             {name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}]
+       else [] end) as $env
+  | {identity: {
+       type: (if ($app.identity.type // "None" | test("SystemAssigned"))
+              then "SystemAssigned,UserAssigned" else "UserAssigned" end),
+       userAssignedIdentities: {($id): {}}},
+     properties: {
+       configuration: {
+         registries: ([($app.properties.configuration.registries // [])[]
+                       | select(.server != $acr)] + [{server: $acr, identity: $id}]),
+         secrets: $secrets},
+       template: {containers: [$app.properties.template.containers[0]
+         | .image = $image
+         | .env = ([(.env // [])[] | select(.name | IN(
+             "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
+             "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)] + $env)]}}}
+')
+patch_app "$PATCH" || fail "the cutover PATCH failed"
 
 # Wait for the new revision. The script checks 60 times, 10 seconds apart.
 READY=""

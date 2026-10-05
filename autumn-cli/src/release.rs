@@ -3071,7 +3071,7 @@ previous_secrets = []
         );
         let patch = script
             .split_once("PATCH=$(")
-            .and_then(|(_, rest)| rest.split_once("\n  ')"))
+            .and_then(|(_, rest)| rest.split_once("\n')"))
             .expect("the script must build the cutover PATCH body")
             .0;
         for field in [

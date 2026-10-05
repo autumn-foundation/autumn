@@ -2046,10 +2046,11 @@ first revision, and a brand-new ACR has none yet). The placeholder **app**
 never gets production credentials (#2314): `main.tf` creates the app with no
 managed identity, no registry and no secret refs. The scaffolded
 `azure-cutover.sh` copies them from the migration job and sets the real image
-in one write. If the first cutover fails, the script removes them again. The
-job also has them, but runs only after you set the real image on it. Two more
-safeguards stay in place: `min_replicas = 0`, and external ingress stays
-**disabled** until the new revision runs the real image (#2312).
+in one write. The identity applies to all revisions, so the first cutover
+waits until the placeholder runs no replica. Keep `min_replicas = 0` until
+then. If the first cutover fails, the script removes the credentials. The
+job also has them, but runs only after you set the real image on it. External
+ingress stays **disabled** until the new revision runs the real image (#2312).
 Build and push your real image, run migrations, then cut the app over:
 
 ```bash
