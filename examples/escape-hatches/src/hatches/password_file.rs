@@ -176,8 +176,7 @@ fn check_url(url: &str) -> Result<(), String> {
                 .to_owned(),
         );
     }
-    let query = url.split_once('?').map_or("", |(_, query)| query);
-    if query.split('&').any(|pair| pair.starts_with("password=")) {
+    if query_pairs(url).any(|(key, _)| key == "password") {
         // A query password wins over the user part, so the file would lose.
         return Err("database URL has a `password` query parameter".to_owned());
     }
@@ -187,15 +186,49 @@ fn check_url(url: &str) -> Result<(), String> {
 /// True if the URL asks for TLS (`sslmode=require`, `verify-ca`, or
 /// `verify-full`).
 fn asks_for_tls(url: &str) -> bool {
-    let Some((_, query)) = url.split_once('?') else {
-        return false;
-    };
-    query.split('&').any(|pair| {
-        matches!(
-            pair.split_once('='),
-            Some(("sslmode", "require" | "verify-ca" | "verify-full"))
-        )
+    query_pairs(url).any(|(key, value)| {
+        key == "sslmode" && matches!(value.as_str(), "require" | "verify-ca" | "verify-full")
     })
+}
+
+/// The query pairs of `url`, percent-decoded, as tokio-postgres reads them.
+fn query_pairs(url: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    let query = url.split_once('?').map_or("", |(_, query)| query);
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode(key), percent_decode(value))
+        })
+}
+
+/// Decode `%XX` escapes and `+`. A bad escape stays as it is.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (b'+', _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Put `password` into the user part of a `postgres://` URL. The URL must
@@ -271,6 +304,14 @@ mod tests {
         assert!(check_url("postgres://app@db/stock?password=old").is_err());
         assert!(check_url("postgres://app@db/stock?sslmode=require").is_err());
         assert!(check_url("host=db user=app").is_err());
+    }
+
+    #[test]
+    fn checks_read_percent_encoded_query_parameters() {
+        // tokio-postgres decodes the query before it applies it.
+        assert!(asks_for_tls("postgres://a@db/x?sslmode=%72equire"));
+        assert!(asks_for_tls("postgres://a@db/x?ssl%6Dode=verify-ca"));
+        assert!(check_url("postgres://a@db/x?pass%77ord=old").is_err());
     }
 
     #[test]
