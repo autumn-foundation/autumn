@@ -2746,7 +2746,9 @@ previous_secrets = []
             "the cutover must select the Redis backend and wire its URL: {script}"
         );
         assert!(
-            script.contains(r#"any($job_secrets[]; .name == "redis-url")"#),
+            script.contains(
+                r#"any(($job.properties.configuration.secrets // [])[]; .name == "redis-url")"#
+            ),
             "the cutover must set the Redis env vars only when the job has redis-url: {script}"
         );
         assert!(
@@ -3078,15 +3080,29 @@ previous_secrets = []
             "userAssignedIdentities",
             "registries:",
             "secrets: $secrets",
+            "template: {containers: $containers}",
+        ] {
+            assert!(
+                patch.contains(field),
+                "the cutover PATCH must set `{field}`: {patch}"
+            );
+        }
+        let containers = script
+            .split_once("CONTAINERS=$(")
+            .and_then(|(_, rest)| rest.split_once("\n')"))
+            .expect("the script must build the new containers")
+            .0;
+        for field in [
             ".image = $image",
+            "+ .[1:]",
             "AUTUMN_DATABASE__PRIMARY_URL",
             "AUTUMN_SECURITY__SIGNING_SECRET",
             "AUTUMN_CACHE__BACKEND",
             "AUTUMN_CACHE__REDIS__URL",
         ] {
             assert!(
-                patch.contains(field),
-                "the cutover PATCH must set `{field}`: {patch}"
+                containers.contains(field),
+                "the new containers must set `{field}`: {containers}"
             );
         }
         assert!(

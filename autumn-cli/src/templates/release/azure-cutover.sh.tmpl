@@ -136,15 +136,38 @@ case "$OLD_IMAGE" in
     ;;
 esac
 
-# A re-run with the same tag makes no new revision. Then the script checks
-# the current revision instead.
-if [ "$OLD_IMAGE" = "$IMAGE" ]; then OLD_REVISION=""; fi
+# The new containers. The script changes only the app container (the first
+# one): it sets the image and the env. Other containers (sidecars) stay. The
+# env keeps the variables that this script does not set, and replaces the
+# four that it sets. This JSON has no secret values.
+CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAGE" '
+  ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
+    {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
+   + if any(($job.properties.configuration.secrets // [])[]; .name == "redis-url")
+     then [{name: "AUTUMN_CACHE__BACKEND", value: "redis"},
+           {name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}]
+     else [] end) as $env
+  | $app.properties.template.containers
+  | [(.[0]
+      | .image = $image
+      | .env = ([(.env // [])[] | select(.name | IN(
+          "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
+          "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)] + $env))]
+    + .[1:]
+')
 
-# The env keeps the variables that this script does not set. The script
-# replaces the four variables that it sets. The secrets, registries and
-# identities that you add to the app stay.
+# A changed template makes a new revision, so the script waits for it. If
+# nothing changes (a re-run with the same tag and config), Azure makes no
+# new revision. Then the script checks the current revision.
+if jq -en --argjson app "$APP" --argjson containers "$CONTAINERS" \
+  '$app.properties.template.containers == $containers' > /dev/null; then
+  OLD_REVISION=""
+fi
+
+# The secrets, registries and identities that you add to the app stay.
 PATCH=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" \
-  --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" --arg image "$IMAGE" "$SECRET_REF"'
+  --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" --argjson containers "$CONTAINERS" \
+  "$SECRET_REF"'
   ($job.properties.configuration.secrets // [] | map({name, keyVaultUrl, identity})) as $job_secrets
   | if $id == "" or ($job_secrets | length) == 0
     then error("the migration job has no identity or secrets to copy")
@@ -152,12 +175,6 @@ PATCH=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets
   | ($app_secrets[0]
      | map(select(.name | IN("database-url", "signing-secret", "redis-url") | not) | secret_ref)
      + $job_secrets) as $secrets
-  | ([{name: "AUTUMN_DATABASE__PRIMARY_URL", secretRef: "database-url"},
-      {name: "AUTUMN_SECURITY__SIGNING_SECRET", secretRef: "signing-secret"}]
-     + if any($job_secrets[]; .name == "redis-url")
-       then [{name: "AUTUMN_CACHE__BACKEND", value: "redis"},
-             {name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}]
-       else [] end) as $env
   | {identity: {
        type: (if ($app.identity.type // "None" | test("SystemAssigned"))
               then "SystemAssigned,UserAssigned" else "UserAssigned" end),
@@ -167,11 +184,7 @@ PATCH=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --slurpfile app_secrets
          registries: ([($app.properties.configuration.registries // [])[]
                        | select(.server != $acr)] + [{server: $acr, identity: $id}]),
          secrets: $secrets},
-       template: {containers: [$app.properties.template.containers[0]
-         | .image = $image
-         | .env = ([(.env // [])[] | select(.name | IN(
-             "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
-             "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)] + $env)]}}}
+       template: {containers: $containers}}}
 ')
 patch_app "$PATCH" || fail "the cutover PATCH failed"
 
