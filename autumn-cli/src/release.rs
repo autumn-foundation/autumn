@@ -3257,6 +3257,7 @@ done
   external=false
   case "$STUB_OLD_IMAGE" in acr.azurecr.io/*) external=true ;; esac
   [ -n "$STUB_INGRESS_INTERNAL" ] && external=false
+  [ -n "$STUB_INGRESS_EXTERNAL" ] && external=true
   ingress="{\"external\":$external,\"targetPort\":3000,\"transport\":\"http\",\"fqdn\":\"app.example.internal\",\"customDomains\":[{\"name\":\"www.example.com\"}]}"
   app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar]$scale}}}"
 case "$1 $2" in
@@ -3264,7 +3265,10 @@ case "$1 $2" in
     secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"$id\"}"; }
     secrets="$(secret database-url),$(secret signing-secret)"
     [ -n "$STUB_REDIS" ] && secrets="$secrets,$(secret redis-url)"
-    echo "{\"properties\":{\"configuration\":{\"registries\":[{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}],\"secrets\":[$secrets]}}}"
+    registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
+    # An operator-added registry listed before the ACR.
+    [ -n "$STUB_JOB_EXTRA_REGISTRY" ] && registries="{\"server\":\"other.example.io\",\"identity\":\"/other-id\"},$registries"
+    echo "{\"properties\":{\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]}}}"
     ;;
   "containerapp show")
     if [ -z "$query" ]; then
@@ -3461,6 +3465,8 @@ esac
             .env_remove("STUB_SIDECAR_REDIS_REF")
             .env_remove("STUB_LATEST_FAILED")
             .env_remove("STUB_INGRESS_INTERNAL")
+            .env_remove("STUB_INGRESS_EXTERNAL")
+            .env_remove("STUB_JOB_EXTRA_REGISTRY")
             .env_remove("STUB_PATCH_PENDING");
         if args.contains(&"--remove-credentials") {
             command.env_remove("IMAGE_TAG");
@@ -3861,6 +3867,48 @@ esac
         assert!(!status.success(), "{calls}");
         assert!(!calls.contains("az rest --method patch"), "{calls}");
         assert!(!calls.contains("ingress disable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_uses_the_acr_registry_identity() {
+        // The job lists an operator-added registry before the ACR. The app
+        // must get the identity of the ACR registry.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_JOB_EXTRA_REGISTRY", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let cutover = bodies.lines().next().unwrap_or_default();
+        assert!(!cutover.contains("/other-id"), "{cutover}");
+        assert!(
+            cutover.contains("\"server\":\"acr.azurecr.io\",\"identity\":\"/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id\""),
+            "{cutover}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rollback_keeps_external_ingress_that_was_open() {
+        // The placeholder had external ingress before the cutover. The
+        // rollback restores it as it was.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let last = bodies.lines().last().unwrap_or_default();
+        assert!(last.contains("\"external\":true"), "{last}");
     }
 
     #[cfg(unix)]
