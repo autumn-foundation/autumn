@@ -6171,9 +6171,8 @@ mod tests {
         #[cfg(feature = "db")]
         shards: Option<crate::sharding::ShardSet>,
         #[cfg(feature = "db")]
-        replica_pool: Option<
-            diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
-        >,
+        replica_pool:
+            Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels,
         #[cfg(feature = "ws")]
