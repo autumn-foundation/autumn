@@ -1468,7 +1468,7 @@ struct Binding {
     inner: Option<Shape>,
     /// What the declared type gives: `let mut repo: PgPostRepository = …;`.
     /// An assignment to the name keeps it.
-    declared: Option<Box<Binding>>,
+    declared: Option<Box<Self>>,
 }
 
 impl Binding {
@@ -5274,10 +5274,10 @@ pub fn query_budget_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // The analysis reads a copy with `&mut |r| …` written as `|r| …`.
-    let mut analyzed = input_fn.clone();
-    PeelClosureRefs.visit_item_fn_mut(&mut analyzed);
-    let mut analyzer = Analyzer::new(&analyzed);
-    let cost = analyzer.function_body(&analyzed.block);
+    let mut normalized = input_fn.clone();
+    PeelClosureRefs.visit_item_fn_mut(&mut normalized);
+    let mut analyzer = Analyzer::new(&normalized);
+    let cost = analyzer.function_body(&normalized.block);
 
     let mut errors: Vec<syn::Error> = std::mem::take(&mut analyzer.errors);
     let proven = match (&budget, &cost) {
