@@ -161,6 +161,7 @@ health.startup_path
 http
 http.client
 http.client.base_urls
+http.client.max_backoff_ms
 http.client.max_retries
 http.client.max_retry_after_secs
 http.client.timeout_secs
@@ -188,6 +189,7 @@ jobs.fleet.manifest
 jobs.fleet.tiers
 jobs.initial_backoff_ms
 jobs.max_attempts
+jobs.max_backoff_ms
 jobs.pin
 jobs.postgres
 jobs.postgres.visibility_timeout_ms

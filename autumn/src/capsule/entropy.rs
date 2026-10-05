@@ -74,6 +74,10 @@ impl Entropy for RecordingEntropy {
             scope.record_random(dest.to_vec());
         }
     }
+
+    fn unrecorded(&self) -> Option<Arc<dyn Entropy>> {
+        Some(Arc::clone(&self.inner))
+    }
 }
 
 /// Serves the draws a capsule recorded, in order.
@@ -200,6 +204,24 @@ mod tests {
         );
         assert_eq!(replay.over_draws(), 0);
         assert_eq!(replay.unconsumed(), 0);
+    }
+
+    /// Issue #3054: framework draws that replay does not make again must not
+    /// reach the tape.
+    #[tokio::test]
+    async fn unrecorded_draws_stay_off_the_tape() {
+        let scope = scope();
+        let recording = RecordingEntropy::new(Arc::new(crate::entropy::OsEntropy));
+        let unrecorded = recording
+            .unrecorded()
+            .expect("a recording has an inner source");
+        crate::capsule::capture::with_capture_scope(Arc::clone(&scope), async {
+            let _ = unrecorded.next_u64();
+            let _ = unrecorded.uuid_v4();
+        })
+        .await;
+        assert!(scope.effects_snapshot().random.is_empty());
+        assert!(crate::entropy::OsEntropy.unrecorded().is_none());
     }
 
     #[tokio::test]
