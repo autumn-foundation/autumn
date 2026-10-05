@@ -943,7 +943,6 @@ pub use nested_form::{
 };
 pub mod data;
 pub mod normalize;
-/// Transactional outbox and inbox (issue #3062).
 #[cfg(feature = "db")]
 pub mod outbox;
 pub mod validation;
