@@ -34,6 +34,8 @@ CREATE TABLE users (
     tip cash,
     fees MONEY[],
     grid MONEY[],
+    ranks INT[],
+    offs MONEY[],
     ratio DOUBLE PRECISION,
     created_at TIMESTAMPTZ NOT NULL,
     born DATE,
@@ -60,15 +62,16 @@ CREATE TABLE comments (
 ";
 
 const SEED: &str = r#"
-INSERT INTO users (email, balance, credit, fee, tip, fees, grid, ratio, created_at, born, avatar, prefs, tags, uid, active)
+INSERT INTO users (email, balance, credit, fee, tip, fees, grid, ranks, offs, ratio, created_at, born, avatar, prefs, tags, uid, active)
 VALUES
   ('Ada@Example.com', 12345678901234567.123456789012, 98765432109876543210.01234567890123456789,
    1234567.89, 12.5, ARRAY[1.5, 2000]::money[], ARRAY[[1.5, 2], [3, NULL]]::money[],
+   '[0:2]={1,2,3}', '[0:1]={1.5,2}',
    0.30000000000000004,
    '2026-01-02 03:04:05.123456+00', '1815-12-10', '\x00ff10'::bytea,
    '{"theme": "dark", "n": [1, 2.5, {"deep": null}]}', ARRAY['a', 'b "q"', 'ü'],
    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', true),
-  ('bob@example.com', 1, NULL, NULL, NULL, '{}', NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
+  ('bob@example.com', 1, NULL, NULL, NULL, '{}', NULL, '{4,5}', NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
    'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', false);
 INSERT INTO posts (author_id, parent_id, title, score) VALUES
   (1, NULL, 'First <post>', 3.14159),
@@ -217,6 +220,11 @@ async fn postgres_round_trip_is_lossless_at_field_level() {
         );
     }
 
+    // `to_jsonb` does not show array bounds, so compare them on their own.
+    let bounds = "SELECT array_dims(ranks) || ' ' || array_dims(offs) AS value \
+                  FROM users WHERE id = 1";
+    assert_eq!(text(&target_pool, bounds).await, "[0:2] [0:1]");
+
     // Export again: the records are the same.
     let second = export_subject(registry.capsule_models(), &target, "1")
         .await
@@ -274,6 +282,9 @@ async fn postgres_round_trip_is_lossless_at_field_level() {
         first.records("users")[0]["grid"],
         serde_json::json!([["1.50", "2.00"], ["3.00", null]])
     );
+    // An array with bounds other than 1 travels as its array literal.
+    assert_eq!(first.records("users")[0]["ranks"], "[0:2]={1,2,3}");
+    assert_eq!(first.records("users")[0]["offs"], "[0:1]={1.50,2.00}");
 
     // A subject that the column type cannot read is bad input, not a fault.
     let err = export_subject(registry.capsule_models(), &source, "not-a-number")
@@ -385,8 +396,10 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
         .expect("connect")
         .batch_execute(
             "CREATE TABLE accounts (code VARCHAR(5) PRIMARY KEY, note TEXT); \
+             CREATE TABLE codes (code CHAR(5) PRIMARY KEY, note TEXT); \
              CREATE TABLE fees (id INT PRIMARY KEY, amount NUMERIC(6, 2), note TEXT); \
              INSERT INTO accounts VALUES ('ab123', 'mine'); \
+             INSERT INTO codes VALUES ('ab123', 'mine'); \
              INSERT INTO fees VALUES (1, 1.23, 'mine');",
         )
         .expect("schema");
@@ -398,6 +411,10 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
     for (model, subject) in [
         (
             CapsuleModel::new("accounts", "code").primary_key("code"),
+            "ab123-extra",
+        ),
+        (
+            CapsuleModel::new("codes", "code").primary_key("code"),
             "ab123-extra",
         ),
         (CapsuleModel::new("fees", "amount"), "1.234"),
@@ -417,6 +434,11 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
         .await
         .expect("export");
     assert_eq!(capsule.records("accounts").len(), 1);
+    let codes = [CapsuleModel::new("codes", "code").primary_key("code")];
+    let capsule = export_subject(&codes, &store, "ab123")
+        .await
+        .expect("export");
+    assert_eq!(capsule.records("codes").len(), 1);
     let fees = [CapsuleModel::new("fees", "amount")];
     let capsule = export_subject(&fees, &store, "1.230")
         .await

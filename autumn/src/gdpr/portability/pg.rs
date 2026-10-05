@@ -81,12 +81,30 @@ fn select_expr(column: &Column) -> Result<String, DataCapsuleError> {
     let col = quote(&column.field.name)?;
     // `money::text` depends on `lc_monetary` (for example `$1,234.50`).
     // Through `numeric` the text is a plain number in every locale.
-    match column.base_type.as_str() {
-        "money" => return Ok(format!("{col}::numeric::text AS {col}")),
-        "money[]" => return Ok(format!("{col}::numeric[]::text[] AS {col}")),
-        _ => {}
+    let base = column.base_type.as_str();
+    if base == "money" {
+        return Ok(format!("{col}::numeric::text AS {col}"));
     }
-    Ok(if travels_as_text(&column.base_type) {
+    if base.ends_with("[]") {
+        // `to_jsonb` drops array bounds. An array with bounds other than 1
+        // travels as its array literal, for example `[0:2]={1,2,3}`, which
+        // import reads back with the bounds.
+        let (json, literal) = if base == "money[]" {
+            (
+                format!("{col}::numeric[]::text[]"),
+                format!("{col}::numeric[]::text"),
+            )
+        } else if travels_as_text(base) {
+            (format!("{col}::text[]"), format!("{col}::text"))
+        } else {
+            (col.clone(), format!("{col}::text"))
+        };
+        return Ok(format!(
+            "CASE WHEN array_dims({col}) IS NULL OR array_dims({col}) ~ '^(\\[1:[0-9]+\\])+$' \
+             THEN to_jsonb({json}) ELSE to_jsonb({literal}) END AS {col}"
+        ));
+    }
+    Ok(if travels_as_text(base) {
         let cast = if column.base_type.ends_with("[]") {
             "text[]"
         } else {
@@ -222,7 +240,14 @@ async fn check_subject(
     subject: &str,
 ) -> Result<(), DataCapsuleError> {
     let column = subject_column(model, columns)?;
-    let (subject_type, bare) = (column.field.data_type.as_str(), column.base_type.as_str());
+    let subject_type = column.field.data_type.as_str();
+    // Without a length, `character` and `bit` mean a length of 1. Compare
+    // through the types that have no length limit.
+    let bare = match column.base_type.as_str() {
+        "character" => "bpchar",
+        "bit" => "bit varying",
+        other => other,
+    };
     let invalid = |reason: String| {
         DataCapsuleError::InvalidInput(format!(
             "subject {subject:?} is not a valid {subject_type} for {}: {reason}",
@@ -389,10 +414,12 @@ fn money_expr(field: &FieldSpec) -> String {
     }
     // The JSON text of a numeric array is an array literal after `[` and `]`
     // become `{` and `}`: the items are plain numbers or `null`. Nested
-    // arrays keep their dimensions. A JSON `null` gives SQL `NULL`.
+    // arrays keep their dimensions. A string is an array literal with its
+    // bounds. A JSON `null` gives SQL `NULL`.
     format!(
-        "CASE WHEN jsonb_typeof(e.j -> '{name}') = 'array' \
-         THEN translate((e.j -> '{name}')::text, '[]', '{{}}')::numeric[]::money[] END"
+        "CASE jsonb_typeof(e.j -> '{name}') \
+         WHEN 'array' THEN translate((e.j -> '{name}')::text, '[]', '{{}}')::numeric[]::money[] \
+         WHEN 'string' THEN (e.j ->> '{name}')::numeric[]::money[] END"
     )
 }
 
@@ -517,9 +544,16 @@ mod tests {
             select_expr(&col("n", "numeric")).unwrap(),
             "\"n\"::text AS \"n\""
         );
+        // An array with bounds other than 1 travels as its array literal.
         assert_eq!(
             select_expr(&col("n", "real[]")).unwrap(),
-            "\"n\"::text[] AS \"n\""
+            "CASE WHEN array_dims(\"n\") IS NULL OR array_dims(\"n\") ~ '^(\\[1:[0-9]+\\])+$' \
+             THEN to_jsonb(\"n\"::text[]) ELSE to_jsonb(\"n\"::text) END AS \"n\""
+        );
+        assert_eq!(
+            select_expr(&col("t", "text[]")).unwrap(),
+            "CASE WHEN array_dims(\"t\") IS NULL OR array_dims(\"t\") ~ '^(\\[1:[0-9]+\\])+$' \
+             THEN to_jsonb(\"t\") ELSE to_jsonb(\"t\"::text) END AS \"t\""
         );
         assert_eq!(select_expr(&col("id", "bigint")).unwrap(), "\"id\"");
         assert_eq!(
@@ -528,7 +562,8 @@ mod tests {
         );
         assert_eq!(
             select_expr(&col("m", "money[]")).unwrap(),
-            "\"m\"::numeric[]::text[] AS \"m\""
+            "CASE WHEN array_dims(\"m\") IS NULL OR array_dims(\"m\") ~ '^(\\[1:[0-9]+\\])+$' \
+             THEN to_jsonb(\"m\"::numeric[]::text[]) ELSE to_jsonb(\"m\"::numeric[]::text) END AS \"m\""
         );
         assert!(select_expr(&col("a\"b", "text")).is_err());
     }
@@ -592,8 +627,9 @@ mod tests {
         // dimensions.
         assert!(
             sql.contains(
-                "CASE WHEN jsonb_typeof(e.j -> 'fee') = 'array' \
-                 THEN translate((e.j -> 'fee')::text, '[]', '{}')::numeric[]::money[] END"
+                "CASE jsonb_typeof(e.j -> 'fee') \
+                 WHEN 'array' THEN translate((e.j -> 'fee')::text, '[]', '{}')::numeric[]::money[] \
+                 WHEN 'string' THEN (e.j ->> 'fee')::numeric[]::money[] END"
             ),
             "{sql}"
         );

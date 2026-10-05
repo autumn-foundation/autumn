@@ -156,9 +156,10 @@ SQLite.
 Import reads only a capsule that passes these checks. It reads each file one
 time, so it imports the same bytes that it verified.
 
-On Unix, verify opens the capsule directory one time and does not follow a
-link. All reads go through that open directory. If a process changes a
-directory to a link after the open, the reads do not follow it.
+On Unix, export and verify open the capsule directory one time and do not
+follow a link. All reads and writes go through that open directory. If a
+process changes a directory to a link after the open, the reads and writes do
+not follow it. Export makes each file new and never replaces a file.
 
 ## Import rules
 
@@ -183,7 +184,9 @@ as text, also through a domain. Export writes `money` and each `money[]`
 item as a plain number, so the value does not depend on the `lc_monetary`
 locale. The manifest keeps the base type of each domain, so import also reads
 a domain over `money` or `money[]` as plain numbers. Time stamps, `bytea`,
-`uuid`, and arrays keep their exact values.
+`uuid`, and arrays keep their exact values. An array with bounds other than 1
+(for example `[0:2]={1,2,3}`) travels as its array literal, so it keeps its
+bounds.
 
 The subject id must be a valid value of the subject column type. For example,
 `abc` for a `bigint` column is an input error (`400`). The column type must not

@@ -1,10 +1,10 @@
-//! Read a capsule directory without following links.
+//! Read and write a capsule directory without following links.
 //!
 //! On Unix, [`Root::open`] opens the capsule directory one time, with
-//! `O_NOFOLLOW`. Every later list and read goes through that handle, one
-//! path segment at a time, with `O_NOFOLLOW` again. A process that swaps the
-//! directory or an entry for a link after the open cannot redirect a read.
-//! Other targets fall back to path-based reads.
+//! `O_NOFOLLOW`. Every later list, read, and write goes through that handle,
+//! one path segment at a time, with `O_NOFOLLOW` again. A process that swaps
+//! the directory or an entry for a link after the open cannot redirect a read
+//! or a write. Other targets fall back to path-based access.
 
 use super::model::DataCapsuleError;
 
@@ -13,14 +13,14 @@ pub(super) use imp::Root;
 #[cfg(unix)]
 mod imp {
     use std::collections::BTreeSet;
-    use std::io::Read as _;
+    use std::io::{Read as _, Write as _};
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
     use std::path::Path;
 
     use nix::dir::{Dir, Type};
     use nix::errno::Errno;
     use nix::fcntl::{AtFlags, OFlag, open, openat};
-    use nix::sys::stat::{Mode, SFlag, fstat, fstatat, mode_t};
+    use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat, mode_t};
 
     use super::DataCapsuleError;
 
@@ -33,6 +33,15 @@ mod imp {
         .union(OFlag::O_NOFOLLOW)
         .union(OFlag::O_CLOEXEC)
         .union(OFlag::O_NONBLOCK);
+
+    /// `O_EXCL`: a new file never replaces an entry, and never follows a link.
+    const NEW_FILE_FLAGS: OFlag = OFlag::O_WRONLY
+        .union(OFlag::O_CREAT)
+        .union(OFlag::O_EXCL)
+        .union(OFlag::O_NOFOLLOW)
+        .union(OFlag::O_CLOEXEC);
+    const DIR_MODE: Mode = Mode::S_IRWXU;
+    const FILE_MODE: Mode = Mode::S_IRUSR.union(Mode::S_IWUSR);
 
     /// An open capsule directory.
     #[derive(Debug)]
@@ -113,6 +122,61 @@ mod imp {
             walk(self.fd.as_fd(), "", &mut files)?;
             Ok(files)
         }
+
+        /// Make the root owner-only and check that it is empty.
+        pub(in crate::gdpr::portability) fn prepare(&self) -> Result<(), DataCapsuleError> {
+            fchmod(&self.fd, DIR_MODE).map_err(|e| error(e, "."))?;
+            let mut listing = Dir::openat(
+                self.fd.as_fd(),
+                ".",
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| error(e, "."))?;
+            for entry in listing.iter() {
+                let entry = entry.map_err(|e| error(e, "."))?;
+                let name = entry.file_name().to_bytes();
+                if name != b"." && name != b".." {
+                    return Err(DataCapsuleError::NotEmpty(".".into()));
+                }
+            }
+            Ok(())
+        }
+
+        /// Write a new owner-only file. Each directory is owner-only too.
+        pub(in crate::gdpr::portability) fn write(
+            &self,
+            rel: &str,
+            bytes: &[u8],
+        ) -> Result<(), DataCapsuleError> {
+            let mut segments: Vec<&str> = rel.split('/').collect();
+            let name = segments
+                .pop()
+                .ok_or_else(|| DataCapsuleError::InvalidName(rel.to_owned()))?;
+            let mut current: Option<OwnedFd> = None;
+            for segment in segments {
+                let parent = current
+                    .as_ref()
+                    .map_or_else(|| self.fd.as_fd(), AsFd::as_fd);
+                match mkdirat(parent, segment, DIR_MODE) {
+                    Ok(()) | Err(Errno::EEXIST) => {}
+                    Err(e) => return Err(error(e, rel)),
+                }
+                let dir =
+                    openat(parent, segment, DIR_FLAGS, Mode::empty()).map_err(|e| error(e, rel))?;
+                // `mkdirat` applies the umask; set the mode on the handle.
+                fchmod(&dir, DIR_MODE).map_err(|e| error(e, rel))?;
+                current = Some(dir);
+            }
+            let parent = current
+                .as_ref()
+                .map_or_else(|| self.fd.as_fd(), AsFd::as_fd);
+            let fd = openat(parent, name, NEW_FILE_FLAGS, FILE_MODE).map_err(|e| error(e, rel))?;
+            fchmod(&fd, FILE_MODE).map_err(|e| error(e, rel))?;
+            std::fs::File::from(fd)
+                .write_all(bytes)
+                .map_err(|e| DataCapsuleError::io(rel, e))
+        }
     }
 
     /// The type of `name` in `dir`, from `fstatat` without following a link.
@@ -190,7 +254,13 @@ mod imp {
 
     impl Root {
         pub(in crate::gdpr::portability) fn open(dir: &Path) -> Result<Self, DataCapsuleError> {
-            let meta = std::fs::symlink_metadata(dir).map_err(|e| DataCapsuleError::io(dir, e))?;
+            let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    DataCapsuleError::Integrity(format!("file is missing: {}", dir.display()))
+                } else {
+                    DataCapsuleError::io(dir, e)
+                }
+            })?;
             if !meta.file_type().is_dir() {
                 return Err(DataCapsuleError::Integrity(format!(
                     "entry is a link or not a directory: {}",
@@ -220,6 +290,37 @@ mod imp {
                 )));
             }
             std::fs::read(&path).map_err(|e| DataCapsuleError::io(path, e))
+        }
+
+        /// Make the root owner-only and check that it is empty.
+        pub(in crate::gdpr::portability) fn prepare(&self) -> Result<(), DataCapsuleError> {
+            crate::fs_atomic::ensure_owner_only_dir(&self.path)
+                .map_err(|e| DataCapsuleError::io(&self.path, e))?;
+            let mut entries =
+                std::fs::read_dir(&self.path).map_err(|e| DataCapsuleError::io(&self.path, e))?;
+            if entries.next().is_some() {
+                return Err(DataCapsuleError::NotEmpty(self.path.clone()));
+            }
+            Ok(())
+        }
+
+        /// Write a new owner-only file. Each directory is owner-only too.
+        pub(in crate::gdpr::portability) fn write(
+            &self,
+            rel: &str,
+            bytes: &[u8],
+        ) -> Result<(), DataCapsuleError> {
+            let mut dir = self.path.clone();
+            let mut segments: Vec<&str> = rel.split('/').collect();
+            segments.pop();
+            for segment in segments {
+                dir.push(segment);
+                crate::fs_atomic::ensure_owner_only_dir(&dir)
+                    .map_err(|e| DataCapsuleError::io(&dir, e))?;
+            }
+            let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
+            crate::fs_atomic::write_owner_only(&path, bytes)
+                .map_err(|e| DataCapsuleError::io(path, e))
         }
 
         pub(in crate::gdpr::portability) fn list_regular_files(

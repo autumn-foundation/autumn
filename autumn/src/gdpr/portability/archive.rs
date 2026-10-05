@@ -11,7 +11,7 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -145,10 +145,6 @@ fn is_safe_rel_path(path: &str) -> bool {
     segments.len() <= MAX_PATH_DEPTH && segments.iter().all(|s| is_safe_segment(s))
 }
 
-fn join(root: &Path, rel: &str) -> PathBuf {
-    rel.split('/').fold(root.to_path_buf(), |p, s| p.join(s))
-}
-
 impl DataCapsule {
     /// Write the capsule to `dir` and sign it.
     ///
@@ -160,8 +156,19 @@ impl DataCapsule {
     /// unsafe name in the manifest.
     pub fn write_dir(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
         let created = prepare_empty_dir(dir)?;
-        let result = self.write_files(dir, signer);
-        if result.is_err() {
+        // Write through a handle: the path can change after the check.
+        let result = Root::open(dir).and_then(|root| {
+            root.prepare().map_err(|e| match e {
+                DataCapsuleError::NotEmpty(_) => DataCapsuleError::NotEmpty(dir.to_path_buf()),
+                other => other,
+            })?;
+            self.write_files(&root, signer)
+        });
+        // Content that was there before this call is not ours to remove.
+        if result
+            .as_ref()
+            .is_err_and(|e| !matches!(e, DataCapsuleError::NotEmpty(_)))
+        {
             // The directory was empty or new, so all content is from this
             // call. Remove it: a partial capsule is not useful.
             let _ = std::fs::remove_dir_all(dir);
@@ -172,7 +179,7 @@ impl DataCapsule {
         result
     }
 
-    fn write_files(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
+    fn write_files(&self, root: &Root, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
         let mut manifest = self.manifest.clone();
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         for model in &mut manifest.models {
@@ -188,11 +195,15 @@ impl DataCapsule {
             model.file = record_file(&model.table);
             files.push((model.file.clone(), to_json(&model.file, records)?));
         }
+        // Two keys with the same bytes share one file: write it one time.
+        let mut seen = std::collections::BTreeSet::new();
         for blob in &manifest.blobs {
             let bytes = self.blobs.get(&blob.sha256).ok_or_else(|| {
                 DataCapsuleError::Blob(format!("no bytes for blob {:?}", blob.key))
             })?;
-            files.push((blob.file(), bytes.to_vec()));
+            if seen.insert(blob.sha256.as_str()) {
+                files.push((blob.file(), bytes.to_vec()));
+            }
         }
         files.extend(super::viewer::render(&manifest, &self.records));
 
@@ -204,7 +215,7 @@ impl DataCapsule {
             if !is_safe_rel_path(rel) {
                 return Err(DataCapsuleError::InvalidName(rel.clone()));
             }
-            write_private(dir, rel, bytes)?;
+            root.write(rel, bytes)?;
         }
 
         let manifest_bytes = to_json(MANIFEST_FILE, &manifest)?;
@@ -212,8 +223,8 @@ impl DataCapsule {
             algorithm: ALGORITHM.to_owned(),
             signature: signer.sign(&manifest_bytes),
         };
-        write_private(dir, MANIFEST_FILE, &manifest_bytes)?;
-        write_private(dir, SIGNATURE_FILE, &to_json(SIGNATURE_FILE, &signature)?)
+        root.write(MANIFEST_FILE, &manifest_bytes)?;
+        root.write(SIGNATURE_FILE, &to_json(SIGNATURE_FILE, &signature)?)
     }
 
     /// Verify the capsule in `dir`, then read it.
@@ -262,20 +273,6 @@ impl DataCapsule {
             blobs,
         })
     }
-}
-
-/// Write one capsule file. A capsule holds personal data, so each directory
-/// is owner-only (`0700`) and each file is owner-only (`0600`) on Unix.
-fn write_private(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), DataCapsuleError> {
-    let mut dir = root.to_path_buf();
-    let mut segments: Vec<&str> = rel.split('/').collect();
-    segments.pop();
-    for segment in segments {
-        dir.push(segment);
-        crate::fs_atomic::ensure_owner_only_dir(&dir).map_err(|e| DataCapsuleError::io(&dir, e))?;
-    }
-    let path = join(root, rel);
-    crate::fs_atomic::write_owner_only(&path, bytes).map_err(|e| DataCapsuleError::io(path, e))
 }
 
 /// Make sure `dir` is an empty, owner-only directory. Give `true` when this
@@ -474,6 +471,45 @@ mod tests {
             assert_eq!(listed.into_iter().collect::<Vec<_>>(), ["records/a.json"]);
             std::fs::remove_file(dir.path()).unwrap();
             std::fs::rename(&moved, dir.path()).unwrap();
+        }
+
+        #[test]
+        fn write_goes_through_the_open_handle() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir = tempfile::tempdir().unwrap();
+            let root = Root::open(dir.path()).unwrap();
+            // Swap the directory after open: writes still go to the original.
+            let moved = dir.path().with_extension("moved");
+            std::fs::rename(dir.path(), &moved).unwrap();
+            let decoy = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(decoy.path(), dir.path()).unwrap();
+            root.write("records/a.json", b"[]").unwrap();
+            assert_eq!(std::fs::read(moved.join("records/a.json")).unwrap(), b"[]");
+            assert!(std::fs::read_dir(decoy.path()).unwrap().next().is_none());
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&moved.join("records")), 0o700);
+            assert_eq!(mode(&moved.join("records/a.json")), 0o600);
+            std::fs::remove_file(dir.path()).unwrap();
+            std::fs::rename(&moved, dir.path()).unwrap();
+        }
+
+        #[test]
+        fn write_refuses_a_linked_dir_or_an_existing_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let decoy = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(decoy.path(), dir.path().join("records")).unwrap();
+            let root = Root::open(dir.path()).unwrap();
+            let err = root.write("records/a.json", b"[]").expect_err("linked dir");
+            assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+            assert!(std::fs::read_dir(decoy.path()).unwrap().next().is_none());
+
+            // A file is never replaced, and a link at the file name is not followed.
+            std::fs::write(decoy.path().join("target"), b"keep").unwrap();
+            std::os::unix::fs::symlink(decoy.path().join("target"), dir.path().join("m.json"))
+                .unwrap();
+            assert!(root.write("m.json", b"{}").is_err());
+            assert_eq!(std::fs::read(decoy.path().join("target")).unwrap(), b"keep");
         }
 
         #[test]
