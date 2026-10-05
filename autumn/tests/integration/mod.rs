@@ -30,6 +30,8 @@ mod boundary_hooks_integration;
 mod broadcast_recorder;
 #[cfg(all(feature = "db", feature = "cache-moka"))]
 mod cache_coherence;
+#[cfg(all(feature = "db", feature = "cache-moka", feature = "test-support"))]
+mod cache_invalidation_after_commit;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
 #[cfg(all(feature = "db", feature = "cache-moka"))]
@@ -174,9 +176,15 @@ mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
 mod job_recorder_integration;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod job_retry_jitter_pg;
+#[cfg(feature = "redis")]
+mod job_retry_jitter_redis;
 mod job_tenant_scope;
 mod job_tracking_route;
 mod job_tracking_stores_integration;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod lease_lock;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
 mod live_state;
@@ -413,6 +421,8 @@ mod sim_monotonic_clock;
 mod sim_net;
 mod sim_rate_limit_clock;
 mod sim_retry_storm;
+#[cfg(feature = "http-client")]
+mod sim_retry_storm_http;
 mod sim_scheduled_ticks;
 #[cfg(feature = "sla")]
 mod sim_sla;

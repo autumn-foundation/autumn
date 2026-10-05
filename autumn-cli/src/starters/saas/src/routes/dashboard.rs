@@ -164,18 +164,8 @@ pub async fn create_project(
         name: trimmed.to_owned(),
     })
     .await?;
-    // Discharge the invalidation the repository declares. The build proves the
-    // edge exists and names a real cached read; calling it is what makes the
-    // next dashboard render show the new count instead of the 30s-old one.
-    //
-    // The return value is not decoration: `false` means the configured cache
-    // backend could not drop the namespace, so the old count is still being
-    // served and the dashboard will lie for up to the 30s TTL.
-    if !PgProjectRepository::invalidate_declared_caches() {
-        autumn_web::reexports::tracing::warn!(
-            "cache backend cannot invalidate by namespace; the project count may be stale \
-             until its TTL expires"
-        );
-    }
+    // `save` committed, then dropped the cached count: the repository declares
+    // `invalidates(cached_project_count)` (#3056). A failure there is logged
+    // and counted, and the 30 s TTL bounds the stale count.
     Ok(Redirect::to("/dashboard").into_response())
 }

@@ -124,6 +124,7 @@
 //! | `AUTUMN_JOBS__PIN` | `jobs.pin` | comma-separated queue names |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__MAX_BACKOFF_MS` | `jobs.max_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
@@ -2249,10 +2250,16 @@ pub struct HttpClientConfig {
     #[serde(default = "default_http_max_retries")]
     pub max_retries: u32,
 
-    /// Maximum Retry-After sleep duration in seconds to accept before clamping.
-    /// Default: 10.
+    /// Cap on a `Retry-After` hint, in seconds. Default: 10. The wait is
+    /// also at most the backoff plus 5 s (issue #3054), so a value above 5
+    /// has no effect.
     #[serde(default = "default_http_max_retry_after_secs")]
     pub max_retry_after_secs: u64,
+
+    /// Cap on the jittered retry backoff in milliseconds. Default: 20 000.
+    /// See [`crate::backoff`].
+    #[serde(default = "default_http_max_backoff_ms")]
+    pub max_backoff_ms: u64,
 
     /// Named base URL aliases, e.g. `stripe = "https://api.stripe.com"`.
     ///
@@ -2280,12 +2287,18 @@ const fn default_http_max_retry_after_secs() -> u64 {
 }
 
 #[cfg(feature = "http-client")]
+const fn default_http_max_backoff_ms() -> u64 {
+    crate::backoff::DEFAULT_HTTP_MAX_BACKOFF_MS
+}
+
+#[cfg(feature = "http-client")]
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_http_timeout_secs(),
             max_retries: default_http_max_retries(),
             max_retry_after_secs: default_http_max_retry_after_secs(),
+            max_backoff_ms: default_http_max_backoff_ms(),
             base_urls: std::collections::HashMap::new(),
         }
     }
@@ -3489,6 +3502,10 @@ pub struct JobConfig {
     /// Default initial retry backoff in milliseconds.
     #[serde(default = "default_job_backoff_ms")]
     pub initial_backoff_ms: u64,
+    /// Cap on the retry backoff in milliseconds, for every backend.
+    /// Default: 3 600 000 (1 hour). See [`crate::backoff`].
+    #[serde(default = "default_job_max_backoff_ms")]
+    pub max_backoff_ms: u64,
     /// Ordered/weighted list of queues workers drain, highest priority first.
     ///
     /// Unset = a single `default` queue (today's behavior). A TOML array such as
@@ -3533,6 +3550,7 @@ impl Default for JobConfig {
             workers: default_job_workers(),
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
+            max_backoff_ms: default_job_max_backoff_ms(),
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
             fleet: JobFleetConfig::default(),
@@ -3991,6 +4009,10 @@ const fn default_job_max_attempts() -> u32 {
 
 const fn default_job_backoff_ms() -> u64 {
     250
+}
+
+const fn default_job_max_backoff_ms() -> u64 {
+    crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS
 }
 
 fn default_jobs_redis_prefix() -> String {
@@ -5197,6 +5219,7 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__PIN` → `jobs.pin` (comma-separated queue names)
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__MAX_BACKOFF_MS` → `jobs.max_backoff_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
@@ -6135,6 +6158,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__INITIAL_BACKOFF_MS",
             &mut self.jobs.initial_backoff_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__MAX_BACKOFF_MS",
+            &mut self.jobs.max_backoff_ms,
         );
         parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
         parse_env_string(
@@ -14552,6 +14580,7 @@ path = "/healthz"
             .with("AUTUMN_JOBS__WORKERS", "8")
             .with("AUTUMN_JOBS__MAX_ATTEMPTS", "12")
             .with("AUTUMN_JOBS__INITIAL_BACKOFF_MS", "750")
+            .with("AUTUMN_JOBS__MAX_BACKOFF_MS", "90000")
             .with("AUTUMN_JOBS__REDIS__URL", "redis://jobs:6379/2")
             .with("AUTUMN_JOBS__REDIS__KEY_PREFIX", "myapp:jobs")
             .with("AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS", "45000");
@@ -14562,6 +14591,7 @@ path = "/healthz"
         assert_eq!(config.jobs.workers, 8);
         assert_eq!(config.jobs.max_attempts, 12);
         assert_eq!(config.jobs.initial_backoff_ms, 750);
+        assert_eq!(config.jobs.max_backoff_ms, 90_000);
         assert_eq!(
             config.jobs.redis.url.as_deref(),
             Some("redis://jobs:6379/2")
