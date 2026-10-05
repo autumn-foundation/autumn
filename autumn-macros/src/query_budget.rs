@@ -2010,8 +2010,14 @@ impl Analyzer {
         if let Pat::Type(typed) = pat
             && let Pat::Ident(id) = &*typed.pat
         {
+            let name = id.ident.to_string();
             let targets = self.referents_of(init);
-            self.add_referents(id.ident.to_string(), &targets);
+            self.add_referents(name.clone(), &targets);
+            if !targets.is_empty() && self.borrows_whole(init) {
+                let mut binding = self.env.binding(&name);
+                binding.whole = true;
+                self.env.declare(name, binding);
+            }
         }
         // `let Holder(ref mut bucket) = holder;`: a store into `bucket` is a
         // store into `holder`.
@@ -2334,6 +2340,15 @@ impl Analyzer {
                     let binding = self.env.binding(&name);
                     binding.referents.is_empty() || binding.whole
                 }),
+            // `if flag { &mut left } else { &mut right }`: every tail does.
+            other @ (Expr::If(_)
+            | Expr::Match(_)
+            | Expr::Block(_)
+            | Expr::Unsafe(_)
+            | Expr::Loop(_)) => {
+                let tails = value_tails(other);
+                !tails.is_empty() && tails.iter().all(|t| self.borrows_whole(t))
+            }
             other => path_ident(other).is_some_and(|name| self.env.binding(&name).whole),
         }
     }
@@ -2434,7 +2449,12 @@ impl Analyzer {
         let known = |e: &Expr| !self.is_opaque_value(e);
         match peel_parens(e) {
             Expr::Lit(_) | Expr::Closure(_) => false,
-            Expr::Path(p) => !p.path.is_ident("None"),
+            // `None`, `std::option::Option::None`.
+            Expr::Path(p) => {
+                !(p.qself.is_none()
+                    && p.path.segments.last().is_some_and(|s| s.ident == "None")
+                    && std_prefix(&p.path))
+            }
             Expr::Call(c) => {
                 !((is_container_constructor(c)
                     || is_smart_pointer_new(c)
@@ -4052,8 +4072,12 @@ impl Analyzer {
     /// `root` now holds at least `kind`. A store through `slot = &mut repos`
     /// is a store into `repos` too.
     fn raise(&mut self, root: String, kind: Kind) {
-        for root in self.alias_targets(root) {
-            self.raise_one(root, kind);
+        // A place an alias borrows only a part of (`&mut slots[0]`) holds
+        // the value one layer down.
+        let whole = self.env.binding(&root).whole;
+        for (i, name) in self.alias_targets(root).into_iter().enumerate() {
+            let held = if i == 0 || whole { kind } else { Kind::Nested };
+            self.raise_one(name, held);
         }
     }
 
@@ -5708,6 +5732,8 @@ const STD_PATH: &[&str] = &[
     "linked_list",
     "option",
     "result",
+    "Option",
+    "Result",
     "sync",
     "rc",
     "boxed",
@@ -11671,7 +11697,8 @@ mod tests {
                  let mut left = Vec::new(); \
                  { let target: &mut Vec<PgPostRepository> = (|x| x)(&mut left); target.push(repo); } \
                  let _ = left[0].find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                // A call may give back a part, so `left` nests the handle.
+                Expect::Unbounded,
             ),
             (
                 "guard: a function given a mut borrow may give it back",
@@ -11679,7 +11706,8 @@ mod tests {
                  let mut left = Vec::new(); \
                  { let target: &mut Vec<PgPostRepository> = pick(&mut left); target.push(repo); } \
                  let _ = left[0].find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                // A call may give back a part, so `left` nests the handle.
+                Expect::Unbounded,
             ),
             (
                 "guard: an entry value aliases its map",
@@ -11805,6 +11833,42 @@ mod tests {
                 "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
                  let mut left = vec![repo]; let mut right = Vec::new(); \
                  { let target = if flag { &mut left } else { &mut right }; target.clear(); } render(left); Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn part_alias_stores_nest_and_qualified_none_clears() {
+        check_handlers(&[
+            (
+                "guard: a store through a part alias nests the owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; \
+                 { let target: &mut Option<PgPostRepository> = &mut slots[0]; target.insert(repo); } \
+                 slots[0].refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a store through a typed whole alias keeps the owner a carrier",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut repos = Vec::new(); \
+                 { let slot: &mut Vec<PgPostRepository> = &mut repos; slot.push(repo); } \
+                 let _ = repos[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a qualified None clears a declared Option",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot: Option<PgPostRepository> = Some(repo); slot = std::option::Option::None; \
+                 render(slot); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a user None path stays opaque",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot: Option<PgPostRepository> = Some(repo); slot = custom::None; \
+                 render(slot); Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
