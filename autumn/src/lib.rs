@@ -772,6 +772,159 @@ macro_rules! __autumn_register_fake_seeder {
 macro_rules! __autumn_register_fake_seeder {
     ($model:ty, $name:expr) => {};
 }
+
+// ── #2148: console REPL registration forwarding ─────────────────────────────
+//
+// Same pattern as the fake seeder above: `#[model]` and `#[repository]` call
+// these macros always. The `repl` feature of autumn-web selects the body, so
+// Rhai and its glue reach a build only when that feature is on.
+
+/// Register a model with the console REPL (internal; invoked by `#[model]`).
+///
+/// `serde` projects a row through its `Serialize` impl. `fields [...]` projects
+/// the listed fields only (a model with `#[classified]` columns has no
+/// `Serialize` impl).
+#[cfg(feature = "repl")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_repl_model {
+    ($model:ty, $name:expr, $table:expr, [$($field:literal),* $(,)?], serde) => {
+        $crate::__autumn_register_repl_model!(@entry $name, $table, [$($field),*]);
+        impl $crate::repl::ReplRow for $model {
+            fn to_repl_value(
+                &self,
+            ) -> ::core::result::Result<$crate::reexports::serde_json::Value, ::std::string::String>
+            {
+                $crate::reexports::serde_json::to_value(self)
+                    .map_err(|err| ::std::string::ToString::to_string(&err))
+            }
+        }
+    };
+    (
+        $model:ty, $name:expr, $table:expr, [$($field:literal),* $(,)?],
+        fields [$($key:literal => $ident:ident),* $(,)?]
+    ) => {
+        $crate::__autumn_register_repl_model!(@entry $name, $table, [$($field),*]);
+        impl $crate::repl::ReplRow for $model {
+            fn to_repl_value(
+                &self,
+            ) -> ::core::result::Result<$crate::reexports::serde_json::Value, ::std::string::String>
+            {
+                #[allow(unused_mut)]
+                let mut map = $crate::reexports::serde_json::Map::new();
+                $(
+                    map.insert(
+                        ::std::string::ToString::to_string($key),
+                        $crate::reexports::serde_json::to_value(&self.$ident)
+                            .map_err(|err| ::std::string::ToString::to_string(&err))?,
+                    );
+                )*
+                ::core::result::Result::Ok($crate::reexports::serde_json::Value::Object(map))
+            }
+        }
+    };
+    (@entry $name:expr, $table:expr, [$($field:literal),*]) => {
+        $crate::reexports::inventory::submit! {
+            $crate::repl::ReplModel { name: $name, table: $table, fields: &[$($field),*] }
+        }
+    };
+}
+
+/// No-op REPL model registration (internal): autumn-web is built without `repl`.
+#[cfg(not(feature = "repl"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_repl_model {
+    ($($tokens:tt)*) => {};
+}
+
+/// Register a repository with the console REPL (internal; invoked by
+/// `#[repository]`). Registers `find_all`, `find_by_id` and `count`.
+#[cfg(feature = "repl")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_repl_repository {
+    ($repository:path, $pg:ty, $model:ty, $name:expr, $model_name:expr) => {
+        $crate::reexports::inventory::submit! {
+            $crate::repl::ReplRepository {
+                name: $name,
+                model: $model_name,
+                find_all: |__pool| ::std::boxed::Box::pin(async move {
+                    let __repo = <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    $crate::repl::__project_all(
+                        <$pg as $repository>::find_all(&__repo).await,
+                        $crate::__autumn_repl_projector!($model),
+                    )
+                }),
+                find_by_id: |__pool, __id| ::std::boxed::Box::pin(async move {
+                    let __repo = <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    $crate::repl::__project_one(
+                        <$pg as $repository>::find_by_id(&__repo, __id).await,
+                        $crate::__autumn_repl_projector!($model),
+                    )
+                }),
+                count: |__pool| ::std::boxed::Box::pin(async move {
+                    let __repo = <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    $crate::repl::__count(<$pg as $repository>::count(&__repo).await)
+                }),
+            }
+        }
+    };
+}
+
+/// The row projection for a repository's model (internal): `ReplRow`, then
+/// `Serialize`, then an error.
+#[cfg(feature = "repl")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_repl_projector {
+    ($model:ty) => {{
+        #[allow(unused_imports)]
+        use $crate::repl::{__ViaNone as _, __ViaRow as _, __ViaSerde as _};
+        (&&&$crate::repl::__Probe::<$model>::new()).__projector()
+    }};
+}
+
+/// No-op REPL repository registration (internal): autumn-web is built without
+/// `repl`.
+#[cfg(not(feature = "repl"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_repl_repository {
+    ($($tokens:tt)*) => {};
+}
+
+/// Opens the console REPL and ends the process, or does nothing.
+///
+/// `autumn console` puts this line in `src/bin/playground.rs`.
+/// `autumn console --repl` builds the playground with `autumn-web/repl`: the
+/// line then opens an interactive Rhai prompt on `pool` and exits when the
+/// user stops. Without that feature the line expands to nothing, and the
+/// playground code after it runs.
+///
+/// Use it in an `async fn`.
+///
+/// ```ignore
+/// let ctx = autumn_web::seed::SeedContext::build()?;
+/// autumn_web::console_repl!(ctx.pool());
+/// ```
+#[cfg(feature = "repl")]
+#[macro_export]
+macro_rules! console_repl {
+    ($pool:expr $(,)?) => {
+        $crate::repl::exit_with($crate::repl::run($pool).await)
+    };
+}
+
+/// Opens the console REPL and ends the process, or does nothing.
+///
+/// This build of autumn-web has no `repl` feature, so the line expands to
+/// nothing. See `autumn console --repl`.
+#[cfg(not(feature = "repl"))]
+#[macro_export]
+macro_rules! console_repl {
+    ($($pool:tt)*) => {};
+}
 /// Widget story gallery (issue #1526).
 ///
 /// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget

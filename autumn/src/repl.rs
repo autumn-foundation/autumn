@@ -357,21 +357,83 @@ pub fn exit_with(result: Result<(), ReplError>) -> ! {
     }
 }
 
+/// Converts one row. Picked by [`__Probe`].
 #[doc(hidden)]
-pub fn __project_all<M: ReplRow>(rows: crate::AutumnResult<Vec<M>>) -> Result<Vec<Value>, String> {
+pub type __Projector<M> = fn(&M) -> Result<Value, String>;
+
+// Autoref selection of the row projection for `#[repository]`. Call it on
+// `&&&__Probe`. The methods take `&self`, so lookup tries the impl for
+// `&&__Probe` first, then `&__Probe`, then `__Probe`: `ReplRow` (a `#[model]`)
+// wins, then `Serialize` (a hand-written model), then an error.
+
+#[doc(hidden)]
+pub struct __Probe<M>(std::marker::PhantomData<M>);
+
+impl<M> __Probe<M> {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[doc(hidden)]
+pub trait __ViaRow<M> {
+    fn __projector(&self) -> __Projector<M>;
+}
+
+impl<M: ReplRow> __ViaRow<M> for &&__Probe<M> {
+    fn __projector(&self) -> __Projector<M> {
+        M::to_repl_value
+    }
+}
+
+#[doc(hidden)]
+pub trait __ViaSerde<M> {
+    fn __projector(&self) -> __Projector<M>;
+}
+
+impl<M: serde::Serialize> __ViaSerde<M> for &__Probe<M> {
+    fn __projector(&self) -> __Projector<M> {
+        |row| serde_json::to_value(row).map_err(|err| err.to_string())
+    }
+}
+
+#[doc(hidden)]
+pub trait __ViaNone<M> {
+    fn __projector(&self) -> __Projector<M>;
+}
+
+impl<M> __ViaNone<M> for __Probe<M> {
+    fn __projector(&self) -> __Projector<M> {
+        |_| {
+            Err(format!(
+                "`{}` is not a `#[model]` and has no `Serialize` impl, so the REPL cannot show it",
+                std::any::type_name::<M>()
+            ))
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn __project_all<M>(
+    rows: crate::AutumnResult<Vec<M>>,
+    project: __Projector<M>,
+) -> Result<Vec<Value>, String> {
     rows.map_err(|err| err.to_string())?
         .iter()
-        .map(ReplRow::to_repl_value)
+        .map(project)
         .collect()
 }
 
 #[doc(hidden)]
-pub fn __project_one<M: ReplRow>(
+pub fn __project_one<M>(
     row: crate::AutumnResult<Option<M>>,
+    project: __Projector<M>,
 ) -> Result<Option<Value>, String> {
     row.map_err(|err| err.to_string())?
         .as_ref()
-        .map(ReplRow::to_repl_value)
+        .map(project)
         .transpose()
 }
 
@@ -801,18 +863,55 @@ mod tests {
         }
     }
 
+    #[derive(serde::Serialize)]
+    struct SerdeOnly {
+        id: i64,
+    }
+
+    struct Opaque;
+
+    // Prefers `ReplRow` even when the type also has `Serialize`.
+    #[derive(serde::Serialize)]
+    struct Both {
+        hidden: i64,
+    }
+    impl ReplRow for Both {
+        fn to_repl_value(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({ "shown": true }))
+        }
+    }
+
+    #[test]
+    fn probe_picks_row_then_serde_then_an_error() {
+        let row = (&&&__Probe::<Row>::new()).__projector();
+        assert_eq!(row(&Row(1)), Ok(serde_json::json!({ "id": 1 })));
+        let both = (&&&__Probe::<Both>::new()).__projector();
+        assert_eq!(
+            both(&Both { hidden: 1 }),
+            Ok(serde_json::json!({ "shown": true }))
+        );
+        let serde_only = (&&&__Probe::<SerdeOnly>::new()).__projector();
+        assert_eq!(
+            serde_only(&SerdeOnly { id: 2 }),
+            Ok(serde_json::json!({ "id": 2 }))
+        );
+        let opaque = (&&&__Probe::<Opaque>::new()).__projector();
+        assert!(opaque(&Opaque).unwrap_err().contains("Opaque"));
+    }
+
     #[test]
     fn projection_helpers_map_rows_and_errors() {
+        let project: __Projector<Row> = Row::to_repl_value;
         assert_eq!(
-            __project_all(Ok(vec![Row(1), Row(2)])),
+            __project_all(Ok(vec![Row(1), Row(2)]), project),
             Ok(vec![
                 serde_json::json!({"id": 1}),
                 serde_json::json!({"id": 2})
             ])
         );
-        assert_eq!(__project_one::<Row>(Ok(None)), Ok(None));
+        assert_eq!(__project_one::<Row>(Ok(None), project), Ok(None));
         assert_eq!(
-            __project_one(Ok(Some(Row(5)))),
+            __project_one(Ok(Some(Row(5))), project),
             Ok(Some(serde_json::json!({"id": 5})))
         );
         assert_eq!(__count(Ok(9)), Ok(9));

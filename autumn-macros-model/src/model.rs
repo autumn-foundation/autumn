@@ -10256,6 +10256,30 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .copied()
         .collect();
+    // #2148: the console REPL shows the same fields a JSON response carries.
+    // A model with classified columns has no `Serialize` impl, so it lists
+    // its visible fields one by one.
+    let repl_registration = {
+        let visible: Vec<&syn::Ident> = serializable_field_refs
+            .iter()
+            .filter_map(|f| f.ident.as_ref())
+            .collect();
+        let names: Vec<String> = visible.iter().map(|ident| unraw_ident(ident)).collect();
+        let projection = if has_classified {
+            quote! { fields [#(#names => #visible),*] }
+        } else {
+            quote! { serde }
+        };
+        quote! {
+            ::autumn_web::__autumn_register_repl_model!(
+                #name,
+                ::core::stringify!(#name),
+                #table_name,
+                [#(#names),*],
+                #projection
+            );
+        }
+    };
     // `skip_serializing_if` is the third member of the omission family, after
     // the unconditional `skip` / `skip_serializing` filtered above. It differs
     // in kind: the field DOES appear in some responses, so the property stays —
@@ -11411,6 +11435,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // feature (which implies `db`, and hence `create_many`); otherwise it
         // expands to nothing, so models compile unchanged when seeding is off.
         ::autumn_web::__autumn_register_fake_seeder!(#name, stringify!(#name));
+
+        // ── #2148: console REPL registration ───────────────────────────
+        // Expands to nothing unless autumn-web has the `repl` feature.
+        #repl_registration
 
         // ── Architecture-graph node (#1747) ────────────────────────────
         // The model's own declaration of the table it maps to: the join key

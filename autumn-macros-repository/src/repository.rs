@@ -3749,6 +3749,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     };
+    // ── Console REPL registration (#2148) ───────────────────────────────
+    // Expands to nothing unless autumn-web has the `repl` feature.
+    let repl_registration = {
+        let trait_name_lit = trait_name.to_string();
+        let model_name_lit = config.model_name.to_string();
+        quote! {
+            ::autumn_web::__autumn_register_repl_repository!(
+                #trait_name,
+                #pg_name,
+                #model_name,
+                #trait_name_lit,
+                #model_name_lit
+            );
+        }
+    };
     let versioned_inventory_registration = if config.versioned {
         quote! {
             ::autumn_web::reexports::inventory::submit! {
@@ -6280,6 +6295,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #position_claim_registration
         #graph_inventory_registration
         #retention_inventory_registration
+        #repl_registration
 
         #api_handlers
 
