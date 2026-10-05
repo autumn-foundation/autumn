@@ -94,7 +94,7 @@ fn flapping(attempts: Arc<AtomicU64>) -> axum::Router {
         axum::routing::get(move || {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst);
             async move {
-                if attempt % 2 == 0 {
+                if attempt.is_multiple_of(2) {
                     axum::http::StatusCode::SERVICE_UNAVAILABLE
                 } else {
                     axum::http::StatusCode::OK
