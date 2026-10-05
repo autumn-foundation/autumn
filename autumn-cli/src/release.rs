@@ -3437,14 +3437,18 @@ case "$1 $2" in
         has_refs=false
         [ -n "$STUB_ACTIVE_HAS_REFS" ] && has_refs=true
         template=$(jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" --argjson refs "[${refs#,}]" \
-          --argjson has_refs "$has_refs" --arg scale_ref "${STUB_ACTIVE_SCALE_REF:-}" '
+          --argjson has_refs "$has_refs" --arg scale_ref "${STUB_ACTIVE_SCALE_REF:-}" \
+          --arg scale_id "${STUB_ACTIVE_SCALE_IDENTITY:+$id}" '
           .properties.template
           | .containers |= map(if .name == "app"
                                then .image = $image | (if $has_refs then .env += $refs else . end)
                                else . end)
           | if $scale_ref == "" then .
             else .scale = {rules: [{name: "q", custom: {type: "azure-queue",
-                   auth: [{secretRef: "database-url", triggerParameter: "connection"}]}}]} end' <<< "$app")
+                   auth: [{secretRef: "database-url", triggerParameter: "connection"}]}}]} end
+          | if $scale_id == "" then .
+            else .scale = {rules: [{name: "h", http: {metadata: {concurrentRequests: "10"},
+                   identity: $scale_id}}]} end' <<< "$app")
         if [ "$query" = properties.template ]; then
           echo "$template"
         else
@@ -3557,6 +3561,7 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_ACTIVE_SCALE_IDENTITY",
         "STUB_APP_SCALE_IDENTITY",
         "STUB_JOB_ACR_SYSTEM",
         "STUB_APP_SHARED_SECRET",
@@ -5472,6 +5477,40 @@ esac
             calls.contains("--revision app--old --query properties.template --output json"),
             "{calls}"
         );
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[..patch_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 4,
+            "stage 2 must wait until the clean revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_a_scale_rule_identity_on_the_active_revision() {
+        // The operator removed the scale rule that uses the job identity.
+        // The template is clean, but the active placeholder revision still
+        // has the rule. Stage 2 must wait until the clean revision is the
+        // only active one before it removes the identity.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_SCALE_IDENTITY", "1"),
+                ("STUB_LATEST", "app--clean"),
+                ("STUB_ACTIVE_LAG", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
         let patch_at = calls.find("az rest --method patch").unwrap();
         assert!(
             calls[..patch_at]
