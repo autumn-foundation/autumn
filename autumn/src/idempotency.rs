@@ -1240,6 +1240,27 @@ impl InFlightLock {
         reason = "consumes the lock; the store's TTL frees the key"
     )]
     fn hold_until_ttl(self) {}
+
+    /// Keep the key locked until its record expires, for a record that
+    /// committed in the handler's transaction and waits for a session rewrite.
+    /// If the hold fails, the lock still expires by its in-flight TTL.
+    #[cfg(feature = "db")]
+    async fn hold_until_record_expires(&self) {
+        let store: &dyn std::any::Any = self.store.as_ref();
+        let Some(db) = store.downcast_ref::<DbIdempotencyStore>() else {
+            return;
+        };
+        if let Err(error) = db.hold_until_expiry(&self.key, &self.owner).await {
+            tracing::warn!(
+                error = %error,
+                "Idempotency lock extension failed; the lock expires by its in-flight TTL"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "db"))]
+    #[allow(clippy::unused_async, reason = "same signature as the db build")]
+    async fn hold_until_record_expires(&self) {}
 }
 
 #[derive(Clone)]
@@ -1801,6 +1822,11 @@ where
                 idempotency.key = %idempotency_key,
                 "Session changed during idempotent request; deferring cache write until SessionLayer finalizes Set-Cookie"
             );
+            if committed_in_tx {
+                // The committed record has no final Set-Cookie. Keep it hidden
+                // until the rewrite ends, even across a crash.
+                lock.hold_until_record_expires().await;
+            }
             resp_parts.extensions.insert(DeferredIdempotencyCommit::new(
                 DeferredIdempotencyState {
                     store,

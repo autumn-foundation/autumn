@@ -31,22 +31,30 @@
 
 #![cfg(all(feature = "sqlite", feature = "test-support"))]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use autumn_web::config::{AutumnConfig, IdempotencyBackend};
-use autumn_web::idempotency::IdempotencyTx;
+use autumn_web::db::RuntimeConnection;
+use autumn_web::idempotency::{DbIdempotencyStore, IdempotencyLayer, IdempotencyTx};
 use autumn_web::migrate::{EmbeddedMigrations, FRAMEWORK_MIGRATIONS, embed_migrations};
 use autumn_web::prelude::*;
 use autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 use autumn_web::reexports::{diesel, diesel_async};
+use autumn_web::session::{
+    MemoryStore, Session, SessionConfig, SessionLayer, SessionStore, SessionStoreError,
+};
 use autumn_web::sim::substrate::SqliteSubstrate;
 use autumn_web::sim::{Sim, crash_at};
 use autumn_web::sim_test;
 use autumn_web::test::{TestApp, TestClient, TestResponse};
 
-use diesel_async::RunQueryDsl as _;
+use axum::body::Body;
+use axum::http::Request;
+use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
+use tower::ServiceExt as _;
 
 const APP_MIGRATIONS: EmbeddedMigrations = embed_migrations!("tests/fixtures/sim_idempotency_db");
 
@@ -225,4 +233,183 @@ async fn sim_idempotency_db_replays_without_running_the_handler(mut sim: Sim) {
     assert_eq!(second.text(), first.text());
     assert_eq!(calls.get(), 1);
     assert_eq!(payments(&substrate).await, 1);
+}
+
+/// A session store whose save fails. It stands in for a crash between the
+/// commit and the session rewrite: in both cases the final record is not
+/// written.
+#[derive(Clone)]
+struct FailingSaveSessionStore;
+
+impl SessionStore for FailingSaveSessionStore {
+    async fn load(&self, _id: &str) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
+        Ok(None)
+    }
+
+    async fn save(
+        &self,
+        _id: &str,
+        _data: HashMap<String, String>,
+    ) -> Result<(), SessionStoreError> {
+        Err(SessionStoreError::backend("save", "boom"))
+    }
+
+    async fn destroy(&self, _id: &str) -> Result<(), SessionStoreError> {
+        Ok(())
+    }
+}
+
+/// A router whose handler commits through `IdempotencyTx` and also changes
+/// the session.
+fn login_router<S: SessionStore + Clone>(
+    substrate: &SqliteSubstrate,
+    calls: &Calls,
+    sessions: S,
+) -> axum::Router {
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(86_400),
+    ));
+    let pool = substrate.pool();
+    let calls = calls.clone();
+    let handler = move |idem: IdempotencyTx, session: Session| {
+        let pool = pool.clone();
+        let calls = calls.clone();
+        async move {
+            calls.add();
+            session.insert("user_id", "42").await;
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                diesel::sql_query("INSERT INTO payments (amount) VALUES (100)")
+                    .execute(conn)
+                    .await?;
+                idem.commit(conn, (StatusCode::CREATED, "logged in")).await
+            })
+            .await
+            .expect("transaction")
+        }
+    };
+    axum::Router::new()
+        .route("/login", axum::routing::post(handler))
+        .layer(IdempotencyLayer::new(store))
+        .layer(SessionLayer::new(sessions, SessionConfig::default()))
+}
+
+fn login(key: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header("idempotency-key", key)
+        .body(Body::empty())
+        .expect("request")
+}
+
+#[sim_test]
+async fn sim_idempotency_db_unfinished_session_rewrite_never_replays(sim: Sim) {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let app = login_router(&substrate, &calls, FailingSaveSessionStore);
+
+    let first = app
+        .clone()
+        .oneshot(login("login"))
+        .await
+        .expect("infallible");
+    assert!(first.status().is_server_error(), "the session save failed");
+    assert_eq!(payments(&substrate).await, 1, "the payment committed");
+
+    // Past the in-flight TTL. The stored record has no session cookie, so a
+    // replay would answer "logged in" with no session.
+    sim.advance(Duration::from_secs(61)).await;
+    let retry = app
+        .clone()
+        .oneshot(login("login"))
+        .await
+        .expect("infallible");
+    assert_eq!(
+        retry.status(),
+        StatusCode::CONFLICT,
+        "a record without its final Set-Cookie is not replayed"
+    );
+    assert_eq!(calls.get(), 1, "the handler does not run again");
+    assert_eq!(payments(&substrate).await, 1);
+}
+
+#[sim_test]
+async fn sim_idempotency_db_session_rewrite_replays_with_cookie(_sim: Sim) {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let app = login_router(&substrate, &calls, MemoryStore::new());
+
+    let first = app
+        .clone()
+        .oneshot(login("login"))
+        .await
+        .expect("infallible");
+    assert_eq!(first.status(), StatusCode::CREATED);
+    assert!(first.headers().contains_key("set-cookie"));
+
+    let retry = app
+        .clone()
+        .oneshot(login("login"))
+        .await
+        .expect("infallible");
+    assert_eq!(retry.status(), StatusCode::CREATED);
+    assert_eq!(
+        retry
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|v| v.to_str().ok()),
+        Some("true")
+    );
+    assert!(
+        retry.headers().contains_key("set-cookie"),
+        "the replay carries the final session cookie"
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(payments(&substrate).await, 1);
+}
+
+#[sim_test]
+async fn sim_idempotency_db_recovery_point_on_a_shard_is_an_error(_sim: Sim) {
+    let primary = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    // A second database stands in for a shard: it has the table, not the key.
+    let shard = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let store = Arc::new(DbIdempotencyStore::new(
+        primary.pool(),
+        Duration::from_secs(86_400),
+    ));
+    let shard_pool = shard.pool();
+    let handler = move |idem: IdempotencyTx| {
+        let shard_pool = shard_pool.clone();
+        async move {
+            let mut pooled = shard_pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            match idem.recovery_point(conn).await {
+                Ok(point) => format!("{point:?}").into_response(),
+                Err(error) => error.into_response(),
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/step", axum::routing::post(handler))
+        .layer(IdempotencyLayer::new(store));
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/step")
+        .header("idempotency-key", "step")
+        .body(Body::empty())
+        .expect("request");
+    let response = app.oneshot(request).await.expect("infallible");
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a missing key row is not read as \"no step committed\""
+    );
 }

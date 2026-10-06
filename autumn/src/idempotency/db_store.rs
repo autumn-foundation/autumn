@@ -117,6 +117,33 @@ impl DbIdempotencyStore {
     }
 }
 
+impl DbIdempotencyStore {
+    /// Keep `owner`'s lock until the record expires.
+    ///
+    /// The middleware calls this before a session rewrite of a record that
+    /// committed in the handler's transaction. That record has no final
+    /// `Set-Cookie` yet. If the rewrite never ends (a crash, a failed save),
+    /// the key stays busy and the record is never replayed without its cookie.
+    /// A successful rewrite releases the lock.
+    pub(super) async fn hold_until_expiry(
+        &self,
+        key: &str,
+        owner: &str,
+    ) -> Result<(), IdempotencyStoreError> {
+        let mut conn = self.conn().await?;
+        let held = keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq(key))
+            .filter(keys::locked_by.eq(owner))
+            .filter(keys::expires_at_ms.gt(keys::locked_until_ms));
+        diesel::update(held)
+            .set(keys::locked_until_ms.eq(keys::expires_at_ms))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| db_error("hold idempotency lock", e))?;
+        Ok(())
+    }
+}
+
 impl IdempotencyStore for DbIdempotencyStore {
     fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
         Box::pin(async move {
@@ -440,7 +467,9 @@ impl IdempotencyTx {
     ///
     /// # Errors
     ///
-    /// `500` when the read fails.
+    /// - `409` when another request took the key (this request's lock expired).
+    /// - `500` when the key row is not on `conn` (for example, a shard
+    ///   connection), or the read fails.
     pub fn recovery_point<'c>(
         &self,
         conn: &'c mut RuntimeConnection,
@@ -450,13 +479,17 @@ impl IdempotencyTx {
             let Some(claim) = claim else {
                 return Ok(None);
             };
-            let point: Option<Option<String>> = keys::autumn_idempotency_keys
-                .filter(keys::storage_key.eq(&claim.storage_key))
+            // An active claim always has its row. A missing row is not
+            // "no step committed": the step may have committed elsewhere.
+            let point: Option<Option<String>> = owned_key(&claim)
                 .select(keys::recovery_point)
                 .first(conn)
                 .await
                 .optional()?;
-            Ok(point.flatten())
+            match point {
+                Some(point) => Ok(point),
+                None => Err(claim_error(conn, &claim).await),
+            }
         }
     }
 }

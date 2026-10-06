@@ -194,10 +194,13 @@ async fn pay(idem: IdempotencyTx, mut db: Db) -> AutumnResult<axum::response::Re
   response unchanged. The same handler works with every backend.
 - `commit` reads the whole body. A body larger than 10 MiB gives `500`.
 - If the handler also changes the session, Autumn rewrites the record after
-  the session is saved, so a replay gets the final `Set-Cookie`. If the
-  session save fails, the record becomes replayable when the lock expires.
-- Call `commit` on a primary `Db` connection. The key row is not on a shard,
-  so `commit` on a `ShardedDb` connection gives `500`.
+  the session is saved, so a replay gets the final `Set-Cookie`. Until the
+  rewrite ends, the key stays locked. If the session save fails or the
+  process stops first, a retry gets `409` until the record expires. The
+  record is never replayed without its `Set-Cookie`.
+- Call `commit`, `set_recovery_point` and `recovery_point` on a primary `Db`
+  connection. The key row is not on a shard, so on a `ShardedDb` connection
+  they give `500`.
 - Autumn finds the store by its type. A wrapper around `DbIdempotencyStore`
   makes `commit` a no-op.
 
