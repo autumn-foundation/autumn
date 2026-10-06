@@ -269,9 +269,6 @@ const OUTPUT_CALLBACKS: &[&str] = &["map_or", "map_or_else", "fold", "try_fold"]
 /// Methods whose result has the receiver's type.
 const SAME_TYPE_METHODS: &[&str] = &["clone", "to_owned"];
 
-/// Methods that give an owned copy of their receiver, not a borrow into it.
-const OWNED_COPY_METHODS: &[&str] = &["to_vec", "to_string"];
-
 /// Constructors that build a carrier and run no code.
 const CONTAINER_CONSTRUCTORS: &[&str] = &["Some", "Ok", "Err"];
 
@@ -2625,11 +2622,10 @@ impl Analyzer {
             // a method on a borrow or a pointer may give a borrow into it.
             // `cell.get()`, `cell.as_ptr()`: a method on a place may give a
             // pointer into it.
-            // A copy or a scalar does not.
+            // A `String` or a scalar does not. A clone may share: an `Arc`,
+            // or a `Vec` of them.
             let through = self.referents_of(&mc.receiver);
-            let owned = SAME_TYPE_METHODS.contains(&method.as_str())
-                || OWNED_COPY_METHODS.contains(&method.as_str())
-                || SCALAR_METHODS.contains(&method.as_str());
+            let owned = method == "to_string" || SCALAR_METHODS.contains(&method.as_str());
             if through.is_empty() && !owned {
                 place_root(&mc.receiver).into_iter().collect()
             } else {
@@ -13670,15 +13666,15 @@ mod tests {
                 Expect::Exact(1),
             ),
             (
-                "guard: an owned copy does not point into its source",
-                "async fn h(repo: PgPostRepository, names: Vec<String>) -> AutumnResult<usize> { \
-                 let mut list = names.to_vec(); list.push(repo); render(&names); Ok(0) }",
-                Expect::Exact(0),
+                "an Arc clone shares its source",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let slot = Arc::new(Mutex::new(None)); let twin = slot.clone(); *twin.lock().unwrap() = Some(repo); let _ = slot.lock().unwrap().take().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
             (
-                "guard: a clone does not point into its source",
-                "async fn h(repo: PgPostRepository, names: Vec<String>) -> AutumnResult<usize> { \
-                 let mut list = names.clone(); list.push(repo); render(&names); Ok(0) }",
+                "guard: a string copy does not point into its source",
+                "async fn h(repo: PgPostRepository, name: String) -> AutumnResult<usize> { \
+                 let mut copy = name.to_string(); copy += repo; render(&name); Ok(0) }",
                 Expect::Exact(0),
             ),
             (
