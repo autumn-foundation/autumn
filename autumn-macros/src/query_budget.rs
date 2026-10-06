@@ -5977,7 +5977,7 @@ fn pattern_key(pat: &Pat, shadowed: &[String]) -> Option<(String, String)> {
     match pat {
         Pat::Paren(p) => pattern_key(&p.pat, shadowed),
         Pat::Lit(l) => literal_value(&l.lit).map(|v| ("literal".to_string(), v)),
-        other => pattern_variant(other, shadowed),
+        other => rooted_variant(other, shadowed),
     }
 }
 
@@ -6003,7 +6003,7 @@ fn patterns_disjoint(a: &Pat, b: &Pat, shadowed: &[String]) -> bool {
         // Two owner paths may name one re-exported enum, so only variants
         // of one written owner are disjoint.
         _ => matches!(
-            (pattern_variant(a, shadowed), pattern_variant(b, shadowed)),
+            (rooted_variant(a, shadowed), rooted_variant(b, shadowed)),
             (Some((owner_a, a)), Some((owner_b, b))) if owner_a == owner_b && a != b
         ),
     }
@@ -6019,6 +6019,28 @@ fn literal_value(lit: &syn::Lit) -> Option<String> {
         syn::Lit::Byte(v) => Some(format!("byte {}", v.value())),
         syn::Lit::Bool(v) => Some(format!("bool {}", v.value)),
         _ => None,
+    }
+}
+
+/// The std variant a pattern names under a `std` or `core` path:
+/// `std::option::Option::Some(_)`. A bare `Some` or `Option::Some` may be
+/// a module-level alias of one user variant (`use E::V as Some;`), which
+/// the macro cannot see.
+fn rooted_variant(pat: &Pat, shadowed: &[String]) -> Option<(String, String)> {
+    let path = match pat {
+        Pat::TupleStruct(p) => &p.path,
+        Pat::Struct(p) => &p.path,
+        Pat::Path(p) => &p.path,
+        _ => return None,
+    };
+    let rooted = path
+        .segments
+        .first()
+        .is_some_and(|s| s.ident == "std" || s.ident == "core");
+    if rooted {
+        pattern_variant(pat, shadowed)
+    } else {
+        None
     }
 }
 
@@ -11783,7 +11805,7 @@ mod tests {
             (
                 "a guard on a disjoint pattern is not charged",
                 "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
-                 let _ = match x { Some(_) if repo.a().await? => plain(), None => repo.b().await?, Some(_) => plain() }; Ok(0) }",
+                 let _ = match x { std::option::Option::Some(_) if repo.a().await? => plain(), std::option::Option::None => repo.b().await?, Some(_) => plain() }; Ok(0) }",
                 Expect::Exact(1),
             ),
             (
@@ -11903,7 +11925,7 @@ mod tests {
                 "a guard binding does not reach a disjoint arm",
                 "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
                  let mut slot = None; \
-                 match x { Some(_) if { slot = Some(&repo); false } => (), None => render(slot), Some(_) => () } Ok(0) }",
+                 match x { std::option::Option::Some(_) if { slot = Some(&repo); false } => (), std::option::Option::None => render(slot), Some(_) => () } Ok(0) }",
                 Expect::Exact(0),
             ),
             (
@@ -12322,10 +12344,16 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                "guards on exclusive variants are not summed",
+                "guards on exclusive std variants are not summed",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 let _ = match x { std::option::Option::Some(_) if repo.a().await? => (), std::option::Option::None if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: guards on bare variant names add up",
                 "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
                  let _ = match x { Some(_) if repo.a().await? => (), None if repo.b().await? => (), _ => () }; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Exact(2),
             ),
             (
                 "guard: guards on overlapping patterns are summed",
@@ -12512,9 +12540,15 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
+                "guard: bare variant names may be module aliases",
+                "async fn h(repo: PgPostRepository, x: E) -> AutumnResult<usize> { \
+                 let _ = match x { Some(_) if repo.a().await? => (), Ok(_) if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
                 "std variants without imports stay exclusive",
                 "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
-                 let _ = match x { Option::Some(_) if repo.a().await? => (), Option::None if repo.b().await? => (), _ => () }; Ok(0) }",
+                 let _ = match x { core::option::Option::Some(_) if repo.a().await? => (), core::option::Option::None if repo.b().await? => (), _ => () }; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
