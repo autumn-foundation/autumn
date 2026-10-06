@@ -833,6 +833,11 @@ mod sqlite {
         handlers.insert("t", |_, _| async { Ok(()) });
         let state = AppState::for_test().with_shards(shards);
         assert!(state.pool().is_none());
+        #[cfg(feature = "mail")]
+        assert!(
+            OutboxMailQueue::from_state(&state).is_ok(),
+            "the mail queue uses the first shard"
+        );
         install(
             &state,
             &OutboxConfig {
@@ -853,6 +858,66 @@ mod sqlite {
 
         assert_eq!(drain(&state, 10).await.unwrap(), 1);
         assert!(purge(&state).await.is_ok());
+    }
+
+    /// A shard that is down at boot does not stop the boot. The relay creates
+    /// its tables when it comes back, and then drains it.
+    #[tokio::test]
+    async fn a_shard_down_at_boot_gets_its_tables_later() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shard_dir = dir.path().join("later");
+        let shard_url = format!("sqlite:{}", shard_dir.join("shard.db").display());
+        let shard_pool = crate::db::create_pool(&crate::config::DatabaseConfig {
+            url: Some(shard_url.clone()),
+            connect_timeout_secs: 1,
+            ..Default::default()
+        })
+        .expect("pool")
+        .expect("a url");
+        let config = crate::config::DatabaseConfig {
+            shards: vec![crate::config::ShardConfig {
+                name: "later".to_owned(),
+                primary_url: shard_url,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let shards = crate::sharding::build_shard_set(
+            &config,
+            vec![crate::db::DatabaseTopology::primary_only(
+                shard_pool.clone(),
+            )],
+            Arc::new(crate::sharding::HashShardRouter),
+        )
+        .expect("shard set");
+        let main = SqliteSubstrate::new().expect("substrate");
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert("t", |_, _| async { Ok(()) });
+        let state = AppState::for_test()
+            .with_pool(main.pool())
+            .with_shards(shards);
+        install(
+            &state,
+            &OutboxConfig {
+                enabled: true,
+                ..OutboxConfig::default()
+            },
+            handlers,
+        );
+
+        ensure_relay_schema(&state)
+            .await
+            .expect("one shard down does not stop the boot");
+
+        std::fs::create_dir(&shard_dir).expect("the shard comes back");
+        assert_eq!(drain(&state, 10).await.unwrap(), 0);
+        let mut conn = shard_pool.get().await.unwrap();
+        Outbox::new(&state)
+            .write(&mut conn, "a", "t", &serde_json::json!({}))
+            .await
+            .expect("the relay created the shard tables");
+        drop(conn);
+        assert_eq!(drain(&state, 10).await.unwrap(), 1);
     }
 
     #[tokio::test]

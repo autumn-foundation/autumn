@@ -869,6 +869,9 @@ pub struct OutboxRelay {
     config: OutboxConfig,
     handlers: Arc<HashMap<String, OutboxHandler>>,
     topics_in_list: Arc<str>,
+    /// Indexes (in `relay_pools` order) of pools with no tables yet: the boot
+    /// could not reach them. The relay tries again before each drain.
+    schema_pending: Arc<std::sync::Mutex<std::collections::HashSet<usize>>>,
 }
 
 impl std::fmt::Debug for OutboxRelay {
@@ -903,7 +906,28 @@ impl OutboxRelay {
             config,
             handlers: Arc::new(all.handlers),
             topics_in_list: topics_in_list.into(),
+            schema_pending: Arc::default(),
         }
+    }
+
+    fn pending_schema(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<usize>> {
+        self.schema_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Create the tables on pool `index` if the boot could not.
+    async fn ensure_pending_schema(
+        &self,
+        index: usize,
+        pool: &Pool<RuntimeConnection>,
+    ) -> AutumnResult<()> {
+        if !self.pending_schema().contains(&index) {
+            return Ok(());
+        }
+        ensure_schema(pool).await?;
+        self.pending_schema().remove(&index);
+        Ok(())
     }
 
     /// The relay settings.
@@ -931,12 +955,7 @@ pub(crate) fn install(state: &AppState, config: &OutboxConfig, handlers: OutboxH
         }
         return;
     }
-    // `deliver_later` has no shard key: it writes on the app pool, or on the
-    // first shard when there is no app pool.
-    let Some(pool) = relay_pools(state)
-        .ok()
-        .and_then(|pools| pools.into_iter().next())
-    else {
+    let Some(pool) = mail_pool(state) else {
         tracing::warn!("outbox.enabled = true needs a database; the relay does not run");
         return;
     };
@@ -1001,8 +1020,12 @@ async fn drain_until(
     let pools = relay_pools(state)?;
     let mut handled = 0;
     let mut failures = Vec::new();
-    for pool in &pools {
-        match drain_pool(state, &relay, pool, max, shutdown).await {
+    for (index, pool) in pools.iter().enumerate() {
+        let drained = match relay.ensure_pending_schema(index, pool).await {
+            Ok(()) => drain_pool(state, &relay, pool, max, shutdown).await,
+            Err(error) => Err(error),
+        };
+        match drained {
             Ok(count) => handled += count,
             Err(error) => {
                 tracing::warn!(%error, "outbox relay could not drain one pool; it goes on with the others");
@@ -1010,12 +1033,14 @@ async fn drain_until(
             }
         }
     }
-    if failures.len() == pools.len()
-        && let Some(error) = failures.into_iter().next()
-    {
-        return Err(error);
-    }
+    fail_if_every_pool_failed(failures, pools.len())?;
     Ok(handled)
+}
+
+/// The pool `deliver_later` writes on. Mail has no shard key: it is the app
+/// pool, or the first shard when there is no app pool.
+fn mail_pool(state: &AppState) -> Option<Pool<RuntimeConnection>> {
+    relay_pools(state).ok()?.into_iter().next()
 }
 
 /// The pools the relay drains: the app pool, if any, and the primary pool of
@@ -1033,14 +1058,36 @@ fn relay_pools(state: &AppState) -> AutumnResult<Vec<Pool<RuntimeConnection>>> {
     Ok(pools)
 }
 
-/// Create the outbox tables on every pool the relay drains.
+/// Create the outbox tables on every pool the relay drains. A pool that
+/// fails (a shard that is down) does not stop the boot: the relay tries
+/// again before it drains that pool.
 ///
 /// # Errors
 ///
-/// Returns the first error of [`ensure_schema`].
+/// Returns an error when every pool fails.
 pub(crate) async fn ensure_relay_schema(state: &AppState) -> AutumnResult<()> {
-    for pool in relay_pools(state)? {
-        ensure_schema(&pool).await?;
+    let relay = state.extension::<OutboxRelay>();
+    let pools = relay_pools(state)?;
+    let mut failures = Vec::new();
+    for (index, pool) in pools.iter().enumerate() {
+        if let Err(error) = ensure_schema(pool).await {
+            tracing::warn!(%error, "outbox could not create its tables on one pool; the relay tries again later");
+            if let Some(relay) = &relay {
+                relay.pending_schema().insert(index);
+            }
+            failures.push(error);
+        }
+    }
+    fail_if_every_pool_failed(failures, pools.len())
+}
+
+/// A multi-pool step fails only when every pool fails. Then it returns the
+/// first error.
+fn fail_if_every_pool_failed(failures: Vec<AutumnError>, pools: usize) -> AutumnResult<()> {
+    if failures.len() == pools
+        && let Some(error) = failures.into_iter().next()
+    {
+        return Err(error);
     }
     Ok(())
 }
@@ -1352,11 +1399,7 @@ pub async fn purge(state: &AppState) -> AutumnResult<(usize, usize)> {
             }
         }
     }
-    if failures.len() == pools.len()
-        && let Some(error) = failures.into_iter().next()
-    {
-        return Err(error);
-    }
+    fail_if_every_pool_failed(failures, pools.len())?;
     Ok((outbox, inbox))
 }
 
@@ -1490,7 +1533,7 @@ impl OutboxMailQueue {
     ///
     /// Returns an error when `state` has no database.
     pub fn from_state(state: &AppState) -> AutumnResult<Self> {
-        let pool = state.pool().cloned().ok_or_else(|| {
+        let pool = mail_pool(state).ok_or_else(|| {
             AutumnError::internal_server_error_msg("OutboxMailQueue needs a database")
         })?;
         Ok(Self {
