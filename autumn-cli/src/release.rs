@@ -3500,6 +3500,7 @@ case "$1 $2" in
     esac
     ;;
   "containerapp secret")
+    list=$(
     [ -n "$STUB_APP_LEGACY_ID" ] && id="$STUB_APP_LEGACY_ID"
     # An operator secret on the app that uses the job's identity.
     if [ -n "$STUB_APP_SHARED_SECRET" ]; then
@@ -3521,6 +3522,24 @@ case "$1 $2" in
     else
       echo '[{"name":"api-key","value":"user-value"}]'
     fi
+    )
+    # The job's inline secret was rotated: the app has the old value until
+    # the PATCH with the new one applies, and then for STUB_INLINE_STALE
+    # more reads.
+    if [ -n "$STUB_JOB_INLINE_SECRET" ]; then
+      value=tok-old
+      if grep -q '"value":"tok"' "$STUB_LOG.bodies" 2>/dev/null; then
+        [ -f "$STUB_LOG.inline" ] || echo "${STUB_INLINE_STALE:-0}" > "$STUB_LOG.inline"
+        left=$(cat "$STUB_LOG.inline")
+        if [ "$left" -gt 0 ]; then
+          echo $((left - 1)) > "$STUB_LOG.inline"
+        else
+          value=tok
+        fi
+      fi
+      list=$(jq -c --arg v "$value" '. + [{name: "api-token", value: $v}]' <<< "$list")
+    fi
+    echo "$list"
     ;;
   "containerapp replica")
     if [ -n "$query" ]; then
@@ -3598,6 +3617,7 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_INLINE_STALE",
         "STUB_APP_COPIED_BIG",
         "STUB_INGRESS_DISABLE_FAILS",
         "STUB_INGRESS_OPEN_LOST",
@@ -5950,6 +5970,41 @@ esac
         assert!(!calls.contains("az tags-patch"), "{calls}");
         assert!(!calls.contains("ingress disable"), "{calls}");
         assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_a_rotated_inline_secret_before_a_restart() {
+        // The job's inline secret got a new value; image and env stay. The
+        // app GET has no secret values, so it looks applied at once. The
+        // script must see the new value in the secret list before it
+        // restarts the revision.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_JOB_INLINE_SECRET", "1"),
+                ("STUB_INLINE_STALE", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").expect("a PATCH");
+        let restart_at = calls.find("revision restart").expect("a restart");
+        assert!(
+            calls[patch_at..restart_at]
+                .matches("az containerapp secret list")
+                .count()
+                >= 4,
+            "the restart must wait for the new value: {calls}"
+        );
+        // The value never goes on a command line.
+        assert!(!calls.contains("tok-old"), "{calls}");
     }
 
     #[cfg(unix)]
