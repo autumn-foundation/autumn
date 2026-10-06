@@ -29,6 +29,6 @@
 
 - **webhooks:** a second delivery job for a log that already got a `2xx`
   response no longer sends the webhook again. `log_delivery` ignores a write
-  to a `2xx` log and a repeat of the outcome of the stored attempt
+  to a `2xx` log and a repeated failure of the stored attempt
   (`webhook_outbound::log_delivery_ignores`), so a late duplicate job cannot
   overwrite a success or count one failure twice.

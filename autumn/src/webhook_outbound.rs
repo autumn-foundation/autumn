@@ -85,15 +85,21 @@ pub struct WebhookDeliveryLog {
 /// `true` when [`OutboundWebhookHandler::log_delivery`] must ignore `new`:
 ///
 /// - `stored` has a 2xx response. A success is final.
-/// - `stored` has an outcome for the same attempt and the same DLQ flag. `new`
-///   comes from a duplicate job.
+/// - `new` is not a 2xx, and `stored` has an outcome for the same attempt and
+///   the same DLQ flag. `new` comes from a duplicate job. A 2xx always
+///   replaces a failure.
 #[must_use]
 pub fn log_delivery_ignores(stored: &WebhookDeliveryLog, new: &WebhookDeliveryLog) -> bool {
+    let is_success = |log: &WebhookDeliveryLog| {
+        log.response_status
+            .is_some_and(|status| (200..300).contains(&status))
+    };
     let has_outcome = stored.response_status.is_some() || stored.last_error.is_some();
-    stored
-        .response_status
-        .is_some_and(|status| (200..300).contains(&status))
-        || (has_outcome && stored.attempt == new.attempt && stored.is_dlq == new.is_dlq)
+    is_success(stored)
+        || (!is_success(new)
+            && has_outcome
+            && stored.attempt == new.attempt
+            && stored.is_dlq == new.is_dlq)
 }
 
 /// Pluggable handler interface for outbound webhook subscriptions and delivery logs.
@@ -107,8 +113,8 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
     /// Log a webhook delivery attempt and handle failure counters/statuses.
     ///
     /// Two jobs can send one delivery (an outbox re-send). Ignore a write
-    /// that [`log_delivery_ignores`] names: a write to a 2xx log, or a repeat
-    /// of the outcome of the stored attempt. Then a late duplicate job cannot
+    /// that [`log_delivery_ignores`] names: a write to a 2xx log, or a repeated
+    /// failure of the stored attempt. Then a late duplicate job cannot
     /// overwrite a success or count one failure twice.
     fn log_delivery(
         &self,
@@ -1334,6 +1340,19 @@ mod tests {
         store.log_delivery(failed).await.unwrap();
         let log = store.get_delivery_log("log").await.unwrap().unwrap();
         assert!(log.is_dlq, "the DLQ move is stored");
+
+        // A 2xx of the same attempt replaces a failure.
+        let mut lost = sample_log("other", "sub");
+        lost.response_status = Some(500);
+        lost.last_error = Some("500".to_owned());
+        store.log_delivery(lost.clone()).await.unwrap();
+        lost.response_status = Some(200);
+        lost.last_error = None;
+        store.log_delivery(lost).await.unwrap();
+        let log = store.get_delivery_log("other").await.unwrap().unwrap();
+        assert_eq!(log.response_status, Some(200));
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
     }
 
     #[tokio::test]

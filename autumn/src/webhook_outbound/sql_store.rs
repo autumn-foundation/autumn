@@ -92,11 +92,13 @@ const LOG_COLUMNS: &str = "id, subscription_id, topic, payload, request_headers,
 
 /// Added to `UPSERT_LOG_SQL` for an outcome. It skips the writes that
 /// [`log_delivery_ignores`](super::log_delivery_ignores) names: a write to a
-/// 2xx log, and a repeat of the outcome of the stored attempt.
+/// 2xx log, and a repeated failure of the stored attempt.
 const SKIP_IGNORED_SQL: &str = " WHERE \
      (autumn_webhook_deliveries.response_status IS NULL \
        OR autumn_webhook_deliveries.response_status NOT BETWEEN 200 AND 299) \
-     AND NOT (autumn_webhook_deliveries.attempt = excluded.attempt \
+     AND NOT ((excluded.response_status IS NULL \
+         OR excluded.response_status NOT BETWEEN 200 AND 299) \
+       AND autumn_webhook_deliveries.attempt = excluded.attempt \
        AND autumn_webhook_deliveries.is_dlq = excluded.is_dlq \
        AND (autumn_webhook_deliveries.response_status IS NOT NULL \
          OR autumn_webhook_deliveries.last_error IS NOT NULL))";

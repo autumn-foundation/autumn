@@ -461,6 +461,20 @@ mod sql_webhook_store {
             store.get_delivery_log("l").await.unwrap().unwrap().is_dlq,
             "the DLQ move is stored"
         );
+
+        // A 2xx of the same attempt replaces a failure.
+        store
+            .log_delivery(log("l2", Some(500), Some("500")))
+            .await
+            .unwrap();
+        store
+            .log_delivery(log("l2", Some(200), None))
+            .await
+            .unwrap();
+        let stored = store.get_delivery_log("l2").await.unwrap().unwrap();
+        assert_eq!(stored.response_status, Some(200));
+        let sub = store.get_subscription("sub-1").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
     }
 
     #[tokio::test]
