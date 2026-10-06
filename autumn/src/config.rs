@@ -7039,33 +7039,12 @@ impl AutumnConfig {
     }
 }
 
-/// HTTP server configuration.
-///
-/// Controls which address the server binds to and how graceful shutdown
-/// behaves.
-///
-/// # Defaults
-///
-/// | Field | Default |
-/// |-------|---------|
-/// | `port` | `3000` |
-/// | `host` | `"127.0.0.1"` |
-/// | `shutdown_timeout_secs` | `30` |
-///
-/// # Examples
-///
-/// ```rust
-/// use autumn_web::config::ServerConfig;
-///
-/// let server = ServerConfig::default();
-/// assert_eq!(server.port, 3000);
-/// assert_eq!(server.host, "127.0.0.1");
-/// ```
 /// Per-request timeout configuration.
 ///
 /// Controls how long the server waits for a complete request-response cycle
-/// before returning `408 Request Timeout`. A value of `None` or `0` disables
-/// the timeout (the default, so existing applications are unaffected).
+/// before it returns `503 Service Unavailable`. A value of `None` or `0`
+/// disables the timeout. The default is disabled. The `prod` profile sets
+/// `30000` (30s).
 ///
 /// # `autumn.toml` example
 ///
@@ -7129,6 +7108,28 @@ pub struct UpgradeConfig {
     pub ready_timeout_secs: u64,
 }
 
+/// HTTP server configuration.
+///
+/// Controls which address the server binds to and how graceful shutdown
+/// behaves.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `port` | `3000` |
+/// | `host` | `"127.0.0.1"` |
+/// | `shutdown_timeout_secs` | `30` |
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::config::ServerConfig;
+///
+/// let server = ServerConfig::default();
+/// assert_eq!(server.port, 3000);
+/// assert_eq!(server.host, "127.0.0.1");
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
@@ -10799,6 +10800,15 @@ pub struct CircuitBreakerPolicyConfig {
     pub open_duration_secs: Option<u64>,
     /// Number of successful trials required in half-open state to close the breaker.
     pub half_open_trial_count: Option<u64>,
+    /// A call of this many milliseconds or more is slow. `0` turns slow-call
+    /// detection off.
+    pub slow_call_duration_threshold_ms: Option<u64>,
+    /// The breaker opens when the slow-call ratio is this value or more.
+    /// Example: `0.8`.
+    pub slow_call_rate_threshold: Option<f64>,
+    /// What a call cancelled at or after the slow-call threshold counts as:
+    /// `"slow"` or `"failure"`.
+    pub cancelled_call_outcome: Option<crate::circuit_breaker::CancelledCallOutcome>,
 }
 
 impl AutumnConfig {
@@ -10839,6 +10849,22 @@ impl AutumnConfig {
                 .circuit_breaker
                 .defaults
                 .half_open_trial_count,
+        );
+        let defaults = &mut self.resilience.circuit_breaker.defaults;
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS",
+            &mut defaults.slow_call_duration_threshold_ms,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_RATE_THRESHOLD",
+            &mut defaults.slow_call_rate_threshold,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__CANCELLED_CALL_OUTCOME",
+            &mut defaults.cancelled_call_outcome,
         );
     }
 }
@@ -19228,6 +19254,74 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
                 .defaults
                 .failure_ratio_threshold,
             Some(0.7)
+        );
+    }
+
+    #[test]
+    fn test_resilience_config_parses_slow_call_keys() {
+        let toml_str = r#"
+            [resilience.circuit_breaker.defaults]
+            slow_call_duration_threshold_ms = 2500
+            slow_call_rate_threshold = 0.4
+            cancelled_call_outcome = "failure"
+
+            [resilience.circuit_breaker.hosts."api.github.com"]
+            slow_call_duration_threshold_ms = 0
+        "#;
+        let config: AutumnConfig = toml::from_str(toml_str).unwrap();
+        let cb = &config.resilience.circuit_breaker;
+        assert_eq!(cb.defaults.slow_call_duration_threshold_ms, Some(2500));
+        assert_eq!(cb.defaults.slow_call_rate_threshold, Some(0.4));
+        assert_eq!(
+            cb.defaults.cancelled_call_outcome,
+            Some(crate::circuit_breaker::CancelledCallOutcome::Failure)
+        );
+        let host_cb = cb.hosts.get("api.github.com").unwrap();
+        assert_eq!(host_cb.slow_call_duration_threshold_ms, Some(0));
+        assert!(host_cb.slow_call_rate_threshold.is_none());
+    }
+
+    #[test]
+    fn test_resilience_config_slow_call_env_overrides() {
+        let env = MockEnv::new()
+            .with(
+                "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS",
+                "1500",
+            )
+            .with(
+                "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_RATE_THRESHOLD",
+                "0.25",
+            )
+            .with(
+                "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__CANCELLED_CALL_OUTCOME",
+                "failure",
+            );
+        let mut config = AutumnConfig::default();
+        config.apply_resilience_env_overrides_with_env(&env);
+        let defaults = &config.resilience.circuit_breaker.defaults;
+        assert_eq!(defaults.slow_call_duration_threshold_ms, Some(1500));
+        assert_eq!(defaults.slow_call_rate_threshold, Some(0.25));
+        assert_eq!(
+            defaults.cancelled_call_outcome,
+            Some(crate::circuit_breaker::CancelledCallOutcome::Failure)
+        );
+    }
+
+    #[test]
+    fn test_resilience_config_bad_cancelled_call_outcome_env_is_ignored() {
+        let env = MockEnv::new().with(
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__CANCELLED_CALL_OUTCOME",
+            "drop",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_resilience_env_overrides_with_env(&env);
+        assert!(
+            config
+                .resilience
+                .circuit_breaker
+                .defaults
+                .cancelled_call_outcome
+                .is_none()
         );
     }
 

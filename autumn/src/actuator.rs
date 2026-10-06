@@ -2644,11 +2644,13 @@ impl HealthIndicatorRegistry {
                 "state".to_string(),
                 serde_json::Value::String(state.as_str().to_string()),
             );
-            if let Some(ratio_num) = serde_json::Number::from_f64(breaker.failure_ratio()) {
-                details.insert(
-                    "failure_ratio".to_string(),
-                    serde_json::Value::Number(ratio_num),
-                );
+            for (key, ratio) in [
+                ("failure_ratio", breaker.failure_ratio()),
+                ("slow_call_ratio", breaker.slow_call_ratio()),
+            ] {
+                if let Some(ratio_num) = serde_json::Number::from_f64(ratio) {
+                    details.insert(key.to_string(), serde_json::Value::Number(ratio_num));
+                }
             }
 
             results.push(HealthRunResult {
@@ -3139,6 +3141,7 @@ pub(crate) struct CircuitBreakerActuatorResponse {
     pub name: String,
     pub state: &'static str,
     pub failure_ratio: f64,
+    pub slow_call_ratio: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_ratio_threshold: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3149,6 +3152,13 @@ pub(crate) struct CircuitBreakerActuatorResponse {
     pub open_duration_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub half_open_trial_count: Option<u64>,
+    /// Absent when slow-call detection is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slow_call_duration_threshold_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slow_call_rate_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled_call_outcome: Option<&'static str>,
 }
 
 /// `GET <actuator-prefix>/circuitbreakers`
@@ -3164,11 +3174,18 @@ pub(crate) async fn circuitbreakers_endpoint<S: ProvideActuatorState + Send + Sy
             name: breaker.name().to_string(),
             state: breaker.state().as_str(),
             failure_ratio: breaker.failure_ratio(),
+            slow_call_ratio: breaker.slow_call_ratio(),
             failure_ratio_threshold: detailed.then_some(policy.failure_ratio_threshold),
             sample_window_secs: detailed.then_some(policy.sample_window.as_secs()),
             minimum_sample_count: detailed.then_some(policy.minimum_sample_count),
             open_duration_secs: detailed.then_some(policy.open_duration.as_secs()),
             half_open_trial_count: detailed.then_some(policy.half_open_trial_count),
+            slow_call_duration_threshold_ms: policy
+                .slow_call_duration_threshold
+                .filter(|_| detailed)
+                .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX)),
+            slow_call_rate_threshold: detailed.then_some(policy.slow_call_rate_threshold),
+            cancelled_call_outcome: detailed.then_some(policy.cancelled_call_outcome.as_str()),
         });
     }
 
@@ -3241,13 +3258,19 @@ pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_to
 /// Redis dead letters removed to obey `jobs.redis.dead_letter_limit`.
 pub(crate) const DEAD_LETTER_TRIMMED_FAMILY: &str = "autumn_jobs_dead_letter_trimmed_total";
 
+/// Slow calls per circuit breaker (issue #3060).
+pub(crate) const BREAKER_SLOW_CALLS_FAMILY: &str = "autumn_circuit_breaker_slow_calls_total";
+
+/// The slow-call ratio in each circuit breaker's window (issue #3060).
+pub(crate) const BREAKER_SLOW_CALL_RATIO_FAMILY: &str = "autumn_circuit_breaker_slow_call_ratio";
+
 /// Every metric family name the framework itself emits on `/actuator/prometheus`.
 ///
 /// Two callers share this list: `prometheus_endpoint` seeds its
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 26] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 28] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
@@ -3278,6 +3301,8 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 26] = [
     "autumn_cache_read_through_stale_if_error_serves_total",
     "autumn_cache_invalidation_failures_total",
     DEAD_LETTER_TRIMMED_FAMILY,
+    BREAKER_SLOW_CALLS_FAMILY,
+    BREAKER_SLOW_CALL_RATIO_FAMILY,
     crate::shadow::COMPARISONS_METRIC,
     crate::shadow::DIVERGENCES_METRIC,
 ];
@@ -3656,6 +3681,54 @@ fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegi
     );
 }
 
+/// Render the per-breaker slow-call families (issue #3060) into `out`.
+///
+/// The families are absent while there is no breaker. One series for each
+/// breaker, sorted by name. Names are escaped: a host name is a breaker name.
+fn write_builtin_circuit_breaker_metrics(
+    out: &mut String,
+    version: &str,
+    breakers: &[crate::circuit_breaker::CircuitBreaker],
+) {
+    use std::fmt::Write;
+
+    if breakers.is_empty() {
+        return;
+    }
+    let mut breakers: Vec<_> = breakers.iter().collect();
+    breakers.sort_by(|a, b| a.name().cmp(b.name()));
+
+    let name = BREAKER_SLOW_CALLS_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Calls each circuit breaker counted as slow, cancelled slow calls included"
+    );
+    let _ = writeln!(out, "# TYPE {name} counter");
+    for breaker in &breakers {
+        let label = escape_prometheus_label_value(breaker.name());
+        let _ = writeln!(
+            out,
+            "{name}{{version=\"{version}\",name=\"{label}\"}} {}",
+            breaker.slow_calls_total()
+        );
+    }
+
+    let name = BREAKER_SLOW_CALL_RATIO_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Share of slow calls in each circuit breaker sample window"
+    );
+    let _ = writeln!(out, "# TYPE {name} gauge");
+    for breaker in &breakers {
+        let label = escape_prometheus_label_value(breaker.name());
+        let _ = writeln!(
+            out,
+            "{name}{{version=\"{version}\",name=\"{label}\"}} {}",
+            breaker.slow_call_ratio()
+        );
+    }
+}
+
 /// Render the shadow-mirroring families (issue #1653) into `out`.
 ///
 /// Written as built-in families rather than through the [`crate::metrics`]
@@ -3873,6 +3946,11 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
         &crate::cache::read_through_metrics().snapshot(),
     );
     write_builtin_job_metrics(&mut out, &version, state.job_registry());
+    write_builtin_circuit_breaker_metrics(
+        &mut out,
+        &version,
+        &crate::circuit_breaker::global_registry().all_breakers(),
+    );
     if let Some(handle) = state.shadow() {
         write_builtin_shadow_metrics(&mut out, &version, &handle.snapshot());
     }
@@ -6434,6 +6512,7 @@ mod tests {
                 minimum_sample_count: 2,
                 open_duration: std::time::Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             },
         );
         assert_eq!(
@@ -6469,6 +6548,10 @@ mod tests {
         assert_eq!(item["state"], "CLOSED");
         assert_eq!(item["failure_ratio_threshold"], 0.5);
         assert_eq!(item["minimum_sample_count"], 2);
+        assert_eq!(item["slow_call_ratio"], 0.0);
+        assert_eq!(item["slow_call_duration_threshold_ms"], 60_000);
+        assert_eq!(item["slow_call_rate_threshold"], 1.0);
+        assert_eq!(item["cancelled_call_outcome"], "slow");
 
         let mut undetailed_config = AutumnConfig::default();
         undetailed_config.health.detailed = false;
@@ -6497,6 +6580,83 @@ mod tests {
         assert_eq!(item_undetailed["state"], "CLOSED");
         assert!(item_undetailed.get("failure_ratio_threshold").is_none());
         assert!(item_undetailed.get("minimum_sample_count").is_none());
+        assert_eq!(item_undetailed["slow_call_ratio"], 0.0);
+        assert!(item_undetailed.get("slow_call_rate_threshold").is_none());
+        assert!(
+            item_undetailed
+                .get("slow_call_duration_threshold_ms")
+                .is_none()
+        );
+        assert!(item_undetailed.get("cancelled_call_outcome").is_none());
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[test]
+    fn prometheus_renders_breaker_slow_call_families() {
+        let mut out = String::new();
+        write_builtin_circuit_breaker_metrics(&mut out, "stable", &[]);
+        assert!(out.is_empty(), "no breaker: no family");
+
+        let policy = crate::circuit_breaker::CircuitBreakerPolicy {
+            slow_call_duration_threshold: Some(std::time::Duration::ZERO),
+            minimum_sample_count: 100,
+            ..crate::circuit_breaker::CircuitBreakerPolicy::default()
+        };
+        let slow = crate::circuit_breaker::CircuitBreaker::new("b\"slow", policy);
+        crate::circuit_breaker::CircuitBreakerGuard::new(slow.clone()).success();
+        crate::circuit_breaker::CircuitBreakerGuard::new(slow.clone()).success();
+        let idle = crate::circuit_breaker::CircuitBreaker::new(
+            "a.idle",
+            crate::circuit_breaker::CircuitBreakerPolicy::default(),
+        );
+
+        write_builtin_circuit_breaker_metrics(&mut out, "stable", &[slow, idle]);
+        let want = "\
+# HELP autumn_circuit_breaker_slow_calls_total Calls each circuit breaker counted as slow, cancelled slow calls included
+# TYPE autumn_circuit_breaker_slow_calls_total counter
+autumn_circuit_breaker_slow_calls_total{version=\"stable\",name=\"a.idle\"} 0
+autumn_circuit_breaker_slow_calls_total{version=\"stable\",name=\"b\\\"slow\"} 2
+# HELP autumn_circuit_breaker_slow_call_ratio Share of slow calls in each circuit breaker sample window
+# TYPE autumn_circuit_breaker_slow_call_ratio gauge
+autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"a.idle\"} 0
+autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
+";
+        assert_eq!(out, want);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn actuator_prometheus_shows_breaker_slow_call_families() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+        let _breaker = crate::circuit_breaker::global_registry().get_or_create(
+            "prometheus_slow_breaker",
+            crate::circuit_breaker::CircuitBreakerPolicy::default(),
+        );
+
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains(
+            "autumn_circuit_breaker_slow_calls_total{version=\"stable\",name=\"prometheus_slow_breaker\"} 0"
+        ));
+        assert!(text.contains(
+            "autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"prometheus_slow_breaker\"} 0"
+        ));
         crate::circuit_breaker::global_registry().clear();
     }
 
@@ -6516,6 +6676,7 @@ mod tests {
                 minimum_sample_count: 2,
                 open_duration: std::time::Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             },
         );
 
@@ -9876,6 +10037,7 @@ mod health_indicator_tests {
                 minimum_sample_count: 2,
                 open_duration: std::time::Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             },
         );
 
@@ -9888,6 +10050,10 @@ mod health_indicator_tests {
         assert_eq!(result.group, IndicatorGroup::HealthOnly);
         assert_eq!(result.output.status, HealthStatus::Up);
         assert_eq!(result.output.details.get("state").unwrap(), "CLOSED");
+        assert_eq!(
+            result.output.details.get("slow_call_ratio").unwrap(),
+            &serde_json::json!(0.0)
+        );
 
         breaker.after_call(false);
         breaker.after_call(false);

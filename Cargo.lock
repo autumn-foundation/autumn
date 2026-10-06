@@ -603,6 +603,7 @@ dependencies = [
 name = "autumn-cli"
 version = "0.8.0"
 dependencies = [
+ "autumn-edge",
  "autumn-schema-core",
  "autumn-web",
  "base64 0.23.1",
@@ -662,8 +663,13 @@ dependencies = [
  "base64 0.23.1",
  "futures",
  "http 1.5.0",
+ "http-body 1.1.0",
+ "hyper",
+ "hyper-util",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "tokio",
  "tower",
  "wasmi",
  "wat",
@@ -3419,6 +3425,7 @@ dependencies = [
  "autumn-web",
  "axum",
  "http 1.5.0",
+ "reqwest 0.13.4",
  "serde_json",
  "tokio",
  "tower",
@@ -3581,6 +3588,30 @@ name = "error-code"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b5343afd4a8365a643ac588dab4cf234a190c7f6c88c9f6dd6ffe00837661b7"
+
+[[package]]
+name = "escape-hatches"
+version = "0.1.0"
+dependencies = [
+ "autumn-web",
+ "axum",
+ "deadpool",
+ "diesel",
+ "diesel-async",
+ "diesel_migrations",
+ "example-e2e",
+ "futures",
+ "maud",
+ "pq-sys",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+]
 
 [[package]]
 name = "etcetera"
