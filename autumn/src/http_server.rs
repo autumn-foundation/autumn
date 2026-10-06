@@ -356,9 +356,11 @@ enum Scan {
 #[derive(Debug, Default)]
 struct H1Scan {
     state: H1State,
-    /// The current line, cut at [`H1_LINE_KEEP`] bytes: only header names
-    /// and short values matter here.
+    /// The current line without spaces and tabs, cut at [`H1_LINE_KEEP`]
+    /// bytes: only header names and short values matter here.
     line: Vec<u8>,
+    /// The current line was longer than [`H1_LINE_KEEP`].
+    line_cut: bool,
     content_length: u64,
     chunked: bool,
     position: HeadPosition,
@@ -385,7 +387,7 @@ enum H1State {
     ChunkData(u64),
     ChunkDataEnd(u8),
     Trailers,
-    /// A head this scan cannot read. hyper rejects it.
+    /// A line this scan cannot read. Heads are not timed after it.
     Stopped,
 }
 
@@ -427,12 +429,23 @@ impl H1Scan {
                     }
                     if byte == b'\n' {
                         self.on_line(head_since);
+                    } else if byte == b' ' || byte == b'\t' {
+                        // Optional whitespace can be long; values do not need it.
                     } else if self.line.len() < H1_LINE_KEEP {
                         self.line.push(byte);
+                    } else {
+                        self.line_cut = true;
                     }
                 }
             }
         }
+    }
+
+    /// Stop the scan. Fail open: hyper can still accept the head, so the
+    /// head timer must not close it.
+    const fn stop(&mut self, head_since: &mut Option<Instant>) {
+        self.state = H1State::Stopped;
+        *head_since = None;
     }
 
     const fn next_message(&mut self) -> H1State {
@@ -444,6 +457,7 @@ impl H1Scan {
 
     fn on_line(&mut self, head_since: &mut Option<Instant>) {
         let mut line = std::mem::take(&mut self.line);
+        let cut = std::mem::take(&mut self.line_cut);
         if line.last() == Some(&b'\r') {
             line.pop();
         }
@@ -468,13 +482,13 @@ impl H1Scan {
                 line.make_ascii_lowercase();
                 let value = |name: &[u8]| {
                     line.strip_prefix(name)
-                        .map(|v| String::from_utf8_lossy(v).trim().to_owned())
+                        .map(|v| String::from_utf8_lossy(v).into_owned())
                 };
                 if let Some(v) = value(b"content-length:") {
                     match v.parse() {
-                        Ok(len) => self.content_length = len,
-                        // hyper rejects the request; stop timing heads.
-                        Err(_) => self.state = H1State::Stopped,
+                        Ok(len) if !cut => self.content_length = len,
+                        // This scan cannot frame the body.
+                        _ => self.stop(head_since),
                     }
                 } else if let Some(v) = value(b"transfer-encoding:") {
                     self.chunked |= v.contains("chunked");
@@ -483,11 +497,11 @@ impl H1Scan {
             H1State::ChunkSize => {
                 let size = line.split(|b| *b == b';').next().unwrap_or_default();
                 let size = String::from_utf8_lossy(size);
-                self.state = match u64::from_str_radix(size.trim(), 16) {
-                    Ok(0) => H1State::Trailers,
-                    Ok(n) => H1State::ChunkData(n),
-                    Err(_) => H1State::Stopped,
-                };
+                match u64::from_str_radix(&size, 16) {
+                    Ok(0) if !cut => self.state = H1State::Trailers,
+                    Ok(n) if !cut => self.state = H1State::ChunkData(n),
+                    _ => self.stop(head_since),
+                }
             }
             H1State::Trailers if line.is_empty() => self.state = self.next_message(),
             _ => {}
@@ -792,6 +806,27 @@ pub(crate) struct TunnelGuard {
     _mark: Arc<InFlight>,
 }
 
+/// Takes the tunnel mark of a `CONNECT` request, for a handler on axum's own
+/// `WebSocketUpgrade`. Keep it for the life of the socket.
+#[cfg(feature = "ws")]
+pub(crate) struct KeepTunnel {
+    _guard: Option<TunnelGuard>,
+}
+
+#[cfg(feature = "ws")]
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for KeepTunnel {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Infallible> {
+        Ok(Self {
+            _guard: parts.extensions.remove::<TunnelGuard>(),
+        })
+    }
+}
+
 impl<S> tower::Service<axum::extract::Request> for Tracked<S>
 where
     S: tower::Service<
@@ -949,6 +984,30 @@ mod tests {
     }
 
     #[test]
+    fn http1_long_whitespace_in_a_field_keeps_the_length() {
+        let mut state = state();
+        let ows = " ".repeat(300);
+        state.scan(format!("POST / HTTP/1.1\r\nContent-Length:{ows}5\r\n\r\n").as_bytes());
+        assert!(state.header_block_since.is_none(), "head complete");
+        state.scan(b"GET /"); // the 5-byte body, not a head
+        assert!(state.header_block_since.is_none());
+        state.scan(b"G");
+        assert!(state.header_block_since.is_some(), "the next head is timed");
+    }
+
+    #[test]
+    fn http1_a_line_the_scan_cannot_read_stops_head_timing() {
+        let mut state = state();
+        let zeros = "0".repeat(300);
+        state.scan(format!("POST / HTTP/1.1\r\nContent-Length: {zeros}5\r\n").as_bytes());
+        // Fail open: hyper can accept this head, so the head timer must not
+        // close the request.
+        assert!(state.header_block_since.is_none());
+        state.scan(b"\r\nhello");
+        assert!(state.header_block_since.is_none());
+    }
+
+    #[test]
     fn a_rejected_http1_upgrade_keeps_the_scan() {
         let mut state = state();
         state.scan(b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\n\r\n");
@@ -1081,6 +1140,34 @@ mod tests {
         let guard = rx.recv().unwrap();
         assert_eq!(expiry(&timers), None, "the tunnel is still open");
         drop(guard);
+        assert_eq!(expiry(&timers), Some(Expiry::Idle));
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn keep_tunnel_holds_the_connection_for_a_raw_upgrade() {
+        use axum::extract::FromRequestParts as _;
+        use tower::Service as _;
+        let timers = idle_timers();
+        let (tx, rx) = std::sync::mpsc::channel::<KeepTunnel>();
+        let mut service = Tracked {
+            inner: tower::service_fn(move |req: axum::extract::Request| {
+                let tx = tx.clone();
+                async move {
+                    let (mut parts, _) = req.into_parts();
+                    let keep = KeepTunnel::from_request_parts(&mut parts, &())
+                        .await
+                        .unwrap();
+                    tx.send(keep).unwrap();
+                    Ok::<_, Infallible>(axum::response::Response::new(axum::body::Body::empty()))
+                }
+            }),
+            timers: Some(Arc::clone(&timers)),
+        };
+        drop(service.call(connect_request()).await.unwrap());
+        let keep = rx.recv().unwrap();
+        assert_eq!(expiry(&timers), None, "the raw tunnel is still open");
+        drop(keep);
         assert_eq!(expiry(&timers), Some(Expiry::Idle));
     }
 
