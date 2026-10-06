@@ -356,6 +356,9 @@ For a `JobInfo` or `TaskInfo` that you make by hand, call
   a queue makes each claim scan past those rows.
 - A local job that waits only for the first runtime-config value, and then
   waits in a window, is not `shifted`.
+- A process knows only the windows that it saw. A durable job that a process
+  claims after a restart, when that process did not see the window, is not
+  `shifted`. The shifted ratio can then be low.
 - On the `local` backend, a deferred job is in memory. A restart loses it, as
   it loses any other queued local job.
 - On the `postgres` and `sqlite` schedulers, replicas can resume at
