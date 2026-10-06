@@ -378,6 +378,7 @@ const SCALAR_METHODS: &[&str] = &[
     "retain",
     "swap",
     "resize",
+    "resize_with",
     "reserve",
     "shrink_to_fit",
 ];
@@ -513,6 +514,7 @@ const VEC_METHODS: &[&str] = &[
     "dedup",
     "retain",
     "resize",
+    "resize_with",
     "reserve",
     "shrink_to_fit",
     "drain",
@@ -572,6 +574,7 @@ const DEQUE_METHODS: &[&str] = &[
     "retain",
     "swap",
     "resize",
+    "resize_with",
     "reserve",
     "shrink_to_fit",
     "drain",
@@ -1104,6 +1107,7 @@ const STORE_METHODS: &[&str] = &[
     "extend",
     "append",
     "resize",
+    "resize_with",
     "resize_with",
     "replace",
     "get_or_insert",
@@ -6012,7 +6016,7 @@ fn std_arities(shape: Shape, method: &str) -> &'static [usize] {
         "drain" if sequence => &[1],
         // `Iterator::take(n)`; `Option::take()`.
         "take" if matches!(shape, Shape::Iter | Shape::IterRef) => &[1],
-        "fold" | "try_fold" | "map_or" | "map_or_else" | "swap" | "resize" => &[2],
+        "fold" | "try_fold" | "map_or" | "map_or_else" | "swap" | "resize" | "resize_with" => &[2],
         "insert"
         | "all"
         | "any"
@@ -14117,6 +14121,14 @@ mod tests {
             ("Vec<PgPostRepository>", "repos.split_off(1)"),
             ("VecDeque<PgPostRepository>", "repos.split_off(1)"),
             ("LinkedList<PgPostRepository>", "repos.split_off(1)"),
+            (
+                "Vec<PgPostRepository>",
+                "repos.resize_with(2, || other.clone())",
+            ),
+            (
+                "VecDeque<PgPostRepository>",
+                "repos.resize_with(2, || other.clone())",
+            ),
         ];
         let handler = |ty: &str, call: &str| {
             format!(
