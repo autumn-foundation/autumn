@@ -1,9 +1,10 @@
 //! Isolated integration test: per-tenant cost reconciles with process CPU
 //! (issue #1720).
 //!
-//! Two tenants send CPU-bound requests. The sum of their metered CPU time must
-//! agree with the CPU time that the process used, within 10%. The allocated
-//! bytes come from an `allocation-counter` probe.
+//! Two tenants send CPU-bound requests, then enqueue CPU-bound jobs. The sum
+//! of their metered CPU time must agree with the CPU time that the process
+//! used, within 10%. The allocated bytes come from an `allocation-counter`
+//! probe.
 //!
 //! The layers outside the `CostLayer` and the test client also use CPU. The
 //! test measures that cost on a route that does nothing, and takes it out of
@@ -86,6 +87,31 @@ async fn noop() -> &'static str {
     "ok"
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BurnArgs {
+    millis: u64,
+}
+
+/// A background job that burns CPU. Its cost goes to the tenant that
+/// enqueued it.
+#[job(name = "cost_reconcile_burn")]
+async fn cost_reconcile_burn(_state: AppState, args: BurnArgs) -> AutumnResult<()> {
+    std::hint::black_box(burn(args.millis));
+    Ok(())
+}
+
+#[post("/enqueue-heavy")]
+async fn enqueue_heavy() -> AutumnResult<&'static str> {
+    CostReconcileBurnJob::enqueue(BurnArgs { millis: 60 }).await?;
+    Ok("queued")
+}
+
+#[post("/enqueue-light")]
+async fn enqueue_light() -> AutumnResult<&'static str> {
+    CostReconcileBurnJob::enqueue(BurnArgs { millis: 20 }).await?;
+    Ok("queued")
+}
+
 /// Requests that each tenant sends.
 const ROUNDS: u32 = 10;
 
@@ -99,7 +125,8 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
 
     let client = TestApp::new()
         .config(config)
-        .routes(routes![heavy, light, noop])
+        .routes(routes![heavy, light, noop, enqueue_heavy, enqueue_light])
+        .jobs(jobs![cost_reconcile_burn])
         .state_initializer(|state| {
             let probe: Arc<dyn AllocationProbe> = Arc::new(CountingProbe);
             state.insert_extension(probe);
@@ -189,4 +216,148 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
     let floor = u64::from(ROUNDS) * ALLOC_BYTES as u64;
     assert!(acme.allocated_bytes >= floor, "{acme:?}");
     assert!(globex.allocated_bytes >= floor, "{globex:?}");
+
+    // Slice 2: background jobs.
+    reconcile_jobs(&client, &accountant, outside_layer).await;
+}
+
+/// Each tenant enqueues jobs from a request. The job CPU goes to the
+/// enqueuing tenant, and the request and job CPU together reconcile with
+/// process CPU.
+async fn reconcile_jobs(
+    client: &autumn_web::test::TestClient,
+    accountant: &CostAccountant,
+    outside_layer: Duration,
+) {
+    let metered_before = metered_all(accountant);
+    let before = process_cpu();
+    for _ in 0..ROUNDS {
+        client
+            .post("/enqueue-heavy")
+            .header("x-tenant-id", "acme")
+            .send()
+            .await
+            .assert_ok();
+        client
+            .post("/enqueue-light")
+            .header("x-tenant-id", "globex")
+            .send()
+            .await
+            .assert_ok();
+    }
+    for _ in 0..2_000 {
+        if accountant.snapshot().jobs.total.runs >= u64::from(2 * ROUNDS) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let process = process_cpu()
+        .saturating_sub(before)
+        .saturating_sub(outside_layer);
+    let jobs = accountant.snapshot().jobs;
+    assert_eq!(jobs.total.runs, u64::from(2 * ROUNDS), "{jobs:?}");
+    let metered = Duration::from_micros(metered_all(accountant) - metered_before);
+
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = metered.as_secs_f64() / process.as_secs_f64();
+    println!("with jobs: metered {metered:?}, process {process:?}, ratio {ratio:.3}");
+    assert!(
+        (1.0 - TOLERANCE..=1.0 + TOLERANCE).contains(&ratio),
+        "metered CPU {metered:?} with jobs must be within 10% of process CPU {process:?} \
+         (ratio {ratio:.3})"
+    );
+
+    #[allow(clippy::cast_precision_loss)]
+    let share = jobs.tenants["acme"].cpu_micros as f64 / jobs.tenants["globex"].cpu_micros as f64;
+    assert!(
+        (2.5..=3.5).contains(&share),
+        "acme/globex job CPU share {share:.2}"
+    );
+}
+
+/// Metered CPU of requests and job runs, in microseconds.
+fn metered_all(accountant: &CostAccountant) -> u64 {
+    let snapshot = accountant.snapshot();
+    snapshot.total.cpu_micros + snapshot.jobs.total.cpu_micros
+}
+
+/// Success-metric probe (issue #1720): metering adds at most 2% to the p99
+/// latency of a request that does 1 ms of CPU work.
+///
+/// Ignored: wall-clock results depend on the machine. Run it manually:
+/// `cargo test -p autumn-web --release --test cost_reconcile -- --ignored`.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "timing-sensitive; run manually in release mode"]
+async fn metering_adds_at_most_two_percent_to_p99() {
+    use autumn_web::middleware::CostLayer;
+    use tower::ServiceExt as _;
+
+    /// Requests for each router. The two routers alternate on each request,
+    /// so drift on the machine hits both.
+    const N: usize = 4_000;
+
+    async fn handler() -> String {
+        burn_micros(1_000).to_string()
+    }
+
+    async fn once(router: &axum::Router) -> u128 {
+        let req = axum::http::Request::builder()
+            .uri("/work")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let start = std::time::Instant::now();
+        router.clone().oneshot(req).await.expect("response");
+        start.elapsed().as_micros()
+    }
+
+    fn percentile(samples: &mut [u128], pct: usize) -> u128 {
+        samples.sort_unstable();
+        samples[samples.len() * pct / 100]
+    }
+
+    let bare = axum::Router::new().route("/work", axum::routing::get(handler));
+    let metered = bare
+        .clone()
+        .layer(CostLayer::new(CostAccountant::new(10), false));
+
+    // Warm-up.
+    for _ in 0..200 {
+        once(&bare).await;
+        once(&metered).await;
+    }
+    let mut bare_samples = Vec::with_capacity(N);
+    let mut metered_samples = Vec::with_capacity(N);
+    for _ in 0..N {
+        bare_samples.push(once(&bare).await);
+        metered_samples.push(once(&metered).await);
+    }
+    let bare_p50 = percentile(&mut bare_samples, 50);
+    let metered_p50 = percentile(&mut metered_samples, 50);
+    let bare = percentile(&mut bare_samples, 99);
+    let metered = percentile(&mut metered_samples, 99);
+
+    #[allow(clippy::cast_precision_loss)]
+    let overhead = metered as f64 / bare as f64 - 1.0;
+    println!(
+        "p50: bare {bare_p50} us, metered {metered_p50} us; \
+         p99: bare {bare} us, metered {metered} us, overhead {:.2}%",
+        overhead * 100.0
+    );
+    assert!(
+        overhead <= 0.02,
+        "metering adds {:.2}% to p99, more than 2%",
+        overhead * 100.0
+    );
+}
+
+/// Spin until this thread used `micros` of CPU.
+fn burn_micros(micros: u64) -> u64 {
+    let target = thread_cpu() + Duration::from_micros(micros);
+    let mut acc = 0_u64;
+    while thread_cpu() < target {
+        for i in 0..100_u64 {
+            acc = std::hint::black_box(acc.wrapping_mul(31).wrapping_add(i));
+        }
+    }
+    acc
 }

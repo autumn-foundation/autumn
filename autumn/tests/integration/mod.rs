@@ -83,6 +83,7 @@ mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
 mod constela;
+mod cost_deferral_durable;
 mod cost_metering;
 #[cfg(feature = "acme")]
 mod custom_domain_issuance;
