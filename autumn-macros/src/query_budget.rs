@@ -3979,6 +3979,10 @@ impl Analyzer {
         let last = method.args.len().saturating_sub(1);
         let every = name == "map_or_else";
         let mut cost = Cost::ZERO;
+        // `opt.map_or_else(|| a, |x| b)` on an `Option` or a `Result` runs
+        // one of its two callbacks.
+        let one_of = every && runs_once && method.args.len() == 2;
+        let mut first = None;
         // `slots.iter_mut().for_each(|t| …)`: a parameter borrows into the
         // place the receiver borrows.
         let borrows = self.referents_of(&method.receiver);
@@ -3999,7 +4003,13 @@ impl Analyzer {
             // Only this argument's closure borrows: a named callback never
             // takes the field, so it must not reach a later closure.
             self.param_referents.clear();
-            cost = cost.then(next);
+            if one_of && i == 0 {
+                first = Some(next);
+            } else if let Some(other) = first.take() {
+                cost = cost.then(other.or_worst(next));
+            } else {
+                cost = cost.then(next);
+            }
         }
         self.keep_reads(reads);
         cost
@@ -6261,6 +6271,7 @@ fn pattern_variant(pat: &Pat, shadowed: &[String]) -> Option<(String, String)> {
 /// suffix: `map.entry(k).or_default()`, `slot.get_or_insert_with(f)`.
 const BORROW_MUT_METHODS: &[&str] = &[
     "entry",
+    "insert",
     "or_default",
     "or_insert",
     "or_insert_with",
@@ -13253,6 +13264,25 @@ mod tests {
              alias.find_all().await?; let _ = list; Ok(0) }",
             Expect::Exact(1),
         )]);
+    }
+
+    #[test]
+    fn option_insert_and_map_or_else() {
+        check_handlers(&[
+            (
+                "guard: Option::insert borrows its receiver",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = slot.insert(None); *target = Some(repo); \
+                 slot.unwrap().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "map_or_else runs one of its callbacks",
+                "async fn h(res: Result<&PgPostRepository, &PgPostRepository>) -> AutumnResult<usize> { \
+                 let _fut = res.map_or_else(|r| r.find_all(), |r| r.find_all()); Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
     }
 
     #[test]
