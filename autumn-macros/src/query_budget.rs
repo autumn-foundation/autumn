@@ -4728,8 +4728,7 @@ impl Analyzer {
                         // `repos.into_repo()`: an unknown method on a
                         // container may give any part of it.
                         || (self.expr_is_carrier(&mc.receiver)
-                            && !self.known_container_method(&mc.receiver, &method, mc.args.len())
-                            && !SCALAR_METHODS.contains(&method.as_str()))
+                            && !self.known_container_method(&mc.receiver, &method, mc.args.len()))
                         || (matches!(method.as_str(), "iter" | "iter_mut" | "into_iter" | "drain")
                             && matches!(
                                 self.shape_of(&mc.receiver),
@@ -5171,11 +5170,10 @@ impl Analyzer {
                     && self.expr_is_holder(&mc.receiver))
                     || self.callback_result(mc) == Kind::Holder
                     // `helper.identity(repo)`: an opaque method may give back
-                    // the handle it is handed. A known std method, a scalar
-                    // one, or a counted query (`table.load(&mut db)`,
-                    // `repo.find(…)`) does not.
+                    // the handle it is handed. A known std method or a
+                    // counted query (`table.load(&mut db)`, `repo.find(…)`)
+                    // does not. A user `len` may: a name alone is no proof.
                     || (mc.args.iter().any(|a| self.expr_carries_handle(a))
-                        && !SCALAR_METHODS.contains(&mc.method.to_string().as_str())
                         && !EXECUTORS.contains(&mc.method.to_string().as_str())
                         && !self.chain_root_is_handle(e)
                         && !self.known_container_method(
@@ -14097,6 +14095,12 @@ mod tests {
                 "an exempt unknown method on a container may give a part",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  #[query_exempt(reason = \"identity only\")] let alias = repos.into_repo(); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an exempt user method with a scalar name may give the handle back",
+                "async fn h(repo: PgPostRepository, helper: Helper) -> AutumnResult<usize> { \
+                 #[query_exempt(reason = \"identity only\")] let alias = make_helper().len(repo); let _ = alias.find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
