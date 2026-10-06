@@ -55,7 +55,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2285,9 +2285,9 @@ impl RequestBuilder {
                 Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
                     // The HTTP stack may have followed a redirect: charge the
                     // host that failed.
-                    if let Some(url) = followed.last() {
-                        gate.rekey(url);
-                    }
+                    // The host that failed: the last redirect target, or the
+                    // request's own host.
+                    gate.rekey(followed.last().map_or(self.url.as_str(), String::as_str));
                     let wait = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
                     if !gate.allow(RetryKind::Transient, wait) {
                         return Err(ClientError::Request(e.without_url()));
@@ -2627,6 +2627,7 @@ impl RequestBuilder {
             is_half_open,
             &gate,
             false,
+            None,
         )
         .await
     }
@@ -2658,6 +2659,10 @@ impl RequestBuilder {
         let mut method = self.method.clone();
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
+        // On the pooled path the whole chain shares one retry count, as when
+        // reqwest follows the redirects.
+        let retries_left = matches!(hop_client, HopClient::Pooled(_))
+            .then(|| AtomicU32::new(self.retry_policy.max_retries));
         for hop in 0.. {
             // Pin only applies to the first hop's original target.
             let resolve = if hop == 0 {
@@ -2700,6 +2705,7 @@ impl RequestBuilder {
                 is_half_open,
                 hop_gate,
                 true,
+                retries_left.as_ref(),
             )
             .await?;
 
@@ -2851,6 +2857,7 @@ impl RequestBuilder {
                 is_half_open,
                 hop_gate,
                 false,
+                None,
             )
             .await?;
 
@@ -3362,16 +3369,21 @@ async fn send_one(
     suppress_retries: bool,
     gate: &RetryGate,
     skip_redirect_body: bool,
+    retries_left: Option<&AtomicU32>,
 ) -> Result<Response, ClientError> {
     let start = crate::time::ambient_instant();
     let mut last_retry = None;
-    let max_attempts = if suppress_retries {
+    let mut max_attempts = if suppress_retries {
         1
     } else if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
         retry_policy.max_retries.saturating_add(1)
     } else {
         1
     };
+    // A redirect chain shares one retry count (see `follow_pooled`).
+    if let Some(left) = retries_left {
+        max_attempts = max_attempts.min(left.load(Ordering::Relaxed).saturating_add(1));
+    }
     let mut last_transient_err: Option<reqwest::Error> = None;
 
     // A prior attempt's own connect/timeout error may be why the deadline is
@@ -3389,6 +3401,9 @@ async fn send_one(
     for attempt in 0..max_attempts {
         let last = attempt + 1 == max_attempts;
         if attempt > 0 {
+            if let Some(left) = retries_left {
+                left.fetch_sub(1, Ordering::Relaxed);
+            }
             if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(deadline_exceeded_err(&mut last_transient_err));
             }
@@ -6527,6 +6542,99 @@ mod tests {
                 plain.status().as_u16(),
                 302,
                 "the same as without a deadline"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_redirect_chain_under_a_deadline_shares_one_retry_count() {
+            use axum::response::IntoResponse;
+            let origin_hits = Arc::new(AtomicU32::new(0));
+            let target_hits = Arc::new(AtomicU32::new(0));
+            let (origin, target) = (Arc::clone(&origin_hits), Arc::clone(&target_hits));
+            // Each hop fails once, then works.
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(move || async move {
+                        if origin.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            axum::response::Redirect::temporary("/t").into_response()
+                        }
+                    }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move || async move {
+                        if target.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            "done".into_response()
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/r");
+            let response = with_deadline(
+                Duration::from_secs(3),
+                Client::new().get(&url).retries(1).send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 503, "the one retry is spent");
+            assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
+            assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn an_origin_failure_after_a_redirect_charges_the_origin() {
+            // The first request redirects to a dead port; later ones hang.
+            let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dead_port = closed.local_addr().unwrap().port();
+            drop(closed);
+            let target = format!("http://127.0.0.1:{dead_port}/t");
+            let hits = Arc::new(AtomicU32::new(0));
+            let counter = Arc::clone(&hits);
+            let app = axum::Router::new().route(
+                "/r",
+                axum::routing::get(move || {
+                    let target = target.clone();
+                    let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        if !first {
+                            std::future::pending::<()>().await;
+                        }
+                        axum::response::Redirect::temporary(&target)
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let client = Client::with_timeout(Duration::from_millis(300));
+            let budgets = client.retry.budgets.clone().unwrap();
+            let result = client
+                .get(format!("http://127.0.0.1:{origin_port}/r"))
+                .retries(2)
+                .send()
+                .await;
+            assert!(result.is_err(), "{result:?}");
+            let full = f64::from(RetryBudgetConfig::default().capacity);
+            let cost = f64::from(RetryBudgetConfig::default().transient_cost);
+            let origin = budgets.for_host(&format!("127.0.0.1:{origin_port}"));
+            let dead = budgets.for_host(&format!("127.0.0.1:{dead_port}"));
+            assert!(
+                (full - dead.available() - cost).abs() < f64::EPSILON,
+                "the dead target pays its one retry: {}",
+                dead.available()
+            );
+            assert!(
+                (full - origin.available() - cost).abs() < f64::EPSILON,
+                "the origin pays the retry after its own timeout: {}",
+                origin.available()
             );
         }
 
