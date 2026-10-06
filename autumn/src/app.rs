@@ -7564,23 +7564,21 @@ impl AppBuilder {
         )
         .await;
 
-        // Verify skips the blob store and the database.
+        // Verify skips the database: it runs no migration. It keeps the blob
+        // store, so an initializer that builds a service from it still works.
+        #[cfg(feature = "db")]
         let verify = mode == DataCapsuleMode::Verify;
 
         #[cfg(feature = "storage")]
-        let storage_bootstrap = if verify {
-            None
-        } else {
-            blob_store.map_or_else(
-                || preflight_storage(&config),
-                |store| {
-                    Some(StorageBootstrap {
-                        store,
-                        serving: None,
-                    })
-                },
-            )
-        };
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
 
         #[cfg(feature = "db")]
         let (topology, shards) = if verify {

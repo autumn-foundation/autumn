@@ -319,11 +319,15 @@ impl BlobStore for LocalBlobStore {
                 return Err(BlobStoreError::io(err));
             }
             let linked = tokio::fs::hard_link(&tmp_path, &path).await;
-            let _ = tokio::fs::remove_file(&tmp_path).await;
             match linked {
                 Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
-                Err(err) => return Err(BlobStoreError::io(err)),
+                Err(err) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    if err.kind() == std::io::ErrorKind::AlreadyExists {
+                        return Ok(None);
+                    }
+                    return Err(BlobStoreError::io(err));
+                }
             }
             if write_meta_sidecar(
                 &path,
@@ -335,14 +339,19 @@ impl BlobStore for LocalBlobStore {
             .await
             .is_err()
             {
-                // The blob is new, so it is ours to remove: a caller must
-                // not get a blob without its MIME type.
-                let _ = tokio::fs::remove_file(&path).await;
-                drop_stale_sidecar(&path).await;
+                // A caller must not get a blob without its MIME type. Remove
+                // the blob only while `path` is still the file this call
+                // linked: another writer can replace it in the meantime.
+                if same_file(&path, &tmp_path).await {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    drop_stale_sidecar(&path).await;
+                }
+                let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::Io(format!(
                     "could not store the metadata of {key}"
                 )));
             }
+            let _ = tokio::fs::remove_file(&tmp_path).await;
             Ok(Some(Blob {
                 provider_id: self.inner.provider_id.clone(),
                 key: key.to_owned(),
@@ -951,6 +960,27 @@ fn backup_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
     name.push(".bak.");
     name.push(&id);
     path.with_file_name(name)
+}
+
+/// `true` when `a` and `b` are the same file, not only the same bytes.
+async fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let (Ok(a), Ok(b)) = (
+        tokio::fs::symlink_metadata(a).await,
+        tokio::fs::symlink_metadata(b).await,
+    ) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // No portable file id in std: a replacement of the same size and
+        // time is very unlikely, so treat that as the same file.
+        a.len() == b.len() && a.modified().ok() == b.modified().ok()
+    }
 }
 
 fn temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {

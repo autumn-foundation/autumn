@@ -187,6 +187,10 @@ capsule directory and to each directory above it.
 - A key outside the range of its sequence is a conflict (`409`). A sequence
   with `CACHE` above 1 is refused (`501`): other sessions can hold cached
   values that an imported key can take.
+- **Import when no other writer uses the tables.** Another session can take a
+  value from a sequence and insert its row later. If the capsule holds that
+  key, the import succeeds and the other insert fails with a duplicate key.
+  No lock can prevent this, so run import in a maintenance window.
 - Import writes blobs before records. If a blob key holds different bytes or a
   different MIME type, import stops and writes no blob. If another writer
   takes a key during the import, import stops and deletes the blobs that it
