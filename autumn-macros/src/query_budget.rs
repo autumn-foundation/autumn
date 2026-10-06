@@ -2127,8 +2127,8 @@ impl Analyzer {
             }
         }
         // `let Holder(ref mut bucket) = holder;`: a store into `bucket` is a
-        // store into `holder`.
-        let names = ref_mut_names(pat);
+        // store into `holder`. A cell writes through a shared `ref` too.
+        let names = ref_names(pat);
         if names.is_empty() {
             return;
         }
@@ -2223,11 +2223,14 @@ impl Analyzer {
             }
             (Pat::Paren(p), _) => self.bind_init(&p.pat, init),
             (_, Expr::Paren(e)) => self.bind_init(pat, &e.expr),
-            // `let ref mut alias = repos;` is `let alias = &mut repos;`.
-            (Pat::Ident(p), _)
-                if p.subpat.is_none() && p.by_ref.is_some() && p.mutability.is_some() =>
-            {
-                let borrow: Expr = syn::parse_quote!(&mut #init);
+            // `let ref mut alias = repos;` is `let alias = &mut repos;`, and
+            // `let ref alias = cell;` is `let alias = &cell;`.
+            (Pat::Ident(p), _) if p.subpat.is_none() && p.by_ref.is_some() => {
+                let borrow: Expr = if p.mutability.is_some() {
+                    syn::parse_quote!(&mut #init)
+                } else {
+                    syn::parse_quote!(&#init)
+                };
                 let binding = self.binding_of(&borrow);
                 self.env.declare(p.ident.to_string(), binding);
             }
@@ -6627,12 +6630,12 @@ fn same_tokens(a: &impl quote::ToTokens, b: &impl quote::ToTokens) -> bool {
     a.to_token_stream().to_string() == b.to_token_stream().to_string()
 }
 
-/// The names a pattern binds by `ref mut`.
-fn ref_mut_names(pat: &Pat) -> Vec<String> {
+/// The names a pattern binds by `ref` or `ref mut`.
+fn ref_names(pat: &Pat) -> Vec<String> {
     struct Names(Vec<String>);
     impl<'a> Visit<'a> for Names {
         fn visit_pat_ident(&mut self, p: &'a syn::PatIdent) {
-            if p.by_ref.is_some() && p.mutability.is_some() {
+            if p.by_ref.is_some() {
                 self.0.push(p.ident.to_string());
             }
             syn::visit::visit_pat_ident(self, p);
@@ -13623,6 +13626,18 @@ mod tests {
                 "async fn h(repo: PgPostRepository, names: Vec<String>) -> AutumnResult<usize> { \
                  let view = &names; render(view); repo.a().await?; Ok(names.len()) }",
                 Expect::Exact(1),
+            ),
+            (
+                "a shared ref binding keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let slots = Mutex::new(None); let ref alias = slots; *alias.lock().unwrap() = Some(repo); let _ = slots.lock().unwrap().as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a shared ref in a pattern keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pair = (UnsafeCell::new(None), 0); let (ref cell, _) = pair; unsafe { *cell.get() = Some(repo); } let r = unsafe { (&*pair.0.get()).as_ref().unwrap() }; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
