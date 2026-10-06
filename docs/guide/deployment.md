@@ -2172,12 +2172,15 @@ The cutover changes only the container named after the app, so a sidecar
 that you add stays as it is. Keep the app container first in `main.tf`: the
 `lifecycle` block ignores the env of the first container only. The script
 stops if the app container is not first.
-If a cutover keeps the current revision (the same image and env), it restarts
-that revision, so it reads changed secret refs. Then it waits until a new
-replica is ready. If the revision does not start with the new secrets, the
-cutover fails. A revision scaled to zero starts no replica after a restart,
-so the script sends a request to the app to start one. If the runner cannot
-reach the app (internal ingress), set `min_replicas` to 1 or more.
+A cutover is done only when the revision has a ready replica. A new
+revision can become the only active one without a replica: Azure starts it
+with the replica count of the old revision, which is zero when that one had
+scaled to zero. If a cutover keeps the current revision (the same image and
+env), it restarts that revision, so it reads changed secret refs, and only a
+replica from after the restart counts. If the revision does not start, the
+cutover fails. A revision without a replica gets a request to the app, so
+that it starts one. If the runner cannot reach the app (internal ingress),
+set `min_replicas` to 1 or more.
 
 **Upgrading an app made by an older template.** An older `main.tf` gave the
 placeholder app the identity, registry and secret refs. `terraform apply`

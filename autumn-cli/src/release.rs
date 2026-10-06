@@ -3574,6 +3574,11 @@ case "$1 $2" in
       echo "${STUB_REPLICAS:-0}"
     elif ! grep -q "revision restart" "$STUB_LOG"; then
       if [ -n "$STUB_RESTART_FROM_ZERO" ]; then echo '[]'; exit 0; fi
+      # A new revision at zero replicas: none starts until a request comes
+      # in (never: none starts at all).
+      if [ -n "$STUB_NEW_FROM_ZERO" ] && { [ "$STUB_NEW_FROM_ZERO" = never ] || ! grep -q "^curl " "$STUB_LOG"; }; then
+        echo '[]'; exit 0
+      fi
       echo '[{"name":"r-old","properties":{"runningState":"Running","containers":[{"ready":true}]}}]'
     elif [ -n "$STUB_RESTART_FROM_ZERO" ] && { [ "$STUB_RESTART_FROM_ZERO" = never ] || ! grep -q "^curl " "$STUB_LOG"; }; then
       # Scaled to zero: no replica starts until a request comes in.
@@ -3661,6 +3666,7 @@ esac
         "STUB_CUTOVER_LOST",
         "STUB_TAGS_CLEAR_FAILS",
         "STUB_PLAIN_ENV",
+        "STUB_NEW_FROM_ZERO",
         "STUB_INGRESS_DISABLE_LOST",
         "STUB_SIDECAR_ACR",
         "STUB_APP_REGISTRY_PASSWORD_REF",
@@ -3889,6 +3895,54 @@ esac
                 .collect();
             assert!(leaked.is_empty(), "{args:?} {state}: {leaked:#?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_wakes_a_new_revision_scaled_to_zero() {
+        // The old revision had no replica, so the new one becomes the only
+        // active revision without one. Provisioned does not show that the
+        // new image starts: after ingress opens, the script sends a request
+        // and waits for a ready replica.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_NEW_FROM_ZERO", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let after_open = calls
+            .split("az ingress-patch external=true")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            after_open.contains(
+                "curl --silent --output /dev/null --max-time 10 https://app.example.internal/"
+            ),
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_a_new_revision_never_starts() {
+        // A later deploy whose new revision never gets a ready replica is not
+        // done. The release before it had the credentials, so nothing rolls
+        // back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_NEW_FROM_ZERO", "never")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!bodies.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
     }
 
     #[cfg(unix)]
@@ -4983,8 +5037,10 @@ esac
             "{calls}"
         );
         assert!(bodies.contains("\"redis-url\""), "{bodies}");
+        // The placeholder check counts replicas; the readiness check of the
+        // new revision lists them.
         assert!(
-            !calls.contains("az containerapp replica list"),
+            !calls.contains("--query length(@)"),
             "a later deploy has no placeholder to check: {calls}"
         );
         assert!(

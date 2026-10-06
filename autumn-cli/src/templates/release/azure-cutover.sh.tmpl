@@ -1079,56 +1079,60 @@ MISSING_REFS=$(jq -r --argjson names "$APP_SECRET_NAMES" '
 sole_active "$REVISION" || fail "revision $REVISION did not become the only active revision"
 
 # The sole active revision runs the real image, so external ingress can
-# open now. It opens before a restart: a revision scaled to zero needs a
-# request through ingress to start a replica.
+# open now. It opens before the readiness check below: a revision without a
+# replica needs a request through ingress to start one.
 # A failed call has an unknown outcome: Azure can apply the PATCH and the
 # answer can be lost. So a rollback treats ingress as open from here on.
 OPENED=1
 open_ingress || fail "cannot open external ingress"
 
+# The deploy is done when the revision has a ready replica: Provisioned and
+# sole-active do not show that the image starts. A new revision can become
+# the only active one without a replica: Azure scales it to the replica count
+# of the old revision, and that is zero when the old one had scaled to zero
+# (min_replicas = 0). A revision without a replica gets a request through
+# ingress, so that the HTTP scale rule starts one.
 # No new revision: secrets are application-scope, and the running revision
-# reads them only when it starts.
-# A restart replaces the replicas. The deploy is done when no replica from
-# before the restart stays, and a new replica is ready. That is the proof
-# that the app starts with the new secrets. A revision scaled to zero
-# starts no replica, so the script sends a request to start one.
-if [ -n "$RESTART" ]; then
-  FQDN=$(az containerapp show \
+# reads them only when it starts. So the script restarts it, and only a
+# replica from after the restart counts.
+FQDN=$(az containerapp show \
+  --name "$AZURE_APP_NAME" \
+  --resource-group "$AZURE_RESOURCE_GROUP" \
+  --query properties.configuration.ingress.fqdn \
+  --output tsv) || FQDN=""
+replicas() {
+  az containerapp replica list \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
-    --query properties.configuration.ingress.fqdn \
-    --output tsv) || FQDN=""
-  replicas() {
-    az containerapp replica list \
-      --name "$AZURE_APP_NAME" \
-      --resource-group "$AZURE_RESOURCE_GROUP" \
-      --revision "$REVISION" \
-      --output json
-  }
+    --revision "$REVISION" \
+    --output json
+}
+BEFORE='[]'
+if [ -n "$RESTART" ]; then
   BEFORE=$(replicas | jq -c 'map(.name)') || fail "cannot list the replicas of revision $REVISION"
   az containerapp revision restart \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
     --revision "$REVISION" \
     --output none || fail "cannot restart revision $REVISION"
-  STARTED=""
-  for _ in $(seq 1 30); do
-    sleep 10
-    NOW=$(replicas) || fail "cannot list the replicas of revision $REVISION"
-    if jq -e 'length == 0' <<< "$NOW" > /dev/null && [ -n "$FQDN" ]; then
-      curl --silent --output /dev/null --max-time 10 "https://$FQDN/" || true
-    fi
-    if jq -e --argjson before "$BEFORE" '
-      (map(.name) | any(IN($before[])) | not)
-      and any(.[]; .properties.runningState == "Running"
-                   and ((.properties.containers // []) | length > 0 and all(.ready == true)))
-    ' <<< "$NOW" > /dev/null; then
-      STARTED=1
-      break
-    fi
-  done
-  [ -n "$STARTED" ] || fail "revision $REVISION has no ready replica after the restart. If ingress is internal and min_replicas = 0, the script cannot start one: set min_replicas to 1 or more, and try again."
 fi
+STARTED=""
+for _ in $(seq 1 30); do
+  sleep 10
+  NOW=$(replicas) || fail "cannot list the replicas of revision $REVISION"
+  if jq -e 'length == 0' <<< "$NOW" > /dev/null && [ -n "$FQDN" ]; then
+    curl --silent --output /dev/null --max-time 10 "https://$FQDN/" || true
+  fi
+  if jq -e --argjson before "$BEFORE" '
+    (map(.name) | any(IN($before[])) | not)
+    and any(.[]; .properties.runningState == "Running"
+                 and ((.properties.containers // []) | length > 0 and all(.ready == true)))
+  ' <<< "$NOW" > /dev/null; then
+    STARTED=1
+    break
+  fi
+done
+[ -n "$STARTED" ] || fail "revision $REVISION has no ready replica. If the app's address is not reachable from this runner (an internal environment) and min_replicas = 0, the script cannot start one: set min_replicas to 1 or more, and try again."
 
 # Remove the unused redis-url secret when no other revision is active. The
 # release runs already, so a failure here is only a warning.
