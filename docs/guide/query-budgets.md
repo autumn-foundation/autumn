@@ -430,6 +430,7 @@ callbacks. These things sit outside it, by construction:
   `format!`, `drop`. It does not trust one under another path
   (`custom::Vec`, `custom::vec!`), or one that the handler body defines or
   imports (`macro_rules! vec`, `fn drop`, `use E::V as Some`, `use E::*`).
+  Such an item applies in its own block, and to a value that leaves it.
   It cannot see a module-level `use` or `macro_rules!` that replaces a bare
   standard name. Do not give an item of yours a standard name.
 

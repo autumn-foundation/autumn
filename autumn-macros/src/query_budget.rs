@@ -1968,7 +1968,6 @@ impl Analyzer {
                 analyzer.bind_typed(&typed.pat, &typed.ty, Kind::Plain);
             }
         }
-        analyzer.shadowed = Rc::new(local_names(&input_fn.block));
         analyzer
     }
 
@@ -3029,9 +3028,21 @@ impl Analyzer {
     // ── Blocks and statements ────────────────────────────────────────
 
     fn block(&mut self, block: &Block) -> Flow {
-        self.scoped(|s| {
+        // An item shadows its whole block. A statement also sees the items
+        // of the blocks nested in it: a value can leave such a block.
+        let outer = Rc::clone(&self.shadowed);
+        let mut own = outer.to_vec();
+        own.extend(block_items(block));
+        let own = Rc::new(own);
+        let flow = self.scoped(|s| {
             let mut flow = Flow::ZERO;
             for stmt in &block.stmts {
+                let nested = item_names(|v| v.visit_stmt(stmt));
+                s.shadowed = if nested.is_empty() {
+                    Rc::clone(&own)
+                } else {
+                    Rc::new(own.iter().cloned().chain(nested).collect())
+                };
                 if flow.fall.is_none() {
                     // No path reaches this statement. Read it for its
                     // diagnostics only.
@@ -3042,7 +3053,9 @@ impl Analyzer {
                 flow = flow.then(next);
             }
             flow
-        })
+        });
+        self.shadowed = outer;
+        flow
     }
 
     /// Run `f` on code that never runs: keep its errors, and drop its
@@ -6514,10 +6527,20 @@ fn std_owner(path: &syn::Path) -> bool {
         .all(|s| STD_PATH.contains(&s.ident.to_string().as_str()))
 }
 
-/// The names that items in `block` define or import: `macro_rules! vec`,
-/// `fn drop`, `struct Vec`, `use x::format as fmt` (`fmt`).
-/// A glob import gives `*`.
-fn local_names(block: &Block) -> Vec<String> {
+/// The names that the items of `block` itself define or import.
+fn block_items(block: &Block) -> Vec<String> {
+    block
+        .stmts
+        .iter()
+        .filter(|stmt| matches!(stmt, Stmt::Item(_)))
+        .flat_map(|stmt| item_names(|v| v.visit_stmt(stmt)))
+        .collect()
+}
+
+/// The names that the items `visit` reaches define or import:
+/// `macro_rules! vec`, `fn drop`, `struct Vec`, `use x::format as fmt`
+/// (`fmt`). A glob import gives `*`.
+fn item_names(visit: impl FnOnce(&mut dyn for<'a> Visit<'a>)) -> Vec<String> {
     struct Names(Vec<String>);
     impl<'a> Visit<'a> for Names {
         fn visit_item_macro(&mut self, m: &'a syn::ItemMacro) {
@@ -6568,11 +6591,11 @@ fn local_names(block: &Block) -> Vec<String> {
         }
     }
     let mut names = Names(Vec::new());
-    names.visit_block(block);
+    visit(&mut names);
     names.0
 }
 
-/// Does an item in the handler body define or import `name`?
+/// Does an item in scope define or import `name`?
 fn shadows(shadowed: &[String], name: &str) -> bool {
     shadowed.iter().any(|n| n == name || n == "*")
 }
@@ -13696,6 +13719,42 @@ mod tests {
                 "async fn h(repo: PgPostRepository, flag: bool, sink: Sink) -> AutumnResult<usize> { \
                  sink.consume(if flag { return Ok(repo.a().await?); } else { 0 }); repo.b().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn shadowing_items_are_scoped_to_their_block() {
+        check_handlers(&[
+            (
+                "an import in an inner block does not reach later statements",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 { use custom::Some; } let slot = Some(repo); let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a glob import in a branch does not reach later statements",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 if flag { use custom::*; } let slot = Some(repo); let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an import shadows its own block",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 { use custom::Some; let slot = Some(repo); let _ = slot.unwrap().find_all().await?; } Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an import shadows its whole block, before it too",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let slot = Some(repo); use custom::Some; let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a value from a block with an import keeps the import",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let slot = { use custom::Some; Some(repo) }; let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
