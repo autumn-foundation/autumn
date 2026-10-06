@@ -7026,33 +7026,12 @@ impl AutumnConfig {
     }
 }
 
-/// HTTP server configuration.
-///
-/// Controls which address the server binds to and how graceful shutdown
-/// behaves.
-///
-/// # Defaults
-///
-/// | Field | Default |
-/// |-------|---------|
-/// | `port` | `3000` |
-/// | `host` | `"127.0.0.1"` |
-/// | `shutdown_timeout_secs` | `30` |
-///
-/// # Examples
-///
-/// ```rust
-/// use autumn_web::config::ServerConfig;
-///
-/// let server = ServerConfig::default();
-/// assert_eq!(server.port, 3000);
-/// assert_eq!(server.host, "127.0.0.1");
-/// ```
 /// Per-request timeout configuration.
 ///
 /// Controls how long the server waits for a complete request-response cycle
-/// before returning `408 Request Timeout`. A value of `None` or `0` disables
-/// the timeout (the default, so existing applications are unaffected).
+/// before it returns `503 Service Unavailable`. A value of `None` or `0`
+/// disables the timeout. The default is disabled. The `prod` profile sets
+/// `30000` (30s).
 ///
 /// # `autumn.toml` example
 ///
@@ -7116,6 +7095,28 @@ pub struct UpgradeConfig {
     pub ready_timeout_secs: u64,
 }
 
+/// HTTP server configuration.
+///
+/// Controls which address the server binds to and how graceful shutdown
+/// behaves.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `port` | `3000` |
+/// | `host` | `"127.0.0.1"` |
+/// | `shutdown_timeout_secs` | `30` |
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::config::ServerConfig;
+///
+/// let server = ServerConfig::default();
+/// assert_eq!(server.port, 3000);
+/// assert_eq!(server.host, "127.0.0.1");
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.

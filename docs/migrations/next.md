@@ -78,6 +78,41 @@ full commit-level picture.
 
 ## Breaking changes
 
+### Commentable: the runtime helpers take `soft_delete: Option<bool>`
+
+**Why:** a model can have a `soft_delete` repository and a plain one. The
+helpers did not know the calling repository. Thus they returned `404` for a
+soft-deleted parent through both (#2284). The caller now gives the fact.
+
+This affects only direct calls to the `autumn_web::commentable` functions. The
+generated `{Model}Comments` methods (`repo.add_comment(...)` and so on) do not
+change. The generic router does not change.
+
+**Before (`0.8`):**
+
+```rust
+use autumn_web::commentable::comment_thread;
+
+let thread = comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None).await?;
+```
+
+**After (next release):**
+
+```rust
+use autumn_web::commentable::comment_thread;
+
+// `None`: the old behavior. Hide the parent if any repository soft-deletes.
+// `Some(true)` / `Some(false)`: your repository's own `soft_delete` setting.
+let thread =
+    comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None, None).await?;
+```
+
+Do the same for `add_comment`, `delete_comment` and
+`recompute_comment_count`: add `None` as the last argument.
+
+**Automation:** `manual` — the new argument depends on the calling
+repository. A codemod cannot know that repository.
+
 Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
 care about.
@@ -249,6 +284,7 @@ single most valuable section of the guide — keep it factual and short.
 | `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 | `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
+| `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
 
 ## Configuration changes
 
@@ -292,6 +328,11 @@ If nothing changed, delete this section.
 - A `POST` or `PATCH` with `.retries(n)` and no `.retry_non_idempotent()`
   now makes one attempt. This compiles with no warning, so search your code
   for `.post(` and `.patch(` calls that use `.retries(`.
+- **Commentable (#2284):** a model can have a `soft_delete` repository and a
+  plain one. Through the plain repository, the `{Model}Comments` helpers now
+  accept a soft-deleted parent. Before, they returned `404`. Through the
+  `soft_delete` repository and through the router, a soft-deleted parent is
+  still `404`.
 - **Resilience (issue #3060):** a circuit breaker opens when all calls in
   its window take 60 s or more. A call dropped at or after the slow-call
   threshold counts as slow. Before, it counted as nothing. To keep the old
@@ -342,6 +383,9 @@ commands with expected output, not "make sure everything works". Required by
 3. `autumn doctor --strict` — no findings.
 4. {one step per breaking change: the observable behaviour that proves the fix
    was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
+5. Commentable (#2284): soft-delete a parent row. Call `comment_thread` on it
+   through a plain repository of the model. Make sure that it returns the
+   thread, not `404`.
 
 ### Guide-only upgrade walkthrough
 
