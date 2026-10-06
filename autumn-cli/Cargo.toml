@@ -88,6 +88,9 @@ autumn-web = { version = "0.8.0", path = "../autumn", default-features = false, 
     "openapi"
 ] }
 autumn-schema-core = { version = "0.8.0", path = "../autumn-schema-core" }
+# `autumn edge serve` / `autumn edge ttfb` (#1790). `node` is the native edge
+# node: the wasmi host, an HTTP server and the origin client.
+autumn-edge = { version = "0.8.0", path = "../autumn-edge", features = ["node"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 diesel = { workspace = true }

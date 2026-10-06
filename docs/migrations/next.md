@@ -78,6 +78,41 @@ full commit-level picture.
 
 ## Breaking changes
 
+### Commentable: the runtime helpers take `soft_delete: Option<bool>`
+
+**Why:** a model can have a `soft_delete` repository and a plain one. The
+helpers did not know the calling repository. Thus they returned `404` for a
+soft-deleted parent through both (#2284). The caller now gives the fact.
+
+This affects only direct calls to the `autumn_web::commentable` functions. The
+generated `{Model}Comments` methods (`repo.add_comment(...)` and so on) do not
+change. The generic router does not change.
+
+**Before (`0.8`):**
+
+```rust
+use autumn_web::commentable::comment_thread;
+
+let thread = comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None).await?;
+```
+
+**After (next release):**
+
+```rust
+use autumn_web::commentable::comment_thread;
+
+// `None`: the old behavior. Hide the parent if any repository soft-deletes.
+// `Some(true)` / `Some(false)`: your repository's own `soft_delete` setting.
+let thread =
+    comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None, None).await?;
+```
+
+Do the same for `add_comment`, `delete_comment` and
+`recompute_comment_count`: add `None` as the last argument.
+
+**Automation:** `manual` — the new argument depends on the calling
+repository. A codemod cannot know that repository.
+
 Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
 care about.
@@ -217,6 +252,39 @@ A struct literal of `autumn_web::config::CircuitBreakerPolicyConfig` needs
 
 **Automation:** `manual` - each struct literal needs a value for the new
 fields, and the choice changes when the breaker opens.
+### Feature flags: `PgFlagStore::get` errors before the first load
+
+**Why:** `get` connected to the database on the request thread, and a store
+error turned every flag off (issue #3063). Now `get` reads an in-memory
+snapshot and never connects on a Tokio worker.
+
+**Before (`{X.Y}`):** `get` on a new store read the database. A read error
+looked like an absent flag to code that used `.ok().flatten()`:
+
+```rust
+let store = PgFlagStore::new(url);
+if store.get("beta").ok().flatten().is_none() {
+    store.disable("beta", Some("init")).ok(); // also ran on a read error
+}
+```
+
+**After (`{(X+1).0}`):** on a Tokio runtime, `get` returns an error until the
+first load ends. Load first, and seed only on `Ok(None)`:
+
+```rust
+let store = PgFlagStore::new(url);
+store.refresh()?; // blocks: call it at startup
+if matches!(store.get("beta"), Ok(None)) {
+    store.disable("beta", Some("init"))?;
+}
+```
+
+An app that registers the store with `with_flag_store` needs no change: the
+app loads the store at startup. `with_cache_ttl(url, Duration::ZERO)` now
+means "refresh at each read", not "read the database at each read".
+
+**Automation:** `manual` - it is a behaviour change, and no code rewrite
+applies.
 
 ---
 
@@ -249,6 +317,7 @@ single most valuable section of the guide — keep it factual and short.
 | `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 | `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
+| `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
 
 ## Configuration changes
 
@@ -299,6 +368,11 @@ If nothing changed, delete this section.
 - **Resilience (issue #3060):** a breaker keeps its counts in 10 time
   buckets. A call leaves the window after 9/10 to 10/10 of
   `sample_window_secs`. Before, it left after exactly `sample_window_secs`.
+- **Commentable (#2284):** a model can have a `soft_delete` repository and a
+  plain one. Through the plain repository, the `{Model}Comments` helpers now
+  accept a soft-deleted parent. Before, they returned `404`. Through the
+  `soft_delete` repository and through the router, a soft-deleted parent is
+  still `404`.
 
 ## Deprecations retained from `{X.Y}`
 
@@ -342,6 +416,9 @@ commands with expected output, not "make sure everything works". Required by
 3. `autumn doctor --strict` — no findings.
 4. {one step per breaking change: the observable behaviour that proves the fix
    was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
+5. Commentable (#2284): soft-delete a parent row. Call `comment_thread` on it
+   through a plain repository of the model. Make sure that it returns the
+   thread, not `404`.
 
 ### Guide-only upgrade walkthrough
 
