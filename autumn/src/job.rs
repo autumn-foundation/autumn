@@ -1099,14 +1099,31 @@ fn record_redis_recovered_requeue(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) {
-    if job_admin.settle_redis_recovered_requeue(id, new_attempt, error, immediate) {
+    let settled = job_admin.settle_redis_recovered_requeue(id, new_attempt, error, immediate);
+    if settled == RedisRecoveredRequeue::BalancePrevious {
         state
             .job_registry
             .record_retry(name, error, new_attempt.saturating_sub(1));
     }
-    if immediate {
+    // A replacement that started here already took the job off the queue.
+    if immediate && settled != RedisRecoveredRequeue::ReplacementStarted {
         state.job_registry.record_enqueue(name);
     }
+}
+
+/// What Redis stale recovery's requeue changed in this process's admin
+/// record.
+#[cfg(feature = "redis")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedisRecoveredRequeue {
+    /// The record showed the previous attempt running: this process started
+    /// it, so the caller balances the registry.
+    BalancePrevious,
+    /// The record was moved on, or this process has none. Nothing to balance.
+    Requeued,
+    /// The record already shows the new attempt or a later one: the
+    /// replacement started here and was left alone.
+    ReplacementStarted,
 }
 
 /// Record a run that stopped because its worker lost the claim. The job is
@@ -1674,9 +1691,7 @@ impl JobAdminMemoryBackend {
     /// `Enqueued` (`immediate`) or `Retrying` (due later, through the
     /// `delayed` set).
     ///
-    /// Returns `true` when the record showed the previous attempt as running:
-    /// this process started it, so the caller balances the registry. A
-    /// record that already shows `new_attempt` or a later one (the
+    /// A record that already shows `new_attempt` or a later one (the
     /// replacement started here) is left alone.
     #[cfg(feature = "redis")]
     fn settle_redis_recovered_requeue(
@@ -1685,18 +1700,23 @@ impl JobAdminMemoryBackend {
         new_attempt: u32,
         error: &str,
         immediate: bool,
-    ) -> bool {
+    ) -> RedisRecoveredRequeue {
         let Ok(mut inner) = self.inner.write() else {
-            return false;
+            return RedisRecoveredRequeue::Requeued;
         };
         let Some(record) = inner.records.get_mut(id) else {
-            return false;
+            return RedisRecoveredRequeue::Requeued;
         };
         if record.attempt >= new_attempt {
-            return false;
+            return RedisRecoveredRequeue::ReplacementStarted;
         }
-        let balance = record.status == JobAdminStatus::Running
-            && record.attempt.saturating_add(1) == new_attempt;
+        let settled = if record.status == JobAdminStatus::Running
+            && record.attempt.saturating_add(1) == new_attempt
+        {
+            RedisRecoveredRequeue::BalancePrevious
+        } else {
+            RedisRecoveredRequeue::Requeued
+        };
         let now = self.clock.now();
         record.last_error = Some(error.to_owned());
         if immediate {
@@ -1710,7 +1730,7 @@ impl JobAdminMemoryBackend {
             record.status = JobAdminStatus::Retrying;
             record.finished_at = Some(now);
         }
-        balance
+        settled
     }
 
     fn record_failure(&self, id: &str, error: String) {
@@ -8502,7 +8522,9 @@ async fn redis_server_time_ms(
 }
 
 /// Move a claim deadline forward if `ARGV[2]`/`ARGV[3]` still hold the claim.
-/// The new deadline is Redis server time plus `ARGV[4]`.
+/// The new deadline is Redis server time plus `ARGV[4]`. A `running`-window
+/// unique lock (`KEYS[3]`) that this job holds gets the `ARGV[5]` backstop
+/// TTL again, as at the claim, so it outlives a claim the heartbeat keeps.
 #[cfg(feature = "redis")]
 const RENEW_REDIS_CLAIM_SCRIPT: &str = r"
 redis.replicate_commands()
@@ -8523,15 +8545,20 @@ end
 local server_time = redis.call('TIME')
 local now = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
 redis.call('ZADD', KEYS[1], 'XX', now + tonumber(ARGV[4]), ARGV[1])
+if record['unique_window'] == 'running' and redis.call('GET', KEYS[3]) == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[5]))
+end
 return 1
 ";
 
-/// Renew `record`'s claim: move its deadline in the processing set forward.
+/// Renew `record`'s claim: move its deadline in the processing set forward,
+/// and refresh the TTL of the `running`-window unique lock it holds.
 #[cfg(feature = "redis")]
 async fn renew_redis_claim(
     connection: &mut redis::aio::ConnectionManager,
     processing_key: &str,
     record_key: &str,
+    unique_lock_key: &str,
     record: &RedisJobRecord,
     visibility_timeout_ms: u64,
 ) -> LeaseRenewal {
@@ -8540,13 +8567,15 @@ async fn renew_redis_claim(
     };
     let renewed: Result<i64, redis::RedisError> = redis::cmd("EVAL")
         .arg(RENEW_REDIS_CLAIM_SCRIPT)
-        .arg(2)
+        .arg(3)
         .arg(processing_key)
         .arg(record_key)
+        .arg(unique_lock_key)
         .arg(&record.id)
         .arg(claimed_by)
         .arg(claimed_at_ms)
         .arg(visibility_timeout_ms)
+        .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
         .query_async(connection)
         .await;
     match renewed {
@@ -8566,18 +8595,21 @@ fn redis_lease_heartbeat(
     let connection = connection.clone();
     let processing_key = worker_config.processing_key.clone();
     let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
+    let unique_lock_key = worker_config.unique_lock_key_for(record);
     let record = record.clone();
     let visibility_timeout_ms = worker_config.visibility_timeout_ms;
     LeaseHeartbeat::spawn(visibility_timeout_ms, move || {
         let mut connection = connection.clone();
         let processing_key = processing_key.clone();
         let record_key = record_key.clone();
+        let unique_lock_key = unique_lock_key.clone();
         let record = record.clone();
         async move {
             renew_redis_claim(
                 &mut connection,
                 &processing_key,
                 &record_key,
+                &unique_lock_key,
                 &record,
                 visibility_timeout_ms,
             )
@@ -15611,6 +15643,109 @@ mod tests {
         // TTL locks expire by time; requeues neither re-acquire nor refresh.
         record.unique_window = Some("ttl".to_string());
         assert_eq!(redis_requeue_unique_action(&record), "");
+    }
+
+    /// The claim gives a `running`-window unique lock the 24 h backstop TTL.
+    /// The heartbeat keeps a claim alive past that, so each renewal must
+    /// refresh the lock too, or an equal job could start alongside it.
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_claim_renewal_refreshes_the_running_window_lock() {
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("renew-lock", "worker-1", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let constraints = ResolvedJobConstraints {
+            unique_key: Some("invoice-7".to_string()),
+            unique_window: Some(JobUniquenessWindow::Running),
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        assert_eq!(
+            redis_enqueue_with_constraints(
+                &client,
+                &worker_config,
+                "r1",
+                "send_invoice",
+                &constraints
+            )
+            .await,
+            EnqueueOutcome::Queued
+        );
+        let record = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("claimed");
+        let lock_key = worker_config.unique_lock_key_for(&record);
+        let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
+        let renew = |connection: &mut redis::aio::ConnectionManager| {
+            let mut connection = connection.clone();
+            let (processing_key, record_key, lock_key, record) = (
+                worker_config.processing_key.clone(),
+                record_key.clone(),
+                lock_key.clone(),
+                record.clone(),
+            );
+            async move {
+                renew_redis_claim(
+                    &mut connection,
+                    &processing_key,
+                    &record_key,
+                    &lock_key,
+                    &record,
+                    30_000,
+                )
+                .await
+            }
+        };
+        let pttl = |connection: &mut redis::aio::ConnectionManager| {
+            let mut connection = connection.clone();
+            let lock_key = lock_key.clone();
+            async move {
+                redis::cmd("PTTL")
+                    .arg(&lock_key)
+                    .query_async::<i64>(&mut connection)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // The job has run almost 24 h: its lock is about to expire.
+        let _: () = redis::cmd("PEXPIRE")
+            .arg(&lock_key)
+            .arg(1_000)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            renew(&mut connection).await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(
+            ttl > 1_000,
+            "the renewal must refresh the running-window lock; PTTL {ttl}"
+        );
+
+        // A lock that another job holds now is not this claim's to extend.
+        let _: () = redis::cmd("SET")
+            .arg(&lock_key)
+            .arg("someone-else")
+            .arg("PX")
+            .arg(1_000)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            renew(&mut connection).await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(ttl <= 1_000, "another job's lock is left alone; PTTL {ttl}");
     }
 
     #[cfg(feature = "redis")]
@@ -24375,6 +24510,15 @@ mod lease_tests {
             .map_or(0, |status| status.in_flight)
     }
 
+    #[cfg(feature = "redis")]
+    fn queued(state: &AppState) -> u64 {
+        state
+            .job_registry
+            .snapshot()
+            .get("leased")
+            .map_or(0, |status| status.queued)
+    }
+
     #[cfg(any(feature = "db", feature = "redis"))]
     #[test]
     fn lease_loss_settles_accounting_once_when_this_attempt_still_runs() {
@@ -24604,9 +24748,15 @@ mod lease_tests {
         assert_eq!(decision, JobAdminStartDecision::Superseded);
         state.job_registry.record_start("leased"); // attempt 2
         assert_eq!(in_flight(&state), 1);
+        let queued_before = queued(&state);
 
         record_redis_recovered_requeue("leased", &id, 2, "expired", true, &state, &admin);
         assert_eq!(in_flight(&state), 1, "attempt 1 is not balanced twice");
+        assert_eq!(
+            queued(&state),
+            queued_before,
+            "the replacement already left the queue: no enqueue is recorded"
+        );
         let record = admin.snapshot_record_for_test(&id).expect("record");
         assert_eq!(
             record.status,
@@ -24630,8 +24780,14 @@ mod lease_tests {
             state.job_registry.record_start("leased"); // attempt 1
             let (admin, id) = admin_with_running_job(1);
 
+            let queued_before = queued(&state);
             record_redis_recovered_requeue("leased", &id, 2, "expired", immediate, &state, &admin);
             assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+            assert_eq!(
+                queued(&state),
+                queued_before + u64::from(immediate),
+                "an immediate requeue is queued; a delayed one waits for promotion"
+            );
             let record = admin.snapshot_record_for_test(&id).expect("record");
             if immediate {
                 assert_eq!(record.status, JobAdminStatus::Enqueued);
