@@ -180,6 +180,9 @@ GATED_MODULES=(
   autumn/src/middleware/access_log.rs:default
   autumn/src/middleware/metrics.rs:default
   autumn/src/middleware/server_timing.rs:default
+  # Cost metering (#1720). Its one wall-clock read is a reasoned allow: it
+  # times a poll on the CPU, which the injected clock cannot see.
+  autumn/src/cost.rs:default
   autumn/src/migrate.rs:default
   autumn/src/notifications.rs:default
   autumn/src/openapi.rs:default

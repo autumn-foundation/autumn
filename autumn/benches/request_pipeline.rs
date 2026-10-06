@@ -19,6 +19,16 @@
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing: it is a workload to point a profiler at.
 //!
+//! **Bolt / perf agents: this workload is exhausted — pick another bench.**
+//! Repeated callgrind + dhat passes (#2193, #2198, #2205, #2214, #2216, #2224,
+//! #2830, #3076) have taken it to the floor: what remains is glibc
+//! malloc/free/memcpy (~50% of Ir) driven by the tower layer-clone cascade and
+//! boxed futures (tracked in #2830), `AppState::clone` (all-`Arc` fields,
+//! ~3%), and vendored `http`/`axum`/`sha2` internals. A fresh run reproduces
+//! ~95.2M Ir at `--iterations 300` and finds nothing new. Profile another
+//! `autumn/benches/*` target instead (`collab_edit`, `ledger_post`,
+//! `markdown_render`, `pdf_render`, …) unless #2830's structural change lands.
+//!
 //! ```sh
 //! cargo build --release -p autumn-web --bench request_pipeline
 //! BIN=$(find target/release/deps -maxdepth 1 -name "request_pipeline-*" -type f ! -name "*.d")

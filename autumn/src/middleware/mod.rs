@@ -7,6 +7,8 @@
 //!   `X-Request-Id` response header.
 //! - [`AccessLogLayer`] -- emits one structured access-log event per served
 //!   request (method, route template, status, `duration_ms`, `request_id`).
+//! - [`CostLayer`] -- meters the CPU time, allocated bytes and DB queries of
+//!   each request, by tenant (issue #1720). Installed when `[cost] enabled`.
 //! - [`ExceptionFilterLayer`] / [`ExceptionFilter`] -- intercepts error
 //!   responses and runs a user-registered filter chain for logging,
 //!   transformation, or replacement.
@@ -19,6 +21,7 @@
 //! [`AppBuilder::exception_filter`](crate::app::AppBuilder::exception_filter).
 
 pub(crate) mod access_log;
+pub(crate) mod cost;
 pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub(crate) mod exception_filter;
@@ -36,6 +39,7 @@ pub(crate) mod trace_context;
 pub use access_log::{
     ACCESS_LOG_TARGET, AccessLogEmitted, AccessLogLayer, AccessLogService, UNMATCHED_ROUTE,
 };
+pub use cost::{CostFuture, CostLayer, CostService};
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
 pub use load_shed::{LoadShedExempt, LoadShedLayer, LoadShedService};
 pub use log_context::{LogContextLayer, LogContextService};

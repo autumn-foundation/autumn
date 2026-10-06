@@ -78,6 +78,41 @@ full commit-level picture.
 
 ## Breaking changes
 
+### Commentable: the runtime helpers take `soft_delete: Option<bool>`
+
+**Why:** a model can have a `soft_delete` repository and a plain one. The
+helpers did not know the calling repository. Thus they returned `404` for a
+soft-deleted parent through both (#2284). The caller now gives the fact.
+
+This affects only direct calls to the `autumn_web::commentable` functions. The
+generated `{Model}Comments` methods (`repo.add_comment(...)` and so on) do not
+change. The generic router does not change.
+
+**Before (`0.8`):**
+
+```rust
+use autumn_web::commentable::comment_thread;
+
+let thread = comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None).await?;
+```
+
+**After (next release):**
+
+```rust
+use autumn_web::commentable::comment_thread;
+
+// `None`: the old behavior. Hide the parent if any repository soft-deletes.
+// `Some(true)` / `Some(false)`: your repository's own `soft_delete` setting.
+let thread =
+    comment_thread(&mut conn, Post::commentable_spec(), "Post", id, None, None).await?;
+```
+
+Do the same for `add_comment`, `delete_comment` and
+`recompute_comment_count`: add `None` as the last argument.
+
+**Automation:** `manual` — the new argument depends on the calling
+repository. A codemod cannot know that repository.
+
 Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
 care about.
@@ -108,6 +143,42 @@ human) instead, and name the shipped codemod id from
 Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
+
+### Config: `AutumnConfig` gains a `cost` field
+
+**Why:** Per-request cost records and cost-aware deferral (issue #1720) need
+their own `[cost]` section. `AutumnConfig` has public fields and is not
+`#[non_exhaustive]`, so a new field breaks a struct literal. `Default` and
+`..AutumnConfig::default()` keep working.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    ..AutumnConfig::default()
+};
+```
+
+The new field is `pub cost: CostConfig`. Its default turns everything off, so an
+app that does not set `[cost]` behaves as before. `CostConfig` is
+`#[non_exhaustive]`: set its fields on a default value.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+means to leave at their defaults.
 
 ### HTTP client: `retries(n)` no longer retries `POST` and `PATCH`
 
@@ -178,6 +249,79 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Resilience: `CircuitBreakerPolicy` and `CircuitBreakerPolicyConfig` have slow-call fields
+
+**Why:** The breaker opened on failures only. A dependency that became slow
+but did not fail did not open it (issue #3060).
+
+**Before (`{X.Y}`):**
+
+```rust
+let policy = CircuitBreakerPolicy {
+    failure_ratio_threshold: 0.5,
+    sample_window: Duration::from_secs(10),
+    minimum_sample_count: 10,
+    open_duration: Duration::from_secs(60),
+    half_open_trial_count: 3,
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let policy = CircuitBreakerPolicy {
+    failure_ratio_threshold: 0.5,
+    sample_window: Duration::from_secs(10),
+    minimum_sample_count: 10,
+    open_duration: Duration::from_secs(60),
+    half_open_trial_count: 3,
+    ..CircuitBreakerPolicy::default()
+};
+```
+
+The defaults are a 60 s slow-call threshold, a slow-call rate threshold of
+`1.0`, and `CancelledCallOutcome::Slow`. Set `slow_call_duration_threshold:
+None` to keep the old behaviour.
+
+A struct literal of `autumn_web::config::CircuitBreakerPolicyConfig` needs
+`..Default::default()` for the same reason.
+
+**Automation:** `manual` - each struct literal needs a value for the new
+fields, and the choice changes when the breaker opens.
+### Feature flags: `PgFlagStore::get` errors before the first load
+
+**Why:** `get` connected to the database on the request thread, and a store
+error turned every flag off (issue #3063). Now `get` reads an in-memory
+snapshot and never connects on a Tokio worker.
+
+**Before (`{X.Y}`):** `get` on a new store read the database. A read error
+looked like an absent flag to code that used `.ok().flatten()`:
+
+```rust
+let store = PgFlagStore::new(url);
+if store.get("beta").ok().flatten().is_none() {
+    store.disable("beta", Some("init")).ok(); // also ran on a read error
+}
+```
+
+**After (`{(X+1).0}`):** on a Tokio runtime, `get` returns an error until the
+first load ends. Load first, and seed only on `Ok(None)`:
+
+```rust
+let store = PgFlagStore::new(url);
+store.refresh()?; // blocks: call it at startup
+if matches!(store.get("beta"), Ok(None)) {
+    store.disable("beta", Some("init"))?;
+}
+```
+
+An app that registers the store with `with_flag_store` needs no change: the
+app loads the store at startup. `with_cache_ttl(url, Duration::ZERO)` now
+means "refresh at each read", not "read the database at each read".
+
+**Automation:** `manual` - it is a behaviour change, and no code rewrite
+applies.
+
 ---
 
 ## Plugin authors
@@ -209,6 +353,7 @@ single most valuable section of the guide — keep it factual and short.
 | `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 | `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
+| `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
 
 ## Configuration changes
 
@@ -222,6 +367,12 @@ If nothing changed, delete this section.
   HTTP client's retry backoff.
 - New: `[jobs] max_backoff_ms` and `AUTUMN_JOBS__MAX_BACKOFF_MS` (default
   `3600000`, 1 h). The cap on job retry backoff for every backend.
+- **Resilience (issue #3060):** new keys `slow_call_duration_threshold_ms`
+  (default `60000`, `0` turns detection off), `slow_call_rate_threshold`
+  (default `1.0`) and `cancelled_call_outcome` (default `"slow"`) under
+  `[resilience.circuit_breaker.defaults]` and host overrides. The env
+  variables are `AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS`,
+  `..._SLOW_CALL_RATE_THRESHOLD` and `..._CANCELLED_CALL_OUTCOME`.
 
 ## Behavior changes
 
@@ -246,6 +397,18 @@ If nothing changed, delete this section.
 - A `POST` or `PATCH` with `.retries(n)` and no `.retry_non_idempotent()`
   now makes one attempt. This compiles with no warning, so search your code
   for `.post(` and `.patch(` calls that use `.retries(`.
+- **Resilience (issue #3060):** a circuit breaker opens when all calls in
+  its window take 60 s or more. A call dropped at or after the slow-call
+  threshold counts as slow. Before, it counted as nothing. To keep the old
+  behaviour, set `slow_call_duration_threshold_ms = 0`.
+- **Resilience (issue #3060):** a breaker keeps its counts in 10 time
+  buckets. A call leaves the window after 9/10 to 10/10 of
+  `sample_window_secs`. Before, it left after exactly `sample_window_secs`.
+- **Commentable (#2284):** a model can have a `soft_delete` repository and a
+  plain one. Through the plain repository, the `{Model}Comments` helpers now
+  accept a soft-deleted parent. Before, they returned `404`. Through the
+  `soft_delete` repository and through the router, a soft-deleted parent is
+  still `404`.
 
 ## Deprecations retained from `{X.Y}`
 
@@ -289,6 +452,9 @@ commands with expected output, not "make sure everything works". Required by
 3. `autumn doctor --strict` — no findings.
 4. {one step per breaking change: the observable behaviour that proves the fix
    was applied, e.g. "hit `/x` and confirm the response carries `Y`"}
+5. Commentable (#2284): soft-delete a parent row. Call `comment_thread` on it
+   through a plain repository of the model. Make sure that it returns the
+   thread, not `404`.
 
 ### Guide-only upgrade walkthrough
 

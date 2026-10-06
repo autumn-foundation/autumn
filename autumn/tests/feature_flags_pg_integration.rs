@@ -38,8 +38,9 @@ async fn setup_pg_store() -> (PgFlagStore, testcontainers::ContainerAsync<Postgr
     let mut conn = PgConnection::establish(&url).expect("db connection");
     conn.batch_execute(MIGRATION_SQL).expect("migration");
 
-    // Use TTL=0 so every test reads from the DB, not the cache.
+    // TTL=0: each read starts a refresh. Load once so reads have a snapshot.
     let store = PgFlagStore::with_cache_ttl(&url, Duration::ZERO);
+    store.refresh().expect("initial flag load");
     (store, container)
 }
 
@@ -169,15 +170,16 @@ async fn pg_store_cache_hit_avoids_second_db_call() {
     let mut conn = PgConnection::establish(&url).expect("conn");
     conn.batch_execute(MIGRATION_SQL).expect("migration");
 
-    // Use a 60-second TTL so reads populate the cache.
+    // Use a 60-second TTL so reads use the snapshot.
     let store = PgFlagStore::with_cache_ttl(&url, Duration::from_secs(60));
+    store.refresh().unwrap();
     store.enable("cached_flag", None).unwrap();
 
-    // First read populates the cache.
+    // The write put the row into the snapshot.
     let v1 = store.get("cached_flag").unwrap();
     assert!(v1.is_some());
 
-    // Second read should hit the in-process cache (same result).
+    // A second read serves the same snapshot value.
     let v2 = store.get("cached_flag").unwrap();
     assert_eq!(v1, v2);
 }
@@ -192,4 +194,39 @@ async fn pg_store_arc_sharing_delegates_correctly() {
     assert!(flag.enabled);
     arc_store.disable("shared", None).unwrap();
     assert!(!arc_store.get("shared").unwrap().unwrap().enabled);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn pg_store_serves_last_known_flags_when_the_database_stops() {
+    use autumn_web::feature_flags::FeatureFlagService;
+
+    let (store, container) = setup_pg_store().await;
+    store.enable("kill_switch_target", None).unwrap();
+    store.disable("payments", None).unwrap();
+    let store = Arc::new(store);
+    let svc = FeatureFlagService::new(store.clone()).with_default("payments", true);
+    assert!(svc.is_enabled("kill_switch_target", None));
+    assert!(!svc.is_enabled("payments", None));
+
+    container.stop().await.expect("stop postgres");
+    // A refresh now fails. The snapshot keeps the flags as they were, so the
+    // declared default (`true`) does not replace the kill switch.
+    assert!(store.refresh().is_err());
+    assert!(svc.is_enabled("kill_switch_target", None));
+    assert!(!svc.is_enabled("payments", None), "a kill switch stays off");
+    assert!(store.refresh_errors() >= 1);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+async fn pg_store_sees_a_remote_write_after_refresh() {
+    let (writer, _c) = setup_pg_store().await;
+    let reader = writer.clone(); // A clone has its own snapshot, like a replica.
+    reader.refresh().unwrap();
+    assert!(reader.get("remote").unwrap().is_none());
+
+    writer.enable("remote", Some("ops")).unwrap();
+    reader.refresh().unwrap();
+    assert!(reader.get("remote").unwrap().unwrap().enabled);
 }
