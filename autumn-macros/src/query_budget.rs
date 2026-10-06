@@ -2323,6 +2323,20 @@ impl Analyzer {
             Expr::Paren(p) => self.referents_of(&p.expr),
             Expr::Group(g) => self.referents_of(&g.expr),
             Expr::Reference(r) if r.mutability.is_some() => self.place_referents(&r.expr),
+            // `addr_of_mut!(slot)`, read like `&raw mut slot`. Any macro of
+            // that name: a borrow only adds to what is reported.
+            Expr::Macro(m)
+                if m.mac
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "addr_of_mut") =>
+            {
+                m.mac
+                    .parse_body::<Expr>()
+                    .map(|place| self.place_referents(&place))
+                    .unwrap_or_default()
+            }
             // `&raw mut slot`: a write through the pointer reaches `slot`.
             Expr::RawAddr(r) if matches!(r.mutability, syn::PointerMutability::Mut(_)) => {
                 self.place_referents(&r.expr)
@@ -12593,6 +12607,20 @@ mod tests {
                 "guard: a raw pointer keeps its owner",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = None; let target = &raw mut slot; \
+                 unsafe { *target = Some(repo); } slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: addr_of_mut keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = std::ptr::addr_of_mut!(slot); \
+                 unsafe { *target = Some(repo); } slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a bare addr_of_mut keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = addr_of_mut!(slot); \
                  unsafe { *target = Some(repo); } slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
