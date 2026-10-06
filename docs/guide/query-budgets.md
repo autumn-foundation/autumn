@@ -233,6 +233,9 @@ negative ships an N+1 to production.
   (`let pending = PgPostRepository::new(&mut db); pending.await`). An
   `.await` on any value that holds a handle is reported, unless the value is
   a query or accessor on a handle, a call, or an `async` block.
+- **An operator handed the handle** — `repo + x`, `-repo`. An `Add` or `Neg`
+  impl is a function, and its output can be a future. A comparison
+  (`repo == other`) gives a `bool` and is not reported.
 - **A macro body that `await`s while naming the handle** — `html! { …
   (fetch(&mut db).await?) … }`. A macro body is token soup to `syn`. A template
   that merely *passes* the handle to a render helper is fine: only an `await`

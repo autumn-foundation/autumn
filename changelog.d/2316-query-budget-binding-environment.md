@@ -52,3 +52,8 @@
   or compound-assignment statement (`=`, `+=`) now apply, as in
   `#[query_cost(2)] links = load_links(&mut db).await?;`. Before, they were
   ignored (#2316).
+- **query budgets:** an arithmetic, bit or unary operator handed a handle
+  (`repo + x`, `-repo`) is reported, like a helper handed it. A comparison is
+  not. A `return` or `?` inside a call argument or a `vec![…]` element no
+  longer adds its cost to the code after it. `transaction` on an
+  `impl AsyncConnection` runs its callback once (#2316).

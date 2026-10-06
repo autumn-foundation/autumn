@@ -1929,6 +1929,9 @@ struct Analyzer {
     /// The same, one list per parameter: an invoked closure's parameter
     /// borrows what its own argument borrows.
     param_referents_each: Vec<Vec<String>>,
+    /// The kinds of the next closure's parameters, one per parameter: a
+    /// fold's accumulator and element differ.
+    closure_params: Vec<Kind>,
     /// Names the handler body defines or imports (`macro_rules! vec`, `fn
     /// drop`, `use x::format`). A std name among them is not trusted.
     shadowed: Rc<Vec<String>>,
@@ -1946,6 +1949,7 @@ impl Analyzer {
             connection_params: false,
             param_referents: Vec::new(),
             param_referents_each: Vec::new(),
+            closure_params: Vec::new(),
             shadowed: Rc::new(Vec::new()),
         };
         // The signature reads names from outside the body, so the body's
@@ -3050,7 +3054,7 @@ impl Analyzer {
         match stmt {
             Stmt::Local(local) => self.local(local),
             Stmt::Expr(expr, _) => self.expr(expr),
-            Stmt::Macro(m) => Flow::cost(self.mac(&m.mac)),
+            Stmt::Macro(m) => self.mac_flow(&m.mac),
             Stmt::Item(_) => Flow::ZERO,
         }
     }
@@ -3200,7 +3204,8 @@ impl Analyzer {
                 // a later argument may change what an earlier one read.
                 // `(|slot| slot.push(repo))(&mut list)`: each parameter
                 // borrows what its argument borrows.
-                let mut cost = Cost::ZERO;
+                // A `return` or `?` in an argument leaves before the body.
+                let mut flow = Flow::ZERO;
                 let mut params = Vec::new();
                 let mut borrows = Vec::new();
                 let mut reads = Vec::new();
@@ -3208,17 +3213,17 @@ impl Analyzer {
                     if i > 0 {
                         reads.push(self.env.clone());
                     }
-                    cost = cost.then(self.cost_of(arg));
+                    flow = flow.then(self.expr(arg));
                     params.push(self.value_of(arg));
                     borrows.push(self.referents_of(arg));
                 }
                 // The call's value is read again later: keep each read.
                 self.keep_reads(reads);
                 self.param_referents_each = borrows;
-                Flow::cost(cost.then(self.closure_body(closure, &params, Kind::Plain)))
+                flow.then(Flow::cost(self.closure_body(closure, &params, Kind::Plain)))
             }
             Expr::Call(call) => self.call(call, awaited),
-            Expr::Macro(m) => Flow::cost(self.mac(&m.mac)),
+            Expr::Macro(m) => self.mac_flow(&m.mac),
             Expr::Closure(_) => Flow::cost(self.closure_arg(expr, Kind::Plain, false)),
 
             Expr::ForLoop(f) => {
@@ -3398,7 +3403,15 @@ impl Analyzer {
                 value_first.or_worst(place_first)
             }
             // The left side runs first; the right may change what it read.
-            Expr::Binary(b) => self.each([&*b.left, &*b.right].into_iter()),
+            Expr::Binary(b) => {
+                let opaque = overloads_output(&b.op)
+                    && (self.expr_carries_handle(&b.left) || self.expr_carries_handle(&b.right));
+                let flow = self.each([&*b.left, &*b.right].into_iter());
+                if opaque {
+                    return flow.then(Flow::cost(opaque_operator(b.span(), &b.op)));
+                }
+                flow
+            }
             Expr::Return(r) => {
                 let value = r.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
                 if let Some(e) = r.expr.as_deref() {
@@ -3430,7 +3443,16 @@ impl Analyzer {
             Expr::Reference(r) => self.expr(&r.expr),
             Expr::Repeat(r) => self.expr(&r.expr).then(self.expr(&r.len)),
             Expr::Struct(s) => self.each(s.fields.iter().map(|f| &f.expr).chain(s.rest.as_deref())),
-            Expr::Unary(u) => self.expr(&u.expr),
+            // `-repo`, `!repo`: an overloaded `Neg` or `Not` may return anything.
+            Expr::Unary(u) => {
+                let opaque =
+                    !matches!(u.op, syn::UnOp::Deref(_)) && self.expr_carries_handle(&u.expr);
+                let flow = self.expr(&u.expr);
+                if opaque {
+                    return flow.then(Flow::cost(opaque_operator(u.span(), &u.op)));
+                }
+                flow
+            }
             Expr::Yield(y) => y.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e)),
 
             // Forms that hold no reachable call at all.
@@ -3612,7 +3634,8 @@ impl Analyzer {
         let Expr::Closure(closure) = arg else {
             return self.non_closure_arg(arg, takes_callback);
         };
-        let body = self.repeated(|s| s.closure_body(closure, &[], param));
+        let params = std::mem::take(&mut self.closure_params);
+        let body = self.repeated(|s| s.closure_body(closure, &params, param));
         if body.is_zero() || matches!(body, Cost::Unbounded(_)) {
             // An unbounded body already explains itself (a nested loop, an
             // opaque helper). Do not overwrite a better diagnostic.
@@ -3673,7 +3696,10 @@ impl Analyzer {
     /// The closure body is a fixed cost.
     fn callback_arg(&mut self, arg: &Expr, param: Kind, takes_callback: bool) -> Cost {
         let cost = match arg {
-            Expr::Closure(closure) => self.optional(|s| s.closure_body(closure, &[], param)),
+            Expr::Closure(closure) => {
+                let params = std::mem::take(&mut self.closure_params);
+                self.optional(|s| s.closure_body(closure, &params, param))
+            }
             _ => self.non_closure_arg(arg, takes_callback),
         };
         // Only this argument's closure gets a connection: a named callback
@@ -3992,25 +4018,31 @@ impl Analyzer {
         } else {
             Kind::Plain
         };
-        // A fold's closure also gets its accumulator: the seed, then what the
-        // closure returns.
-        let param = if matches!(
+        // A fold's closure also gets its accumulator, first: the seed, then
+        // what the closure returns.
+        let (param, fold_params) = if matches!(
             name.as_str(),
             "fold" | "try_fold" | "rfold" | "try_rfold" | "scan"
         ) {
-            let seed = method
+            let mut acc = method
                 .args
                 .iter()
                 .filter(|a| !matches!(a, Expr::Closure(_)))
                 .map(|a| self.value_of(a))
-                .fold(param, Kind::max);
-            let acc = method
-                .args
-                .last()
-                .map_or(Kind::Plain, |f| self.closure_output(f, seed));
-            seed.max(acc)
+                .fold(Kind::Plain, Kind::max);
+            loop {
+                let out = method
+                    .args
+                    .last()
+                    .map_or(Kind::Plain, |f| self.closure_output(f, acc.max(param)));
+                if out <= acc {
+                    break;
+                }
+                acc = acc.max(out);
+            }
+            (param.max(acc), vec![acc, param])
         } else {
-            param
+            (param, Vec::new())
         };
         // A function given by path where a closure would run is opaque.
         // An at-most-once method calls its argument too: `inspect_err(f)`.
@@ -4045,7 +4077,11 @@ impl Analyzer {
             if runs_once {
                 self.connection_params = is_transaction;
             }
+            if i == last {
+                self.closure_params.clone_from(&fold_params);
+            }
             let next = self.arg_flow(arg, param, callback, runs_once);
+            self.closure_params.clear();
             // Only this argument's closure borrows: a named callback never
             // takes the field, so it must not reach a later closure.
             self.param_referents.clear();
@@ -4186,13 +4222,18 @@ impl Analyzer {
         cost
     }
 
+    /// A macro's flow. `vec![a, b]` and `vec![a; n]` are read like an array,
+    /// so a `return` in an element keeps its path.
+    fn mac_flow(&mut self, mac: &syn::Macro) -> Flow {
+        match self.std_vec(mac) {
+            Some(elems) => self.each(elems.iter()),
+            None => Flow::cost(self.mac(mac)),
+        }
+    }
+
     /// A macro body is an opaque token soup to `syn`. If it so much as names a
     /// handle, the queries it may hide are reported rather than assumed absent.
-    fn mac(&mut self, mac: &syn::Macro) -> Cost {
-        // `vec![a, b]` and `vec![a; n]` are read like an array.
-        if let Some(elems) = self.std_vec(mac) {
-            return self.each(elems.iter()).total();
-        }
+    fn mac(&self, mac: &syn::Macro) -> Cost {
         if !tokens_mention_any(&mac.tokens, &|name| self.env.is_tracked(name)) {
             return Cost::ZERO;
         }
@@ -4770,6 +4811,7 @@ impl Analyzer {
             connection_params: false,
             param_referents: Vec::new(),
             param_referents_each: Vec::new(),
+            closure_params: Vec::new(),
             shadowed: Rc::clone(&self.shadowed),
         }
     }
@@ -5719,6 +5761,39 @@ fn break_results(expr: &Expr) -> Vec<&Expr> {
 }
 
 /// The tail expression of a block, when the block has one.
+/// True for a binary operator whose trait sets its own `Output`: its result
+/// can be a future. A comparison gives a `bool`, and `&&`, `||` and the
+/// compound assignments cannot give a value.
+const fn overloads_output(op: &syn::BinOp) -> bool {
+    use syn::BinOp;
+    matches!(
+        op,
+        BinOp::Add(_)
+            | BinOp::Sub(_)
+            | BinOp::Mul(_)
+            | BinOp::Div(_)
+            | BinOp::Rem(_)
+            | BinOp::BitXor(_)
+            | BinOp::BitAnd(_)
+            | BinOp::BitOr(_)
+            | BinOp::Shl(_)
+            | BinOp::Shr(_)
+    )
+}
+
+/// An operator handed the handle: its impl is opaque, like a helper's body.
+fn opaque_operator(span: Span, op: &impl quote::ToTokens) -> Cost {
+    Cost::unbounded(
+        span,
+        format!(
+            "the `{}` operator is handed the database handle, and what its impl does with \
+             it is another function's business",
+            op.to_token_stream()
+        ),
+        DECLARE_HINT,
+    )
+}
+
 /// The receiver a method chain is rooted at, and its methods, innermost
 /// first.
 fn chain_parts(outermost: &ExprMethodCall) -> (&Expr, Vec<&ExprMethodCall>) {
@@ -12026,7 +12101,7 @@ mod tests {
             (
                 "guard: a turbofish Vec keeps its element type",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
-                 let mut repos = Vec::<PgPostRepository>::new(); repos = repo + (); \
+                 let mut repos = Vec::<PgPostRepository>::new(); repos = make(); \
                  let _ = repos[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -13414,6 +13489,72 @@ mod tests {
                 "map_or_else runs one of its callbacks",
                 "async fn h(res: Result<&PgPostRepository, &PgPostRepository>) -> AutumnResult<usize> { \
                  let _fut = res.map_or_else(|r| r.find_all(), |r| r.find_all()); Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn operators_on_handles_and_exits_in_arguments() {
+        check_handlers(&[
+            (
+                "an overloaded operator handed the handle is reported",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = repo + (); pending.await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an overloaded unary operator handed the handle is reported",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let pending = -repo; pending.await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a comparison returns a bool, not a future",
+                "async fn h(repo: PgPostRepository, other: PgPostRepository) -> AutumnResult<usize> { \
+                 let _ = repo == other; Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "plain arithmetic is not reported",
+                "async fn h(repo: PgPostRepository, n: usize) -> AutumnResult<usize> { \
+                 let m = n + 1; repo.a().await?; Ok(m) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a fold accumulator from a plain seed is plain",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = repos.into_iter().fold(0, |n, _| n + 1); Ok(n) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a fold element is still a handle",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = repos.into_iter().fold((), |_, r| r + ()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a fold accumulator seeded with the handle is a handle",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let _ = ids.iter().fold(repo, |acc, _| acc + ()); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a fold accumulator the closure makes a handle is a handle",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = repos.into_iter().fold(None, |acc, r| { let _ = acc + (); Some(r) }); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a return in an immediate closure argument skips the code after the call",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 (|_| ())(if flag { return Ok(repo.a().await?); } else { 0 }); repo.b().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a return in a vec! element skips the code after it",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let _ = vec![if flag { return Ok(repo.a().await?); } else { 0 }]; repo.b().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
