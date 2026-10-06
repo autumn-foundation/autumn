@@ -3723,6 +3723,8 @@ esac
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
+        // STUB_NO_CURL: a host without curl.
+        let no_curl = extra_env.iter().any(|(name, _)| *name == "STUB_NO_CURL");
         for (name, body) in [
             ("az", AZ_STUB),
             ("sleep", "#!/bin/sh\nexit 0\n"),
@@ -3731,16 +3733,34 @@ esac
                 "#!/bin/sh\necho \"curl $*\" >> \"$STUB_LOG\"\nexit 0\n",
             ),
         ] {
+            if no_curl && name == "curl" {
+                continue;
+            }
             let path = bin.join(name);
             fs::write(&path, body).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         let log = tmp.path().join("az.log");
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let system_path = std::env::var("PATH").unwrap_or_default();
+        let path = if no_curl {
+            // The host's tools, without its curl, as links in one directory.
+            let host = tmp.path().join("host");
+            fs::create_dir_all(&host).unwrap();
+            for dir in std::env::split_paths(&system_path) {
+                let Ok(entries) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let link = host.join(entry.file_name());
+                    if entry.file_name() != "curl" && !link.exists() {
+                        let _ = std::os::unix::fs::symlink(entry.path(), link);
+                    }
+                }
+            }
+            format!("{}:{}", bin.display(), host.display())
+        } else {
+            format!("{}:{system_path}", bin.display())
+        };
         let mut command = std::process::Command::new("bash");
         command
             .arg(dir.join("azure-cutover.sh"))
@@ -3771,6 +3791,28 @@ esac
         let status = command.output().expect("run azure-cutover.sh").status;
         let read = |path: &std::path::Path| fs::read_to_string(path).unwrap_or_default();
         Some((status, read(&log), read(&log.with_extension("log.bodies"))))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_before_any_call_without_curl() {
+        // A restart of a revision scaled to zero needs a request to start a
+        // replica. Without curl, the script stops before it changes
+        // anything, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "acr.azurecr.io/app:t0",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_NO_CURL", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(calls.is_empty(), "{args:?}: {calls}");
+        }
     }
 
     #[cfg(unix)]

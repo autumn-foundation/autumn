@@ -43,7 +43,7 @@
 # AZURE_BOOTSTRAP_IMAGE to that image. The script treats only a revision
 # that runs it as the placeholder.
 #
-# Needs: az (logged in) and jq.
+# Needs: az (logged in), jq and curl.
 
 set -euo pipefail
 
@@ -55,6 +55,13 @@ case "${1:-}" in
   --without-redis) WITHOUT_REDIS=1 ;;
   *) echo "usage: azure-cutover.sh [--remove-credentials | --without-redis]" >&2; exit 2 ;;
 esac
+
+# The script checks its tools before it changes anything. curl sends the
+# request that starts a replica of a revision scaled to zero after a restart.
+for tool in az jq curl; do
+  command -v "$tool" > /dev/null \
+    || { echo "::error::azure-cutover.sh needs $tool. Install it, and try again." >&2; exit 1; }
+done
 
 : "${AZURE_APP_NAME:?set AZURE_APP_NAME (terraform output app_name)}"
 : "${AZURE_RESOURCE_GROUP:?set AZURE_RESOURCE_GROUP (terraform output resource_group_name)}"
@@ -1023,7 +1030,7 @@ if [ -n "$RESTART" ]; then
   for _ in $(seq 1 30); do
     sleep 10
     NOW=$(replicas) || fail "cannot list the replicas of revision $REVISION"
-    if jq -e 'length == 0' <<< "$NOW" > /dev/null && [ -n "$FQDN" ] && command -v curl > /dev/null; then
+    if jq -e 'length == 0' <<< "$NOW" > /dev/null && [ -n "$FQDN" ]; then
       curl --silent --output /dev/null --max-time 10 "https://$FQDN/" || true
     fi
     if jq -e --argjson before "$BEFORE" '

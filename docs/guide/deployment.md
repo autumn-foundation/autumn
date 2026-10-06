@@ -2156,7 +2156,7 @@ done
 
 # Attach the identity, registry and secret refs, and set the real image, in
 # one write (#2314). Then open external ingress (#2312). The scaffolded
-# script reads these variables and needs `jq`. See its header for details.
+# script reads these variables and needs `jq` and `curl`. See its header for details.
 AZURE_APP_NAME="$APP_NAME" AZURE_RESOURCE_GROUP="$RG" \
 AZURE_MIGRATE_JOB_NAME="$MIGRATE_JOB" ACR_LOGIN_SERVER="$ACR" IMAGE_TAG="$TAG" \
   bash azure-cutover.sh
