@@ -266,7 +266,11 @@ async fn signal_follows_runtime_config_without_redeploy() {
 
 // ── Background work (slice 2) ───────────────────────────────────────
 
-static JOB_SAW_TENANT: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+/// The ambient tenant that the job handler saw. `None` until the job runs.
+static JOB_SAW_TENANT: std::sync::Mutex<Option<Ambient>> = std::sync::Mutex::new(None);
+
+#[derive(Debug, PartialEq, Eq)]
+struct Ambient(Option<String>);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ReportArgs {}
@@ -279,7 +283,7 @@ async fn cost_metering_report(_state: AppState, _args: ReportArgs) -> AutumnResu
         .flatten();
     *JOB_SAW_TENANT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ambient);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Ambient(ambient));
     Ok(())
 }
 
@@ -332,7 +336,7 @@ async fn local_job_cost_goes_to_the_enqueuing_tenant() {
         *JOB_SAW_TENANT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        Some(None),
+        Some(Ambient(None)),
         "the job handler has no ambient tenant"
     );
 

@@ -217,10 +217,19 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
     assert!(acme.allocated_bytes >= floor, "{acme:?}");
     assert!(globex.allocated_bytes >= floor, "{globex:?}");
 
-    // Slice 2: background jobs. Each tenant enqueues jobs from a request.
-    // The job CPU goes to the enqueuing tenant, and the request and job CPU
-    // together reconcile with process CPU.
-    let metered_before = metered_all(&accountant);
+    // Slice 2: background jobs.
+    reconcile_jobs(&client, &accountant, outside_layer).await;
+}
+
+/// Each tenant enqueues jobs from a request. The job CPU goes to the
+/// enqueuing tenant, and the request and job CPU together reconcile with
+/// process CPU.
+async fn reconcile_jobs(
+    client: &autumn_web::test::TestClient,
+    accountant: &CostAccountant,
+    outside_layer: Duration,
+) {
+    let metered_before = metered_all(accountant);
     let before = process_cpu();
     for _ in 0..ROUNDS {
         client
@@ -247,7 +256,7 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
         .saturating_sub(outside_layer);
     let jobs = accountant.snapshot().jobs;
     assert_eq!(jobs.total.runs, u64::from(2 * ROUNDS), "{jobs:?}");
-    let metered = Duration::from_micros(metered_all(&accountant) - metered_before);
+    let metered = Duration::from_micros(metered_all(accountant) - metered_before);
 
     #[allow(clippy::cast_precision_loss)]
     let ratio = metered.as_secs_f64() / process.as_secs_f64();
