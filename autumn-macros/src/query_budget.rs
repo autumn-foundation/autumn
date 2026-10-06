@@ -1020,6 +1020,17 @@ fn type_shape(ty: &Type) -> Option<Shape> {
         Type::Array(_) => Some(Shape::Array),
         Type::Slice(_) => Some(Shape::Slice),
         Type::Tuple(_) => Some(Shape::Tuple),
+        // `impl AsyncConnection`, `&mut dyn AsyncConnection`: a connection.
+        Type::ImplTrait(syn::TypeImplTrait { bounds, .. })
+        | Type::TraitObject(syn::TypeTraitObject { bounds, .. }) => bounds
+            .iter()
+            .any(|bound| {
+                matches!(bound, syn::TypeParamBound::Trait(t) if t.path.segments.last().is_some_and(|s| {
+                    let name = s.ident.to_string();
+                    HANDLE_TYPES.contains(&name.as_str()) && name != "LazyDb"
+                }))
+            })
+            .then_some(Shape::Db),
         Type::Path(path) => {
             let segment = path.path.segments.last()?;
             let std = path.qself.is_none() && std_prefix(&path.path);
@@ -1418,6 +1429,14 @@ impl Flow {
             });
         self.exits = kept;
         taken
+    }
+
+    /// The same exits, with `cost` on the path that falls through, if any.
+    fn with_fall(self, cost: Cost) -> Self {
+        Self {
+            fall: self.fall.map(|_| cost),
+            ..self
+        }
     }
 
     /// The worst path, wherever it goes.
@@ -3170,7 +3189,7 @@ impl Analyzer {
             Expr::Paren(e) => self.expr_in(&e.expr, awaited),
             Expr::Group(e) => self.expr_in(&e.expr, awaited),
 
-            Expr::MethodCall(mc) => Flow::cost(self.method_chain(mc, awaited)),
+            Expr::MethodCall(mc) => self.method_chain(mc, awaited),
             // `(|| async move { … })()` — the shape `#[cached]` wraps a handler
             // body in. It runs exactly once, so it is seen through rather than
             // reported as a closure the user never wrote.
@@ -3198,7 +3217,7 @@ impl Analyzer {
                 self.param_referents_each = borrows;
                 Flow::cost(cost.then(self.closure_body(closure, &params, Kind::Plain)))
             }
-            Expr::Call(call) => Flow::cost(self.call(call, awaited)),
+            Expr::Call(call) => self.call(call, awaited),
             Expr::Macro(m) => Flow::cost(self.mac(&m.mac)),
             Expr::Closure(_) => Flow::cost(self.closure_arg(expr, Kind::Plain, false)),
 
@@ -3614,16 +3633,40 @@ impl Analyzer {
     /// plain path (`PgPostRepository::find_all`, `do_work`) is a function
     /// whose body the analysis cannot read.
     fn non_closure_arg(&mut self, arg: &Expr, takes_callback: bool) -> Cost {
-        let cost = self.cost_of(arg);
+        self.non_closure_flow(arg, takes_callback).total()
+    }
+
+    /// The same, as a flow: a `return` or `?` in the argument keeps its path.
+    fn non_closure_flow(&mut self, arg: &Expr, takes_callback: bool) -> Flow {
+        let flow = self.expr(arg);
         if takes_callback && matches!(arg, Expr::Path(_)) && self.value_of(arg) == Kind::Plain {
-            return Cost::unbounded(
+            return Flow::cost(Cost::unbounded(
                 arg.span(),
                 "a function is passed by name where a closure runs, and its body is another \
                  function's business",
                 DECLARE_HINT,
-            );
+            ));
         }
-        cost
+        flow
+    }
+
+    /// The flow of one argument. A closure is a fixed cost: it runs zero or
+    /// more times, or at most once when `runs_once`. Any other argument keeps
+    /// its exits.
+    fn arg_flow(&mut self, arg: &Expr, param: Kind, takes_callback: bool, runs_once: bool) -> Flow {
+        match arg {
+            Expr::Closure(_) if runs_once => {
+                Flow::cost(self.callback_arg(arg, param, takes_callback))
+            }
+            Expr::Closure(_) => Flow::cost(self.closure_arg(arg, param, takes_callback)),
+            _ => {
+                let flow = self.non_closure_flow(arg, takes_callback);
+                if runs_once {
+                    self.connection_params = false;
+                }
+                flow
+            }
+        }
     }
 
     /// An argument that runs at most once, such as a transaction callback.
@@ -3748,21 +3791,19 @@ impl Analyzer {
 
     /// Analyse a `recv.a().b().c()` chain as one unit: in autumn a chain rooted
     /// at a handle is *one* query, however many builder methods it carries.
-    fn method_chain(&mut self, outermost: &ExprMethodCall, awaited: bool) -> Cost {
-        // Innermost-first list of the methods in this chain, and the receiver
-        // the chain is rooted at.
-        let mut methods: Vec<&ExprMethodCall> = Vec::new();
-        let mut current = outermost;
-        let root = loop {
-            methods.push(current);
-            match &*current.receiver {
-                Expr::MethodCall(inner) => current = inner,
-                other => break other,
-            }
-        };
-        methods.reverse();
+    fn method_chain(&mut self, outermost: &ExprMethodCall, awaited: bool) -> Flow {
+        // The root and the arguments run first. A `return` or `?` in them
+        // leaves before the chain runs.
+        let (root, methods) = chain_parts(outermost);
+        let pre = self.expr(root).then(self.chain_args(&methods));
+        let cost = pre.fall.clone().unwrap_or(Cost::ZERO);
+        let cost = self.chain_cost(outermost, awaited, cost);
+        pre.with_fall(cost)
+    }
 
-        let mut cost = self.cost_of(root).then(self.chain_args(&methods));
+    /// What a chain costs after its root and arguments ran (`cost`).
+    fn chain_cost(&mut self, outermost: &ExprMethodCall, awaited: bool, mut cost: Cost) -> Cost {
+        let (root, methods) = chain_parts(outermost);
         // Where the handle enters the chain: the root itself, or the first
         // method that yields one (`app.db()…`, `slot.unwrap()…`). Methods
         // before it are ordinary; methods after it act on a handle.
@@ -3903,8 +3944,8 @@ impl Analyzer {
     /// what the chain does with them. Each store reads its own arguments
     /// right after they ran, before a later method's arguments run:
     /// `dest.push({ source.push(repo); … })`.
-    fn chain_args(&mut self, methods: &[&ExprMethodCall]) -> Cost {
-        let mut cost = Cost::ZERO;
+    fn chain_args(&mut self, methods: &[&ExprMethodCall]) -> Flow {
+        let mut cost = Flow::ZERO;
         let mut reads = Vec::new();
         for method in methods {
             if !method.args.is_empty() {
@@ -3918,7 +3959,7 @@ impl Analyzer {
         cost
     }
 
-    fn method_args(&mut self, method: &ExprMethodCall) -> Cost {
+    fn method_args(&mut self, method: &ExprMethodCall) -> Flow {
         let name = method.method.to_string();
         // A user type may have a method with a transaction name that calls
         // its closure many times, so the receiver must be a handle.
@@ -3981,7 +4022,7 @@ impl Analyzer {
         // `opt.map_or(default, f)`. Every argument of `map_or_else` is one.
         let last = method.args.len().saturating_sub(1);
         let every = name == "map_or_else";
-        let mut cost = Cost::ZERO;
+        let mut cost = Flow::ZERO;
         // `opt.map_or_else(|| a, |x| b)` on an `Option` or a `Result` runs
         // one of its two callbacks.
         let one_of = every && runs_once && method.args.len() == 2;
@@ -4001,12 +4042,10 @@ impl Analyzer {
             let callback = takes_callback && (every || i == last);
             let param = self.side_param(method, i).unwrap_or(param);
             self.param_referents.clone_from(&borrows);
-            let next = if runs_once {
+            if runs_once {
                 self.connection_params = is_transaction;
-                self.callback_arg(arg, param, callback)
-            } else {
-                self.closure_arg(arg, param, callback)
-            };
+            }
+            let next = self.arg_flow(arg, param, callback, runs_once);
             // Only this argument's closure borrows: a named callback never
             // takes the field, so it must not reach a later closure.
             self.param_referents.clear();
@@ -4048,7 +4087,7 @@ impl Analyzer {
         Cost::Exact(associations)
     }
 
-    fn call(&mut self, call: &ExprCall, awaited: bool) -> Cost {
+    fn call(&mut self, call: &ExprCall, awaited: bool) -> Flow {
         let name = call_path_name(call);
         // `scoped_transaction` / `savepoint` run their closure once and hand
         // it a connection.
@@ -4059,20 +4098,36 @@ impl Analyzer {
             .is_some_and(|n| TRANSACTION_FREE_FNS.contains(&n))
             && call.args.first().is_some_and(|a| self.is_connection(a));
 
-        let mut cost = self.cost_of(&call.func);
+        // The callee and the arguments run first. A `return` or `?` in them
+        // leaves before the call.
+        let mut flow = self.expr(&call.func);
         let last = call.args.len().saturating_sub(1);
         let mut reads = Vec::new();
         for (i, arg) in call.args.iter().enumerate() {
             reads.push(self.env.clone());
             let next = if runs_once {
                 self.connection_params = true;
-                self.callback_arg(arg, Kind::Handle, i == last)
+                self.arg_flow(arg, Kind::Handle, i == last, true)
             } else {
-                self.cost_of(arg)
+                self.expr(arg)
             };
-            cost = cost.then(next);
+            flow = flow.then(next);
         }
         self.keep_reads(reads);
+        let cost = flow.fall.clone().unwrap_or(Cost::ZERO);
+        let cost = self.call_cost(call, awaited, name, runs_once, cost);
+        flow.with_fall(cost)
+    }
+
+    /// What a call costs after its callee and arguments ran (`cost`).
+    fn call_cost(
+        &mut self,
+        call: &ExprCall,
+        awaited: bool,
+        name: Option<String>,
+        runs_once: bool,
+        cost: Cost,
+    ) -> Cost {
         // `fill(&mut repos, &repo)` or `fill(slot, &repo)`: a `&mut`
         // argument may receive a handle from another argument, or from a
         // stored closure that captures one. The arguments ran first, so what
@@ -5664,6 +5719,22 @@ fn break_results(expr: &Expr) -> Vec<&Expr> {
 }
 
 /// The tail expression of a block, when the block has one.
+/// The receiver a method chain is rooted at, and its methods, innermost
+/// first.
+fn chain_parts(outermost: &ExprMethodCall) -> (&Expr, Vec<&ExprMethodCall>) {
+    let mut methods: Vec<&ExprMethodCall> = Vec::new();
+    let mut current = outermost;
+    let root = loop {
+        methods.push(current);
+        match &*current.receiver {
+            Expr::MethodCall(inner) => current = inner,
+            other => break other,
+        }
+    };
+    methods.reverse();
+    (root, methods)
+}
+
 fn block_tail(block: &Block) -> Option<&Expr> {
     match block.stmts.last() {
         Some(Stmt::Expr(expr, None)) => Some(expr),
@@ -13343,6 +13414,36 @@ mod tests {
                 "map_or_else runs one of its callbacks",
                 "async fn h(res: Result<&PgPostRepository, &PgPostRepository>) -> AutumnResult<usize> { \
                  let _fut = res.map_or_else(|r| r.find_all(), |r| r.find_all()); Ok(0) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn impl_connections_and_exits_in_arguments() {
+        check_handlers(&[
+            (
+                "a Db transaction runs its callback once",
+                "async fn h(mut conn: Db) -> AutumnResult<usize> { \
+                 conn.transaction(|c| async move { let _ = posts::table.load(&mut *c).await?; Ok(()) }).await?; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "an impl AsyncConnection transaction runs its callback once",
+                "async fn h(mut conn: impl AsyncConnection) -> AutumnResult<usize> { \
+                 conn.transaction(|c| async move { let _ = posts::table.load(&mut *c).await?; Ok(()) }).await?; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "a return in a call argument skips the code after the call",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 consume(if flag { return Ok(repo.a().await?); } else { 0 }); repo.b().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "a return in a method argument skips the code after the call",
+                "async fn h(repo: PgPostRepository, flag: bool, sink: Sink) -> AutumnResult<usize> { \
+                 sink.consume(if flag { return Ok(repo.a().await?); } else { 0 }); repo.b().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
