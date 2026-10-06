@@ -100,6 +100,7 @@ const HANDLE_BUILDERS: &[&str] = &[
 /// query inside one is a fixed cost. An iterator has some of these names
 /// too, so the receiver must be known to be an `Option` or a `Result`.
 const AT_MOST_ONCE_CLOSURE_METHODS: &[&str] = &[
+    "take_if",
     "unwrap_or_else",
     "ok_or_else",
     "get_or_insert_with",
@@ -386,6 +387,7 @@ const SCALAR_METHODS: &[&str] = &[
 /// Methods on a carrier that return a carrier: a view, an iterator, or an
 /// `Option` of a part.
 const CARRIER_METHODS: &[&str] = &[
+    "take_if",
     "as_mut_slice",
     "make_contiguous",
     "split_off",
@@ -658,6 +660,7 @@ const ITER_METHODS: &[&str] = &[
 ];
 
 const OPTION_METHODS: &[&str] = &[
+    "take_if",
     "is_some",
     "is_none",
     "is_some_and",
@@ -692,6 +695,7 @@ const OPTION_METHODS: &[&str] = &[
 /// An `Option` of a reference also has `cloned`, `copied` and `as_deref`. On
 /// an `Option` of a value, an extension trait may give those names.
 const OPTION_REF_METHODS: &[&str] = &[
+    "take_if",
     "is_some",
     "is_none",
     "is_some_and",
@@ -4721,6 +4725,11 @@ impl Analyzer {
                         || (method == "chain" && mc.args.iter().any(|a| self.expr_is_nested(a)))
                         // `enumerate` and a map's iterators yield tuples.
                         || (method == "enumerate" && self.holds(&mc.receiver))
+                        // `repos.into_repo()`: an unknown method on a
+                        // container may give any part of it.
+                        || (self.expr_is_carrier(&mc.receiver)
+                            && !self.known_container_method(&mc.receiver, &method, mc.args.len())
+                            && !SCALAR_METHODS.contains(&method.as_str()))
                         || (matches!(method.as_str(), "iter" | "iter_mut" | "into_iter" | "drain")
                             && matches!(
                                 self.shape_of(&mc.receiver),
@@ -6099,6 +6108,7 @@ fn std_arities(shape: Shape, method: &str) -> &'static [usize] {
         | "sort_unstable_by_key"
         | "step_by"
         | "swap_remove"
+        | "take_if"
         | "take_while"
         | "then"
         | "then_some"
@@ -14083,6 +14093,12 @@ mod tests {
                  let m = helper.double(n); repo.a().await?; Ok(m) }",
                 Expect::Exact(1),
             ),
+            (
+                "an exempt unknown method on a container may give a part",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 #[query_exempt(reason = \"identity only\")] let alias = repos.into_repo(); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
         ]);
     }
 
@@ -14228,6 +14244,7 @@ mod tests {
                 "VecDeque<PgPostRepository>",
                 "repos.make_contiguous().len()",
             ),
+            ("Option<PgPostRepository>", "repos.take_if(|_| false)"),
         ];
         let handler = |ty: &str, call: &str| {
             format!(
