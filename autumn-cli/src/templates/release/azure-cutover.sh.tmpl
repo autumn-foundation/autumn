@@ -230,8 +230,20 @@ REMOVE_UIDS=$(jq -c --argjson job "$JOB_UIDS" --argjson copied "$COPIED" --argjs
 # keeping it would keep vault access on the placeholder. So the script
 # stops before a first cutover (its rollback removes the credentials) or a
 # removal, and names them.
+# The templates of the active placeholder revisions: stage 1 of credential
+# removal starts from them, so their sidecars count too.
+ACTIVE_TEMPLATES="[]"
+for revision in $PLACEHOLDER_REVISIONS; do
+  TEMPLATE=$(az containerapp revision show \
+    --name "$AZURE_APP_NAME" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --revision "$revision" \
+    --query properties.template \
+    --output json) || { echo "::error::cannot read the template of revision $revision" >&2; exit 1; }
+  ACTIVE_TEMPLATES=$(jq -c --argjson t "${TEMPLATE:-null}" '. + [$t]' <<< "$ACTIVE_TEMPLATES")
+done
 SHARED_IDENTITY=$(jq -r --argjson app "$APP" --argjson uids "$REMOVE_UIDS" --arg acr "$ACR_LOGIN_SERVER" \
-  --arg name "$AZURE_APP_NAME" "$MANAGED_DEF"'
+  --arg name "$AZURE_APP_NAME" --argjson actives "$ACTIVE_TEMPLATES" "$MANAGED_DEF"'
   ($uids | map(ascii_downcase)) as $lids
   | [(.[] | select(.keyVaultUrl and ((.identity // "" | ascii_downcase) | IN($lids[]))
                and (.name | IN(managed[]) | not)) | "secret " + .name),
@@ -239,8 +251,9 @@ SHARED_IDENTITY=$(jq -r --argjson app "$APP" --argjson uids "$REMOVE_UIDS" --arg
       | select(.server != $acr and ((.identity // "" | ascii_downcase) | IN($lids[]))) | "registry " + .server),
      # A sidecar or init container that pulls from the ACR needs the ACR
      # entry, which credential removal drops.
-     ($app.properties.template | ((.containers // []) | map(select(.name != $name))) + (.initContainers // [])
-      | .[] | select((.image // "") | startswith($acr + "/"))
+     ([$app.properties.template] + $actives | map(select(. != null))
+      | [.[] | ((.containers // []) | map(select(.name != $name))) + (.initContainers // []) | .[]]
+      | map(select((.image // "") | startswith($acr + "/"))) | unique_by(.name) | .[]
       | "container " + .name + " (image from " + $acr + ")"),
      ($app.properties.configuration.registries // [] | .[]
       | select((.passwordSecretRef // "") | IN(managed[]))
