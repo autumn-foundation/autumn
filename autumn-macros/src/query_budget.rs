@@ -2371,6 +2371,17 @@ impl Analyzer {
             Expr::Async(a) => self.block_borrows(&a.block),
             // `move || alias`: what the body names or borrows.
             Expr::Closure(c) => self.closure_borrows(c),
+            // `vec![&raw mut slot]`, or any macro whose body reads as
+            // expressions: a borrow in it only adds to what is reported.
+            Expr::Macro(m) => {
+                let mut all: Vec<String> = macro_exprs(&m.mac)
+                    .iter()
+                    .flat_map(|e| self.referents_of(e))
+                    .collect();
+                all.sort();
+                all.dedup();
+                all
+            }
             // `&raw mut slot`: a write through the pointer reaches `slot`.
             Expr::RawAddr(r) if matches!(r.mutability, syn::PointerMutability::Mut(_)) => {
                 self.place_referents(&r.expr)
@@ -5838,6 +5849,23 @@ fn vec_elems(mac: &syn::Macro) -> Option<Vec<Expr>> {
         Ok(vec![elem, len])
     })
     .ok()
+}
+
+/// The expressions of a macro body that reads as a comma list or as
+/// `elem; len`. Empty when it does not parse.
+fn macro_exprs(mac: &syn::Macro) -> Vec<Expr> {
+    let list =
+        mac.parse_body_with(syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated);
+    if let Ok(list) = list {
+        return list.into_iter().collect();
+    }
+    mac.parse_body_with(|input: ParseStream| {
+        let elem: Expr = input.parse()?;
+        let _: syn::Token![;] = input.parse()?;
+        let _: Expr = input.parse()?;
+        Ok(vec![elem])
+    })
+    .unwrap_or_default()
 }
 
 /// Is this call `Box::new(x)`, `Arc::new(x)` or `Rc::new(x)`?
@@ -13130,6 +13158,13 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = None; let alias = &mut slot; let make = move || alias; \
                  let target = make(); *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a vec of raw pointers keeps their owners",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let refs = vec![&raw mut slot]; let target = refs[0]; \
+                 unsafe { *target = Some(repo); } slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
