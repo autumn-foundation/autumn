@@ -2220,8 +2220,8 @@ job's secrets. When the job has `redis-url`, the cutover sets the Redis env
 vars and secret ref.
 
 **To turn Redis off,** stop using it before Terraform deletes it. If a
-sidecar in `main.tf` has an env var that refers to `redis-url`, remove that
-env var from `main.tf` first. Else the next `terraform apply` adds it back.
+sidecar or an init container in `main.tf` has an env var that refers to
+`redis-url`, remove that env var from `main.tf` first. Else the next `terraform apply` adds it back.
 Then run the cutover with `--without-redis` and the tag that runs now:
 
 ```bash

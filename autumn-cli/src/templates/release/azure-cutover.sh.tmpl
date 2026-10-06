@@ -283,11 +283,13 @@ if jq -e 'any(.[]; .name == "redis-url")' "$APP_SECRETS" > /dev/null \
   && ! jq -e 'index("redis-url")' <<< "$JOB_SECRET_NAMES" > /dev/null; then
   STALE_REDIS=1
 fi
-# The cutover removes redis-url from every env var. A scale rule or a volume
-# can also refer to it, and the script cannot remove that ref without
-# changing what the app does, so it stops before any write.
+# The cutover removes redis-url from every env var (of the containers and
+# the init containers). A scale rule or a volume can also refer to it, and
+# the script cannot remove that ref without changing what the app does, so
+# it stops before any write.
 if [ "$MODE" = cutover ] && [ -n "$STALE_REDIS" ] \
   && jq -e '.properties.template | (.containers |= map(del(.env)))
+            | (.initContainers |= if . then map(del(.env)) else . end)
             | [.. | objects | .secretRef? // empty] | index("redis-url")' <<< "$APP" > /dev/null; then
   echo "::error::a scale rule or volume of $AZURE_APP_NAME uses redis-url. Remove that reference, then run the script again." >&2
   exit 1
@@ -894,6 +896,14 @@ CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAG
           "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL",
           "AUTUMN_CREDENTIAL_CLEANUP", "AUTUMN_FORCE_REVISION") | not)] + $env))
 ') || fail "cannot build the new containers"
+# The init containers stay, but without Redis no env var in them may refer
+# to redis-url either. null: the app has none, and the PATCH leaves them.
+INIT_CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" '
+  any(($job.properties.configuration.secrets // [])[]; .name == "redis-url") as $redis
+  | $app.properties.template.initContainers
+  | if . == null or $redis then . else
+      map(if .env then .env = [.env[] | select(.secretRef != "redis-url")] else . end)
+    end') || fail "cannot build the new init containers"
 
 # A changed template makes a new revision, so the script waits for it. If
 # nothing changes (a re-run with the same tag and config), Azure makes no
@@ -901,8 +911,9 @@ CONTAINERS=$(jq -cn --argjson job "$JOB" --argjson app "$APP" --arg image "$IMAG
 # revision failed (the old one still serves), a marker env var makes the
 # template differ, so Azure makes a fresh revision.
 RESTART=""
-if jq -en --argjson app "$APP" --argjson containers "$CONTAINERS" \
-  '$app.properties.template.containers == $containers' > /dev/null; then
+if jq -en --argjson app "$APP" --argjson containers "$CONTAINERS" --argjson inits "$INIT_CONTAINERS" \
+  '$app.properties.template.containers == $containers
+   and $app.properties.template.initContainers == $inits' > /dev/null; then
   LATEST_STATE=$(az containerapp revision show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -935,7 +946,7 @@ fi
 # The secrets, registries and identities that you add to the app stay.
 PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slurpfile job_secrets "$JOB_SECRETS" \
   --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" --argjson containers "$CONTAINERS" \
-  --argjson uids "$JOB_UIDS" --argjson copied_tags "$COPIED_TAGS" "$SECRET_REF"'
+  --argjson uids "$JOB_UIDS" --argjson copied_tags "$COPIED_TAGS" --argjson inits "$INIT_CONTAINERS" "$SECRET_REF"'
   ($job_secrets[0] | map(secret_ref)) as $job_secrets
   | if $id == "" or ($job_secrets | length) == 0
     then error("the migration job has no identity or secrets to copy")
@@ -956,6 +967,7 @@ PATCH=$(jq -cn --argjson app "$APP" --slurpfile app_secrets "$APP_SECRETS" --slu
          secrets: $secrets},
        template: {containers: $containers}}}
   + (if $copied_tags == {} then {} else {tags: $copied_tags} end)
+  | if $inits == null then . else .properties.template.initContainers = $inits end
 ') || fail "cannot build the cutover PATCH"
 patch_app "$PATCH" || fail "the cutover PATCH failed"
 

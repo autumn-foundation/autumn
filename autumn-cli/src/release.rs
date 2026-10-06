@@ -3334,7 +3334,10 @@ fi
   [ -n "$STUB_SIDECAR_FIRST" ] && containers="$sidecar,{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]}"
   # An init container env var can also refer to a managed secret.
   init=""
-  [ -n "$STUB_INIT_SECRET_REF" ] && init=',"initContainers":[{"name":"migrate","image":"busybox","env":[{"name":"INIT_DB","secretRef":"database-url"}]}]'
+  # STUB_INIT_SECRET_REF=redis-url: the ref names redis-url instead.
+  init_ref=database-url
+  [ "$STUB_INIT_SECRET_REF" = redis-url ] && init_ref=redis-url
+  [ -n "$STUB_INIT_SECRET_REF" ] && init=',"initContainers":[{"name":"migrate","image":"busybox","env":[{"name":"INIT_DB","secretRef":"'"$init_ref"'"}]}]'
   app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",\"tags\":$tags,$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$init$scale}}}"
 # An older placeholder whose credentials use an identity that the job no
 # longer uses.
@@ -5520,6 +5523,32 @@ esac
         let patches: Vec<&str> = bodies.lines().collect();
         assert_eq!(patches.len(), 2, "{bodies}");
         assert!(!patches[0].contains("SIDECAR_REDIS"), "{}", patches[0]);
+        assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_init_container_redis_refs_without_redis() {
+        // An init container env var refers to redis-url. The cutover removes
+        // it like a sidecar's, and keeps the init container.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[
+                ("STUB_APP_REDIS", "1"),
+                ("STUB_INIT_SECRET_REF", "redis-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(!patches[0].contains("INIT_DB"), "{}", patches[0]);
+        assert!(patches[0].contains("\"migrate\""), "{}", patches[0]);
         assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
     }
 
