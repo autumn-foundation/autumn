@@ -8420,9 +8420,9 @@ fn spawn_redis_worker(
                 {
                     tracing::warn!(error = %error, "redis blocked job promotion failed");
                 }
-                // Jobs parked for the cost signal go back when it is low.
-                if crate::cost::any_deferrable(crate::cost::WorkKind::Job)
-                    && !crate::cost::deferring_jobs(&state)
+                // Jobs parked for the cost signal go back when it is low,
+                // even when this deploy no longer marks them deferrable.
+                if !crate::cost::deferring_jobs(&state)
                     && let Err(error) =
                         promote_deferred_redis_jobs(&mut connection, &worker_config).await
                 {

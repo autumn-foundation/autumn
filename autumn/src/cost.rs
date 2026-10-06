@@ -1102,18 +1102,6 @@ pub fn mark_deferrable(kind: WorkKind, name: &str) {
     names.any.store(true, Ordering::Release);
 }
 
-/// `true` when any name of `kind` is deferrable.
-#[cfg(feature = "redis")]
-pub(crate) fn any_deferrable(kind: WorkKind) -> bool {
-    let names = deferrable();
-    names.any.load(Ordering::Acquire)
-        && !names
-            .set(kind)
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-}
-
 /// `true` when the job or task `name` is deferrable.
 #[must_use]
 pub fn is_deferrable(kind: WorkKind, name: &str) -> bool {

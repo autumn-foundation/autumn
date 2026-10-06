@@ -9046,16 +9046,11 @@ async fn execute_task_result(
         task = %name,
         schedule = schedule,
     );
-    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (handler)(state.clone()).instrument(task_span)
-    })) {
-        Ok(future) => future,
-        Err(panic) => {
-            let duration_ms = task_duration_ms(state, start);
-            return Err((duration_ms, format_scheduled_task_panic(panic.as_ref())));
-        }
-    };
-    // Meter the tick (issue #1720).
+    // The handler is called in the first poll, so `catch_unwind` below also
+    // catches a handler that panics before it returns its future, and the
+    // meter records that tick too (issue #1720).
+    let handler_state = state.clone();
+    let future = async move { (handler)(handler_state).instrument(task_span).await };
     let run = crate::cost::WorkRun {
         tenant: None,
         waited,
@@ -19859,6 +19854,28 @@ mod tests {
         let (duration_ms, msg) = result.expect_err("expected Err from panicking handler");
         assert!(duration_ms < u64::MAX);
         assert!(msg.contains("scheduled task handler panicked: panic before scheduled future"));
+    }
+
+    /// A tick whose handler panics before it returns its future is metered
+    /// too (issue #1720).
+    #[tokio::test]
+    async fn execute_task_result_meters_an_immediate_handler_panic() {
+        let state = AppState::for_test();
+        let accountant = crate::cost::CostAccountant::new(10);
+        state.insert_extension(accountant.clone());
+        let start = state.monotonic();
+        let result = super::execute_task_result(
+            &state,
+            instantly_panicking_scheduled_handler,
+            start,
+            "test_task",
+            "fixed_delay",
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(accountant.snapshot().tasks.total.runs, 1);
     }
 
     #[tokio::test]
