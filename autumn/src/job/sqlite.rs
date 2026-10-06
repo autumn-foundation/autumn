@@ -1211,7 +1211,7 @@ fn lease_heartbeat(
 }
 
 /// Run one claimed job and settle its row.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_job(
     row: SqliteJobRow,
     claimed_at: tokio::time::Instant,
