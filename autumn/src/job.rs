@@ -9398,6 +9398,7 @@ fn record_pg_lifecycle_after_ack(
     ack_applied: bool,
     job_name: &str,
     job_id: &str,
+    attempt: u32,
     lifecycle: PgLifecycleRecord<'_>,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
@@ -9407,35 +9408,24 @@ fn record_pg_lifecycle_after_ack(
         // The recovery task already transitioned the row in the database:
         // - non-terminal attempts are requeued (attempt < max_attempts)
         // - terminal attempts are dead-lettered (attempt >= max_attempts)
-        // Mirror whichever outcome the worker intended so /actuator metrics stay
-        // consistent with the database row.
-        if let PgLifecycleRecord::Failure { error } = lifecycle {
-            // Terminal failure whose ack no longer applies: stale-claim recovery already
-            // transitioned this row out from under the worker, and recovery — not this
-            // resuming worker — owns the dead-letter accounting for `!ack_applied` rows.
-            //   * Final attempt: `pg_recover_stale_claims` flipped the row to `failed`
-            //     and already called `record_failure(.., dead_letter=true)` plus
-            //     `notify_dead_lettered_job`. Recording again would double the
-            //     `/actuator/jobs` failure and dead-letter counters and fire a second,
-            //     dedup-suppressed alert for one DB row.
-            //   * Non-final panic or unknown-type dead-letter: recovery requeued the row
-            //     instead. It is still alive, so no dead-letter is owed yet; the real
-            //     terminal outcome is recorded when it next runs.
-            // Either way, record no failure, dead-letter, or alert here. Still balance
-            // this worker's own `record_start` so the process-local `in_flight` gauge does
-            // not leak — `record_retry` decrements `in_flight` without touching the
-            // failure counters — and settle this job_id's admin record to Failed. Admin
-            // state is keyed per job_id and untouched by the maintenance loop, so this is
-            // the single, non-duplicated update that moves it out of Running.
+        //
+        // Recovery owns the dead-letter accounting (failure counters, alert),
+        // so record none here. This worker's own `record_start` is balanced
+        // once: only while this process's admin record still shows this
+        // attempt as running (issue #3051). Recovery in this process, or a
+        // replacement attempt that started here, already moved the record on
+        // and owns the count (see `record_lease_lost`). Recovery in another
+        // process leaves it, so it is balanced here: `record_retry` decrements
+        // `in_flight` without touching the failure counters.
+        let error = match lifecycle {
+            PgLifecycleRecord::Failure { error } => error,
+            _ => "visibility timeout expired",
+        };
+        if job_admin.settle_lease_lost(job_id, attempt, error) {
             state.job_registry.record_retry(job_name, error, 0);
-            job_admin.record_failure(job_id, error.to_owned());
-        } else {
-            // Non-terminal or successful outcome: decrement in_flight and
-            // mark as retrying; the row is already back in the queue.
-            state
-                .job_registry
-                .record_retry(job_name, "visibility timeout expired", 0);
-            job_admin.record_retrying(job_id, "visibility timeout expired");
+            if matches!(lifecycle, PgLifecycleRecord::Failure { .. }) {
+                job_admin.record_failure(job_id, error.to_owned());
+            }
         }
         return false;
     }
@@ -9496,10 +9486,12 @@ fn record_pg_lifecycle_after_ack(
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 fn record_pg_lifecycle_ack_result(
     ack_result: AutumnResult<bool>,
     job_name: &str,
     job_id: &str,
+    attempt: u32,
     outcome: &str,
     lifecycle: PgLifecycleRecord<'_>,
     state: &AppState,
@@ -9508,7 +9500,7 @@ fn record_pg_lifecycle_ack_result(
     match ack_result {
         Ok(applied) => {
             let recorded = record_pg_lifecycle_after_ack(
-                applied, job_name, job_id, lifecycle, state, job_admin,
+                applied, job_name, job_id, attempt, lifecycle, state, job_admin,
             );
             if !recorded {
                 tracing::warn!(
@@ -9542,8 +9534,9 @@ fn record_pg_row_lifecycle_ack_result(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> bool {
+    let attempt = u32::try_from(row.attempt).unwrap_or(0);
     record_pg_lifecycle_ack_result(
-        ack_result, &row.name, &row.id, outcome, lifecycle, state, job_admin,
+        ack_result, &row.name, &row.id, attempt, outcome, lifecycle, state, job_admin,
     )
 }
 
@@ -17918,6 +17911,7 @@ mod tests {
                 Ok(false),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -17947,6 +17941,7 @@ mod tests {
                 Ok(true),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -17982,6 +17977,7 @@ mod tests {
                 Ok(false),
                 "slow_failure",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "visibility timeout expired"
@@ -18072,6 +18068,7 @@ mod tests {
                 Ok(true),
                 "slow_failure",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "worker failed"
@@ -18107,6 +18104,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -18156,6 +18154,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -18200,6 +18199,7 @@ mod tests {
                 Ok(true),
                 "fast_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -18260,6 +18260,7 @@ mod tests {
                 Ok(true),
                 "racer",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -18323,6 +18324,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -18368,6 +18370,7 @@ mod tests {
                 Err(AutumnError::internal_server_error_msg("ack failed")),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -18396,6 +18399,7 @@ mod tests {
                 Ok(false),
                 "evicted_job",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -18444,6 +18448,7 @@ mod tests {
                 Ok(false),
                 "terminal_job",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "handler timed out"
@@ -18518,6 +18523,7 @@ mod tests {
                 Ok(false),
                 "slow_resumer",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "handler returned error"
@@ -24425,6 +24431,70 @@ mod lease_tests {
         state.job_registry.record_start("leased"); // attempt 2
         record_lease_lost("leased", &id, 2, &state, &admin);
         assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    /// The handler finished, but stale recovery took the claim first, so the
+    /// ack or nack applies to nothing. Recovery in this process already moved
+    /// the record on; the old worker must not count its start again.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_lost_ack_after_recovery_counts_nothing_again() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0);
+
+        record_pg_lifecycle_ack_result(
+            Ok(false),
+            "leased",
+            &id,
+            1,
+            "success",
+            PgLifecycleRecord::Success,
+            &state,
+            &admin,
+        );
+        assert_eq!(in_flight(&state), 0, "attempt 1 is not balanced twice");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued);
+        assert_eq!(record.attempt, 2);
+
+        // The replacement started here: a late terminal nack for attempt 1
+        // leaves it alone.
+        state.job_registry.record_start("leased");
+        record_attempt_start("leased", &id, 2, &state, &admin);
+        record_pg_lifecycle_ack_result(
+            Ok(false),
+            "leased",
+            &id,
+            1,
+            "failure",
+            PgLifecycleRecord::Failure { error: "boom" },
+            &state,
+            &admin,
+        );
+        assert_eq!(in_flight(&state), 1, "the replacement is still in flight");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Running);
+        assert_eq!(record.attempt, 2);
+    }
+
+    /// `tokio::time::sleep` clamps a deadline past `Instant`'s range to its
+    /// far future, so an enormous timeout must not panic.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_timeout_acts_as_a_distant_deadline() {
+        let bounds = ExecutionBounds {
+            timeout: Some(Duration::from_millis(u64::MAX)),
+            lease_lost: None,
+        };
+        let signals = crate::job_tracking::RunSignals::default();
+        let ended = bound_run(async { 7 }, &bounds, &signals).await;
+        assert!(
+            matches!(ended, BoundedRun::Finished(7)),
+            "no overflow panic"
+        );
     }
 
     #[test]

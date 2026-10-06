@@ -1271,6 +1271,7 @@ async fn execute_job(
             ack,
             &row.name,
             &row.id,
+            attempt,
             "unknown-type",
             PgLifecycleRecord::Failure { error: &error },
             state,
@@ -1346,6 +1347,7 @@ async fn settle_outcome(
                 ack,
                 &row.name,
                 &row.id,
+                attempt,
                 "success",
                 PgLifecycleRecord::Success,
                 state,
@@ -1384,7 +1386,7 @@ async fn settle_outcome(
             )
             .await;
             record_pg_lifecycle_ack_result(
-                ack, &row.name, &row.id, "failure", lifecycle, state, job_admin,
+                ack, &row.name, &row.id, attempt, "failure", lifecycle, state, job_admin,
             );
         }
         // A panic dead-letters at once whatever the remaining attempts, as on
@@ -1396,6 +1398,7 @@ async fn settle_outcome(
                 ack,
                 &row.name,
                 &row.id,
+                attempt,
                 "panic",
                 PgLifecycleRecord::Failure { error: &error },
                 state,
