@@ -38,6 +38,20 @@
 //! delete path decrements by the number of rows the cascade actually removed,
 //! never by an assumed 1.
 //!
+//! # Caller scope
+//!
+//! The four public helpers take two facts from the calling repository:
+//!
+//! - `tenant`: `Some` matches the parent on its tenant column. `None` does not.
+//! - `soft_delete`: `Some(true)` hides a parent with `deleted_at` set.
+//!   `Some(false)` does not. `None` means "no repository": the parent is
+//!   hidden if any repository of the model soft-deletes (see
+//!   [`model_soft_deletes`]). [`router()`] passes `None`.
+//!
+//! The generated `{Model}Comments` helpers pass their own repository's facts.
+//! A model with a `soft_delete` repository and a plain one therefore gets
+//! each repository's own rule (#2284).
+//!
 //! # Identifier safety
 //!
 //! Every table/column name below arrives as a `&'static str` emitted by
@@ -571,23 +585,17 @@ pub fn model_soft_deletes(model: &str) -> Option<bool> {
 /// The aggregation behind [`model_soft_deletes`], split out so the choice it
 /// makes across MULTIPLE repositories can be tested directly.
 ///
-/// ANY repository soft-deleting makes the model soft-deleting here. That is a
-/// deliberate conservative default, and it is not free: a model carrying both a
-/// `soft_delete` repository and an ordinary one gets `deleted_at IS NULL` on
-/// every helper, so a caller working through the ordinary repository sees a 404
-/// for rows that repository's own finders would return.
+/// If one repository of the model soft-deletes, this returns `Some(true)`.
 ///
-/// It is still the better error of the two available. The helpers take a spec
-/// and a connection, never a repository handle, so there is no "the repository
-/// being used" to consult — and the opposite rule (soft-deleting only when
-/// EVERY repository opts in) would let one admin repository that sees deleted
-/// rows switch the filter off for the application repository beside it,
-/// attaching comments to rows the app treats as gone. Erring toward 404 is
-/// recoverable; erring toward writing is not.
+/// Only a caller with no repository uses this rule: the router, or a direct
+/// call that passes `soft_delete: None`. The generated `{Model}Comments`
+/// helpers pass their repository's own fact instead (#2284).
 ///
-/// Threading the caller's own repository fact through the helper API would beat
-/// both, the way `tenant: Option<&str>` already does for tenancy — that is a
-/// signature change to generated helpers, filed as #2284.
+/// For a model with a `soft_delete` repository and a plain one, this rule
+/// gives `404` for a soft-deleted row. The other rule (all repositories opt
+/// in) is not safe. The plain repository then removes the filter for the
+/// `soft_delete` repository, and a comment can attach to a deleted row. A
+/// `404` changes no data. A wrong write does.
 #[cfg(feature = "db")]
 fn soft_deletes_from<'a>(facts: impl Iterator<Item = &'a RepositoryFacts>) -> Option<bool> {
     let mut any = false;
@@ -608,23 +616,41 @@ pub fn commentable_spec_for(type_name: &str) -> Option<&'static CommentableSpec>
         .map(|descriptor| descriptor.spec)
 }
 
-/// The model type name registered for `spec`, matched by IDENTITY.
+/// The model type name registered for `spec`, matched by address, then by
+/// value.
 ///
 /// Not by discriminator: two models sharing a `commentable_type` while pointing
 /// at different comment tables is a supported helper-only shape (the router
-/// still refuses it), so a name lookup could return the other model's identity
+/// still refuses it), so a name lookup could return the other model's name
 /// — and with it the other model's repository facts, applying one model's
 /// soft-delete rule to the other's table.
 ///
-/// The registered specs are `&'static`, so address equality is exactly the
-/// question being asked. A hand-built spec matches nothing and the caller falls
-/// back to what the spec itself declares.
+/// The lookup first compares addresses, which finds the registered reference
+/// itself. A copy has a new address (issue #2286), so the lookup then compares
+/// values. An equal hand-built spec matches the same way. If two models
+/// register an equal value, the lookup returns `None`. On `None`, the caller
+/// uses what the spec itself declares.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn commentable_model_for_spec(spec: &CommentableSpec) -> Option<&'static str> {
-    inventory::iter::<CommentableDescriptor>()
-        .find(|descriptor| std::ptr::eq(descriptor.spec, spec))
+    match models_for_spec(spec).as_slice() {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// Every model that `spec` can be: the registered reference itself, else each
+/// model that registers an equal value. Empty when nothing matches.
+#[cfg(feature = "db")]
+fn models_for_spec(spec: &CommentableSpec) -> Vec<&'static str> {
+    let registry = || inventory::iter::<CommentableDescriptor>();
+    if let Some(descriptor) = registry().find(|descriptor| std::ptr::eq(descriptor.spec, spec)) {
+        return vec![(descriptor.model)()];
+    }
+    registry()
+        .filter(|descriptor| descriptor.spec == spec)
         .map(|descriptor| (descriptor.model)())
+        .collect()
 }
 
 /// The model type name registered for `type_name`, or `None` when no
@@ -765,6 +791,9 @@ pub fn duplicate_commentable_storage() -> Option<&'static str> {
 /// 4. `UPDATE parent SET comment_count = comment_count + 1` via
 ///    [`counter_cache_apply_delta`].
 ///
+/// `tenant` and `soft_delete` are the caller's scope: see
+/// [Caller scope](crate::commentable#caller-scope).
+///
 /// # Errors
 ///
 /// - `422` when `body` is blank after trimming, exceeds
@@ -773,9 +802,9 @@ pub fn duplicate_commentable_storage() -> Option<&'static str> {
 ///   `max_depth`.
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
 /// - Any database error.
-#[allow(clippy::too_many_arguments)] // The polymorphic key is two values, and
-// the tenant scope is a third: collapsing them into a struct would hide the
-// association's actual shape at every call site.
+#[allow(clippy::too_many_arguments)] // The polymorphic key is two values.
+// `tenant` and `soft_delete` are two more. A struct hides them at each call
+// site.
 pub async fn add_comment(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -785,6 +814,7 @@ pub async fn add_comment(
     body: &str,
     reply_to: Option<i64>,
     tenant: Option<&str>,
+    soft_delete: Option<bool>,
 ) -> AutumnResult<Comment> {
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
@@ -800,10 +830,9 @@ pub async fn add_comment(
         )));
     }
 
-    // Resolved from THIS `spec` reference, before it is copied below:
-    // `commentable_model_for_spec` (inside `resolve_soft_deletes`) matches the
-    // registry by pointer identity, which an owned copy would not carry.
-    let soft_deletes = resolve_soft_deletes(spec);
+    // Resolve this from the caller's reference, before the copy below. When
+    // two models register equal specs, only the address finds the model.
+    let soft_deletes = resolve_soft_deletes(spec, soft_delete);
 
     // Owned copies so the transaction closure — which must be `'static`-ish
     // across the `scope_boxed` boundary — can move them.
@@ -865,6 +894,9 @@ pub async fn add_comment(
 /// and moves no counter, which is what keeps a double-submit from driving the
 /// count negative.
 ///
+/// `tenant` and `soft_delete` are the caller's scope: see
+/// [Caller scope](crate::commentable#caller-scope).
+///
 /// # Errors
 ///
 /// - `404` when `comment_id` names no comment on `(parent_type, parent_id)`, or
@@ -882,13 +914,13 @@ pub async fn delete_comment(
     parent_id: i64,
     comment_id: i64,
     tenant: Option<&str>,
+    soft_delete: Option<bool>,
 ) -> AutumnResult<usize> {
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    // See `add_comment`'s comment: resolved before the copy below, from the
-    // spec reference the registry actually holds.
-    let soft_deletes = resolve_soft_deletes(spec);
+    // Before the copy: see `add_comment`.
+    let soft_deletes = resolve_soft_deletes(spec, soft_delete);
     let spec = *spec;
     let parent_type = parent_type.to_owned();
     let tenant = tenant.map(str::to_owned);
@@ -973,6 +1005,9 @@ pub async fn delete_comment(
 /// Returns `0` for a parent that keeps no counter (`counter_cache = false`),
 /// having written nothing.
 ///
+/// `tenant` and `soft_delete` are the caller's scope: see
+/// [Caller scope](crate::commentable#caller-scope).
+///
 /// # Errors
 ///
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
@@ -983,13 +1018,13 @@ pub async fn recompute_comment_count(
     parent_type: &str,
     parent_id: i64,
     tenant: Option<&str>,
+    soft_delete: Option<bool>,
 ) -> AutumnResult<i64> {
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    // See `add_comment`'s comment: resolved before either branch below copies
-    // or otherwise loses this reference's identity.
-    let soft_deletes = resolve_soft_deletes(spec);
+    // Before the copy: see `add_comment`.
+    let soft_deletes = resolve_soft_deletes(spec, soft_delete);
     let Some(counter_column) = spec.counter_column else {
         probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
         return Ok(0);
@@ -1051,6 +1086,9 @@ pub async fn recompute_comment_count(
 /// Soft-deleted comments are filtered out; a live reply whose parent is missing
 /// is promoted to the top level rather than silently dropped.
 ///
+/// `tenant` and `soft_delete` are the caller's scope: see
+/// [Caller scope](crate::commentable#caller-scope).
+///
 /// # Errors
 ///
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
@@ -1061,11 +1099,12 @@ pub async fn comment_thread(
     parent_type: &str,
     parent_id: i64,
     tenant: Option<&str>,
+    soft_delete: Option<bool>,
 ) -> AutumnResult<Vec<CommentNode>> {
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
-    let soft_deletes = resolve_soft_deletes(spec);
+    let soft_deletes = resolve_soft_deletes(spec, soft_delete);
     probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
 
     // Under read-committed, the probe and the read use different snapshots.
@@ -1284,23 +1323,27 @@ fn build_nodes(
 
 /// Whether `spec`'s parent hides on `deleted_at`.
 ///
-/// The column's presence is the fallback, not the answer. A `deleted_at`
-/// timestamp on a model whose repository does not opt into `soft_delete` is
-/// ordinary audit data, and filtering on it would 404 rows the app still
-/// serves deliberately. Only when no repository is registered does the
-/// column get to decide.
+/// The order of the sources:
 ///
-/// Call this with the spec reference the `#[commentable]` registry actually
-/// holds. `commentable_model_for_spec` matches it by pointer identity
-/// (`std::ptr::eq`); a copy of the `Copy` `CommentableSpec` value lives at a
-/// new address and would never match, silently falling back to the column
-/// alone (issue #2263). Every public entry point in this module resolves
-/// this **before** it copies `spec` for its transaction closure, then passes
-/// the answer down explicitly — never re-derives it after the copy.
-fn resolve_soft_deletes(spec: &CommentableSpec) -> bool {
-    commentable_model_for_spec(spec)
-        .and_then(model_soft_deletes)
-        .unwrap_or(spec.parent_soft_delete)
+/// 1. `soft_delete`: the calling repository's own fact (#2284).
+/// 2. The registry: `true` if one repository of the model soft-deletes. The
+///    router uses this, because it has no repository. A copy of a registered
+///    spec finds its model by value (#2286). If two models register equal
+///    specs, a copy can be either model, and the parent hides if one of them
+///    hides it.
+/// 3. The `deleted_at` column, only when no repository is registered. A
+///    `deleted_at` column alone can be audit data (#2263).
+fn resolve_soft_deletes(spec: &CommentableSpec, soft_delete: Option<bool>) -> bool {
+    if let Some(fact) = soft_delete {
+        return fact;
+    }
+    let models = models_for_spec(spec);
+    if models.is_empty() {
+        return spec.parent_soft_delete;
+    }
+    models
+        .into_iter()
+        .any(|model| model_soft_deletes(model).unwrap_or(spec.parent_soft_delete))
 }
 
 /// One parent-visibility rule, evaluated two ways (issue #2281).
@@ -1380,8 +1423,8 @@ fn parent_visibility(
 /// this caller's tenant". Everything else in this module keys on `parent_id`
 /// having passed through here.
 ///
-/// `soft_deletes` is resolved by the caller via [`resolve_soft_deletes`],
-/// not derived here — see that function's doc for why.
+/// The caller resolves `soft_deletes` with [`resolve_soft_deletes`] before it
+/// copies `spec`, and passes it in.
 async fn probe_parent(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -2069,8 +2112,8 @@ mod tests {
     }
 
     /// The soft-delete counterpart of the tenancy rule below, with the same
-    /// link-order independence — and one case that is a documented cost rather
-    /// than a win: see [`soft_deletes_from`] and #2284.
+    /// link-order independence. Only a caller with no repository (the router)
+    /// uses it: see [`soft_deletes_from`] and #2284.
     #[test]
     fn any_soft_deleting_repository_filters_deleted_parents() {
         let soft = RepositoryFacts {
@@ -2103,6 +2146,24 @@ mod tests {
         // the column implies only in the latter case.
         assert_eq!(soft_deletes_from([&plain].into_iter()), Some(false));
         assert_eq!(soft_deletes_from(std::iter::empty()), None);
+    }
+
+    /// #2284: the caller's own repository fact wins. With `None` and no
+    /// registered repository, the spec's column decides.
+    #[test]
+    fn the_callers_soft_delete_fact_wins() {
+        let mut spec = sample_spec();
+
+        spec.parent_soft_delete = true;
+        assert!(
+            !resolve_soft_deletes(&spec, Some(false)),
+            "plain repository"
+        );
+        assert!(resolve_soft_deletes(&spec, None), "the column decides");
+
+        spec.parent_soft_delete = false;
+        assert!(resolve_soft_deletes(&spec, Some(true)), "soft repository");
+        assert!(!resolve_soft_deletes(&spec, None), "the column decides");
     }
 
     /// A model may have more than one repository. Taking the FIRST registration
@@ -2629,6 +2690,8 @@ async fn show_thread(
         &commentable_type,
         parent_id,
         tenant.as_deref(),
+        // The router has no repository. Use the registry rule (#2284).
+        None,
     )
     .await?;
     Ok(render(
@@ -2718,6 +2781,8 @@ async fn post_comment(
         &submission.body,
         reply_to,
         tenant.as_deref(),
+        // The router has no repository. Use the registry rule (#2284).
+        None,
     )
     .await;
 
@@ -2755,6 +2820,8 @@ async fn post_comment(
             &commentable_type,
             parent_id,
             tenant.as_deref(),
+            // The router has no repository. Use the registry rule (#2284).
+            None,
         )
         .await
     };

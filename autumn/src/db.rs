@@ -1595,6 +1595,7 @@ fn build_pool(
 
     #[cfg(not(feature = "sqlite"))]
     {
+        let _ = crate::lock::pooler::warn_if_pooled(url);
         let timeout = Duration::from_secs(connect_timeout_secs);
         let config = pg_manager_config(url);
         let manager =
@@ -2508,8 +2509,8 @@ const fn retry_decision(attempt: u32, max_attempts: u32, retryable: bool) -> Ret
 /// Deterministic capped exponential backoff base: `initial * 2^(attempt-1)`,
 /// saturating on overflow and capped at `max`.
 ///
-/// Mirrors the jobs system's backoff shape (`pg_retry_delay_ms`) plus the cap
-/// idiom from the migrate startup loop. Kept jitter-free so it is unit-testable.
+/// Same exponential shape and cap as [`crate::backoff::ceiling_ms`]. Kept
+/// jitter-free so it is unit-testable. [`retry_backoff_delay`] adds the jitter.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duration {
     // Cap the shift so `2^shift` never overflows and huge attempts saturate.

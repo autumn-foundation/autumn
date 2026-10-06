@@ -1735,6 +1735,14 @@ jobs:
           # migrated table. Only its Chromium smoke runs elsewhere (the
           # publish-gate fleet e2e), so without this line the tier never runs.
           cargo test -p react-graphql --test graphql_api -- --ignored --test-threads=1
+          # examples/escape-hatches: the Docker tests in `hatches` (H1, H2, H3,
+          # H12, H13) and `boot`. `boot` starts the real binary to check the
+          # wiring that `TestApp` cannot reach (pool provider, error pages,
+          # exception filter, env-driven hatches). Testcontainer-managed. The
+          # `hatches` tests share tables; a lock in their `fresh_db` helper
+          # runs them one at a time.
+          cargo test -p escape-hatches --test hatches -- --ignored
+          cargo test -p escape-hatches --test boot -- --ignored
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
@@ -2462,7 +2470,10 @@ jobs:
   # Status, headers and body bytes are compared; every fallthrough is checked
   # against the answer the origin actually gives. A gateway tier puts the
   # capsule in front of the origin, and a generated tier sends 10,000
-  # requests through every lane. A last step runs the real `autumn build`.
+  # requests through every lane. Tier E runs the edge node over real HTTP
+  # against an origin with a simulated distance, and needs a >= 50% lower
+  # median TTFB (the success metric). The last steps run the real
+  # `autumn build`, then `autumn edge serve` and `autumn edge ttfb`.
   #
   # Its own job because it is the only lane that installs a second target, and
   # NOT path-filtered on purpose: byte-identity between the origin and the edge
@@ -2517,6 +2528,36 @@ jobs:
         run: |
           cargo run -q -p autumn-cli --bin autumn -- build --debug --edge
           test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
+      - name: autumn edge serve and autumn edge ttfb, end to end
+        # AC-3 with no glue: the real CLI puts the capsule in front of the
+        # real origin binary. One host has no distance, so the probe checks
+        # the bytes only (--divergence-only). Tier E checks the speed-up.
+        # The access log must show the edge lane for each probed path: a
+        # fallthrough also sends the origin's bytes.
+        working-directory: examples/edge-greeting
+        run: |
+          wait_for() {
+            for _ in $(seq 1 120); do curl -sf -o /dev/null "$1" && return 0; sleep 1; done
+            echo "::error::$1 did not answer"; return 1
+          }
+          cargo build -q -p edge-greeting --bin edge-greeting
+          ../../target/debug/edge-greeting &
+          wait_for http://127.0.0.1:3000/greet/ci
+          ../../target/debug/autumn edge serve \
+            --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+            --origin http://127.0.0.1:3000 --listen 127.0.0.1:8787 \
+            --response-header 'access-control-allow-origin: *' > edge-node.log &
+          wait_for http://127.0.0.1:8787/greet/ci
+          ../../target/debug/autumn edge ttfb --divergence-only --rounds 20 \
+            --edge http://127.0.0.1:8787 --origin http://127.0.0.1:3000 \
+            --path /greet/ada --path '/stats?tag=one&tag=two' --path /stats/count
+          for path in /greet/ada /stats /stats/count; do
+            if [ "$(grep -c "^GET $path 200 edge " edge-node.log)" -lt 20 ]; then
+              cat edge-node.log
+              echo "::error::the capsule did not serve GET $path"
+              exit 1
+            fi
+          done
 
   windows-tier1:
     name: Windows Tier 1 journey

@@ -111,7 +111,8 @@ the framework almost certainly already generates or ships it:
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
-| Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0) |
+| Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0); `.stale_if_error(window)` serves the last value when a fill fails |
+| Calling `cache.invalidate(key)` by hand after a repository write | `#[repository(Model, invalidates(cached_fn))]`: each generated write drops the read after it commits (#3056). Async code uses `Cache::invalidate_async`, which returns the error |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | `Db` taken before a body extractor (`Form`/`Json`/`Multipart`) in the same handler — pins a pooled connection for as long as the client takes to send the body | `LazyDb` in the same argument spot; call `.checkout().await?` after the body extractor runs — for `Form`/`Json` that means right at handler entry, but `Multipart` doesn't buffer anything during extraction, so checkout must wait until every field this handler needs has been read from the `next_field()` loop, not before it (issue #2264) |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
@@ -1538,11 +1539,9 @@ Two things to get right when generating this code:
       distinguishes a first attempt from a retry of the same event, and the
       `Autumn-Signature` header's `t=` is recomputed per attempt but is
       neither unique nor stable — it is a whole-second `Utc::now().timestamp()`
-      and nothing guarantees two attempts differ. On the `local` backend they
-      routinely do not: equal jitter puts the first retry 500-1000 ms later, so
-      the same second yields a byte-identical signature. (`redis`/`postgres` do
-      not jitter and retry at the exact exponential delay — do not describe
-      jitter as backend-neutral.) (Do not enumerate
+      and nothing guarantees two attempts differ. Every backend uses full
+      jitter (issue #3054), so the first retry can come 0-1000 ms later and the
+      same second yields a byte-identical signature. (Do not enumerate
       the headers — under `telemetry-otlp` the shared client also injects W3C
       `traceparent`/`tracestate`.) Receiver-side deduplication needs an ID the
       app mints into the payload itself.
@@ -1855,8 +1854,19 @@ that already gates migrations and ISR. (`#[scheduled]` uses a tick table.)
   only — under the `sqlite` feature `from_state` refuses rather than pretending
   to hold a lock (see below).
 
-See `docs/guide/distributed-locks.md` and
-`docs/adr/0010-app-facing-distributed-lock.md`.
+- `Lock` is mutual exclusion for efficiency, not correctness. When overlap
+  corrupts data, use `LeaseLock` (Postgres only): each grant gets a strictly
+  larger `FencingToken`, the lease renews in the background, and
+  `lease_lost()` signals loss. `try_with(|lease| ..)` passes the `Lease` and
+  stops the closure on loss (`LockError::LeaseLost`). Check the token at the
+  resource: `UPDATE .. SET fencing_token = $t WHERE .. AND fencing_token <= $t`.
+- Behind a transaction-mode pooler (PgBouncer, RDS Proxy), session advisory
+  locks (`Lock`, migrations) are not safe; `LeaseLock` and the Postgres scheduler
+  (a tick row since #3052) work.
+
+See `docs/guide/distributed-locks.md`,
+`docs/adr/0010-app-facing-distributed-lock.md` and
+`docs/adr/0015-fencing-lease-lock.md`.
 
 ## Postgres-only subsystems on a SQLite app (0.8.0, issue #1905)
 
@@ -1869,6 +1879,13 @@ backend-conditionally rather than assuming Postgres.
   `from_database_config(&config.database)` returns `None` unless the configured
   primary names Postgres. `.expect()` on it fails at BOOT on a `sqlite://`
   target — pick `InMemoryFlagStore` / `InMemoryConfigStore` on that arm instead.
+- `PgFlagStore` reads an in-memory snapshot and never connects on a Tokio
+  worker (issue #3063). Run `PgFlagStore::spawn_poll_listener` so replicas see
+  changes (they poll; there is no `LISTEN`). Before its first load, `get` on a
+  runtime returns an error: call `refresh()` before you seed flags, and seed
+  only on `Ok(None)`. A store error serves last-known values; set a fallback
+  with `FeatureFlagService::with_default` and register it with
+  `AppBuilder::with_flag_service`.
 - `DatabaseConfig::effective_primary_postgres_url()` is the screen to branch on
   (`effective_primary_url()` returns the target whatever backend it names).
 - `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite`
@@ -2713,6 +2730,33 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Resilience: outbound circuit breakers
+
+The HTTP client (per host), durable job enqueue (`job_queue`) and the SMTP
+mailer (`smtp_mailer`) run behind a `CircuitBreaker`. It opens on the failure
+ratio **or** the slow-call ratio (issue #3060):
+
+```toml
+[resilience.circuit_breaker.defaults]
+slow_call_duration_threshold_ms = 60000  # 0 turns slow-call detection off
+slow_call_rate_threshold = 1.0           # open when all calls are slow
+cancelled_call_outcome = "slow"          # or "failure"
+
+[resilience.circuit_breaker.hosts."api.stripe.com"]
+slow_call_duration_threshold_ms = 5000
+slow_call_rate_threshold = 0.5
+```
+
+- A call dropped (for example by a timeout) at or after the threshold counts
+  as slow, or as failed. Dropped earlier, it counts as nothing.
+- Set the threshold below `server.timeouts.request_timeout_ms`, or the timeout
+  cancels a slow call first.
+- Breaker state is per process. Metrics: `autumn_circuit_breaker_slow_calls_total`,
+  `autumn_circuit_breaker_slow_call_ratio` (label `name`).
+- A `CircuitBreakerPolicy` struct literal needs `..CircuitBreakerPolicy::default()`.
+
+See `docs/guide/resilience.md`.
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
@@ -3161,6 +3205,9 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+# Release probe paths (#3066): every target sends traffic checks to /ready and liveness to /live, never the /health alias.
+#   Image HEALTHCHECK -> /startup (compose --wait waits for startup; Swarm does not replace containers during a DB outage). ECS ALB target group and App Runner cutover -> /ready.
+#   Cloud Run -> startup probe /ready (its only traffic gate), liveness /live. Azure Container Apps -> startup /startup, readiness /ready, liveness /live. Fly -> /ready + /live.
 autumn migrate new add_widget_archived_at   # collision-free migration dir: prefer this (or `generate migration`) over hand-creating one — see "Migration version collisions" below
 autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
 autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (0.8.0, issue #1615)

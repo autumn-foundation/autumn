@@ -618,7 +618,7 @@ struct StoreInner {
 /// replica development setups where cross-restart persistence is not required.
 ///
 /// For production, use the Postgres-backed store (coming soon) which persists
-/// assignments across restarts and propagates weight changes via LISTEN/NOTIFY.
+/// assignments across restarts. Replicas poll for weight changes.
 #[derive(Default)]
 pub struct InMemoryExperimentStore {
     inner: RwLock<StoreInner>,

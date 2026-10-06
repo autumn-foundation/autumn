@@ -123,6 +123,7 @@ backend = "local"   # local | postgres | redis | sqlite
 workers = 2
 max_attempts = 5
 initial_backoff_ms = 250
+max_backoff_ms = 3600000   # cap on the jittered retry backoff (default: 1 h)
 
 [jobs.postgres]
 # Reuses the configured [database] pool. No extra URL needed.
@@ -299,6 +300,10 @@ the `autumn_jobs` table. Workers claim a row atomically with
 `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)`, which prevents any
 two replicas from claiming the same job simultaneously.
 
+Workers poll. There is no `LISTEN`/`NOTIFY` wake-up. A busy worker claims the
+next job at once. An idle worker polls again after 200ms. A new job can wait up
+to 200ms, also when the same process enqueued it. The 200ms interval is fixed.
+
 A claimed job's status is set to `running` with a `claimed_at` timestamp and a
 `claimed_by` worker id. A maintenance loop running inside each worker process
 requeues jobs whose `claimed_at` is older than `jobs.postgres.visibility_timeout_ms`.
@@ -404,7 +409,15 @@ as every other durable backend.
 
 ## Retry/backoff and dead letters
 
-- Jobs retry with exponential backoff (`initial_backoff_ms * 2^(attempt-1)`).
+- Jobs retry with exponential backoff and full jitter: the wait is a random
+  value in `[0, min(max_backoff_ms, initial_backoff_ms * 2^(attempt-1))]`
+  (issue #3054). Jobs that fail together do not retry together. All four
+  backends use the same rule. Under a `Sim`, the jitter replays from the seed.
+- `max_backoff_ms` caps the wait. Default: 3 600 000 (1 hour). Set it in
+  `[jobs]` or with `AUTUMN_JOBS__MAX_BACKOFF_MS`.
+- A durable backend recovers a claim after its visibility timeout (the worker
+  crashed or the handler hung). The recovered job uses the same jittered
+  wait, so claims that expire together do not all run again at once.
 - Retries stop at `max_attempts` (job-level override or config default).
 - Exhausted jobs are dead-lettered.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
