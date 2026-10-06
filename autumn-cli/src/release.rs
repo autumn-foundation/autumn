@@ -3274,7 +3274,10 @@ fi
   registries=""
   [ -n "$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_NO_REGISTRY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
   # An operator registry whose password is a managed secret.
-  [ -n "$STUB_APP_REGISTRY_PASSWORD_REF" ] && registries="${registries:+$registries,}{\"server\":\"other.example.io\",\"username\":\"u\",\"passwordSecretRef\":\"database-url\"}"
+  # STUB_APP_REGISTRY_PASSWORD_REF=redis-url: the password is redis-url.
+  password_ref=database-url
+  [ "$STUB_APP_REGISTRY_PASSWORD_REF" = redis-url ] && password_ref=redis-url
+  [ -n "$STUB_APP_REGISTRY_PASSWORD_REF" ] && registries="${registries:+$registries,}{\"server\":\"other.example.io\",\"username\":\"u\",\"passwordSecretRef\":\"$password_ref\"}"
   secrets=""
   sid="$id"
   [ -n "$STUB_APP_STALE_SECRET_IDENTITY" ] && sid=/old-id
@@ -5684,6 +5687,28 @@ esac
             &[
                 ("STUB_APP_REDIS", "1"),
                 ("STUB_SCALE_SECRET_REF", "redis-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_without_redis_on_a_registry_password_ref() {
+        // A registry uses redis-url as its password. Removing the secret
+        // would break the registry, so the script stops before any write.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[
+                ("STUB_APP_REDIS", "1"),
+                ("STUB_APP_REGISTRY_PASSWORD_REF", "redis-url"),
             ],
         ) else {
             return;

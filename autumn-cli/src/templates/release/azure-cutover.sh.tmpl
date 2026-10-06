@@ -324,6 +324,14 @@ if [ "$MODE" = cutover ] && [ -n "$STALE_REDIS" ] \
   echo "::error::a scale rule or volume of $AZURE_APP_NAME uses redis-url. Remove that reference, then run the script again." >&2
   exit 1
 fi
+# A registry can use redis-url as its password. Without that secret it could
+# not pull, so the script stops before any write here too.
+if [ "$MODE" = cutover ] && [ -n "$STALE_REDIS" ] \
+  && jq -e 'any(.properties.configuration.registries // [] | .[]; .passwordSecretRef == "redis-url")' \
+    <<< "$APP" > /dev/null; then
+  echo "::error::a registry of $AZURE_APP_NAME uses redis-url as its password. Give it its own secret, then run the script again." >&2
+  exit 1
+fi
 
 # A PATCH can return 202 Accepted, and a GET can still show the old state.
 # So the script reads the app until it shows the change. These checks use
