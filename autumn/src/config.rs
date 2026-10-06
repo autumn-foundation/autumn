@@ -169,6 +169,11 @@
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
 //! | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` | `bool` |
+//! | `AUTUMN_COST__ENABLED` | `cost.enabled` | `bool` |
+//! | `AUTUMN_COST__DEFER_THRESHOLD` | `cost.defer_threshold` | `f64` |
+//! | `AUTUMN_COST__DEFER_RECHECK_SECS` | `cost.defer_recheck_secs` | `u64` |
+//! | `AUTUMN_COST__MAX_TENANTS` | `cost.max_tenants` | `usize` |
+//! | `AUTUMN_COST__SIGNAL_REFRESH_SECS` | `cost.signal_refresh_secs` | `u64` |
 //! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
 //! | `AUTUMN_STORIES__ENABLED` | `stories.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
@@ -1626,6 +1631,11 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub observability: ObservabilityConfig,
 
+    /// Cost accounting and deferral settings (`[cost]` section in
+    /// `autumn.toml`, issue #1720). See [`CostConfig`] and `docs/guide/cost.md`.
+    #[serde(default)]
+    pub cost: CostConfig,
+
     /// Operator alerts settings (`[alerts]` section in `autumn.toml`).
     ///
     /// Configure an operator email and/or a webhook URL to receive alerts for
@@ -1909,6 +1919,94 @@ impl DeployConfig {
 
         Ok(())
     }
+}
+
+/// Cost accounting settings (`[cost]` section in `autumn.toml`, issue #1720).
+///
+/// `enabled` turns on per-request metering. `defer_threshold` turns on
+/// deferral: deferrable jobs and tasks wait while the
+/// [`CostSignal`](crate::cost::CostSignal) is above it. The two settings are
+/// independent.
+///
+/// ```toml
+/// [cost]
+/// enabled = true
+/// defer_threshold = 400.0   # g/kWh, or your price unit
+/// defer_recheck_secs = 30
+/// max_tenants = 1000
+/// signal_refresh_secs = 5
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct CostConfig {
+    /// Meter CPU time, allocated bytes and DB queries for each request.
+    /// Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Deferrable work waits while the cost signal is above this value.
+    /// Default: unset, so work never waits.
+    #[serde(default)]
+    pub defer_threshold: Option<f64>,
+    /// Seconds between two checks of the signal while work waits.
+    /// Default: `30`.
+    #[serde(default = "default_cost_defer_recheck_secs")]
+    pub defer_recheck_secs: u64,
+    /// Most tenant keys that the accountant keeps. More tenants go into the
+    /// `_other` key. Default: `1000`.
+    #[serde(default = "default_cost_max_tenants")]
+    pub max_tenants: usize,
+    /// Seconds between two reads of the `autumn_cost_signal` runtime-config
+    /// key. Default: `5`.
+    #[serde(default = "default_cost_signal_refresh_secs")]
+    pub signal_refresh_secs: u64,
+}
+
+impl CostConfig {
+    /// Check the values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message that names the bad key.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.defer_recheck_secs == 0 {
+            return Err("cost.defer_recheck_secs must be at least 1".to_owned());
+        }
+        if self.signal_refresh_secs == 0 {
+            return Err("cost.signal_refresh_secs must be at least 1".to_owned());
+        }
+        if let Some(threshold) = self.defer_threshold
+            && !(threshold.is_finite() && threshold >= 0.0)
+        {
+            return Err(format!(
+                "cost.defer_threshold must be a finite number >= 0, got {threshold}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            defer_threshold: None,
+            defer_recheck_secs: default_cost_defer_recheck_secs(),
+            max_tenants: default_cost_max_tenants(),
+            signal_refresh_secs: default_cost_signal_refresh_secs(),
+        }
+    }
+}
+
+const fn default_cost_defer_recheck_secs() -> u64 {
+    30
+}
+
+const fn default_cost_max_tenants() -> usize {
+    1000
+}
+
+const fn default_cost_signal_refresh_secs() -> u64 {
+    5
 }
 
 /// Observability configuration (`[observability]` section in `autumn.toml`).
@@ -5171,6 +5269,9 @@ impl AutumnConfig {
         // at apply time, so `autumn check` names the key. A cap of 0 would
         // silently drop every labeled sample the app records.
         self.metrics.validate()?;
+        // A zero recheck would spin; a negative threshold keeps deferrable work
+        // waiting for ever, because the runtime-config signal is never below 0.
+        self.cost.validate().map_err(ConfigError::Validation)?;
         // A `[replication]` block that is switched on but cannot ship (no
         // destination, both destinations, no credential indirection) must fail
         // here — so `autumn check` and `autumn doctor` see it too — rather than
@@ -5413,6 +5514,7 @@ impl AutumnConfig {
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
         self.apply_observability_env_overrides_with_env(env);
+        self.apply_cost_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         self.apply_metrics_env_overrides_with_env(env);
@@ -5761,6 +5863,26 @@ impl AutumnConfig {
             env,
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
+        );
+    }
+
+    fn apply_cost_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_COST__ENABLED", &mut self.cost.enabled);
+        parse_env_option(
+            env,
+            "AUTUMN_COST__DEFER_THRESHOLD",
+            &mut self.cost.defer_threshold,
+        );
+        parse_env(
+            env,
+            "AUTUMN_COST__DEFER_RECHECK_SECS",
+            &mut self.cost.defer_recheck_secs,
+        );
+        parse_env(env, "AUTUMN_COST__MAX_TENANTS", &mut self.cost.max_tenants);
+        parse_env(
+            env,
+            "AUTUMN_COST__SIGNAL_REFRESH_SECS",
+            &mut self.cost.signal_refresh_secs,
         );
     }
 
@@ -15507,6 +15629,67 @@ path = "/healthz"
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.observability.server_timing, Some(false));
         assert!(!server_timing_enabled(&config));
+    }
+
+    #[test]
+    fn cost_section_defaults_and_toml() {
+        let config = AutumnConfig::default();
+        assert!(!config.cost.enabled);
+        assert_eq!(config.cost.defer_threshold, None);
+        assert_eq!(config.cost.defer_recheck_secs, 30);
+        assert_eq!(config.cost.max_tenants, 1000);
+        assert_eq!(config.cost.signal_refresh_secs, 5);
+
+        let config: AutumnConfig =
+            toml::from_str("[cost]\nenabled = true\ndefer_threshold = 400.5\n").expect("parse");
+        assert!(config.cost.enabled);
+        assert_eq!(config.cost.defer_threshold, Some(400.5));
+        assert_eq!(
+            config.cost.defer_recheck_secs, 30,
+            "unset keys keep defaults"
+        );
+    }
+
+    #[test]
+    fn cost_validation_names_the_bad_key() {
+        assert!(CostConfig::default().validate().is_ok());
+        let cost = CostConfig {
+            defer_recheck_secs: 0,
+            ..CostConfig::default()
+        };
+        assert!(cost.validate().unwrap_err().contains("defer_recheck_secs"));
+        let cost = CostConfig {
+            signal_refresh_secs: 0,
+            ..CostConfig::default()
+        };
+        assert!(cost.validate().unwrap_err().contains("signal_refresh_secs"));
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let cost = CostConfig {
+                defer_threshold: Some(bad),
+                ..CostConfig::default()
+            };
+            assert!(cost.validate().unwrap_err().contains("defer_threshold"));
+        }
+        let mut config = AutumnConfig::default();
+        config.cost.defer_recheck_secs = 0;
+        assert!(config.validate().is_err(), "AutumnConfig::validate runs it");
+    }
+
+    #[test]
+    fn cost_env_overrides_wire_into_dispatcher() {
+        let env = MockEnv::new()
+            .with("AUTUMN_COST__ENABLED", "true")
+            .with("AUTUMN_COST__DEFER_THRESHOLD", "250")
+            .with("AUTUMN_COST__DEFER_RECHECK_SECS", "10")
+            .with("AUTUMN_COST__MAX_TENANTS", "7")
+            .with("AUTUMN_COST__SIGNAL_REFRESH_SECS", "2");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.cost.enabled);
+        assert_eq!(config.cost.defer_threshold, Some(250.0));
+        assert_eq!(config.cost.defer_recheck_secs, 10);
+        assert_eq!(config.cost.max_tenants, 7);
+        assert_eq!(config.cost.signal_refresh_secs, 2);
     }
 
     #[test]

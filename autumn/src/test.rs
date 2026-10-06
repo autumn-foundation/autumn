@@ -2330,6 +2330,7 @@ impl TestApp {
         for initializer in self.state_initializers {
             initializer(&state);
         }
+        crate::cost::install(&state, &self.config);
 
         // Register the fault plan's 5xx projector alongside the app's own
         // reporters (which keep receiving every event). It goes FIRST in the

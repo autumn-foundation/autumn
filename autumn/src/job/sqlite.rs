@@ -577,15 +577,21 @@ async fn evict_expired_unique_key(
 /// One statement: `SQLite` serializes writers, so the select-and-update cannot
 /// interleave with another worker's claim. That is the single-writer analog of
 /// `FOR UPDATE SKIP LOCKED`.
+///
+/// A job named in `deferred` is not claimed (issue #1720): it stays enqueued
+/// and keeps its attempt.
 async fn claim_next_job(
     pool: &SqlitePool,
     worker_id: &str,
     queue: &str,
     now: i64,
+    deferred: &[String],
 ) -> Option<SqliteJobRow> {
     use diesel::OptionalExtension as _;
     use diesel_async::RunQueryDsl as _;
 
+    // One JSON array bind: `SQLite` has no array type.
+    let deferred = super::deferred_names_json(deferred);
     let mut conn = pool.get().await.ok()?;
     // Probe with a read first. The claim is an UPDATE, which opens a write
     // transaction and takes the single writer lock even when it matches
@@ -595,10 +601,12 @@ async fn claim_next_job(
         "SELECT COUNT(*) AS count FROM ( \
            SELECT 1 FROM autumn_jobs \
            WHERE status = '{STATUS_ENQUEUED}' AND run_at <= ? AND queue = ? \
+             AND name NOT IN (SELECT value FROM json_each(?)) \
            LIMIT 1)"
     ))
     .bind::<diesel::sql_types::BigInt, _>(now)
     .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Text, _>(deferred.as_str())
     .get_result::<CountRow>(&mut *conn)
     .await;
     match ready {
@@ -622,6 +630,7 @@ async fn claim_next_job(
                WHERE r.status = '{STATUS_RUNNING}' AND r.name = c.name \
                  AND r.concurrency_key IS c.concurrency_key \
              ) < c.concurrency_limit) \
+             AND c.name NOT IN (SELECT value FROM json_each(?)) \
            ORDER BY c.run_at ASC \
            LIMIT 1) \
          RETURNING {JOB_SELECT_COLS}"
@@ -631,6 +640,7 @@ async fn claim_next_job(
     .bind::<diesel::sql_types::BigInt, _>(now)
     .bind::<diesel::sql_types::BigInt, _>(now)
     .bind::<diesel::sql_types::Text, _>(queue)
+    .bind::<diesel::sql_types::Text, _>(deferred.as_str())
     .get_result::<SqliteJobRow>(&mut *conn)
     .await
     .optional();
@@ -1220,7 +1230,14 @@ async fn execute_job(
     );
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
     let outcome = tracing::Instrument::instrument(
-        run_job_handler(&row.name, handler, state.clone(), payload, final_attempt),
+        run_job_handler(
+            &row.name,
+            handler,
+            state.clone(),
+            payload,
+            final_attempt,
+            super::durable_work_run(state, Some(row.run_at)),
+        ),
         job_span,
     )
     .await;
@@ -1349,7 +1366,8 @@ async fn worker_loop(
             let Some(guard) = slots.try_reserve(&queue) else {
                 continue;
             };
-            match claim_next_job(&pool, &worker_id, &queue, now_ms(&state)).await {
+            let deferred = super::deferred_job_names(&state, &jobs_by_name);
+            match claim_next_job(&pool, &worker_id, &queue, now_ms(&state), &deferred).await {
                 Some(row) => {
                     execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
                     drop(guard);

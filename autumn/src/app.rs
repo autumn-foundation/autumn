@@ -4491,6 +4491,7 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        crate::cost::install(&state, &config);
         // A live-state block that could not be installed is a refusal to start,
         // not a silent fallback: the previous build is still serving and still
         // holds the only copy of that state (#1674). Checked here, in async
@@ -6437,6 +6438,7 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        crate::cost::install(&state, &config);
         // Static generation has no job runtime, so register only sync listeners.
         // Durable listeners are dropped entirely (not just their jobs) so a
         // static route publishing such an event is a clean no-op for the durable
@@ -7804,6 +7806,7 @@ impl AppBuilder {
         #[cfg(feature = "storage")]
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
         run_state_initializers(state_initializers, &state);
+        crate::cost::install(&state, &config);
         finalize_event_bus(listeners, &mut jobs, &state);
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
@@ -8184,6 +8187,7 @@ impl AppBuilder {
 
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        crate::cost::install(&state, &config);
         // Durable listeners need the job runtime this path never starts, so —
         // as in static builds — only sync listeners are registered, and a
         // durable side effect is a clean no-op.
@@ -8931,6 +8935,7 @@ pub(crate) fn start_task_scheduler_with_config(
                                     coordination,
                                     Arc::clone(&coordinator),
                                     lease_ttl,
+                                    shutdown.clone(),
                                 )
                                 .await;
                             }
@@ -9033,6 +9038,7 @@ async fn execute_task_result(
     start: crate::time::MonotonicInstant,
     name: &str,
     schedule: &'static str,
+    waited: bool,
 ) -> Result<u64, (u64, String)> {
     // A tick is work a sim drain must see (issue #2967).
     crate::sim::note_drain_progress();
@@ -9046,15 +9052,16 @@ async fn execute_task_result(
         task = %name,
         schedule = schedule,
     );
-    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (handler)(state.clone()).instrument(task_span)
-    })) {
-        Ok(future) => future,
-        Err(panic) => {
-            let duration_ms = task_duration_ms(state, start);
-            return Err((duration_ms, format_scheduled_task_panic(panic.as_ref())));
-        }
+    // The handler is called in the first poll, so `catch_unwind` below also
+    // catches a handler that panics before it returns its future, and the
+    // meter records that tick too (issue #1720).
+    let handler_state = state.clone();
+    let future = async move { (handler)(handler_state).instrument(task_span).await };
+    let run = crate::cost::WorkRun {
+        tenant: None,
+        waited,
     };
+    let future = crate::cost::meter_work(state, crate::cost::WorkKind::Task, name, run, future);
     let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
     let duration_ms = task_duration_ms(state, start);
 
@@ -9078,6 +9085,10 @@ fn format_scheduled_task_panic(panic: &(dyn Any + Send)) -> String {
 
 /// Run one tick with `tick` as its [`crate::scheduler::current_tick`], and
 /// stop it after `lease_ttl` when one is set.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one tick: its task, schedule, lease and cost wait"
+)]
 async fn execute_task_result_with_optional_lease_ttl(
     state: &AppState,
     handler: crate::task::TaskHandler,
@@ -9086,10 +9097,11 @@ async fn execute_task_result_with_optional_lease_ttl(
     schedule: &'static str,
     lease_ttl: Option<std::time::Duration>,
     tick: crate::scheduler::ScheduledTick,
+    waited: bool,
 ) -> Result<u64, (u64, String)> {
     let run = crate::scheduler::with_tick(
         tick,
-        execute_task_result(state, handler, start, name, schedule),
+        execute_task_result(state, handler, start, name, schedule, waited),
     );
     let Some(lease_ttl) = lease_ttl else {
         return run.await;
@@ -9111,6 +9123,10 @@ async fn execute_task_result_with_optional_lease_ttl(
 
 /// Handle the execution of a single fixed-delay task.
 #[allow(clippy::cognitive_complexity)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one tick: its task, schedule, lease and cost gate"
+)]
 async fn execute_fixed_delay_task(
     name: String,
     state: AppState,
@@ -9119,30 +9135,54 @@ async fn execute_fixed_delay_task(
     coordination: crate::task::TaskCoordination,
     coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
     lease_ttl: std::time::Duration,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
-    let tick_key = crate::scheduler::fixed_delay_tick_key(
-        &name,
-        delay,
-        crate::time::clock_unix_duration(state.clock()),
-    );
-    // Pass the delay: replica timers can reach one bucket a full delay apart.
-    let lease = match coordinator
-        .try_acquire_for_period(&name, &tick_key, coordination, delay)
-        .await
-    {
-        Ok(Some(lease)) => lease,
-        Ok(None) => {
-            tracing::debug!(task = %name, tick = %tick_key, "Scheduled task tick already claimed");
+    // Cost gate (#1720). The loop awaits this run, so later ticks wait too.
+    let gate = CostGate {
+        shutdown,
+        waiting: None,
+        waited: std::sync::atomic::AtomicBool::new(false),
+    };
+    let wait_first = CostGate::waits_before_lease(&*coordinator);
+    let (lease, tick_key) = loop {
+        if wait_first && !gate.wait(&state, &name).await {
             return;
         }
-        Err(error) => {
-            tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire scheduled task lease");
-            return;
+        let tick_key = crate::scheduler::fixed_delay_tick_key(
+            &name,
+            delay,
+            crate::time::clock_unix_duration(state.clock()),
+        );
+        let lease = match coordinator
+            // Pass the delay: replica timers can reach one bucket a full delay apart.
+            .try_acquire_for_period(&name, &tick_key, coordination, delay)
+            .await
+        {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                tracing::debug!(task = %name, tick = %tick_key, "Scheduled task tick already claimed");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire scheduled task lease");
+                return;
+            }
+        };
+        // The signal can rise while an expiring lease attempt waits: free the
+        // claim (the tick has not run), wait again, and retry the same key.
+        if wait_first && CostGate::must_wait(&state, &name) {
+            CostGate::free_unrun_claim(lease, &name, &tick_key).await;
+            continue;
         }
+        break (lease, tick_key);
     };
     state
         .task_registry
         .record_leader(&name, lease.leader_id(), &tick_key);
+    if !wait_first && !gate.wait(&state, &name).await {
+        release_task_lease(lease, &name, &tick_key).await;
+        return;
+    }
     tracing::debug!(task = %name, "Running scheduled task");
     state.task_registry.record_start(&name);
 
@@ -9159,6 +9199,7 @@ async fn execute_fixed_delay_task(
         "fixed_delay",
         lease_ttl,
         tick,
+        gate.waited(),
     )
     .await
     {
@@ -9196,6 +9237,89 @@ async fn execute_fixed_delay_task(
     }
 }
 
+/// The cost-signal gate for one scheduled tick (issue #1720).
+struct CostGate {
+    shutdown: tokio_util::sync::CancellationToken,
+    /// `true` while the tick waits. The cron loop folds later ticks into it.
+    waiting: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// `true` after the tick waited in a real window. The cost meter reads it.
+    waited: std::sync::atomic::AtomicBool,
+}
+
+impl CostGate {
+    /// Wait while the task must defer. Return `false` on shutdown.
+    async fn wait(&self, state: &AppState, name: &str) -> bool {
+        crate::cost::wait_while_deferred(
+            state,
+            crate::cost::WorkKind::Task,
+            name,
+            &self.shutdown,
+            self.waiting.as_deref(),
+            &self.waited,
+        )
+        .await
+    }
+
+    fn waited(&self) -> bool {
+        self.waited.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Free a claim whose tick has not run, so a retry of the same key can
+    /// take it again. Every replica then resumes against that one key, so the
+    /// tick runs one time. A tick that ran keeps its claim
+    /// ([`SchedulerLease::release`](crate::scheduler::SchedulerLease::release)).
+    /// A failed delete is tried again a few times. If it still fails, the
+    /// claim stays until it expires: the tick may then not run, but it never
+    /// runs twice.
+    async fn free_unrun_claim(lease: crate::scheduler::SchedulerLease, name: &str, tick_key: &str) {
+        const ATTEMPTS: u32 = 5;
+        for attempt in 1..=ATTEMPTS {
+            match lease.free().await {
+                Ok(()) => break,
+                Err(error) if attempt < ATTEMPTS => {
+                    tracing::debug!(task = %name, tick = %tick_key, attempt, error = %error, "Retrying the free of a deferred tick's claim");
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
+                        .await;
+                }
+                Err(error) => {
+                    tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to free the claim of a deferred tick; the tick may not run");
+                }
+            }
+        }
+        release_task_lease(lease, name, tick_key).await;
+    }
+
+    /// `true` when the tick waits before it takes its lease.
+    ///
+    /// A `SQLite` lease and a Postgres tick row (#3052) expire, and a wait can
+    /// be longer. So with those backends the tick waits first, then takes the
+    /// lease and checks the signal again. An in-process lease does not expire,
+    /// so the tick waits while it holds it.
+    fn waits_before_lease(coordinator: &dyn crate::scheduler::SchedulerCoordinator) -> bool {
+        matches!(coordinator.backend(), "sqlite" | "postgres")
+    }
+
+    /// `true` when the task must wait now: it is deferrable and the signal is
+    /// high.
+    fn must_wait(state: &AppState, name: &str) -> bool {
+        crate::cost::deferral_signal(state, crate::cost::WorkKind::Task, name).is_some()
+    }
+
+    /// The tick no longer needs the reservation: later ticks run again. Call it
+    /// on every way out of the lease and wait steps.
+    fn release(&self) {
+        if let Some(flag) = &self.waiting {
+            flag.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+async fn release_task_lease(lease: crate::scheduler::SchedulerLease, name: &str, tick_key: &str) {
+    if let Err(error) = lease.release().await {
+        tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to release scheduled task lease");
+    }
+}
+
 /// One cron occurrence to run.
 #[derive(Debug, Clone, Copy)]
 struct CronTick {
@@ -9208,6 +9332,10 @@ struct CronTick {
 
 /// Handle the execution of a single cron task.
 #[allow(clippy::cognitive_complexity)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one tick: its task, schedule, lease and cost gate"
+)]
 async fn execute_cron_task(
     name: String,
     state: AppState,
@@ -9216,25 +9344,51 @@ async fn execute_cron_task(
     coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
     lease_ttl: std::time::Duration,
     occurrence: CronTick,
+    gate: CostGate,
 ) {
-    let tick_key = crate::scheduler::cron_tick_key(&name, occurrence.unix_secs);
-    let lease = match coordinator
-        .try_acquire_for_period(&name, &tick_key, coordination, occurrence.window)
-        .await
-    {
-        Ok(Some(lease)) => lease,
-        Ok(None) => {
-            tracing::debug!(task = %name, tick = %tick_key, "Cron task tick already claimed");
+    let scheduled_key = crate::scheduler::cron_tick_key(&name, occurrence.unix_secs);
+    // Cost gate (#1720), as in `execute_fixed_delay_task`. The fold
+    // reservation holds until this tick has its lease and is done waiting.
+    let wait_first = CostGate::waits_before_lease(&*coordinator);
+    let tick_key = scheduled_key;
+    let lease = loop {
+        if wait_first && !gate.wait(&state, &name).await {
+            gate.release();
             return;
         }
-        Err(error) => {
-            tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire cron task lease");
-            return;
+        let lease = match coordinator
+            .try_acquire_for_period(&name, &tick_key, coordination, occurrence.window)
+            .await
+        {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                tracing::debug!(task = %name, tick = %tick_key, "Cron task tick already claimed");
+                gate.release();
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire cron task lease");
+                gate.release();
+                return;
+            }
+        };
+        // As in `execute_fixed_delay_task`: the signal can rise during a
+        // lease attempt that waited first.
+        if wait_first && CostGate::must_wait(&state, &name) {
+            CostGate::free_unrun_claim(lease, &name, &tick_key).await;
+            continue;
         }
+        break lease;
     };
     state
         .task_registry
         .record_leader(&name, lease.leader_id(), &tick_key);
+    if !wait_first && !gate.wait(&state, &name).await {
+        gate.release();
+        release_task_lease(lease, &name, &tick_key).await;
+        return;
+    }
+    gate.release();
     tracing::debug!(task = %name, "Running cron task");
     state.task_registry.record_start(&name);
 
@@ -9244,7 +9398,14 @@ async fn execute_cron_task(
     let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
     let tick = crate::scheduler::ScheduledTick::new(&tick_key, &lease);
     match execute_task_result_with_optional_lease_ttl(
-        &state, handler, start, &name, "cron", lease_ttl, tick,
+        &state,
+        handler,
+        start,
+        &name,
+        "cron",
+        lease_ttl,
+        tick,
+        gate.waited(),
     )
     .await
     {
@@ -9357,6 +9518,7 @@ async fn run_cron_task_loop(
         })
         .unwrap_or(chrono_tz::UTC);
     let mut cursor = state.clock().now().with_timezone(&timezone);
+    let deferring = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
         let now = state.clock().now().with_timezone(&timezone);
@@ -9393,6 +9555,20 @@ async fn run_cron_task_loop(
                         return;
                     }
                 }
+                // Cost gate (#1720): while a tick of this task waits for the
+                // cost signal, later ticks fold into it.
+                if deferring.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::debug!(task = %name, "cron tick folds into the tick that waits for the cost signal");
+                    cursor = scheduled_at;
+                    continue;
+                }
+                // Reserve the tick before the lease attempt, whatever the signal
+                // is now: a slow lease must not let the next ticks spawn and
+                // pile up behind a signal that rises meanwhile. The tick clears
+                // the mark when it stops to wait or to take its lease.
+                if crate::cost::is_deferrable(crate::cost::WorkKind::Task, &name) {
+                    deferring.store(true, std::sync::atomic::Ordering::Release);
+                }
                 let occurrence = CronTick {
                     unix_secs: u64::try_from(scheduled_at.timestamp()).unwrap_or_default(),
                     window: cron_occurrence_window(&cron, &scheduled_at),
@@ -9405,6 +9581,11 @@ async fn run_cron_task_loop(
                     Arc::clone(&coordinator),
                     lease_ttl,
                     occurrence,
+                    CostGate {
+                        shutdown: shutdown.clone(),
+                        waiting: Some(Arc::clone(&deferring)),
+                        waited: std::sync::atomic::AtomicBool::new(false),
+                    },
                 ));
                 cursor = scheduled_at;
             }
@@ -19632,7 +19813,8 @@ mod tests {
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         let start = state.monotonic();
         let result =
-            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay", false)
+                .await;
         assert!(result.is_ok(), "expected Ok from successful handler");
         // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
@@ -19645,7 +19827,8 @@ mod tests {
             |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
         let start = state.monotonic();
         let result =
-            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay", false)
+                .await;
         assert!(result.is_err(), "expected Err from failing handler");
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);
@@ -19668,12 +19851,35 @@ mod tests {
             start,
             "test_task",
             "fixed_delay",
+            false,
         )
         .await;
 
         let (duration_ms, msg) = result.expect_err("expected Err from panicking handler");
         assert!(duration_ms < u64::MAX);
         assert!(msg.contains("scheduled task handler panicked: panic before scheduled future"));
+    }
+
+    /// A tick whose handler panics before it returns its future is metered
+    /// too (issue #1720).
+    #[tokio::test]
+    async fn execute_task_result_meters_an_immediate_handler_panic() {
+        let state = AppState::for_test();
+        let accountant = crate::cost::CostAccountant::new(10);
+        state.insert_extension(accountant.clone());
+        let start = state.monotonic();
+        let result = super::execute_task_result(
+            &state,
+            instantly_panicking_scheduled_handler,
+            start,
+            "test_task",
+            "fixed_delay",
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(accountant.snapshot().tasks.total.runs, 1);
     }
 
     #[tokio::test]
@@ -19704,6 +19910,7 @@ mod tests {
             crate::task::TaskCoordination::Fleet,
             coordinator,
             std::time::Duration::from_millis(10),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -19813,6 +20020,7 @@ mod tests {
             crate::task::TaskCoordination::Fleet,
             coordinator,
             std::time::Duration::from_secs(1),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -19822,6 +20030,217 @@ mod tests {
         assert_eq!(status.total_runs, 0);
         assert!(status.current_leader.is_none());
         assert!(status.last_tick.is_none());
+    }
+
+    /// A `SQLite` lease and a Postgres tick row expire, so a deferred tick takes
+    /// them only after the wait. An in-process lease does not expire, so the
+    /// tick holds it while it waits (#1720).
+    #[tokio::test(start_paused = true)]
+    async fn deferred_tick_takes_an_expiring_lease_only_after_the_wait() {
+        for (backend, acquired_while_high) in [("sqlite", 0), ("postgres", 0), ("in_process", 1)] {
+            let name = format!("cost_lease_order_{backend}");
+            crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
+            let state = AppState::for_test();
+            let signal = crate::cost::CostSignal::new(Some(1.0));
+            signal.set(5.0);
+            state.insert_extension(signal.clone());
+            let tick_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+                backend,
+                tick_keys: std::sync::Arc::clone(&tick_keys),
+                release_count: None,
+            });
+            let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+            let run = tokio::spawn(super::execute_cron_task(
+                name,
+                state,
+                handler,
+                crate::task::TaskCoordination::Fleet,
+                coordinator,
+                std::time::Duration::from_secs(30),
+                super::CronTick {
+                    unix_secs: 1_700_000_000,
+                    window: std::time::Duration::from_secs(60),
+                },
+                super::CostGate {
+                    shutdown: tokio_util::sync::CancellationToken::new(),
+                    waiting: None,
+                    waited: std::sync::atomic::AtomicBool::new(false),
+                },
+            ));
+
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            assert_eq!(
+                tick_keys.lock().unwrap().len(),
+                acquired_while_high,
+                "{backend}"
+            );
+
+            signal.set(0.5);
+            run.await.expect("the tick ends");
+            assert_eq!(tick_keys.lock().unwrap().len(), 1, "{backend}");
+        }
+    }
+
+    /// A `SQLite` coordinator that raises the cost signal during its first
+    /// lease attempt, and records the key and the fold flag of each attempt.
+    struct RisingSignal {
+        signal: crate::cost::CostSignal,
+        acquired: std::sync::Arc<AtomicUsize>,
+        /// The key and the fold flag at each lease attempt.
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::scheduler::SchedulerCoordinator for RisingSignal {
+        fn backend(&self) -> &'static str {
+            "sqlite"
+        }
+
+        fn replica_id(&self) -> &'static str {
+            "replica-a"
+        }
+
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async move {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((tick_key.to_owned(), self.flag.load(Ordering::SeqCst)));
+                if self.acquired.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.signal.set(5.0);
+                }
+                Ok(Some(crate::scheduler::SchedulerLease::local(
+                    "sqlite",
+                    "replica-a",
+                )))
+            })
+        }
+    }
+
+    /// A `SQLite` lease attempt that the signal outruns: the signal rises while
+    /// the tick takes its lease. The tick gives the lease back, waits, and runs
+    /// only after the signal falls (#1720).
+    #[tokio::test(start_paused = true)]
+    async fn deferred_tick_gives_back_a_sqlite_lease_when_the_signal_rises() {
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        static SEEN_RETRY_TICK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let name = "cost_sqlite_rising_signal".to_owned();
+        crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
+        let state = AppState::for_test();
+        let signal = crate::cost::CostSignal::new(Some(1.0));
+        state.insert_extension(signal.clone());
+        let acquired = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The cron loop reserves the fold flag before it spawns the tick.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let coordinator = std::sync::Arc::new(RisingSignal {
+            signal: signal.clone(),
+            acquired: std::sync::Arc::clone(&acquired),
+            seen: std::sync::Arc::clone(&seen),
+            flag: std::sync::Arc::clone(&flag),
+        });
+        let handler: crate::task::TaskHandler = |_| {
+            Box::pin(async {
+                RAN.fetch_add(1, Ordering::SeqCst);
+                *SEEN_RETRY_TICK.lock().unwrap() =
+                    crate::scheduler::current_tick().map(|tick| tick.tick_key().to_owned());
+                Ok(())
+            })
+        };
+        let run = tokio::spawn(super::execute_cron_task(
+            name,
+            state,
+            handler,
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_secs(30),
+            super::CronTick {
+                unix_secs: 1_700_000_000,
+                window: std::time::Duration::from_secs(60),
+            },
+            super::CostGate {
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                waiting: Some(std::sync::Arc::clone(&flag)),
+                waited: std::sync::atomic::AtomicBool::new(false),
+            },
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        assert_eq!(
+            RAN.load(Ordering::SeqCst),
+            0,
+            "no run while the signal is high"
+        );
+
+        signal.set(0.5);
+        run.await.expect("the tick ends");
+        assert_eq!(RAN.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            acquired.load(Ordering::SeqCst),
+            2,
+            "the lease is taken again"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen[0].0, "cost_sqlite_rising_signal:1700000000",
+            "{seen:?}"
+        );
+        assert_eq!(
+            seen[1].0, seen[0].0,
+            "every replica resumes against the one tick key: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, reserved)| *reserved),
+            "later ticks stay folded while a lease attempt is in flight: {seen:?}"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the tick clears the reservation"
+        );
+        assert_eq!(
+            SEEN_RETRY_TICK.lock().unwrap().as_deref(),
+            Some("cost_sqlite_rising_signal:1700000000"),
+            "the task sees the scheduled tick, not the retry key"
+        );
+    }
+
+    /// A cron tick that does not get its lease clears the cost-gate flag, or
+    /// every later tick would fold into a wait that never happens (#1720).
+    #[tokio::test]
+    async fn execute_cron_task_clears_the_cost_flag_when_the_lease_is_taken() {
+        let state = AppState::for_test();
+        let waiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+
+        super::execute_cron_task(
+            "cron_lease_taken".to_owned(),
+            state,
+            handler,
+            crate::task::TaskCoordination::Fleet,
+            std::sync::Arc::new(DenyingSchedulerCoordinator),
+            std::time::Duration::from_secs(30),
+            super::CronTick {
+                unix_secs: 1_700_000_000,
+                window: std::time::Duration::from_secs(60),
+            },
+            super::CostGate {
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                waiting: Some(std::sync::Arc::clone(&waiting)),
+                waited: std::sync::atomic::AtomicBool::new(false),
+            },
+        )
+        .await;
+
+        assert!(!waiting.load(Ordering::SeqCst), "later ticks run again");
     }
 
     #[tokio::test]
@@ -19854,6 +20273,7 @@ mod tests {
             crate::task::TaskCoordination::Fleet,
             coordinator,
             std::time::Duration::from_millis(10),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -19961,6 +20381,7 @@ mod tests {
             crate::task::TaskCoordination::Fleet,
             std::sync::Arc::clone(&coordinator) as _,
             std::time::Duration::from_secs(300),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -20049,6 +20470,11 @@ mod tests {
                 unix_secs: 1_700_000_000,
                 window: std::time::Duration::from_secs(60),
             },
+            super::CostGate {
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
+            },
         )
         .await;
 
@@ -20091,6 +20517,11 @@ mod tests {
                 unix_secs: scheduled_unix_secs,
                 window: std::time::Duration::from_secs(10),
             },
+            super::CostGate {
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
+            },
         )
         .await;
 
@@ -20132,6 +20563,7 @@ mod tests {
             crate::task::TaskCoordination::Fleet,
             coordinator,
             std::time::Duration::from_secs(30),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await;
 
@@ -20215,6 +20647,11 @@ mod tests {
             super::CronTick {
                 unix_secs: 1_700_000_000,
                 window: std::time::Duration::from_secs(86_400),
+            },
+            super::CostGate {
+                shutdown: tokio_util::sync::CancellationToken::new(),
+                waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;
