@@ -3375,7 +3375,8 @@ impl Analyzer {
                 self.store_into(&b.left, "", &[&b.right]);
                 value_first.or_worst(place_first)
             }
-            Expr::Binary(b) => self.expr(&b.left).then(self.expr(&b.right)),
+            // The left side runs first; the right may change what it read.
+            Expr::Binary(b) => self.each([&*b.left, &*b.right].into_iter()),
             Expr::Return(r) => {
                 let value = r.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
                 if let Some(e) = r.expr.as_deref() {
@@ -3395,7 +3396,8 @@ impl Analyzer {
             }
             Expr::Cast(c) => self.expr(&c.expr),
             Expr::Field(f) => self.expr(&f.base),
-            Expr::Index(i) => self.expr(&i.expr).then(self.expr(&i.index)),
+            // The base runs first; the index may change what it read.
+            Expr::Index(i) => self.each([&*i.expr, &*i.index].into_iter()),
             Expr::Let(l) => {
                 let flow = self.expr(&l.expr);
                 self.bind_init(&l.pat, &l.expr);
@@ -13239,6 +13241,18 @@ mod tests {
                 Expect::Unbounded,
             ),
         ]);
+    }
+
+    #[test]
+    fn index_reads_its_base_first() {
+        check_handlers(&[(
+            "guard: an index does not erase what its base read",
+            "async fn h(repo: PgPostRepository, list: Repos) -> AutumnResult<usize> { \
+             let mut source = Some(&repo); \
+             let alias = &source.unwrap()[{ source = None; 0 }]; \
+             alias.find_all().await?; let _ = list; Ok(0) }",
+            Expect::Exact(1),
+        )]);
     }
 
     #[test]
