@@ -2369,6 +2369,8 @@ impl Analyzer {
             // or a `return`, or any borrow made in it (a local may pass it
             // on).
             Expr::Async(a) => self.block_borrows(&a.block),
+            // `move || alias`: what the body names or borrows.
+            Expr::Closure(c) => self.closure_borrows(c),
             // `&raw mut slot`: a write through the pointer reaches `slot`.
             Expr::RawAddr(r) if matches!(r.mutability, syn::PointerMutability::Mut(_)) => {
                 self.place_referents(&r.expr)
@@ -2410,8 +2412,13 @@ impl Analyzer {
             // `pick(&mut left)`, `(|x| x)(&mut left)`, `Some(&mut left)`: the
             // result may borrow any place a `&mut` argument points to.
             Expr::Call(c) => {
-                let mut all: Vec<String> =
-                    c.args.iter().flat_map(|a| self.referents_of(a)).collect();
+                // `make()` on a closure that captures a borrow may give it.
+                let mut all: Vec<String> = c
+                    .args
+                    .iter()
+                    .chain(std::iter::once(&*c.func))
+                    .flat_map(|a| self.referents_of(a))
+                    .collect();
                 all.sort();
                 all.dedup();
                 all
@@ -2441,6 +2448,37 @@ impl Analyzer {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Every name that a closure body may point to: through a name it
+    /// captures, or a borrow it makes.
+    fn closure_borrows(&self, c: &syn::ExprClosure) -> Vec<String> {
+        struct Parts<'a>(Vec<&'a Expr>);
+        impl<'a> Visit<'a> for Parts<'a> {
+            fn visit_expr(&mut self, e: &'a Expr) {
+                if matches!(
+                    e,
+                    Expr::Path(_)
+                        | Expr::Reference(_)
+                        | Expr::RawAddr(_)
+                        | Expr::MethodCall(_)
+                        | Expr::Macro(_)
+                ) {
+                    self.0.push(e);
+                }
+                syn::visit::visit_expr(self, e);
+            }
+        }
+        let mut parts = Parts(Vec::new());
+        parts.visit_expr(&c.body);
+        let mut all: Vec<String> = parts
+            .0
+            .into_iter()
+            .flat_map(|e| self.referents_of(e))
+            .collect();
+        all.sort();
+        all.dedup();
+        all
     }
 
     /// Every name that a `&mut`, a `&raw mut` or a `_mut` method in `block`
@@ -6541,6 +6579,7 @@ fn type_depth(ty: &Type) -> u8 {
     };
     match ty {
         Type::Reference(r) => type_depth(&r.elem),
+        Type::Ptr(p) => type_depth(&p.elem),
         Type::Paren(p) => type_depth(&p.elem),
         Type::Group(g) => type_depth(&g.elem),
         Type::Array(a) => part(&a.elem),
@@ -6583,6 +6622,7 @@ const PLAIN_STD_TYPES: &[&str] = &[
 fn type_is_plain_std(ty: &Type) -> bool {
     match ty {
         Type::Reference(r) => type_is_plain_std(&r.elem),
+        Type::Ptr(p) => type_is_plain_std(&p.elem),
         Type::Paren(p) => type_is_plain_std(&p.elem),
         Type::Group(g) => type_is_plain_std(&g.elem),
         Type::Array(a) => type_is_plain_std(&a.elem),
@@ -6626,6 +6666,7 @@ fn generic_types(segment: &syn::PathSegment) -> impl Iterator<Item = &Type> {
 fn type_is_handle(ty: &Type) -> bool {
     match ty {
         Type::Reference(r) => type_is_handle(&r.elem),
+        Type::Ptr(p) => type_is_handle(&p.elem),
         Type::Paren(p) => type_is_handle(&p.elem),
         Type::Group(g) => type_is_handle(&g.elem),
         Type::Path(path) => {
@@ -6661,6 +6702,7 @@ fn type_is_handle(ty: &Type) -> bool {
 fn type_is_handle_part(ty: &Type) -> bool {
     match ty {
         Type::Reference(r) => type_is_handle_part(&r.elem),
+        Type::Ptr(p) => type_is_handle_part(&p.elem),
         Type::Paren(p) => type_is_handle_part(&p.elem),
         Type::Group(g) => type_is_handle_part(&g.elem),
         Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
@@ -6689,6 +6731,7 @@ fn bounds_name_handle<P>(bounds: &syn::punctuated::Punctuated<syn::TypeParamBoun
 fn type_is_exact_handle(ty: &Type) -> bool {
     match ty {
         Type::Reference(r) => type_is_exact_handle(&r.elem),
+        Type::Ptr(p) => type_is_exact_handle(&p.elem),
         Type::Paren(p) => type_is_exact_handle(&p.elem),
         Type::Group(g) => type_is_exact_handle(&g.elem),
         Type::Path(path) => path
@@ -6706,6 +6749,7 @@ fn type_is_exact_handle(ty: &Type) -> bool {
 fn type_is_lazy_db(ty: &Type) -> bool {
     match ty {
         Type::Reference(r) => type_is_lazy_db(&r.elem),
+        Type::Ptr(p) => type_is_lazy_db(&p.elem),
         Type::Paren(p) => type_is_lazy_db(&p.elem),
         Type::Group(g) => type_is_lazy_db(&g.elem),
         Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
@@ -13074,6 +13118,19 @@ mod tests {
                  let wrapped = Ctx { db: source.take().unwrap(), n: { source = None; 0 } }; \
                  wrapped.db.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+            (
+                "guard: a raw pointer parameter is a handle",
+                "async fn h(ptr: *const PgPostRepository) -> AutumnResult<usize> { \
+                 unsafe { (&*ptr).find_all().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a closure returning a captured borrow keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let alias = &mut slot; let make = move || alias; \
+                 let target = make(); *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
             (
                 "guard: a borrow moved out by a dereference keeps its owner",
