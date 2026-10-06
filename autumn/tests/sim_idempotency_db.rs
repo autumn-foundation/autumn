@@ -816,3 +816,86 @@ async fn short_ttl_crash_after_recovery_point_resumes() {
         "the recovery point outlives the crash lock"
     );
 }
+
+/// The release fails after a successful commit (a crash between statements).
+/// The record must keep its crash-safe expiry, so a retry after the lock
+/// frees still replays it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_ttl_failed_release_still_replays() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    {
+        let mut conn = substrate.pool().get().await.expect("checkout");
+        diesel::sql_query(
+            "CREATE TRIGGER fail_release BEFORE UPDATE OF locked_by ON autumn_idempotency_keys \
+             WHEN NEW.locked_by IS NULL BEGIN SELECT RAISE(ABORT, 'release fails'); END",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("trigger");
+    }
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(1),
+    ));
+    let pool = substrate.pool();
+    let handler_calls = calls.clone();
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            calls.add();
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                diesel::sql_query("INSERT INTO payments (amount) VALUES (100)")
+                    .execute(conn)
+                    .await?;
+                idem.commit(conn, (StatusCode::CREATED, "paid")).await
+            })
+            .await
+            .expect("transaction")
+        }
+    };
+    let app = axum::Router::new()
+        .route("/pay", axum::routing::post(handler))
+        .layer(
+            IdempotencyLayer::new(store)
+                .with_ttl(Duration::from_secs(1))
+                .with_in_flight_ttl(Duration::from_secs(3)),
+        );
+    let pay = || {
+        Request::builder()
+            .method("POST")
+            .uri("/pay")
+            .header("idempotency-key", "failed-release")
+            .body(Body::empty())
+            .expect("request")
+    };
+
+    let first = app.clone().oneshot(pay()).await.expect("infallible");
+    assert_eq!(first.status(), StatusCode::CREATED);
+    assert_eq!(payments(&substrate).await, 1);
+    {
+        let mut conn = substrate.pool().get().await.expect("checkout");
+        diesel::sql_query("DROP TRIGGER fail_release")
+            .execute(&mut conn)
+            .await
+            .expect("drop trigger");
+    }
+
+    // At about 3.3 s: the 3 s lock has freed the key; the 1 s TTL has passed.
+    tokio::time::sleep(Duration::from_millis(3_300)).await;
+    let retry = app.clone().oneshot(pay()).await.expect("infallible");
+    assert_eq!(
+        retry
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "an interrupted release keeps the record past the lock"
+    );
+    assert_eq!(calls.get(), 1, "the handler does not run again");
+    assert_eq!(payments(&substrate).await, 1);
+}

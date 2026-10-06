@@ -322,7 +322,9 @@ impl IdempotencyStore for DbIdempotencyStore {
             .execute(&mut conn)
             .await
             .map_err(|e| db_error("release idempotency lock", e))?;
-            // A record written in a transaction lives `ttl_ms` from now.
+            // A record written in a transaction lives `ttl_ms` from now. One
+            // statement: if the release stops before it, the row keeps the
+            // crash-safe expiry from `keep_past_crash_lock`.
             #[allow(
                 clippy::arithmetic_side_effects,
                 reason = "a SQL expression, evaluated by the database"
@@ -332,10 +334,15 @@ impl IdempotencyStore for DbIdempotencyStore {
                 held.filter(keys::record.is_not_null())
                     .filter(keys::ttl_ms.gt(0)),
             )
-            .set(keys::expires_at_ms.eq(release_expiry))
+            .set((
+                keys::expires_at_ms.eq(release_expiry),
+                keys::locked_by.eq(None::<String>),
+                keys::locked_until_ms.eq(0),
+            ))
             .execute(&mut conn)
             .await
             .map_err(|e| db_error("release idempotency lock", e))?;
+            // Any other row this request holds: release only.
             diesel::update(held)
                 .set((
                     keys::locked_by.eq(None::<String>),
