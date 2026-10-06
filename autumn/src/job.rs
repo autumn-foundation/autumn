@@ -7566,7 +7566,8 @@ fn fold_due_delayed_records(
 /// on every replica — including enqueue-only web replicas that never pop.
 ///
 /// Per-queue `depth` is the exact `LLEN` of each queue list plus any due
-/// (ready-at `<= now`) entries still parked in the delayed ZSET; oldest-waiting
+/// (ready-at `<= now`) entries still parked in the delayed ZSET, plus the jobs
+/// parked for the cost signal (issue #1720); oldest-waiting
 /// age comes from the tail record's enqueue time (enqueue `LPUSH`es to the head
 /// and claim `RPOP`s from the tail, so the tail is the next job to run) and/or
 /// the min due-delayed score. The per-name `queued` tally reads a bounded sample
@@ -7653,8 +7654,68 @@ async fn update_redis_queue_depth_gauges(
     )
     .await?;
 
+    // Jobs parked for the cost signal (issue #1720) are still enqueued.
+    let blocked_key = format!("{key_prefix}:blocked");
+    survey_cost_parked_gauges(
+        connection,
+        &blocked_key,
+        record_prefix,
+        &mut per_queue,
+        &mut per_name,
+    )
+    .await?;
+
     state.job_registry.set_queue_depth_gauges(&per_queue);
     state.job_registry.set_queued_counts(&per_name);
+    Ok(())
+}
+
+/// Fold the jobs parked for the cost signal (the blocked zset band above
+/// `REDIS_DEFERRED_SCORE_BASE`) into the per-queue and per-name tallies. Their
+/// oldest age is their enqueue time. The scan stops at
+/// `REDIS_QUEUE_DEPTH_DUE_SCAN_CAP`.
+#[cfg(feature = "redis")]
+async fn survey_cost_parked_gauges(
+    connection: &mut redis::aio::ConnectionManager,
+    blocked_key: &str,
+    record_prefix: &str,
+    per_queue: &mut HashMap<String, (u64, Option<u64>)>,
+    per_name: &mut HashMap<String, u64>,
+) -> Result<(), redis::RedisError> {
+    let page_size = REDIS_QUEUE_DEPTH_SAMPLE.max(1).cast_unsigned();
+    let mut offset: isize = 0;
+    let mut scanned: usize = 0;
+    loop {
+        let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(blocked_key)
+            .arg(REDIS_DEFERRED_SCORE_BASE)
+            .arg("+inf")
+            .arg("LIMIT")
+            .arg(offset)
+            .arg(REDIS_QUEUE_DEPTH_SAMPLE)
+            .query_async(connection)
+            .await?;
+        let page_len = ids.len();
+        if !ids.is_empty() {
+            let keys: Vec<String> = ids
+                .iter()
+                .map(|id| redis_record_key(record_prefix, id))
+                .collect();
+            let bodies: Vec<Option<String>> =
+                redis::cmd("MGET").arg(keys).query_async(connection).await?;
+            let records = bodies.into_iter().flatten().filter_map(|body| {
+                serde_json::from_str::<RedisJobRecord>(&body)
+                    .ok()
+                    .map(|record| (record.queue, record.name, record.enqueued_at_ms))
+            });
+            fold_due_delayed_records(records, per_queue, per_name);
+        }
+        scanned = scanned.saturating_add(page_len);
+        if page_len < page_size || scanned >= REDIS_QUEUE_DEPTH_DUE_SCAN_CAP {
+            break;
+        }
+        offset = offset.saturating_add(REDIS_QUEUE_DEPTH_SAMPLE);
+    }
     Ok(())
 }
 
@@ -15328,6 +15389,25 @@ mod tests {
             .find(|r| r.id == "c1")
             .expect("the parked job is listed as enqueued");
         assert!(!listed.blocked_on_concurrency);
+
+        // The backlog gauges still count it as queued.
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("rebuild_index");
+        update_redis_queue_depth_gauges(
+            &mut connection,
+            prefix,
+            &["default".to_owned()],
+            &worker_config.delayed_key,
+            &worker_config.record_prefix,
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.job_registry().snapshot()["rebuild_index"].queued, 1);
+        assert_eq!(
+            state.job_registry().snapshot()["rebuild_index"].blocked_on_concurrency,
+            0
+        );
 
         // The signal is low: the job goes back to its queue.
         promote_deferred_redis_jobs(&mut connection, &worker_config)
