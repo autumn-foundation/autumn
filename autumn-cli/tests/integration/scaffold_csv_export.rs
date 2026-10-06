@@ -205,8 +205,8 @@ fn export_reflects_the_filtered_view_not_find_all() {
         "the export must extract the same ListQuery as the index:\n{export}"
     );
     assert!(
-        export.contains("repo.list(&list_query,"),
-        "the export must apply the allowlisted sort/filter via repo.list:\n{export}"
+        export.contains("repo.list_rows(&list_query,"),
+        "the export must apply the allowlisted sort/filter via repo.list_rows:\n{export}"
     );
     assert!(
         !export.contains("find_all("),
@@ -215,21 +215,33 @@ fn export_reflects_the_filtered_view_not_find_all() {
 }
 
 #[test]
-fn export_is_bounded_by_a_row_cap_and_reads_in_pages() {
+fn export_is_bounded_by_a_row_cap_in_one_count_free_read() {
+    // #2185: one statement is one snapshot, so a concurrent write cannot
+    // duplicate or skip a row. `list` pays a `COUNT(*)` per page and reads
+    // each page on its own pooled connection, so the export must not use it.
     let (_tmp, routes) = scaffold_routes("csv-bounded", &[]);
     assert!(
         routes.contains("const MAX_EXPORT_ROWS: usize"),
         "the export must carry an explicit row cap:\n{routes}"
     );
     let export = handler_slice(&routes, "export_csv");
-    assert!(
-        export.contains("autumn_web::pagination::MAX_PAGE_SIZE"),
-        "the export must read in MAX_PAGE_SIZE batches:\n{export}"
+    assert_eq!(
+        export.matches("repo.list_rows(").count(),
+        1,
+        "the export must read its rows in exactly one call:\n{export}"
     );
-    assert!(
-        export.contains("MAX_EXPORT_ROWS"),
-        "the export must stop at the row cap:\n{export}"
-    );
+    for paged in [
+        "repo.list(",
+        "PageRequest",
+        "Page<",
+        "MAX_PAGE_SIZE",
+        "loop {",
+    ] {
+        assert!(
+            !export.contains(paged),
+            "the export must not read in pages (`{paged}`):\n{export}"
+        );
+    }
 }
 
 #[test]
@@ -248,8 +260,8 @@ fn export_reads_past_the_cap_so_truncation_is_detectable() {
          from a truncated one:\n{export}"
     );
     assert!(
-        export.contains("if exhausted || rows.len() > MAX_EXPORT_ROWS"),
-        "the export loop must read past the cap before stopping:\n{export}"
+        export.contains(".list_rows(&list_query, MAX_EXPORT_ROWS + 1)"),
+        "the export must read one row past the cap:\n{export}"
     );
     assert!(
         export.contains("let truncated = rows.len() > MAX_EXPORT_ROWS;"),
@@ -259,6 +271,62 @@ fn export_reads_past_the_cap_so_truncation_is_detectable() {
         export.contains("rows.truncate(MAX_EXPORT_ROWS);"),
         "the surplus read past the cap must be trimmed before the CSV is \
          written:\n{export}"
+    );
+}
+
+#[test]
+fn export_read_is_laid_out_as_rustfmt_lays_it_out() {
+    // A short model name fits on one line.
+    let (_tmp, routes) = scaffold_routes("csv-layout-short", &[]);
+    assert!(
+        handler_slice(&routes, "export_csv").contains(
+            "    let mut rows: Vec<Post> = repo.list_rows(&list_query, MAX_EXPORT_ROWS + 1).await?;\n"
+        ),
+        "a short read must stay on one line:\n{routes}"
+    );
+
+    // A long one does not, and rustfmt moves the call below the `=`.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    run_autumn_ok(tmp.path(), &["new", "csv-layout-long"]);
+    let project = tmp.path().join("csv-layout-long");
+    run_autumn_ok(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "PurchaseOrderRecord",
+            "title:String",
+        ],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/purchase_order_records.rs")).unwrap();
+    assert!(
+        handler_slice(&routes, "export_csv").contains(
+            "    let mut rows: Vec<PurchaseOrderRecord> =\n        repo.list_rows(&list_query, MAX_EXPORT_ROWS + 1).await?;\n"
+        ),
+        "a long read must break after the `=`:\n{routes}"
+    );
+}
+
+#[test]
+fn export_docs_drop_the_per_batch_consistency_and_count_caveats() {
+    // #2185: these paragraphs described the paged read. The single read
+    // removes both problems, so the paragraphs go, not a new wording of them.
+    let (_tmp, routes) = scaffold_routes("csv-caveats", &[]);
+    for withdrawn in [
+        "CONSISTENCY is per batch",
+        "COUNT(*)",
+        "~200 round trips",
+        "LIMIT`/`OFFSET",
+        "Db::tx_with(TxOptions::repeatable_read().read_only(), ..)",
+    ] {
+        assert!(
+            !routes.contains(withdrawn),
+            "the emitted export docs must not keep `{withdrawn}`:\n{routes}"
+        );
+    }
+    assert!(
+        routes.contains("one snapshot"),
+        "the emitted docs must state the single-snapshot read:\n{routes}"
     );
 }
 
@@ -407,10 +475,10 @@ fn export_mirrors_the_index_security_posture() {
 
 #[test]
 fn export_carries_a_per_ip_throttle_the_index_does_not_need() {
-    // One export reads up to MAX_EXPORT_ROWS rows over ~100 page queries plus
-    // ~100 filtered COUNT(*)s (`list` counts before every page), where one index
-    // page costs two round trips — so on an unsecured scaffold the route is a
-    // large cost amplifier on traffic the index already accepts.
+    // One export is one statement, but it loads up to MAX_EXPORT_ROWS + 1 rows
+    // and builds the whole CSV body in memory, where one index page loads
+    // MAX_PAGE_SIZE rows. On an unsecured scaffold the route is still a cost
+    // amplifier on traffic the index already accepts.
     let (_tmp, routes) = scaffold_routes("csv-throttle", &[]);
     assert!(
         routes.contains("#[autumn_web::throttle(limit = 6, per = \"1m\", key = \"ip\")]"),
@@ -514,12 +582,19 @@ fn owner_scoped_export_never_calls_the_unscoped_list() {
     );
     let export = handler_slice(&routes, "export_csv");
     assert!(
-        export.contains("repo.list_scoped(owner_id, &list_query,"),
-        "an owner-scoped export must go through list_scoped:\n{export}"
+        export.contains(".list_scoped_rows(owner_id, &list_query, MAX_EXPORT_ROWS + 1)"),
+        "an owner-scoped export must go through list_scoped_rows:\n{export}"
+    );
+    // Too long for one line, so it is laid out as rustfmt would.
+    assert!(
+        export.contains(
+            "let mut rows: Vec<Post> = repo\n        .list_scoped_rows(owner_id, &list_query, MAX_EXPORT_ROWS + 1)\n        .await?;"
+        ),
+        "the long read must be laid out as rustfmt would:\n{export}"
     );
     assert!(
-        !export.contains("repo.list(&list_query"),
-        "an owner-scoped export must never call the unscoped list:\n{export}"
+        !export.contains("repo.list(") && !export.contains(".list_rows("),
+        "an owner-scoped export must never call an unscoped list:\n{export}"
     );
 }
 
