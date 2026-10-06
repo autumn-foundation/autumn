@@ -83,7 +83,37 @@ BODY=$(mktemp "$TMP_TEMPLATE")
 APP_SECRETS=$(mktemp "$TMP_TEMPLATE")
 JOB_SECRETS=$(mktemp "$TMP_TEMPLATE")
 LIVE_SECRETS=$(mktemp "$TMP_TEMPLATE")
-trap 'rm -f "$BODY" "$APP_SECRETS" "$JOB_SECRETS" "$LIVE_SECRETS"' EXIT
+# A private directory (mode 0700) for the JSON values of jq calls.
+JQ_VARS=$(mktemp -d "$TMP_TEMPLATE")
+trap 'rm -f "$BODY" "$APP_SECRETS" "$JOB_SECRETS" "$LIVE_SECRETS"; rm -rf "$JQ_VARS"' EXIT
+
+# Every jq call goes through this function. The app and job JSON hold the
+# plain env values of their containers, so a --argjson value goes through a
+# private file, not the command line. printf is a builtin, so the value never
+# becomes a process argument. The filter binds the name to the file's value,
+# so the jq programs read it as before.
+jq() {
+  local args=() files=() nfiles=0 binds="" filter=-1 file status=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --argjson)
+        file=$(mktemp "$JQ_VARS/v.XXXXXX") || return 1
+        printf '%s' "$3" > "$file"
+        files+=("$file")
+        nfiles=$((nfiles + 1))
+        args+=(--slurpfile "$2" "$file")
+        binds="$binds\$$2[0] as \$$2 | "
+        shift 3 ;;
+      --arg|--slurpfile|--rawfile) args+=("$1" "$2" "$3"); shift 3 ;;
+      -*) args+=("$1"); shift ;;
+      *) [ "$filter" -ge 0 ] || filter=${#args[@]}; args+=("$1"); shift ;;
+    esac
+  done
+  [ "$filter" -lt 0 ] || args[filter]="$binds${args[filter]}"
+  command jq "${args[@]}" || status=$?
+  [ "$nfiles" -eq 0 ] || rm -f "${files[@]}"
+  return "$status"
+}
 
 JOB=$(az containerapp job show \
   --name "$AZURE_MIGRATE_JOB_NAME" \

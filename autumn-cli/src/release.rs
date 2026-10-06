@@ -3253,6 +3253,8 @@ else
 fi
 # The app as the GET shows it before any PATCH.
   env='{"name":"AUTUMN_PROFILE","value":"prod"}'
+  # An operator env var with a plain value (not a secret ref).
+  [ -n "$STUB_PLAIN_ENV" ] && env="$env"',{"name":"PARTNER_KEY","value":"plain-value-7f3a"}'
   refs=',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
   [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_TEMPLATE_CLEAN" ] && env="$env$refs"
   [ -n "$STUB_APP_REDIS" ] && env="$env"',{"name":"AUTUMN_CACHE__BACKEND","value":"redis"},{"name":"AUTUMN_CACHE__REDIS__URL","secretRef":"redis-url"}'
@@ -3595,7 +3597,7 @@ case "$1 $2" in
   "rest --method")
     # The modes of the script's temp files at the time of the PATCH.
     if [ -n "$STUB_TMP_MODES" ]; then
-      ls -l "$TMPDIR"/azure-cutover.* | sed 's/^/mode /' >> "$STUB_LOG"
+      ls -ld "$TMPDIR"/azure-cutover.* | sed 's/^/mode /' >> "$STUB_LOG"
     fi
     # Azure rejects a PATCH that removes tags.
     if [ -n "$tags_only" ] && [ -n "$STUB_TAGS_CLEAR_FAILS" ] \
@@ -3658,6 +3660,7 @@ esac
         "STUB_INIT_SECRET_REF",
         "STUB_CUTOVER_LOST",
         "STUB_TAGS_CLEAR_FAILS",
+        "STUB_PLAIN_ENV",
         "STUB_INGRESS_DISABLE_LOST",
         "STUB_SIDECAR_ACR",
         "STUB_APP_REGISTRY_PASSWORD_REF",
@@ -3761,6 +3764,24 @@ esac
         }
         let log = tmp.path().join("az.log");
         let system_path = std::env::var("PATH").unwrap_or_default();
+        // STUB_JQ_ARGS: a jq shim logs the arguments of each jq call (as
+        // `jq <args>`) to the az log, then runs the real jq.
+        if extra_env.iter().any(|(name, _)| *name == "STUB_JQ_ARGS") {
+            let real = std::env::split_paths(&system_path)
+                .map(|dir| dir.join("jq"))
+                .find(|path| path.is_file())
+                .expect("jq on PATH");
+            let path = bin.join("jq");
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf 'jq %s\\n' \"$*\" >> \"$STUB_LOG\"\nexec '{}' \"$@\"\n",
+                    real.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let path = if no_curl {
             // The host's tools, without its curl, as links in one directory.
             let host = tmp.path().join("host");
@@ -3831,6 +3852,42 @@ esac
             };
             assert!(!status.success(), "{args:?}: {calls}");
             assert!(calls.is_empty(), "{args:?}: {calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_env_values_out_of_jq_arguments() {
+        // The app JSON holds the plain env values of its containers. A
+        // process's arguments are visible to other users, so no jq call may
+        // get that JSON (or a part of it) as an argument. In both modes, and
+        // on a rollback.
+        for (args, state, legacy) in [
+            (&[][..], "Provisioned", ""),
+            (&[][..], "Failed", ""),
+            (&["--remove-credentials"][..], "Provisioned", "1"),
+        ] {
+            let mut env = vec![("STUB_JQ_ARGS", "1"), ("STUB_PLAIN_ENV", "1")];
+            if !legacy.is_empty() {
+                env.push(("STUB_APP_LEGACY", legacy));
+            }
+            let Some((_, calls, bodies)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                state,
+                false,
+                0,
+                &env,
+            ) else {
+                return;
+            };
+            assert!(calls.contains("\njq "), "{args:?}: {calls}");
+            assert!(bodies.contains("plain-value-7f3a"), "{args:?}: {bodies}");
+            let leaked: Vec<&str> = calls
+                .lines()
+                .filter(|line| line.starts_with("jq ") && line.contains("plain-value-7f3a"))
+                .collect();
+            assert!(leaked.is_empty(), "{args:?} {state}: {leaked:#?}");
         }
     }
 
@@ -4310,7 +4367,7 @@ esac
     fn azure_cutover_script_keeps_the_filtered_job_secrets_private() {
         // With --without-redis, the script filters the job's secrets, which
         // hold inline values. Every temp file must stay readable by the
-        // owner only.
+        // owner only, and so must the directory of the jq values.
         let tmpdir = TempDir::new().unwrap();
         let tmpdir_path = tmpdir.path().to_str().unwrap().to_string();
         let Some((status, calls, _)) = run_azure_cutover_with_args(
@@ -4330,8 +4387,15 @@ esac
         assert!(status.success(), "{calls}");
         let modes: Vec<&str> = calls.lines().filter(|l| l.starts_with("mode ")).collect();
         assert!(!modes.is_empty(), "{calls}");
+        assert!(
+            modes.iter().any(|line| line.starts_with("mode drwx------")),
+            "{calls}"
+        );
         for line in modes {
-            assert!(line.starts_with("mode -rw-------"), "{line}\n{calls}");
+            assert!(
+                line.starts_with("mode -rw-------") || line.starts_with("mode drwx------"),
+                "{line}\n{calls}"
+            );
         }
     }
 
