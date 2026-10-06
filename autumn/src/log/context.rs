@@ -56,7 +56,9 @@ tokio::task_local! {
 /// Field keys reserved for the built-in correlation ids. Custom fields using
 /// these names are ignored so they can never shadow the authoritative values
 /// when [`LogFields`] flattens custom fields alongside the core ids.
-const RESERVED_FIELD_KEYS: [&str; 3] = ["request_id", "user_id", "tenant_id"];
+/// `trace_id` and `span_id` are set only by the framework (issue #3064).
+const RESERVED_FIELD_KEYS: [&str; 5] =
+    ["request_id", "user_id", "tenant_id", "trace_id", "span_id"];
 
 /// A snapshot of the fields carried by the current request context.
 ///
@@ -187,6 +189,17 @@ impl LogContext {
         };
         if let Ok(mut guard) = self.inner.write() {
             guard.fields.insert(key, value);
+        }
+    }
+
+    /// Record the OpenTelemetry trace id and span id of the request (issue
+    /// #3064). Only the framework calls this: [`Self::insert_field`] ignores
+    /// these keys, so an app field cannot point a log line at another trace.
+    #[cfg_attr(not(feature = "telemetry-otlp"), allow(dead_code))]
+    pub(crate) fn set_trace_ids(&self, trace_id: String, span_id: String) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.fields.insert("trace_id".to_owned(), trace_id);
+            guard.fields.insert("span_id".to_owned(), span_id);
         }
     }
 
@@ -338,6 +351,24 @@ pub fn in_current_context<F: Future>(future: F) -> impl Future<Output = F::Outpu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A custom field cannot replace the trace ids the framework records
+    /// (issue #3064): they point a log line at its trace.
+    #[test]
+    fn custom_fields_cannot_shadow_trace_ids() {
+        let ctx = LogContext::new(Some("rid".to_owned()));
+        ctx.insert_field("trace_id", "app-value");
+        ctx.insert_field("span_id", "app-value");
+        let fields = ctx.snapshot().fields;
+        assert!(!fields.contains_key("trace_id"), "{fields:?}");
+        assert!(!fields.contains_key("span_id"), "{fields:?}");
+
+        ctx.set_trace_ids("abc".to_owned(), "def".to_owned());
+        ctx.insert_field("trace_id", "app-value");
+        let fields = ctx.snapshot().fields;
+        assert_eq!(fields.get("trace_id").map(String::as_str), Some("abc"));
+        assert_eq!(fields.get("span_id").map(String::as_str), Some("def"));
+    }
 
     #[tokio::test]
     async fn seeds_request_id_and_exposes_it_via_current() {

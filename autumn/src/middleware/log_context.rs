@@ -82,8 +82,7 @@ fn record_trace_ids(span: &tracing::Span, ctx: &LogContext) {
     let span_id = span_context.span_id().to_string();
     span.record("trace_id", trace_id.as_str());
     span.record("span_id", span_id.as_str());
-    ctx.insert_field("trace_id", trace_id);
-    ctx.insert_field("span_id", span_id);
+    ctx.set_trace_ids(trace_id, span_id);
 }
 
 /// Tower [`Service`] produced by [`LogContextLayer`].
