@@ -361,7 +361,6 @@ save_ingress_tags() {
   tags=$(jq -cn --argjson app "$APP" --argjson saved "$SAVED_INGRESS" '($app | '"$INGRESS_TAG_NAMES"') as $old
     | ($saved | tojson | @base64) as $b
     | [range(0; $b | length; 256) as $i | $b[$i:$i + 256]]
-    | if length > 40 then error("the ingress is too large for the tags") else . end
     | (to_entries | map({key: ("autumn-ingress-" + (.key | tostring)), value}) | from_entries) as $new
     | ($old | map(select(in($new) | not) | {(.): null}) | add // {}) + $new') || return 1
   patch_app "$(jq -cn --argjson app "$APP" --argjson tags "$tags" '{location: $app.location, tags: $tags}')" \
@@ -392,7 +391,8 @@ restore_ingress() {
   if set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")"; then
     clear_tags '["autumn-ingress-"]'
   else
-    echo "::warning::restore the ingress of $AZURE_APP_NAME manually. Its autumn-ingress-* tags hold the saved ingress (base64 JSON)." >&2
+    echo "::error::cannot restore the ingress of $AZURE_APP_NAME. Run the script again, or restore it manually: its autumn-ingress-* tags hold the saved ingress (base64 JSON)." >&2
+    return 1
   fi
 }
 
@@ -604,12 +604,15 @@ rollback() {
   # This run opened ingress already (a restart that then failed). The
   # placeholder template comes back before stage 2 removes the identity,
   # so ingress closes again first.
-  if [ -n "$OPENED" ]; then
-    az containerapp ingress disable \
+  # If ingress cannot close, stage 1 would put the placeholder behind
+  # open ingress while the identity is still attached. So the rollback
+  # stops: the credentials stay with the real image.
+  if [ -n "$OPENED" ] && ! az containerapp ingress disable \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
-      --output none \
-      || echo "::warning::cannot disable the ingress of $AZURE_APP_NAME" >&2
+      --output none; then
+    echo "::error::rollback stopped: cannot disable the ingress of $AZURE_APP_NAME. The app keeps its credentials. Disable its ingress, then run the script with --remove-credentials." >&2
+    return
   fi
   echo "::warning::removing the credentials from the placeholder app" >&2
   if remove_credentials; then
@@ -669,7 +672,10 @@ if [ "$MODE" = remove ]; then
     echo "::error::cannot remove the credentials from $AZURE_APP_NAME. Its ingress stays disabled; the next run restores it from the app's tags." >&2
     exit 1
   }
-  restore_ingress
+  restore_ingress || {
+    echo "::error::the credentials are removed from $AZURE_APP_NAME, but its ingress is not back." >&2
+    exit 1
+  }
   echo "removed the credentials from the placeholder app $AZURE_APP_NAME"
   exit 0
 fi
@@ -825,10 +831,9 @@ if [ -z "$RELEASED" ]; then
     [$app.tags // {} | keys[] | select(startswith("autumn-copied-"))] as $old
     | ($record | tojson | @base64) as $b
     | [range(0; $b | length; 256) as $i | $b[$i:$i + 256]]
-    | if length > 40 then error("the record of copied credentials is too large for the tags") else . end
     | (to_entries | map({key: ("autumn-copied-" + (.key | tostring)), value}) | from_entries) as $new
     | ($old | map(select(in($new) | not) | {(.): null}) | add // {}) + $new') \
-    || { echo "::error::cannot record the copied credentials in the tags of $AZURE_APP_NAME" >&2; exit 1; }
+    || stop_before_patch "cannot record the copied credentials in the tags of $AZURE_APP_NAME"
 fi
 
 # The secrets, registries and identities that you add to the app stay.
