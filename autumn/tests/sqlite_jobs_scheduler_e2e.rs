@@ -2647,3 +2647,113 @@ async fn sqlite_a_freed_deferred_tick_runs_on_one_replica() {
         "exactly one replica runs the tick: a={a_runs} b={b_runs}"
     );
 }
+
+static COST_DEFERRED_RAN: AtomicUsize = AtomicUsize::new(0);
+static COST_URGENT_RAN: AtomicUsize = AtomicUsize::new(0);
+
+/// Issue #1720, slice 2: on the SQLite jobs backend, a deferrable job waits
+/// while the cost signal is high. The worker does not claim it, so the row
+/// stays `enqueued` with its first attempt. A job that is not deferrable on
+/// the same queue runs. When the signal falls, the deferred job runs. Each
+/// run is metered, and no deferrable run is in the window.
+#[tokio::test]
+async fn sqlite_deferrable_job_waits_for_the_cost_signal() {
+    use autumn_web::cost::{CostAccountant, CostSignal, WorkKind, mark_deferrable};
+
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    COST_DEFERRED_RAN.store(0, Ordering::SeqCst);
+    COST_URGENT_RAN.store(0, Ordering::SeqCst);
+    mark_deferrable(WorkKind::Job, "sqlite_cost_deferred_job");
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+    let state = AppState::for_test()
+        .with_profile("dev")
+        .with_pool(pool.clone());
+    let signal = CostSignal::new(Some(100.0));
+    signal.set(500.0);
+    let accountant = CostAccountant::new(10);
+    state.insert_extension(signal.clone());
+    state.insert_extension(accountant.clone());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
+    job::start_runtime(
+        vec![
+            job_info("sqlite_cost_deferred_job", 3, |_state, _payload| {
+                Box::pin(async move {
+                    COST_DEFERRED_RAN.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+            job_info("sqlite_cost_urgent_job", 3, |_state, _payload| {
+                Box::pin(async move {
+                    COST_URGENT_RAN.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }),
+        ],
+        &state,
+        &shutdown,
+        &sqlite_job_config(3),
+        true,
+    )
+    .expect("the durable sqlite job runtime starts");
+
+    // The deferrable job is first in the queue.
+    job::enqueue("sqlite_cost_deferred_job", serde_json::json!({}))
+        .await
+        .expect("enqueue");
+    job::enqueue("sqlite_cost_urgent_job", serde_json::json!({}))
+        .await
+        .expect("enqueue");
+
+    eventually(400, "the urgent job to run in the window", async || {
+        COST_URGENT_RAN.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // Many poll intervals (20 ms) in the window.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        COST_DEFERRED_RAN.load(Ordering::SeqCst),
+        0,
+        "no deferrable run in the window"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs \
+             WHERE name = 'sqlite_cost_deferred_job' AND status = 'enqueued' AND attempt = 1",
+        )
+        .await,
+        1,
+        "the deferred job stays enqueued and uses no attempt"
+    );
+
+    signal.set(10.0);
+    eventually(
+        400,
+        "the deferred job to run after the window",
+        async || COST_DEFERRED_RAN.load(Ordering::SeqCst) == 1,
+    )
+    .await;
+    eventually(400, "both rows to complete", async || {
+        count(
+            &pool,
+            "SELECT COUNT(*) AS value FROM autumn_jobs WHERE status = 'completed'",
+        )
+        .await
+            == 2
+    })
+    .await;
+
+    let jobs = accountant.snapshot().jobs;
+    assert_eq!(jobs.total.runs, 2, "{jobs:?}");
+    assert_eq!(jobs.shift.in_window_runs, 0, "{jobs:?}");
+    assert_eq!(
+        jobs.shift.shifted_runs, 1,
+        "the held job is shifted: {jobs:?}"
+    );
+
+    shutdown.cancel();
+    job::clear_global_job_client();
+}

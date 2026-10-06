@@ -9032,6 +9032,7 @@ async fn execute_task_result(
     start: crate::time::MonotonicInstant,
     name: &str,
     schedule: &'static str,
+    waited: bool,
 ) -> Result<u64, (u64, String)> {
     // A tick is work a sim drain must see (issue #2967).
     crate::sim::note_drain_progress();
@@ -9045,15 +9046,16 @@ async fn execute_task_result(
         task = %name,
         schedule = schedule,
     );
-    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (handler)(state.clone()).instrument(task_span)
-    })) {
-        Ok(future) => future,
-        Err(panic) => {
-            let duration_ms = task_duration_ms(state, start);
-            return Err((duration_ms, format_scheduled_task_panic(panic.as_ref())));
-        }
+    // The handler is called in the first poll, so `catch_unwind` below also
+    // catches a handler that panics before it returns its future, and the
+    // meter records that tick too (issue #1720).
+    let handler_state = state.clone();
+    let future = async move { (handler)(handler_state).instrument(task_span).await };
+    let run = crate::cost::WorkRun {
+        tenant: None,
+        waited,
     };
+    let future = crate::cost::meter_work(state, crate::cost::WorkKind::Task, name, run, future);
     let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
     let duration_ms = task_duration_ms(state, start);
 
@@ -9077,6 +9079,10 @@ fn format_scheduled_task_panic(panic: &(dyn Any + Send)) -> String {
 
 /// Run one tick with `tick` as its [`crate::scheduler::current_tick`], and
 /// stop it after `lease_ttl` when one is set.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one tick: its task, schedule, lease and cost wait"
+)]
 async fn execute_task_result_with_optional_lease_ttl(
     state: &AppState,
     handler: crate::task::TaskHandler,
@@ -9085,10 +9091,11 @@ async fn execute_task_result_with_optional_lease_ttl(
     schedule: &'static str,
     lease_ttl: Option<std::time::Duration>,
     tick: crate::scheduler::ScheduledTick,
+    waited: bool,
 ) -> Result<u64, (u64, String)> {
     let run = crate::scheduler::with_tick(
         tick,
-        execute_task_result(state, handler, start, name, schedule),
+        execute_task_result(state, handler, start, name, schedule, waited),
     );
     let Some(lease_ttl) = lease_ttl else {
         return run.await;
@@ -9128,6 +9135,7 @@ async fn execute_fixed_delay_task(
     let gate = CostGate {
         shutdown,
         waiting: None,
+        waited: std::sync::atomic::AtomicBool::new(false),
     };
     let wait_first = CostGate::waits_before_lease(&*coordinator);
     let (lease, tick_key) = loop {
@@ -9185,6 +9193,7 @@ async fn execute_fixed_delay_task(
         "fixed_delay",
         lease_ttl,
         tick,
+        gate.waited(),
     )
     .await
     {
@@ -9227,6 +9236,8 @@ struct CostGate {
     shutdown: tokio_util::sync::CancellationToken,
     /// `true` while the tick waits. The cron loop folds later ticks into it.
     waiting: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// `true` after the tick waited in a real window. The cost meter reads it.
+    waited: std::sync::atomic::AtomicBool,
 }
 
 impl CostGate {
@@ -9238,8 +9249,13 @@ impl CostGate {
             name,
             &self.shutdown,
             self.waiting.as_deref(),
+            &self.waited,
         )
         .await
+    }
+
+    fn waited(&self) -> bool {
+        self.waited.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Free a claim whose tick has not run, so a retry of the same key can
@@ -9376,7 +9392,14 @@ async fn execute_cron_task(
     let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
     let tick = crate::scheduler::ScheduledTick::new(&tick_key, &lease);
     match execute_task_result_with_optional_lease_ttl(
-        &state, handler, start, &name, "cron", lease_ttl, tick,
+        &state,
+        handler,
+        start,
+        &name,
+        "cron",
+        lease_ttl,
+        tick,
+        gate.waited(),
     )
     .await
     {
@@ -9555,6 +9578,7 @@ async fn run_cron_task_loop(
                     CostGate {
                         shutdown: shutdown.clone(),
                         waiting: Some(Arc::clone(&deferring)),
+                        waited: std::sync::atomic::AtomicBool::new(false),
                     },
                 ));
                 cursor = scheduled_at;
@@ -19787,7 +19811,8 @@ mod tests {
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         let start = state.monotonic();
         let result =
-            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay", false)
+                .await;
         assert!(result.is_ok(), "expected Ok from successful handler");
         // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
@@ -19800,7 +19825,8 @@ mod tests {
             |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
         let start = state.monotonic();
         let result =
-            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay", false)
+                .await;
         assert!(result.is_err(), "expected Err from failing handler");
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);
@@ -19823,12 +19849,35 @@ mod tests {
             start,
             "test_task",
             "fixed_delay",
+            false,
         )
         .await;
 
         let (duration_ms, msg) = result.expect_err("expected Err from panicking handler");
         assert!(duration_ms < u64::MAX);
         assert!(msg.contains("scheduled task handler panicked: panic before scheduled future"));
+    }
+
+    /// A tick whose handler panics before it returns its future is metered
+    /// too (issue #1720).
+    #[tokio::test]
+    async fn execute_task_result_meters_an_immediate_handler_panic() {
+        let state = AppState::for_test();
+        let accountant = crate::cost::CostAccountant::new(10);
+        state.insert_extension(accountant.clone());
+        let start = state.monotonic();
+        let result = super::execute_task_result(
+            &state,
+            instantly_panicking_scheduled_handler,
+            start,
+            "test_task",
+            "fixed_delay",
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(accountant.snapshot().tasks.total.runs, 1);
     }
 
     #[tokio::test]
@@ -20014,6 +20063,7 @@ mod tests {
                 super::CostGate {
                     shutdown: tokio_util::sync::CancellationToken::new(),
                     waiting: None,
+                    waited: std::sync::atomic::AtomicBool::new(false),
                 },
             ));
 
@@ -20118,6 +20168,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: Some(std::sync::Arc::clone(&flag)),
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         ));
 
@@ -20182,6 +20233,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: Some(std::sync::Arc::clone(&waiting)),
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;
@@ -20419,6 +20471,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;
@@ -20465,6 +20518,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;
@@ -20595,6 +20649,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;
