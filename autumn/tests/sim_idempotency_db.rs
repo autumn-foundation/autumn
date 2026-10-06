@@ -676,3 +676,70 @@ async fn short_ttl_normal_release_keeps_the_configured_ttl() {
     );
     assert_eq!(calls.get(), 2);
 }
+
+/// `commit` ran, then the transaction rolled back. The record is gone, so a
+/// retry runs the handler again; the error response is not stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rolled_back_commit_is_not_stored() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(86_400),
+    ));
+    let pool = substrate.pool();
+    let handler_calls = calls.clone();
+    let handler = move |idem: IdempotencyTx, session: Session| {
+        let pool = pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            let first = calls.get() == 0;
+            calls.add();
+            session.insert("user_id", "42").await;
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            let result = conn
+                .transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                    let response = idem.commit(conn, (StatusCode::CREATED, "paid")).await?;
+                    if first {
+                        // A later step fails: the whole transaction rolls back.
+                        return Err(autumn_web::AutumnError::internal_server_error_msg("boom"));
+                    }
+                    Ok(response)
+                })
+                .await;
+            match result {
+                Ok(response) => response,
+                Err(error) => error.into_response(),
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/login", axum::routing::post(handler))
+        .layer(IdempotencyLayer::new(store))
+        .layer(SessionLayer::new(
+            MemoryStore::new(),
+            SessionConfig::default(),
+        ));
+
+    let first = app
+        .clone()
+        .oneshot(login("rollback"))
+        .await
+        .expect("infallible");
+    assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let retry = app
+        .clone()
+        .oneshot(login("rollback"))
+        .await
+        .expect("infallible");
+    assert_eq!(
+        retry.headers().get("x-idempotent-replayed"),
+        None,
+        "the error of a rolled-back transaction is not replayed"
+    );
+    assert_eq!(retry.status(), StatusCode::CREATED);
+    assert_eq!(calls.get(), 2, "the handler runs again");
+}

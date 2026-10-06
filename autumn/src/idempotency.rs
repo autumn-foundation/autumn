@@ -1587,14 +1587,26 @@ impl TxProbe {
         Self::default()
     }
 
+    /// `true` when the handler's transaction committed the record.
     #[cfg(feature = "db")]
-    fn committed(&self) -> bool {
-        self.tx.as_ref().is_some_and(IdempotencyTx::committed)
+    async fn committed(&self, store: &Arc<dyn IdempotencyStore>) -> bool {
+        let Some(tx) = &self.tx else {
+            return false;
+        };
+        let store: &dyn std::any::Any = store.as_ref();
+        match store.downcast_ref::<DbIdempotencyStore>() {
+            Some(db) => tx.committed(db).await,
+            None => false,
+        }
     }
 
     #[cfg(not(feature = "db"))]
-    #[allow(clippy::unused_self, reason = "same signature as the db build")]
-    const fn committed(&self) -> bool {
+    #[allow(
+        clippy::unused_self,
+        clippy::unused_async,
+        reason = "same signature as the db build"
+    )]
+    async fn committed(&self, _store: &Arc<dyn IdempotencyStore>) -> bool {
         false
     }
 }
@@ -1795,7 +1807,7 @@ where
     };
 
     // The handler stored the record in its own transaction, with its mutation.
-    let committed_in_tx = probe.committed();
+    let committed_in_tx = probe.committed(&store).await;
     let replay_metadata = resp_parts
         .extensions
         .remove::<IdempotencyReplayMetadata>()

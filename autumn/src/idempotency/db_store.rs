@@ -140,6 +140,23 @@ impl DbIdempotencyStore {
     }
 }
 
+impl DbIdempotencyStore {
+    /// `true` when `owner` still holds `key` and its row has a record.
+    async fn holds_record(&self, key: &str, owner: &str) -> Result<bool, IdempotencyStoreError> {
+        let mut conn = self.conn().await?;
+        keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq(key))
+            .filter(keys::locked_by.eq(owner))
+            .filter(keys::record.is_not_null())
+            .select(keys::storage_key)
+            .first::<String>(&mut conn)
+            .await
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|e| db_error("read idempotency record", e))
+    }
+}
+
 /// Keep `owner`'s lock on `key` until the record expires. A lock that already
 /// ends later does not change.
 async fn extend_lock_to_expiry(
@@ -397,11 +414,26 @@ impl IdempotencyTx {
         self.claim.is_some()
     }
 
-    /// `true` after [`Self::commit`] wrote the record.
-    pub(super) fn committed(&self) -> bool {
-        self.claim
-            .as_ref()
-            .is_some_and(|claim| AtomicBool::load(&claim.committed, Ordering::SeqCst))
+    /// `true` when [`Self::commit`] wrote the record and its transaction
+    /// committed.
+    ///
+    /// `commit` can succeed in a transaction that then rolls back, so the
+    /// record must still be in `store`. A read error gives `false`: the
+    /// middleware then treats the response as it does for any other store.
+    pub(super) async fn committed(&self, store: &DbIdempotencyStore) -> bool {
+        let Some(claim) = &self.claim else {
+            return false;
+        };
+        if !AtomicBool::load(&claim.committed, Ordering::SeqCst) {
+            return false;
+        }
+        store
+            .holds_record(&claim.storage_key, &claim.owner)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "Idempotency record check failed; treating it as not committed");
+                false
+            })
     }
 
     /// Store `response` as this key's record, in the transaction of `conn`.
