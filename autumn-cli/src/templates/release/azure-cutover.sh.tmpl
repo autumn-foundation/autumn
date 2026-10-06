@@ -69,9 +69,12 @@ fi
 API="api-version=2024-03-01"
 # Secret values go through these private files, never through a process
 # argument (visible in /proc/*/cmdline).
-BODY=$(mktemp)
-APP_SECRETS=$(mktemp)
-JOB_SECRETS=$(mktemp)
+# An explicit template in $TMPDIR: GNU and BSD (macOS) mktemp both make it
+# with mode 0600, in the same place.
+TMP_TEMPLATE="${TMPDIR:-/tmp}/azure-cutover.XXXXXX"
+BODY=$(mktemp "$TMP_TEMPLATE")
+APP_SECRETS=$(mktemp "$TMP_TEMPLATE")
+JOB_SECRETS=$(mktemp "$TMP_TEMPLATE")
 trap 'rm -f "$BODY" "$APP_SECRETS" "$JOB_SECRETS"' EXIT
 
 JOB=$(az containerapp job show \

@@ -3537,7 +3537,7 @@ case "$1 $2" in
   "rest --method")
     # The modes of the script's temp files at the time of the PATCH.
     if [ -n "$STUB_TMP_MODES" ]; then
-      ls -l "$TMPDIR" | grep '^-' | sed 's/^/mode /' >> "$STUB_LOG"
+      ls -l "$TMPDIR"/azure-cutover.* | sed 's/^/mode /' >> "$STUB_LOG"
     fi
     if grep -q '"ingress"' <<< "$body"; then
       echo "az ingress-patch external=$(jq -r '.properties.configuration.ingress.external' <<< "$body")" >> "$STUB_LOG"
