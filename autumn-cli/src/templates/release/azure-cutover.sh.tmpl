@@ -75,7 +75,8 @@ TMP_TEMPLATE="${TMPDIR:-/tmp}/azure-cutover.XXXXXX"
 BODY=$(mktemp "$TMP_TEMPLATE")
 APP_SECRETS=$(mktemp "$TMP_TEMPLATE")
 JOB_SECRETS=$(mktemp "$TMP_TEMPLATE")
-trap 'rm -f "$BODY" "$APP_SECRETS" "$JOB_SECRETS"' EXIT
+LIVE_SECRETS=$(mktemp "$TMP_TEMPLATE")
+trap 'rm -f "$BODY" "$APP_SECRETS" "$JOB_SECRETS" "$LIVE_SECRETS"' EXIT
 
 JOB=$(az containerapp job show \
   --name "$AZURE_MIGRATE_JOB_NAME" \
@@ -311,6 +312,23 @@ app_shows() {
   jq -e --arg id "$JOB_IDENTITY" --arg acr "$ACR_LOGIN_SERVER" \
     --argjson uids "$JOB_UIDS" --argjson ruids "$REMOVE_UIDS" \
     --argjson want "$JOB_SECRET_REFS" "$1" <<< "$now" > /dev/null
+}
+
+# The app GET has no secret values, so a rotated inline job secret looks
+# applied before it is. This reads the app's secrets with their values into
+# a private file and checks that each inline job secret has the job's value.
+# The values never appear in a process argument.
+inline_secrets_applied() {
+  jq -e 'any(.[]; .keyVaultUrl == null)' "$JOB_SECRETS" > /dev/null || return 0
+  az containerapp secret list \
+    --name "$AZURE_APP_NAME" \
+    --resource-group "$AZURE_RESOURCE_GROUP" \
+    --show-values \
+    --output json > "$LIVE_SECRETS" || return 1
+  jq -e --slurpfile job "$JOB_SECRETS" '. as $live
+    | $job[0] | map(select(.keyVaultUrl == null))
+    | all(.[]; . as $s | any($live[]; .name == $s.name and .value == $s.value))' \
+    "$LIVE_SECRETS" > /dev/null
 }
 
 # A PATCH body goes in a file, not on the command line: it can hold secret
@@ -894,6 +912,7 @@ for _ in $(seq 1 60); do
     continue
   fi
   app_shows "$APPLIED" || continue
+  inline_secrets_applied || continue
   REVISION_STATUS=$(az containerapp revision show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
