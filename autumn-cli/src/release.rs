@@ -3297,6 +3297,10 @@ fi
   [ -n "$STUB_INGRESS_PLAIN" ] && ingress='{"external":false,"targetPort":3000,"transport":"http"}'
   # The snapshot that an interrupted first cutover saved in the app's tags.
   tags='{"team":"web"}'
+  # Many tags of the operator's own.
+  if [ -n "$STUB_APP_TAG_COUNT" ]; then
+    tags=$(jq -cn --argjson n "$STUB_APP_TAG_COUNT" '[range(0; $n) | {key: "t\(.)", value: "x"}] | from_entries')
+  fi
   if [ -n "$STUB_APP_COPIED" ]; then
     tags=$(jq -cn '{secrets: ["queue-key"], uids: ["/kv-id-2"]} | tojson | @base64
       | {"autumn-copied-0": ., team: "web"}')
@@ -3539,12 +3543,16 @@ case "$1 $2" in
     if [ -n "$STUB_TMP_MODES" ]; then
       ls -l "$TMPDIR"/azure-cutover.* | sed 's/^/mode /' >> "$STUB_LOG"
     fi
+    open_patch=""
     if grep -q '"ingress"' <<< "$body"; then
       echo "az ingress-patch external=$(jq -r '.properties.configuration.ingress.external' <<< "$body")" >> "$STUB_LOG"
+      jq -e '.properties.configuration.ingress.external == true' <<< "$body" > /dev/null && open_patch=1
     fi
     [ -n "$tags_only" ] || echo "$body" >> "$STUB_LOG.bodies"
     echo "$body" > "$STUB_LOG.unapplied"
     echo "${STUB_PATCH_PENDING:-0}" > "$STUB_LOG.pending"
+    # Azure accepts the PATCH that opens ingress, but the response is lost.
+    if [ -n "$open_patch" ] && [ -n "$STUB_INGRESS_OPEN_LOST" ]; then exit 1; fi
     ;;
   "containerapp ingress") ;;
   *) echo "unexpected az call: $*" >&2; exit 2 ;;
@@ -3576,6 +3584,8 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_INGRESS_OPEN_LOST",
+        "STUB_APP_TAG_COUNT",
         "STUB_APP_LEGACY_ID",
         "STUB_TWO_PLACEHOLDERS",
         "STUB_APP_COPIED",
@@ -5749,6 +5759,78 @@ esac
                 >= 4,
             "stage 2 must wait until the clean revision is the only active one: {calls}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_rollback_closes_ingress_after_a_lost_open_response() {
+        // Azure accepts the PATCH that opens ingress, but the script gets no
+        // answer. The outcome is unknown, so a rollback must close ingress
+        // again before it brings the placeholder template back.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_INGRESS_OPEN_LOST", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let open_at = calls
+            .find("az ingress-patch external=true")
+            .expect("an open");
+        let after = &calls[open_at..];
+        let disable_at = after
+            .find("ingress disable")
+            .unwrap_or_else(|| panic!("the rollback must close ingress: {calls}"));
+        let patch_at = after[1..]
+            .find("az rest --method patch")
+            .map_or(usize::MAX, |i| i + 1);
+        assert!(disable_at < patch_at, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_the_snapshots_exceed_the_tag_limit() {
+        // Azure allows 50 tags. 49 of the operator's own leave no room for
+        // the ingress snapshot and the copied record, so the script stops
+        // before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_TAG_COUNT", "49"), ("STUB_APP_LEGACY", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fits_the_snapshots_into_the_tag_limit() {
+        // 48 own tags, one ingress part and one copied part: 50 tags fit.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_TAG_COUNT", "48")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
     }
 
     #[cfg(unix)]
