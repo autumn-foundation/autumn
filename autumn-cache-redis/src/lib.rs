@@ -649,7 +649,8 @@ fn register_cache_health_indicator(
     let Some(url) = config.cache.redis.url.as_deref() else {
         return;
     };
-    match autumn_web::redis_health::RedisHealthIndicator::new(url) {
+    // Share the app's connection to this URL with the built-in indicators.
+    match autumn_web::redis_health::RedisHealthIndicator::shared(state, url) {
         Ok(indicator) => {
             let indicator = indicator.configured(&config.health);
             let group = autumn_web::actuator::HealthIndicator::group(&indicator);

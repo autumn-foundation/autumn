@@ -4530,6 +4530,7 @@ impl AppBuilder {
             crate::redis_health::register_redis_health_indicators(
                 &config,
                 &state.health_indicator_registry,
+                &crate::redis_health::app_pingers(&state),
                 &unused_redis_subsystems,
             );
         }

@@ -2382,6 +2382,7 @@ impl TestApp {
         crate::redis_health::register_redis_health_indicators(
             &self.config,
             &state.health_indicator_registry,
+            &crate::redis_health::app_pingers(&state),
             if self.jobs.is_empty() {
                 &["channels", "jobs"]
             } else {

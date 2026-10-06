@@ -152,6 +152,17 @@ impl RedisHealthIndicator {
         Ok(Self::sharing(Arc::new(RedisPinger::new(url)?)))
     }
 
+    /// Build an indicator for `url` that shares the connection of the app's
+    /// other Redis indicators on the same URL. A plugin that installs a Redis
+    /// backend uses this, so the app opens one `PING` connection per server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `url` is not a valid Redis URL.
+    pub fn shared(state: &crate::AppState, url: &str) -> redis::RedisResult<Self> {
+        Ok(Self::sharing(app_pingers(state).for_url(url)?))
+    }
+
     const fn sharing(pinger: Arc<RedisPinger>) -> Self {
         Self {
             pinger,
@@ -305,6 +316,35 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
         .collect()
 }
 
+/// The `PING` connections of one app: one [`RedisPinger`] per Redis URL.
+/// The built-in indicators and [`RedisHealthIndicator::shared`] use the same
+/// map, so indicators on one URL share one connection and one `PING`.
+#[derive(Default)]
+pub(crate) struct RedisPingers(std::sync::Mutex<HashMap<String, Arc<RedisPinger>>>);
+
+impl RedisPingers {
+    /// The pinger for `url`. Build it on first use.
+    fn for_url(&self, url: &str) -> redis::RedisResult<Arc<RedisPinger>> {
+        let mut pingers = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinger = match pingers.entry(url.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                Arc::clone(entry.insert(Arc::new(RedisPinger::new(url)?)))
+            }
+        };
+        drop(pingers);
+        Ok(pinger)
+    }
+}
+
+/// The pinger map of `state`. Create it on first use.
+pub(crate) fn app_pingers(state: &crate::AppState) -> Arc<RedisPingers> {
+    state.extension_or_insert_with(RedisPingers::default)
+}
+
 /// The subsystems that a process with `role` does not use. A `worker` serves
 /// no user routes, so it uses no HTTP middleware and no webhook endpoints. It
 /// still publishes to channels and runs jobs.
@@ -331,6 +371,7 @@ pub(crate) const fn unused_for_role(role: crate::config::ProcessRole) -> &'stati
 pub(crate) fn register_redis_health_indicators(
     config: &AutumnConfig,
     registry: &HealthIndicatorRegistry,
+    pingers: &RedisPingers,
     skip: &[&str],
 ) {
     let group = if config.health.redis_readiness {
@@ -338,31 +379,21 @@ pub(crate) fn register_redis_health_indicators(
     } else {
         IndicatorGroup::HealthOnly
     };
-    // One kept connection per Redis server, not per subsystem.
-    let mut pingers: HashMap<String, Arc<RedisPinger>> = HashMap::new();
     for (subsystem, url) in redis_subsystems(config) {
         if skip.contains(&subsystem) {
             continue;
         }
         let name = format!("redis:{subsystem}");
-        let pinger = if let Some(pinger) = pingers.get(&url) {
-            Arc::clone(pinger)
-        } else {
-            match RedisPinger::new(&url) {
-                Ok(pinger) => {
-                    let pinger = Arc::new(pinger);
-                    pingers.insert(url.clone(), Arc::clone(&pinger));
-                    pinger
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        indicator = %name,
-                        url = %crate::redis_tls::redact_url(&url),
-                        error = %error,
-                        "Redis health indicator not registered: URL is not valid"
-                    );
-                    continue;
-                }
+        let pinger = match pingers.for_url(&url) {
+            Ok(pinger) => pinger,
+            Err(error) => {
+                tracing::warn!(
+                    indicator = %name,
+                    url = %crate::redis_tls::redact_url(&url),
+                    error = %error,
+                    "Redis health indicator not registered: URL is not valid"
+                );
+                continue;
             }
         };
         let indicator = RedisHealthIndicator::sharing(pinger).configured(&config.health);
@@ -515,13 +546,13 @@ mod tests {
         config.session.redis.url = Some("redis://127.0.0.1:1".to_owned());
 
         let health_only = HealthIndicatorRegistry::new();
-        register_redis_health_indicators(&config, &health_only, &[]);
+        register_redis_health_indicators(&config, &health_only, &RedisPingers::default(), &[]);
         assert!(health_only.contains("redis:sessions"));
         assert!(health_only.run_readiness().await.is_empty());
 
         config.health.redis_readiness = true;
         let readiness = HealthIndicatorRegistry::new();
-        register_redis_health_indicators(&config, &readiness, &[]);
+        register_redis_health_indicators(&config, &readiness, &RedisPingers::default(), &[]);
         let results = readiness.run_readiness().await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "redis:sessions");
@@ -536,7 +567,12 @@ mod tests {
         config.jobs.redis.url = Some("redis://127.0.0.1:1".to_owned());
         let registry = HealthIndicatorRegistry::new();
 
-        register_redis_health_indicators(&config, &registry, &["sessions"]);
+        register_redis_health_indicators(
+            &config,
+            &registry,
+            &RedisPingers::default(),
+            &["sessions"],
+        );
 
         assert!(!registry.contains("redis:sessions"));
         assert!(registry.contains("redis:jobs"));
@@ -810,7 +846,7 @@ mod tests {
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = Some(redis.url());
         let registry = HealthIndicatorRegistry::new();
-        register_redis_health_indicators(&config, &registry, &[]);
+        register_redis_health_indicators(&config, &registry, &RedisPingers::default(), &[]);
 
         let results = registry.run_all().await;
 
@@ -876,7 +912,7 @@ mod tests {
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = Some(redis.url());
         let registry = HealthIndicatorRegistry::new();
-        register_redis_health_indicators(&config, &registry, &[]);
+        register_redis_health_indicators(&config, &registry, &RedisPingers::default(), &[]);
 
         let results = registry.run_all().await;
 
@@ -895,5 +931,31 @@ mod tests {
                 .all(|r| r.output.status == HealthStatus::Up)
         );
         assert_eq!(redis.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_indicator_reuses_the_apps_connection() {
+        // `RedisCachePlugin` registers `redis:cache` with `shared`. On the
+        // same URL as a built-in subsystem, it must use the same pinger.
+        let redis = FakeRedis::start(Duration::ZERO).await;
+        let state = crate::AppState::for_test();
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Redis;
+        config.session.redis.url = Some(redis.url());
+        let registry = state.health_indicator_registry();
+        register_redis_health_indicators(&config, registry, &app_pingers(&state), &[]);
+        let cache = RedisHealthIndicator::shared(&state, &redis.url()).expect("valid url");
+        registry
+            .register("redis:cache", cache.group(), Arc::new(cache))
+            .expect("unique name");
+
+        let results = registry.run_all().await;
+
+        let up = results
+            .iter()
+            .filter(|r| r.name.starts_with("redis:") && r.output.status == HealthStatus::Up)
+            .count();
+        assert_eq!(up, 2, "{results:?}");
+        assert_eq!(redis.accepted(), 1, "one connection for both indicators");
     }
 }

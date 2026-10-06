@@ -245,7 +245,9 @@ The framework registers one indicator for each subsystem that runs on Redis:
 `submit_token` and `webhook_replay`. A subsystem that is off gets none (for
 example, idempotency without `enabled = true`, webhook replay with no
 replay-protected endpoint, or jobs when the app has no jobs). `RedisCachePlugin`
-registers `redis:cache` when it installs the Redis cache. Without the plugin,
+registers `redis:cache` when it installs the Redis cache, with
+`RedisHealthIndicator::shared`, so it shares the connection of the other
+indicators on the same URL. Without the plugin,
 `cache.backend = "redis"` gets no indicator. `rate_limit` follows
 `security.rate_limit.backend = "redis"` also when the global limiter is off,
 because `#[throttle]` routes use that backend. A `worker` replica serves no user

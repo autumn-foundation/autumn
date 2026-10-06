@@ -1780,7 +1780,9 @@ redis_readiness = false  # true: redis:<subsystem> indicators gate /ready
   (feature `redis`); `RedisCachePlugin` adds `redis:cache`. It is health-only
   by default, because all replicas share Redis. For another Redis, register
   `autumn_web::redis_health::RedisHealthIndicator::new(url)?.configured(&config.health)`
-  with `.health_indicator(name, Arc::new(..))`.
+  with `.health_indicator(name, Arc::new(..))`. A plugin that has the
+  `AppState` uses `RedisHealthIndicator::shared(&state, url)` instead, so it
+  shares the app's one `PING` connection per URL.
 - Registered indicators are cached too
   (`HealthIndicatorRegistry::set_cache_ttl`). In a `TestApp` test that flips an
   indicator and reads it again at once, set `health.cache_ttl_ms = 0`.
