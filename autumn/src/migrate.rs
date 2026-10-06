@@ -304,6 +304,11 @@ impl Migration<Pg> for LockTimeoutMigration {
         &self,
         conn: &mut dyn diesel::connection::BoxableConnection<Pg>,
     ) -> diesel::migration::Result<()> {
+        // A non-transactional migration leaves the session at
+        // `lock_timeout = 0` on purpose. Diesel inserts its version after
+        // `run` returns, outside any transaction: a timeout there would leave
+        // `CREATE INDEX CONCURRENTLY` applied but unrecorded, and the retry
+        // would run it again. The next migration sets its own value first.
         conn.batch_execute(&migration_lock_sql(
             self.inner.metadata().run_in_transaction(),
             self.lock_timeout,
@@ -641,6 +646,37 @@ pub fn server_lock_timeout_is_off(database_url: &str) -> bool {
         .map_err(|e| MigrationError::Migration(e.to_string()))
     });
     result.is_ok_and(|value| value.trim() == "0")
+}
+
+/// [`pending_migrations`], with `lock_timeout` set for the session first, so
+/// a lock held on `__diesel_schema_migrations` fails fast instead of blocking
+/// (#3057). The `autumn migrate` CLI reads its pending set with this, under
+/// [`retry_on_lock_timeout`].
+///
+/// # Errors
+///
+/// As [`pending_migrations`]. A lock timeout is a [`MigrationError::Migration`]
+/// that [`retry_on_lock_timeout`] retries.
+#[doc(hidden)]
+pub fn pending_migrations_with_lock_timeout(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
+    lock_timeout: std::time::Duration,
+) -> Result<Vec<String>, MigrationError> {
+    with_migration_connection!(database_url, |conn| {
+        use diesel::connection::SimpleConnection as _;
+        // English messages, so the retry can read a lock timeout.
+        let _ = conn.batch_execute("SET lc_messages = 'C'");
+        conn.batch_execute(&session_lock_timeout_statement(lock_timeout))
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
+        let pending = conn
+            .pending_migrations(migrations)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
+        Ok(pending
+            .iter()
+            .map(|m| m.name().version().to_string())
+            .collect())
+    })
 }
 
 /// Return names of pending (not yet applied) migrations.
@@ -5648,6 +5684,59 @@ mod tests {
             run_pending_locked_with_policy(&url, LOCK_PROBE_MIGRATIONS, None, policy)
         });
         let result = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+
+        match result
+            .expect("must not block on the migrations table")
+            .expect("join")
+        {
+            Err(MigrationError::LockContention { attempts, .. }) => assert_eq!(attempts, 2),
+            other => panic!("expected LockContention, got {other:?}"),
+        }
+    }
+
+    /// The CLI reads its pending set before it batches. A lock held on
+    /// `__diesel_schema_migrations` must fail that read fast too.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn the_pending_read_fails_fast_on_a_held_migrations_table_lock() {
+        let (_container, url) = lock_probe_database().await;
+        let first_url = url.clone();
+        crate::time::spawn_blocking(move || {
+            run_pending_locked_with_policy(
+                &first_url,
+                LOCK_PROBE_MIGRATIONS,
+                None,
+                MigrationLockPolicy::default(),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("the first run creates the migrations table");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = hold_table_lock(
+            url.clone(),
+            release_rx,
+            "__diesel_schema_migrations",
+            "ACCESS EXCLUSIVE",
+        );
+        let policy = MigrationLockPolicy {
+            lock_timeout: std::time::Duration::from_millis(200),
+            retries: 1,
+        };
+        let read = crate::time::spawn_blocking(move || {
+            retry_on_lock_timeout(policy, std::thread::sleep, || {
+                pending_migrations_with_lock_timeout(
+                    &url,
+                    LOCK_PROBE_MIGRATIONS,
+                    policy.lock_timeout,
+                )
+            })
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), read).await;
         release_tx.send(()).expect("release");
         holder.join().expect("holder");
 

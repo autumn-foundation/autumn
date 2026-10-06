@@ -1656,9 +1656,10 @@ jobs:
               migrate::tests::superuser_may_set_lc_messages \
               migrate::tests::a_held_lock_on_the_migrations_table_fails_fast \
               migrate::tests::server_lock_timeout_is_off_reads_the_database_default \
+              migrate::tests::the_pending_read_fails_fast_on_a_held_migrations_table_lock \
               | tee "${RUNNER_TEMP}/migration-lock-timeout.log"
           )
-          grep -qE 'test result: ok\. 6 passed' "${RUNNER_TEMP}/migration-lock-timeout.log" \
+          grep -qE 'test result: ok\. 7 passed' "${RUNNER_TEMP}/migration-lock-timeout.log" \
             || { echo "::error::the migration lock_timeout tests did not all run — the ci.yml filters no longer match"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           # Issue #2108: the same AdminModel cover as token_admin_db, for the

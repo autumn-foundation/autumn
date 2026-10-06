@@ -1777,12 +1777,13 @@ fn run_user_migrations(
     let non_transactional: std::collections::HashSet<String> =
         non_transactional_versions(dir).into_iter().collect();
     let pending = if non_transactional.is_empty() {
-        None
+        Ok(None)
     } else {
-        pending_versions(database_url, dir)
+        pending_versions(database_url, dir, lock_policy)
     };
     let outcome = match pending {
-        Some(pending) if pending.iter().any(|v| non_transactional.contains(v)) => {
+        Err(e) => Err(e),
+        Ok(Some(pending)) if pending.iter().any(|v| non_transactional.contains(v)) => {
             run_diesel_in_batches(
                 database_url,
                 dir,
@@ -1792,10 +1793,10 @@ fn run_user_migrations(
             )
         }
         // All pending migrations are transactional.
-        Some(_) => run_diesel_with_policy(database_url, dir, lock_policy, true, english),
+        Ok(Some(_)) => run_diesel_with_policy(database_url, dir, lock_policy, true, english),
         // No non-transactional migration exists, or the pending set is
         // unknown: then the timeout stays off when one exists.
-        None => run_diesel_with_policy(
+        Ok(None) => run_diesel_with_policy(
             database_url,
             dir,
             lock_policy,
@@ -1878,6 +1879,9 @@ fn run_diesel_with_policy(
         !transactional,
         english,
     );
+    // After a pooler fallback, transactional migrations run from a copy that
+    // sets the timeout inside each migration's own transaction.
+    let mut fallback_dir: Option<tempfile::TempDir> = None;
     autumn_web::migrate::retry_on_lock_timeout(
         lock_policy,
         |delay| {
@@ -1887,39 +1891,111 @@ fn run_diesel_with_policy(
             );
             std::thread::sleep(delay);
         },
-        || match run_diesel_migrations_once(database_url, dir, pgoptions.as_deref()) {
-            Err(MigrationError::Migration(text)) if startup_options_rejected(&text) => {
-                let base = pooler_fallback_base(inherited.as_deref(), transactional);
-                let Some(fallback) = pooler_fallback(pgoptions.as_deref(), base.as_deref()) else {
-                    return Err(MigrationError::Migration(text));
-                };
-                // The fallback cannot send `lock_timeout=0`. A role or
-                // database default would then cancel `CREATE INDEX
-                // CONCURRENTLY` and leave an INVALID index, so a
-                // non-transactional batch runs only when the server default
-                // is already off.
-                if !pooler_fallback_is_safe(transactional, || {
-                    autumn_web::migrate::server_lock_timeout_is_off(database_url)
-                }) {
-                    return Err(MigrationError::Migration(format!(
-                        "{text}\nThe server refused PGOPTIONS (a pooler such as PgBouncer?), so \
+        || {
+            let run_dir = fallback_dir.as_ref().map_or(dir, tempfile::TempDir::path);
+            match run_diesel_migrations_once(database_url, run_dir, pgoptions.as_deref()) {
+                Err(MigrationError::Migration(text)) if startup_options_rejected(&text) => {
+                    let base = pooler_fallback_base(inherited.as_deref(), transactional);
+                    let Some(fallback) = pooler_fallback(pgoptions.as_deref(), base.as_deref())
+                    else {
+                        return Err(MigrationError::Migration(text));
+                    };
+                    // The fallback cannot send `lock_timeout=0`. A role or
+                    // database default would then cancel `CREATE INDEX
+                    // CONCURRENTLY` and leave an INVALID index, so a
+                    // non-transactional batch runs only when the server default
+                    // is already off.
+                    if !pooler_fallback_is_safe(transactional, || {
+                        autumn_web::migrate::server_lock_timeout_is_off(database_url)
+                    }) {
+                        return Err(MigrationError::Migration(format!(
+                            "{text}\nThe server refused PGOPTIONS (a pooler such as PgBouncer?), so \
                          lock_timeout=0 cannot be sent, and the role or database sets a \
                          nonzero lock_timeout. A run_in_transaction = false migration \
                          (CREATE INDEX CONCURRENTLY) would be cancelled and leave an INVALID \
                          index. Run migrations against Postgres directly, or set \
                          lock_timeout = 0 for the migration role."
-                    )));
+                        )));
+                    }
+                    pgoptions = fallback;
+                    if transactional {
+                        // A transaction pooler drops a startup option but keeps a
+                        // `SET LOCAL` for the transaction that issued it.
+                        let copy = tempfile::TempDir::new().map_err(|e| {
+                        MigrationError::Migration(format!(
+                            "could not create a migration directory for the pooler fallback: {e}"
+                        ))
+                    })?;
+                        copy_with_lock_timeout(
+                            dir,
+                            copy.path(),
+                            lock_policy.lock_timeout,
+                            &non_transactional_versions(dir).into_iter().collect(),
+                        )
+                        .map_err(|e| {
+                            MigrationError::Migration(format!(
+                                "could not copy migrations for the pooler fallback: {e}"
+                            ))
+                        })?;
+                        fallback_dir = Some(copy);
+                        eprintln!(
+                            "  The server refused PGOPTIONS (a pooler such as PgBouncer?); running \
+                         again with lock_timeout set inside each migration's transaction."
+                        );
+                    } else {
+                        eprintln!(
+                            "  The server refused PGOPTIONS (a pooler such as PgBouncer?); running \
+                         again without it (the server lock_timeout is already 0)."
+                        );
+                    }
+                    let run_dir = fallback_dir.as_ref().map_or(dir, tempfile::TempDir::path);
+                    run_diesel_migrations_once(database_url, run_dir, pgoptions.as_deref())
                 }
-                eprintln!(
-                    "  The server refused PGOPTIONS (a pooler such as PgBouncer?); \
-                     running again with only the inherited options, without lock_timeout."
-                );
-                pgoptions = fallback;
-                run_diesel_migrations_once(database_url, dir, pgoptions.as_deref())
+                other => other,
             }
-            other => other,
         },
     )
+}
+
+/// Copy the migration directories in `src` into `dst`. Each transactional
+/// migration's `up.sql` starts with `SET LOCAL lock_timeout = <ms>;`, which
+/// `diesel` runs inside that migration's transaction. Versions in
+/// `non_transactional` are copied unchanged.
+fn copy_with_lock_timeout(
+    src: &Path,
+    dst: &Path,
+    lock_timeout: std::time::Duration,
+    non_transactional: &std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    let ms = u64::try_from(lock_timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(i32::MAX.unsigned_abs().into());
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let transactional = !non_transactional.contains(&migration_dir_version(&name));
+        let target = dst.join(&name);
+        std::fs::create_dir_all(&target)?;
+        for file in std::fs::read_dir(entry.path())? {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            if transactional && file.file_name() == "up.sql" {
+                let body = std::fs::read_to_string(file.path())?;
+                std::fs::write(
+                    target.join("up.sql"),
+                    format!("SET LOCAL lock_timeout = {ms};\n{body}"),
+                )?;
+            } else {
+                std::fs::copy(file.path(), target.join(file.file_name()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `database_url` without its `options` parameter, and that parameter's
@@ -2049,9 +2125,12 @@ fn split_keyword_options(conninfo: &str) -> (String, Option<String>) {
 }
 
 /// Whether a batch may run again without its startup options. A
-/// transactional batch may: each migration sets `SET LOCAL lock_timeout`
-/// itself. A non-transactional one may only when the server default is
-/// already off (`server_lock_timeout_is_off`, asked only then).
+/// transactional batch may: it runs from a copy whose migrations set
+/// `SET LOCAL lock_timeout` themselves (`copy_with_lock_timeout`). A
+/// non-transactional one may only when the server default is already off
+/// (`server_lock_timeout_is_off`, asked only then): outside a transaction, a
+/// pooler can send each statement to a different server connection, so a
+/// `SET` in the file would not reach the `CREATE INDEX CONCURRENTLY`.
 fn pooler_fallback_is_safe(
     transactional: bool,
     server_lock_timeout_is_off: impl FnOnce() -> bool,
@@ -2102,13 +2181,43 @@ fn non_transactional_versions(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// The pending migration versions in `dir`, in version order. `None` when
-/// they cannot be read.
-fn pending_versions(database_url: &str, dir: &Path) -> Option<Vec<String>> {
-    let source = diesel_migrations::FileBasedMigrations::from_path(dir).ok()?;
-    let mut pending = autumn_web::migrate::pending_migrations(database_url, source).ok()?;
-    pending.sort();
-    Some(pending)
+/// The pending migration versions in `dir`, in version order. `Ok(None)`
+/// when they cannot be read. The read runs under `lock_policy`, so a lock on
+/// `__diesel_schema_migrations` fails fast and is retried; a lock that
+/// outlasts the retries is an error, not an unknown pending set.
+fn pending_versions(
+    database_url: &str,
+    dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> Result<Option<Vec<String>>, MigrationError> {
+    let Ok(source) = diesel_migrations::FileBasedMigrations::from_path(dir) else {
+        return Ok(None);
+    };
+    let read = autumn_web::migrate::retry_on_lock_timeout(
+        lock_policy,
+        |delay| {
+            eprintln!(
+                "  Reading the pending migrations timed out on a table lock; retrying in {}ms\u{2026}",
+                delay.as_millis()
+            );
+            std::thread::sleep(delay);
+        },
+        || {
+            autumn_web::migrate::pending_migrations_with_lock_timeout(
+                database_url,
+                source.clone(),
+                lock_policy.lock_timeout,
+            )
+        },
+    );
+    match read {
+        Ok(mut pending) => {
+            pending.sort();
+            Ok(Some(pending))
+        }
+        Err(e @ MigrationError::LockContention { .. }) => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 /// `pending` split into runs of the same kind, in order. `true` marks a run
@@ -5128,6 +5237,55 @@ primary_url = "postgres://prod-s0:5432/app"
             split_url_options("postgres://db/app?sslmode=require"),
             ("postgres://db/app?sslmode=require".to_owned(), None)
         );
+    }
+
+    #[test]
+    fn the_pooler_fallback_copy_sets_lock_timeout_in_each_transactional_migration() {
+        let src = tempfile::TempDir::new().expect("src");
+        for (name, up) in [
+            (
+                "2026-01-01-000000_add_column",
+                "ALTER TABLE t ADD COLUMN c INT;\n",
+            ),
+            (
+                "2026-01-02-000000_index",
+                "CREATE INDEX CONCURRENTLY i ON t (c);\n",
+            ),
+        ] {
+            let dir = src.path().join(name);
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::write(dir.join("up.sql"), up).expect("up");
+            std::fs::write(dir.join("down.sql"), "SELECT 1;\n").expect("down");
+        }
+        std::fs::write(src.path().join("README"), "not a migration").expect("file");
+        let dst = tempfile::TempDir::new().expect("dst");
+        let non_transactional = std::iter::once("20260102000000".to_owned()).collect();
+
+        copy_with_lock_timeout(
+            src.path(),
+            dst.path(),
+            std::time::Duration::from_secs(5),
+            &non_transactional,
+        )
+        .expect("copy");
+
+        let read = |name: &str, file: &str| {
+            std::fs::read_to_string(dst.path().join(name).join(file)).expect("read")
+        };
+        assert_eq!(
+            read("2026-01-01-000000_add_column", "up.sql"),
+            "SET LOCAL lock_timeout = 5000;\nALTER TABLE t ADD COLUMN c INT;\n"
+        );
+        assert_eq!(
+            read("2026-01-02-000000_index", "up.sql"),
+            "CREATE INDEX CONCURRENTLY i ON t (c);\n",
+            "a non-transactional migration is copied unchanged"
+        );
+        assert_eq!(
+            read("2026-01-01-000000_add_column", "down.sql"),
+            "SELECT 1;\n"
+        );
+        assert!(!dst.path().join("README").exists());
     }
 
     #[test]
