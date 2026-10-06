@@ -1605,6 +1605,26 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
 /// Type alias for a redirect-`Location` validator.
 type RedirectValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+tokio::task_local! {
+    /// The last redirect target the pooled client followed during one send.
+    /// An error does not say which host failed after a redirect, so the
+    /// plain path reads it here to charge that host's budget.
+    static FOLLOWED: std::cell::RefCell<Option<String>>;
+}
+
+/// Send `req` on the pooled client. Also return the last redirect target the
+/// HTTP stack followed, if any.
+async fn send_tracking_redirects(
+    req: reqwest::RequestBuilder,
+) -> (Result<reqwest::Response, reqwest::Error>, Option<String>) {
+    FOLLOWED
+        .scope(std::cell::RefCell::new(None), async {
+            let sent = req.send().await;
+            (sent, FOLLOWED.with(|last| last.borrow_mut().take()))
+        })
+        .await
+}
+
 /// The hop limit of the plain send path, as in reqwest's default policy.
 const PLAIN_MAX_REDIRECTS: usize = 10;
 
@@ -1620,6 +1640,7 @@ fn pooled_redirect_policy() -> reqwest::redirect::Policy {
         } else if attempt.previous().len() >= PLAIN_MAX_REDIRECTS {
             attempt.error("too many redirects")
         } else {
+            let _ = FOLLOWED.try_with(|last| *last.borrow_mut() = Some(attempt.url().to_string()));
             attempt.follow()
         }
     })
@@ -2185,7 +2206,8 @@ impl RequestBuilder {
                 req = req.body(body.clone());
             }
 
-            match req.send().await {
+            let (sent, followed) = send_tracking_redirects(req).await;
+            match sent {
                 Ok(resp) => {
                     let status = resp.status();
                     let headers = resp.headers().clone();
@@ -2241,6 +2263,11 @@ impl RequestBuilder {
                 // Only retry transient connect/timeout errors; non-transient errors
                 // (e.g. malformed URL) fail immediately.
                 Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
+                    // The HTTP stack may have followed a redirect: charge the
+                    // host that failed.
+                    if let Some(url) = &followed {
+                        gate.rekey(url);
+                    }
                     let wait = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
                     if !gate.allow(RetryKind::Transient, wait) {
                         return Err(ClientError::Request(e.without_url()));
@@ -6296,6 +6323,39 @@ mod tests {
                 *at_target + 400 <= *at_origin,
                 "the target gets the time left after the redirect: {seen:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn a_redirected_connect_error_charges_the_destination_budget() {
+            // A port with nothing listening on it.
+            let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dead_port = closed.local_addr().unwrap().port();
+            drop(closed);
+            let target = format!("http://127.0.0.1:{dead_port}/t");
+            let app = axum::Router::new().route(
+                "/r",
+                axum::routing::get(move || {
+                    let target = target.clone();
+                    async move { axum::response::Redirect::temporary(&target) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let client = Client::from_config(&crate::config::HttpClientConfig::default());
+            let budgets = client.retry.budgets.clone().unwrap();
+            let result = client
+                .get(format!("http://127.0.0.1:{origin_port}/r"))
+                .retries(1)
+                .send()
+                .await;
+            assert!(result.is_err(), "{result:?}");
+            let full = f64::from(RetryBudgetConfig::default().capacity);
+            let origin = budgets.for_host(&format!("127.0.0.1:{origin_port}"));
+            let destination = budgets.for_host(&format!("127.0.0.1:{dead_port}"));
+            assert!((origin.available() - full).abs() < f64::EPSILON, "origin");
+            assert!(destination.available() < full, "the destination paid");
         }
 
         #[tokio::test]
