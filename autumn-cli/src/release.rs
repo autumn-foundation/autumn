@@ -3477,6 +3477,11 @@ case "$1 $2" in
           | if $scale_id == "" then .
             else .scale = {rules: [{name: "h", http: {metadata: {concurrentRequests: "10"},
                    identity: $scale_id}}]} end' <<< "$app")
+        # The active placeholder revision still has a sidecar from the ACR,
+        # which the template no longer has.
+        if [ -n "$STUB_ACTIVE_SIDECAR_ACR" ] && [[ " $* " == *" --revision app--old "* ]]; then
+          template=$(jq -c '.containers |= map(if .name == "sidecar" then .image = "acr.azurecr.io/side:1" else . end)' <<< "$template")
+        fi
         # Azure can rewrite the secret refs of a new revision to a secret that
         # does not exist (azure-container-apps issue 1705).
         if [ -n "$STUB_REVISION_REWRITTEN" ] && [[ " $* " != *" --revision app--old "* ]]; then
@@ -3626,6 +3631,7 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_ACTIVE_SIDECAR_ACR",
         "STUB_REVISION_REWRITTEN",
         "STUB_SIDECAR_ACR",
         "STUB_APP_REGISTRY_PASSWORD_REF",
@@ -6098,6 +6104,33 @@ esac
             "{calls}"
         );
         assert!(!calls.contains("az ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_an_active_placeholder_has_an_acr_sidecar() {
+        // The template no longer has the ACR sidecar, but the active
+        // placeholder revision does, and stage 1 starts from that revision.
+        // The script stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_LEGACY", "1"), ("STUB_ACTIVE_SIDECAR_ACR", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
     }
 
     #[cfg(unix)]
