@@ -2195,6 +2195,9 @@ impl RequestBuilder {
         }
         let mut last_retry = None;
         let mut delay = Duration::ZERO;
+        // Hosts refilled for this request: the first one already was.
+        let mut refilled: std::collections::HashSet<String> =
+            url_host(&self.url).into_iter().collect();
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -2227,6 +2230,9 @@ impl RequestBuilder {
             }
 
             let (sent, followed) = send_tracking_redirects(req).await;
+            // Each host that served a redirect gets its refill, even when
+            // the send or the body fails later.
+            gate.record_destinations(&followed, &mut refilled);
             match sent {
                 Ok(resp) => {
                     let status = resp.status();
@@ -2259,7 +2265,6 @@ impl RequestBuilder {
                     };
                     // Refund only after the body arrived.
                     gate.finish(last_retry, status.as_u16());
-                    gate.record_destinations(&followed);
                     let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
@@ -3071,10 +3076,18 @@ impl RetryGate {
 
     /// Move to the budget of `url`'s host when it is not the current host,
     /// for example after the HTTP stack followed a redirect.
+    ///
+    /// The plain path refills a redirect host with
+    /// [`record_destinations`](Self::record_destinations), so this does not.
     fn rekey(&mut self, url: &str) {
         let host = url_host(url);
         if host.is_some() && host != self.host {
-            *self = self.for_hop(url);
+            self.budget = self
+                .budgets
+                .as_deref()
+                .zip(host.as_deref())
+                .map(|(budgets, host)| budgets.for_host(host));
+            self.host = host;
         }
     }
 
@@ -3093,9 +3106,8 @@ impl RetryGate {
     }
 
     /// [`record_destination`](Self::record_destination) for each host of a
-    /// redirect chain, once per host.
-    fn record_destinations(&self, urls: &[String]) {
-        let mut seen = std::collections::HashSet::new();
+    /// redirect chain that is not in `seen`, then add it to `seen`.
+    fn record_destinations(&self, urls: &[String], seen: &mut std::collections::HashSet<String>) {
         for url in urls {
             if url_host(url).is_some_and(|host| seen.insert(host)) {
                 self.record_destination(url);
@@ -3405,7 +3417,7 @@ async fn send_one(
                 left.fetch_sub(1, Ordering::Relaxed);
             }
             if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
-                return Err(deadline_exceeded_err(&mut last_transient_err));
+                return Err(gate.classify(deadline_exceeded_err(&mut last_transient_err)));
             }
             let mut sleep_for = delay;
             if let Some(d) = deadline {
@@ -3414,7 +3426,7 @@ async fn send_one(
             }
             tokio::time::sleep(sleep_for).await;
             if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
-                return Err(deadline_exceeded_err(&mut last_transient_err));
+                return Err(gate.classify(deadline_exceeded_err(&mut last_transient_err)));
             }
         }
 
@@ -6479,11 +6491,15 @@ mod tests {
             let (middle_before, last_before) = (middle.available(), last.available());
             let gate =
                 RetryGate::with_deadline(None, Some(Arc::clone(&budgets)), Some("a:443"), true);
-            gate.record_destinations(&[
-                "https://b/1".to_owned(),
-                "https://c/2".to_owned(),
-                "https://c/3".to_owned(),
-            ]);
+            let mut seen = std::collections::HashSet::new();
+            gate.record_destinations(
+                &[
+                    "https://b/1".to_owned(),
+                    "https://c/2".to_owned(),
+                    "https://c/3".to_owned(),
+                ],
+                &mut seen,
+            );
             assert!(middle.available() > middle_before, "the middle host");
             let one_refill = middle.available() - middle_before;
             assert!(
@@ -6636,6 +6652,45 @@ mod tests {
                 "the origin pays the retry after its own timeout: {}",
                 origin.available()
             );
+        }
+
+        #[tokio::test]
+        async fn a_redirect_host_is_refilled_when_the_final_body_fails() {
+            // The target's body fails after the head.
+            let target_app = axum::Router::new().route(
+                "/t",
+                axum::routing::get(|| async {
+                    axum::body::Body::from_stream(futures::stream::once(async {
+                        Err::<Bytes, _>(std::io::Error::other("broken body"))
+                    }))
+                }),
+            );
+            let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_port = target_listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(target_listener, target_app).await.unwrap() });
+            let target = format!("http://127.0.0.1:{target_port}/t");
+            let origin_app = axum::Router::new().route(
+                "/r",
+                axum::routing::get(move || {
+                    let target = target.clone();
+                    async move { axum::response::Redirect::temporary(&target) }
+                }),
+            );
+            let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin_listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(origin_listener, origin_app).await.unwrap() });
+
+            let client = Client::new();
+            let budgets = client.retry.budgets.clone().unwrap();
+            let drained = budgets.for_host(&format!("127.0.0.1:{target_port}"));
+            while drained.try_acquire(RetryKind::Transient) {}
+            let before = drained.available();
+            let result = client
+                .get(format!("http://127.0.0.1:{origin_port}/r"))
+                .send()
+                .await;
+            assert!(result.is_err(), "{result:?}");
+            assert!(drained.available() > before, "the target got its refill");
         }
 
         #[tokio::test]
