@@ -35,6 +35,19 @@ async fn limited() -> impl WsHandler {
     }
 }
 
+/// A `split()` handler whose writer half waits for work that never comes.
+#[ws("/split")]
+async fn split_writer() -> impl WsHandler {
+    |socket: WebSocket| async move {
+        let (sink, mut stream) = socket.split();
+        tokio::spawn(async move {
+            let _sink = sink;
+            std::future::pending::<()>().await;
+        });
+        while let Some(Ok(_)) = stream.next().await {}
+    }
+}
+
 /// A handler on the axum socket. It keeps the hold for the socket's life.
 #[get("/raw")]
 async fn raw(ws: autumn_web::ws::WebSocketUpgrade) -> axum::response::Response {
@@ -50,7 +63,7 @@ async fn serve_with(configure: impl FnOnce(&mut AutumnConfig)) -> SocketAddr {
     configure(&mut config);
     let router = TestApp::new()
         .config(config)
-        .routes(routes![limited, raw])
+        .routes(routes![limited, raw, split_writer])
         .build()
         .into_router();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -203,5 +216,33 @@ async fn into_parts_keeps_the_connection_slot() {
             assert_eq!(response.status().as_u16(), 503);
         }
         other => panic!("expected an HTTP rejection, got {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_close_releases_a_split_socket() {
+    let addr = serve_with(|c| {
+        c.realtime.max_connections = Some(1);
+        c.realtime.idle_timeout_ms = Some(200);
+    })
+    .await;
+    // This client never reads, so it never answers the close frame.
+    let (_silent, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
+        .await
+        .expect("first socket");
+    // After the idle close, the slot is free, although the writer half lives.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the closed socket still holds the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

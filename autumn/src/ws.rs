@@ -434,8 +434,12 @@ const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The timers run only while the handler reads (`recv` or `next`). A
 /// handler that never reads gets no pings and no idle timeout.
+///
+/// When the stream ends, the socket drops its transport and its connection
+/// slot, also when a `split()` sink half lives on. A later send fails.
 pub struct WebSocket {
-    inner: axum::extract::ws::WebSocket,
+    /// `None` after the stream ends: the transport is dropped.
+    inner: Option<axum::extract::ws::WebSocket>,
     ping: Option<(Duration, Pin<Box<tokio::time::Sleep>>)>,
     idle: Option<(Duration, Pin<Box<tokio::time::Sleep>>)>,
     ping_due: bool,
@@ -482,7 +486,7 @@ impl WebSocket {
         hold: ConnectionHold,
     ) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             ping: limits.ping_interval.map(timer),
             idle: limits.idle_timeout.map(timer),
             ping_due: false,
@@ -520,21 +524,51 @@ impl WebSocket {
     /// The subprotocol the server selected, if any.
     #[must_use]
     pub fn protocol(&self) -> Option<&axum::http::HeaderValue> {
-        self.inner.protocol()
+        self.inner.as_ref().and_then(|socket| socket.protocol())
     }
 
     /// The axum socket, without the `[realtime]` limits. The connection slot
     /// is released. To keep it, use [`into_parts`](Self::into_parts).
+    ///
+    /// # Panics
+    ///
+    /// Panics after the stream ended. The socket is then closed.
     #[must_use]
     pub fn into_inner(self) -> axum::extract::ws::WebSocket {
-        self.inner
+        self.inner.expect("the WebSocket is closed")
     }
 
     /// The axum socket, without the `[realtime]` limits, and the
     /// [`ConnectionHold`]. Keep the hold for the life of the socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics after the stream ended. The socket is then closed.
     #[must_use]
     pub fn into_parts(self) -> (axum::extract::ws::WebSocket, ConnectionHold) {
-        (self.inner, self.hold)
+        (self.inner.expect("the WebSocket is closed"), self.hold)
+    }
+
+    /// The axum socket. An error after the stream ended.
+    fn socket(&mut self) -> Result<&mut axum::extract::ws::WebSocket, axum::Error> {
+        self.inner.as_mut().ok_or_else(|| {
+            axum::Error::new(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "the WebSocket is closed",
+            ))
+        })
+    }
+
+    /// The stream ended. Drop the transport and release the hold, also when
+    /// a `split()` sink half lives on. A waiting writer gets an error.
+    fn finish(&mut self) {
+        self.done = true;
+        self.inner = None;
+        self.hold = ConnectionHold {
+            _permit: None,
+            _tunnel: None,
+        };
+        self.wake_writer();
     }
 
     fn start_close(&mut self, frame: Message, then: AfterClose) {
@@ -565,23 +599,24 @@ impl WebSocket {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Message, axum::Error>>> {
         use futures::Sink as _;
-        let Some(closing) = self.closing.as_mut() else {
+        let (Some(closing), Some(inner)) = (self.closing.as_mut(), self.inner.as_mut()) else {
+            self.finish();
             return Poll::Ready(None);
         };
         let mut sent = true;
         if let Some(frame) = closing.frame.take() {
-            match Pin::new(&mut self.inner).poll_ready(cx) {
+            match Pin::new(&mut *inner).poll_ready(cx) {
                 Poll::Pending => {
                     closing.frame = Some(frame);
                     sent = false;
                 }
                 Poll::Ready(Ok(())) => {
-                    let _ = Pin::new(&mut self.inner).start_send(frame);
+                    let _ = Pin::new(&mut *inner).start_send(frame);
                 }
                 Poll::Ready(Err(_)) => {}
             }
         }
-        let flushed = sent && Pin::new(&mut self.inner).poll_flush(cx).is_ready();
+        let flushed = sent && Pin::new(inner).poll_flush(cx).is_ready();
         let timed_out = !flushed && closing.deadline.as_mut().poll(cx).is_ready();
         let then = if flushed || timed_out {
             closing.then.take()
@@ -589,8 +624,7 @@ impl WebSocket {
             self.wake_writer();
             return Poll::Pending;
         };
-        self.wake_writer();
-        self.done = true;
+        self.finish();
         Poll::Ready(match then {
             Some(AfterClose::Error(error)) => Some(Err(error)),
             Some(AfterClose::End) | None => None,
@@ -600,18 +634,21 @@ impl WebSocket {
     /// Send a due ping and flush it. Errors surface on the next read or send.
     fn poll_ping(&mut self, cx: &mut Context<'_>) {
         use futures::Sink as _;
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
         if self.ping_due {
-            match Pin::new(&mut self.inner).poll_ready(cx) {
+            match Pin::new(&mut *inner).poll_ready(cx) {
                 Poll::Ready(Ok(())) => {
                     let ping = Message::Ping(axum::body::Bytes::from_static(PING_PAYLOAD));
-                    self.flush_due = Pin::new(&mut self.inner).start_send(ping).is_ok();
+                    self.flush_due = Pin::new(&mut *inner).start_send(ping).is_ok();
                     self.ping_due = false;
                 }
                 Poll::Ready(Err(_)) => self.ping_due = false,
                 Poll::Pending => {}
             }
         }
-        if self.flush_due && Pin::new(&mut self.inner).poll_flush(cx).is_ready() {
+        if self.flush_due && Pin::new(inner).poll_flush(cx).is_ready() {
             self.flush_due = false;
         }
         self.wake_writer();
@@ -630,7 +667,11 @@ impl futures::Stream for WebSocket {
             if this.closing.is_some() {
                 return this.poll_close_frame(cx);
             }
-            match Pin::new(&mut this.inner).poll_next(cx) {
+            let Some(inner) = this.inner.as_mut() else {
+                this.done = true;
+                return Poll::Ready(None);
+            };
+            match Pin::new(inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(msg))) => {
                     if let Some((period, sleep)) = this.idle.as_mut() {
                         sleep.as_mut().reset(tokio::time::Instant::now() + *period);
@@ -649,7 +690,7 @@ impl futures::Stream for WebSocket {
                 }
                 Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
                 Poll::Ready(None) => {
-                    this.done = true;
+                    this.finish();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {}
@@ -681,21 +722,31 @@ impl futures::Sink<Message> for WebSocket {
     type Error = axum::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let poll = Pin::new(&mut self.inner).poll_ready(cx);
+        let poll = match self.socket() {
+            Ok(socket) => Pin::new(socket).poll_ready(cx),
+            Err(error) => return Poll::Ready(Err(error)),
+        };
         self.note_writer(cx, poll)
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-        Pin::new(&mut self.inner).start_send(item)
+        Pin::new(self.socket()?).start_send(item)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        let poll = match self.socket() {
+            Ok(socket) => Pin::new(socket).poll_flush(cx),
+            Err(error) => return Poll::Ready(Err(error)),
+        };
         self.note_writer(cx, poll)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let poll = Pin::new(&mut self.inner).poll_close(cx);
+        // A socket that the stream already closed is closed.
+        let poll = match self.inner.as_mut() {
+            Some(socket) => Pin::new(socket).poll_close(cx),
+            None => return Poll::Ready(Ok(())),
+        };
         self.note_writer(cx, poll)
     }
 }
