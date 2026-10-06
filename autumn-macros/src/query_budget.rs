@@ -5169,6 +5169,19 @@ impl Analyzer {
                 (SAME_TYPE_METHODS.contains(&mc.method.to_string().as_str())
                     && self.expr_is_holder(&mc.receiver))
                     || self.callback_result(mc) == Kind::Holder
+                    // `helper.identity(repo)`: an opaque method may give back
+                    // the handle it is handed. A known std method, a scalar
+                    // one, or a counted query (`table.load(&mut db)`,
+                    // `repo.find(…)`) does not.
+                    || (mc.args.iter().any(|a| self.expr_carries_handle(a))
+                        && !SCALAR_METHODS.contains(&mc.method.to_string().as_str())
+                        && !EXECUTORS.contains(&mc.method.to_string().as_str())
+                        && !self.chain_root_is_handle(e)
+                        && !self.known_container_method(
+                            &mc.receiver,
+                            &mc.method.to_string(),
+                            mc.args.len(),
+                        ))
             }
             // `Ctx(repo)`: a user tuple struct that holds the handle.
             // `identity(repo)`: an opaque helper may give it back.
@@ -14026,6 +14039,30 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  core::mem::drop(repo); Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn exempt_methods_keep_their_handle() {
+        check_handlers(&[
+            (
+                "an exempt method handed the handle may give it back",
+                "async fn h(repo: PgPostRepository, helper: Helper) -> AutumnResult<usize> { \
+                 #[query_exempt(reason = \"identity only\")] let alias = make_helper().identity(repo); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a scalar method handed the handle gives a plain value",
+                "async fn h(repo: PgPostRepository, repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let found = repos.as_slice().contains(&repo); render(found); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a plain method handed only plain values gives a plain value",
+                "async fn h(repo: PgPostRepository, helper: Helper, n: usize) -> AutumnResult<usize> { \
+                 let m = helper.double(n); repo.a().await?; Ok(m) }",
+                Expect::Exact(1),
             ),
         ]);
     }
