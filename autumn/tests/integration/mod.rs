@@ -402,6 +402,7 @@ mod sim_advance_to;
 mod sim_ambient_clock;
 mod sim_ambient_modules;
 mod sim_chaos_clock_skew_monotonic;
+mod sim_circuit_breaker_slow_calls;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;

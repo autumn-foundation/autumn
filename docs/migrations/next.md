@@ -213,6 +213,45 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Resilience: `CircuitBreakerPolicy` and `CircuitBreakerPolicyConfig` have slow-call fields
+
+**Why:** The breaker opened on failures only. A dependency that became slow
+but did not fail did not open it (issue #3060).
+
+**Before (`{X.Y}`):**
+
+```rust
+let policy = CircuitBreakerPolicy {
+    failure_ratio_threshold: 0.5,
+    sample_window: Duration::from_secs(10),
+    minimum_sample_count: 10,
+    open_duration: Duration::from_secs(60),
+    half_open_trial_count: 3,
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let policy = CircuitBreakerPolicy {
+    failure_ratio_threshold: 0.5,
+    sample_window: Duration::from_secs(10),
+    minimum_sample_count: 10,
+    open_duration: Duration::from_secs(60),
+    half_open_trial_count: 3,
+    ..CircuitBreakerPolicy::default()
+};
+```
+
+The defaults are a 60 s slow-call threshold, a slow-call rate threshold of
+`1.0`, and `CancelledCallOutcome::Slow`. Set `slow_call_duration_threshold:
+None` to keep the old behaviour.
+
+A struct literal of `autumn_web::config::CircuitBreakerPolicyConfig` needs
+`..Default::default()` for the same reason.
+
+**Automation:** `manual` - each struct literal needs a value for the new
+fields, and the choice changes when the breaker opens.
 ### Feature flags: `PgFlagStore::get` errors before the first load
 
 **Why:** `get` connected to the database on the request thread, and a store
@@ -292,6 +331,12 @@ If nothing changed, delete this section.
   HTTP client's retry backoff.
 - New: `[jobs] max_backoff_ms` and `AUTUMN_JOBS__MAX_BACKOFF_MS` (default
   `3600000`, 1 h). The cap on job retry backoff for every backend.
+- **Resilience (issue #3060):** new keys `slow_call_duration_threshold_ms`
+  (default `60000`, `0` turns detection off), `slow_call_rate_threshold`
+  (default `1.0`) and `cancelled_call_outcome` (default `"slow"`) under
+  `[resilience.circuit_breaker.defaults]` and host overrides. The env
+  variables are `AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS`,
+  `..._SLOW_CALL_RATE_THRESHOLD` and `..._CANCELLED_CALL_OUTCOME`.
 
 ## Behavior changes
 
@@ -316,6 +361,13 @@ If nothing changed, delete this section.
 - A `POST` or `PATCH` with `.retries(n)` and no `.retry_non_idempotent()`
   now makes one attempt. This compiles with no warning, so search your code
   for `.post(` and `.patch(` calls that use `.retries(`.
+- **Resilience (issue #3060):** a circuit breaker opens when all calls in
+  its window take 60 s or more. A call dropped at or after the slow-call
+  threshold counts as slow. Before, it counted as nothing. To keep the old
+  behaviour, set `slow_call_duration_threshold_ms = 0`.
+- **Resilience (issue #3060):** a breaker keeps its counts in 10 time
+  buckets. A call leaves the window after 9/10 to 10/10 of
+  `sample_window_secs`. Before, it left after exactly `sample_window_secs`.
 - **Commentable (#2284):** a model can have a `soft_delete` repository and a
   plain one. Through the plain repository, the `{Model}Comments` helpers now
   accept a soft-deleted parent. Before, they returned `404`. Through the

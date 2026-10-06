@@ -2654,12 +2654,11 @@ impl MailTransport for SmtpTransport {
                 },
             );
 
-            if breaker.before_call().is_err() {
+            let Ok(guard) = breaker.admit() else {
                 return Err(MailError::RuntimeUnavailable(
                     "smtp mailer circuit breaker is open".to_owned(),
                 ));
-            }
-            let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+            };
 
             let message = lettre_message(&mail)?;
             let res = self.inner.send(message).await;
@@ -7760,6 +7759,7 @@ mod tests {
             minimum_sample_count: 3,
             open_duration: std::time::Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..crate::circuit_breaker::CircuitBreakerPolicy::default()
         };
         let breaker =
             crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
