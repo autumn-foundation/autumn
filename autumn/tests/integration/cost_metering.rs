@@ -191,6 +191,20 @@ async fn metering_is_off_by_default() {
     assert_eq!(body["enabled"], false, "{body}");
 }
 
+/// An accountant that the app inserted does not turn metering on: with
+/// `[cost] enabled = false`, `/actuator/cost` reports metering as off (#1720).
+#[tokio::test]
+async fn an_inserted_accountant_does_not_report_metering_as_on() {
+    let mut config = AutumnConfig::default();
+    config.actuator.sensitive = true;
+    let client = TestApp::new()
+        .config(config)
+        .state_initializer(|state| state.insert_extension(CostAccountant::new(8)))
+        .build();
+    let body: serde_json::Value = client.get("/actuator/cost").send().await.json();
+    assert_eq!(body["enabled"], false, "{body}");
+}
+
 /// AC: the signal is live. An operator changes the runtime-config key and the
 /// running app follows it, with no redeploy.
 #[tokio::test]
