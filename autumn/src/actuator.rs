@@ -4457,8 +4457,8 @@ fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
     )
 }
 
-/// `GET <actuator-prefix>/cost` -- the cost signal and the cost total for
-/// each tenant (issue #1720).
+/// `GET <actuator-prefix>/cost` -- the cost signal, the request cost of
+/// each tenant, and the cost of job runs and task ticks (issue #1720).
 ///
 /// Sensitive-gated: tenant ids and their costs are not public. With
 /// `[cost] enabled = false` the endpoint answers `{"enabled": false, ...}`.
@@ -4476,6 +4476,8 @@ pub(crate) async fn cost_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
         "signal": signal.map(|signal| signal.snapshot()),
         "total": snapshot.total,
         "tenants": snapshot.tenants,
+        "jobs": snapshot.jobs,
+        "tasks": snapshot.tasks,
     }))
 }
 
