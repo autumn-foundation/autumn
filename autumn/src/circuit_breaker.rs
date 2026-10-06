@@ -496,7 +496,7 @@ impl CircuitBreaker {
     }
 
     /// Replaces the policy. A new `sample_window` keeps the counts. See
-    /// [`SampleWindow::resize`].
+    /// `SampleWindow::resize`.
     pub fn update_config(&self, config: CircuitBreakerPolicy) {
         let config = config.clamped();
         let mut inner = self.lock_inner();
