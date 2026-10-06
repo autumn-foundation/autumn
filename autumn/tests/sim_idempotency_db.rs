@@ -540,3 +540,139 @@ async fn session_change_before_commit_holds_the_key() {
         "the record without its Set-Cookie stays hidden past the in-flight TTL"
     );
 }
+
+/// A response TTL shorter than the in-flight TTL: a crash after the commit
+/// must not let the record expire while the crash lock still hides it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_ttl_crash_after_commit_still_replays() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(1),
+    ));
+    let pool = substrate.pool();
+    let handler_calls = calls.clone();
+    // The first run commits, then hangs until the client drops it (a crash).
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            let first = calls.get() == 0;
+            calls.add();
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            let response = conn
+                .transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                    diesel::sql_query("INSERT INTO payments (amount) VALUES (100)")
+                        .execute(conn)
+                        .await?;
+                    idem.commit(conn, (StatusCode::CREATED, "paid")).await
+                })
+                .await
+                .expect("transaction");
+            drop(pooled);
+            if first {
+                std::future::pending::<()>().await;
+            }
+            response
+        }
+    };
+    let app = axum::Router::new()
+        .route("/pay", axum::routing::post(handler))
+        .layer(
+            IdempotencyLayer::new(store)
+                .with_ttl(Duration::from_secs(1))
+                .with_in_flight_ttl(Duration::from_secs(3)),
+        );
+    let pay = || {
+        Request::builder()
+            .method("POST")
+            .uri("/pay")
+            .header("idempotency-key", "short-ttl")
+            .body(Body::empty())
+            .expect("request")
+    };
+
+    let crashed =
+        tokio::time::timeout(Duration::from_millis(500), app.clone().oneshot(pay())).await;
+    assert!(
+        crashed.is_err(),
+        "the first request is dropped after its commit"
+    );
+    assert_eq!(payments(&substrate).await, 1);
+
+    // At about 3.3 s: the 3 s crash lock has freed the key, and the 1 s
+    // response TTL from the commit has passed.
+    tokio::time::sleep(Duration::from_millis(2_800)).await;
+    let retry = app.clone().oneshot(pay()).await.expect("infallible");
+    assert_eq!(retry.status(), StatusCode::CREATED);
+    assert_eq!(
+        retry
+            .headers()
+            .get("x-idempotent-replayed")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "the committed record outlives the crash lock"
+    );
+    assert_eq!(calls.get(), 1, "the handler does not run again");
+    assert_eq!(payments(&substrate).await, 1);
+}
+
+/// On a normal release, the record lives the configured TTL from the release,
+/// not the crash-lock window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_ttl_normal_release_keeps_the_configured_ttl() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(1),
+    ));
+    let pool = substrate.pool();
+    let handler_calls = calls.clone();
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            calls.add();
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                idem.commit(conn, (StatusCode::CREATED, "paid")).await
+            })
+            .await
+            .expect("transaction")
+        }
+    };
+    let app = axum::Router::new()
+        .route("/pay", axum::routing::post(handler))
+        .layer(
+            IdempotencyLayer::new(store)
+                .with_ttl(Duration::from_secs(1))
+                .with_in_flight_ttl(Duration::from_secs(3)),
+        );
+    let pay = || {
+        Request::builder()
+            .method("POST")
+            .uri("/pay")
+            .header("idempotency-key", "short-ttl-release")
+            .body(Body::empty())
+            .expect("request")
+    };
+
+    let first = app.clone().oneshot(pay()).await.expect("infallible");
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let later = app.clone().oneshot(pay()).await.expect("infallible");
+    assert_eq!(later.status(), StatusCode::CREATED);
+    assert_eq!(
+        later.headers().get("x-idempotent-replayed"),
+        None,
+        "the 1 s response TTL has passed"
+    );
+    assert_eq!(calls.get(), 2);
+}

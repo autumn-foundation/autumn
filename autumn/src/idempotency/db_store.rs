@@ -41,6 +41,7 @@ diesel::table! {
         locked_by -> Nullable<Text>,
         locked_until_ms -> BigInt,
         expires_at_ms -> BigInt,
+        ttl_ms -> BigInt,
     }
 }
 
@@ -304,6 +305,20 @@ impl IdempotencyStore for DbIdempotencyStore {
             .execute(&mut conn)
             .await
             .map_err(|e| db_error("release idempotency lock", e))?;
+            // A record written in a transaction lives `ttl_ms` from now.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "a SQL expression, evaluated by the database"
+            )]
+            let release_expiry = keys::ttl_ms + now_ms();
+            diesel::update(
+                held.filter(keys::record.is_not_null())
+                    .filter(keys::ttl_ms.gt(0)),
+            )
+            .set(keys::expires_at_ms.eq(release_expiry))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| db_error("release idempotency lock", e))?;
             diesel::update(held)
                 .set((
                     keys::locked_by.eq(None::<String>),
@@ -440,16 +455,30 @@ impl IdempotencyTx {
             // The lock stays. The middleware releases it after the response
             // is final; after a crash, the lock TTL frees it. Until then a
             // retry gets `409`, not this record.
+            let ttl = ms(claim.ttl);
             let written = diesel::update(owned_key(&claim))
                 .set((
                     keys::record.eq(Some(encoded)),
-                    keys::expires_at_ms.eq(after(claim.ttl)),
+                    keys::expires_at_ms.eq(now_ms().saturating_add(ttl)),
+                    keys::ttl_ms.eq(ttl),
                 ))
                 .execute(conn)
                 .await?;
             if written != 1 {
                 return Err(claim_error(conn, &claim).await);
             }
+            // After a crash the record stays hidden until the lock frees. It
+            // must live a full TTL after that, or the retry runs again.
+            // `unlock` sets it back to `now + ttl` on a normal release.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "a SQL expression, evaluated by the database"
+            )]
+            let crash_expiry = keys::locked_until_ms + ttl;
+            diesel::update(owned_key(&claim).filter(keys::locked_until_ms.gt(now_ms())))
+                .set(keys::expires_at_ms.eq(crash_expiry))
+                .execute(conn)
+                .await?;
             // The session already changed, so this record has no final
             // `Set-Cookie`. Keep it hidden until the session rewrite ends.
             if let Some(session) = &session
