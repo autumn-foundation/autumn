@@ -64,6 +64,15 @@ Or set `AUTUMN_COST__ENABLED=true`.
 Cost measurement is off by default. When it is on, each request reads the
 thread CPU clock two times per poll.
 
+To check the overhead on your machine, run the p99 probe:
+
+```bash
+cargo test -p autumn-web --release --test cost_reconcile -- --ignored
+```
+
+It sends requests that each use 1 ms of CPU, with and without metering. It
+fails when metering adds more than 2% to p99.
+
 ### Tenant keys
 
 The tenant key is the tenant id. With `[tenancy] source = "header"` or

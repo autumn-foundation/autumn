@@ -292,28 +292,27 @@ async fn metering_adds_at_most_two_percent_to_p99() {
     use autumn_web::middleware::CostLayer;
     use tower::ServiceExt as _;
 
-    /// Requests in one round. The rounds alternate between the two routers,
+    /// Requests for each router. The two routers alternate on each request,
     /// so drift on the machine hits both.
-    const N: usize = 400;
-    const ROUNDS: usize = 10;
+    const N: usize = 4_000;
 
     async fn handler() -> String {
         burn_micros(1_000).to_string()
     }
 
-    async fn p99_micros(router: &axum::Router) -> u128 {
-        let mut samples = Vec::with_capacity(N);
-        for _ in 0..N {
-            let req = axum::http::Request::builder()
-                .uri("/work")
-                .body(axum::body::Body::empty())
-                .expect("request");
-            let start = std::time::Instant::now();
-            router.clone().oneshot(req).await.expect("response");
-            samples.push(start.elapsed().as_micros());
-        }
+    async fn once(router: &axum::Router) -> u128 {
+        let req = axum::http::Request::builder()
+            .uri("/work")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let start = std::time::Instant::now();
+        router.clone().oneshot(req).await.expect("response");
+        start.elapsed().as_micros()
+    }
+
+    fn percentile(samples: &mut [u128], pct: usize) -> u128 {
         samples.sort_unstable();
-        samples[N * 99 / 100]
+        samples[samples.len() * pct / 100]
     }
 
     let bare = axum::Router::new().route("/work", axum::routing::get(handler));
@@ -322,23 +321,26 @@ async fn metering_adds_at_most_two_percent_to_p99() {
         .layer(CostLayer::new(CostAccountant::new(10), false));
 
     // Warm-up.
-    p99_micros(&bare).await;
-    p99_micros(&metered).await;
-    let mut bare_p99 = Vec::with_capacity(ROUNDS);
-    let mut metered_p99 = Vec::with_capacity(ROUNDS);
-    for _ in 0..ROUNDS {
-        bare_p99.push(p99_micros(&bare).await);
-        metered_p99.push(p99_micros(&metered).await);
+    for _ in 0..200 {
+        once(&bare).await;
+        once(&metered).await;
     }
-    bare_p99.sort_unstable();
-    metered_p99.sort_unstable();
-    let bare = bare_p99[ROUNDS / 2];
-    let metered = metered_p99[ROUNDS / 2];
+    let mut bare_samples = Vec::with_capacity(N);
+    let mut metered_samples = Vec::with_capacity(N);
+    for _ in 0..N {
+        bare_samples.push(once(&bare).await);
+        metered_samples.push(once(&metered).await);
+    }
+    let bare_p50 = percentile(&mut bare_samples, 50);
+    let metered_p50 = percentile(&mut metered_samples, 50);
+    let bare = percentile(&mut bare_samples, 99);
+    let metered = percentile(&mut metered_samples, 99);
 
     #[allow(clippy::cast_precision_loss)]
     let overhead = metered as f64 / bare as f64 - 1.0;
     println!(
-        "median p99: bare {bare} us, metered {metered} us, overhead {:.2}%",
+        "p50: bare {bare_p50} us, metered {metered_p50} us; \
+         p99: bare {bare} us, metered {metered} us, overhead {:.2}%",
         overhead * 100.0
     );
     assert!(
