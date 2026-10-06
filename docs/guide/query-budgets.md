@@ -433,9 +433,9 @@ callbacks. These things sit outside it, by construction:
   `use custom as mem` for `mem::drop`).
   Such an item applies in its own block, and to a value that leaves it.
   It cannot see a module-level `use` or `macro_rules!` that replaces a bare
-  standard name. Do not give an item of yours a standard name. Call `drop`
-  bare or as `std::mem::drop`: `mem::drop` may name a module-level alias, so
-  it is reported.
+  standard name. Do not give an item of yours a standard name. A std path
+  must start with `std`, `core` or `alloc`: `mem::drop` and `vec::Vec` may
+  name a module-level alias, so they are not trusted.
 
 ### `proven_max` is not `query_count()`
 

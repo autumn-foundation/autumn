@@ -387,6 +387,7 @@ const SCALAR_METHODS: &[&str] = &[
 /// `Option` of a part.
 const CARRIER_METHODS: &[&str] = &[
     "as_mut_slice",
+    "make_contiguous",
     "split_off",
     "xor",
     "err",
@@ -554,6 +555,7 @@ const SLICE_METHODS: &[&str] = &[
 const DEQUE_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "make_contiguous",
     "split_off",
     "capacity",
     "contains",
@@ -949,7 +951,7 @@ impl Shape {
             // A part has its own shape: `slot.insert(repo)`, `maybe.unwrap()`.
             _ if ELEMENT_METHODS.contains(&method) => None,
             "to_vec" => Some(Self::Vec),
-            "as_slice" | "as_mut_slice" => Some(Self::Slice),
+            "as_slice" | "as_mut_slice" | "make_contiguous" => Some(Self::Slice),
             "collect" => None,
             _ => Some(self),
         }
@@ -4909,16 +4911,6 @@ impl Analyzer {
         let Expr::Path(path) = &*call.func else {
             return false;
         };
-        // `mem::drop` may name a module-level alias the macro cannot see.
-        let rooted = path.path.segments.len() == 1
-            || path
-                .path
-                .segments
-                .first()
-                .is_some_and(|s| s.ident == "std" || s.ident == "core" || s.ident == "alloc");
-        if !rooted {
-            return false;
-        }
         call_path_name(call)
             .is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()) && !self.call_head_shadowed(call))
             && std_prefix(&path.path)
@@ -6625,10 +6617,22 @@ const STD_PATH: &[&str] = &[
 /// is std unless the handler body defines it.
 fn std_prefix(path: &syn::Path) -> bool {
     let n = path.segments.len().saturating_sub(1);
+    // `vec::Vec` may name a module-level alias: only `std`, `core` or
+    // `alloc` roots a std path.
+    if n > 0 && !std_rooted(path) {
+        return false;
+    }
     path.segments
         .iter()
         .take(n)
         .all(|s| STD_PATH.contains(&s.ident.to_string().as_str()))
+}
+
+/// Does `path` start with `std`, `core` or `alloc`?
+fn std_rooted(path: &syn::Path) -> bool {
+    path.segments
+        .first()
+        .is_some_and(|s| s.ident == "std" || s.ident == "core" || s.ident == "alloc")
 }
 
 /// Is every segment of `path` before its last two a std module? The
@@ -6636,6 +6640,9 @@ fn std_prefix(path: &syn::Path) -> bool {
 /// `custom::Vec::new` is not.
 fn std_owner(path: &syn::Path) -> bool {
     let n = path.segments.len().saturating_sub(2);
+    if n > 0 && !std_rooted(path) {
+        return false;
+    }
     path.segments
         .iter()
         .take(n)
@@ -14040,6 +14047,18 @@ mod tests {
                  core::mem::drop(repo); Ok(0) }",
                 Expect::Exact(0),
             ),
+            (
+                "a type path not rooted at std is not std",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let wrapped: vec::Vec<i64> = vec::Vec { repo }; let _ = wrapped.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a type path rooted at std is std",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let ids: std::vec::Vec<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
+                Expect::Exact(0),
+            ),
         ]);
     }
 
@@ -14204,6 +14223,10 @@ mod tests {
             (
                 "VecDeque<PgPostRepository>",
                 "repos.resize_with(2, || other.clone())",
+            ),
+            (
+                "VecDeque<PgPostRepository>",
+                "repos.make_contiguous().len()",
             ),
         ];
         let handler = |ty: &str, call: &str| {
