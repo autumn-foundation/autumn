@@ -4415,6 +4415,7 @@ impl Analyzer {
             Expr::Reference(r) => self.expr_is_nested(&r.expr),
             Expr::RawAddr(r) => self.expr_is_nested(&r.expr),
             Expr::Cast(c) => self.expr_is_nested(&c.expr),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.expr_is_nested(&u.expr),
             Expr::Paren(p) => self.expr_is_nested(&p.expr),
             Expr::Group(g) => self.expr_is_nested(&g.expr),
             // A part of a user value with no recorded parts may itself be a
@@ -4856,6 +4857,7 @@ impl Analyzer {
                 }) && self.async_output(&a.block) != Kind::Plain
             }
             Expr::Reference(r) => self.expr_is_holder(&r.expr),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.expr_is_holder(&u.expr),
             Expr::Paren(p) => self.expr_is_holder(&p.expr),
             Expr::Group(g) => self.expr_is_holder(&g.expr),
             _ => false,
@@ -5225,6 +5227,7 @@ impl Analyzer {
             Expr::Reference(r) => self.expr_is_carrier(&r.expr),
             Expr::RawAddr(r) => self.expr_is_carrier(&r.expr),
             Expr::Cast(c) => self.expr_is_carrier(&c.expr),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.expr_is_carrier(&u.expr),
             Expr::Paren(p) => self.expr_is_carrier(&p.expr),
             Expr::Group(g) => self.expr_is_carrier(&g.expr),
             Expr::Array(a) => a.elems.iter().any(holds),
@@ -5311,6 +5314,9 @@ impl Analyzer {
             Expr::Reference(r) => self.expr_carries_handle(&r.expr),
             Expr::RawAddr(r) => self.expr_carries_handle(&r.expr),
             Expr::Cast(c) => self.expr_carries_handle(&c.expr),
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+                self.expr_carries_handle(&u.expr)
+            }
             Expr::Paren(p) => self.expr_carries_handle(&p.expr),
             Expr::Group(g) => self.expr_carries_handle(&g.expr),
             // No `Await`/`Try` arms: `expr_is_handle` covers a fresh handle,
@@ -12964,6 +12970,19 @@ mod tests {
                  let ptr = &repo as *const PgPostRepository; \
                  unsafe { (&*ptr).find_all().await?; } Ok(0) }",
                 Expect::Exact(1),
+            ),
+            (
+                "guard: a dereferenced holder keeps its handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let ctx = Ctx { inner: repo }; let borrowed = &ctx; \
+                 (*borrowed).inner.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a dereferenced carrier keeps its handles",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let borrowed = &repos; (*borrowed).refresh_all().await; Ok(0) }",
+                Expect::Unbounded,
             ),
             (
                 "guard: a range keeps the handle",
