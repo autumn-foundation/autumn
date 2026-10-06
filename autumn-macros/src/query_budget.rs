@@ -2586,25 +2586,22 @@ impl Analyzer {
             if matches!(peel_parens(&mc.receiver), Expr::MethodCall(_)) {
                 return self.referents_of(&mc.receiver);
             }
-            place_root(&mc.receiver)
-                .map(|root| {
+            // `(&mut slot).get_mut()`: what the borrow points to.
+            place_root(&mc.receiver).map_or_else(
+                || self.referents_of(&mc.receiver),
+                |root| {
                     let through = self.env.binding(&root).referents;
                     if through.is_empty() {
                         vec![root]
                     } else {
                         through
                     }
-                })
-                .unwrap_or_default()
-        } else if matches!(
-            peel_parens(&mc.receiver),
-            Expr::MethodCall(_) | Expr::Path(_)
-        ) {
-            // `slots.iter_mut().next()`, `it.next()`: a method on a borrow
-            // may give a borrow into it.
-            self.referents_of(&mc.receiver)
+                },
+            )
         } else {
-            Vec::new()
+            // `slots.iter_mut().next()`, `it.next()`, `(&raw mut slot).cast()`:
+            // a method on a borrow or a pointer may give a borrow into it.
+            self.referents_of(&mc.receiver)
         }
     }
 
@@ -13490,6 +13487,36 @@ mod tests {
                 "async fn h(res: Result<&PgPostRepository, &PgPostRepository>) -> AutumnResult<usize> { \
                  let _fut = res.map_or_else(|r| r.find_all(), |r| r.find_all()); Ok(0) }",
                 Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn pointer_methods_keep_their_referents() {
+        check_handlers(&[
+            (
+                "a raw pointer cast keeps its referent",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = (&raw mut slot).cast::<Option<PgPostRepository>>(); unsafe { *target = Some(repo); } let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a pointer offset keeps its referent",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = (&mut slot as *mut Option<PgPostRepository>).add(0); unsafe { *target = Some(repo); } let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a method on a borrow keeps its referent",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = (&mut slot).as_deref_mut_like(); *target = Some(repo); let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a pointer from a call keeps its referent",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = std::ptr::from_mut(&mut slot).cast::<Option<PgPostRepository>>(); unsafe { *target = Some(repo); } let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
