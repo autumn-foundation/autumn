@@ -371,16 +371,29 @@ patch_app() {
 # the app shows it. Without a saved ingress, it uses the port and transport
 # that main.tf sets.
 set_ingress() {
-  local body
+  local body want now
   body=$(jq -cn --argjson app "$APP" --argjson saved "$SAVED_INGRESS" --argjson external "$1" '
     {location: $app.location, properties: {configuration: {ingress:
       (($saved // {targetPort: 3000, transport: "http"}) | .external = $external)}}}')
   patch_app "$body" || return 1
   local check="$INGRESS_CLOSED"
   [ "$1" = true ] && check="$INGRESS_OPEN"
+  # The settings of the saved ingress must show too, not only external: the
+  # app can show an open ingress before the PATCH applies (a plain one that
+  # terraform apply made), and the caller then removes the snapshot tags.
+  # The snapshot comes from a GET, so its values have the form Azure shows.
+  want=$(jq -c '(. // {}) | with_entries(select(.key | IN("targetPort", "transport",
+    "customDomains", "ipSecurityRestrictions", "corsPolicy", "clientCertificateMode",
+    "stickySessions", "additionalPortMappings", "exposedPort", "allowInsecure")))' <<< "$SAVED_INGRESS")
   for _ in $(seq 1 30); do
     sleep 10
-    app_shows "$check" && return 0
+    now=$(az containerapp show \
+      --name "$AZURE_APP_NAME" \
+      --resource-group "$AZURE_RESOURCE_GROUP" \
+      --output json) || return 1
+    jq -e --argjson want "$want" "($check)"' and (.properties.configuration.ingress as $i
+      | $want | to_entries | all(($i[.key] // null) == (.value // null)))' <<< "$now" > /dev/null \
+      && return 0
   done
   return 1
 }
@@ -489,7 +502,8 @@ sole_active() {
 # provisioned and no other revision is active. Stage 2 then removes the
 # identity, registry and secrets, and waits until the app shows it.
 remove_credentials() {
-  local live status state latest revision body containers source active actives template first patch
+  local live status state latest revision body containers inits source active actives template first patch marker
+  marker="$(date +%s)-$$-$RANDOM"
   live=$(az containerapp show \
     --name "$AZURE_APP_NAME" \
     --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -527,9 +541,15 @@ remove_credentials() {
     | .[$i].env = [(.[$i].env // [])[] | select(.name | IN(
         "AUTUMN_DATABASE__PRIMARY_URL", "AUTUMN_SECURITY__SIGNING_SECRET",
         "AUTUMN_CACHE__BACKEND", "AUTUMN_CACHE__REDIS__URL") | not)]' <<< "$source")
+  # The init containers the same way: no env var that refers to a managed
+  # secret.
+  inits=$(jq -c "$MANAGED_DEF"'
+    (.initContainers // [])
+    | map(if .env then .env = [.env[] | select((.secretRef // "") | IN(managed[]) | not)] else . end)' <<< "$active")
   # A scale rule or a volume can also refer to a secret. The script cannot
   # remove that ref without changing what the app does, so it stops.
-  if jq -c --argjson c "$containers" '.properties.template.containers = $c' <<< "$APP" \
+  if jq -c --argjson c "$containers" --argjson i "$inits" \
+      '.properties.template.containers = $c | .properties.template.initContainers = $i' <<< "$APP" \
     | jq -e "$REFS_MANAGED" > /dev/null; then
     echo "::error::a scale rule or volume of $AZURE_APP_NAME uses a managed secret. Remove that reference, then run the script again." >&2
     return 1
@@ -569,11 +589,13 @@ remove_credentials() {
       { [ "$state" = Failed ] || [ "$state" = Canceled ]; } && patch=1
     fi
     if [ -n "$patch" ]; then
-      body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" --arg now "$(date +%s)" "$APP_C"'
+      body=$(jq -cn --argjson app "$APP" --argjson containers "$containers" --argjson inits "$inits" \
+        --arg now "$(date +%s)" "$APP_C"'
         {location: $app.location, properties: {template: {containers: ($containers
           | app_i as $i
           | .[$i].env = [(.[$i].env // [])[] | select(.name != "AUTUMN_CREDENTIAL_CLEANUP")]
-                        + [{name: "AUTUMN_CREDENTIAL_CLEANUP", value: $now}])}}}')
+                        + [{name: "AUTUMN_CREDENTIAL_CLEANUP", value: $now}]),
+          initContainers: $inits}}}')
       patch_app "$body" || return 1
       revision=""
     fi
@@ -611,7 +633,7 @@ remove_credentials() {
     sole_active "$revision" || return 1
   fi
   body=$(jq -cn --argjson app "$APP" --argjson live "$live" --slurpfile app_secrets "$APP_SECRETS" \
-    --argjson uids "$REMOVE_UIDS" "$SECRET_REF$MANAGED_DEF"'
+    --argjson uids "$REMOVE_UIDS" --arg marker "$marker" "$SECRET_REF$MANAGED_DEF"'
     ($uids | map(ascii_downcase)) as $lids
     # The cutover never turns the system identity on, so it stays.
     | ($live.identity.type // "None" | test("SystemAssigned")) as $keep_system
@@ -638,11 +660,19 @@ remove_credentials() {
                            | secret_ref))}}}
     # The record of what a first cutover copied goes with the credentials.
     + ([$live.tags // {} | keys[] | select(startswith("autumn-copied-"))] as $copied
-       | if $copied == [] then {} else {tags: ($copied | map({(.): null}) | add)} end)')
+       | if $copied == [] then {} else {tags: ($copied | map({(.): null}) | add)} end)
+    # A marker of this PATCH. A read can still show the state before an
+    # earlier PATCH (a cutover whose response was lost): the placeholder
+    # without credentials. Only a read that shows the marker proves that
+    # this PATCH, which Azure applies after the earlier one, applied.
+    | .tags = ((.tags // {}) + {"autumn-cleanup": $marker})')
   patch_app "$body" || return 1
   for _ in $(seq 1 30); do
     sleep 10
-    app_shows "$REMOVED" && return 0
+    if app_shows "$REMOVED"' and (.tags["autumn-cleanup"] // "") == "'"$marker"'"'; then
+      clear_tags '["autumn-cleanup"]'
+      return 0
+    fi
   done
   return 1
 }
@@ -710,7 +740,9 @@ if [ "$MODE" = remove ]; then
   fi
   [ -z "$SHARED_IDENTITY" ] || shared_identity_stop
   # The removal keeps the existing copied record until stage 2.
-  check_tag_budget "$EXISTING_COPIED_PARTS"
+  # The cleanup PATCH adds one marker tag while it removes the copied
+  # record, so the budget counts at least one tag for these.
+  check_tag_budget "$(( EXISTING_COPIED_PARTS > 1 ? EXISTING_COPIED_PARTS : 1 ))"
   # The placeholder has credentials until stage 2. Ingress closes for the
   # removal (the tags keep the snapshot) and comes back only after it.
   if [ "$(jq -r '.properties.configuration.ingress != null' <<< "$APP")" = true ]; then

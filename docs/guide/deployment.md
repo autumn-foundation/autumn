@@ -2202,8 +2202,11 @@ ingress stays disabled; run the command again.
 A first cutover records the secrets and identities that it copies in the
 app's `autumn-copied-*` tags. A rollback or `--remove-credentials` removes
 them too, also when you removed them from the job in between. A successful
-cutover removes the tags. Azure allows 50 tags on an app, so the script
-stops before any change if the app's own tags leave no room for these.
+cutover removes the tags. The removal also sets an `autumn-cleanup` tag, and
+removes it again: ingress comes back only when the app shows that tag, so a
+read from before the removal cannot pass for it. Azure allows 50 tags on an
+app, so the script stops before any change if the app's own tags leave no
+room for these.
 
 **Secret changes reach the app without a deploy.** The app refers to the
 latest version of each Key Vault secret. Container Apps gets a new version

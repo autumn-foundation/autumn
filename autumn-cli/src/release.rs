@@ -3332,7 +3332,10 @@ fi
   containers="{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar"
   # An operator can put a sidecar before the app container.
   [ -n "$STUB_SIDECAR_FIRST" ] && containers="$sidecar,{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]}"
-  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",\"tags\":$tags,$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$scale}}}"
+  # An init container env var can also refer to a managed secret.
+  init=""
+  [ -n "$STUB_INIT_SECRET_REF" ] && init=',"initContainers":[{"name":"migrate","image":"busybox","env":[{"name":"INIT_DB","secretRef":"database-url"}]}]'
+  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",\"tags\":$tags,$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$init$scale}}}"
 # An older placeholder whose credentials use an identity that the job no
 # longer uses.
 [ -n "$STUB_APP_LEGACY_ID" ] && app="${app//$id/$STUB_APP_LEGACY_ID}"
@@ -3601,6 +3604,8 @@ case "$1 $2" in
     echo "${STUB_PATCH_PENDING:-0}" > "$STUB_LOG.pending"
     # Azure accepts the PATCH that opens ingress, but the response is lost.
     if [ -n "$open_patch" ] && [ -n "$STUB_INGRESS_OPEN_LOST" ]; then exit 1; fi
+    # Azure accepts the cutover PATCH, but the response is lost.
+    if [ -n "$STUB_CUTOVER_LOST" ] && grep -q '"acr.azurecr.io/app:t1"' <<< "$body"; then exit 1; fi
     ;;
   "containerapp ingress")
     # The disable fails once this run has opened ingress.
@@ -3640,6 +3645,8 @@ esac
         "STUB_ACTIVE_SIDECAR_ACR",
         "STUB_REVISION_REWRITTEN",
         "STUB_REVISION_INIT_REWRITTEN",
+        "STUB_INIT_SECRET_REF",
+        "STUB_CUTOVER_LOST",
         "STUB_SIDECAR_ACR",
         "STUB_APP_REGISTRY_PASSWORD_REF",
         "STUB_INLINE_STALE",
@@ -4466,6 +4473,42 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_waits_for_the_tagged_ingress_before_clearing_its_tags() {
+        // As above, but the first reads after the PATCH still show the plain
+        // ingress, which is open already. The script must wait until the app
+        // shows the saved ingress (with the custom domain) before it removes
+        // the tags: until then, the tags are the only copy.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_PLAIN", "external"),
+                ("STUB_SAVED_INGRESS_TAGS", "external"),
+                ("STUB_PATCH_PENDING", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let after_open = calls
+            .split("az ingress-patch external=true")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{calls}"));
+        let before_clear = after_open.split("az tags-patch").next().unwrap_or_default();
+        // Two stale reads, then the read that shows the saved ingress.
+        assert!(
+            before_clear
+                .matches("az containerapp show --name app --resource-group rg --output json")
+                .count()
+                >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_stops_on_min_replicas_above_zero() {
         // With min_replicas above zero, Azure starts the placeholder again
         // after the zero-replica check, and it would get the credentials.
@@ -5165,6 +5208,48 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_rollback_waits_for_its_own_cleanup_before_the_ingress() {
+        // Azure accepted the cutover PATCH, but the response was lost, and
+        // the first reads after each PATCH still show the state before it:
+        // the placeholder without credentials. That state does not prove
+        // that the cleanup applied. The rollback waits until the app shows
+        // the marker of its own cleanup PATCH, and only then sends the saved
+        // (open) ingress back.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_EXTERNAL", "1"),
+                ("STUB_CUTOVER_LOST", "1"),
+                ("STUB_PATCH_PENDING", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let before_open = calls
+            .split("az ingress-patch external=true")
+            .next()
+            .unwrap_or_default();
+        assert!(before_open.len() < calls.len(), "{calls}");
+        let after_cleanup = before_open
+            .rsplit("az rest --method patch")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{calls}"));
+        // Three stale reads, then the read that shows the cleanup.
+        assert!(
+            after_cleanup
+                .matches("az containerapp show --name app --resource-group rg --output json")
+                .count()
+                >= 4,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_restores_the_ingress_after_a_failed_first_cutover() {
         // The first cutover disabled ingress. After the rollback removed the
         // credentials, the saved ingress (still closed) comes back.
@@ -5461,6 +5546,27 @@ esac
         let stage1 = bodies.lines().next().unwrap_or_default();
         assert!(!stage1.contains("database-url"), "{stage1}");
         assert!(stage1.contains("\"sidecar\""), "{stage1}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_init_container_refs_before_the_secrets() {
+        // An init container env var also refers to a managed secret. Stage 1
+        // removes it like a container's, and keeps the init container.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_INIT_SECRET_REF", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage1 = bodies.lines().next().unwrap_or_default();
+        assert!(!stage1.contains("database-url"), "{stage1}");
+        assert!(stage1.contains("\"migrate\""), "{stage1}");
     }
 
     #[cfg(unix)]
