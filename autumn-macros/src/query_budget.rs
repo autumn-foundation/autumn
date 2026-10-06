@@ -2398,11 +2398,23 @@ impl Analyzer {
             // `refs.0`, `refs[i]`: a part may be any borrow of the whole.
             Expr::Field(f) => self.referents_of(&f.base),
             Expr::Index(i) => self.referents_of(&i.expr),
-            // `(&mut left, 1)`, `[&mut left, &mut right]`: a part may borrow.
-            Expr::Tuple(_) | Expr::Array(_) | Expr::Struct(_) => {
+            // `(&mut left, 1)`, `[&mut left, &mut right]`, a range or a
+            // repeat: a part may borrow.
+            Expr::Tuple(_)
+            | Expr::Array(_)
+            | Expr::Struct(_)
+            | Expr::Range(_)
+            | Expr::Repeat(_) => {
                 let parts: Vec<&Expr> = match init {
                     Expr::Tuple(t) => t.elems.iter().collect(),
                     Expr::Array(a) => a.elems.iter().collect(),
+                    // `(&mut a)..(&mut b)`, `[&raw mut a; 2]`.
+                    Expr::Range(r) => [&r.start, &r.end]
+                        .into_iter()
+                        .flatten()
+                        .map(|e| &**e)
+                        .collect(),
+                    Expr::Repeat(r) => vec![&*r.expr],
                     // `Ctx { n: 1, ..base }` keeps what `base` borrows.
                     Expr::Struct(st) => st
                         .fields
@@ -13164,6 +13176,20 @@ mod tests {
                 "guard: a vec of raw pointers keeps their owners",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = None; let refs = vec![&raw mut slot]; let target = refs[0]; \
+                 unsafe { *target = Some(repo); } slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a range of borrows keeps their owners",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let mut other = None; let refs = (&mut slot)..(&mut other); \
+                 let target = refs.start; *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a repeated raw pointer keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let refs = [&raw mut slot; 2]; let target = refs[1]; \
                  unsafe { *target = Some(repo); } slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
