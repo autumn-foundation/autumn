@@ -28,7 +28,8 @@
   `Set-Cookie`. Use it on a primary `Db` connection, not a shard.
 - **idempotency:** `IdempotencyTx::set_recovery_point` and
   `IdempotencyTx::recovery_point` let a multi-step handler resume after a
-  crash.
+  crash. A recovery point belongs to its request body: a retry with another
+  body gets `422`.
 - **idempotency:** a boot warning when `in_flight_ttl_secs` is shorter than
   `server.timeouts.request_timeout_ms`, and a boot note when no request
   timeout is set.

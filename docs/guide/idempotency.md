@@ -195,9 +195,15 @@ async fn pay(idem: IdempotencyTx, mut db: Db) -> AutumnResult<axum::response::Re
 - `commit` reads the whole body. A body larger than 10 MiB gives `500`.
 - If the handler also changes the session, Autumn rewrites the record after
   the session is saved, so a replay gets the final `Set-Cookie`. Until the
-  rewrite ends, the key stays locked. If the session save fails or the
-  process stops first, a retry gets `409` until the record expires. The
-  record is never replayed without its `Set-Cookie`.
+  rewrite ends, the key stays locked:
+  - A session change before `commit`: `commit` holds the lock in its own
+    transaction.
+  - A session change after `commit`: the middleware holds the lock when the
+    handler returns. Keep the handler within `in_flight_ttl_secs`.
+
+  If the session save fails or the process stops first, a retry gets `409`
+  until the record expires. The record is never replayed without its
+  `Set-Cookie`.
 - Call `commit`, `set_recovery_point` and `recovery_point` on a primary `Db`
   connection. The key row is not on a shard, so on a `ShardedDb` connection
   they give `500`.
@@ -221,6 +227,11 @@ db.tx(|conn| async move {
     idem.commit(conn, (StatusCode::CREATED, "done")).await
 }.scope_boxed()).await
 ```
+
+A recovery point belongs to the request body that set it. A retry with the
+same key and another body gets `422` from `recovery_point`,
+`set_recovery_point` and `commit`. It cannot skip a step done for the first
+body.
 
 Lock expiry uses the app clock, not the database clock. Keep replica clocks
 in sync, and keep `in_flight_ttl_secs` much larger than the clock skew.

@@ -1244,7 +1244,8 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   response it gives back. A crash after the commit replays it; it is never
   re-run. Use a primary `Db` connection, not a shard.
 - Multi-step handlers: `idem.set_recovery_point(conn, "step")` in a tx;
-  `idem.recovery_point(&mut db)` on retry.
+  `idem.recovery_point(&mut db)` on retry. Another body with the same key
+  gets `422`.
 - `IdempotencyTx` methods are no-ops without a key or with another backend.
 - Custom store: implement the async `IdempotencyStore` trait (`get`, `set`,
   `try_lock(key, owner, ttl)`, `unlock(key, owner)`, each returns an

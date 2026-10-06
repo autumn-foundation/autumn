@@ -30,12 +30,14 @@ use super::{
 };
 use crate::db::RuntimeConnection;
 use crate::error::{AutumnError, AutumnResult};
+use crate::session::Session;
 
 diesel::table! {
     autumn_idempotency_keys (storage_key) {
         storage_key -> Text,
         record -> Nullable<Binary>,
         recovery_point -> Nullable<Text>,
+        recovery_body_hash -> Nullable<Binary>,
         locked_by -> Nullable<Text>,
         locked_until_ms -> BigInt,
         expires_at_ms -> BigInt,
@@ -131,17 +133,28 @@ impl DbIdempotencyStore {
         owner: &str,
     ) -> Result<(), IdempotencyStoreError> {
         let mut conn = self.conn().await?;
-        let held = keys::autumn_idempotency_keys
-            .filter(keys::storage_key.eq(key))
-            .filter(keys::locked_by.eq(owner))
-            .filter(keys::expires_at_ms.gt(keys::locked_until_ms));
-        diesel::update(held)
-            .set(keys::locked_until_ms.eq(keys::expires_at_ms))
-            .execute(&mut conn)
+        extend_lock_to_expiry(&mut conn, key, owner)
             .await
-            .map_err(|e| db_error("hold idempotency lock", e))?;
-        Ok(())
+            .map_err(|e| db_error("hold idempotency lock", e))
     }
+}
+
+/// Keep `owner`'s lock on `key` until the record expires. A lock that already
+/// ends later does not change.
+async fn extend_lock_to_expiry(
+    conn: &mut RuntimeConnection,
+    key: &str,
+    owner: &str,
+) -> diesel::QueryResult<()> {
+    let held = keys::autumn_idempotency_keys
+        .filter(keys::storage_key.eq(key))
+        .filter(keys::locked_by.eq(owner))
+        .filter(keys::expires_at_ms.gt(keys::locked_until_ms));
+    diesel::update(held)
+        .set(keys::locked_until_ms.eq(keys::expires_at_ms))
+        .execute(conn)
+        .await
+        .map(drop)
 }
 
 impl IdempotencyStore for DbIdempotencyStore {
@@ -341,6 +354,7 @@ struct TxClaim {
 #[derive(Clone, Default)]
 pub struct IdempotencyTx {
     claim: Option<Arc<TxClaim>>,
+    session: Option<Session>,
 }
 
 impl IdempotencyTx {
@@ -358,6 +372,7 @@ impl IdempotencyTx {
                 ttl,
                 committed: AtomicBool::new(false),
             })),
+            session: None,
         }
     }
 
@@ -385,8 +400,14 @@ impl IdempotencyTx {
     ///   expired and another request took it). The transaction must roll back.
     /// - `500` when `conn` is not a primary database connection (for example,
     ///   a shard). The key row is only on the primary database.
+    /// - `422` when a recovery point of this key came from another request
+    ///   body.
     /// - `500` when the body is larger than 10 MiB or cannot be read, or the
     ///   write fails.
+    ///
+    /// If the session already changed, the key stays locked until the session
+    /// rewrite ends, so a retry never replays a record without its
+    /// `Set-Cookie`.
     pub fn commit<'c>(
         &self,
         conn: &'c mut RuntimeConnection,
@@ -394,10 +415,12 @@ impl IdempotencyTx {
     ) -> impl Future<Output = AutumnResult<Response<Body>>> + Send + 'c {
         let response = response.into_response();
         let claim = self.claim.clone();
+        let session = self.session.clone();
         async move {
             let Some(claim) = claim else {
                 return Ok(response);
             };
+            held_row(conn, &claim).await?;
             let (parts, body) = response.into_parts();
             let bytes = axum::body::to_bytes(body, MAX_CACHEABLE_RESPONSE_BODY)
                 .await
@@ -427,6 +450,13 @@ impl IdempotencyTx {
             if written != 1 {
                 return Err(claim_error(conn, &claim).await);
             }
+            // The session already changed, so this record has no final
+            // `Set-Cookie`. Keep it hidden until the session rewrite ends.
+            if let Some(session) = &session
+                && session.has_pending_changes().await
+            {
+                extend_lock_to_expiry(conn, &claim.storage_key, &claim.owner).await?;
+            }
             AtomicBool::store(&claim.committed, true, Ordering::SeqCst);
             Ok(Response::from_parts(parts, Body::from(bytes)))
         }
@@ -437,8 +467,11 @@ impl IdempotencyTx {
     ///
     /// # Errors
     ///
-    /// `409` when this request no longer holds the key. `500` when the write
-    /// fails.
+    /// - `409` when this request no longer holds the key.
+    /// - `422` when a recovery point of this key came from another request
+    ///   body.
+    /// - `500` when the key row is not on `conn` (for example, a shard
+    ///   connection), or the write fails.
     pub fn set_recovery_point<'c>(
         &self,
         conn: &'c mut RuntimeConnection,
@@ -450,8 +483,12 @@ impl IdempotencyTx {
             let Some(claim) = claim else {
                 return Ok(());
             };
+            held_row(conn, &claim).await?;
             let written = diesel::update(owned_key(&claim))
-                .set(keys::recovery_point.eq(Some(point)))
+                .set((
+                    keys::recovery_point.eq(Some(point)),
+                    keys::recovery_body_hash.eq(Some(claim.body_hash.clone())),
+                ))
                 .execute(conn)
                 .await?;
             if written == 1 {
@@ -468,6 +505,8 @@ impl IdempotencyTx {
     /// # Errors
     ///
     /// - `409` when another request took the key (this request's lock expired).
+    /// - `422` when the recovery point came from another request body. A step
+    ///   done for one body is not done for another.
     /// - `500` when the key row is not on `conn` (for example, a shard
     ///   connection), or the read fails.
     pub fn recovery_point<'c>(
@@ -479,17 +518,7 @@ impl IdempotencyTx {
             let Some(claim) = claim else {
                 return Ok(None);
             };
-            // An active claim always has its row. A missing row is not
-            // "no step committed": the step may have committed elsewhere.
-            let point: Option<Option<String>> = owned_key(&claim)
-                .select(keys::recovery_point)
-                .first(conn)
-                .await
-                .optional()?;
-            match point {
-                Some(point) => Ok(point),
-                None => Err(claim_error(conn, &claim).await),
-            }
+            held_row(conn, &claim).await
         }
     }
 }
@@ -508,6 +537,27 @@ fn owned_key(claim: &TxClaim) -> HeldKey<'_> {
     keys::autumn_idempotency_keys
         .filter(keys::storage_key.eq(claim.storage_key.as_str()))
         .filter(keys::locked_by.eq(claim.owner.as_str()))
+}
+
+/// The recovery point of the row this request holds.
+///
+/// - No such row: [`claim_error`]. An active claim always has its row, so a
+///   missing row is not "no step committed".
+/// - The recovery point came from another request body: `422`, as for a
+///   replay with another body.
+async fn held_row(conn: &mut RuntimeConnection, claim: &TxClaim) -> AutumnResult<Option<String>> {
+    let row: Option<(Option<String>, Option<Vec<u8>>)> = owned_key(claim)
+        .select((keys::recovery_point, keys::recovery_body_hash))
+        .first(conn)
+        .await
+        .optional()?;
+    match row {
+        None => Err(claim_error(conn, claim).await),
+        Some((_, Some(hash))) if hash != claim.body_hash => Err(AutumnError::unprocessable_msg(
+            "idempotency key reused with different payload",
+        )),
+        Some((point, _)) => Ok(point),
+    }
 }
 
 /// The error for a write that found no row held by this request.
@@ -541,6 +591,8 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for IdempotencyTx {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        Ok(parts.extensions.get::<Self>().cloned().unwrap_or_default())
+        let mut tx = parts.extensions.get::<Self>().cloned().unwrap_or_default();
+        tx.session = parts.extensions.get::<Session>().cloned();
+        Ok(tx)
     }
 }

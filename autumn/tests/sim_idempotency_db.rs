@@ -417,3 +417,126 @@ async fn sim_idempotency_db_recovery_point_on_a_shard_is_an_error(_sim: Sim) {
         "a missing key row is not read as \"no step committed\""
     );
 }
+
+fn step(key: &str, body: &'static str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/step")
+        .header("idempotency-key", key)
+        .body(Body::from(body))
+        .expect("request")
+}
+
+#[sim_test]
+async fn sim_idempotency_db_recovery_point_is_bound_to_the_request_body(_sim: Sim) {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(86_400),
+    ));
+    let pool = substrate.pool();
+    // The first attempt records its step, then fails before `commit`.
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        async move {
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            match idem.recovery_point(conn).await {
+                Err(error) => error.into_response(),
+                Ok(Some(point)) => format!("resumed after {point}").into_response(),
+                Ok(None) => {
+                    let step = idem.clone();
+                    conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                        step.set_recovery_point(conn, "charged").await
+                    })
+                    .await
+                    .expect("transaction");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/step", axum::routing::post(handler))
+        .layer(IdempotencyLayer::new(store));
+
+    let first = app
+        .clone()
+        .oneshot(step("pay", "A"))
+        .await
+        .expect("infallible");
+    assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let other_body = app
+        .clone()
+        .oneshot(step("pay", "B"))
+        .await
+        .expect("infallible");
+    assert_eq!(
+        other_body.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a step done for body A is not a step done for body B"
+    );
+
+    let same_body = app
+        .clone()
+        .oneshot(step("pay", "A"))
+        .await
+        .expect("infallible");
+    assert_eq!(same_body.status(), StatusCode::OK, "body A resumes");
+}
+
+/// Multi-thread with real time, like the crash sweep: a `SQLite` query
+/// cannot overlap a `Sim` clock jump on a current-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_change_before_commit_holds_the_key() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(86_400),
+    ));
+    let pool = substrate.pool();
+    // The handler changes the session, commits, then runs past the 1 s lock.
+    let handler = move |idem: IdempotencyTx, session: Session| {
+        let pool = pool.clone();
+        async move {
+            session.insert("user_id", "42").await;
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            let response = conn
+                .transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                    idem.commit(conn, (StatusCode::CREATED, "logged in")).await
+                })
+                .await
+                .expect("transaction");
+            drop(pooled);
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            response
+        }
+    };
+    let app = axum::Router::new()
+        .route("/login", axum::routing::post(handler))
+        .layer(IdempotencyLayer::new(store).with_in_flight_ttl(Duration::from_secs(1)))
+        .layer(SessionLayer::new(
+            MemoryStore::new(),
+            SessionConfig::default(),
+        ));
+
+    let first = app.clone().oneshot(login("slow"));
+    let retry = async {
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        app.clone()
+            .oneshot(login("slow"))
+            .await
+            .expect("infallible")
+    };
+    let (first, retry) = tokio::join!(first, retry);
+    assert_eq!(first.expect("infallible").status(), StatusCode::CREATED);
+    assert_eq!(
+        retry.status(),
+        StatusCode::CONFLICT,
+        "the record without its Set-Cookie stays hidden past the in-flight TTL"
+    );
+}
