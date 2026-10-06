@@ -579,6 +579,14 @@ impl CostSignal {
             key: COST_SIGNAL_KEY.to_owned(),
             reason: format!("expected float, got {}", value.value_type()),
         })?;
+        // A stored value that is not finite is an error, not a silent no-op:
+        // the refresher logs it, and the signal keeps its last good value.
+        if !value.is_finite() {
+            return Err(ConfigError::TypeMismatch {
+                key: COST_SIGNAL_KEY.to_owned(),
+                reason: format!("expected a finite float, got {value}"),
+            });
+        }
         self.set(value);
         Ok(())
     }

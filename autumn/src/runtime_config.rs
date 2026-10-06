@@ -333,6 +333,11 @@ impl ConfigValidator {
                 let v = value
                     .as_float()
                     .ok_or_else(|| "FloatRange validator applied to non-float value".to_owned())?;
+                // `NaN` compares false with every bound, so it would pass any
+                // range; it is in none.
+                if v.is_nan() {
+                    return Err("value NaN is not a number".to_owned());
+                }
                 if let Some(lo) = min
                     && v < *lo
                 {
@@ -733,7 +738,9 @@ impl ConfigRegistry {
             .description("Live cost signal: carbon g/kWh or price per unit (issue #1720)")
             .validator(ConfigValidator::FloatRange {
                 min: Some(0.0),
-                max: None,
+                // A finite bound keeps `inf` out: the signal ignores a value
+                // that is not finite.
+                max: Some(f64::MAX),
             }),
         )
     }
@@ -1939,6 +1946,38 @@ mod tests {
             max: Some(1.0),
         };
         v.validate(&ConfigValue::Float(0.5)).unwrap();
+    }
+
+    #[test]
+    fn float_range_rejects_nan() {
+        let v = ConfigValidator::FloatRange {
+            min: Some(0.0),
+            max: None,
+        };
+        v.validate(&ConfigValue::Float(f64::NAN)).unwrap_err();
+    }
+
+    /// The cost signal key accepts only finite values (#1720).
+    #[test]
+    fn cost_signal_key_rejects_values_that_are_not_finite() {
+        let mut registry = ConfigRegistry::new();
+        registry.define_cost_signal().unwrap();
+        let schema = registry.get(COST_SIGNAL_KEY).unwrap();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            assert!(
+                schema
+                    .validators
+                    .iter()
+                    .any(|v| v.validate(&ConfigValue::Float(bad)).is_err()),
+                "{bad} must be rejected"
+            );
+        }
+        assert!(
+            schema
+                .validators
+                .iter()
+                .all(|v| v.validate(&ConfigValue::Float(520.0)).is_ok())
+        );
     }
 
     #[test]
