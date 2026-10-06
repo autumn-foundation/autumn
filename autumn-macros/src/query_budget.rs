@@ -4062,32 +4062,11 @@ impl Analyzer {
         } else {
             Kind::Plain
         };
-        // A fold's closure also gets its accumulator, first: the seed, then
-        // what the closure returns.
-        let (param, fold_params) = if matches!(
-            name.as_str(),
-            "fold" | "try_fold" | "rfold" | "try_rfold" | "scan"
-        ) {
-            let mut acc = method
-                .args
-                .iter()
-                .filter(|a| !matches!(a, Expr::Closure(_)))
-                .map(|a| self.value_of(a))
-                .fold(Kind::Plain, Kind::max);
-            loop {
-                let out = method
-                    .args
-                    .last()
-                    .map_or(Kind::Plain, |f| self.closure_output(f, acc.max(param)));
-                if out <= acc {
-                    break;
-                }
-                acc = acc.max(out);
-            }
-            (param.max(acc), vec![acc, param])
-        } else {
-            (param, Vec::new())
-        };
+        // A fold's closure also gets its accumulator, first.
+        let (param, fold_params) = self.fold_acc(method, param).map_or_else(
+            || (param, Vec::new()),
+            |acc| (param.max(acc), vec![acc, param]),
+        );
         // A function given by path where a closure would run is opaque.
         // An at-most-once method calls its argument too: `inspect_err(f)`.
         let takes_callback = is_transaction
@@ -4751,6 +4730,34 @@ impl Analyzer {
         }
     }
 
+    /// What a fold's accumulator holds: the seed, then what the closure
+    /// returns when it gets the accumulator and an `element`. `None` for
+    /// any other method.
+    fn fold_acc(&self, method: &ExprMethodCall, element: Kind) -> Option<Kind> {
+        if !matches!(
+            method.method.to_string().as_str(),
+            "fold" | "try_fold" | "rfold" | "try_rfold" | "scan"
+        ) {
+            return None;
+        }
+        let mut acc = method
+            .args
+            .iter()
+            .filter(|a| !matches!(a, Expr::Closure(_)))
+            .map(|a| self.value_of(a))
+            .fold(Kind::Plain, Kind::max);
+        loop {
+            let out = method.args.last().map_or(Kind::Plain, |f| match f {
+                Expr::Closure(c) => self.closure_value(c, &[acc, element], element, false),
+                _ => Kind::Plain,
+            });
+            if out <= acc {
+                return Some(acc);
+            }
+            acc = acc.max(out);
+        }
+    }
+
     /// What a callback method's result holds, from what its callback
     /// returns and its other arguments hold. Plain for any other method.
     fn callback_result(&self, mc: &ExprMethodCall) -> Kind {
@@ -4764,6 +4771,13 @@ impl Analyzer {
             Kind::Plain => Kind::Plain,
             kind => kind.element(),
         };
+        // A fold gives its accumulator. `scan` yields what its closure
+        // returns.
+        if method != "scan"
+            && let Some(acc) = self.fold_acc(mc, param)
+        {
+            return acc;
+        }
         let out = mc
             .args
             .iter()
@@ -4867,6 +4881,16 @@ impl Analyzer {
         let Expr::Path(path) = &*call.func else {
             return false;
         };
+        // `mem::drop` may name a module-level alias the macro cannot see.
+        let rooted = path.path.segments.len() == 1
+            || path
+                .path
+                .segments
+                .first()
+                .is_some_and(|s| s.ident == "std" || s.ident == "core" || s.ident == "alloc");
+        if !rooted {
+            return false;
+        }
         call_path_name(call)
             .is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()) && !self.call_head_shadowed(call))
             && std_prefix(&path.path)
@@ -5142,6 +5166,13 @@ impl Analyzer {
             }
             Expr::Reference(r) => self.expr_is_holder(&r.expr),
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.expr_is_holder(&u.expr),
+            // `repo + x`, `-repo`: an overloaded operator may give the handle
+            // back, like an opaque helper.
+            Expr::Binary(b) => {
+                overloads_output(&b.op)
+                    && (self.expr_carries_handle(&b.left) || self.expr_carries_handle(&b.right))
+            }
+            Expr::Unary(u) => self.expr_carries_handle(&u.expr),
             Expr::Paren(p) => self.expr_is_holder(&p.expr),
             Expr::Group(g) => self.expr_is_holder(&g.expr),
             _ => false,
@@ -13829,6 +13860,12 @@ mod tests {
                  let _ = vec![if flag { return Ok(repo.a().await?); } else { 0 }]; repo.b().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
+            (
+                "guard: a fold seeded with the handle gives it",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let r = ids.iter().fold(repo, |acc, _| acc); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
         ]);
     }
 
@@ -13925,6 +13962,24 @@ mod tests {
                  std::mem::drop(repo); Ok(0) }",
                 Expect::Exact(0),
             ),
+            (
+                "a drop under a path not rooted at std is not std",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 mem::drop(repo); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a bare drop is std",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 drop(repo); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: core::mem::drop is std",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 core::mem::drop(repo); Ok(0) }",
+                Expect::Exact(0),
+            ),
         ]);
     }
 
@@ -13996,6 +14051,18 @@ mod tests {
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let ids: Vec<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
                 Expect::Exact(0),
+            ),
+            (
+                "an exempt operator may give its handle back",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 #[query_exempt(reason = \"identity only\")] let alias = repo + (); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an exempt unary operator may give its handle back",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 #[query_exempt(reason = \"identity only\")] let alias = -repo; let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
