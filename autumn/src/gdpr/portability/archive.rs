@@ -227,8 +227,7 @@ impl DataCapsule {
             if !is_safe_rel_path(rel) {
                 return Err(DataCapsuleError::InvalidName(rel.clone()));
             }
-            root.write(rel, bytes)?;
-            written.push(rel.clone());
+            root.write(rel, bytes, written)?;
         }
 
         let manifest_bytes = to_json(MANIFEST_FILE, &manifest)?;
@@ -236,10 +235,12 @@ impl DataCapsule {
             algorithm: ALGORITHM.to_owned(),
             signature: signer.sign(&manifest_bytes),
         };
-        root.write(MANIFEST_FILE, &manifest_bytes)?;
-        written.push(MANIFEST_FILE.to_owned());
-        root.write(SIGNATURE_FILE, &to_json(SIGNATURE_FILE, &signature)?)?;
-        written.push(SIGNATURE_FILE.to_owned());
+        root.write(MANIFEST_FILE, &manifest_bytes, written)?;
+        root.write(
+            SIGNATURE_FILE,
+            &to_json(SIGNATURE_FILE, &signature)?,
+            written,
+        )?;
         Ok(())
     }
 
@@ -500,7 +501,8 @@ mod tests {
             std::fs::rename(dir.path(), &moved).unwrap();
             let decoy = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(decoy.path(), dir.path()).unwrap();
-            root.write("records/a.json", b"[]").unwrap();
+            root.write("records/a.json", b"[]", &mut Vec::new())
+                .unwrap();
             assert_eq!(std::fs::read(moved.join("records/a.json")).unwrap(), b"[]");
             assert!(std::fs::read_dir(decoy.path()).unwrap().next().is_none());
             let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -511,18 +513,36 @@ mod tests {
         }
 
         #[test]
+        fn a_file_is_tracked_before_a_step_that_can_fail() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = Root::open(dir.path()).unwrap();
+            let mut written = Vec::new();
+            // The fill after the create fails (for example, the disk is full).
+            drop(
+                root.create("viewer/users/index.html", &mut written)
+                    .unwrap(),
+            );
+            assert_eq!(
+                written,
+                ["viewer/", "viewer/users/", "viewer/users/index.html"]
+            );
+
+            root.remove_written(&written);
+            assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        }
+
+        #[test]
         fn cleanup_removes_only_the_files_of_this_call() {
             let dir = tempfile::tempdir().unwrap();
             let root = Root::open(dir.path()).unwrap();
-            root.write("records/a.json", b"[]").unwrap();
-            root.write("viewer/users/index.html", b"<p>").unwrap();
+            let mut written = Vec::new();
+            root.write("records/a.json", b"[]", &mut written).unwrap();
+            root.write("viewer/users/index.html", b"<p>", &mut written)
+                .unwrap();
             // Another export wrote into the same directory.
             std::fs::write(dir.path().join("records/b.json"), b"[1]").unwrap();
 
-            root.remove_written(&[
-                "records/a.json".to_owned(),
-                "viewer/users/index.html".to_owned(),
-            ]);
+            root.remove_written(&written);
             assert!(!dir.path().join("records/a.json").exists());
             assert_eq!(
                 std::fs::read(dir.path().join("records/b.json")).unwrap(),
@@ -539,7 +559,9 @@ mod tests {
             let decoy = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(decoy.path(), dir.path().join("records")).unwrap();
             let root = Root::open(dir.path()).unwrap();
-            let err = root.write("records/a.json", b"[]").expect_err("linked dir");
+            let err = root
+                .write("records/a.json", b"[]", &mut Vec::new())
+                .expect_err("linked dir");
             assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
             assert!(std::fs::read_dir(decoy.path()).unwrap().next().is_none());
 
@@ -547,7 +569,10 @@ mod tests {
             std::fs::write(decoy.path().join("target"), b"keep").unwrap();
             std::os::unix::fs::symlink(decoy.path().join("target"), dir.path().join("m.json"))
                 .unwrap();
-            assert!(root.write("m.json", b"{}").is_err());
+            let mut written = Vec::new();
+            assert!(root.write("m.json", b"{}", &mut written).is_err());
+            // A file of another writer is not ours to remove.
+            assert!(written.is_empty(), "{written:?}");
             assert_eq!(std::fs::read(decoy.path().join("target")).unwrap(), b"keep");
         }
 

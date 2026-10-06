@@ -145,14 +145,17 @@ mod imp {
         }
 
         /// Remove the files in `written`, then each of their directories that
-        /// is empty. Content of another writer stays. Errors are ignored: this
-        /// is a cleanup after a failure.
+        /// is empty. An entry that ends in `/` is a directory. Content of
+        /// another writer stays. Errors are ignored: this is a cleanup after a
+        /// failure.
         pub(in crate::gdpr::portability) fn remove_written(&self, written: &[String]) {
             let mut dirs = BTreeSet::new();
             for rel in written {
                 let mut segments: Vec<&str> = rel.split('/').collect();
                 let Some(name) = segments.pop() else { continue };
-                if let Ok(dir) = self.open_dir(&segments, rel) {
+                if !name.is_empty()
+                    && let Ok(dir) = self.open_dir(&segments, rel)
+                {
                     let parent = dir.as_ref().map_or_else(|| self.fd.as_fd(), AsFd::as_fd);
                     let _ = unlinkat(parent, name, UnlinkatFlags::NoRemoveDir);
                 }
@@ -174,22 +177,42 @@ mod imp {
         }
 
         /// Write a new owner-only file. Each directory is owner-only too.
+        /// `created` gets each new entry before a step that can fail.
         pub(in crate::gdpr::portability) fn write(
             &self,
             rel: &str,
             bytes: &[u8],
+            created: &mut Vec<String>,
         ) -> Result<(), DataCapsuleError> {
+            let fd = self.create(rel, created)?;
+            fchmod(&fd, FILE_MODE).map_err(|e| error(e, rel))?;
+            std::fs::File::from(fd)
+                .write_all(bytes)
+                .map_err(|e| DataCapsuleError::io(rel, e))
+        }
+
+        /// Create the empty file `rel` and its directories. Each new entry
+        /// goes into `created` as it is made; a directory ends in `/`.
+        pub(in crate::gdpr::portability) fn create(
+            &self,
+            rel: &str,
+            created: &mut Vec<String>,
+        ) -> Result<OwnedFd, DataCapsuleError> {
             let mut segments: Vec<&str> = rel.split('/').collect();
             let name = segments
                 .pop()
                 .ok_or_else(|| DataCapsuleError::InvalidName(rel.to_owned()))?;
             let mut current: Option<OwnedFd> = None;
+            let mut path = String::new();
             for segment in segments {
                 let parent = current
                     .as_ref()
                     .map_or_else(|| self.fd.as_fd(), AsFd::as_fd);
+                path.push_str(segment);
+                path.push('/');
                 match mkdirat(parent, segment, DIR_MODE) {
-                    Ok(()) | Err(Errno::EEXIST) => {}
+                    Ok(()) => created.push(path.clone()),
+                    Err(Errno::EEXIST) => {}
                     Err(e) => return Err(error(e, rel)),
                 }
                 let dir =
@@ -202,10 +225,8 @@ mod imp {
                 .as_ref()
                 .map_or_else(|| self.fd.as_fd(), AsFd::as_fd);
             let fd = openat(parent, name, NEW_FILE_FLAGS, FILE_MODE).map_err(|e| error(e, rel))?;
-            fchmod(&fd, FILE_MODE).map_err(|e| error(e, rel))?;
-            std::fs::File::from(fd)
-                .write_all(bytes)
-                .map_err(|e| DataCapsuleError::io(rel, e))
+            created.push(rel.to_owned());
+            Ok(fd)
         }
     }
 
@@ -335,14 +356,16 @@ mod imp {
         }
 
         /// Remove the files in `written`, then each of their directories that
-        /// is empty. Content of another writer stays.
+        /// is empty. An entry that ends in `/` is a directory. Content of
+        /// another writer stays.
         pub(in crate::gdpr::portability) fn remove_written(&self, written: &[String]) {
             let mut dirs = BTreeSet::new();
             for rel in written {
-                let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
-                let _ = std::fs::remove_file(&path);
                 let mut segments: Vec<&str> = rel.split('/').collect();
-                segments.pop();
+                if segments.pop().is_some_and(|name| !name.is_empty()) {
+                    let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
+                    let _ = std::fs::remove_file(&path);
+                }
                 for depth in 1..=segments.len() {
                     dirs.insert(segments[..depth].join("/"));
                 }
@@ -357,22 +380,34 @@ mod imp {
         }
 
         /// Write a new owner-only file. Each directory is owner-only too.
+        /// `created` gets each new entry; a directory ends in `/`.
         pub(in crate::gdpr::portability) fn write(
             &self,
             rel: &str,
             bytes: &[u8],
+            created: &mut Vec<String>,
         ) -> Result<(), DataCapsuleError> {
             let mut dir = self.path.clone();
+            let mut prefix = String::new();
             let mut segments: Vec<&str> = rel.split('/').collect();
             segments.pop();
             for segment in segments {
                 dir.push(segment);
+                prefix.push_str(segment);
+                prefix.push('/');
+                let existed = dir.is_dir();
                 crate::fs_atomic::ensure_owner_only_dir(&dir)
                     .map_err(|e| DataCapsuleError::io(&dir, e))?;
+                if !existed {
+                    created.push(prefix.clone());
+                }
             }
             let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
+            // A failed write leaves no file: it writes a temp file, then renames it.
             crate::fs_atomic::write_owner_only(&path, bytes)
-                .map_err(|e| DataCapsuleError::io(path, e))
+                .map_err(|e| DataCapsuleError::io(&path, e))?;
+            created.push(rel.to_owned());
+            Ok(())
         }
 
         pub(in crate::gdpr::portability) fn list_regular_files(

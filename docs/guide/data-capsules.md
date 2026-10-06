@@ -72,7 +72,9 @@ fails.
 
 Capsules use `[security.signing_secret]`. Set it with
 `AUTUMN_SECURITY__SIGNING_SECRET`. Export, verify, and import need a secret.
-Without one, they stop with an error.
+Without one, they stop with an error. With the `prod` profile, the CLI uses
+the same secret rules as the server: a short secret, or a short key in
+`previous_secrets`, stops the command.
 
 Verify also accepts the keys in `previous_secrets`. Old capsules stay valid
 after a key rotation.

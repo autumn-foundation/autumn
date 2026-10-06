@@ -329,27 +329,30 @@ impl BlobStore for LocalBlobStore {
                     return Err(BlobStoreError::io(err));
                 }
             }
-            if write_meta_sidecar(
-                &path,
-                &StoredBlobMeta {
-                    content_type: content_type.to_owned(),
-                    etag: Some(etag.clone()),
-                },
-            )
-            .await
-            .is_err()
-            {
-                // A caller must not get a blob without its MIME type. Remove
-                // the blob only while `path` is still the file this call
-                // linked: another writer can replace it in the meantime.
-                if same_file(&path, &tmp_path).await {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    drop_stale_sidecar(&path).await;
+            let meta = StoredBlobMeta {
+                content_type: content_type.to_owned(),
+                etag: Some(etag.clone()),
+            };
+            match commit_meta(&path, &tmp_path, &meta).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Another writer replaced the blob: the key is taken.
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Ok(None);
                 }
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                return Err(BlobStoreError::Io(format!(
-                    "could not store the metadata of {key}"
-                )));
+                Err(()) => {
+                    // A caller must not get a blob without its MIME type.
+                    // Remove the blob only while `path` is still the file
+                    // this call linked: another writer can replace it.
+                    if same_file(&path, &tmp_path).await {
+                        let _ = tokio::fs::remove_file(&path).await;
+                        drop_stale_sidecar(&path).await;
+                    }
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(BlobStoreError::Io(format!(
+                        "could not store the metadata of {key}"
+                    )));
+                }
             }
             let _ = tokio::fs::remove_file(&tmp_path).await;
             Ok(Some(Blob {
@@ -1007,7 +1010,7 @@ fn temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
 /// `attachments/{uuid}.pdf`) so the chance is vanishing. The S3
 /// backend has no equivalent issue because S3 stores `Content-Type` as
 /// part of the object's metadata.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StoredBlobMeta {
     pub content_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1098,6 +1101,35 @@ async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) 
 /// fallback rather than stale `content_type` from the previous put.
 /// The bytes are already committed; we'd rather serve "I don't know"
 /// than misrepresent the MIME.
+/// Write the sidecar of a blob that `put_if_absent` linked from `tmp_path`.
+///
+/// `Ok(false)` when another writer replaced the blob first: its metadata
+/// stays. When the blob is replaced during the write, this call removes the
+/// sidecar while it is still its own. A reader then gets the default MIME
+/// type, never a wrong one.
+async fn commit_meta(
+    path: &std::path::Path,
+    tmp_path: &std::path::Path,
+    meta: &StoredBlobMeta,
+) -> Result<bool, ()> {
+    if !same_file(path, tmp_path).await {
+        return Ok(false);
+    }
+    write_meta_sidecar(path, meta).await?;
+    if same_file(path, tmp_path).await {
+        return Ok(true);
+    }
+    drop_own_sidecar(path, meta).await;
+    Ok(false)
+}
+
+/// Remove the sidecar of `blob_path` only if it still holds `meta`.
+async fn drop_own_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) {
+    if read_meta_sidecar(blob_path).await.as_ref() == Some(meta) {
+        drop_stale_sidecar(blob_path).await;
+    }
+}
+
 async fn drop_stale_sidecar(blob_path: &std::path::Path) {
     let path = meta_sidecar_path(blob_path);
     if let Err(err) = tokio::fs::remove_file(&path).await
@@ -1392,6 +1424,44 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, ["b.png", "b.png.meta"]);
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_meta_keeps_the_metadata_of_a_replacement() {
+        let dir = temp_root();
+        let path = dir.path().join("a.bin");
+        let tmp_path = dir.path().join("a.bin.tmp");
+        std::fs::write(&tmp_path, b"ours").unwrap();
+        // Another writer replaced the linked blob before the sidecar write.
+        std::fs::write(&path, b"theirs").unwrap();
+        let theirs = StoredBlobMeta {
+            content_type: "text/plain".to_owned(),
+            etag: Some(sha256_hex(b"theirs")),
+        };
+        write_meta_sidecar(&path, &theirs).await.unwrap();
+        let ours = StoredBlobMeta {
+            content_type: "image/png".to_owned(),
+            etag: Some(sha256_hex(b"ours")),
+        };
+
+        assert_eq!(commit_meta(&path, &tmp_path, &ours).await, Ok(false));
+        assert_eq!(read_meta_sidecar(&path).await, Some(theirs));
+    }
+
+    #[tokio::test]
+    async fn drop_own_sidecar_keeps_the_metadata_of_another_writer() {
+        let dir = temp_root();
+        let path = dir.path().join("a.bin");
+        let meta = |etag: &[u8]| StoredBlobMeta {
+            content_type: "text/plain".to_owned(),
+            etag: Some(sha256_hex(etag)),
+        };
+        write_meta_sidecar(&path, &meta(b"theirs")).await.unwrap();
+        drop_own_sidecar(&path, &meta(b"ours")).await;
+        assert_eq!(read_meta_sidecar(&path).await, Some(meta(b"theirs")));
+
+        drop_own_sidecar(&path, &meta(b"theirs")).await;
+        assert_eq!(read_meta_sidecar(&path).await, None);
     }
 
     #[tokio::test]

@@ -7589,6 +7589,8 @@ impl AppBuilder {
             plugin_config_roots,
         )
         .await;
+        // A capsule holds personal data: use the same secret rules as a server.
+        fail_fast_on_invalid_signing_secret(&config);
 
         // Verify skips the database: it runs no migration. It keeps the blob
         // store, so an initializer that builds a service from it still works.

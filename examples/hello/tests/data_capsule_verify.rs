@@ -67,3 +67,25 @@ async fn the_binary_verifies_a_capsule_and_detects_a_change() {
         "{report}"
     );
 }
+
+#[test]
+fn the_prod_profile_refuses_a_weak_signing_secret() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_hello"))
+        .env("AUTUMN_DATA_CAPSULE", "verify")
+        .env("AUTUMN_DATA_CAPSULE_PATH", dir.path())
+        .env("AUTUMN_PROFILE", "prod")
+        .env("AUTUMN_SECURITY__SIGNING_SECRET", "short")
+        .env_remove("AUTUMN_ENV")
+        .env_remove("DATABASE_URL")
+        .output()
+        .expect("the app binary must run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Invalid signing secret configuration"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains(REPORT), "stdout:\n{stdout}");
+}
