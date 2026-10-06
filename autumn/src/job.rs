@@ -15871,7 +15871,7 @@ mod tests {
         .expect("claimed");
         let lock_key = worker_config.unique_lock_key_for(&record);
         let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
-        let renew = |connection: &mut redis::aio::ConnectionManager| {
+        let renew = |connection: &mut redis::aio::ConnectionManager, visibility_timeout_ms: u64| {
             let mut connection = connection.clone();
             let (processing_key, record_key, lock_key, record) = (
                 worker_config.processing_key.clone(),
@@ -15886,7 +15886,7 @@ mod tests {
                     &record_key,
                     &lock_key,
                     &record,
-                    30_000,
+                    visibility_timeout_ms,
                 )
                 .await
             }
@@ -15911,7 +15911,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            renew(&mut connection).await,
+            renew(&mut connection, 30_000).await,
             LeaseRenewal::Renewed
         ));
         let ttl = pttl(&mut connection).await;
@@ -15923,17 +15923,8 @@ mod tests {
         // A visibility timeout past the 24 h backstop: the first renewal
         // comes after a third of it, so the lock must outlive the claim.
         let long_visibility_ms: u64 = 4 * 86_400_000;
-        let mut long_renewal = connection.clone();
         assert!(matches!(
-            renew_redis_claim(
-                &mut long_renewal,
-                &worker_config.processing_key,
-                &record_key,
-                &lock_key,
-                &record,
-                long_visibility_ms,
-            )
-            .await,
+            renew(&mut connection, long_visibility_ms).await,
             LeaseRenewal::Renewed
         ));
         let ttl = pttl(&mut connection).await;
@@ -15952,7 +15943,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            renew(&mut connection).await,
+            renew(&mut connection, 30_000).await,
             LeaseRenewal::Renewed
         ));
         let ttl = pttl(&mut connection).await;
