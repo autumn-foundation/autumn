@@ -2370,21 +2370,24 @@ impl Analyzer {
         tail.max(probe.returned)
     }
 
-    /// The names that `init` may point to when it is a `&mut` place or a
-    /// `&mut` binding: `&mut repos`, `&mut *slot`, `slot`.
+    /// The names that `init` may point to when it is a borrow or a binding
+    /// that holds one: `&mut repos`, `&mut *slot`, `slot`. A shared borrow
+    /// counts too: a cell writes through it.
     fn referents_of(&self, init: &Expr) -> Vec<String> {
         match init {
             Expr::Paren(p) => self.referents_of(&p.expr),
             Expr::Group(g) => self.referents_of(&g.expr),
-            Expr::Reference(r) if r.mutability.is_some() => self.place_referents(&r.expr),
-            // `addr_of_mut!(slot)`, read like `&raw mut slot`. Any macro of
-            // that name: a borrow only adds to what is reported.
+            // `&cell`: `cell.get()` writes through a shared borrow.
+            Expr::Reference(r) => self.place_referents(&r.expr),
+            // `addr_of_mut!(slot)` and `addr_of!(cell)`, read like `&raw mut
+            // slot`. Any macro of that name: a borrow only adds to what is
+            // reported.
             Expr::Macro(m)
                 if m.mac
                     .path
                     .segments
                     .last()
-                    .is_some_and(|s| s.ident == "addr_of_mut") =>
+                    .is_some_and(|s| s.ident == "addr_of_mut" || s.ident == "addr_of") =>
             {
                 m.mac
                     .parse_body::<Expr>()
@@ -2411,9 +2414,9 @@ impl Analyzer {
                 all
             }
             // `&raw mut slot`: a write through the pointer reaches `slot`.
-            Expr::RawAddr(r) if matches!(r.mutability, syn::PointerMutability::Mut(_)) => {
-                self.place_referents(&r.expr)
-            }
+            // `UnsafeCell::raw_get(&raw const cell)` writes through a const
+            // pointer too.
+            Expr::RawAddr(r) => self.place_referents(&r.expr),
             Expr::Path(_) => path_ident(init)
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
@@ -13561,6 +13564,36 @@ mod tests {
                 "async fn h(repo: PgPostRepository, names: Vec<String>) -> AutumnResult<usize> { \
                  let mut list = names.clone(); list.push(repo); render(&names); Ok(0) }",
                 Expect::Exact(0),
+            ),
+            (
+                "a const raw pointer to a cell keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let cell = UnsafeCell::new(None); let ptr = UnsafeCell::raw_get(&raw const cell); unsafe { *ptr = Some(repo); } let r = unsafe { (&*cell.get()).as_ref().unwrap() }; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "addr_of keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let cell = UnsafeCell::new(None); let ptr = UnsafeCell::raw_get(addr_of!(cell)); unsafe { *ptr = Some(repo); } let r = unsafe { (&*cell.get()).as_ref().unwrap() }; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a shared borrow cast to a pointer keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let cell = UnsafeCell::new(None); let ptr = UnsafeCell::raw_get(&cell as *const _); unsafe { *ptr = Some(repo); } let r = unsafe { (&*cell.get()).as_ref().unwrap() }; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a shared borrow of a cell keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let cell = UnsafeCell::new(None); let view = &cell; let ptr = view.get(); unsafe { *ptr = Some(repo); } let r = unsafe { (&*cell.get()).as_ref().unwrap() }; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a shared view of plain data stays plain",
+                "async fn h(repo: PgPostRepository, names: Vec<String>) -> AutumnResult<usize> { \
+                 let view = &names; render(view); repo.a().await?; Ok(names.len()) }",
+                Expect::Exact(1),
             ),
         ]);
     }
