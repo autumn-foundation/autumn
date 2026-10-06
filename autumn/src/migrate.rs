@@ -230,10 +230,21 @@ pub fn retry_on_lock_timeout<T>(
 /// The `SET LOCAL lock_timeout` statement for `timeout`, in milliseconds,
 /// capped at the Postgres maximum (`i32::MAX`).
 fn lock_timeout_statement(timeout: std::time::Duration) -> String {
-    let ms = u64::try_from(timeout.as_millis())
+    format!("SET LOCAL lock_timeout = {}", lock_timeout_ms(timeout))
+}
+
+/// The session `SET lock_timeout` each attempt runs first. It covers the
+/// harness's own queries on `__diesel_schema_migrations`, which run before
+/// any migration's [`migration_lock_sql`].
+fn session_lock_timeout_statement(timeout: std::time::Duration) -> String {
+    format!("SET lock_timeout = {}", lock_timeout_ms(timeout))
+}
+
+/// `timeout` in milliseconds, capped at the Postgres maximum.
+fn lock_timeout_ms(timeout: std::time::Duration) -> u64 {
+    u64::try_from(timeout.as_millis())
         .unwrap_or(u64::MAX)
-        .min(i32::MAX.unsigned_abs().into());
-    format!("SET LOCAL lock_timeout = {ms}")
+        .min(i32::MAX.unsigned_abs().into())
 }
 
 /// The `lock_timeout` statement a migration runs first. It is always explicit,
@@ -343,7 +354,7 @@ where
         tracing::debug!("could not set lc_messages; a non-English lock timeout is not retried");
     }
     let applied: AppliedLog = std::rc::Rc::default();
-    retry_on_lock_timeout(
+    let outcome = retry_on_lock_timeout(
         policy,
         |delay| {
             tracing::warn!(
@@ -355,6 +366,11 @@ where
             std::thread::sleep(delay);
         },
         || {
+            // The harness creates and reads `__diesel_schema_migrations`
+            // before it runs a migration. The session value covers that;
+            // each migration still sets its own first.
+            conn.batch_execute(&session_lock_timeout_statement(policy.lock_timeout))
+                .map_err(|e| MigrationError::Migration(e.to_string()))?;
             let source = LockTimeoutSource {
                 inner: &migrations,
                 lock_timeout: policy.lock_timeout,
@@ -365,7 +381,12 @@ where
                 .map(|_| ())
                 .map_err(|e| MigrationError::Migration(e.to_string()))
         },
-    )?;
+    );
+    // Give the connection back with the role or database default.
+    if conn.batch_execute("RESET lock_timeout").is_err() {
+        tracing::debug!("could not reset lock_timeout on the migration connection");
+    }
+    outcome?;
     Ok(dedup_applied(applied.take()))
 }
 
@@ -5224,6 +5245,19 @@ mod tests {
     }
 
     #[test]
+    fn session_lock_timeout_statement_is_a_session_set() {
+        assert_eq!(
+            session_lock_timeout_statement(std::time::Duration::from_secs(5)),
+            "SET lock_timeout = 5000"
+        );
+        // `0s` turns an inherited role or database default off.
+        assert_eq!(
+            session_lock_timeout_statement(std::time::Duration::ZERO),
+            "SET lock_timeout = 0"
+        );
+    }
+
+    #[test]
     fn migration_lock_sql_is_always_explicit() {
         let five = std::time::Duration::from_secs(5);
         assert_eq!(
@@ -5484,12 +5518,24 @@ mod tests {
         release: std::sync::mpsc::Receiver<()>,
         mode: &'static str,
     ) -> std::thread::JoinHandle<()> {
+        hold_table_lock(url, release, "autumn_lock_probe", mode)
+    }
+
+    /// Hold a `mode` lock on `table` in an open transaction until `release`
+    /// fires. Returns once the lock is held.
+    #[cfg(feature = "test-support")]
+    fn hold_table_lock(
+        url: String,
+        release: std::sync::mpsc::Receiver<()>,
+        table: &'static str,
+        mode: &'static str,
+    ) -> std::thread::JoinHandle<()> {
         use diesel::{Connection as _, connection::SimpleConnection as _};
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let mut conn = diesel::PgConnection::establish(&url).expect("connect holder");
             conn.batch_execute("BEGIN").expect("begin");
-            conn.batch_execute(&format!("LOCK TABLE autumn_lock_probe IN {mode} MODE"))
+            conn.batch_execute(&format!("LOCK TABLE {table} IN {mode} MODE"))
                 .expect("lock");
             held_tx.send(()).expect("signal held");
             let _ = release.recv();
@@ -5543,6 +5589,54 @@ mod tests {
                 .expect("join")
                 .expect("pending");
         assert_eq!(pending, vec!["20261005000000".to_owned()]);
+    }
+
+    /// The harness reads `__diesel_schema_migrations` before any migration
+    /// runs. A lock held on that table must hit the policy timeout too, not
+    /// block the run forever.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn a_held_lock_on_the_migrations_table_fails_fast() {
+        let (_container, url) = lock_probe_database().await;
+        let first_url = url.clone();
+        crate::time::spawn_blocking(move || {
+            run_pending_locked_with_policy(
+                &first_url,
+                LOCK_PROBE_MIGRATIONS,
+                None,
+                MigrationLockPolicy::default(),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("the first run applies everything");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = hold_table_lock(
+            url.clone(),
+            release_rx,
+            "__diesel_schema_migrations",
+            "ACCESS EXCLUSIVE",
+        );
+        let policy = MigrationLockPolicy {
+            lock_timeout: std::time::Duration::from_millis(200),
+            retries: 1,
+        };
+        let run = crate::time::spawn_blocking(move || {
+            run_pending_locked_with_policy(&url, LOCK_PROBE_MIGRATIONS, None, policy)
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+
+        match result
+            .expect("must not block on the migrations table")
+            .expect("join")
+        {
+            Err(MigrationError::LockContention { attempts, .. }) => assert_eq!(attempts, 2),
+            other => panic!("expected LockContention, got {other:?}"),
+        }
     }
 
     /// AC: once the blocking transaction ends, a retry applies the migration.
