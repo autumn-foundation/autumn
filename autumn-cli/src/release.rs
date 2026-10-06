@@ -3477,6 +3477,11 @@ case "$1 $2" in
           | if $scale_id == "" then .
             else .scale = {rules: [{name: "h", http: {metadata: {concurrentRequests: "10"},
                    identity: $scale_id}}]} end' <<< "$app")
+        # Azure can rewrite the secret refs of a new revision to a secret that
+        # does not exist (azure-container-apps issue 1705).
+        if [ -n "$STUB_REVISION_REWRITTEN" ] && [[ " $* " != *" --revision app--old "* ]]; then
+          template=$(jq -c '.containers |= map(.env = ((.env // []) + [{name: "DB", secretRef: "capp-app"}]))' <<< "$template")
+        fi
         if [ "$query" = properties.template ]; then
           echo "$template"
         else
@@ -3621,6 +3626,7 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_REVISION_REWRITTEN",
         "STUB_SIDECAR_ACR",
         "STUB_APP_REGISTRY_PASSWORD_REF",
         "STUB_INLINE_STALE",
@@ -6068,6 +6074,30 @@ esac
                 "{args:?}: {calls}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rejects_a_revision_with_rewritten_secret_refs() {
+        // Azure can provision a revision whose secret refs point at a secret
+        // the app does not have. The script checks the new revision's env
+        // before it trusts it: a first cutover fails and rolls back, and
+        // ingress never opens.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_REVISION_REWRITTEN", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(
+            calls.contains("--query properties.template.containers"),
+            "{calls}"
+        );
+        assert!(!calls.contains("az ingress-patch external=true"), "{calls}");
     }
 
     #[cfg(unix)]
