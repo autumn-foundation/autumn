@@ -48,6 +48,7 @@ pub trait CapsuleStore: Send + Sync {
     ) -> CapsuleFuture<'a, Vec<Record>>;
 
     /// Give the columns and records of each model, in the order of `models`.
+    /// Give one entry for each model: export refuses a different count.
     ///
     /// The default calls [`describe`](Self::describe) and
     /// [`fetch`](Self::fetch) for each model. A store with transactions

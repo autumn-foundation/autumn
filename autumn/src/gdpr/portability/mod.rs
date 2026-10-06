@@ -165,6 +165,14 @@ pub async fn export_subject(
     }
     check_models(models)?;
     let data = store.fetch_subject(models, subject).await?;
+    // A short result must not give a capsule without some models.
+    if data.len() != models.len() {
+        return Err(DataCapsuleError::Store(format!(
+            "the store gave data for {} of {} models",
+            data.len(),
+            models.len()
+        )));
+    }
     let mut manifest = CapsuleManifest::new(subject);
     let mut records = BTreeMap::new();
     for (model, (mut fields, mut rows)) in models.iter().zip(data) {
@@ -294,6 +302,57 @@ fn import_order(models: &[ModelManifest]) -> Result<Vec<&ModelManifest>, DataCap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store that gives the data of the first model only.
+    struct FirstOnly(MemoryCapsuleStore);
+
+    impl CapsuleStore for FirstOnly {
+        fn describe<'a>(&'a self, model: &'a CapsuleModel) -> CapsuleFuture<'a, Vec<FieldSpec>> {
+            self.0.describe(model)
+        }
+
+        fn fetch<'a>(
+            &'a self,
+            model: &'a CapsuleModel,
+            subject: &'a str,
+        ) -> CapsuleFuture<'a, Vec<Record>> {
+            self.0.fetch(model, subject)
+        }
+
+        fn fetch_subject<'a>(
+            &'a self,
+            models: &'a [CapsuleModel],
+            subject: &'a str,
+        ) -> CapsuleFuture<'a, Vec<ModelData>> {
+            Box::pin(async move {
+                let mut data = self.0.fetch_subject(models, subject).await?;
+                data.truncate(1);
+                Ok(data)
+            })
+        }
+
+        fn insert_all<'a>(&'a self, batches: &'a [ImportBatch<'a>]) -> CapsuleFuture<'a, ()> {
+            self.0.insert_all(batches)
+        }
+    }
+
+    #[tokio::test]
+    async fn export_refuses_a_store_that_skips_a_model() {
+        let fields = || vec![FieldSpec::new("id", "bigint")];
+        let store = FirstOnly(
+            MemoryCapsuleStore::new()
+                .table("users", fields())
+                .table("posts", fields()),
+        );
+        let models = [
+            CapsuleModel::new("users", "id"),
+            CapsuleModel::new("posts", "id"),
+        ];
+        let err = export_subject(&models, &store, "1")
+            .await
+            .expect_err("posts is missing");
+        assert!(matches!(err, DataCapsuleError::Store(_)), "{err:?}");
+    }
 
     fn manifest(table: &str, targets: &[&str]) -> ModelManifest {
         let mut model = CapsuleModel::new(table, "id");

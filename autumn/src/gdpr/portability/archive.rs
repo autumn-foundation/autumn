@@ -31,7 +31,7 @@ const ALGORITHM: &str = "HMAC-SHA256";
 /// Domain separation: a capsule signature is never a valid cookie or CSRF tag.
 const SIGNATURE_DOMAIN: &[u8] = b"autumn-data-capsule/v1\n";
 /// The deepest file path in a capsule (`viewer/<table>/index.html`).
-const MAX_PATH_DEPTH: usize = 3;
+pub(super) const MAX_PATH_DEPTH: usize = 3;
 
 /// Signs and verifies capsules with the app signing secret.
 ///
@@ -450,6 +450,34 @@ fn check_manifest_refs(manifest: &CapsuleManifest) -> Result<(), DataCapsuleErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_never_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root::open(dir.path()).unwrap();
+        // Another export wrote the file first.
+        std::fs::write(dir.path().join("manifest.json"), b"theirs").unwrap();
+        let mut written = Vec::new();
+        assert!(root.write("manifest.json", b"ours", &mut written).is_err());
+        assert!(written.is_empty(), "{written:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join("manifest.json")).unwrap(),
+            b"theirs"
+        );
+    }
+
+    #[test]
+    fn listing_refuses_a_tree_deeper_than_a_capsule() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f.json"), b"[]").unwrap();
+        let err = Root::open(dir.path())
+            .unwrap()
+            .list_regular_files()
+            .expect_err("too deep");
+        assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+    }
 
     #[cfg(unix)]
     mod no_follow {

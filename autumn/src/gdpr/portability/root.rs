@@ -8,6 +8,17 @@
 
 use super::model::DataCapsuleError;
 
+/// Refuse a directory that can hold no capsule file. A capsule is shallow, so
+/// a deep tree is not a capsule, and the walk does not recurse into it.
+fn check_depth(dir: &str) -> Result<(), DataCapsuleError> {
+    if dir.split('/').count() >= super::archive::MAX_PATH_DEPTH {
+        return Err(DataCapsuleError::Integrity(format!(
+            "directory is deeper than a capsule: {dir}"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) use imp::Root;
 
 #[cfg(unix)]
@@ -23,7 +34,7 @@ mod imp {
     use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat, mode_t};
     use nix::unistd::{UnlinkatFlags, unlinkat};
 
-    use super::DataCapsuleError;
+    use super::{DataCapsuleError, check_depth};
 
     const DIR_FLAGS: OFlag = OFlag::O_RDONLY
         .union(OFlag::O_DIRECTORY)
@@ -272,6 +283,7 @@ mod imp {
             let kind = kind.map_or_else(|| stat_kind(dir, &name, &rel), Ok)?;
             match kind {
                 Type::Directory => {
+                    check_depth(&rel)?;
                     let child = openat(dir, name.as_str(), DIR_FLAGS, Mode::empty())
                         .map_err(|e| error(e, &rel))?;
                     walk(child.as_fd(), &rel, files)?;
@@ -293,6 +305,7 @@ mod imp {
 #[cfg(not(unix))]
 mod imp {
     use std::collections::BTreeSet;
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
 
     use super::DataCapsuleError;
@@ -403,11 +416,15 @@ mod imp {
                 }
             }
             let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
-            // A failed write leaves no file: it writes a temp file, then renames it.
-            crate::fs_atomic::write_owner_only(&path, bytes)
+            // Never replace a file: another export can write here too.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
                 .map_err(|e| DataCapsuleError::io(&path, e))?;
             created.push(rel.to_owned());
-            Ok(())
+            file.write_all(bytes)
+                .map_err(|e| DataCapsuleError::io(&path, e))
         }
 
         pub(in crate::gdpr::portability) fn list_regular_files(
@@ -431,6 +448,7 @@ mod imp {
                         .file_type()
                         .map_err(|e| DataCapsuleError::io(entry.path(), e))?;
                     if kind.is_dir() {
+                        super::check_depth(&rel)?;
                         stack.push((entry.path(), rel));
                     } else if kind.is_file() {
                         files.insert(rel);
