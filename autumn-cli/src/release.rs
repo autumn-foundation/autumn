@@ -3297,6 +3297,15 @@ fi
   [ -n "$STUB_INGRESS_PLAIN" ] && ingress='{"external":false,"targetPort":3000,"transport":"http"}'
   # The snapshot that an interrupted first cutover saved in the app's tags.
   tags='{"team":"web"}'
+  # A large record of copied credentials from an interrupted run, in many
+  # parts.
+  if [ -n "$STUB_APP_COPIED_BIG" ]; then
+    tags=$(jq -cn --argjson n "$STUB_APP_COPIED_BIG" '
+      {secrets: [range(0; $n) | "secret-name-\(.)-padding-padding"], uids: []}
+      | tojson | @base64 | . as $b
+      | [range(0; length; 256) as $i | $b[$i:$i + 256]]
+      | to_entries | map({key: ("autumn-copied-" + (.key | tostring)), value}) | from_entries')
+  fi
   # Many tags of the operator's own.
   if [ -n "$STUB_APP_TAG_COUNT" ]; then
     tags=$(jq -cn --argjson n "$STUB_APP_TAG_COUNT" '[range(0; $n) | {key: "t\(.)", value: "x"}] | from_entries')
@@ -3554,7 +3563,12 @@ case "$1 $2" in
     # Azure accepts the PATCH that opens ingress, but the response is lost.
     if [ -n "$open_patch" ] && [ -n "$STUB_INGRESS_OPEN_LOST" ]; then exit 1; fi
     ;;
-  "containerapp ingress") ;;
+  "containerapp ingress")
+    # The disable fails once this run has opened ingress.
+    if [ -n "$STUB_INGRESS_DISABLE_FAILS" ] && grep -q "ingress-patch external=true" "$STUB_LOG"; then
+      exit 1
+    fi
+    ;;
   *) echo "unexpected az call: $*" >&2; exit 2 ;;
 esac
 "#;
@@ -3584,6 +3598,8 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_APP_COPIED_BIG",
+        "STUB_INGRESS_DISABLE_FAILS",
         "STUB_INGRESS_OPEN_LOST",
         "STUB_APP_TAG_COUNT",
         "STUB_APP_LEGACY_ID",
@@ -5831,6 +5847,87 @@ esac
             return;
         };
         assert!(status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_rollback_stops_when_ingress_cannot_close() {
+        // The restart failed after this run opened ingress, and the disable
+        // fails too. Stage 1 would put the placeholder behind open ingress
+        // while the identity is still attached, so the rollback stops.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_LATEST", "app--old"),
+                ("STUB_RESTART_UNREADY", "1"),
+                ("STUB_INGRESS_DISABLE_FAILS", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        let after = &calls[restart_at..];
+        let disable_at = after.find("ingress disable").expect("a disable");
+        assert!(
+            !after[disable_at..].contains("az rest --method patch"),
+            "no rollback PATCH after a failed disable: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_ingress_does_not_come_back_after_removal() {
+        // The credentials are gone, but the ingress PATCH fails. The app is
+        // unreachable, so the run must not report success.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_INGRESS_EXTERNAL", "1"),
+                ("STUB_INGRESS_OPEN_LOST", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(calls.contains("az ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_writes_a_copied_record_of_more_than_40_parts() {
+        // A large copied record (over 40 parts) still fits the 50-tag
+        // budget. The cutover writes it, instead of stopping after ingress
+        // is disabled.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_COPIED_BIG", "250")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let cutover = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(cutover.contains("\"autumn-copied-40\""), "{cutover}");
     }
 
     #[cfg(unix)]
