@@ -2365,6 +2365,10 @@ impl Analyzer {
                     .map(|place| self.place_referents(&place))
                     .unwrap_or_default()
             }
+            // `async { &mut slot }.await`: what the block gives, by its tail
+            // or a `return`, or any borrow made in it (a local may pass it
+            // on).
+            Expr::Async(a) => self.block_borrows(&a.block),
             // `&raw mut slot`: a write through the pointer reaches `slot`.
             Expr::RawAddr(r) if matches!(r.mutability, syn::PointerMutability::Mut(_)) => {
                 self.place_referents(&r.expr)
@@ -2435,6 +2439,34 @@ impl Analyzer {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Every name that a `&mut`, a `&raw mut` or a `_mut` method in `block`
+    /// may point to, with what its tail points to.
+    fn block_borrows(&self, block: &Block) -> Vec<String> {
+        struct Borrows<'a>(Vec<&'a Expr>);
+        impl<'a> Visit<'a> for Borrows<'a> {
+            fn visit_expr(&mut self, e: &'a Expr) {
+                if matches!(
+                    e,
+                    Expr::Reference(_) | Expr::RawAddr(_) | Expr::MethodCall(_) | Expr::Macro(_)
+                ) {
+                    self.0.push(e);
+                }
+                syn::visit::visit_expr(self, e);
+            }
+        }
+        let mut borrows = Borrows(Vec::new());
+        borrows.visit_block(block);
+        let mut all: Vec<String> = borrows
+            .0
+            .into_iter()
+            .chain(block_tail(block))
+            .flat_map(|e| self.referents_of(e))
+            .collect();
+        all.sort();
+        all.dedup();
+        all
     }
 
     /// The names that a `&mut` or `&raw mut` of `place` points to.
@@ -12988,6 +13020,34 @@ mod tests {
                 "guard: a range keeps the handle",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let wrapped = repo..; wrapped.start.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn async_blocks_keep_their_borrows() {
+        check_handlers(&[
+            (
+                "guard: an awaited async block keeps its borrow",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = async { &mut slot }.await; \
+                 *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an async block's returned borrow is kept",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let mut slot = None; let mut other = None; \
+                 let target = async { if flag { return &mut slot; } &mut other }.await; \
+                 *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an async block's local borrow is kept",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = async { let r = &mut slot; r }.await; \
+                 *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
