@@ -9084,10 +9084,12 @@ async fn execute_task_result_with_optional_lease_ttl(
     lease_ttl: Option<std::time::Duration>,
     tick: crate::scheduler::ScheduledTick,
 ) -> Result<u64, (u64, String)> {
-    let run = crate::scheduler::with_tick(
-        tick,
-        execute_task_result(state, handler, start, name, schedule),
-    );
+    let run = execute_task_result(state, handler, start, name, schedule);
+    // A scheduled task runs outside any request, so its framework
+    // transactions get the configured timeouts from here (#3057).
+    #[cfg(feature = "db")]
+    let run = crate::db::scope_background_tx_timeouts(state, run);
+    let run = crate::scheduler::with_tick(tick, run);
     let Some(lease_ttl) = lease_ttl else {
         return run.await;
     };

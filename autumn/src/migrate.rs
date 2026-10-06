@@ -622,6 +622,27 @@ pub fn can_set_lc_messages(database_url: &str) -> bool {
     result.is_ok()
 }
 
+/// Whether a connection to `database_url` starts with `lock_timeout` off,
+/// with no startup options (#3057).
+///
+/// The `autumn migrate` CLI asks this before it runs a non-transactional
+/// batch without `-c lock_timeout=0` (after a pooler refused the option): a
+/// role or database default would cancel `CREATE INDEX CONCURRENTLY` and
+/// leave an INVALID index. `false` when the value cannot be read.
+#[doc(hidden)]
+#[must_use]
+pub fn server_lock_timeout_is_off(database_url: &str) -> bool {
+    let result: Result<String, MigrationError> = with_migration_connection!(database_url, |conn| {
+        use diesel::RunQueryDsl as _;
+        diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+            "current_setting('lock_timeout')",
+        ))
+        .get_result::<String>(conn)
+        .map_err(|e| MigrationError::Migration(e.to_string()))
+    });
+    result.is_ok_and(|value| value.trim() == "0")
+}
+
 /// Return names of pending (not yet applied) migrations.
 ///
 /// # Errors
@@ -5637,6 +5658,26 @@ mod tests {
             Err(MigrationError::LockContention { attempts, .. }) => assert_eq!(attempts, 2),
             other => panic!("expected LockContention, got {other:?}"),
         }
+    }
+
+    /// The CLI's pooler fallback for a non-transactional batch asks this:
+    /// `true` only while no role or database default sets `lock_timeout`.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn server_lock_timeout_is_off_reads_the_database_default() {
+        let (_container, url) = lock_probe_database().await;
+        let probe_url = url.clone();
+        let off = crate::time::spawn_blocking(move || server_lock_timeout_is_off(&probe_url))
+            .await
+            .expect("join");
+        assert!(off, "a fresh database has no lock_timeout");
+
+        set_database_lock_timeout(&url, "100ms").await;
+        let off = crate::time::spawn_blocking(move || server_lock_timeout_is_off(&url))
+            .await
+            .expect("join");
+        assert!(!off, "a database default of 100ms is not off");
     }
 
     /// AC: once the blocking transaction ends, a retry applies the migration.

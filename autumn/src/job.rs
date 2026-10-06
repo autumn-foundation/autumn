@@ -2352,6 +2352,8 @@ async fn run_job_handler_inner(
     // listener) that calls the free `events::publish` dispatches against its own
     // app rather than the process-global bus.
     let event_app = state.clone();
+    #[cfg(feature = "db")]
+    let tx_timeout_state = state.clone();
     let interceptor = state
         .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
         .map(|arc| (*arc).clone());
@@ -2384,6 +2386,10 @@ async fn run_job_handler_inner(
     let outcome = match interceptor_res {
         Ok(future) => {
             let execution = std::panic::AssertUnwindSafe(future).catch_unwind();
+            // A job runs outside any request, so its framework transactions
+            // get the configured timeouts from here (#3057).
+            #[cfg(feature = "db")]
+            let execution = crate::db::scope_background_tx_timeouts(&tx_timeout_state, execution);
             match crate::job_tracking::scope(
                 ctx.clone(),
                 crate::events::scope_event_app(event_app, execution),

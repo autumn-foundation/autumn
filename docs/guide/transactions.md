@@ -173,7 +173,7 @@ SET LOCAL idle_in_transaction_session_timeout = 60000
 ```
 
 This covers `db.tx`, `db.tx_with`, `db.tx_immediate`, and repository writes in
-a request. A savepoint keeps the outer values. A transaction pooler
+a request, a `#[scheduled]` task, or a job. A savepoint keeps the outer values. A transaction pooler
 (`PgBouncer` in transaction mode) keeps a `SET LOCAL`, but drops a session
 `SET`. The `prod` profile sets `30s` and `60s` (#3057). A route's
 `StatementTimeout` extension replaces the statement value for the

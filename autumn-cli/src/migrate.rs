@@ -1893,6 +1893,23 @@ fn run_diesel_with_policy(
                 let Some(fallback) = pooler_fallback(pgoptions.as_deref(), base.as_deref()) else {
                     return Err(MigrationError::Migration(text));
                 };
+                // The fallback cannot send `lock_timeout=0`. A role or
+                // database default would then cancel `CREATE INDEX
+                // CONCURRENTLY` and leave an INVALID index, so a
+                // non-transactional batch runs only when the server default
+                // is already off.
+                if !pooler_fallback_is_safe(transactional, || {
+                    autumn_web::migrate::server_lock_timeout_is_off(database_url)
+                }) {
+                    return Err(MigrationError::Migration(format!(
+                        "{text}\nThe server refused PGOPTIONS (a pooler such as PgBouncer?), so \
+                         lock_timeout=0 cannot be sent, and the role or database sets a \
+                         nonzero lock_timeout. A run_in_transaction = false migration \
+                         (CREATE INDEX CONCURRENTLY) would be cancelled and leave an INVALID \
+                         index. Run migrations against Postgres directly, or set \
+                         lock_timeout = 0 for the migration role."
+                    )));
+                }
                 eprintln!(
                     "  The server refused PGOPTIONS (a pooler such as PgBouncer?); \
                      running again with only the inherited options, without lock_timeout."
@@ -2029,6 +2046,17 @@ fn split_keyword_options(conninfo: &str) -> (String, Option<String>) {
         return (conninfo.to_owned(), None);
     }
     (kept.join(" "), options)
+}
+
+/// Whether a batch may run again without its startup options. A
+/// transactional batch may: each migration sets `SET LOCAL lock_timeout`
+/// itself. A non-transactional one may only when the server default is
+/// already off (`server_lock_timeout_is_off`, asked only then).
+fn pooler_fallback_is_safe(
+    transactional: bool,
+    server_lock_timeout_is_off: impl FnOnce() -> bool,
+) -> bool {
+    transactional || server_lock_timeout_is_off()
 }
 
 /// The inherited `PGOPTIONS` a pooler fallback may use. A non-transactional
@@ -5100,6 +5128,13 @@ primary_url = "postgres://prod-s0:5432/app"
             split_url_options("postgres://db/app?sslmode=require"),
             ("postgres://db/app?sslmode=require".to_owned(), None)
         );
+    }
+
+    #[test]
+    fn a_non_transactional_fallback_needs_the_server_timeout_off() {
+        assert!(pooler_fallback_is_safe(true, || panic!("not asked")));
+        assert!(pooler_fallback_is_safe(false, || true));
+        assert!(!pooler_fallback_is_safe(false, || false));
     }
 
     #[test]

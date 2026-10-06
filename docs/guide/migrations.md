@@ -199,7 +199,10 @@ run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
   pending set in batches of one kind. Transactional batches get the timeout.
   Non-transactional batches get `lock_timeout=0`.
 - When the server refuses the option (`PgBouncer` can), the CLI runs again
-  with only the `PGOPTIONS` it inherited, unchanged.
+  with only the `PGOPTIONS` it inherited, unchanged. A non-transactional batch
+  runs again only when the server default `lock_timeout` is already `0`;
+  otherwise the run stops, because a role or database default would cancel
+  `CREATE INDEX CONCURRENTLY` and leave an INVALID index.
 - libpq ignores `PGOPTIONS` when `DATABASE_URL` has an `options` parameter,
   in a `postgres://` URI or a keyword/value string (`host=db options='…'`).
   So the CLI takes that parameter out of the connection string and uses its

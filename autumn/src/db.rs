@@ -222,6 +222,23 @@ impl TxTimeouts {
     }
 }
 
+/// Run background work (a scheduled task or a job) with the app's configured
+/// [`TxTimeouts`] in scope, so its framework transactions set them as a
+/// request's do (#3057). A `Db` method inside still scopes its own values.
+///
+/// The values are read here, so the returned future holds no borrow of
+/// `state`.
+pub(crate) fn scope_background_tx_timeouts<S: DbState, F: std::future::Future>(
+    state: &S,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> + use<S, F> {
+    let timeouts = TxTimeouts::new(
+        state.statement_timeout(),
+        state.idle_in_transaction_timeout(),
+    );
+    TX_TIMEOUTS.scope(timeouts, fut)
+}
+
 /// Record a route's [`StatementTimeout`] for the request's transactions.
 ///
 /// The request layer sits outside the route layer that adds the extension,
@@ -4249,6 +4266,37 @@ mod tests {
                 "SET LOCAL statement_timeout = 30000; \
                  SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
             )
+        );
+    }
+
+    /// A scheduled task or a job has no request scope. The background scope
+    /// gives its framework transactions the app's configured timeouts.
+    #[tokio::test]
+    async fn background_work_gets_the_configured_tx_timeouts() {
+        use std::time::Duration;
+        struct Configured;
+        impl super::DbState for Configured {
+            fn pool(&self) -> Option<&super::Pool<super::RuntimeConnection>> {
+                None
+            }
+            fn statement_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(30))
+            }
+            fn idle_in_transaction_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(60))
+            }
+        }
+        assert_eq!(super::TxTimeouts::current(), None);
+        let inside = super::scope_background_tx_timeouts(&Configured, async {
+            super::TxTimeouts::current()
+        })
+        .await;
+        assert_eq!(
+            inside,
+            Some(super::TxTimeouts::new(
+                Some(Duration::from_secs(30)),
+                Some(Duration::from_secs(60))
+            ))
         );
     }
 
