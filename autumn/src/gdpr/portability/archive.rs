@@ -157,29 +157,41 @@ impl DataCapsule {
     pub fn write_dir(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
         let created = prepare_empty_dir(dir)?;
         // Write through a handle: the path can change after the check.
-        let result = Root::open(dir).and_then(|root| {
-            root.prepare().map_err(|e| match e {
+        let root = match Root::open(dir) {
+            Ok(root) => root,
+            Err(error) => {
+                if created {
+                    let _ = std::fs::remove_dir(dir);
+                }
+                return Err(error);
+            }
+        };
+        let mut written = Vec::new();
+        let result = root
+            .prepare()
+            .map_err(|e| match e {
                 DataCapsuleError::NotEmpty(_) => DataCapsuleError::NotEmpty(dir.to_path_buf()),
                 other => other,
-            })?;
-            self.write_files(&root, signer)
-        });
-        // Content that was there before this call is not ours to remove.
-        if result
-            .as_ref()
-            .is_err_and(|e| !matches!(e, DataCapsuleError::NotEmpty(_)))
-        {
-            // The directory was empty or new, so all content is from this
-            // call. Remove it: a partial capsule is not useful.
-            let _ = std::fs::remove_dir_all(dir);
-            if !created {
-                let _ = std::fs::create_dir(dir);
+            })
+            .and_then(|()| self.write_files(&root, signer, &mut written));
+        if result.is_err() {
+            // A partial capsule is not useful. Remove only what this call
+            // wrote: another export can write into the same directory.
+            root.remove_written(&written);
+            if created {
+                // `remove_dir` removes only an empty directory.
+                let _ = std::fs::remove_dir(dir);
             }
         }
         result
     }
 
-    fn write_files(&self, root: &Root, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
+    fn write_files(
+        &self,
+        root: &Root,
+        signer: &CapsuleSigner,
+        written: &mut Vec<String>,
+    ) -> Result<(), DataCapsuleError> {
         let mut manifest = self.manifest.clone();
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         for model in &mut manifest.models {
@@ -216,6 +228,7 @@ impl DataCapsule {
                 return Err(DataCapsuleError::InvalidName(rel.clone()));
             }
             root.write(rel, bytes)?;
+            written.push(rel.clone());
         }
 
         let manifest_bytes = to_json(MANIFEST_FILE, &manifest)?;
@@ -224,7 +237,10 @@ impl DataCapsule {
             signature: signer.sign(&manifest_bytes),
         };
         root.write(MANIFEST_FILE, &manifest_bytes)?;
-        root.write(SIGNATURE_FILE, &to_json(SIGNATURE_FILE, &signature)?)
+        written.push(MANIFEST_FILE.to_owned());
+        root.write(SIGNATURE_FILE, &to_json(SIGNATURE_FILE, &signature)?)?;
+        written.push(SIGNATURE_FILE.to_owned());
+        Ok(())
     }
 
     /// Verify the capsule in `dir`, then read it.
@@ -492,6 +508,29 @@ mod tests {
             assert_eq!(mode(&moved.join("records/a.json")), 0o600);
             std::fs::remove_file(dir.path()).unwrap();
             std::fs::rename(&moved, dir.path()).unwrap();
+        }
+
+        #[test]
+        fn cleanup_removes_only_the_files_of_this_call() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = Root::open(dir.path()).unwrap();
+            root.write("records/a.json", b"[]").unwrap();
+            root.write("viewer/users/index.html", b"<p>").unwrap();
+            // Another export wrote into the same directory.
+            std::fs::write(dir.path().join("records/b.json"), b"[1]").unwrap();
+
+            root.remove_written(&[
+                "records/a.json".to_owned(),
+                "viewer/users/index.html".to_owned(),
+            ]);
+            assert!(!dir.path().join("records/a.json").exists());
+            assert_eq!(
+                std::fs::read(dir.path().join("records/b.json")).unwrap(),
+                b"[1]"
+            );
+            // Empty directories go; a directory with a file of another call stays.
+            assert!(!dir.path().join("viewer").exists());
+            assert!(dir.path().join("records").is_dir());
         }
 
         #[test]

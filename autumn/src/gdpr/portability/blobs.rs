@@ -112,15 +112,7 @@ pub(super) async fn restore_and_track<'c>(
         {
             Ok(Some(_)) => {
                 written.push(entry);
-                // A store can keep the bytes but lose the MIME type.
-                match stored_content_type(store, entry).await {
-                    Ok(content_type) if content_type == entry.content_type => Ok(()),
-                    Ok(content_type) => Err(DataCapsuleError::Blob(format!(
-                        "blob {:?} was stored with MIME type {content_type:?}, not {:?}",
-                        entry.key, entry.content_type
-                    ))),
-                    Err(e) => Err(e),
-                }
+                verify_created(store, entry).await
             }
             // Another writer took the key after the check. If the key is
             // free again, the blob is not there: that is a conflict too.
@@ -145,6 +137,31 @@ pub(super) async fn restore_and_track<'c>(
         }
     }
     Ok(written)
+}
+
+/// Read back a blob that this import created. Another writer can replace it
+/// right after the create, and a store can keep the bytes but lose the MIME
+/// type.
+async fn verify_created(store: &dyn BlobStore, entry: &BlobEntry) -> Result<(), DataCapsuleError> {
+    match store.get(&entry.key).await {
+        Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == entry.sha256 => {}
+        Ok(_) | Err(BlobStoreError::NotFound(_)) => {
+            return Err(DataCapsuleError::Conflict(format!(
+                "blob {:?} changed during the import",
+                entry.key
+            )));
+        }
+        Err(e) => return Err(DataCapsuleError::Blob(format!("get {:?}: {e}", entry.key))),
+    }
+    let content_type = stored_content_type(store, entry).await?;
+    if content_type == entry.content_type {
+        Ok(())
+    } else {
+        Err(DataCapsuleError::Blob(format!(
+            "blob {:?} was stored with MIME type {content_type:?}, not {:?}",
+            entry.key, entry.content_type
+        )))
+    }
 }
 
 /// Delete the blobs that this import wrote.

@@ -530,6 +530,8 @@ struct SequencePlan {
     max: i64,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     needed: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    can_update: bool,
 }
 
 /// The `setval` that moves a serial or identity sequence past the imported
@@ -562,7 +564,8 @@ async fn plan_sequence(
     let plan: Option<SequencePlan> = diesel::sql_query(format!(
         "SELECT s.m AS target, s.cache, s.min, s.max, CASE WHEN s.inc > 0 \
            THEN s.m > COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) \
-           ELSE s.m < COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) END AS needed \
+           ELSE s.m < COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) END AS needed, \
+           has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
          FROM (SELECT CASE WHEN q.seqincrement > 0 THEN MAX(t.{pk}) ELSE MIN(t.{pk}) END::bigint AS m, \
                       q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
                       q.seqmin AS min, q.seqmax AS max \
@@ -587,6 +590,13 @@ async fn plan_sequence(
     }
     if !plan.needed {
         return Ok(None);
+    }
+    // `setval` needs `UPDATE`. Check it now: a later `setval` that fails
+    // would leave the earlier ones in place.
+    if !plan.can_update {
+        return Err(DataCapsuleError::Store(format!(
+            "the import role has no UPDATE privilege on the sequence of {table}"
+        )));
     }
     if plan.target < plan.min || plan.target > plan.max {
         return Err(DataCapsuleError::Conflict(format!(

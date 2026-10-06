@@ -479,7 +479,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
-    for db in ["target", "busy", "deferred", "capped", "cached"] {
+    for db in ["target", "busy", "deferred", "capped", "cached", "limited"] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
             .expect("create db");
@@ -491,7 +491,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
              INSERT INTO notes (id, owner, body) VALUES (500, 1, 'mine');"
         ))
         .expect("source");
-    for db in ["target", "busy", "deferred", "capped", "cached"] {
+    for db in ["target", "busy", "deferred", "capped", "cached", "limited"] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
             .batch_execute(LEDGER)
@@ -598,6 +598,36 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         0,
         "the import rolls back"
     );
+
+    // A role that may move the `ledger` sequence but not the `notes` one:
+    // the import must fail before the first `setval`.
+    admin
+        .batch_execute("CREATE ROLE limited LOGIN PASSWORD 'limited'")
+        .expect("role");
+    PgConnection::establish(&format!("{base}/limited"))
+        .expect("connect")
+        .batch_execute(
+            "GRANT USAGE ON SCHEMA public TO limited; \
+             GRANT SELECT, INSERT ON ledger, notes TO limited; \
+             GRANT SELECT, USAGE, UPDATE ON SEQUENCE ledger_id_seq TO limited; \
+             GRANT SELECT, USAGE ON SEQUENCE notes_id_seq TO limited;",
+        )
+        .expect("grants");
+    let limited_url = format!(
+        "{}/limited",
+        base.replace("postgres:postgres@", "limited:limited@")
+    );
+    let err = import_capsule(&capsule, &models, &PgCapsuleStore::new(pool(&limited_url)))
+        .await
+        .expect_err("no UPDATE on notes_id_seq");
+    assert!(matches!(err, DataCapsuleError::Store(_)), "{err:?}");
+    let last = text(
+        &pool(&format!("{base}/limited")),
+        "SELECT COALESCE(pg_sequence_last_value(pg_get_serial_sequence('ledger', 'id'))::text, \
+         'unused') AS value",
+    )
+    .await;
+    assert_eq!(last, "unused");
 
     drop(container);
 }

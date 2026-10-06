@@ -1024,6 +1024,36 @@ mod blobs {
     }
 
     #[tokio::test]
+    async fn restore_reports_a_blob_replaced_right_after_its_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source_blobs).await.unwrap();
+
+        // Another writer replaces the blob with other bytes of the same MIME
+        // type just after the import creates it.
+        let target = OddStore {
+            inner: blob_store(&tmp.path().join("b")),
+            odd: Odd {
+                replaced_after: Some("docs/ada-cv.txt"),
+                ..Odd::default()
+            },
+        };
+        let err = restore_blobs(&capsule, &target)
+            .await
+            .expect_err("bytes changed");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+        assert_eq!(
+            target.get("docs/ada-cv.txt").await.unwrap(),
+            Bytes::from_static(b"theirs")
+        );
+    }
+
+    #[tokio::test]
     async fn restore_needs_a_store_with_a_conditional_create() {
         let tmp = tempfile::tempdir().unwrap();
         let source_blobs = blob_store(&tmp.path().join("a"));

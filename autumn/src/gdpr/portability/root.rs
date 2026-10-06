@@ -21,6 +21,7 @@ mod imp {
     use nix::errno::Errno;
     use nix::fcntl::{AtFlags, OFlag, open, openat};
     use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat, mode_t};
+    use nix::unistd::{UnlinkatFlags, unlinkat};
 
     use super::DataCapsuleError;
 
@@ -141,6 +142,35 @@ mod imp {
                 }
             }
             Ok(())
+        }
+
+        /// Remove the files in `written`, then each of their directories that
+        /// is empty. Content of another writer stays. Errors are ignored: this
+        /// is a cleanup after a failure.
+        pub(in crate::gdpr::portability) fn remove_written(&self, written: &[String]) {
+            let mut dirs = BTreeSet::new();
+            for rel in written {
+                let mut segments: Vec<&str> = rel.split('/').collect();
+                let Some(name) = segments.pop() else { continue };
+                if let Ok(dir) = self.open_dir(&segments, rel) {
+                    let parent = dir.as_ref().map_or_else(|| self.fd.as_fd(), AsFd::as_fd);
+                    let _ = unlinkat(parent, name, UnlinkatFlags::NoRemoveDir);
+                }
+                for depth in 1..=segments.len() {
+                    dirs.insert(segments[..depth].join("/"));
+                }
+            }
+            // Deepest first, so a parent is empty when its turn comes.
+            let mut dirs: Vec<String> = dirs.into_iter().collect();
+            dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+            for rel in dirs {
+                let mut segments: Vec<&str> = rel.split('/').collect();
+                let Some(name) = segments.pop() else { continue };
+                if let Ok(dir) = self.open_dir(&segments, &rel) {
+                    let parent = dir.as_ref().map_or_else(|| self.fd.as_fd(), AsFd::as_fd);
+                    let _ = unlinkat(parent, name, UnlinkatFlags::RemoveDir);
+                }
+            }
         }
 
         /// Write a new owner-only file. Each directory is owner-only too.
@@ -302,6 +332,28 @@ mod imp {
                 return Err(DataCapsuleError::NotEmpty(self.path.clone()));
             }
             Ok(())
+        }
+
+        /// Remove the files in `written`, then each of their directories that
+        /// is empty. Content of another writer stays.
+        pub(in crate::gdpr::portability) fn remove_written(&self, written: &[String]) {
+            let mut dirs = BTreeSet::new();
+            for rel in written {
+                let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
+                let _ = std::fs::remove_file(&path);
+                let mut segments: Vec<&str> = rel.split('/').collect();
+                segments.pop();
+                for depth in 1..=segments.len() {
+                    dirs.insert(segments[..depth].join("/"));
+                }
+            }
+            let mut dirs: Vec<String> = dirs.into_iter().collect();
+            dirs.sort_by_key(|d| std::cmp::Reverse(d.matches('/').count()));
+            for rel in dirs {
+                let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
+                // `remove_dir` removes only an empty directory.
+                let _ = std::fs::remove_dir(path);
+            }
         }
 
         /// Write a new owner-only file. Each directory is owner-only too.
