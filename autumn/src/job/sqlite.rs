@@ -1192,6 +1192,7 @@ async fn renew_claim(
 fn lease_heartbeat(
     pool: &SqlitePool,
     row: &SqliteJobRow,
+    claimed_at: tokio::time::Instant,
     worker_id: &str,
     state: &AppState,
     visibility_timeout_ms: u64,
@@ -1200,7 +1201,7 @@ fn lease_heartbeat(
     let job_id = row.id.clone();
     let worker_id = worker_id.to_owned();
     let clock = state.clock_arc();
-    LeaseHeartbeat::spawn(visibility_timeout_ms, move || {
+    LeaseHeartbeat::spawn(claimed_at, visibility_timeout_ms, move || {
         let pool = pool.clone();
         let clock = Arc::clone(&clock);
         let job_id = job_id.clone();
@@ -1213,6 +1214,7 @@ fn lease_heartbeat(
 #[allow(clippy::too_many_arguments)]
 async fn execute_job(
     row: SqliteJobRow,
+    claimed_at: tokio::time::Instant,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     pool: &SqlitePool,
     worker_id: &str,
@@ -1294,7 +1296,14 @@ async fn execute_job(
         row.tracestate.as_deref(),
     );
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
-    let heartbeat = lease_heartbeat(pool, &row, worker_id, state, visibility_timeout_ms);
+    let heartbeat = lease_heartbeat(
+        pool,
+        &row,
+        claimed_at,
+        worker_id,
+        state,
+        visibility_timeout_ms,
+    );
     let bounds = ExecutionBounds {
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
@@ -1443,10 +1452,13 @@ async fn worker_loop(
             let Some(guard) = slots.try_reserve(&queue) else {
                 continue;
             };
+            // The claim stamps `claimed_at` inside the claim query.
+            let claimed_at = tokio::time::Instant::now();
             match claim_next_job(&pool, &worker_id, &queue, now_ms(&state)).await {
                 Some(row) => {
                     execute_job(
                         row,
+                        claimed_at,
                         &jobs_by_name,
                         &pool,
                         &worker_id,

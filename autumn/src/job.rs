@@ -936,14 +936,19 @@ struct LeaseHeartbeat {
 
 #[cfg(any(feature = "db", feature = "redis"))]
 impl LeaseHeartbeat {
-    /// Call `renew` every third of `visibility_timeout_ms`.
+    /// Call `renew` every third of `visibility_timeout_ms`, counting from
+    /// `claimed_at`: an instant taken just before the claim was sent.
     ///
     /// A `Lost` result cancels the lost token and ends the heartbeat. A
     /// `Failed` result is logged and tried again. When no renewal succeeds
     /// for two thirds of the visibility timeout, the heartbeat also cancels
     /// the lost token: another worker can recover the claim soon, so this
     /// worker must stop first.
-    fn spawn<R, F>(visibility_timeout_ms: u64, mut renew: R) -> Self
+    fn spawn<R, F>(
+        claimed_at: tokio::time::Instant,
+        visibility_timeout_ms: u64,
+        mut renew: R,
+    ) -> Self
     where
         R: FnMut() -> F + Send + 'static,
         F: Future<Output = LeaseRenewal> + Send + 'static,
@@ -957,8 +962,9 @@ impl LeaseHeartbeat {
             let lost = lost.clone();
             let stop = stop.clone();
             async move {
-                // The claim was written just before the heartbeat started.
-                let mut last_renewed = tokio::time::Instant::now();
+                // The claim's deadline counts from when the worker sent the
+                // claim, which can be well before this task starts.
+                let mut last_renewed = claimed_at;
                 let mut next_attempt =
                     crate::time_math::saturating_tokio_deadline(last_renewed, interval);
                 loop {
@@ -2432,6 +2438,25 @@ const REDIS_CLAIM_SCAN_LIMIT: usize = 8;
 /// keyspace), so a dead key can never deadlock uniqueness forever.
 #[cfg(feature = "redis")]
 const REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS: u64 = 86_400_000;
+
+/// TTL for a `running`-window unique lock while its job holds a claim: the
+/// crash backstop, or twice the visibility timeout when that is longer. The
+/// claim and each renewal set it, so the lock outlives the claim it guards
+/// even when the first renewal comes after the backstop (issue #3051).
+///
+/// Capped at ten years, so the Lua number stays an integer `PEXPIRE` accepts.
+#[cfg(feature = "redis")]
+const fn redis_running_lock_ttl_ms(visibility_timeout_ms: u64) -> u64 {
+    const MAX_TTL_MS: u64 = 10 * 365 * 86_400_000;
+    let claim_ttl = visibility_timeout_ms.saturating_mul(2);
+    if claim_ttl > MAX_TTL_MS {
+        MAX_TTL_MS
+    } else if claim_ttl > REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS {
+        claim_ttl
+    } else {
+        REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+    }
+}
 
 #[cfg(feature = "redis")]
 fn redis_unique_lock_key(unique_prefix: &str, name: &str, unique_key: &str) -> String {
@@ -7620,7 +7645,9 @@ return nil
         .arg(blocked_due_ms)
         .arg(REDIS_CLAIM_SCAN_LIMIT)
         .arg(&worker_config.unique_prefix)
-        .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(redis_running_lock_ttl_ms(
+            worker_config.visibility_timeout_ms,
+        ))
         .arg(queue_keys.len());
     for queue_key in queue_keys {
         cmd.arg(queue_key);
@@ -8647,8 +8674,9 @@ async fn redis_server_time_ms(
 
 /// Move a claim deadline forward if `ARGV[2]`/`ARGV[3]` still hold the claim.
 /// The new deadline is Redis server time plus `ARGV[4]`. A `running`-window
-/// unique lock (`KEYS[3]`) that this job holds gets the `ARGV[5]` backstop
-/// TTL again, as at the claim, so it outlives a claim the heartbeat keeps.
+/// unique lock (`KEYS[3]`) that this job holds gets the `ARGV[5]` TTL again
+/// (`redis_running_lock_ttl_ms`), as at the claim, so it outlives a claim the
+/// heartbeat keeps.
 #[cfg(feature = "redis")]
 const RENEW_REDIS_CLAIM_SCRIPT: &str = r"
 redis.replicate_commands()
@@ -8699,7 +8727,7 @@ async fn renew_redis_claim(
         .arg(claimed_by)
         .arg(claimed_at_ms)
         .arg(visibility_timeout_ms)
-        .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(redis_running_lock_ttl_ms(visibility_timeout_ms))
         .query_async(connection)
         .await;
     match renewed {
@@ -8715,6 +8743,7 @@ fn redis_lease_heartbeat(
     connection: &redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
     record: &RedisJobRecord,
+    claimed_at: tokio::time::Instant,
 ) -> LeaseHeartbeat {
     let connection = connection.clone();
     let processing_key = worker_config.processing_key.clone();
@@ -8722,7 +8751,7 @@ fn redis_lease_heartbeat(
     let unique_lock_key = worker_config.unique_lock_key_for(record);
     let record = record.clone();
     let visibility_timeout_ms = worker_config.visibility_timeout_ms;
-    LeaseHeartbeat::spawn(visibility_timeout_ms, move || {
+    LeaseHeartbeat::spawn(claimed_at, visibility_timeout_ms, move || {
         let mut connection = connection.clone();
         let processing_key = processing_key.clone();
         let record_key = record_key.clone();
@@ -8942,11 +8971,14 @@ fn spawn_redis_worker(
                         continue;
                     };
                     let queue_keys = worker_config.queue_keys_for(std::slice::from_ref(queue));
+                    // The claim deadline starts inside the claim script.
+                    let claimed_at = tokio::time::Instant::now();
                     match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
                         Ok(Some(record)) => {
                             process_redis_job_record(
                                 &mut connection,
                                 record,
+                                claimed_at,
                                 &jobs_by_name,
                                 &state,
                                 &job_admin,
@@ -8981,6 +9013,8 @@ fn spawn_redis_worker(
                 continue;
             }
             let queue_keys = worker_config.queue_keys_for(&order);
+            // The claim deadline starts inside the claim script.
+            let claimed_at = tokio::time::Instant::now();
             let claimed =
                 match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
                     Ok(record) => record,
@@ -9003,6 +9037,7 @@ fn spawn_redis_worker(
             process_redis_job_record(
                 &mut connection,
                 record,
+                claimed_at,
                 &jobs_by_name,
                 &state,
                 &job_admin,
@@ -9201,6 +9236,7 @@ async fn dead_letter_invalid_redis_job(
 async fn process_redis_job_record(
     connection: &mut redis::aio::ConnectionManager,
     mut record: RedisJobRecord,
+    claimed_at: tokio::time::Instant,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
@@ -9287,7 +9323,7 @@ async fn process_redis_job_record(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&record.attempt, &record.max_attempts);
-    let heartbeat = redis_lease_heartbeat(connection, worker_config, &record);
+    let heartbeat = redis_lease_heartbeat(connection, worker_config, &record, claimed_at);
     let bounds = ExecutionBounds {
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
@@ -11131,13 +11167,14 @@ async fn pg_renew_claim(pool: &PgPool, job_id: &str, worker_id: &str) -> LeaseRe
 fn pg_lease_heartbeat(
     pool: &PgPool,
     row: &PgJobRow,
+    claimed_at: tokio::time::Instant,
     worker_id: &str,
     visibility_timeout_ms: u64,
 ) -> LeaseHeartbeat {
     let pool = pool.clone();
     let job_id = row.id.clone();
     let worker_id = worker_id.to_owned();
-    LeaseHeartbeat::spawn(visibility_timeout_ms, move || {
+    LeaseHeartbeat::spawn(claimed_at, visibility_timeout_ms, move || {
         let pool = pool.clone();
         let job_id = job_id.clone();
         let worker_id = worker_id.clone();
@@ -11150,6 +11187,7 @@ fn pg_lease_heartbeat(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_execute_job(
     row: PgJobRow,
+    claimed_at: tokio::time::Instant,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     pool: &PgPool,
     worker_id: &str,
@@ -11231,7 +11269,7 @@ async fn pg_execute_job(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
-    let heartbeat = pg_lease_heartbeat(pool, &row, worker_id, visibility_timeout_ms);
+    let heartbeat = pg_lease_heartbeat(pool, &row, claimed_at, worker_id, visibility_timeout_ms);
     let bounds = ExecutionBounds {
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
@@ -11460,6 +11498,8 @@ async fn pg_worker_loop(
                 let Some(guard) = slots.try_reserve(queue) else {
                     continue;
                 };
+                // The claim stamps `claimed_at` inside the claim query.
+                let claimed_at = tokio::time::Instant::now();
                 match pg_claim_next_job(
                     &pool,
                     &worker_id,
@@ -11471,6 +11511,7 @@ async fn pg_worker_loop(
                     Some(row) => {
                         pg_execute_job(
                             row,
+                            claimed_at,
                             &jobs_by_name,
                             &pool,
                             &worker_id,
@@ -11508,11 +11549,14 @@ async fn pg_worker_loop(
             }
             continue;
         }
+        // The claim stamps `claimed_at` inside the claim query.
+        let claimed_at = tokio::time::Instant::now();
         match pg_claim_next_job(&pool, &worker_id, serialize_claims, &queue_order).await {
             Some(row) => {
                 let _slot = slots.acquire(&normalize_queue_name(&row.queue));
                 pg_execute_job(
                     row,
+                    claimed_at,
                     &jobs_by_name,
                     &pool,
                     &worker_id,
@@ -15049,6 +15093,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             record,
+            tokio::time::Instant::now(),
             &redis_jobs_by_name(redis_counting_success_handler, 2),
             &state,
             &job_admin,
@@ -15101,6 +15146,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             first,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -15134,6 +15180,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             second,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -15179,6 +15226,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             record,
+            tokio::time::Instant::now(),
             &redis_jobs_by_name(panicking_handler, 3),
             &state,
             &job_admin,
@@ -15358,6 +15406,7 @@ mod tests {
             process_redis_job_record(
                 &mut connection,
                 record,
+                tokio::time::Instant::now(),
                 &jobs,
                 state,
                 &job_admin,
@@ -15634,6 +15683,22 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[test]
+    fn redis_running_lock_ttl_outlives_the_claim() {
+        assert_eq!(
+            redis_running_lock_ttl_ms(30_000),
+            REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+        );
+        let four_days = 4 * 86_400_000;
+        assert_eq!(redis_running_lock_ttl_ms(four_days), 2 * four_days);
+        assert_eq!(
+            redis_running_lock_ttl_ms(u64::MAX),
+            10 * 365 * 86_400_000,
+            "capped so PEXPIRE accepts it"
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
     fn redis_delayed_unique_lock_ttl_extends_for_long_delays() {
         // Helper mirroring the exact formula in RedisClient::enqueue so we
         // can test it without a live Redis connection.
@@ -15853,6 +15918,28 @@ mod tests {
         assert!(
             ttl > 1_000,
             "the renewal must refresh the running-window lock; PTTL {ttl}"
+        );
+
+        // A visibility timeout past the 24 h backstop: the first renewal
+        // comes after a third of it, so the lock must outlive the claim.
+        let long_visibility_ms: u64 = 4 * 86_400_000;
+        let mut long_renewal = connection.clone();
+        assert!(matches!(
+            renew_redis_claim(
+                &mut long_renewal,
+                &worker_config.processing_key,
+                &record_key,
+                &lock_key,
+                &record,
+                long_visibility_ms,
+            )
+            .await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(
+            u64::try_from(ttl).unwrap_or(0) > long_visibility_ms,
+            "the lock must outlive a long claim; PTTL {ttl}"
         );
 
         // A lock that another job holds now is not this claim's to extend.
@@ -16369,6 +16456,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             claimed,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -24511,7 +24599,7 @@ mod lease_tests {
     ) -> LeaseHeartbeat {
         let results = Arc::new(results);
         // 300ms visibility: renew every 100ms, give up after 200ms of failures.
-        LeaseHeartbeat::spawn(300, move || {
+        LeaseHeartbeat::spawn(tokio::time::Instant::now(), 300, move || {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             let result = results.get(n).map_or(LeaseRenewal::Renewed, |f| f());
             async move { result }
@@ -24636,7 +24724,7 @@ mod lease_tests {
         // one interval apart, not one interval after the last one finished,
         // or the give-up time (two thirds of 300ms from the last renewal's
         // start) passes while the next renewal is in flight.
-        let heartbeat = LeaseHeartbeat::spawn(300, || async {
+        let heartbeat = LeaseHeartbeat::spawn(tokio::time::Instant::now(), 300, || async {
             tokio::time::sleep(Duration::from_millis(90)).await;
             LeaseRenewal::Renewed
         });
@@ -24653,7 +24741,11 @@ mod lease_tests {
     #[tokio::test(start_paused = true)]
     async fn heartbeat_gives_up_while_a_renewal_stalls() {
         // A renewal that never returns, as on a pool wait or a reconnect.
-        let heartbeat = LeaseHeartbeat::spawn(300, std::future::pending::<LeaseRenewal>);
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            std::future::pending::<LeaseRenewal>,
+        );
         let lost = heartbeat.lost_token();
         tokio::time::sleep(Duration::from_millis(190)).await;
         assert!(!lost.is_cancelled(), "inside two thirds of the timeout");
@@ -24661,6 +24753,41 @@ mod lease_tests {
         assert!(
             lost.is_cancelled(),
             "a stalled renewal must not keep the run alive past the give-up time"
+        );
+        heartbeat.stop().await;
+    }
+
+    /// The claim's deadline starts when the backend writes the claim, before
+    /// the heartbeat starts. The renewals and the give-up time must count from
+    /// the claim, not from the spawn, or a slow claim round trip lets the
+    /// lease expire before the first renewal.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_counts_from_the_claim_not_from_its_start() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        // 300ms visibility: first renewal 100ms after the claim, give up
+        // 200ms after it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::spawn(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<LeaseRenewal>()
+            }
+        });
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the first renewal comes one interval after the claim"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            lost.is_cancelled(),
+            "the give-up time counts from the claim"
         );
         heartbeat.stop().await;
     }
