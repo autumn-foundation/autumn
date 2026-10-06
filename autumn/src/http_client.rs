@@ -2626,6 +2626,7 @@ impl RequestBuilder {
             None,
             is_half_open,
             &gate,
+            false,
         )
         .await
     }
@@ -2698,11 +2699,18 @@ impl RequestBuilder {
                 None,
                 is_half_open,
                 hop_gate,
+                true,
             )
             .await?;
 
-            let Some(next) = redirect_target(&resp, &current)? else {
-                return Ok(resp);
+            let next = match redirect_target(&resp, &current) {
+                Ok(Some(next)) => next,
+                Ok(None) => return Ok(resp),
+                // reqwest returns a redirect with a bad `Location` as is.
+                Err(ClientError::InvalidUrl(_)) if matches!(hop_client, HopClient::Pooled(_)) => {
+                    return Ok(resp);
+                }
+                Err(error) => return Err(error),
             };
             if hop >= max {
                 return Err(ClientError::TooManyRedirects(max));
@@ -2842,6 +2850,7 @@ impl RequestBuilder {
                 Some(deadline),
                 is_half_open,
                 hop_gate,
+                false,
             )
             .await?;
 
@@ -3352,6 +3361,7 @@ async fn send_one(
     deadline: Option<Instant>,
     suppress_retries: bool,
     gate: &RetryGate,
+    skip_redirect_body: bool,
 ) -> Result<Response, ClientError> {
     let start = crate::time::ambient_instant();
     let mut last_retry = None;
@@ -3449,7 +3459,11 @@ async fn send_one(
                         continue;
                     }
                 }
-                let body = if discard_response_body {
+                // A redirect the caller follows: its body is not needed, and
+                // may be large or never end.
+                let followed = skip_redirect_body
+                    && matches!(redirect_location(status, &headers, url), Ok(Some(_)));
+                let body = if discard_response_body || followed {
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
                     Bytes::new()
                 } else {
@@ -3525,12 +3539,22 @@ fn scheme_is_https(url: &str) -> Result<bool, ClientError> {
 /// the non-followable 3xx `300`/`304`/`305`/`306`), or a followable status
 /// missing its `Location` header.
 fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, ClientError> {
+    redirect_location(resp.status(), resp.headers(), base)
+}
+
+/// [`redirect_target`] from a response's status and headers, before its body
+/// is read.
+fn redirect_location(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    base: &str,
+) -> Result<Option<String>, ClientError> {
     // Only the statuses reqwest itself follows are treated as redirects. A
     // response like `304 Not Modified` (or 300/305/306) can legitimately carry
     // a `Location` header without being a followable redirect, so matching the
     // entire 300–399 range via `is_redirection()` would wrongly issue an extra
     // request instead of returning the response to the caller.
-    match resp.status() {
+    match status {
         reqwest::StatusCode::MOVED_PERMANENTLY
         | reqwest::StatusCode::FOUND
         | reqwest::StatusCode::SEE_OTHER
@@ -3538,8 +3562,7 @@ fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, Client
         | reqwest::StatusCode::PERMANENT_REDIRECT => {}
         _ => return Ok(None),
     }
-    let Some(location) = resp
-        .headers()
+    let Some(location) = headers
         .get(reqwest::header::LOCATION)
         .and_then(|v| v.to_str().ok())
     else {
@@ -6451,6 +6474,59 @@ mod tests {
             assert!(
                 (last.available() - last_before - one_refill).abs() < f64::EPSILON,
                 "one refill per host"
+            );
+        }
+
+        /// A server whose `/r` answers 302 with `location`, and whose `/t`
+        /// answers 200. With `endless`, the 302 body never ends.
+        async fn redirect_server(location: &'static str, endless: bool) -> String {
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(move || async move {
+                        let body = if endless {
+                            axum::body::Body::from_stream(futures::stream::pending::<
+                                Result<Bytes, std::io::Error>,
+                            >())
+                        } else {
+                            axum::body::Body::empty()
+                        };
+                        axum::response::Response::builder()
+                            .status(302)
+                            .header("location", location)
+                            .body(body)
+                            .unwrap()
+                    }),
+                )
+                .route("/t", axum::routing::get(|| async { "done" }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://127.0.0.1:{port}/r")
+        }
+
+        #[tokio::test]
+        async fn a_redirect_under_a_deadline_does_not_read_the_redirect_body() {
+            let url = redirect_server("/t", true).await;
+            let response = with_deadline(Duration::from_secs(3), Client::new().get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(response.text(), "done");
+        }
+
+        #[tokio::test]
+        async fn a_bad_location_under_a_deadline_returns_the_redirect() {
+            let url = redirect_server("http://[::1", false).await;
+            let response = with_deadline(Duration::from_secs(3), Client::new().get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 302);
+            let plain = Client::new().get(&url).send().await.unwrap();
+            assert_eq!(
+                plain.status().as_u16(),
+                302,
+                "the same as without a deadline"
             );
         }
 
