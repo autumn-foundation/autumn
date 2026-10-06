@@ -627,8 +627,10 @@ pub fn is_session_housekeeping(sql: &str) -> bool {
 
 /// Whether `sql` is the `SET LOCAL` pair a framework transaction opens with
 /// (`crate::db::TxTimeouts::set_local_sql`, #3057): exactly
-/// `statement_timeout` then `idle_in_transaction_session_timeout`, each with
-/// an integer value or `DEFAULT`.
+/// `statement_timeout` with an integer value, then
+/// `idle_in_transaction_session_timeout` with an integer value or `DEFAULT`.
+/// The framework never sends `DEFAULT` for the statement timeout (an unset
+/// one is `0`), so an application pair that does stays on the tape.
 ///
 /// Only that exact pair counts. A single `SET LOCAL statement_timeout` stays
 /// the application's (#2202). The values depend on the config, so a tape
@@ -642,19 +644,19 @@ fn is_framework_tx_timeouts(sql: &str) -> bool {
     let [statement, idle] = statements.as_slice() else {
         return false;
     };
-    let is_local_int_setting = |statement: &str, name: &str| {
+    let is_local_int_setting = |statement: &str, name: &str, allow_default: bool| {
         strip_keyword(statement, "SET")
             .and_then(|rest| strip_keyword(rest, "LOCAL"))
             .and_then(|rest| strip_keyword_exact(rest, name))
             .and_then(|rest| rest.strip_prefix('='))
             .is_some_and(|value| {
                 let value = value.trim();
-                value.eq_ignore_ascii_case("DEFAULT")
+                (allow_default && value.eq_ignore_ascii_case("DEFAULT"))
                     || (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
             })
     };
-    is_local_int_setting(statement, "statement_timeout")
-        && is_local_int_setting(idle, "idle_in_transaction_session_timeout")
+    is_local_int_setting(statement, "statement_timeout", false)
+        && is_local_int_setting(idle, "idle_in_transaction_session_timeout", true)
 }
 
 /// Whether one statement is a session setting replay reproduces on its own.

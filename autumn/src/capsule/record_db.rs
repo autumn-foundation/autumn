@@ -1815,6 +1815,13 @@ mod tests {
         ));
         assert!(
             !is_session_housekeeping(
+                "SET LOCAL statement_timeout = DEFAULT; \
+                 SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
+            ),
+            "the framework sends `0` for an unset statement timeout, never `DEFAULT`"
+        );
+        assert!(
+            !is_session_housekeeping(
                 "SET LOCAL statement_timeout = 30000; \
                  SET LOCAL idle_in_transaction_session_timeout = 60000; SELECT 1"
             ),
