@@ -187,6 +187,8 @@ mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod lease_lock;
+#[cfg(feature = "db")]
+mod list_rows_snapshot;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
 mod live_state;
