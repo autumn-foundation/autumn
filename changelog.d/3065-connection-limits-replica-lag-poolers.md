@@ -7,6 +7,9 @@
   [Server Connection Limits](docs/guide/connection-limits.md).
 - **server:** `autumn_web::http_server::serve`, the serve loop that applies
   these limits. `App::run` uses it for every listener.
+- **server:** `autumn_web::http_server::KeepTunnel`. A handler on axum's own
+  `WebSocketUpgrade` keeps it for the socket's life, so an HTTP/2 WebSocket
+  is not closed by `keep_alive_timeout_ms`.
 - **ws:** `[realtime]` WebSocket limits: `max_connections` (`503` above the
   cap), `max_message_bytes` (close code `1009`), `ping_interval_ms` and
   `idle_timeout_ms` (close code `1001`). See

@@ -174,6 +174,12 @@ axum socket, call `into_parts()`. It returns the axum socket and a
 `max_connections` slot and keeps an HTTP/2 connection out of its idle timer.
 `into_inner()` drops the hold.
 
+A handler on axum's own `WebSocketUpgrade` (for example in a router you add
+with `merge_router`) has no `[realtime]` limits. Over HTTP/2, add the
+`autumn_web::http_server::KeepTunnel` extractor and keep it for the life of
+the socket. Without it, `keep_alive_timeout_ms` closes the connection while
+the socket is open.
+
 To set a different message limit on one route, write the upgrade yourself:
 
 ```rust,ignore

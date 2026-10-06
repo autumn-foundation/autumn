@@ -356,14 +356,83 @@ enum Scan {
 #[derive(Debug, Default)]
 struct H1Scan {
     state: H1State,
-    /// The current line without spaces and tabs, cut at [`H1_LINE_KEEP`]
-    /// bytes: only header names and short values matter here.
-    line: Vec<u8>,
-    /// The current line was longer than [`H1_LINE_KEEP`].
-    line_cut: bool,
+    /// What the scan keeps of the current line.
+    line: LineScan,
     content_length: u64,
     chunked: bool,
     position: HeadPosition,
+}
+
+/// The parts of the current line that frame a message. The scan reads
+/// values byte by byte and does not keep the line, so a long valid line
+/// (optional whitespace, leading zeros, chunk extensions) still frames.
+#[derive(Debug, Default)]
+struct LineScan {
+    /// Bytes in the line, without CR.
+    len: usize,
+    /// The field name, lowercase. Only the first bytes: a longer name is
+    /// not a name the scan reads.
+    name: Vec<u8>,
+    in_value: bool,
+    field: Field,
+    /// `Content-Length` (decimal) or the chunk size (hexadecimal).
+    number: Number,
+    /// The chunk size is complete; the rest is a chunk extension.
+    in_extension: bool,
+    /// The last bytes of a `Transfer-Encoding` value, lowercase, without
+    /// spaces and tabs.
+    tail: Vec<u8>,
+}
+
+/// A field this scan reads.
+#[derive(Debug, Default, Clone, Copy)]
+enum Field {
+    #[default]
+    Other,
+    ContentLength,
+    TransferEncoding,
+}
+
+/// A number read one digit at a time. A comma-separated list is one value
+/// if all items are equal, as hyper reads `Content-Length`.
+#[derive(Debug, Default)]
+struct Number {
+    item: Option<u64>,
+    first: Option<u64>,
+    bad: bool,
+}
+
+impl Number {
+    fn push(&mut self, byte: u8, radix: u32) {
+        match char::from(byte).to_digit(radix) {
+            Some(digit) => {
+                let next = self
+                    .item
+                    .unwrap_or(0)
+                    .checked_mul(u64::from(radix))
+                    .and_then(|v| v.checked_add(u64::from(digit)));
+                self.bad |= next.is_none();
+                self.item = next;
+            }
+            None if byte == b',' && radix == 10 => self.end_item(),
+            None => self.bad = true,
+        }
+    }
+
+    const fn end_item(&mut self) {
+        match (self.item.take(), self.first) {
+            (Some(item), None) => self.first = Some(item),
+            (Some(item), Some(first)) if item == first => {}
+            (Some(_), Some(_)) => self.bad = true,
+            (None, _) => {}
+        }
+    }
+
+    /// The value, or `None` when it is not a valid number.
+    const fn finish(mut self) -> Option<u64> {
+        self.end_item();
+        if self.bad { None } else { self.first }
+    }
 }
 
 /// Where the scan is inside the current head.
@@ -376,7 +445,8 @@ enum HeadPosition {
     Fields,
 }
 
-const H1_LINE_KEEP: usize = 256;
+/// Field names longer than this are not names the scan reads.
+const H1_NAME_KEEP: usize = 20;
 
 #[derive(Debug, Default, Clone, Copy)]
 enum H1State {
@@ -387,7 +457,7 @@ enum H1State {
     ChunkData(u64),
     ChunkDataEnd(u8),
     Trailers,
-    /// A line this scan cannot read. Heads are not timed after it.
+    /// A value hyper rejects. Heads are not timed after it.
     Stopped,
 }
 
@@ -429,20 +499,16 @@ impl H1Scan {
                     }
                     if byte == b'\n' {
                         self.on_line(head_since);
-                    } else if byte == b' ' || byte == b'\t' {
-                        // Optional whitespace can be long; values do not need it.
-                    } else if self.line.len() < H1_LINE_KEEP {
-                        self.line.push(byte);
-                    } else {
-                        self.line_cut = true;
+                    } else if byte != b'\r' {
+                        self.on_line_byte(byte);
                     }
                 }
             }
         }
     }
 
-    /// Stop the scan. Fail open: hyper can still accept the head, so the
-    /// head timer must not close it.
+    /// Stop the scan at a value hyper rejects. Fail open: the head timer
+    /// does not close the connection.
     const fn stop(&mut self, head_since: &mut Option<Instant>) {
         self.state = H1State::Stopped;
         *head_since = None;
@@ -455,14 +521,52 @@ impl H1Scan {
         H1State::Head
     }
 
-    fn on_line(&mut self, head_since: &mut Option<Instant>) {
-        let mut line = std::mem::take(&mut self.line);
-        let cut = std::mem::take(&mut self.line_cut);
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
+    fn on_line_byte(&mut self, byte: u8) {
+        let line = &mut self.line;
+        line.len = line.len.saturating_add(1);
+        let blank = byte == b' ' || byte == b'\t';
         match self.state {
-            H1State::Head if line.is_empty() => {
+            H1State::Head if self.position == HeadPosition::Fields => {
+                if line.in_value {
+                    match line.field {
+                        // Optional whitespace can be long; values do not need it.
+                        _ if blank => {}
+                        Field::ContentLength => line.number.push(byte, 10),
+                        Field::TransferEncoding => {
+                            if line.tail.len() == b"chunked".len() {
+                                line.tail.remove(0);
+                            }
+                            line.tail.push(byte.to_ascii_lowercase());
+                        }
+                        Field::Other => {}
+                    }
+                } else if byte == b':' {
+                    line.in_value = true;
+                    line.field = match line.name.as_slice() {
+                        b"content-length" => Field::ContentLength,
+                        b"transfer-encoding" => Field::TransferEncoding,
+                        _ => Field::Other,
+                    };
+                } else if line.name.len() <= H1_NAME_KEEP {
+                    line.name.push(byte.to_ascii_lowercase());
+                }
+            }
+            H1State::ChunkSize if !line.in_extension && !blank => {
+                if byte == b';' {
+                    line.in_extension = true;
+                } else {
+                    line.number.push(byte, 16);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_line(&mut self, head_since: &mut Option<Instant>) {
+        let line = std::mem::take(&mut self.line);
+        let empty = line.len == 0;
+        match self.state {
+            H1State::Head if empty => {
                 *head_since = None;
                 // An upgrade (`Upgrade`, `CONNECT`) needs no special case:
                 // a rejected one stays HTTP/1, and an accepted one ends the
@@ -478,32 +582,22 @@ impl H1Scan {
             H1State::Head if self.position == HeadPosition::RequestLine => {
                 self.position = HeadPosition::Fields;
             }
-            H1State::Head => {
-                line.make_ascii_lowercase();
-                let value = |name: &[u8]| {
-                    line.strip_prefix(name)
-                        .map(|v| String::from_utf8_lossy(v).into_owned())
-                };
-                if let Some(v) = value(b"content-length:") {
-                    match v.parse() {
-                        Ok(len) if !cut => self.content_length = len,
-                        // This scan cannot frame the body.
-                        _ => self.stop(head_since),
-                    }
-                } else if let Some(v) = value(b"transfer-encoding:") {
-                    self.chunked |= v.contains("chunked");
-                }
-            }
-            H1State::ChunkSize => {
-                let size = line.split(|b| *b == b';').next().unwrap_or_default();
-                let size = String::from_utf8_lossy(size);
-                match u64::from_str_radix(&size, 16) {
-                    Ok(0) if !cut => self.state = H1State::Trailers,
-                    Ok(n) if !cut => self.state = H1State::ChunkData(n),
-                    _ => self.stop(head_since),
-                }
-            }
-            H1State::Trailers if line.is_empty() => self.state = self.next_message(),
+            H1State::Head => match line.field {
+                Field::ContentLength => match line.number.finish() {
+                    Some(len) => self.content_length = len,
+                    // hyper rejects the head and closes the connection.
+                    None => self.stop(head_since),
+                },
+                // `chunked` must be the last coding.
+                Field::TransferEncoding => self.chunked = line.tail == b"chunked",
+                Field::Other => {}
+            },
+            H1State::ChunkSize => match line.number.finish() {
+                Some(0) => self.state = H1State::Trailers,
+                Some(n) => self.state = H1State::ChunkData(n),
+                None => self.stop(head_since),
+            },
+            H1State::Trailers if empty => self.state = self.next_message(),
             _ => {}
         }
     }
@@ -563,10 +657,15 @@ impl PhaseState {
                     *have += n;
                     bytes = &bytes[n..];
                     if *have < 9 {
-                        // The frame type is not known yet. It can be a head.
-                        if self.header_block_since.is_none() {
+                        // Until the type byte is in, the frame can be a head.
+                        let head = *have < 4
+                            || header[3] == H2_FRAME_HEADERS
+                            || header[3] == H2_FRAME_CONTINUATION;
+                        if head && self.header_block_since.is_none() {
                             self.header_block_since = Some(Instant::now());
                             *provisional = true;
+                        } else if !head && std::mem::take(provisional) {
+                            self.header_block_since = None;
                         }
                         return;
                     }
@@ -806,14 +905,42 @@ pub(crate) struct TunnelGuard {
     _mark: Arc<InFlight>,
 }
 
-/// Takes the tunnel mark of a `CONNECT` request, for a handler on axum's own
-/// `WebSocketUpgrade`. Keep it for the life of the socket.
-#[cfg(feature = "ws")]
-pub(crate) struct KeepTunnel {
-    _guard: Option<TunnelGuard>,
+/// Keeps an HTTP/2 WebSocket connection out of its idle timer.
+///
+/// Over HTTP/2, a WebSocket is a `CONNECT` stream. The server counts the
+/// connection as busy while the request holds a tunnel mark. A handler on
+/// axum's own `WebSocketUpgrade` drops that mark after the handshake, so
+/// `keep_alive_timeout_ms` closes the connection while the socket is open.
+/// Extract `KeepTunnel` and keep it for the life of the socket.
+/// `autumn_web::ws::WebSocketUpgrade` does this for you.
+///
+/// It never rejects. On HTTP/1, or for a request that is not `CONNECT`, it
+/// holds nothing.
+///
+/// ```rust,ignore
+/// use autumn_web::http_server::KeepTunnel;
+///
+/// async fn raw(tunnel: KeepTunnel, ws: axum::extract::ws::WebSocketUpgrade)
+///     -> axum::response::Response
+/// {
+///     ws.on_upgrade(move |mut socket| async move {
+///         let _tunnel = tunnel; // drop it when the socket closes
+///         while let Some(Ok(_)) = socket.recv().await {}
+///     })
+/// }
+/// ```
+pub struct KeepTunnel {
+    guard: Option<TunnelGuard>,
 }
 
-#[cfg(feature = "ws")]
+impl std::fmt::Debug for KeepTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeepTunnel")
+            .field("holds_tunnel", &self.guard.is_some())
+            .finish()
+    }
+}
+
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for KeepTunnel {
     type Rejection = Infallible;
 
@@ -822,7 +949,7 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for KeepTunnel {
         _state: &S,
     ) -> Result<Self, Infallible> {
         Ok(Self {
-            _guard: parts.extensions.remove::<TunnelGuard>(),
+            guard: parts.extensions.remove::<TunnelGuard>(),
         })
     }
 }
@@ -995,15 +1122,57 @@ mod tests {
         assert!(state.header_block_since.is_some(), "the next head is timed");
     }
 
-    #[test]
-    fn http1_a_line_the_scan_cannot_read_stops_head_timing() {
+    /// Scan `head`, then `body`, then one byte of the next head. The head
+    /// must close, the body must not open a head, and the next head must.
+    fn assert_frames(head: &[u8], body: &[u8]) {
         let mut state = state();
+        state.scan(head);
+        assert!(state.header_block_since.is_none(), "head complete");
+        state.scan(body);
+        assert!(state.header_block_since.is_none(), "the body is not a head");
+        state.scan(b"G");
+        assert!(state.header_block_since.is_some(), "the next head is timed");
+    }
+
+    #[test]
+    fn http1_long_valid_framing_values_still_frame() {
         let zeros = "0".repeat(300);
-        state.scan(format!("POST / HTTP/1.1\r\nContent-Length: {zeros}5\r\n").as_bytes());
-        // Fail open: hyper can accept this head, so the head timer must not
-        // close the request.
+        assert_frames(
+            format!("POST / HTTP/1.1\r\nContent-Length: {zeros}5\r\n\r\n").as_bytes(),
+            b"GET /",
+        );
+        let codings = "gzip, ".repeat(60);
+        assert_frames(
+            format!("POST / HTTP/1.1\r\nTransfer-Encoding: {codings}chunked\r\n\r\n").as_bytes(),
+            b"5\r\nGET /\r\n0\r\n\r\n",
+        );
+        let ext = "x".repeat(300);
+        assert_frames(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            format!("5;{ext}\r\nGET /\r\n0\r\n\r\n").as_bytes(),
+        );
+        assert_frames(b"POST / HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\n", b"GET /");
+    }
+
+    #[test]
+    fn http1_chunked_must_be_the_last_coding() {
+        // hyper rejects this head; the body is not chunked.
+        let mut scan = H1Scan::default();
+        let mut since = None;
+        scan.scan(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+            &mut since,
+        );
+        assert!(!scan.chunked);
+    }
+
+    #[test]
+    fn http1_a_value_the_scan_cannot_read_stops_head_timing() {
+        let mut state = state();
+        state.scan(b"POST / HTTP/1.1\r\nContent-Length: abc\r\n");
+        // Fail open: hyper rejects this head and closes the connection.
         assert!(state.header_block_since.is_none());
-        state.scan(b"\r\nhello");
+        state.scan(b"\r\nGET /");
         assert!(state.header_block_since.is_none());
     }
 
@@ -1143,7 +1312,6 @@ mod tests {
         assert_eq!(expiry(&timers), Some(Expiry::Idle));
     }
 
-    #[cfg(feature = "ws")]
     #[tokio::test]
     async fn keep_tunnel_holds_the_connection_for_a_raw_upgrade() {
         use axum::extract::FromRequestParts as _;
@@ -1209,12 +1377,30 @@ mod tests {
 
         let mut state = state_after_preface();
         let ping = frame(0x6, 0, &[0; 8]);
-        state.scan(&ping[..5]);
+        state.scan(&ping[..3]); // the type byte is not in yet
         assert!(state.header_block_since.is_some());
-        state.scan(&ping[5..]);
+        state.scan(&ping[3..]);
         assert!(
             state.header_block_since.is_none(),
             "control traffic cancels the timer"
+        );
+    }
+
+    #[test]
+    fn a_known_control_frame_type_cancels_the_provisional_timer() {
+        let mut state = state_after_preface();
+        let ping = frame(0x6, 0, &[0; 8]); // PING
+        state.scan(&ping[..4]); // the type byte is in; the flags are not
+        assert!(
+            state.header_block_since.is_none(),
+            "a PING is not a head, so no head timer"
+        );
+        let mut state = state_after_preface();
+        let headers = frame(H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, &[0x82]);
+        state.scan(&headers[..4]);
+        assert!(
+            state.header_block_since.is_some(),
+            "a HEADERS frame is a head"
         );
     }
 
