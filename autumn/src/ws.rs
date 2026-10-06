@@ -426,7 +426,7 @@ const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// `Sink` the same way, so `split()` works.
 ///
 /// - A message over `max_message_bytes` sends close code `1009`. The stream
-///   then yields the error and ends.
+///   then yields the error and ends. Any other receive error also ends it.
 /// - Every `ping_interval_ms` the socket sends a ping while the handler
 ///   reads. The pong is not given to the handler.
 /// - When no frame arrives for `idle_timeout_ms`, the socket sends close code
@@ -688,7 +688,12 @@ impl futures::Stream for WebSocket {
                     );
                     continue;
                 }
-                Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                // A receive error ends the socket (tungstenite does not
+                // recover), so release it before the error is yielded.
+                Poll::Ready(Some(Err(error))) => {
+                    this.finish();
+                    return Poll::Ready(Some(Err(error)));
+                }
                 Poll::Ready(None) => {
                     this.finish();
                     return Poll::Ready(None);

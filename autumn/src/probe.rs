@@ -659,11 +659,18 @@ async fn refresh_replica_readiness<S: ProvideProbeState + Sync>(state: &S) {
     match replica_pool.get().await {
         Ok(mut conn) => {
             let alive = crate::db::probe_connection_alive(&mut conn).await;
-            if alive.is_ok() && state.probes().replica_max_lag().is_some() {
-                refresh_replica_lag_with(state.probes(), crate::db::measure_replica_lag(&mut conn))
+            match state.probes().replica_max_lag().filter(|_| alive.is_ok()) {
+                Some(max_lag) => {
+                    refresh_replica_lag_bounded(
+                        state.probes(),
+                        conn,
+                        replica_lag_query_budget(max_lag),
+                        |conn| Box::pin(crate::db::measure_replica_lag(conn)),
+                    )
                     .await;
+                }
+                None => drop(conn),
             }
-            drop(conn);
             match alive {
                 Ok(()) => {
                     state.probes().mark_replica_connection_ready();
@@ -713,6 +720,63 @@ where
 
 /// Measure the replica lag with `measure` and record the result.
 #[cfg(feature = "db")]
+/// The longest a replica lag query may run: the lag limit, at least 1 s.
+#[cfg(feature = "db")]
+pub(crate) fn replica_lag_query_budget(max_lag: std::time::Duration) -> std::time::Duration {
+    max_lag.max(std::time::Duration::from_secs(1))
+}
+
+/// Discards a pooled connection on drop, unless the query on it finished.
+#[cfg(feature = "db")]
+struct DiscardUnlessFinished<M: deadpool::managed::Manager>(Option<deadpool::managed::Object<M>>);
+
+#[cfg(feature = "db")]
+impl<M: deadpool::managed::Manager> Drop for DiscardUnlessFinished<M> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            // The query can still run: do not return it to the pool.
+            drop(deadpool::managed::Object::take(conn));
+        }
+    }
+}
+
+/// Measure the replica lag on `conn` within `budget`, and record it.
+///
+/// A query that does not finish (a timeout, or a cancelled caller such as a
+/// `/ready` request that timed out) can still run on the server, for
+/// example on a half-open TCP connection. Its connection does not go back to
+/// the pool.
+#[cfg(feature = "db")]
+pub(crate) async fn refresh_replica_lag_bounded<M, F>(
+    probes: &ProbeState,
+    conn: deadpool::managed::Object<M>,
+    budget: std::time::Duration,
+    measure: F,
+) where
+    M: deadpool::managed::Manager,
+    F: for<'c> FnOnce(
+        &'c mut deadpool::managed::Object<M>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<std::time::Duration, String>> + Send + 'c>,
+    >,
+{
+    let mut guard = DiscardUnlessFinished(Some(conn));
+    let Some(conn) = guard.0.as_mut() else {
+        return;
+    };
+    let measured = tokio::time::timeout(budget, measure(conn))
+        .await
+        .map_or_else(
+            |_| Err(format!("query took over {}ms", budget.as_millis())),
+            |result| {
+                // The query finished: the connection can go back to the pool.
+                drop(guard.0.take());
+                result
+            },
+        );
+    refresh_replica_lag_with(probes, std::future::ready(measured)).await;
+}
+
 pub(crate) async fn refresh_replica_lag_with<Fut>(probes: &ProbeState, measure: Fut)
 where
     Fut: std::future::Future<Output = Result<std::time::Duration, String>>,
@@ -1316,5 +1380,87 @@ mod tests {
         let (status, Json(response)) = readiness_response(&state).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.status, "ok");
+    }
+
+    #[cfg(feature = "db")]
+    mod bounded_lag {
+        use super::*;
+        use std::time::Duration;
+
+        /// A pool of `()` connections. Only the pool size matters here.
+        struct Unit;
+
+        impl deadpool::managed::Manager for Unit {
+            type Type = ();
+            type Error = std::convert::Infallible;
+
+            async fn create(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            async fn recycle(
+                &self,
+                _conn: &mut (),
+                _metrics: &deadpool::managed::Metrics,
+            ) -> deadpool::managed::RecycleResult<Self::Error> {
+                Ok(())
+            }
+        }
+
+        fn pool() -> deadpool::managed::Pool<Unit> {
+            deadpool::managed::Pool::builder(Unit)
+                .max_size(1)
+                .build()
+                .unwrap()
+        }
+
+        fn probes() -> ProbeState {
+            let probes = ProbeState::default();
+            probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+            probes.mark_replica_ready();
+            probes.configure_replica_max_lag(Some(Duration::from_secs(1)));
+            probes
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_hung_lag_query_is_bounded_and_its_connection_discarded() {
+            let (pool, probes) = (pool(), probes());
+            let conn = pool.get().await.unwrap();
+            refresh_replica_lag_bounded(&probes, conn, Duration::from_secs(1), |_| {
+                Box::pin(std::future::pending())
+            })
+            .await;
+            assert!(!probes.replica_lag_ok(), "the lag is unknown");
+            assert_eq!(pool.status().size, 0, "the connection is not reused");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_cancelled_lag_query_discards_its_connection() {
+            let (pool, probes) = (pool(), probes());
+            let conn = pool.get().await.unwrap();
+            let probe = refresh_replica_lag_bounded(&probes, conn, Duration::from_secs(10), |_| {
+                Box::pin(std::future::pending())
+            });
+            // An outer request timeout drops the probe mid-query.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), probe)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(pool.status().size, 0, "the connection is not reused");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_finished_lag_query_returns_its_connection() {
+            let (pool, probes) = (pool(), probes());
+            let conn = pool.get().await.unwrap();
+            refresh_replica_lag_bounded(&probes, conn, Duration::from_secs(1), |_| {
+                Box::pin(async { Ok(Duration::from_millis(5)) })
+            })
+            .await;
+            assert!(probes.replica_lag_ok());
+            assert_eq!(pool.status().size, 1);
+            assert_eq!(pool.status().available, 1, "back in the pool");
+        }
     }
 }

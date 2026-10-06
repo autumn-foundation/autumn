@@ -246,3 +246,33 @@ async fn a_server_close_releases_a_split_socket() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receive_error_releases_a_split_socket() {
+    use tokio::io::AsyncWriteExt as _;
+    let addr = serve_with(|c| c.realtime.max_connections = Some(1)).await;
+    let (mut bad, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
+        .await
+        .expect("first socket");
+    // A masked frame with the reserved opcode 0x3: a protocol error.
+    let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = bad.get_mut() else {
+        panic!("plain TCP");
+    };
+    tcp.write_all(&[0x83, 0x80, 0, 0, 0, 0]).await.unwrap();
+    // The client keeps its socket open. The slot must still come free.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the failed socket still holds the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(bad);
+}

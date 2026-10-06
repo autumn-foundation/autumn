@@ -164,10 +164,10 @@ The ping and idle timers run only while the handler waits in `recv()` (or
 idle timeout. A handler that does long work between reads gets no pings
 during that work, so a quiet client can reach the idle timeout.
 
-When the stream ends (a close the server sends, or the peer's close), the
-socket closes its transport and frees its `max_connections` slot. This also
-occurs when a `split()` sink half is still alive in another task. A later
-send on that half returns an error.
+When the stream ends (a close the server sends, the peer's close, or a
+receive error), the socket closes its transport and frees its
+`max_connections` slot. This also occurs when a `split()` sink half is still
+alive in another task. A later send on that half returns an error.
 
 The actuator `tasks/stream` socket does not use these limits.
 

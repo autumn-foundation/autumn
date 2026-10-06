@@ -10748,25 +10748,15 @@ fn spawn_replica_lag_monitor(
     let interval = replica_lag_check_interval(max_lag);
     // A query that hangs (for example on a half-open TCP connection) must not
     // keep the monitor from its next sample.
-    let budget = max_lag.max(std::time::Duration::from_secs(1));
+    let budget = crate::probe::replica_lag_query_budget(max_lag);
     Some(tokio::spawn(async move {
         loop {
             match replica.get().await {
-                Ok(mut conn) => {
-                    let mut timed_out = false;
-                    let measure = async {
-                        tokio::time::timeout(budget, crate::db::measure_replica_lag(&mut conn))
-                            .await
-                            .unwrap_or_else(|_| {
-                                timed_out = true;
-                                Err(format!("query took over {}ms", budget.as_millis()))
-                            })
-                    };
-                    crate::probe::refresh_replica_lag_with(&probes, measure).await;
-                    if timed_out {
-                        // The query can still run: do not return it to the pool.
-                        drop(deadpool::managed::Object::take(conn));
-                    }
+                Ok(conn) => {
+                    crate::probe::refresh_replica_lag_bounded(&probes, conn, budget, |conn| {
+                        Box::pin(crate::db::measure_replica_lag(conn))
+                    })
+                    .await;
                 }
                 // A full pool is not a stale replica. Keep the last sample: it
                 // ages out on its own (see `ProbeState::replica_status`).
