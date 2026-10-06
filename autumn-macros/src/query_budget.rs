@@ -3181,11 +3181,17 @@ impl Analyzer {
                 let mut cost = Cost::ZERO;
                 let mut params = Vec::new();
                 let mut borrows = Vec::new();
-                for arg in &call.args {
+                let mut reads = Vec::new();
+                for (i, arg) in call.args.iter().enumerate() {
+                    if i > 0 {
+                        reads.push(self.env.clone());
+                    }
                     cost = cost.then(self.cost_of(arg));
                     params.push(self.value_of(arg));
                     borrows.push(self.referents_of(arg));
                 }
+                // The call's value is read again later: keep each read.
+                self.keep_reads(reads);
                 self.param_referents_each = borrows;
                 Flow::cost(cost.then(self.closure_body(closure, &params, Kind::Plain)))
             }
@@ -13192,6 +13198,14 @@ mod tests {
                  let mut slot = None; let refs = [&raw mut slot; 2]; let target = refs[1]; \
                  unsafe { *target = Some(repo); } slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
+            ),
+            (
+                "guard: an invoked closure's result keeps an earlier argument",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); \
+                 let alias = (|r, _| r)(source.take().unwrap(), { source = None; 0 }); \
+                 alias.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
             ),
             (
                 "guard: a borrow moved out by a dereference keeps its owner",
