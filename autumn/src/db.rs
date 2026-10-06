@@ -226,6 +226,11 @@ pub(crate) fn record_request_db_query(elapsed: Duration, sql: Option<&str>) {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
 
+    // Lane 3: per-request cost metering (issue #1720). No-op outside a
+    // metered request.
+    #[cfg(feature = "db")]
+    crate::cost::record_db_query();
+
     // Lane 2: request-wide SQL capture, independent of the timing lane. Only
     // active when a test scoped `REQUEST_QUERY_CAPTURE`; a no-op otherwise
     // (production, background jobs). The two `try_with` calls are independent —
@@ -278,6 +283,15 @@ pub(crate) fn request_db_timing_active() -> bool {
 #[cfg(feature = "db")]
 pub(crate) fn request_query_capture_active() -> bool {
     REQUEST_QUERY_CAPTURE.try_with(|_| ()).is_ok()
+}
+
+/// Whether any per-request DB lane is active: `Server-Timing` timing, test
+/// query capture, or cost metering (issue #1720).
+#[cfg(feature = "db")]
+fn request_db_lane_active() -> bool {
+    request_db_timing_active()
+        || request_query_capture_active()
+        || crate::cost::request_cost_active()
 }
 
 /// diesel-async [`Instrumentation`](diesel::connection::Instrumentation)
@@ -456,7 +470,7 @@ impl RequestQueryTimer {
         // opted-out / off-request path) the timer does nothing and never
         // invokes `sql`, so the caller's `DebugQuery` `to_string()` allocation
         // is skipped — keeping a stale installed timer a cheap bool-probe no-op.
-        if !request_db_timing_active() && !request_query_capture_active() {
+        if !request_db_lane_active() {
             self.pending = None;
             return;
         }
@@ -1423,6 +1437,7 @@ fn build_pool(
 
     #[cfg(not(feature = "sqlite"))]
     {
+        let _ = crate::lock::pooler::warn_if_pooled(url);
         let timeout = Duration::from_secs(connect_timeout_secs);
         let config = pg_manager_config(url);
         let manager =
@@ -2299,8 +2314,8 @@ const fn retry_decision(attempt: u32, max_attempts: u32, retryable: bool) -> Ret
 /// Deterministic capped exponential backoff base: `initial * 2^(attempt-1)`,
 /// saturating on overflow and capped at `max`.
 ///
-/// Mirrors the jobs system's backoff shape (`pg_retry_delay_ms`) plus the cap
-/// idiom from the migrate startup loop. Kept jitter-free so it is unit-testable.
+/// Same exponential shape and cap as [`crate::backoff::ceiling_ms`]. Kept
+/// jitter-free so it is unit-testable. [`retry_backoff_delay`] adds the jitter.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duration {
     // Cap the shift so `2^shift` never overflows and huge attempts saturate.
@@ -3493,9 +3508,9 @@ impl Db {
         // default via `diesel::connection::set_default_instrumentation` — query logging,
         // tracing, metrics — would have it silently clobbered on the first checkout and
         // never restored, even with `server_timing` disabled. Gating on
-        // `request_db_timing_active() || request_query_capture_active()` preserves the
-        // app's instrumentation whenever neither lane is scoped, the production default,
-        // and overwrites it only while a query observer is active.
+        // `request_db_lane_active()` preserves the app's instrumentation whenever no
+        // lane is scoped, the production default, and overwrites it only while a query
+        // observer is active. Cost metering (`[cost] enabled`) is the third lane.
         //
         // Installing a fresh timer on every observed checkout also clears any stale
         // `RequestQueryTimer` a pooled connection carried from a prior request —
@@ -3509,7 +3524,7 @@ impl Db {
         #[cfg(feature = "db")]
         {
             use diesel_async::AsyncConnection as _;
-            if request_db_timing_active() || request_query_capture_active() {
+            if request_db_lane_active() {
                 conn.set_instrumentation(RequestQueryTimer::with_clock(std::sync::Arc::clone(
                     &params.clock,
                 )));

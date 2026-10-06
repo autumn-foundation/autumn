@@ -43,6 +43,7 @@ registered with `TestApp::http_mock`.
 [http.client]
 timeout_secs = 30     # per-request timeout (default: 30)
 max_retries  = 3      # retries on idempotent methods (default: 3)
+max_backoff_ms = 20000 # cap on the jittered retry backoff (default: 20000)
 
 [http.client.base_urls]
 stripe   = "https://api.stripe.com"
@@ -64,18 +65,33 @@ methods) are retried up to three times on:
 
 | Condition | Behaviour |
 |---|---|
-| `502 Bad Gateway` | Immediate retry with exponential back-off (100 ms × 2ⁿ) |
-| `503 Service Unavailable` | Same |
-| `504 Gateway Timeout` | Same |
-| `429 Too Many Requests` | Retried after the `Retry-After` header delay (1 s default) |
-| Connection / timeout error | Retried up to `max_retries` times |
+| `502 Bad Gateway`, `504 Gateway Timeout` | Retry after the jittered backoff |
+| `503 Service Unavailable` | Same. With `Retry-After`, wait for the hint (see below) |
+| `429 Too Many Requests` | Wait for `Retry-After` (1 s when absent, see below) |
+| Connection / timeout error | Retry after the jittered backoff |
 
-`POST` and `PATCH` are **not** retried by default (not idempotent). Override
-per-call:
+**Backoff.** The wait before retry `n` (0 = first retry) is a random value in
+`[0, min(max_backoff, 100 ms × 2ⁿ)]` ("full jitter"). Callers that fail
+together do not retry together. `max_backoff` is `[http.client]
+max_backoff_ms` (default 20 000), or `.max_backoff(d)` per call. A client
+from app state (the `Client` extractor, `Client::from_state`) draws the
+jitter from the app's entropy. Under a `Sim` that entropy is seeded, so a
+seed replays the same delays.
+
+**`Retry-After`.** On a `429` or `503`, the client reads `Retry-After`
+(seconds or an HTTP date). It caps the hint at `max_retry_after_secs` and at
+the request timeout. The wait is then `backoff + min(hint, 5 s)`. So the
+retry never comes before a hint of up to 5 s, and callers that get the same
+hint still spread out. A hint above 5 s is cut to about 5 s.
+
+`POST` and `PATCH` are **not** retried by default (not idempotent).
+`.retries(n)` sets the count only. Opt in per call with
+`.retry_non_idempotent()`. The client then sends an `Idempotency-Key` header
+with a random value, the same on every attempt, unless you set one:
 
 ```rust
-// Retry a POST up to 2 extra times (e.g. idempotent webhook delivery)
-client.post(url).retries(2).send().await?;
+// Retry a POST up to 2 extra times. The server can deduplicate on the key.
+client.post(url).retries(2).retry_non_idempotent().send().await?;
 
 // Disable retries entirely
 client.get(url).no_retry().send().await?;

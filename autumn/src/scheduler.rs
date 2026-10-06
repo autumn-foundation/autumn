@@ -213,16 +213,31 @@ impl SchedulerLease {
     /// # Errors
     ///
     /// Returns [`AutumnError`] when the backend cannot delete the row.
-    pub async fn release_and_free(mut self) -> AutumnResult<()> {
+    pub async fn release_and_free(self) -> AutumnResult<()> {
+        self.free().await?;
+        self.release().await
+    }
+
+    /// Free the key, and keep the lease, so a caller can try again when the
+    /// delete fails. Only this lease's own row is deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] when the backend cannot delete the row.
+    #[allow(
+        clippy::unused_async,
+        reason = "only the postgres and sqlite rows await in the body"
+    )]
+    pub(crate) async fn free(&self) -> AutumnResult<()> {
         #[cfg(feature = "db")]
-        if let Some(row) = self.postgres.take() {
+        if let Some(row) = self.postgres.as_ref() {
             row.free().await?;
         }
         #[cfg(feature = "sqlite")]
         if let Some(lease) = self.sqlite.as_ref() {
             lease.free().await?;
         }
-        self.release().await
+        Ok(())
     }
 }
 
@@ -423,7 +438,7 @@ struct PostgresTickRow {
 impl PostgresTickRow {
     /// Delete this row. The `generation` match keeps a row that another
     /// replica claimed after this one expired.
-    async fn free(self) -> AutumnResult<()> {
+    async fn free(&self) -> AutumnResult<()> {
         use diesel_async::RunQueryDsl as _;
 
         let mut conn = self.pool.get().await.map_err(|error| {

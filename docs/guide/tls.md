@@ -173,7 +173,7 @@ docker run -d \
   -v /etc/letsencrypt:/etc/letsencrypt:ro \
   -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/letsencrypt/live/app.example.com/fullchain.pem \
   -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/letsencrypt/live/app.example.com/privkey.pem \
-  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/startup \
   -e AUTUMN_HEALTHCHECK_INSECURE=1 \
   -p 443:3000 \
   my-app
@@ -197,14 +197,14 @@ docker run -d \
   -v /srv/tls:/etc/autumn/tls:ro \
   -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/fullchain.pem \
   -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/privkey.pem \
-  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/startup \
   -e AUTUMN_HEALTHCHECK_INSECURE=1 \
   -p 443:3000 \
   my-app
 ```
 
 Both health-check variables matter. `AUTUMN_HEALTHCHECK_URL` re-points the
-generated `HEALTHCHECK`, which defaults to `http://localhost:3000/health`: a
+generated `HEALTHCHECK`, which defaults to `http://localhost:3000/startup`: a
 plain-HTTP probe against an HTTPS listener marks the container **unhealthy**
 forever — and in the generated `docker-compose.yml`, anything waiting on
 `condition: service_healthy` then never starts.

@@ -28,6 +28,10 @@
 //! valgrind --tool=dhat --dhat-out-file=dhat-run.json  "$BIN" --chars 6000
 //! ```
 //!
+//! Baseline (callgrind, `Ir`, before the OpId-hashing change; 4.3k Ir/char,
+//! linear in N): `--chars 0` 402,423 · `1500` 6,940,384 · `3000` 12,903,254 ·
+//! `6000` 25,296,447. dhat at 6000: 2,502,356 bytes in 60,051 blocks.
+//!
 //! `--chars N` types N characters (cycling a fixed prose paragraph) into one
 //! document, one `insert_after` call per character.
 

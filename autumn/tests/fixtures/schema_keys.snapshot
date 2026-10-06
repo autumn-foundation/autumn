@@ -100,6 +100,12 @@ cors.allowed_headers
 cors.allowed_methods
 cors.allowed_origins
 cors.max_age_secs
+cost
+cost.defer_recheck_secs
+cost.defer_threshold
+cost.enabled
+cost.max_tenants
+cost.signal_refresh_secs
 database
 database.auto_migrate
 database.auto_migrate_in_production
@@ -165,6 +171,7 @@ health.startup_path
 http
 http.client
 http.client.base_urls
+http.client.max_backoff_ms
 http.client.max_retries
 http.client.max_retry_after_secs
 http.client.timeout_secs
@@ -192,6 +199,7 @@ jobs.fleet.manifest
 jobs.fleet.tiers
 jobs.initial_backoff_ms
 jobs.max_attempts
+jobs.max_backoff_ms
 jobs.pin
 jobs.postgres
 jobs.postgres.visibility_timeout_ms
@@ -275,11 +283,14 @@ reporting.sample_rate
 resilience
 resilience.circuit_breaker
 resilience.circuit_breaker.defaults
+resilience.circuit_breaker.defaults.cancelled_call_outcome
 resilience.circuit_breaker.defaults.failure_ratio_threshold
 resilience.circuit_breaker.defaults.half_open_trial_count
 resilience.circuit_breaker.defaults.minimum_sample_count
 resilience.circuit_breaker.defaults.open_duration_secs
 resilience.circuit_breaker.defaults.sample_window_secs
+resilience.circuit_breaker.defaults.slow_call_duration_threshold_ms
+resilience.circuit_breaker.defaults.slow_call_rate_threshold
 resilience.circuit_breaker.hosts
 retention
 retention.audit_archives

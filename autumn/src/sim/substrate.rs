@@ -84,12 +84,12 @@
 //! * **Jobs** — the sim runs the **local `JobAdminMemoryBackend`**
 //!   ([`crate::job::start_runtime`] with the `"local"` backend default);
 //!   `jobs.backend = "postgres"` is a hard-error stub under the `sqlite` feature
-//!   because `SQLite` has no `LISTEN`/`NOTIFY` + `SKIP LOCKED` durable queue.
+//!   because `SQLite` has no `SKIP LOCKED` + advisory-lock durable queue.
 //!
 //! **Documented divergence** (consistent with the RFC §12 scope): a green sim
 //! proves the *orchestration, timing, and ordering* of the local scheduler + job
 //! paths. It does **not** validate the Postgres tick-table scheduler leasing
-//! or the durable Postgres `LISTEN`/`NOTIFY` + `SKIP LOCKED` job-queue
+//! or the durable Postgres `SKIP LOCKED` + advisory-lock job-queue
 //! claim/lock semantics — those are compiled out under `sqlite` and remain the
 //! province of the Postgres-backed integration tests. The sim is a determinism /
 //! orchestration harness, not a Postgres queue-semantics conformance suite.

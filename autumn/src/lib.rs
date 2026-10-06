@@ -87,6 +87,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod backoff;
 // The build-time agent authority envelope (issue #1691): what an MCP-exposed,
 // agent-operable handler is allowed to do -- which models it writes, whether it
 // leaves the tenant, which hosts it calls, which jobs it enqueues, how
@@ -166,6 +167,7 @@ pub mod consent;
 pub mod confidential;
 #[cfg(feature = "constela")]
 pub mod constela;
+pub mod cost;
 pub mod credentials;
 pub mod current;
 pub mod custom_domain;
