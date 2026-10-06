@@ -1241,6 +1241,16 @@ impl JobAdminMemoryBackend {
         }
     }
 
+    /// `true` when an operator canceled the job `id`.
+    fn is_canceled(&self, id: &str) -> bool {
+        self.inner.read().is_ok_and(|inner| {
+            inner
+                .records
+                .get(id)
+                .is_some_and(|record| record.status == JobAdminStatus::Canceled)
+        })
+    }
+
     fn record_success(&self, id: &str) {
         let Ok(mut inner) = self.inner.write() else {
             return;
@@ -4077,78 +4087,80 @@ impl JobClient {
                     // shared health signal, for every other enqueuer to
                     // read.
                     let breaker = self.job_queue_breaker();
-                    if breaker.before_call().is_err() {
-                        for row in batch {
-                            if row.due_at.is_some() {
-                                self.registry.record_cancel_scheduled(name);
-                            } else {
-                                self.registry.record_cancel(name);
-                            }
-                            self.registry.forget_pg_job_mark(&row.id);
-                            self.job_admin.record_cancelled(&row.id);
-                            let row_error = AutumnError::service_unavailable(
-                                std::io::Error::other("job queue circuit breaker is open"),
-                            );
-                            fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
-                            resolved.push((row.result_index, Err(row_error)));
-                        }
-                    } else {
-                        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
-                        let insert_result = pg_insert_jobs_many(
-                            pool,
-                            name,
-                            &job_queue,
-                            job_max_attempts,
-                            job_backoff_ms,
-                            unique_window_tag,
-                            concurrency_limit,
-                            &batch,
-                        )
-                        .await;
-                        if insert_result.is_ok() {
-                            guard.success();
-                        } else {
-                            guard.failure();
-                        }
-                        match insert_result {
-                            Ok(inserted_ids) => {
-                                let inserted: std::collections::HashSet<&str> =
-                                    inserted_ids.iter().map(String::as_str).collect();
-                                for row in batch {
-                                    let outcome = if inserted.contains(row.id.as_str()) {
-                                        EnqueueOutcome::Queued
-                                    } else {
-                                        self.record_deduplicated_enqueue(
-                                            name,
-                                            &row.id,
-                                            row.due_at.is_some(),
-                                        );
-                                        EnqueueOutcome::Deduplicated
-                                    };
-                                    fill_enqueue(row.slot, name, row.due_at, row.now, None);
-                                    resolved.push((row.result_index, Ok(outcome)));
+                    match breaker.admit() {
+                        Err(_) => {
+                            for row in batch {
+                                if row.due_at.is_some() {
+                                    self.registry.record_cancel_scheduled(name);
+                                } else {
+                                    self.registry.record_cancel(name);
                                 }
+                                self.registry.forget_pg_job_mark(&row.id);
+                                self.job_admin.record_cancelled(&row.id);
+                                let row_error = AutumnError::service_unavailable(
+                                    std::io::Error::other("job queue circuit breaker is open"),
+                                );
+                                fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
+                                resolved.push((row.result_index, Err(row_error)));
                             }
-                            Err(error) => {
-                                let message = error.to_string();
-                                for row in batch {
-                                    if row.due_at.is_some() {
-                                        self.registry.record_cancel_scheduled(name);
-                                    } else {
-                                        self.registry.record_cancel(name);
+                        }
+                        Ok(guard) => {
+                            let insert_result = pg_insert_jobs_many(
+                                pool,
+                                name,
+                                &job_queue,
+                                job_max_attempts,
+                                job_backoff_ms,
+                                unique_window_tag,
+                                concurrency_limit,
+                                &batch,
+                            )
+                            .await;
+                            if insert_result.is_ok() {
+                                guard.success();
+                            } else {
+                                guard.failure();
+                            }
+                            match insert_result {
+                                Ok(inserted_ids) => {
+                                    let inserted: std::collections::HashSet<&str> =
+                                        inserted_ids.iter().map(String::as_str).collect();
+                                    for row in batch {
+                                        let outcome = if inserted.contains(row.id.as_str()) {
+                                            EnqueueOutcome::Queued
+                                        } else {
+                                            self.record_deduplicated_enqueue(
+                                                name,
+                                                &row.id,
+                                                row.due_at.is_some(),
+                                            );
+                                            EnqueueOutcome::Deduplicated
+                                        };
+                                        fill_enqueue(row.slot, name, row.due_at, row.now, None);
+                                        resolved.push((row.result_index, Ok(outcome)));
                                     }
-                                    self.registry.forget_pg_job_mark(&row.id);
-                                    self.job_admin.record_cancelled(&row.id);
-                                    let row_error =
-                                        AutumnError::internal_server_error_msg(message.clone());
-                                    fill_enqueue(
-                                        row.slot,
-                                        name,
-                                        row.due_at,
-                                        row.now,
-                                        Some(&row_error),
-                                    );
-                                    resolved.push((row.result_index, Err(row_error)));
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    for row in batch {
+                                        if row.due_at.is_some() {
+                                            self.registry.record_cancel_scheduled(name);
+                                        } else {
+                                            self.registry.record_cancel(name);
+                                        }
+                                        self.registry.forget_pg_job_mark(&row.id);
+                                        self.job_admin.record_cancelled(&row.id);
+                                        let row_error =
+                                            AutumnError::internal_server_error_msg(message.clone());
+                                        fill_enqueue(
+                                            row.slot,
+                                            name,
+                                            row.due_at,
+                                            row.now,
+                                            Some(&row_error),
+                                        );
+                                        resolved.push((row.result_index, Err(row_error)));
+                                    }
                                 }
                             }
                         }
@@ -4411,12 +4423,11 @@ impl JobClient {
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.job_queue_breaker();
 
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(AutumnError::service_unavailable(std::io::Error::other(
                 "job queue circuit breaker is open",
             )));
-        }
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+        };
 
         let res = self
             .enqueue_durable_inner(
@@ -4698,12 +4709,11 @@ impl JobClient {
                 },
             );
 
-            if breaker.before_call().is_err() {
+            let Ok(guard) = breaker.admit() else {
                 return Err(AutumnError::service_unavailable(std::io::Error::other(
                     "job queue circuit breaker is open",
                 )));
-            }
-            let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+            };
 
             let id_for_enqueue = id.clone();
             let payload_for_enqueue = payload.clone();
@@ -4789,6 +4799,9 @@ pub fn start_runtime(
     })?;
 
     crate::job_tracking::ensure_tracking_store_installed_from_config(state, config);
+    if run_workers {
+        warn_deferrable_jobs_not_deferred(state, &jobs, &config.backend);
+    }
     if config.max_backoff_ms == 0 {
         tracing::warn!("jobs.max_backoff_ms = 0: every job retry is due at once, with no backoff");
     }
@@ -4905,6 +4918,10 @@ struct LocalJobCoordinationInner {
     unique_holds: HashMap<String, LocalUniqueHold>,
     running_slots: HashMap<String, u32>,
     waiting: HashMap<String, VecDeque<QueuedJob>>,
+    /// Deferrable jobs that wait for the cost signal to fall (issue #1720).
+    deferred: Vec<QueuedJob>,
+    /// `true` while one task checks `deferred`.
+    deferred_waiter: bool,
 }
 
 struct LocalUniqueHold {
@@ -4996,6 +5013,36 @@ enum LocalSlotDecision {
 }
 
 impl LocalJobCoordination {
+    /// Keep `job` until the cost signal falls. Return `true` when no task
+    /// checks the deferred jobs yet, so the caller must start one.
+    fn defer(&self, job: QueuedJob) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.deferred.push(job);
+        let running = std::mem::replace(&mut inner.deferred_waiter, true);
+        drop(inner);
+        !running
+    }
+
+    /// Take the deferred jobs that may go back on the queue. Return `false` as
+    /// the second value when no job is left; the checking task then stops.
+    fn take_deferred(&self, ready: impl Fn(&QueuedJob) -> bool) -> (Vec<QueuedJob>, bool) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (go, stay): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.deferred)
+            .into_iter()
+            .partition(|job| ready(job));
+        let more = !stay.is_empty();
+        inner.deferred = stay;
+        inner.deferred_waiter = more;
+        drop(inner);
+        (go, more)
+    }
+
     /// Coordination reading TTL expiry from `clock` (the app's injected clock).
     fn with_clock(clock: Arc<dyn crate::time::ClockSource>) -> Self {
         Self {
@@ -5326,6 +5373,30 @@ pub(crate) fn start_local_runtime_inner(
     }
 }
 
+/// Warn when a `#[job(deferrable)]` job runs on a backend that does not defer.
+///
+/// Only the `local` backend defers jobs in this slice (issue #1720). On the
+/// durable backends the job runs as usual, so say so at boot rather than fail
+/// silently.
+fn warn_deferrable_jobs_not_deferred(state: &AppState, jobs: &[JobInfo], backend: &str) {
+    let deferral_on = state
+        .extension::<crate::cost::CostSignal>()
+        .is_some_and(|signal| signal.threshold().is_some());
+    if backend == "local" || !deferral_on {
+        return;
+    }
+    for job in jobs {
+        if crate::cost::is_deferrable(crate::cost::WorkKind::Job, &job.name) {
+            tracing::warn!(
+                job = %job.name,
+                backend,
+                "job is deferrable, but this jobs backend does not defer; it runs \
+                 when the cost signal is high. Only `local` defers jobs"
+            );
+        }
+    }
+}
+
 /// Whether this process should evaluate queue-pin coverage and emit the AC6
 /// startup diagnostic (issue #1623). Only worker/combined roles
 /// (`run_workers == true`) claim queues, so a web replica (`run_workers ==
@@ -5608,6 +5679,30 @@ async fn execute_local_job(
         return;
     };
 
+    // Cost gate (issue #1720): a deferrable job waits while the cost signal is
+    // high. It has not started, so it holds no slot and uses no attempt, and
+    // its queued gauge does not change. The runtime keeps it in one deferred
+    // list, and one task checks that list every recheck interval: it puts a
+    // job back on the queue when the signal falls. A canceled job goes back at
+    // once, so the cancel branch below settles it. A canceled job does not
+    // wait. The task stops when the list is empty or the runtime shuts down.
+    if !job_admin.is_canceled(&job.id)
+        && let Some(signal) =
+            crate::cost::deferral_signal(state, crate::cost::WorkKind::Job, &job.name)
+    {
+        crate::cost::note_deferral(&signal);
+        tracing::info!(job = %job.name, value = signal.value(), "cost signal is high; job waits");
+        if coordination.defer(job) {
+            tokio::spawn(run_deferred_job_waiter(
+                Arc::clone(coordination),
+                signal,
+                job_admin.clone(),
+                tx.clone(),
+            ));
+        }
+        return;
+    }
+
     // Concurrency gate: park the job when its group is saturated. Parked jobs
     // keep their enqueued status and resume when release_slot pops them.
     let job_name = job.name.clone();
@@ -5812,6 +5907,35 @@ async fn execute_local_job(
     // The concurrency slot frees as soon as the handler is no longer running,
     // including while a retry waits out its backoff.
     finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+}
+
+/// Check the deferred local jobs every recheck interval (issue #1720). Put a
+/// job back on the queue when the cost signal falls or an operator cancels it.
+async fn run_deferred_job_waiter(
+    coordination: Arc<LocalJobCoordination>,
+    signal: Arc<crate::cost::CostSignal>,
+    job_admin: JobAdminMemoryBackend,
+    sender: tokio::sync::mpsc::Sender<QueuedJob>,
+) {
+    loop {
+        tokio::select! {
+            // The runtime stopped: its queue is gone, as for any queued local
+            // job.
+            () = sender.closed() => return,
+            () = tokio::time::sleep(signal.recheck()) => {}
+        }
+        let low = !signal.is_high();
+        let (ready, more) = coordination.take_deferred(|job| low || job_admin.is_canceled(&job.id));
+        for job in ready {
+            tracing::info!(job = %job.name, "job goes back on the queue");
+            if sender.send(job).await.is_err() {
+                return;
+            }
+        }
+        if !more {
+            return;
+        }
+    }
 }
 
 /// Release a unique hold after a job settles. No-op for TTL-window holds
@@ -18364,6 +18488,7 @@ mod tests {
                 minimum_sample_count: 3,
                 open_duration: Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             };
             let breaker =
                 crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
@@ -20235,6 +20360,7 @@ mod tests {
             minimum_sample_count: 3,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..crate::circuit_breaker::CircuitBreakerPolicy::default()
         };
         let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
 
@@ -20608,6 +20734,52 @@ mod tests {
                 .delay_cancelers
                 .contains_key(&id),
             "cancel_enqueued must remove the delay canceler from the map"
+        );
+    }
+
+    fn deferred_test_job(id: &str) -> QueuedJob {
+        QueuedJob {
+            id: id.to_string(),
+            name: "deferred_test".to_string(),
+            queue: "default".to_string(),
+            payload: serde_json::json!({}),
+            attempt: 1,
+            max_attempts: 3,
+            initial_backoff_ms: 10,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        }
+    }
+
+    /// One task checks all deferred jobs, however many there are (#1720).
+    #[test]
+    fn deferred_jobs_share_one_waiter() {
+        let coordination = LocalJobCoordination::default();
+        assert!(
+            coordination.defer(deferred_test_job("a")),
+            "the first job starts the waiter"
+        );
+        assert!(
+            !coordination.defer(deferred_test_job("b")),
+            "later jobs use it"
+        );
+        assert!(!coordination.defer(deferred_test_job("c")));
+
+        let (ready, more) = coordination.take_deferred(|job| job.id == "b");
+        assert_eq!(
+            ready.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert!(more, "two jobs still wait");
+
+        let (ready, more) = coordination.take_deferred(|_| true);
+        assert_eq!(ready.len(), 2);
+        assert!(!more, "the waiter stops when no job is left");
+        assert!(
+            coordination.defer(deferred_test_job("d")),
+            "a new job starts a new waiter"
         );
     }
 

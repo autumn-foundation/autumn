@@ -124,6 +124,7 @@ the framework almost certainly already generates or ships it:
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument, 256 instruments, 8 labels/series by default) instead of leaking series (0.7.0, issue #1378); those three are the `[metrics]` section — `max_series_per_metric` / `max_instruments` / `max_labels_per_series`, plus `AUTUMN_METRICS__*` — so an app with a genuinely larger label space raises them rather than losing series, while the name/value/help-length caps stay fixed. Lowering a cap never evicts a retained series (that would reset a counter); an out-of-range value fails the boot naming the key. `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
+| Hand-timing handlers with `Instant::now()` to bill tenants, or a cron job that checks a carbon/price API before it runs heavy work | `[cost] enabled = true` meters CPU time, allocated bytes (with an `AllocationProbe`) and DB queries per request, by tenant: `Server-Timing` `cost-cpu`/`cost-db`, the `autumn_cost_*_total{tenant}` metrics, `GET /actuator/cost` (sensitive). `#[job(deferrable)]` / `#[scheduled(..., deferrable)]` wait while `CostSignal` is above `[cost] defer_threshold`, then run; never dropped. Set the signal with `CostSignal::set` or the `autumn_cost_signal` runtime-config key (`ConfigRegistry::define_cost_signal`). Only the `local` jobs backend defers jobs. See `docs/guide/cost.md` (issue #1720) |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598; 0.8.0, #1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.8.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
@@ -2728,6 +2729,33 @@ Each route in the contract also carries a resource shape (`db-bound`,
 declares. Every contract failure — missing file, malformed document, a contract
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
+
+## Resilience: outbound circuit breakers
+
+The HTTP client (per host), durable job enqueue (`job_queue`) and the SMTP
+mailer (`smtp_mailer`) run behind a `CircuitBreaker`. It opens on the failure
+ratio **or** the slow-call ratio (issue #3060):
+
+```toml
+[resilience.circuit_breaker.defaults]
+slow_call_duration_threshold_ms = 60000  # 0 turns slow-call detection off
+slow_call_rate_threshold = 1.0           # open when all calls are slow
+cancelled_call_outcome = "slow"          # or "failure"
+
+[resilience.circuit_breaker.hosts."api.stripe.com"]
+slow_call_duration_threshold_ms = 5000
+slow_call_rate_threshold = 0.5
+```
+
+- A call dropped (for example by a timeout) at or after the threshold counts
+  as slow, or as failed. Dropped earlier, it counts as nothing.
+- Set the threshold below `server.timeouts.request_timeout_ms`, or the timeout
+  cancels a slow call first.
+- Breaker state is per process. Metrics: `autumn_circuit_breaker_slow_calls_total`,
+  `autumn_circuit_breaker_slow_call_ratio` (label `name`).
+- A `CircuitBreakerPolicy` struct literal needs `..CircuitBreakerPolicy::default()`.
+
+See `docs/guide/resilience.md`.
 
 ## Sharding (0.6.0)
 
