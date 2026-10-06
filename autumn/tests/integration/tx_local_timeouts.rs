@@ -58,8 +58,8 @@ mod tx_local_timeouts {
             .clone()
     }
 
-    async fn pool() -> Pool<AsyncPgConnection> {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(pg_url().await);
+    fn pool_at(url: String) -> Pool<AsyncPgConnection> {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
         Pool::builder(manager).max_size(4).build().expect("pool")
     }
 
@@ -186,7 +186,15 @@ mod tx_local_timeouts {
         statement: Option<Duration>,
         idle: Option<Duration>,
     ) -> autumn_web::test::TestClient {
-        let pool = pool().await;
+        client_at(pg_url().await, statement, idle)
+    }
+
+    fn client_at(
+        url: String,
+        statement: Option<Duration>,
+        idle: Option<Duration>,
+    ) -> autumn_web::test::TestClient {
+        let pool = pool_at(url);
         let mut config = autumn_web::config::AutumnConfig::default();
         config.database.statement_timeout = statement;
         config.database.idle_in_transaction_timeout = idle;
@@ -326,6 +334,28 @@ mod tx_local_timeouts {
             .assert_json::<serde_json::Value, _>(|body| {
                 assert_eq!(body["statement"], "0");
                 assert_eq!(body["idle"], "0");
+            });
+    }
+
+    /// A connection whose session default is `statement_timeout = 50ms` (a
+    /// role or database default looks the same). With only the idle timeout
+    /// configured, the transaction keeps checkout's `0`: `DEFAULT` would bring
+    /// the 50ms back.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn unset_statement_timeout_stays_off_inside_tx() {
+        let base = pg_url().await;
+        let sep = if base.contains('?') { '&' } else { '?' };
+        let url = format!("{base}{sep}options=-c%20statement_timeout%3D50ms");
+        let client = client_at(url, None, Some(IDLE_TIMEOUT));
+        client
+            .get("/tx-settings")
+            .send()
+            .await
+            .assert_status(200)
+            .assert_json::<serde_json::Value, _>(|body| {
+                assert_eq!(body["statement"], "0");
+                assert_eq!(body["idle"], "2s");
             });
     }
 }

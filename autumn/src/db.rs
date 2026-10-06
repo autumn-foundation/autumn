@@ -135,8 +135,13 @@ tokio::task_local! {
 ///
 /// A transaction pooler (`PgBouncer` in transaction mode) drops a session
 /// `SET`, but keeps a `SET LOCAL` for the transaction that issued it. The
-/// values are milliseconds. `Some(0)` turns the limit off. `None` keeps the
-/// server or role default (`SET LOCAL ... = DEFAULT`).
+/// values are milliseconds. `Some(0)` turns the limit off.
+///
+/// An unset statement timeout is sent as `0`. `Db::checkout` and generated
+/// repositories already `SET statement_timeout = 0` for the session when none
+/// is configured. `DEFAULT` would undo that and bring back a role or database
+/// default. An unset idle timeout is sent as `DEFAULT`; nothing sets it for
+/// the session, so that is the session value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TxTimeouts {
     /// `statement_timeout`, in milliseconds.
@@ -176,15 +181,13 @@ impl TxTimeouts {
     /// The batch always has both statements, in this order. The capsule
     /// recorder matches that exact form (`capsule::wire`).
     pub(crate) fn set_local_sql(self) -> Option<String> {
-        fn value(ms: Option<u64>) -> String {
-            ms.map_or_else(|| "DEFAULT".to_owned(), |ms| ms.to_string())
-        }
         (self.statement_ms.is_some() || self.idle_in_transaction_ms.is_some()).then(|| {
             format!(
                 "SET LOCAL statement_timeout = {}; \
                  SET LOCAL idle_in_transaction_session_timeout = {}",
-                value(self.statement_ms),
-                value(self.idle_in_transaction_ms)
+                self.statement_ms.unwrap_or(0),
+                self.idle_in_transaction_ms
+                    .map_or_else(|| "DEFAULT".to_owned(), |ms| ms.to_string())
             )
         })
     }
@@ -4226,6 +4229,29 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 
 #[cfg(test)]
 mod tests {
+    /// An unset statement timeout keeps the session's `0` from checkout; an
+    /// unset idle timeout keeps the session value through `DEFAULT`.
+    #[test]
+    fn tx_timeouts_send_zero_for_an_unset_statement_timeout() {
+        use std::time::Duration;
+        let sql = |statement, idle| super::TxTimeouts::new(statement, idle).set_local_sql();
+        assert_eq!(sql(None, None), None);
+        assert_eq!(
+            sql(None, Some(Duration::from_secs(60))).as_deref(),
+            Some(
+                "SET LOCAL statement_timeout = 0; \
+                 SET LOCAL idle_in_transaction_session_timeout = 60000"
+            )
+        );
+        assert_eq!(
+            sql(Some(Duration::from_secs(30)), None).as_deref(),
+            Some(
+                "SET LOCAL statement_timeout = 30000; \
+                 SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
+            )
+        );
+    }
+
     #[test]
     fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
         // Continuous replication (#1628) needs the replicator to be the only

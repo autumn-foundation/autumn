@@ -1864,8 +1864,13 @@ fn run_diesel_with_policy(
     transactional: bool,
     english: bool,
 ) -> Result<(), MigrationError> {
-    let inherited = std::env::var("PGOPTIONS")
-        .ok()
+    // libpq reads `PGOPTIONS` only when the URL has no `options` parameter.
+    // So a URL `options` value is the operator's base. It moves into
+    // `PGOPTIONS`, where the framework options can be added to it.
+    let (database_url, url_options) = split_url_options(database_url);
+    let database_url = database_url.as_str();
+    let inherited = url_options
+        .or_else(|| std::env::var("PGOPTIONS").ok())
         .filter(|options| !options.trim().is_empty());
     let mut pgoptions = child_pgoptions(
         inherited.as_deref(),
@@ -1898,6 +1903,36 @@ fn run_diesel_with_policy(
             other => other,
         },
     )
+}
+
+/// `url` without its `options` query parameter, and that parameter's decoded
+/// value. When it appears more than once, the last value wins, as in libpq.
+/// An empty value is still returned: libpq then ignores `PGOPTIONS` too.
+/// A URL with no `options` parameter (or a key/value conninfo string) comes
+/// back unchanged, with `None`.
+fn split_url_options(url: &str) -> (String, Option<String>) {
+    let Some((base, query)) = url.split_once('?') else {
+        return (url.to_owned(), None);
+    };
+    let mut options = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        match pair.strip_prefix("options=") {
+            Some(value) => {
+                options = Some(
+                    percent_encoding::percent_decode_str(value)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                );
+            }
+            None => kept.push(pair),
+        }
+    }
+    if kept.is_empty() {
+        (base.to_owned(), options)
+    } else {
+        (format!("{base}?{}", kept.join("&")), options)
+    }
 }
 
 /// The inherited `PGOPTIONS` a pooler fallback may use. A non-transactional
@@ -4942,6 +4977,57 @@ primary_url = "postgres://prod-s0:5432/app"
         );
         assert_eq!(strip_lock_timeout(Some("-c lock_timeout=5000")), None);
         assert_eq!(strip_lock_timeout(None), None);
+    }
+
+    #[test]
+    fn split_url_options_moves_the_url_options_out_of_the_url() {
+        assert_eq!(
+            split_url_options(
+                "postgres://u:p@db:5432/app?sslmode=require&options=-c%20search_path%3Dtenant"
+            ),
+            (
+                "postgres://u:p@db:5432/app?sslmode=require".to_owned(),
+                Some("-c search_path=tenant".to_owned())
+            )
+        );
+        assert_eq!(
+            split_url_options("postgres://db/app?options=-c%20a%3D1&options=-c%20b%3D2"),
+            ("postgres://db/app".to_owned(), Some("-c b=2".to_owned())),
+            "the last value wins, as in libpq"
+        );
+        assert_eq!(
+            split_url_options("postgres://db/app?options="),
+            ("postgres://db/app".to_owned(), Some(String::new())),
+            "an empty value still hides PGOPTIONS from libpq"
+        );
+        assert_eq!(
+            split_url_options("postgres://db/app?sslmode=require"),
+            ("postgres://db/app?sslmode=require".to_owned(), None)
+        );
+        assert_eq!(
+            split_url_options("host=db dbname=app"),
+            ("host=db dbname=app".to_owned(), None)
+        );
+    }
+
+    /// libpq ignores `PGOPTIONS` when the URL has `options`, so the URL value
+    /// is the base the framework options join.
+    #[test]
+    fn url_options_keep_the_framework_lock_timeout() {
+        let five = std::time::Duration::from_secs(5);
+        let (_, url_options) = split_url_options(
+            "postgres://db/app?options=-c%20search_path%3Dtenant%20-c%20lock_timeout%3D100",
+        );
+        assert_eq!(
+            child_pgoptions(url_options.as_deref(), five, false, true).as_deref(),
+            Some("-c search_path=tenant -c lock_timeout=100 -c lock_timeout=5000 -c lc_messages=C"),
+            "a later -c wins, so the policy timeout applies"
+        );
+        assert_eq!(
+            child_pgoptions(url_options.as_deref(), five, true, false).as_deref(),
+            Some("-c search_path=tenant -c lock_timeout=0"),
+            "a non-transactional run drops the URL's lock_timeout"
+        );
     }
 
     #[test]

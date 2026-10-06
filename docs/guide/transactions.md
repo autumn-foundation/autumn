@@ -177,9 +177,10 @@ a request. A savepoint keeps the outer values. A transaction pooler
 (`PgBouncer` in transaction mode) keeps a `SET LOCAL`, but drops a session
 `SET`. The `prod` profile sets `30s` and `60s` (#3057). A route's
 `StatementTimeout` extension replaces the statement value for the
-transactions of that request. A value that is not set is sent as `DEFAULT`, so
-a role or database default stays in effect. When neither value is set, no
-extra statement is sent.
+transactions of that request. An unset statement timeout is sent as `0`, the
+same value `Db` and repositories set for the session when none is configured.
+An unset idle timeout is sent as `DEFAULT`, so a role or database default
+stays in effect. When neither value is set, no extra statement is sent.
 
 ## Nesting policy
 
