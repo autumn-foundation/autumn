@@ -491,8 +491,14 @@ image = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 # `umask` (via the safe `nix` wrapper) for binding `server.unix_socket` with
 # owner-only permissions from creation, closing the bind→chmod race on
-# user-configured socket paths in shared directories.
-nix = { version = "0.31.2", features = ["fs"] }
+# user-configured socket paths in shared directories. `time` gives the safe
+# thread CPU clock that `cost` reads for each request poll (issue #1720).
+nix = { version = "0.31.2", features = ["fs", "time"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# `getrusage` for the process CPU time that `tests/cost_reconcile.rs` checks
+# the per-tenant cost against (issue #1720).
+nix = { version = "0.31.2", features = ["resource", "time"] }
 
 [dev-dependencies]
 # Counting global allocator behind a safe API, used by the isolated
@@ -701,6 +707,13 @@ path = "tests/integration_tests.rs"
 [[test]]
 name = "config_alloc_gate"
 path = "tests/config_alloc_gate.rs"
+
+# Per-tenant cost reconciles with process CPU (issue #1720). Own binary: it
+# reads process-wide CPU time, and it installs the `allocation-counter`
+# global allocator for its allocation probe.
+[[test]]
+name = "cost_reconcile"
+path = "tests/cost_reconcile.rs"
 
 # Allocation gate for `auth::validate_password` on a realistic signup-form
 # workload (Bolt follow-up to #2198/#2205/#2214/#2232, looking at the password

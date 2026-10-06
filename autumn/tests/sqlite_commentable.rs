@@ -18,6 +18,9 @@
 //! It also proves that a copy of a registered spec finds the repository of
 //! its model (issue #2286).
 //!
+//! It also proves #2284 on `SQLite`: each repository of a model applies its own
+//! soft-delete rule to the parent.
+//!
 //! Only meaningful under `--features sqlite` (same convention as
 //! `sqlite_dependent_destroy.rs`): `cargo test -p autumn-web --features
 //! sqlite --test sqlite_commentable`.
@@ -58,9 +61,18 @@ mod schema {
             deleted_at -> Nullable<Timestamp>,
         }
     }
+
+    autumn_web::reexports::diesel::table! {
+        sqc_duals (id) {
+            id -> Int8,
+            title -> Text,
+            comment_count -> Int8,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
 }
 
-use schema::{sqc_audits, sqc_hards, sqc_users};
+use schema::{sqc_audits, sqc_duals, sqc_hards, sqc_users};
 
 #[autumn_web::model(table = "sqc_users")]
 pub struct SqcUser {
@@ -167,6 +179,24 @@ mod twins {
     pub trait SqcMixedSoftRepository {}
 }
 
+/// #2284: one model, two repositories. Only the first soft-deletes.
+#[autumn_web::model(table = "sqc_duals")]
+#[commentable(by = SqcUser, table = sqc_comments)]
+pub struct SqcDual {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(SqcDual, table = "sqc_duals", soft_delete)]
+pub trait SqcDualRepository {}
+
+#[autumn_web::repository(SqcDual, table = "sqc_duals")]
+pub trait SqcDualAdminRepository {}
+
 #[derive(QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = BigInt)]
@@ -247,6 +277,22 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
              deleted_at TIMESTAMP\
          )",
+        "CREATE TABLE sqc_duals (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             title TEXT NOT NULL, \
+             comment_count BIGINT NOT NULL DEFAULT 0, \
+             deleted_at TIMESTAMP\
+         )",
+        "CREATE TABLE sqc_comments (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             commentable_type TEXT NOT NULL, \
+             commentable_id BIGINT NOT NULL, \
+             parent_id BIGINT REFERENCES sqc_comments(id) ON DELETE CASCADE, \
+             author_id BIGINT NOT NULL REFERENCES sqc_users(id), \
+             body TEXT NOT NULL, \
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             deleted_at TIMESTAMP\
+         )",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut *conn)
@@ -303,6 +349,32 @@ async fn seed_audited(pool: &SqlitePool) -> i64 {
     count(
         pool,
         "SELECT id AS n FROM sqc_audits ORDER BY id DESC LIMIT 1",
+    )
+    .await
+}
+
+/// Insert one `sqc_duals` row that is already soft-deleted.
+async fn seed_soft_deleted_dual(pool: &SqlitePool) -> i64 {
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO sqc_duals (title, deleted_at) VALUES ('gone', CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("seed a soft-deleted parent");
+    }
+    count(
+        pool,
+        "SELECT id AS n FROM sqc_duals ORDER BY id DESC LIMIT 1",
+    )
+    .await
+}
+
+async fn dual_counter(pool: &SqlitePool, id: i64) -> i64 {
+    count(
+        pool,
+        &format!("SELECT comment_count AS n FROM sqc_duals WHERE id = {id}"),
     )
     .await
 }
@@ -495,21 +567,23 @@ async fn a_copied_spec_keeps_the_repository_soft_delete_rule_on_sqlite() {
     let kind = SqcAudit::COMMENTABLE_TYPE;
     let mut conn = pool.get().await.expect("conn");
 
-    let comment = add_comment(&mut conn, &spec, kind, target, author, "hi", None, None)
-        .await
-        .expect("add_comment: an audit deleted_at must not hide the parent");
-    let thread = comment_thread(&mut conn, &spec, kind, target, None)
+    let comment = add_comment(
+        &mut conn, &spec, kind, target, author, "hi", None, None, None,
+    )
+    .await
+    .expect("add_comment: an audit deleted_at must not hide the parent");
+    let thread = comment_thread(&mut conn, &spec, kind, target, None, None)
         .await
         .expect("comment_thread");
     assert_eq!(thread.len(), 1);
     assert_eq!(
-        recompute_comment_count(&mut conn, &spec, kind, target, None)
+        recompute_comment_count(&mut conn, &spec, kind, target, None, None)
             .await
             .expect("recompute_comment_count"),
         1
     );
     assert_eq!(
-        delete_comment(&mut conn, &spec, kind, target, comment.id, None)
+        delete_comment(&mut conn, &spec, kind, target, comment.id, None, None)
             .await
             .expect("delete_comment"),
         1
@@ -531,14 +605,77 @@ async fn a_copy_of_a_shared_spec_uses_the_facts_of_every_model_on_sqlite() {
 
     let plain = *SqcTwinA::commentable_spec();
     let kind = SqcTwinA::COMMENTABLE_TYPE;
-    add_comment(&mut conn, &plain, kind, target, author, "hi", None, None)
-        .await
-        .expect("no repository soft-deletes, so the row is live");
+    add_comment(
+        &mut conn, &plain, kind, target, author, "hi", None, None, None,
+    )
+    .await
+    .expect("no repository soft-deletes, so the row is live");
 
     let mixed = *SqcMixedPlain::commentable_spec();
     let kind = SqcMixedPlain::COMMENTABLE_TYPE;
-    let err = add_comment(&mut conn, &mixed, kind, target, author, "hi", None, None)
-        .await
-        .expect_err("one repository soft-deletes, so the row is hidden");
+    let err = add_comment(
+        &mut conn, &mixed, kind, target, author, "hi", None, None, None,
+    )
+    .await
+    .expect_err("one repository soft-deletes, so the row is hidden");
     assert_eq!(err.status().as_u16(), 404, "{err}");
+}
+
+/// #2284: a model with a `soft_delete` repository and a plain one. Before,
+/// every helper filtered `deleted_at` if one repository soft-deleted, so the
+/// plain repository got `404` for rows its own finders return. Now each
+/// repository applies its own rule.
+#[tokio::test]
+async fn each_repository_applies_its_own_soft_delete_rule_on_sqlite() {
+    let pool = boot_pool("sqc_commentable_dual").await;
+    let soft = PgSqcDualRepository::with_pool_untracked(pool.clone());
+    let plain = PgSqcDualAdminRepository::with_pool_untracked(pool.clone());
+    let author = seed_user(&pool, "ada").await;
+    let target = seed_soft_deleted_dual(&pool).await;
+
+    // The plain repository sees the row, so its helpers do too.
+    let comment = plain
+        .add_comment(target, author, "still here", None)
+        .await
+        .expect("the plain repository comments on its own row");
+    assert_eq!(dual_counter(&pool, target).await, 1);
+    let thread = plain
+        .comment_thread(target)
+        .await
+        .expect("the plain repository reads the thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(
+        plain
+            .recompute_comment_count(target)
+            .await
+            .expect("recompute"),
+        1
+    );
+
+    // The soft-deleting repository does not see the row: every helper is 404.
+    let hidden = "the soft-deleting repository does not see the row";
+    let errors = [
+        soft.add_comment(target, author, "x", None)
+            .await
+            .expect_err(hidden),
+        soft.comment_thread(target).await.expect_err(hidden),
+        soft.delete_comment(target, comment.id)
+            .await
+            .expect_err(hidden),
+        soft.recompute_comment_count(target)
+            .await
+            .expect_err(hidden),
+    ];
+    for err in errors {
+        assert_eq!(err.status().as_u16(), 404, "{err}");
+    }
+
+    assert_eq!(
+        plain
+            .delete_comment(target, comment.id)
+            .await
+            .expect("the plain repository deletes"),
+        1
+    );
+    assert_eq!(dual_counter(&pool, target).await, 0);
 }

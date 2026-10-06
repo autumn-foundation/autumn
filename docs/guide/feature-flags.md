@@ -28,15 +28,20 @@ that flags survive restarts and propagate across replicas:
 ```rust
 use autumn_web::feature_flags::{InMemoryFlagStore, FlagStore, pg::PgFlagStore};
 use std::sync::Arc;
+use std::time::Duration;
 
 // `from_database_config` yields `None` unless the configured primary names
 // Postgres — this store opens a `PgConnection` and notifies through
 // `pg_notify`, so it cannot serve a `sqlite://` target.
-let store: Arc<dyn FlagStore> = PgFlagStore::from_database_config(&config.database)
-    .map_or_else(
-        || Arc::new(InMemoryFlagStore::new()) as Arc<dyn FlagStore>,
-        |store| Arc::new(store) as Arc<dyn FlagStore>,
-    );
+let store: Arc<dyn FlagStore> = match PgFlagStore::from_database_config(&config.database) {
+    Some(store) => {
+        let store = Arc::new(store);
+        // Refresh all flags now and then each second, off the request path.
+        PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
+        store
+    }
+    None => Arc::new(InMemoryFlagStore::new()),
+};
 
 autumn_web::app()
     .with_flag_store(store)
@@ -114,7 +119,10 @@ For a given `(flag, actor)` pair, rules are checked in this order:
 | 3        | **Actor allowlist**    | `enabled = true` AND the actor's ID is in `actor_allowlist` → on for that actor    |
 | 4        | **Group allowlist**    | `enabled = true` AND the actor belongs to a group in `group_allowlist` → on        |
 | 5        | **Percent rollout**    | `enabled = true` AND actor's deterministic bucket < `rollout_pct` → on             |
-| 6        | **Default**            | Returns `false` (fail-closed)                                                      |
+| 6        | **Default**            | Returns `false` (fail-closed). An unknown flag gets its declared default.          |
+
+A flag that the store does not hold gets its declared default
+(`FeatureFlagService::with_default`), or `false`.
 
 > **Note:** `enabled = true` alone does **not** enable a flag for all actors — it
 > only means the kill switch is off.  To enable for everyone set `rollout_pct = 100`
@@ -134,9 +142,51 @@ feature instantly at the CLI:
 autumn flags disable dark_mode
 ```
 
-This writes to the database and broadcasts a `NOTIFY autumn_flags` message.
-All replicas listening on that channel invalidate their cache and pick up the
-new state within one cache-refresh window (default: 1 second).
+This writes to the database. Each replica reads all flags again on its next
+refresh, so the change reaches every replica in about one poll interval
+(1 second in the example above). Autumn does not `LISTEN` on a channel. The
+store also sends `NOTIFY autumn_flags` for other tools.
+
+---
+
+## Store failures
+
+`PgFlagStore` keeps all flags in memory. A flag read does not connect to the
+database on the request thread. When the snapshot is older than the TTL
+(default 1 second), the store refreshes it on Tokio's blocking pool and
+returns the current value at once. `spawn_poll_listener` refreshes on its own
+thread.
+
+When the database fails, flags do not change:
+
+1. A failed refresh keeps the last-known snapshot. The store logs a warning
+   and counts the error (`PgFlagStore::refresh_errors`).
+2. A failed read in `FeatureFlagService` uses the last-known value for that
+   flag. The service logs a warning and counts the error
+   (`FeatureFlagService::store_errors`).
+3. With no last-known value, the flag gets its declared default:
+
+```rust
+let service = FeatureFlagService::new(store)
+    // Stay on if the store cannot answer at startup.
+    .with_default("checkout_v2", true);
+
+autumn_web::app()
+    .with_flag_service(service)
+    .run()
+    .await;
+```
+
+When the app installs the flag service, it calls `FlagStore::preload` once and
+waits up to 10 seconds for it. This occurs in every mode (server, `autumn
+build`, one-off tasks, replay), before later state initializers, job workers,
+startup hooks and requests. If the load takes longer, the app continues and
+reads get declared defaults until the load ends. Outside an app, call
+`PgFlagStore::refresh` to load the flags.
+
+Each store connection has a 5 second statement timeout. The store adds a 5
+second `connect_timeout` when the URL sets none. While refreshes fail, the wait
+between attempts doubles, up to 30 seconds.
 
 ---
 
