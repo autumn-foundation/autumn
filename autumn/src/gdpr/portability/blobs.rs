@@ -83,6 +83,17 @@ pub async fn restore_blobs(
     capsule: &DataCapsule,
     store: &dyn BlobStore,
 ) -> Result<usize, DataCapsuleError> {
+    restore_and_track(capsule, store).await?;
+    Ok(capsule.manifest.blobs.len())
+}
+
+/// Restore the blobs of `capsule` and give the entries that this call wrote.
+/// [`roll_back`] removes them again, for example when the record import
+/// fails after this.
+pub(super) async fn restore_and_track<'c>(
+    capsule: &'c DataCapsule,
+    store: &dyn BlobStore,
+) -> Result<Vec<&'c BlobEntry>, DataCapsuleError> {
     let mut to_write = Vec::new();
     for entry in &capsule.manifest.blobs {
         let bytes = capsule
@@ -133,7 +144,7 @@ pub async fn restore_blobs(
             return Err(error);
         }
     }
-    Ok(capsule.manifest.blobs.len())
+    Ok(written)
 }
 
 /// Delete the blobs that this import wrote.
@@ -142,7 +153,7 @@ pub async fn restore_blobs(
 /// key only when it still holds the bytes of this import. The store has no
 /// conditional delete, so a replacement between the read and the delete is
 /// still possible, but the window is short.
-async fn roll_back(store: &dyn BlobStore, written: &[&BlobEntry]) {
+pub(super) async fn roll_back(store: &dyn BlobStore, written: &[&BlobEntry]) {
     for entry in written {
         let ours = store
             .get(&entry.key)

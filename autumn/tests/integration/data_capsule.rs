@@ -1141,6 +1141,42 @@ mod blobs {
     }
 
     #[tokio::test]
+    async fn a_failed_record_import_removes_the_blobs_it_wrote() {
+        use std::sync::Arc;
+
+        use autumn_web::gdpr::portability::CapsuleService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        let source = CapsuleService::new(models(), Arc::new(store()), signer())
+            .with_blob_store(Arc::new(source_blobs));
+        let root = tmp.path().join("capsule");
+        source.export_to("1", &root).await.unwrap();
+
+        // The target has the record already: the record import conflicts
+        // after the blobs are written.
+        let target_blobs = Arc::new(blob_store(&tmp.path().join("b")));
+        let target = CapsuleService::new(models(), Arc::new(store()), signer())
+            .with_blob_store(target_blobs.clone());
+        let err = target
+            .import_from(&root)
+            .await
+            .expect_err("record conflict");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+        assert!(
+            matches!(
+                target_blobs.get("avatars/ada.png").await,
+                Err(BlobStoreError::NotFound(_))
+            ),
+            "a failed import leaves no blob"
+        );
+    }
+
+    #[tokio::test]
     async fn verify_detects_a_changed_blob() {
         let tmp = tempfile::tempdir().unwrap();
         let source_blobs = blob_store(&tmp.path().join("a"));

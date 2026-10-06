@@ -247,28 +247,38 @@ impl CapsuleService {
     ///
     /// The errors of [`DataCapsule::read_dir`], `restore_blobs`, and
     /// [`import_capsule`]. [`DataCapsuleError::NotConfigured`] when the capsule
-    /// has blobs but the service has no blob store.
+    /// has blobs but the service has no blob store. When the record import
+    /// fails, the blobs that this call wrote are removed again.
     pub async fn import_from(&self, dir: &Path) -> Result<ImportSummary, DataCapsuleError> {
         let (dir, signer) = (dir.to_path_buf(), self.signer.clone());
         let capsule = blocking(move || DataCapsule::read_dir(&dir, &signer)).await?;
-        self.restore(&capsule).await?;
-        import_capsule(&capsule, &self.models, self.store.as_ref()).await
+        self.import_with_blobs(&capsule).await
     }
 
     #[cfg(feature = "storage")]
-    async fn restore(&self, capsule: &DataCapsule) -> Result<(), DataCapsuleError> {
-        match &self.blobs {
-            Some(blobs) => super::restore_blobs(capsule, blobs.as_ref())
-                .await
-                .map(drop),
-            None => no_blob_store(capsule),
+    async fn import_with_blobs(
+        &self,
+        capsule: &DataCapsule,
+    ) -> Result<ImportSummary, DataCapsuleError> {
+        let Some(blobs) = &self.blobs else {
+            no_blob_store(capsule)?;
+            return import_capsule(capsule, &self.models, self.store.as_ref()).await;
+        };
+        let written = super::blobs::restore_and_track(capsule, blobs.as_ref()).await?;
+        let result = import_capsule(capsule, &self.models, self.store.as_ref()).await;
+        if result.is_err() {
+            super::blobs::roll_back(blobs.as_ref(), &written).await;
         }
+        result
     }
 
     #[cfg(not(feature = "storage"))]
-    #[allow(clippy::unused_async)]
-    async fn restore(&self, capsule: &DataCapsule) -> Result<(), DataCapsuleError> {
-        no_blob_store(capsule)
+    async fn import_with_blobs(
+        &self,
+        capsule: &DataCapsule,
+    ) -> Result<ImportSummary, DataCapsuleError> {
+        no_blob_store(capsule)?;
+        import_capsule(capsule, &self.models, self.store.as_ref()).await
     }
 }
 

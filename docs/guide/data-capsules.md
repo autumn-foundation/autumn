@@ -191,7 +191,8 @@ capsule directory and to each directory above it.
   value from a sequence and insert its row later. If the capsule holds that
   key, the import succeeds and the other insert fails with a duplicate key.
   No lock can prevent this, so run import in a maintenance window.
-- Import writes blobs before records. If a blob key holds different bytes or a
+- Import writes blobs before records. If the record import fails, import
+  removes the blobs that it wrote. If a blob key holds different bytes or a
   different MIME type, import stops and writes no blob. If another writer
   takes a key during the import, import stops and deletes the blobs that it
   wrote. Import needs a blob store with a conditional create
