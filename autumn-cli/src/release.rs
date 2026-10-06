@@ -3299,6 +3299,7 @@ fi
   [ -n "$STUB_INGRESS_NONE" ] && ingress=null
   # Terraform can make a new, plain ingress after such a stop.
   [ -n "$STUB_INGRESS_PLAIN" ] && ingress='{"external":false,"targetPort":3000,"transport":"http"}'
+  [ "$STUB_INGRESS_PLAIN" = external ] && ingress='{"external":true,"targetPort":3000,"transport":"http"}'
   # The snapshot that an interrupted first cutover saved in the app's tags.
   tags='{"team":"web"}'
   # A large record of copied credentials from an interrupted run, in many
@@ -4378,6 +4379,35 @@ esac
             0,
             &[
                 ("STUB_INGRESS_NONE", "1"),
+                ("STUB_SAVED_INGRESS_TAGS", "external"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("az ingress-patch external=true"), "{calls}");
+        let open = bodies
+            .lines()
+            .find(|line| line.contains("\"external\":true"))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(open.contains("www.example.com"), "{open}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_the_tagged_ingress_over_a_plain_open_one() {
+        // A first cutover stopped after the real revision took over, before
+        // ingress came back, and terraform apply then made a plain, open
+        // ingress. The live ingress is external, but the tags still hold the
+        // full snapshot (with the custom domain): the retry sends it back
+        // before it removes the tags.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_PLAIN", "external"),
                 ("STUB_SAVED_INGRESS_TAGS", "external"),
             ],
         ) else {

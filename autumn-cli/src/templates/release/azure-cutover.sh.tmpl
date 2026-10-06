@@ -439,9 +439,12 @@ restore_ingress() {
 # Opens external ingress. On a later deploy whose live ingress is open,
 # nothing changes, so the script sends nothing. The check reads the live
 # app, not the snapshot: after an interrupted first cutover, the snapshot
-# from the tags can say external while the app has no ingress.
+# from the tags can say external while the app has no ingress. With such a
+# snapshot, the script always sends it: terraform apply can have made a
+# plain, open ingress without the custom domains, CORS or IP restrictions,
+# and the end of the run removes the tags.
 open_ingress() {
-  if [ -n "$RELEASED" ] \
+  if [ -n "$RELEASED" ] && [ "$TAGGED_INGRESS" = null ] \
     && [ "$(jq -r '.properties.configuration.ingress.external // false' <<< "$APP")" = true ]; then
     return 0
   fi
