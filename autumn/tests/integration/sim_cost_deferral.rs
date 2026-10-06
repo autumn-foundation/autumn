@@ -336,3 +336,86 @@ async fn sim_an_operator_can_cancel_a_deferred_job(mut sim: Sim) {
         "the canceled job left the queue and did not run: {snapshot:?}"
     );
 }
+
+// ── Shift accounting (slice 2) ──────────────────────────────────────
+
+static SHIFT_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+#[job(name = "sim_cost_shift_batch", deferrable)]
+async fn sim_cost_shift_batch(_state: AppState, _args: Args) -> AutumnResult<()> {
+    let mut acc = 0_u64;
+    for i in 0..50_000_u64 {
+        acc = std::hint::black_box(acc.wrapping_mul(31).wrapping_add(i));
+    }
+    std::hint::black_box(acc);
+    SHIFT_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
+#[scheduled(every = "1m", name = "sim_cost_shift_tick", deferrable)]
+async fn sim_cost_shift_tick(_state: AppState) -> AutumnResult<()> {
+    Ok(())
+}
+
+/// The success metric of issue #1720: during a synthetic high window, at
+/// least 90% of the deferrable CPU moves out of the window. The meter reads
+/// it: every deferred run is `shifted`, none ran `in_window`. Requests in the
+/// window are metered as usual.
+#[sim_test]
+async fn sim_deferral_shifts_deferrable_cpu_out_of_the_window(mut sim: Sim) {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+    SHIFT_RUNS.store(0, Ordering::SeqCst);
+
+    let mut config = config();
+    config.cost.enabled = true;
+    config.actuator.sensitive = true;
+    sim.build(
+        TestApp::new()
+            .config(config)
+            .routes(routes![ping])
+            .jobs(jobs![sim_cost_shift_batch, sim_cost_send_receipt])
+            .tasks(tasks![sim_cost_shift_tick]),
+    );
+    let signal = signal(&sim);
+
+    signal.set(THRESHOLD + 100.0);
+    for _ in 0..4 {
+        SimCostShiftBatchJob::enqueue(Args).await.expect("enqueue");
+    }
+    SimCostSendReceiptJob::enqueue(Args).await.expect("enqueue");
+    for _ in 0..10 {
+        advance_minutes(&sim, 1).await;
+        sim.client().get("/ping").send().await.assert_ok();
+    }
+    assert_eq!(SHIFT_RUNS.load(Ordering::SeqCst), 0, "no run in the window");
+
+    signal.set(THRESHOLD - 100.0);
+    sim.advance(Duration::from_secs(RECHECK_SECS)).await;
+    sim.run_to_idle().await;
+    assert_eq!(
+        SHIFT_RUNS.load(Ordering::SeqCst),
+        4,
+        "all deferred jobs run"
+    );
+
+    let body: serde_json::Value = sim.client().get("/actuator/cost").send().await.json();
+    let jobs = &body["jobs"];
+    assert_eq!(jobs["shift"]["shifted_runs"], 4, "{body}");
+    assert_eq!(jobs["shift"]["in_window_runs"], 0, "{body}");
+    let ratio = jobs["shift"]["ratio"].as_f64().expect("a ratio");
+    assert!(ratio >= 0.9, "shifted ratio {ratio} < 0.9: {body}");
+    assert_eq!(
+        jobs["total"]["runs"], 5,
+        "the urgent job is metered too: {body}"
+    );
+    assert_eq!(body["tasks"]["shift"]["in_window_runs"], 0, "{body}");
+    assert!(
+        body["tasks"]["shift"]["shifted_runs"].as_u64() >= Some(1),
+        "the waiting tick is shifted: {body}"
+    );
+    assert!(
+        body["total"]["requests"].as_u64() >= Some(10),
+        "requests in the window are served and metered: {body}"
+    );
+}

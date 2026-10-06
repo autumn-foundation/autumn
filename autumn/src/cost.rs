@@ -3,16 +3,18 @@
 //! This module has three parts:
 //!
 //! - [`CostAccountant`] records the CPU time, allocated bytes and DB-query
-//!   count of each request. It adds each request to the total of its tenant.
-//!   The [`CostLayer`](crate::middleware::CostLayer) measures the request.
+//!   count of each request, job run and scheduled tick. It adds each one to
+//!   the total of its tenant. The [`CostLayer`](crate::middleware::CostLayer)
+//!   measures a request. The job and task runtimes measure background runs.
 //! - [`CostSignal`] holds a live value (carbon g/kWh or price per unit) and a
 //!   threshold. Set it from code, or from the runtime-config key
 //!   [`COST_SIGNAL_KEY`](crate::runtime_config::COST_SIGNAL_KEY).
 //! - Deferral. Work marked `deferrable` (`#[job(deferrable)]`,
 //!   `#[scheduled(..., deferrable)]`) waits while the signal is above the
 //!   threshold. The work runs when the signal falls. The runtime never drops
-//!   the work. Request handlers do not wait. Scheduled tasks wait on all
-//!   backends. Only the `local` jobs backend makes jobs wait.
+//!   the work. Request handlers do not wait. Jobs and scheduled tasks wait
+//!   on all backends. The accountant classes each deferrable run as
+//!   `shifted` or `in_window` ([`ShiftCost`]).
 //!
 //! Set `[cost] enabled = true` to measure requests. See `docs/guide/cost.md`.
 //!
@@ -137,10 +139,131 @@ impl TenantCost {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct CostSnapshot {
-    /// The total for all tenants.
+    /// The request total for all tenants.
     pub total: TenantCost,
-    /// The total for each tenant key.
+    /// The request total for each tenant key.
     pub tenants: BTreeMap<String, TenantCost>,
+    /// Job runs, on all jobs backends.
+    pub jobs: WorkSnapshot,
+    /// Scheduled task ticks.
+    pub tasks: WorkSnapshot,
+}
+
+// ── Background work cost ────────────────────────────────────────────
+
+/// The total cost of background runs (job runs or task ticks) for one key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct WorkCost {
+    /// Number of runs. A retry is a new run.
+    pub runs: u64,
+    /// Total CPU time, in microseconds.
+    pub cpu_micros: u64,
+    /// Total allocated bytes. Zero without a probe.
+    pub allocated_bytes: u64,
+    /// Total DB queries.
+    pub db_queries: u64,
+}
+
+impl WorkCost {
+    /// Total CPU time, in seconds.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn cpu_seconds(&self) -> f64 {
+        self.cpu_micros as f64 / 1_000_000.0
+    }
+
+    const fn from_totals(cost: TenantCost) -> Self {
+        Self {
+            runs: cost.requests,
+            cpu_micros: cost.cpu_micros,
+            allocated_bytes: cost.allocated_bytes,
+            db_queries: cost.db_queries,
+        }
+    }
+}
+
+/// The class of a deferrable run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shift {
+    /// The run waited for the signal, then started while the signal was low.
+    Shifted,
+    /// The run started while the signal was high.
+    InWindow,
+}
+
+/// The cost of deferrable runs, by class.
+///
+/// A run that did not wait and started while the signal was low is in
+/// neither class: no window held it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ShiftCost {
+    /// Runs that waited, then started while the signal was low.
+    pub shifted_runs: u64,
+    /// CPU time of the shifted runs, in microseconds.
+    pub shifted_cpu_micros: u64,
+    /// Runs that started while the signal was high.
+    pub in_window_runs: u64,
+    /// CPU time of the in-window runs, in microseconds.
+    pub in_window_cpu_micros: u64,
+}
+
+impl ShiftCost {
+    /// The part of the deferrable CPU time that moved out of the window:
+    /// `shifted / (shifted + in_window)`.
+    ///
+    /// When no CPU time is measured, the run counts are used. Returns `None`
+    /// when there is no run in either class.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn ratio(&self) -> Option<f64> {
+        let ratio = |shifted: u64, in_window: u64| {
+            let all = shifted.saturating_add(in_window);
+            (all > 0).then(|| shifted as f64 / all as f64)
+        };
+        ratio(self.shifted_cpu_micros, self.in_window_cpu_micros)
+            .or_else(|| ratio(self.shifted_runs, self.in_window_runs))
+    }
+
+    const fn add(&mut self, shift: Shift, cpu_micros: u64) {
+        match shift {
+            Shift::Shifted => {
+                self.shifted_runs = self.shifted_runs.saturating_add(1);
+                self.shifted_cpu_micros = self.shifted_cpu_micros.saturating_add(cpu_micros);
+            }
+            Shift::InWindow => {
+                self.in_window_runs = self.in_window_runs.saturating_add(1);
+                self.in_window_cpu_micros = self.in_window_cpu_micros.saturating_add(cpu_micros);
+            }
+        }
+    }
+}
+
+impl Serialize for ShiftCost {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        let mut out = serializer.serialize_struct("ShiftCost", 5)?;
+        out.serialize_field("shifted_runs", &self.shifted_runs)?;
+        out.serialize_field("shifted_cpu_micros", &self.shifted_cpu_micros)?;
+        out.serialize_field("in_window_runs", &self.in_window_runs)?;
+        out.serialize_field("in_window_cpu_micros", &self.in_window_cpu_micros)?;
+        out.serialize_field("ratio", &self.ratio())?;
+        out.end()
+    }
+}
+
+/// A point-in-time copy of the background totals of one [`WorkKind`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct WorkSnapshot {
+    /// The total for all tenants.
+    pub total: WorkCost,
+    /// The total for each tenant key. Only local jobs have a tenant. Other
+    /// runs go to [`UNATTRIBUTED_TENANT`].
+    pub tenants: BTreeMap<String, WorkCost>,
+    /// The deferrable runs, by class.
+    pub shift: ShiftCost,
 }
 
 // ── Allocation probe ────────────────────────────────────────────────
@@ -186,13 +309,79 @@ struct AccountantInner {
     max_tenants: usize,
     probe: Option<Arc<dyn AllocationProbe>>,
     tenant_labels: bool,
-    totals: Mutex<Totals>,
+    totals: Mutex<Tables>,
+}
+
+#[derive(Default)]
+struct Tables {
+    requests: Totals,
+    jobs: Totals,
+    tasks: Totals,
+    job_shift: ShiftCost,
+    task_shift: ShiftCost,
 }
 
 #[derive(Default)]
 struct Totals {
     total: TenantCost,
     tenants: HashMap<String, TenantCost>,
+}
+
+impl Totals {
+    /// Add one run under the key of `tenant`.
+    fn add(
+        &mut self,
+        max_tenants: usize,
+        tenant: Option<&str>,
+        micros: u64,
+        allocated_bytes: u64,
+        db_queries: u64,
+    ) {
+        let key = match tenant {
+            None => UNATTRIBUTED_TENANT,
+            Some(id)
+                if id.len() > MAX_TENANT_KEY_BYTES
+                    || id == UNATTRIBUTED_TENANT
+                    || id == OVERFLOW_TENANT =>
+            {
+                OVERFLOW_TENANT
+            }
+            Some(id) => id,
+        };
+        self.total.add(micros, allocated_bytes, db_queries);
+        // `get_mut` first: a known tenant does not allocate a key.
+        if let Some(entry) = self.tenants.get_mut(key) {
+            entry.add(micros, allocated_bytes, db_queries);
+            return;
+        }
+        // The reserved keys do not count toward the limit, so requests with
+        // no tenant keep their own key.
+        let reserved = [UNATTRIBUTED_TENANT, OVERFLOW_TENANT]
+            .iter()
+            .filter(|reserved| self.tenants.contains_key(**reserved))
+            .count();
+        let key = if key == UNATTRIBUTED_TENANT || self.tenants.len() - reserved < max_tenants {
+            key
+        } else {
+            OVERFLOW_TENANT
+        };
+        self.tenants
+            .entry(key.to_owned())
+            .or_default()
+            .add(micros, allocated_bytes, db_queries);
+    }
+
+    fn work_snapshot(&self, shift: ShiftCost) -> WorkSnapshot {
+        WorkSnapshot {
+            total: WorkCost::from_totals(self.total),
+            tenants: self
+                .tenants
+                .iter()
+                .map(|(key, cost)| (key.clone(), WorkCost::from_totals(*cost)))
+                .collect(),
+            shift,
+        }
+    }
 }
 
 impl std::fmt::Debug for CostAccountant {
@@ -254,7 +443,7 @@ impl CostAccountant {
                 max_tenants,
                 probe,
                 tenant_labels,
-                totals: Mutex::new(Totals::default()),
+                totals: Mutex::new(Tables::default()),
             }),
         }
     }
@@ -284,65 +473,69 @@ impl CostAccountant {
         tenant: Option<&str>,
     ) {
         let micros = u64::try_from(cpu.as_micros()).unwrap_or(u64::MAX);
-        let key = match tenant {
-            None => UNATTRIBUTED_TENANT,
-            Some(id)
-                if id.len() > MAX_TENANT_KEY_BYTES
-                    || id == UNATTRIBUTED_TENANT
-                    || id == OVERFLOW_TENANT =>
-            {
-                OVERFLOW_TENANT
-            }
-            Some(id) => id,
+        self.lock().requests.add(
+            self.inner.max_tenants,
+            tenant,
+            micros,
+            allocated_bytes,
+            db_queries,
+        );
+    }
+
+    /// Add one background run (a job run or a task tick) to the totals.
+    /// `shift` is the class of a deferrable run.
+    pub(crate) fn record_work(
+        &self,
+        kind: WorkKind,
+        cpu: Duration,
+        allocated_bytes: u64,
+        db_queries: u64,
+        tenant: Option<&str>,
+        shift: Option<Shift>,
+    ) {
+        let micros = u64::try_from(cpu.as_micros()).unwrap_or(u64::MAX);
+        let mut tables = self.lock();
+        let tables = &mut *tables;
+        let (totals, shifts) = match kind {
+            WorkKind::Job => (&mut tables.jobs, &mut tables.job_shift),
+            WorkKind::Task => (&mut tables.tasks, &mut tables.task_shift),
         };
-        let mut totals = self.lock();
-        totals.total.add(micros, allocated_bytes, db_queries);
-        // `get_mut` first: a known tenant does not allocate a key.
-        if let Some(entry) = totals.tenants.get_mut(key) {
-            entry.add(micros, allocated_bytes, db_queries);
-            return;
+        totals.add(
+            self.inner.max_tenants,
+            tenant,
+            micros,
+            allocated_bytes,
+            db_queries,
+        );
+        if let Some(shift) = shift {
+            shifts.add(shift, micros);
         }
-        // The reserved keys do not count toward the limit, so requests with
-        // no tenant keep their own key.
-        let reserved = [UNATTRIBUTED_TENANT, OVERFLOW_TENANT]
-            .iter()
-            .filter(|reserved| totals.tenants.contains_key(**reserved))
-            .count();
-        let key = if key == UNATTRIBUTED_TENANT
-            || totals.tenants.len() - reserved < self.inner.max_tenants
-        {
-            key
-        } else {
-            OVERFLOW_TENANT
-        };
-        totals
-            .tenants
-            .entry(key.to_owned())
-            .or_default()
-            .add(micros, allocated_bytes, db_queries);
     }
 
     /// Copy the current totals.
     #[must_use]
     pub fn snapshot(&self) -> CostSnapshot {
-        let totals = self.lock();
+        let tables = self.lock();
         CostSnapshot {
-            total: totals.total,
-            tenants: totals
+            total: tables.requests.total,
+            tenants: tables
+                .requests
                 .tenants
                 .iter()
                 .map(|(key, cost)| (key.clone(), *cost))
                 .collect(),
+            jobs: tables.jobs.work_snapshot(tables.job_shift),
+            tasks: tables.tasks.work_snapshot(tables.task_shift),
         }
     }
 
-    /// The total for one tenant key, if it has a request.
+    /// The request total for one tenant key, if it has a request.
     #[must_use]
     pub fn tenant(&self, tenant: &str) -> Option<TenantCost> {
-        self.lock().tenants.get(tenant).copied()
+        self.lock().requests.tenants.get(tenant).copied()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Totals> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Tables> {
         self.inner
             .totals
             .lock()
@@ -371,7 +564,7 @@ impl MetricsSource for PublicCostMetrics {
 }
 
 impl CostAccountant {
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn metric_families(&self, tenant_labels: bool) -> Vec<MetricFamily> {
         let snapshot = self.snapshot();
         let family = |name: &str, help: &str, value: fn(&TenantCost) -> f64| MetricFamily {
@@ -413,7 +606,129 @@ impl CostAccountant {
                 "DB queries that requests ran.",
                 |c| c.db_queries as f64,
             ),
+            work_family(
+                &snapshot,
+                tenant_labels,
+                "autumn_cost_work_runs_total",
+                "Measured job runs and task ticks.",
+                |c| c.runs as f64,
+            ),
+            work_family(
+                &snapshot,
+                tenant_labels,
+                "autumn_cost_work_cpu_seconds_total",
+                "CPU seconds that job runs and task ticks used.",
+                WorkCost::cpu_seconds,
+            ),
+            work_family(
+                &snapshot,
+                tenant_labels,
+                "autumn_cost_work_allocated_bytes_total",
+                "Bytes that job runs and task ticks allocated. Zero without a probe.",
+                |c| c.allocated_bytes as f64,
+            ),
+            work_family(
+                &snapshot,
+                tenant_labels,
+                "autumn_cost_work_db_queries_total",
+                "DB queries that job runs and task ticks ran.",
+                |c| c.db_queries as f64,
+            ),
+            shift_family(
+                &snapshot,
+                "autumn_cost_deferrable_runs_total",
+                "Deferrable runs, by window class.",
+                |runs, _cpu| runs as f64,
+            ),
+            shift_family(
+                &snapshot,
+                "autumn_cost_deferrable_cpu_seconds_total",
+                "CPU seconds of deferrable runs, by window class.",
+                |_runs, cpu| cpu as f64 / 1_000_000.0,
+            ),
         ]
+    }
+}
+
+/// The metric label value of a background kind.
+const fn kind_label(kind: WorkKind) -> &'static str {
+    match kind {
+        WorkKind::Job => "job",
+        WorkKind::Task => "task",
+    }
+}
+
+/// One counter family over job runs and task ticks, with a `kind` label, and
+/// a `tenant` label when `tenant_labels` is `true`.
+fn work_family(
+    snapshot: &CostSnapshot,
+    tenant_labels: bool,
+    name: &str,
+    help: &str,
+    value: fn(&WorkCost) -> f64,
+) -> MetricFamily {
+    let mut samples = Vec::new();
+    for (kind, work) in [
+        (WorkKind::Job, &snapshot.jobs),
+        (WorkKind::Task, &snapshot.tasks),
+    ] {
+        let kind = ("kind".to_owned(), kind_label(kind).to_owned());
+        if tenant_labels {
+            samples.extend(work.tenants.iter().map(|(tenant, cost)| MetricSample {
+                labels: vec![kind.clone(), ("tenant".to_owned(), tenant.clone())],
+                value: value(cost),
+            }));
+        } else {
+            samples.push(MetricSample {
+                labels: vec![kind],
+                value: value(&work.total),
+            });
+        }
+    }
+    MetricFamily {
+        name: name.to_owned(),
+        help: help.to_owned(),
+        kind: MetricKind::Counter,
+        samples,
+    }
+}
+
+/// One counter family over the deferrable runs, with `kind` and `window`
+/// labels. `value` gets the runs and the CPU microseconds of one class.
+fn shift_family(
+    snapshot: &CostSnapshot,
+    name: &str,
+    help: &str,
+    value: fn(u64, u64) -> f64,
+) -> MetricFamily {
+    let mut samples = Vec::new();
+    for (kind, work) in [
+        (WorkKind::Job, &snapshot.jobs),
+        (WorkKind::Task, &snapshot.tasks),
+    ] {
+        let shift = work.shift;
+        for (window, runs, cpu) in [
+            ("shifted", shift.shifted_runs, shift.shifted_cpu_micros),
+            (
+                "in_window",
+                shift.in_window_runs,
+                shift.in_window_cpu_micros,
+            ),
+        ] {
+            samples.push(MetricSample {
+                labels: vec![
+                    ("kind".to_owned(), kind_label(kind).to_owned()),
+                    ("window".to_owned(), window.to_owned()),
+                ],
+                value: value(runs, cpu),
+            });
+        }
+    }
+    MetricFamily {
+        name: name.to_owned(),
+        help: help.to_owned(),
+        kind: MetricKind::Counter,
+        samples,
     }
 }
 
@@ -596,7 +911,9 @@ impl CostSignal {
         Duration::from_millis(self.inner.recheck_ms.load(Ordering::Relaxed))
     }
 
-    fn set_recheck(&self, every: Duration) {
+    /// Set the time between two checks while work waits. The framework sets
+    /// it from `[cost] defer_recheck_secs`. The minimum is one second.
+    pub fn set_recheck(&self, every: Duration) {
         let ms = u64::try_from(every.as_millis())
             .unwrap_or(u64::MAX)
             .max(MIN_RECHECK_MS);
@@ -796,17 +1113,21 @@ pub(crate) fn deferral_signal(
 ///
 /// The scheduler calls this after it takes the tick lease, or before it with
 /// a lease that expires. `waiting` is set to `true` when the wait starts. The
-/// caller clears it when the tick no longer needs the reservation.
+/// caller clears it when the tick no longer needs the reservation. `waited`
+/// is set to `true` when the wait starts, and stays `true`: the cost meter
+/// reads it.
 pub(crate) async fn wait_while_deferred(
     state: &crate::AppState,
     kind: WorkKind,
     name: &str,
     shutdown: &tokio_util::sync::CancellationToken,
     waiting: Option<&AtomicBool>,
+    waited: &AtomicBool,
 ) -> bool {
     let Some(signal) = deferral_signal(state, kind, name) else {
         return true;
     };
+    waited.store(true, Ordering::Release);
     signal.note_deferral();
     tracing::info!(
         task = name,
@@ -835,6 +1156,188 @@ pub(crate) async fn wait_while_deferred(
 /// Note one deferral on the app signal.
 pub(crate) fn note_deferral(signal: &CostSignal) {
     signal.note_deferral();
+}
+
+/// The time between two signal checks of the app signal, in milliseconds.
+pub(crate) fn recheck_ms(state: &crate::AppState) -> u64 {
+    state
+        .extension::<CostSignal>()
+        .map_or(DEFAULT_RECHECK_MS, |signal| {
+            u64::try_from(signal.recheck().as_millis()).unwrap_or(DEFAULT_RECHECK_MS)
+        })
+}
+
+/// The names in `names` that are deferrable jobs, while the app signal is
+/// high. Otherwise empty. The durable job backends do not claim these jobs.
+pub(crate) fn deferred_job_names<'a>(
+    state: &crate::AppState,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    if !state
+        .extension::<CostSignal>()
+        .is_some_and(|signal| signal.is_high())
+    {
+        return Vec::new();
+    }
+    names
+        .into_iter()
+        .filter(|name| is_deferrable(WorkKind::Job, name))
+        .map(str::to_owned)
+        .collect()
+}
+
+// ── Background lane ─────────────────────────────────────────────────
+
+/// What the runtime knows about one background run before it starts.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkRun {
+    /// The tenant that caused the run. Used only for cost: the handler does
+    /// not run in this tenant's scope.
+    pub(crate) tenant: Option<String>,
+    /// `true` when the run waited for the cost signal first.
+    pub(crate) waited: bool,
+}
+
+/// The tenant of the current request, to attribute the cost of a job that
+/// the request enqueues.
+pub(crate) fn enqueuing_tenant() -> Option<String> {
+    crate::tenancy::CURRENT_TENANT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
+/// The class of a run when it starts. `None` for a run that is not
+/// deferrable, or that no window held.
+pub(crate) fn shift_class(
+    signal: Option<&CostSignal>,
+    deferrable: bool,
+    waited: bool,
+) -> Option<Shift> {
+    if !deferrable {
+        return None;
+    }
+    if signal.is_some_and(CostSignal::is_high) {
+        Some(Shift::InWindow)
+    } else if waited {
+        Some(Shift::Shifted)
+    } else {
+        None
+    }
+}
+
+/// Meter `fut` as one background run of `name`, when the app has a
+/// [`CostAccountant`]. The cost is recorded when the run completes, or when
+/// it stops early (a lease timeout, a shutdown).
+pub(crate) fn meter_work<F: std::future::Future>(
+    state: &crate::AppState,
+    kind: WorkKind,
+    name: &str,
+    run: WorkRun,
+    fut: F,
+) -> MeteredWork<F> {
+    let Some(accountant) = state.extension::<CostAccountant>() else {
+        return MeteredWork::Plain { fut };
+    };
+    let signal = state.extension::<CostSignal>();
+    let shift = shift_class(signal.as_deref(), is_deferrable(kind, name), run.waited);
+    let cell = Arc::new(RequestCostCell::default());
+    MeteredWork::Metered {
+        fut: scope_request(Arc::clone(&cell), fut),
+        meter: WorkMeter {
+            probe: accountant.allocation_probe().cloned(),
+            accountant: (*accountant).clone(),
+            cell,
+            cpu: Duration::ZERO,
+            allocated: 0,
+            kind,
+            tenant: run.tenant,
+            shift,
+        },
+    }
+}
+
+/// The running cost of one background run. It records itself when dropped.
+pub(crate) struct WorkMeter {
+    accountant: CostAccountant,
+    probe: Option<Arc<dyn AllocationProbe>>,
+    cell: Arc<RequestCostCell>,
+    cpu: Duration,
+    allocated: u64,
+    kind: WorkKind,
+    tenant: Option<String>,
+    shift: Option<Shift>,
+}
+
+impl Drop for WorkMeter {
+    fn drop(&mut self) {
+        self.accountant.record_work(
+            self.kind,
+            self.cpu,
+            self.allocated,
+            self.cell.db_queries(),
+            self.tenant.as_deref(),
+            self.shift,
+        );
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future made by [`meter_work`].
+    #[project = MeteredWorkProj]
+    pub(crate) enum MeteredWork<F> {
+        /// No accountant: the run is not metered.
+        Plain { #[pin] fut: F },
+        /// The run is metered, and its DB queries count.
+        Metered { #[pin] fut: ScopedRequest<F>, meter: WorkMeter },
+    }
+}
+
+impl<F: std::future::Future> std::future::Future for MeteredWork<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        match self.project() {
+            MeteredWorkProj::Plain { fut } => fut.poll(cx),
+            MeteredWorkProj::Metered { mut fut, meter } => {
+                let mut out = std::task::Poll::Pending;
+                measure_poll(
+                    meter.probe.as_deref(),
+                    &mut meter.cpu,
+                    &mut meter.allocated,
+                    || out = fut.as_mut().poll(cx),
+                );
+                out
+            }
+        }
+    }
+}
+
+/// Run `f` one time and add its CPU time and allocated bytes to the totals.
+pub(crate) fn measure_poll(
+    probe: Option<&dyn AllocationProbe>,
+    cpu: &mut Duration,
+    allocated: &mut u64,
+    f: impl FnOnce(),
+) {
+    let mut f = Some(f);
+    let mark = cpu_mark();
+    if let Some(probe) = probe {
+        let bytes = probe.measure(&mut || {
+            if let Some(f) = f.take() {
+                f();
+            }
+        });
+        *allocated = allocated.saturating_add(bytes);
+    }
+    // No probe, or a probe that did not call `poll`: run it here.
+    if let Some(f) = f.take() {
+        f();
+    }
+    *cpu = cpu.saturating_add(cpu_since(mark));
 }
 
 // ── Install ─────────────────────────────────────────────────────────
@@ -1023,6 +1526,16 @@ mod tests {
         accountant.record(&cost(1_000_000, 0, 1).with_tenant("globex"));
 
         for family in accountant.collect() {
+            assert!(
+                family
+                    .samples
+                    .iter()
+                    .all(|s| !s.labels.iter().any(|(key, _)| key == "tenant")),
+                "{}",
+                family.name
+            );
+        }
+        for family in &accountant.collect()[..4] {
             assert_eq!(family.samples.len(), 1, "{}", family.name);
             assert!(family.samples[0].labels.is_empty(), "{}", family.name);
         }
@@ -1080,7 +1593,7 @@ mod tests {
         let families = accountant.collect();
         let names: Vec<&str> = families.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
-            names,
+            names[..4],
             [
                 "autumn_cost_requests_total",
                 "autumn_cost_cpu_seconds_total",
@@ -1185,5 +1698,321 @@ mod tests {
         assert!(is_deferrable(WorkKind::Job, "cost_unit_test_job"));
         assert!(!is_deferrable(WorkKind::Task, "cost_unit_test_job"));
         assert!(!is_deferrable(WorkKind::Job, "cost_unit_test_other"));
+    }
+
+    // ── Background work (slice 2) ───────────────────────────────────
+
+    fn us(micros: u64) -> Duration {
+        Duration::from_micros(micros)
+    }
+
+    /// Job runs and task ticks have their own totals. They do not change the
+    /// request totals.
+    #[test]
+    fn background_work_has_its_own_totals() {
+        let accountant = CostAccountant::new(10);
+        accountant.record_work(WorkKind::Job, us(300), 64, 2, Some("acme"), None);
+        accountant.record_work(WorkKind::Job, us(100), 0, 1, None, None);
+        accountant.record_work(WorkKind::Task, us(50), 0, 0, None, None);
+
+        let snapshot = accountant.snapshot();
+        assert_eq!(snapshot.total.requests, 0, "jobs are not requests");
+        assert!(snapshot.tenants.is_empty());
+
+        let acme = snapshot.jobs.tenants["acme"];
+        assert_eq!(
+            (
+                acme.runs,
+                acme.cpu_micros,
+                acme.allocated_bytes,
+                acme.db_queries
+            ),
+            (1, 300, 64, 2)
+        );
+        assert_eq!(snapshot.jobs.tenants[UNATTRIBUTED_TENANT].runs, 1);
+        assert_eq!(snapshot.jobs.total.runs, 2);
+        assert_eq!(snapshot.jobs.total.cpu_micros, 400);
+        assert_eq!(snapshot.tasks.total.runs, 1);
+        assert_eq!(snapshot.tasks.tenants[UNATTRIBUTED_TENANT].cpu_micros, 50);
+    }
+
+    /// Background tenant keys follow the request rules: limit, reserved ids
+    /// and long ids go to `_other`.
+    #[test]
+    fn background_tenants_past_the_limit_go_to_overflow() {
+        let accountant = CostAccountant::new(1);
+        let long = "x".repeat(MAX_TENANT_KEY_BYTES + 1);
+        for tenant in ["a", "b", long.as_str(), OVERFLOW_TENANT] {
+            accountant.record_work(WorkKind::Job, us(1), 0, 0, Some(tenant), None);
+        }
+        let jobs = accountant.snapshot().jobs;
+        assert_eq!(jobs.tenants["a"].runs, 1);
+        assert_eq!(jobs.tenants[OVERFLOW_TENANT].runs, 3);
+        assert_eq!(jobs.tenants.len(), 2, "{:?}", jobs.tenants.keys());
+    }
+
+    /// A deferrable run is `shifted` (it waited, then ran while the signal
+    /// was low) or `in_window` (it ran while the signal was high).
+    #[test]
+    fn shift_totals_and_ratio() {
+        let accountant = CostAccountant::new(10);
+        assert_eq!(accountant.snapshot().jobs.shift.ratio(), None, "no runs");
+
+        accountant.record_work(WorkKind::Job, us(900), 0, 0, None, Some(Shift::Shifted));
+        accountant.record_work(WorkKind::Job, us(100), 0, 0, None, Some(Shift::InWindow));
+        accountant.record_work(WorkKind::Job, us(5_000), 0, 0, None, None);
+        accountant.record_work(WorkKind::Task, us(10), 0, 0, None, Some(Shift::Shifted));
+
+        let snapshot = accountant.snapshot();
+        let shift = snapshot.jobs.shift;
+        assert_eq!((shift.shifted_runs, shift.shifted_cpu_micros), (1, 900));
+        assert_eq!((shift.in_window_runs, shift.in_window_cpu_micros), (1, 100));
+        let ratio = shift.ratio().expect("ratio");
+        assert!((ratio - 0.9).abs() < 1e-9, "{ratio}");
+        assert_eq!(snapshot.tasks.shift.ratio(), Some(1.0));
+        assert_eq!(snapshot.jobs.total.runs, 3, "every run is in the totals");
+    }
+
+    /// With no measured CPU (a coarse clock), the ratio uses the run counts.
+    #[test]
+    fn shift_ratio_uses_runs_when_no_cpu_is_measured() {
+        let accountant = CostAccountant::new(10);
+        for _ in 0..3 {
+            accountant.record_work(WorkKind::Job, us(0), 0, 0, None, Some(Shift::Shifted));
+        }
+        accountant.record_work(WorkKind::Job, us(0), 0, 0, None, Some(Shift::InWindow));
+        assert_eq!(accountant.snapshot().jobs.shift.ratio(), Some(0.75));
+    }
+
+    #[test]
+    fn shift_class_follows_the_signal_and_the_wait() {
+        let signal = CostSignal::new(Some(1.0));
+        assert_eq!(shift_class(Some(&signal), true, true), Some(Shift::Shifted));
+        assert_eq!(shift_class(Some(&signal), true, false), None, "no window");
+        assert_eq!(
+            shift_class(Some(&signal), false, true),
+            None,
+            "not deferrable"
+        );
+        signal.set(2.0);
+        assert_eq!(
+            shift_class(Some(&signal), true, false),
+            Some(Shift::InWindow)
+        );
+        assert_eq!(
+            shift_class(Some(&signal), true, true),
+            Some(Shift::InWindow),
+            "the signal rose again before the run"
+        );
+        assert_eq!(shift_class(None, true, true), Some(Shift::Shifted));
+    }
+
+    fn sample<'a>(families: &'a [MetricFamily], name: &str) -> &'a MetricFamily {
+        families
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no family {name}"))
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn work_metrics_have_a_kind_label_and_tenant_labels_only_when_allowed() {
+        for tenant_labels in [false, true] {
+            let accountant = CostAccountant::new(10).with_tenant_labels(tenant_labels);
+            accountant.record_work(WorkKind::Job, us(2_000_000), 8, 3, Some("acme"), None);
+            accountant.record_work(WorkKind::Task, us(1_000_000), 0, 0, None, None);
+            let families = accountant.collect();
+
+            let runs = sample(&families, "autumn_cost_work_runs_total");
+            let cpu = sample(&families, "autumn_cost_work_cpu_seconds_total");
+            sample(&families, "autumn_cost_work_allocated_bytes_total");
+            sample(&families, "autumn_cost_work_db_queries_total");
+            assert_eq!(runs.kind, MetricKind::Counter);
+            let job_labels = if tenant_labels {
+                labels(&[("kind", "job"), ("tenant", "acme")])
+            } else {
+                labels(&[("kind", "job")])
+            };
+            let job = cpu
+                .samples
+                .iter()
+                .find(|s| s.labels == job_labels)
+                .unwrap_or_else(|| panic!("{:?}", cpu.samples));
+            assert!((job.value - 2.0).abs() < f64::EPSILON);
+            assert!(
+                cpu.samples
+                    .iter()
+                    .any(|s| s.labels.contains(&("kind".to_owned(), "task".to_owned()))),
+                "{:?}",
+                cpu.samples
+            );
+        }
+    }
+
+    #[test]
+    fn deferrable_metrics_split_by_window() {
+        let accountant = CostAccountant::new(10);
+        accountant.record_work(
+            WorkKind::Job,
+            us(3_000_000),
+            0,
+            0,
+            None,
+            Some(Shift::Shifted),
+        );
+        accountant.record_work(
+            WorkKind::Job,
+            us(1_000_000),
+            0,
+            0,
+            None,
+            Some(Shift::InWindow),
+        );
+        let families = accountant.collect();
+
+        let cpu = sample(&families, "autumn_cost_deferrable_cpu_seconds_total");
+        let shifted = cpu
+            .samples
+            .iter()
+            .find(|s| s.labels == labels(&[("kind", "job"), ("window", "shifted")]))
+            .expect("shifted sample");
+        assert!((shifted.value - 3.0).abs() < f64::EPSILON);
+        let runs = sample(&families, "autumn_cost_deferrable_runs_total");
+        assert!(
+            runs.samples.iter().any(|s| s.labels
+                == labels(&[("kind", "job"), ("window", "in_window")])
+                && (s.value - 1.0).abs() < f64::EPSILON),
+            "{:?}",
+            runs.samples
+        );
+    }
+
+    fn metered_state(threshold: Option<f64>) -> (crate::AppState, CostAccountant, CostSignal) {
+        let state = crate::AppState::for_test();
+        let accountant = CostAccountant::new(10);
+        let signal = CostSignal::new(threshold);
+        state.insert_extension(accountant.clone());
+        state.insert_extension(signal.clone());
+        (state, accountant, signal)
+    }
+
+    #[tokio::test]
+    async fn meter_work_records_a_run_with_its_tenant() {
+        let (state, accountant, _signal) = metered_state(None);
+        let run = WorkRun {
+            tenant: Some("acme".to_owned()),
+            waited: false,
+        };
+        let out = meter_work(&state, WorkKind::Job, "cost_unit_meter", run, async {
+            std::hint::black_box((0..10_000_u64).sum::<u64>())
+        })
+        .await;
+        assert_eq!(out, 49_995_000);
+        let acme = accountant.snapshot().jobs.tenants["acme"];
+        assert_eq!(acme.runs, 1);
+    }
+
+    #[tokio::test]
+    async fn meter_work_classes_a_deferrable_run() {
+        let (state, accountant, signal) = metered_state(Some(1.0));
+        mark_deferrable(WorkKind::Task, "cost_unit_meter_deferrable");
+        let waited = WorkRun {
+            tenant: None,
+            waited: true,
+        };
+        meter_work(
+            &state,
+            WorkKind::Task,
+            "cost_unit_meter_deferrable",
+            waited,
+            async {},
+        )
+        .await;
+        signal.set(5.0);
+        meter_work(
+            &state,
+            WorkKind::Task,
+            "cost_unit_meter_deferrable",
+            WorkRun::default(),
+            async {},
+        )
+        .await;
+        meter_work(
+            &state,
+            WorkKind::Task,
+            "cost_unit_meter_urgent",
+            WorkRun::default(),
+            async {},
+        )
+        .await;
+
+        let tasks = accountant.snapshot().tasks;
+        assert_eq!(tasks.total.runs, 3);
+        assert_eq!(tasks.shift.shifted_runs, 1);
+        assert_eq!(tasks.shift.in_window_runs, 1);
+    }
+
+    /// A run that stops before it completes (a lease timeout, a shutdown) is
+    /// still recorded.
+    #[tokio::test]
+    async fn meter_work_records_a_dropped_run() {
+        let (state, accountant, _signal) = metered_state(None);
+        let fut = meter_work(
+            &state,
+            WorkKind::Job,
+            "cost_unit_dropped",
+            WorkRun::default(),
+            std::future::pending::<()>(),
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(1), fut).await;
+        assert_eq!(accountant.snapshot().jobs.total.runs, 1);
+    }
+
+    /// Without an accountant, the run is not metered, and the DB lane stays
+    /// off, so the DB layer does not install its query timer.
+    #[tokio::test]
+    async fn meter_work_without_an_accountant_is_a_no_op() {
+        let state = crate::AppState::for_test();
+        let active = meter_work(
+            &state,
+            WorkKind::Job,
+            "cost_unit_plain",
+            WorkRun::default(),
+            async { REQUEST_COST.try_with(|_| ()).is_ok() },
+        )
+        .await;
+        assert!(!active);
+
+        let (state, _accountant, _signal) = metered_state(None);
+        let active = meter_work(
+            &state,
+            WorkKind::Job,
+            "cost_unit_lane",
+            WorkRun::default(),
+            async { REQUEST_COST.try_with(|_| ()).is_ok() },
+        )
+        .await;
+        assert!(active, "a metered run counts its DB queries");
+    }
+
+    #[test]
+    fn deferred_job_names_lists_deferrable_names_only_while_high() {
+        mark_deferrable(WorkKind::Job, "cost_unit_names_deferrable");
+        let names = ["cost_unit_names_deferrable", "cost_unit_names_urgent"];
+        let (state, _accountant, signal) = metered_state(Some(1.0));
+        assert!(deferred_job_names(&state, names).is_empty(), "signal low");
+        signal.set(2.0);
+        assert_eq!(
+            deferred_job_names(&state, names),
+            vec!["cost_unit_names_deferrable".to_owned()]
+        );
+        let bare = crate::AppState::for_test();
+        assert!(deferred_job_names(&bare, names).is_empty(), "no signal");
     }
 }

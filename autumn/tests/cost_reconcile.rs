@@ -1,9 +1,10 @@
 //! Isolated integration test: per-tenant cost reconciles with process CPU
 //! (issue #1720).
 //!
-//! Two tenants send CPU-bound requests. The sum of their metered CPU time must
-//! agree with the CPU time that the process used, within 10%. The allocated
-//! bytes come from an `allocation-counter` probe.
+//! Two tenants send CPU-bound requests, then enqueue CPU-bound jobs. The sum
+//! of their metered CPU time must agree with the CPU time that the process
+//! used, within 10%. The allocated bytes come from an `allocation-counter`
+//! probe.
 //!
 //! The layers outside the `CostLayer` and the test client also use CPU. The
 //! test measures that cost on a route that does nothing, and takes it out of
@@ -86,6 +87,31 @@ async fn noop() -> &'static str {
     "ok"
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct BurnArgs {
+    millis: u64,
+}
+
+/// A background job that burns CPU. Its cost goes to the tenant that
+/// enqueued it.
+#[job(name = "cost_reconcile_burn")]
+async fn cost_reconcile_burn(_state: AppState, args: BurnArgs) -> AutumnResult<()> {
+    std::hint::black_box(burn(args.millis));
+    Ok(())
+}
+
+#[post("/enqueue-heavy")]
+async fn enqueue_heavy() -> AutumnResult<&'static str> {
+    CostReconcileBurnJob::enqueue(BurnArgs { millis: 60 }).await?;
+    Ok("queued")
+}
+
+#[post("/enqueue-light")]
+async fn enqueue_light() -> AutumnResult<&'static str> {
+    CostReconcileBurnJob::enqueue(BurnArgs { millis: 20 }).await?;
+    Ok("queued")
+}
+
 /// Requests that each tenant sends.
 const ROUNDS: u32 = 10;
 
@@ -99,7 +125,8 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
 
     let client = TestApp::new()
         .config(config)
-        .routes(routes![heavy, light, noop])
+        .routes(routes![heavy, light, noop, enqueue_heavy, enqueue_light])
+        .jobs(jobs![cost_reconcile_burn])
         .state_initializer(|state| {
             let probe: Arc<dyn AllocationProbe> = Arc::new(CountingProbe);
             state.insert_extension(probe);
@@ -189,4 +216,58 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
     let floor = u64::from(ROUNDS) * ALLOC_BYTES as u64;
     assert!(acme.allocated_bytes >= floor, "{acme:?}");
     assert!(globex.allocated_bytes >= floor, "{globex:?}");
+
+    // Slice 2: background jobs. Each tenant enqueues jobs from a request.
+    // The job CPU goes to the enqueuing tenant, and the request and job CPU
+    // together reconcile with process CPU.
+    let metered_before = metered_all(&accountant);
+    let before = process_cpu();
+    for _ in 0..ROUNDS {
+        client
+            .post("/enqueue-heavy")
+            .header("x-tenant-id", "acme")
+            .send()
+            .await
+            .assert_ok();
+        client
+            .post("/enqueue-light")
+            .header("x-tenant-id", "globex")
+            .send()
+            .await
+            .assert_ok();
+    }
+    for _ in 0..2_000 {
+        if accountant.snapshot().jobs.total.runs >= u64::from(2 * ROUNDS) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let process = process_cpu()
+        .saturating_sub(before)
+        .saturating_sub(outside_layer);
+    let jobs = accountant.snapshot().jobs;
+    assert_eq!(jobs.total.runs, u64::from(2 * ROUNDS), "{jobs:?}");
+    let metered = Duration::from_micros(metered_all(&accountant) - metered_before);
+
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = metered.as_secs_f64() / process.as_secs_f64();
+    println!("with jobs: metered {metered:?}, process {process:?}, ratio {ratio:.3}");
+    assert!(
+        (1.0 - TOLERANCE..=1.0 + TOLERANCE).contains(&ratio),
+        "metered CPU {metered:?} with jobs must be within 10% of process CPU {process:?} \
+         (ratio {ratio:.3})"
+    );
+
+    #[allow(clippy::cast_precision_loss)]
+    let share = jobs.tenants["acme"].cpu_micros as f64 / jobs.tenants["globex"].cpu_micros as f64;
+    assert!(
+        (2.5..=3.5).contains(&share),
+        "acme/globex job CPU share {share:.2}"
+    );
+}
+
+/// Metered CPU of requests and job runs, in microseconds.
+fn metered_all(accountant: &CostAccountant) -> u64 {
+    let snapshot = accountant.snapshot();
+    snapshot.total.cpu_micros + snapshot.jobs.total.cpu_micros
 }

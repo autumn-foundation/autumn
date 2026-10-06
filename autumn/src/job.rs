@@ -781,6 +781,11 @@ struct QueuedJob {
     attempt: u32,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    /// The tenant of the request that enqueued the job. Used only to
+    /// attribute cost: the handler does not run in this tenant's scope.
+    tenant: Option<String>,
+    /// `true` after the job waited for the cost signal (issue #1720).
+    cost_waited: bool,
     /// W3C `traceparent` serialized at enqueue time.  `None` when the
     /// `telemetry-otlp` feature is disabled or no active span was present.
     #[cfg(feature = "telemetry-otlp")]
@@ -2246,7 +2251,28 @@ fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
     tracing::info_span!("job.execute", "otel.kind" = "consumer", job.name = %name, job.attempt = attempt)
 }
 
+/// Run one job attempt, metered as one job run (issue #1720). All job
+/// backends run their handlers through here.
 async fn run_job_handler(
+    name: &str,
+    handler: JobHandler,
+    state: AppState,
+    payload: Value,
+    final_attempt: bool,
+    run: crate::cost::WorkRun,
+) -> JobExecutionOutcome {
+    let metered_state = state.clone();
+    crate::cost::meter_work(
+        &metered_state,
+        crate::cost::WorkKind::Job,
+        name,
+        run,
+        run_job_handler_unmetered(name, handler, state, payload, final_attempt),
+    )
+    .await
+}
+
+async fn run_job_handler_unmetered(
     name: &str,
     handler: JobHandler,
     state: AppState,
@@ -3645,6 +3671,8 @@ impl JobClient {
                     attempt: 1,
                     max_attempts: job_max_attempts,
                     initial_backoff_ms: job_backoff_ms,
+                    tenant: crate::cost::enqueuing_tenant(),
+                    cost_waited: false,
                     #[cfg(feature = "telemetry-otlp")]
                     traceparent,
                     #[cfg(feature = "telemetry-otlp")]
@@ -4799,9 +4827,6 @@ pub fn start_runtime(
     })?;
 
     crate::job_tracking::ensure_tracking_store_installed_from_config(state, config);
-    if run_workers {
-        warn_deferrable_jobs_not_deferred(state, &jobs, &config.backend);
-    }
     if config.max_backoff_ms == 0 {
         tracing::warn!("jobs.max_backoff_ms = 0: every job retry is due at once, with no backoff");
     }
@@ -5373,30 +5398,6 @@ pub(crate) fn start_local_runtime_inner(
     }
 }
 
-/// Warn when a `#[job(deferrable)]` job runs on a backend that does not defer.
-///
-/// Only the `local` backend defers jobs in this slice (issue #1720). On the
-/// durable backends the job runs as usual, so say so at boot rather than fail
-/// silently.
-fn warn_deferrable_jobs_not_deferred(state: &AppState, jobs: &[JobInfo], backend: &str) {
-    let deferral_on = state
-        .extension::<crate::cost::CostSignal>()
-        .is_some_and(|signal| signal.threshold().is_some());
-    if backend == "local" || !deferral_on {
-        return;
-    }
-    for job in jobs {
-        if crate::cost::is_deferrable(crate::cost::WorkKind::Job, &job.name) {
-            tracing::warn!(
-                job = %job.name,
-                backend,
-                "job is deferrable, but this jobs backend does not defer; it runs \
-                 when the cost signal is high. Only `local` defers jobs"
-            );
-        }
-    }
-}
-
 /// Whether this process should evaluate queue-pin coverage and emit the AC6
 /// startup diagnostic (issue #1623). Only worker/combined roles
 /// (`run_workers == true`) claim queues, so a web replica (`run_workers ==
@@ -5692,6 +5693,8 @@ async fn execute_local_job(
     {
         crate::cost::note_deferral(&signal);
         tracing::info!(job = %job.name, value = signal.value(), "cost signal is high; job waits");
+        let mut job = job;
+        job.cost_waited = true;
         if coordination.defer(job) {
             tokio::spawn(run_deferred_job_waiter(
                 Arc::clone(coordination),
@@ -5784,6 +5787,10 @@ async fn execute_local_job(
         state.clone(),
         job.payload.clone(),
         final_attempt,
+        crate::cost::WorkRun {
+            tenant: job.tenant.clone(),
+            waited: job.cost_waited,
+        },
     );
     let outcome = tracing::Instrument::instrument(f, job_span).await;
     match outcome {
@@ -5851,6 +5858,7 @@ async fn execute_local_job(
                 let traceparent = job.traceparent;
                 #[cfg(feature = "telemetry-otlp")]
                 let tracestate = job.tracestate;
+                let tenant = job.tenant;
                 let delay = job_retry_delay_ms(state, backoff_ms, job.attempt);
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -5865,6 +5873,8 @@ async fn execute_local_job(
                             attempt: job.attempt.saturating_add(1),
                             max_attempts,
                             initial_backoff_ms: backoff_ms,
+                            tenant,
+                            cost_waited: false,
                             #[cfg(feature = "telemetry-otlp")]
                             traceparent,
                             #[cfg(feature = "telemetry-otlp")]
@@ -5907,6 +5917,18 @@ async fn execute_local_job(
     // The concurrency slot frees as soon as the handler is no longer running,
     // including while a retry waits out its backoff.
     finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+}
+
+/// The registered deferrable job names while the cost signal is high (issue
+/// #1720). The durable backends do not claim these jobs. Empty otherwise.
+pub(crate) fn deferred_job_names(
+    state: &AppState,
+    jobs_by_name: &RwLock<HashMap<String, JobInfo>>,
+) -> Vec<String> {
+    let jobs = jobs_by_name
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::cost::deferred_job_names(state, jobs.keys().map(String::as_str))
 }
 
 /// Check the deferred local jobs every recheck interval (issue #1720). Put a
@@ -6848,7 +6870,9 @@ async fn redis_admin_active_list_page(
         .map_err(|error| redis_admin_error("read enqueued records", &error))?
         .into_iter()
         .map(|record| {
-            let blocked = blocked_ids.contains(&record.id);
+            // A parked job with no concurrency limit waits for the cost
+            // signal (issue #1720), not for a slot.
+            let blocked = blocked_ids.contains(&record.id) && record.concurrency_limit.is_some();
             redis_record_to_admin_record(&record, status, blocked)
         })
         .collect();
@@ -7005,10 +7029,25 @@ async fn push_json_list_item<T: ?Sized + Serialize + Sync>(
 
 #[cfg(feature = "redis")]
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
 async fn claim_next_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
     queue_keys: &[String],
+) -> Result<Option<RedisJobRecord>, redis::RedisError> {
+    claim_next_redis_job_except(connection, worker_config, queue_keys, &[], 0).await
+}
+
+/// Claim the next job, but park a job named in `deferred` in the blocked zset
+/// for `defer_ms` (issue #1720). A parked job stays enqueued and keeps its
+/// attempt.
+#[cfg(feature = "redis")]
+async fn claim_next_redis_job_except(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    queue_keys: &[String],
+    deferred: &[String],
+    defer_ms: u64,
 ) -> Result<Option<RedisJobRecord>, redis::RedisError> {
     // Walks the priority-ordered queue list keys (ARGV[9..]) highest first,
     // popping entries until one is claimable. Jobs whose concurrency group is
@@ -7016,7 +7055,9 @@ async fn claim_next_redis_job(
     // and retried via promotion; the scan bound keeps one call from walking an
     // arbitrarily long queue. The concurrency counter INCR is atomic with the
     // claim itself, so two workers can never both observe a free slot for the
-    // last opening in a group.
+    // last opening in a group. A deferred job (the names in the JSON array
+    // after the queue keys) is parked the same way, until the next signal
+    // check.
     const CLAIM_SCRIPT: &str = r"
 local function scope_string(value)
   if value == nil or value == cjson.null then
@@ -7025,6 +7066,11 @@ local function scope_string(value)
   return tostring(value)
 end
 local queue_count = tonumber(ARGV[9])
+local deferred_due = ARGV[10 + queue_count]
+local deferred = {}
+for _, name in ipairs(cjson.decode(ARGV[11 + queue_count])) do
+  deferred[name] = true
+end
 for qi = 1, queue_count do
   local queue_key = ARGV[9 + qi]
   for attempt = 1, tonumber(ARGV[6]) do
@@ -7041,7 +7087,10 @@ for qi = 1, queue_count do
         return { id, body }
       end
       local blocked = false
-      if record['concurrency_limit'] and record['concurrency_limit'] ~= cjson.null then
+      if deferred[record['name']] then
+        redis.call('ZADD', KEYS[3], deferred_due, id)
+        blocked = true
+      elseif record['concurrency_limit'] and record['concurrency_limit'] ~= cjson.null then
         local counter = ARGV[4] .. record['name'] .. ':' .. scope_string(record['concurrency_key'])
         local current = tonumber(redis.call('GET', counter) or '0')
         if current >= tonumber(record['concurrency_limit']) then
@@ -7098,6 +7147,8 @@ return nil
     for queue_key in queue_keys {
         cmd.arg(queue_key);
     }
+    cmd.arg(now_ms.saturating_add(defer_ms))
+        .arg(serde_json::to_string(deferred).unwrap_or_else(|_| "[]".to_owned()));
     let response: Option<(String, String)> = cmd.query_async(connection).await?;
 
     let Some((id, body)) = response else {
@@ -7334,6 +7385,7 @@ return #ids
 }
 
 /// Publish per-name blocked-on-concurrency gauges from the blocked zset.
+/// Jobs parked for the cost signal are not counted.
 #[cfg(feature = "redis")]
 async fn update_redis_blocked_gauges(
     connection: &mut redis::aio::ConnectionManager,
@@ -7355,7 +7407,11 @@ async fn update_redis_blocked_gauges(
         let bodies: Vec<Option<String>> =
             redis::cmd("MGET").arg(keys).query_async(connection).await?;
         for body in bodies.into_iter().flatten() {
-            if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body) {
+            // A parked job with no concurrency limit waits for the cost signal
+            // (issue #1720), not for a slot.
+            if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body)
+                && record.concurrency_limit.is_some()
+            {
                 let slot = counts.entry(record.name).or_insert(0);
                 *slot = slot.saturating_add(1);
             }
@@ -8295,7 +8351,15 @@ fn spawn_redis_worker(
                         continue;
                     };
                     let queue_keys = worker_config.queue_keys_for(std::slice::from_ref(queue));
-                    match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
+                    match claim_next_redis_job_except(
+                        &mut connection,
+                        &worker_config,
+                        &queue_keys,
+                        &deferred_job_names(&state, &jobs_by_name),
+                        crate::cost::recheck_ms(&state),
+                    )
+                    .await
+                    {
                         Ok(Some(record)) => {
                             process_redis_job_record(
                                 &mut connection,
@@ -8334,15 +8398,22 @@ fn spawn_redis_worker(
                 continue;
             }
             let queue_keys = worker_config.queue_keys_for(&order);
-            let claimed =
-                match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
-                    Ok(record) => record,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "redis job worker claim failed");
-                        tokio::time::sleep(idle_sleep).await;
-                        continue;
-                    }
-                };
+            let claimed = match claim_next_redis_job_except(
+                &mut connection,
+                &worker_config,
+                &queue_keys,
+                &deferred_job_names(&state, &jobs_by_name),
+                crate::cost::recheck_ms(&state),
+            )
+            .await
+            {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(error = %error, "redis job worker claim failed");
+                    tokio::time::sleep(idle_sleep).await;
+                    continue;
+                }
+            };
             let Some(record) = claimed else {
                 tokio::time::sleep(idle_sleep).await;
                 continue;
@@ -8639,6 +8710,7 @@ async fn process_redis_job_record(
         state.clone(),
         record.payload.clone(),
         final_attempt,
+        crate::cost::WorkRun::default(),
     );
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
@@ -9827,6 +9899,8 @@ const PG_CLAIM_ADVISORY_LOCK_KEY: i64 = 0x6175_7475_6d6e_6a62; // "autumnjb"
 
 #[cfg(feature = "db")]
 fn pg_claim_sql() -> String {
+    // `$3` is the deferred job names (issue #1720): empty unless the cost
+    // signal is high. Those rows stay enqueued and keep their attempt.
     // `$2` is the worker's ordered queue list for this claim. Restricting to it
     // and ordering by `array_position` drains higher-priority queues first;
     // passing a per-iteration rotation of the list yields weighted draining.
@@ -9848,6 +9922,7 @@ fn pg_claim_sql() -> String {
                  AND running.name = candidate.name \
                  AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
              ) < candidate.concurrency_limit) \
+             AND NOT (candidate.name = ANY($3)) \
            ORDER BY array_position($2::text[], candidate.queue), candidate.run_at ASC \
            LIMIT 1 \
            FOR UPDATE SKIP LOCKED \
@@ -9892,6 +9967,7 @@ fn pg_claim_sql_single_queue() -> String {
                  AND running.name = candidate.name \
                  AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
              ) < candidate.concurrency_limit) \
+             AND NOT (candidate.name = ANY($3)) \
            ORDER BY candidate.run_at ASC \
            LIMIT 1 \
            FOR UPDATE SKIP LOCKED \
@@ -9900,14 +9976,27 @@ fn pg_claim_sql_single_queue() -> String {
     )
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", test))]
 async fn pg_claim_next_job(
     pool: &PgPool,
     worker_id: &str,
     serialize_claims: bool,
     queue_order: &[String],
 ) -> Option<PgJobRow> {
+    pg_claim_next_job_except(pool, worker_id, serialize_claims, queue_order, &[]).await
+}
+
+/// Claim the next ready job, but not a job named in `deferred` (issue #1720).
+#[cfg(feature = "db")]
+async fn pg_claim_next_job_except(
+    pool: &PgPool,
+    worker_id: &str,
+    serialize_claims: bool,
+    queue_order: &[String],
+    deferred: &[String],
+) -> Option<PgJobRow> {
     use diesel::OptionalExtension as _;
+    type Names = diesel::sql_types::Array<diesel::sql_types::Text>;
     use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
 
     let mut conn = pool.get().await.ok()?;
@@ -9917,6 +10006,7 @@ async fn pg_claim_next_job(
     let claimed = if let [only_queue] = queue_order {
         let sql = pg_claim_sql_single_queue();
         let only_queue = only_queue.clone();
+        let deferred = deferred.to_vec();
         if serialize_claims {
             let worker_id = worker_id.to_owned();
             conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
@@ -9927,6 +10017,7 @@ async fn pg_claim_next_job(
                 diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Text, _>(worker_id)
                     .bind::<diesel::sql_types::Text, _>(only_queue)
+                    .bind::<Names, _>(deferred)
                     .get_result::<PgJobRow>(conn)
                     .await
                     .optional()
@@ -9936,6 +10027,7 @@ async fn pg_claim_next_job(
             diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Text, _>(worker_id)
                 .bind::<diesel::sql_types::Text, _>(only_queue)
+                .bind::<Names, _>(deferred)
                 .get_result::<PgJobRow>(&mut *conn)
                 .await
                 .optional()
@@ -9943,6 +10035,7 @@ async fn pg_claim_next_job(
     } else {
         let sql = pg_claim_sql();
         let queue_order = queue_order.to_vec();
+        let deferred = deferred.to_vec();
         if serialize_claims {
             let worker_id = worker_id.to_owned();
             conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
@@ -9953,6 +10046,7 @@ async fn pg_claim_next_job(
                 diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Text, _>(worker_id)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                    .bind::<Names, _>(deferred)
                     .get_result::<PgJobRow>(conn)
                     .await
                     .optional()
@@ -9962,6 +10056,7 @@ async fn pg_claim_next_job(
             diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Text, _>(worker_id)
                 .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                .bind::<Names, _>(deferred)
                 .get_result::<PgJobRow>(&mut *conn)
                 .await
                 .optional()
@@ -10505,7 +10600,14 @@ async fn pg_execute_job(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
-    let f = run_job_handler(&row.name, handler, state.clone(), payload, final_attempt);
+    let f = run_job_handler(
+        &row.name,
+        handler,
+        state.clone(),
+        payload,
+        final_attempt,
+        crate::cost::WorkRun::default(),
+    );
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
@@ -10690,11 +10792,12 @@ async fn pg_worker_loop(
                 let Some(guard) = slots.try_reserve(queue) else {
                     continue;
                 };
-                match pg_claim_next_job(
+                match pg_claim_next_job_except(
                     &pool,
                     &worker_id,
                     serialize_claims,
                     std::slice::from_ref(queue),
+                    &deferred_job_names(&state, &jobs_by_name),
                 )
                 .await
                 {
@@ -10730,7 +10833,10 @@ async fn pg_worker_loop(
             }
             continue;
         }
-        match pg_claim_next_job(&pool, &worker_id, serialize_claims, &queue_order).await {
+        let deferred = deferred_job_names(&state, &jobs_by_name);
+        match pg_claim_next_job_except(&pool, &worker_id, serialize_claims, &queue_order, &deferred)
+            .await
+        {
             Some(row) => {
                 let _slot = slots.acquire(&normalize_queue_name(&row.queue));
                 pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
@@ -12506,6 +12612,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            crate::cost::WorkRun::default(),
         )
         .await;
         assert_eq!(
@@ -12563,6 +12670,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            crate::cost::WorkRun::default(),
         )
         .await;
 
@@ -12632,6 +12740,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            crate::cost::WorkRun::default(),
         )
         .await;
 
@@ -13170,6 +13279,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 3,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -13231,6 +13342,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -13294,6 +13407,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -13352,6 +13467,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 initial_backoff_ms: 60_000,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -16566,6 +16683,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            crate::cost::WorkRun::default(),
         )
         .await;
         assert_eq!(
@@ -16769,6 +16887,8 @@ mod tests {
             attempt: 1,
             max_attempts: 3,
             initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
             #[cfg(feature = "telemetry-otlp")]
             traceparent: None,
             #[cfg(feature = "telemetry-otlp")]
@@ -16823,6 +16943,8 @@ mod tests {
             attempt: 1,
             max_attempts: 3,
             initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
             #[cfg(feature = "telemetry-otlp")]
             traceparent: None,
             #[cfg(feature = "telemetry-otlp")]
@@ -17145,6 +17267,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -20032,6 +20156,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 0,
+                tenant: None,
+                cost_waited: false,
                 traceparent: Some(
                     "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
                 ),
@@ -20189,6 +20315,8 @@ mod tests {
                     attempt: 1,
                     max_attempts: 1,
                     initial_backoff_ms: 0,
+                    tenant: None,
+                    cost_waited: false,
                     traceparent: Some(
                         "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
                     ),
@@ -20746,6 +20874,8 @@ mod tests {
             attempt: 1,
             max_attempts: 3,
             initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
             #[cfg(feature = "telemetry-otlp")]
             traceparent: None,
             #[cfg(feature = "telemetry-otlp")]
