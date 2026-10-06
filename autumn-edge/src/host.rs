@@ -429,6 +429,18 @@ impl<'kv> HostState<'kv> {
 
     /// `SplitMix64`: tiny, deterministic, and good enough for a shim whose
     /// entire job is to be reproducible.
+    ///
+    /// Duplicated byte-for-byte in `autumn::plugin_sandbox::host::HostState::
+    /// next_random_byte` — the plugin sandbox's WASI shim hand-copied this
+    /// round function when it was built two weeks after this one. The two
+    /// *seeding policies* deliberately differ (this crate fixes `random_state`
+    /// to one constant forever, for the byte-identical-across-every-run
+    /// property the module doc describes; the sandbox derives its seed from
+    /// each request, see that file's `seed_from`) — don't try to unify those.
+    /// The round function's math itself must stay identical, though: pinned
+    /// by `tests::the_splitmix64_round_matches_plugin_sandboxs_copy` here and
+    /// the identically-named test over there. Change this, change that copy
+    /// too, or one of the two tests fails.
     const fn next_random_byte(&mut self) -> u8 {
         self.random_state = self.random_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.random_state;
@@ -459,6 +471,13 @@ impl<'kv> HostState<'kv> {
 // ── the WASI shim ────────────────────────────────────────────────────
 
 type Shim<'kv> = Linker<HostState<'kv>>;
+
+// `memory_of`, `read_u32`, `write_u32`, and `iovec` below are duplicated
+// byte-for-byte (modulo the lifetime parameter here) in
+// `autumn::plugin_sandbox::host` — the same four small WASI memory-access
+// primitives, hand-copied into that crate's independent shim rather than
+// shared. See `next_random_byte`'s doc comment above for why these two WASI
+// shims are separate crates with a linked, not merged, implementation.
 
 fn memory_of(caller: &Caller<'_, HostState<'_>>) -> Option<wasmi::Memory> {
     caller
@@ -1063,6 +1082,32 @@ mod tests {
         // Not a constant stream either — a shim that returned all zeroes would
         // be deterministic and useless.
         assert!(left.windows(2).any(|pair| pair.first() != pair.last()));
+    }
+
+    #[test]
+    fn the_splitmix64_round_matches_plugin_sandboxs_copy() {
+        // `next_random_byte`'s doc comment names this as the drift guard for
+        // the round function duplicated into
+        // `autumn::plugin_sandbox::host::HostState::next_random_byte`. Both
+        // crates seed `random_state` to the same literal here — not either
+        // type's own fixed/per-request seed — specifically so this test
+        // exercises only the shared mixing math, not either seeding policy
+        // (which deliberately differ and are not under test). This exact
+        // seed and expected-byte array are duplicated, word-for-word, in
+        // `autumn::plugin_sandbox::host::tests::
+        // the_splitmix64_round_matches_edges_copy`; if this breaks from an
+        // edit here, check whether that copy's round function changed too.
+        let kv = InMemoryEdgeKv::new();
+        let mut state = state_with(&kv, false);
+        state.random_state = 0xA5A5_A5A5_A5A5_A5A5;
+        let bytes: Vec<u8> = (0..16).map(|_| state.next_random_byte()).collect();
+        assert_eq!(
+            bytes,
+            [
+                0x21, 0x31, 0x5A, 0x15, 0x86, 0x63, 0x6E, 0xD2, 0x52, 0x7A, 0xF5, 0xB0, 0xC1, 0xDE,
+                0x74, 0xA1,
+            ]
+        );
     }
 
     #[test]
