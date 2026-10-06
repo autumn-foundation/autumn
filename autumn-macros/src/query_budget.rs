@@ -346,6 +346,7 @@ const CARRIER_TYPES: &[&str] = &[
 const SCALAR_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "capacity",
     "contains_key",
     "is_some",
     "is_none",
@@ -495,6 +496,7 @@ const BOOL_METHODS: &[&str] = &["then", "then_some"];
 const VEC_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "capacity",
     "into_iter",
     "as_slice",
     "as_mut_slice",
@@ -550,6 +552,7 @@ const SLICE_METHODS: &[&str] = &[
 const DEQUE_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "capacity",
     "contains",
     "iter",
     "iter_mut",
@@ -591,6 +594,7 @@ const LIST_METHODS: &[&str] = &[
 const HEAP_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "capacity",
     "iter",
     "into_iter",
     "push",
@@ -744,6 +748,7 @@ const RESULT_METHODS: &[&str] = &[
 const MAP_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "capacity",
     "contains_key",
     "get",
     "get_mut",
@@ -787,6 +792,7 @@ const SORTED_MAP_METHODS: &[&str] = &[
 const SET_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "capacity",
     "contains",
     "insert",
     "remove",
@@ -5059,9 +5065,9 @@ impl Analyzer {
                     || self.callback_result(mc) == Kind::Holder
             }
             // `Ctx(repo)`: a user tuple struct that holds the handle.
+            // `identity(repo)`: an opaque helper may give it back.
             Expr::Call(c) => {
-                call_path_name(c).is_some_and(|n| n.starts_with(char::is_uppercase))
-                    && !self.is_container_constructor(c)
+                !self.is_container_constructor(c)
                     && !is_handle_constructor(c)
                     && c.args.iter().any(|a| self.holds(a))
             }
@@ -13695,6 +13701,36 @@ mod tests {
     }
 
     #[test]
+    fn exempt_calls_keep_their_handle() {
+        check_handlers(&[
+            (
+                "an exempt helper may give its handle back",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 #[query_exempt(reason = \"identity only\")] let alias = identity(repo); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an exempt path helper may give its handle back",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 #[query_exempt(reason = \"identity only\")] let alias = util::identity(&repo); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an annotated awaited finder gives rows",
+                "async fn h(mut db: Db) -> AutumnResult<usize> { \
+                 #[query_cost(1)] let posts = Post::published(&mut db).await?; render(&posts); Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a helper handed only plain values gives a plain value",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let n = count(&ids); repo.a().await?; Ok(n) }",
+                Expect::Exact(1),
+            ),
+        ]);
+    }
+
+    #[test]
     fn each_container_type_has_its_own_methods() {
         // `(parameter type, call)`: the type has no such method, so an
         // extension trait gives it, and it may query.
@@ -13707,6 +13743,8 @@ mod tests {
             ("&[PgPostRepository]", "repos.clear()"),
             ("BTreeMap<i64, PgPostRepository>", "repos.reserve(1)"),
             ("BTreeSet<PgPostRepository>", "repos.drain()"),
+            ("BTreeMap<i64, PgPostRepository>", "repos.capacity()"),
+            ("LinkedList<PgPostRepository>", "repos.capacity()"),
         ];
         // The type has the method, so it issues nothing.
         let present = [
@@ -13718,6 +13756,11 @@ mod tests {
                 "repos.retain(|_, _| true)",
             ),
             ("HashSet<PgPostRepository>", "repos.drain()"),
+            ("Vec<PgPostRepository>", "repos.capacity()"),
+            ("VecDeque<PgPostRepository>", "repos.capacity()"),
+            ("BinaryHeap<PgPostRepository>", "repos.capacity()"),
+            ("HashMap<i64, PgPostRepository>", "repos.capacity()"),
+            ("HashSet<PgPostRepository>", "repos.capacity()"),
         ];
         let handler = |ty: &str, call: &str| {
             format!(
