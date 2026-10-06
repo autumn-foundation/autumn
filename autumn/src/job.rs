@@ -25599,6 +25599,7 @@ mod lease_tests {
                 timeout: Some(Duration::from_millis(250)),
                 lease_lost: None,
             },
+            crate::cost::WorkRun::default(),
         )
         .await;
         assert_eq!(
@@ -25626,6 +25627,7 @@ mod lease_tests {
                 timeout: None,
                 lease_lost: Some(lost.clone()),
             },
+            crate::cost::WorkRun::default(),
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         lost.cancel();
@@ -25651,6 +25653,7 @@ mod lease_tests {
                 timeout: Some(Duration::from_secs(1)),
                 lease_lost: Some(tokio_util::sync::CancellationToken::new()),
             },
+            crate::cost::WorkRun::default(),
         )
         .await;
         assert_eq!(outcome, JobExecutionOutcome::Succeeded);
