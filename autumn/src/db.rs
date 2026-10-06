@@ -764,6 +764,11 @@ pub(crate) fn reject_ambient_after_commit_registry_for_tx() -> Result<(), Autumn
     Ok(())
 }
 
+/// Run the committed transaction's after-commit callbacks on a new task.
+///
+/// A spawned task does not inherit task-locals, so the [`TxTimeouts`] in
+/// scope here (the request's, or a scheduled task's or job's) are carried
+/// into it. A repository write in a callback then sets them as well (#3057).
 pub(crate) fn spawn_committed_after_commit_callbacks(
     callbacks: Vec<CommitCallback>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -771,33 +776,37 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
         return None;
     }
 
-    Some(tokio::task::spawn(async move {
-        for cb in callbacks {
-            let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
-                Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
-                Err(panic) => Err(panic),
-            };
+    let timeouts = TxTimeouts::current().unwrap_or_default();
+    Some(tokio::task::spawn(TX_TIMEOUTS.scope(
+        timeouts,
+        async move {
+            for cb in callbacks {
+                let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
+                    Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
+                    Err(panic) => Err(panic),
+                };
 
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    let failures_total = record_after_commit_failure();
-                    tracing::error!(
-                        autumn.after_commit.failures_total = failures_total,
-                        "after_commit callback failed (tx already committed): {e}"
-                    );
-                }
-                Err(panic) => {
-                    let failures_total = record_after_commit_failure();
-                    let panic = after_commit_panic_message(&*panic);
-                    tracing::error!(
-                        autumn.after_commit.failures_total = failures_total,
-                        "after_commit callback panicked (tx already committed): {panic}"
-                    );
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let failures_total = record_after_commit_failure();
+                        tracing::error!(
+                            autumn.after_commit.failures_total = failures_total,
+                            "after_commit callback failed (tx already committed): {e}"
+                        );
+                    }
+                    Err(panic) => {
+                        let failures_total = record_after_commit_failure();
+                        let panic = after_commit_panic_message(&*panic);
+                        tracing::error!(
+                            autumn.after_commit.failures_total = failures_total,
+                            "after_commit callback panicked (tx already committed): {panic}"
+                        );
+                    }
                 }
             }
-        }
-    }))
+        },
+    )))
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
@@ -4311,6 +4320,40 @@ mod tests {
                 Some(Duration::from_secs(30)),
                 Some(Duration::from_secs(60))
             ))
+        );
+    }
+
+    /// After-commit callbacks run on a spawned task, which inherits no
+    /// task-locals. The spawner carries the timeouts in scope into it.
+    #[tokio::test]
+    async fn after_commit_callbacks_keep_the_tx_timeouts() {
+        use std::time::Duration;
+        struct Configured;
+        impl super::DbState for Configured {
+            fn pool(&self) -> Option<&super::Pool<super::RuntimeConnection>> {
+                None
+            }
+            fn statement_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(30))
+            }
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_in_callback = std::sync::Arc::clone(&seen);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                *seen_in_callback.lock().expect("lock") = super::TxTimeouts::current();
+                Ok(())
+            })
+        });
+        let drain = super::scope_background_tx_timeouts(&Configured, async move {
+            super::spawn_committed_after_commit_callbacks(vec![callback])
+        })
+        .await
+        .expect("a callback was registered");
+        drain.await.expect("callback task");
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            Some(super::TxTimeouts::new(Some(Duration::from_secs(30)), None))
         );
     }
 
