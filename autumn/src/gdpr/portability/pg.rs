@@ -125,8 +125,10 @@ struct ColumnRow {
     data_type: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     base_type: String,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
-    is_domain: bool,
+    /// The type name without a modifier. It differs from `base_type` only
+    /// for a domain or an array of a domain.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    plain_type: String,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     nullable: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -151,16 +153,22 @@ async fn describe_table(
 ) -> Result<Vec<Column>, DataCapsuleError> {
     let rows: Vec<ColumnRow> = diesel::sql_query(
         // `information_schema.columns.is_generated` exists on every version;
-        // `pg_attribute.attgenerated` only from Postgres 12.
+        // `pg_attribute.attgenerated` only from Postgres 12. For an array,
+        // the chain starts at the element type: an array of a domain has the
+        // base type of that domain, with `[]`.
         "SELECT a.attname::text AS name, \
                 format_type(a.atttypid, a.atttypmod) AS data_type, \
                 (WITH RECURSIVE chain(oid, base, kind) AS ( \
-                     SELECT t.oid, t.typbasetype, t.typtype \
+                     SELECT e.oid, e.typbasetype, e.typtype FROM pg_type e \
+                     WHERE e.oid = CASE WHEN t.typtype <> 'd' AND t.typcategory = 'A' \
+                                        THEN t.typelem ELSE t.oid END \
                      UNION ALL \
                      SELECT b.oid, b.typbasetype, b.typtype \
                      FROM chain c JOIN pg_type b ON b.oid = c.base WHERE c.kind = 'd') \
-                 SELECT format_type(oid, NULL) FROM chain WHERE kind <> 'd' LIMIT 1) AS base_type, \
-                t.typtype = 'd' AS is_domain, \
+                 SELECT format_type(oid, NULL) || \
+                        CASE WHEN t.typtype <> 'd' AND t.typcategory = 'A' THEN '[]' ELSE '' END \
+                 FROM chain WHERE kind <> 'd' LIMIT 1) AS base_type, \
+                format_type(a.atttypid, NULL) AS plain_type, \
                 NOT a.attnotnull AS nullable, \
                 COALESCE(c.is_generated = 'ALWAYS', false) AS generated \
          FROM pg_attribute a \
@@ -191,7 +199,7 @@ async fn describe_table(
             // The manifest keeps the base type of a domain, so import can
             // treat a domain over `money` as `money`. A domain over a domain
             // resolves to the last base type.
-            if r.is_domain {
+            if r.base_type != r.plain_type {
                 field.base_type = Some(r.base_type.clone());
             }
             Column {
@@ -532,6 +540,8 @@ struct SequencePlan {
     needed: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     can_update: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    cycle: bool,
 }
 
 /// The `setval` that moves a serial or identity sequence past the imported
@@ -541,7 +551,8 @@ struct SequencePlan {
 ///
 /// [`DataCapsuleError::NotConfigured`] for a sequence with `CACHE` above 1:
 /// other sessions can hold cached values, and `setval` does not take them
-/// back. [`DataCapsuleError::Conflict`] for a key outside the sequence range.
+/// back. The same for a `CYCLE` sequence: it starts again at an imported key.
+/// [`DataCapsuleError::Conflict`] for a key outside the sequence range.
 async fn plan_sequence(
     conn: &mut AsyncPgConnection,
     table: &str,
@@ -562,16 +573,17 @@ async fn plan_sequence(
     // unused sequence has no last value: then compare with the value before
     // its start.
     let plan: Option<SequencePlan> = diesel::sql_query(format!(
-        "SELECT s.m AS target, s.cache, s.min, s.max, CASE WHEN s.inc > 0 \
+        "SELECT s.m AS target, s.cache, s.min, s.max, s.cycle, CASE WHEN s.inc > 0 \
            THEN s.m > COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) \
            ELSE s.m < COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) END AS needed, \
            has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
          FROM (SELECT CASE WHEN q.seqincrement > 0 THEN MAX(t.{pk}) ELSE MIN(t.{pk}) END::bigint AS m, \
                       q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
-                      q.seqmin AS min, q.seqmax AS max \
+                      q.seqmin AS min, q.seqmax AS max, q.seqcycle AS cycle \
                FROM {quoted_table} t CROSS JOIN pg_sequence q \
                WHERE q.seqrelid = $1::regclass \
-               GROUP BY q.seqincrement, q.seqstart, q.seqcache, q.seqmin, q.seqmax) s \
+               GROUP BY q.seqincrement, q.seqstart, q.seqcache, q.seqmin, q.seqmax, \
+                        q.seqcycle) s \
          WHERE s.m IS NOT NULL"
     ))
     .bind::<diesel::sql_types::Text, _>(&seq)
@@ -586,6 +598,13 @@ async fn plan_sequence(
         return Err(DataCapsuleError::NotConfigured(format!(
             "the sequence of {table} caches {} values; import needs CACHE 1",
             plan.cache
+        )));
+    }
+    // After its last value, a `CYCLE` sequence starts again, at an imported
+    // key.
+    if plan.cycle {
+        return Err(DataCapsuleError::NotConfigured(format!(
+            "the sequence of {table} cycles; import needs NO CYCLE"
         )));
     }
     if !plan.needed {

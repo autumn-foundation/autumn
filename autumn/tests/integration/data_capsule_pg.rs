@@ -30,6 +30,7 @@ CREATE TABLE users (
     email TEXT NOT NULL UNIQUE,
     balance NUMERIC(30, 12) NOT NULL,
     credit amount,
+    credits amount[],
     fee MONEY,
     tip cash,
     fees MONEY[],
@@ -62,16 +63,17 @@ CREATE TABLE comments (
 ";
 
 const SEED: &str = r#"
-INSERT INTO users (email, balance, credit, fee, tip, fees, grid, ranks, offs, ratio, created_at, born, avatar, prefs, tags, uid, active)
+INSERT INTO users (email, balance, credit, credits, fee, tip, fees, grid, ranks, offs, ratio, created_at, born, avatar, prefs, tags, uid, active)
 VALUES
   ('Ada@Example.com', 12345678901234567.123456789012, 98765432109876543210.01234567890123456789,
+   ARRAY[98765432109876543210.01234567890123456789, 0.10000000000000000001]::amount[],
    1234567.89, 12.5, ARRAY[1.5, 2000]::money[], ARRAY[[1.5, 2], [3, NULL]]::money[],
    '[0:2]={1,2,3}', '[0:1]={1.5,2}',
    0.30000000000000004,
    '2026-01-02 03:04:05.123456+00', '1815-12-10', '\x00ff10'::bytea,
    '{"theme": "dark", "n": [1, 2.5, {"deep": null}]}', ARRAY['a', 'b "q"', 'ü'],
    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', true),
-  ('bob@example.com', 1, NULL, NULL, NULL, '{}', NULL, '{4,5}', NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
+  ('bob@example.com', 1, NULL, NULL, NULL, NULL, '{}', NULL, '{4,5}', NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
    'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', false);
 INSERT INTO posts (author_id, parent_id, title, score) VALUES
   (1, NULL, 'First <post>', 3.14159),
@@ -479,7 +481,9 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
-    for db in ["target", "busy", "deferred", "capped", "cached", "limited"] {
+    for db in [
+        "target", "busy", "deferred", "capped", "cached", "cycled", "limited",
+    ] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
             .expect("create db");
@@ -491,7 +495,9 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
              INSERT INTO notes (id, owner, body) VALUES (500, 1, 'mine');"
         ))
         .expect("source");
-    for db in ["target", "busy", "deferred", "capped", "cached", "limited"] {
+    for db in [
+        "target", "busy", "deferred", "capped", "cached", "cycled", "limited",
+    ] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
             .batch_execute(LEDGER)
@@ -595,6 +601,23 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
     assert_eq!(
         count(&cached, "SELECT COUNT(*) AS count FROM ledger").await,
+        0,
+        "the import rolls back"
+    );
+
+    // A `CYCLE` sequence wraps to its start after its last value, onto an
+    // imported key. Import refuses such a sequence.
+    let cycled = pool(&format!("{base}/cycled"));
+    PgConnection::establish(&format!("{base}/cycled"))
+        .expect("connect")
+        .batch_execute("ALTER SEQUENCE notes_id_seq CYCLE")
+        .expect("cycle");
+    let err = import_capsule(&capsule, &models, &PgCapsuleStore::new(cycled.clone()))
+        .await
+        .expect_err("cycling sequence");
+    assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
+    assert_eq!(
+        count(&cycled, "SELECT COUNT(*) AS count FROM ledger").await,
         0,
         "the import rolls back"
     );

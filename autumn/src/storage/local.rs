@@ -1124,10 +1124,25 @@ async fn commit_meta(
 }
 
 /// Remove the sidecar of `blob_path` only if it still holds `meta`.
+///
+/// The rename takes the sidecar that is in place at that moment, so the check
+/// and the removal act on one file. A sidecar of another writer goes back
+/// with a link, which never replaces a newer sidecar.
 async fn drop_own_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) {
-    if read_meta_sidecar(blob_path).await.as_ref() == Some(meta) {
-        drop_stale_sidecar(blob_path).await;
+    let path = meta_sidecar_path(blob_path);
+    let taken = temp_sibling_path(&path);
+    if tokio::fs::rename(&path, &taken).await.is_err() {
+        return;
     }
+    let ours = tokio::fs::read(&taken)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StoredBlobMeta>(&bytes).ok())
+        .is_some_and(|found| &found == meta);
+    if !ours {
+        let _ = tokio::fs::hard_link(&taken, &path).await;
+    }
+    let _ = tokio::fs::remove_file(&taken).await;
 }
 
 async fn drop_stale_sidecar(blob_path: &std::path::Path) {
@@ -1459,6 +1474,12 @@ mod tests {
         write_meta_sidecar(&path, &meta(b"theirs")).await.unwrap();
         drop_own_sidecar(&path, &meta(b"ours")).await;
         assert_eq!(read_meta_sidecar(&path).await, Some(meta(b"theirs")));
+        // No temp file stays next to the blob.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.bin.meta"]);
 
         drop_own_sidecar(&path, &meta(b"theirs")).await;
         assert_eq!(read_meta_sidecar(&path).await, None);

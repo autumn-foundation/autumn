@@ -188,7 +188,8 @@ capsule directory and to each directory above it.
   import does not change a sequence.
 - A key outside the range of its sequence is a conflict (`409`). A sequence
   with `CACHE` above 1 is refused (`501`): other sessions can hold cached
-  values that an imported key can take.
+  values that an imported key can take. A `CYCLE` sequence is refused
+  (`501`) too: after its last value, it starts again at an imported key.
 - **Import when no other writer uses the tables.** Another session can take a
   value from a sequence and insert its row later. If the capsule holds that
   key, the import succeeds and the other insert fails with a duplicate key.
