@@ -209,6 +209,10 @@ run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
 - Before it splits the pending set into batches, the CLI reads it with the
   same `lock_timeout` and retries, so a lock on `__diesel_schema_migrations`
   cannot block it.
+- Through a transaction pooler, `diesel` reads `__diesel_schema_migrations`
+  before the first migration's `SET LOCAL` runs, and no session setting
+  reaches that read. A lock held on that table can make this read wait. Run
+  migrations against Postgres directly to keep every step bounded.
 - libpq ignores `PGOPTIONS` when `DATABASE_URL` has an `options` parameter,
   in a `postgres://` URI or a keyword/value string (`host=db options='…'`).
   So the CLI takes that parameter out of the connection string and uses its

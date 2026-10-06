@@ -3289,10 +3289,10 @@ fn run_pending_locked_inner(
         let outcome: Result<MigrationResult, MigrationError> = (|| {
             // (2) Authoritative pre-apply validation: every already-applied
             //     version's recorded checksum vs its current on-disk up.sql.
+            //     The reads run under the policy `lock_timeout` and retry, so
+            //     a lock on either table fails fast instead of blocking boot.
             if let Some(up) = up_sql_by_version {
-                let recorded = recorded_checksums(conn)?;
-                let applied = load_applied_versions_lenient(conn)?;
-                validate_checksums(&applied, up, &recorded)?;
+                validate_checksums_under_policy(&mut *conn, up, policy)?;
             }
 
             // (3) Apply pending migrations, with `lock_timeout` and a jittered
@@ -3323,9 +3323,7 @@ fn run_pending_locked_inner(
             //     our edited on-disk `up.sql`, so the mismatch still fails fast
             //     before boot.
             if let Some(up) = up_sql_by_version {
-                let applied_versions = load_applied_versions_lenient(conn)?;
-                let recorded = recorded_checksums(conn)?;
-                validate_checksums(&applied_versions, up, &recorded)?;
+                validate_checksums_under_policy(&mut *conn, up, policy)?;
             }
 
             Ok(MigrationResult { applied })
@@ -3334,6 +3332,41 @@ fn run_pending_locked_inner(
         release_migration_lock_on(conn);
         outcome
     })
+}
+
+/// Compare the recorded checksums with `up_sql_by_version`, with the policy
+/// `lock_timeout` set for the session and a retry, then reset the session
+/// value. Steps (2) and (5) of [`run_pending_locked_inner`] (#3057).
+fn validate_checksums_under_policy<C>(
+    conn: &mut C,
+    up_sql_by_version: &HashMap<String, String>,
+    policy: MigrationLockPolicy,
+) -> Result<(), MigrationError>
+where
+    C: diesel::connection::LoadConnection<Backend = Pg> + diesel::connection::SimpleConnection,
+{
+    let _ = conn.batch_execute("SET lc_messages = 'C'");
+    conn.batch_execute(&session_lock_timeout_statement(policy.lock_timeout))
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    let outcome = retry_on_lock_timeout(
+        policy,
+        |delay| {
+            tracing::warn!(
+                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                "migration checksum check timed out waiting for a table lock; retrying"
+            );
+            std::thread::sleep(delay);
+        },
+        || {
+            let recorded = recorded_checksums(conn)?;
+            let applied = load_applied_versions_lenient(conn)?;
+            validate_checksums(&applied, up_sql_by_version, &recorded)
+        },
+    );
+    if conn.batch_execute("RESET lock_timeout").is_err() {
+        tracing::debug!("could not reset lock_timeout on the migration connection");
+    }
+    outcome
 }
 
 /// The framework migration sets every **shard** target requires.
@@ -5682,6 +5715,56 @@ mod tests {
         };
         let run = crate::time::spawn_blocking(move || {
             run_pending_locked_with_policy(&url, LOCK_PROBE_MIGRATIONS, None, policy)
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+
+        match result
+            .expect("must not block on the migrations table")
+            .expect("join")
+        {
+            Err(MigrationError::LockContention { attempts, .. }) => assert_eq!(attempts, 2),
+            other => panic!("expected LockContention, got {other:?}"),
+        }
+    }
+
+    /// Startup auto-migration checks checksums before and after it applies.
+    /// Those reads run under the policy too: a lock held on
+    /// `__diesel_schema_migrations` fails them fast instead of blocking boot.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn a_held_lock_fails_the_checksum_check_fast() {
+        let (_container, url) = lock_probe_database().await;
+        let first_url = url.clone();
+        crate::time::spawn_blocking(move || {
+            run_pending_locked_with_policy(
+                &first_url,
+                LOCK_PROBE_MIGRATIONS,
+                None,
+                MigrationLockPolicy::default(),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("the first run applies everything");
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = hold_table_lock(
+            url.clone(),
+            release_rx,
+            "__diesel_schema_migrations",
+            "ACCESS EXCLUSIVE",
+        );
+        let policy = MigrationLockPolicy {
+            lock_timeout: std::time::Duration::from_millis(200),
+            retries: 1,
+        };
+        let run = crate::time::spawn_blocking(move || {
+            // An empty map turns the checksum steps on without any files.
+            let up_sql = HashMap::new();
+            run_pending_locked_inner(&url, LOCK_PROBE_MIGRATIONS, None, Some(&up_sql), policy)
         });
         let result = tokio::time::timeout(std::time::Duration::from_secs(20), run).await;
         release_tx.send(()).expect("release");

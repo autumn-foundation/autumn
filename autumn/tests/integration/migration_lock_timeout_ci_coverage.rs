@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 /// Full test paths that ci.yml's Docker step passes as libtest filters.
-const CI_FILTERS: [&str; 7] = [
+const CI_FILTERS: [&str; 8] = [
     "migrate::tests::migration_blocked_by_a_held_lock_fails_fast_after_retries",
     "migrate::tests::migration_retry_applies_after_the_lock_is_released",
     "migrate::tests::non_transactional_migration_waits_without_lock_timeout",
@@ -15,6 +15,7 @@ const CI_FILTERS: [&str; 7] = [
     "migrate::tests::a_held_lock_on_the_migrations_table_fails_fast",
     "migrate::tests::server_lock_timeout_is_off_reads_the_database_default",
     "migrate::tests::the_pending_read_fails_fast_on_a_held_migrations_table_lock",
+    "migrate::tests::a_held_lock_fails_the_checksum_check_fast",
 ];
 
 fn workspace_root() -> PathBuf {
