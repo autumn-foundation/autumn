@@ -499,18 +499,8 @@ impl IdempotencyTx {
             if written != 1 {
                 return Err(claim_error(conn, &claim).await);
             }
-            // After a crash the record stays hidden until the lock frees. It
-            // must live a full TTL after that, or the retry runs again.
-            // `unlock` sets it back to `now + ttl` on a normal release.
-            #[allow(
-                clippy::arithmetic_side_effects,
-                reason = "a SQL expression, evaluated by the database"
-            )]
-            let crash_expiry = keys::locked_until_ms + ttl;
-            diesel::update(owned_key(&claim).filter(keys::locked_until_ms.gt(now_ms())))
-                .set(keys::expires_at_ms.eq(crash_expiry))
-                .execute(conn)
-                .await?;
+            // `unlock` sets the expiry back to `now + ttl` on a normal release.
+            keep_past_crash_lock(conn, &claim).await?;
             // The session already changed, so this record has no final
             // `Set-Cookie`. Keep it hidden until the session rewrite ends.
             if let Some(session) = &session
@@ -552,11 +542,11 @@ impl IdempotencyTx {
                 ))
                 .execute(conn)
                 .await?;
-            if written == 1 {
-                Ok(())
-            } else {
-                Err(claim_error(conn, &claim).await)
+            if written != 1 {
+                return Err(claim_error(conn, &claim).await);
             }
+            keep_past_crash_lock(conn, &claim).await?;
+            Ok(())
         }
     }
 
@@ -598,6 +588,30 @@ fn owned_key(claim: &TxClaim) -> HeldKey<'_> {
     keys::autumn_idempotency_keys
         .filter(keys::storage_key.eq(claim.storage_key.as_str()))
         .filter(keys::locked_by.eq(claim.owner.as_str()))
+}
+
+/// Keep the held row for one TTL after its lock frees.
+///
+/// After a crash, a retry can take the key only when the lock frees. The row
+/// (a record or a recovery point) must still be there, or the retry runs the
+/// committed work again. The expiry only moves later.
+async fn keep_past_crash_lock(
+    conn: &mut RuntimeConnection,
+    claim: &TxClaim,
+) -> diesel::QueryResult<()> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a SQL expression, evaluated by the database"
+    )]
+    let crash_expiry = keys::locked_until_ms + ms(claim.ttl);
+    let live = owned_key(claim)
+        .filter(keys::locked_until_ms.gt(now_ms()))
+        .filter(keys::expires_at_ms.lt(crash_expiry));
+    diesel::update(live)
+        .set(keys::expires_at_ms.eq(crash_expiry))
+        .execute(conn)
+        .await
+        .map(drop)
 }
 
 /// The recovery point of the row this request holds.
