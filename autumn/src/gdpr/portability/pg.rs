@@ -6,6 +6,7 @@
 //! digit. The SQL quotes all names, and each name is a checked identifier. The
 //! subject id is a bound parameter.
 
+use diesel::OptionalExtension as _;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _};
@@ -153,8 +154,12 @@ async fn describe_table(
         // `pg_attribute.attgenerated` only from Postgres 12.
         "SELECT a.attname::text AS name, \
                 format_type(a.atttypid, a.atttypmod) AS data_type, \
-                format_type(CASE WHEN t.typtype = 'd' THEN t.typbasetype \
-                                 ELSE a.atttypid END, NULL) AS base_type, \
+                (WITH RECURSIVE chain(oid, base, kind) AS ( \
+                     SELECT t.oid, t.typbasetype, t.typtype \
+                     UNION ALL \
+                     SELECT b.oid, b.typbasetype, b.typtype \
+                     FROM chain c JOIN pg_type b ON b.oid = c.base WHERE c.kind = 'd') \
+                 SELECT format_type(oid, NULL) FROM chain WHERE kind <> 'd' LIMIT 1) AS base_type, \
                 t.typtype = 'd' AS is_domain, \
                 NOT a.attnotnull AS nullable, \
                 COALESCE(c.is_generated = 'ALWAYS', false) AS generated \
@@ -184,7 +189,8 @@ async fn describe_table(
             field.nullable = r.nullable;
             field.generated = r.generated;
             // The manifest keeps the base type of a domain, so import can
-            // treat a domain over `money` as `money`.
+            // treat a domain over `money` as `money`. A domain over a domain
+            // resolves to the last base type.
             if r.is_domain {
                 field.base_type = Some(r.base_type.clone());
             }
@@ -397,9 +403,26 @@ impl CapsuleStore for PgCapsuleStore {
                         .execute(conn)
                         .await
                         .map_err(|e| store_error("check deferred constraints", &e))?;
+                    // Check every move first: one `setval` that fails after
+                    // another one ran would leave a changed sequence.
+                    let mut moves = Vec::new();
                     for (_, _, batch) in &statements {
-                        advance_sequence(conn, &batch.model.table, &batch.model.primary_key)
-                            .await?;
+                        if let Some(next) =
+                            plan_sequence(conn, &batch.model.table, &batch.model.primary_key)
+                                .await?
+                        {
+                            moves.push(next);
+                        }
+                    }
+                    for (seq, value, table) in moves {
+                        diesel::sql_query("SELECT setval($1::regclass, $2)")
+                            .bind::<diesel::sql_types::Text, _>(seq)
+                            .bind::<diesel::sql_types::BigInt, _>(value)
+                            .execute(conn)
+                            .await
+                            .map_err(|e| {
+                                store_error(&format!("advance sequence of {table}"), &e)
+                            })?;
                     }
                     Ok(())
                 })
@@ -495,12 +518,33 @@ fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
     ))
 }
 
-/// Move a serial or identity sequence past the largest imported key.
-async fn advance_sequence(
+#[derive(diesel::QueryableByName)]
+struct SequencePlan {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    target: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    cache: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    min: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    max: i64,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    needed: bool,
+}
+
+/// The `setval` that moves a serial or identity sequence past the imported
+/// keys, as `(sequence, value, table)`, or `None` when no move is needed.
+///
+/// # Errors
+///
+/// [`DataCapsuleError::NotConfigured`] for a sequence with `CACHE` above 1:
+/// other sessions can hold cached values, and `setval` does not take them
+/// back. [`DataCapsuleError::Conflict`] for a key outside the sequence range.
+async fn plan_sequence(
     conn: &mut AsyncPgConnection,
     table: &str,
     primary_key: &str,
-) -> Result<(), DataCapsuleError> {
+) -> Result<Option<(String, i64, String)>, DataCapsuleError> {
     let quoted_table = quote(table)?;
     let seq: SequenceRow = diesel::sql_query("SELECT pg_get_serial_sequence($1, $2) AS seq")
         .bind::<diesel::sql_types::Text, _>(&quoted_table)
@@ -509,28 +553,48 @@ async fn advance_sequence(
         .await
         .map_err(|e| store_error(&format!("sequence of {table}"), &e))?;
     let Some(seq) = seq.seq else {
-        return Ok(());
+        return Ok(None);
     };
     let pk = quote(primary_key)?;
-    // Move the sequence past the imported keys, in its own direction. An
+    // The sequence moves past the imported keys, in its own direction. An
     // unused sequence has no last value: then compare with the value before
     // its start.
-    diesel::sql_query(format!(
-        "SELECT setval($1::regclass, s.m) \
+    let plan: Option<SequencePlan> = diesel::sql_query(format!(
+        "SELECT s.m AS target, s.cache, s.min, s.max, CASE WHEN s.inc > 0 \
+           THEN s.m > COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) \
+           ELSE s.m < COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) END AS needed \
          FROM (SELECT CASE WHEN q.seqincrement > 0 THEN MAX(t.{pk}) ELSE MIN(t.{pk}) END::bigint AS m, \
-                      q.seqincrement AS inc, q.seqstart AS start \
+                      q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
+                      q.seqmin AS min, q.seqmax AS max \
                FROM {quoted_table} t CROSS JOIN pg_sequence q \
                WHERE q.seqrelid = $1::regclass \
-               GROUP BY q.seqincrement, q.seqstart) s \
-         WHERE s.m IS NOT NULL AND CASE WHEN s.inc > 0 \
-           THEN s.m > COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) \
-           ELSE s.m < COALESCE(pg_sequence_last_value($1::regclass), s.start - s.inc) END"
+               GROUP BY q.seqincrement, q.seqstart, q.seqcache, q.seqmin, q.seqmax) s \
+         WHERE s.m IS NOT NULL"
     ))
-    .bind::<diesel::sql_types::Text, _>(seq)
-    .execute(conn)
+    .bind::<diesel::sql_types::Text, _>(&seq)
+    .get_result(conn)
     .await
-    .map_err(|e| store_error(&format!("advance sequence of {table}"), &e))?;
-    Ok(())
+    .optional()
+    .map_err(|e| store_error(&format!("sequence of {table}"), &e))?;
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    if plan.cache > 1 {
+        return Err(DataCapsuleError::NotConfigured(format!(
+            "the sequence of {table} caches {} values; import needs CACHE 1",
+            plan.cache
+        )));
+    }
+    if !plan.needed {
+        return Ok(None);
+    }
+    if plan.target < plan.min || plan.target > plan.max {
+        return Err(DataCapsuleError::Conflict(format!(
+            "key {} of {table} is outside its sequence range ({}..{})",
+            plan.target, plan.min, plan.max
+        )));
+    }
+    Ok(Some((seq, plan.target, table.to_owned())))
 }
 
 #[cfg(test)]

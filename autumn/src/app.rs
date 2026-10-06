@@ -7584,7 +7584,7 @@ impl AppBuilder {
 
         #[cfg(feature = "db")]
         let (topology, shards) = if verify {
-            (None, None)
+            verify_database_parts(&config, shard_router)
         } else {
             match setup_database(
                 &config,
@@ -8788,9 +8788,64 @@ fn emit_data_capsule_report(
     std::process::exit(i32::from(result.is_err()));
 }
 
+/// The database state that verify gives to the state initializers.
+///
+/// The pools are lazy: verify does not connect and runs no migration. An
+/// initializer still sees `pool()` and `shards()`, for example to build a
+/// routed `CapsuleService`.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+fn verify_database_parts(
+    config: &AutumnConfig,
+    shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+) -> (
+    Option<crate::db::DatabaseTopology>,
+    Option<crate::sharding::ShardSet>,
+) {
+    let topology = crate::db::create_topology(&config.database).ok().flatten();
+    let router = shard_router.unwrap_or_else(|| Arc::new(crate::sharding::HashShardRouter));
+    let shards = crate::sharding::create_shard_set(&config.database, router)
+        .ok()
+        .flatten();
+    (topology, shards)
+}
+
+/// A SQLite pool can create its file, so verify gives no database state.
+#[cfg(feature = "sqlite")]
+fn verify_database_parts(
+    _config: &AutumnConfig,
+    _shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+) -> (
+    Option<crate::db::DatabaseTopology>,
+    Option<crate::sharding::ShardSet>,
+) {
+    (None, None)
+}
+
 #[cfg(test)]
 mod data_capsule_mode_tests {
     use super::*;
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[test]
+    fn verify_gives_initializers_lazy_pools_and_shards() {
+        // A state initializer can build a routed store from `shards()`, so
+        // verify keeps the shape of the state. The pools must not connect:
+        // nothing listens on port 9.
+        let mut config = AutumnConfig::default();
+        config.database.url = Some("postgres://u:p@127.0.0.1:9/none".to_owned());
+        config.database.shards = vec![crate::config::ShardConfig {
+            name: "s1".to_owned(),
+            primary_url: crate::test_urls::primary("s1"),
+            slots: None,
+            replica_url: None,
+            primary_pool_size: None,
+            replica_pool_size: None,
+            replica_fallback: None,
+        }];
+        let (topology, shards) = verify_database_parts(&config, None);
+        assert!(topology.is_some(), "a lazy control pool");
+        assert_eq!(shards.map(|s| s.len()), Some(1), "the configured shard");
+    }
 
     #[test]
     fn mode_parses_the_three_values_and_ignores_others() {

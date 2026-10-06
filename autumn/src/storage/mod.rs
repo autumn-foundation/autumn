@@ -201,27 +201,23 @@ pub trait BlobStore: Send + Sync + 'static {
     fn put<'a>(&'a self, key: &'a str, content_type: &'a str, bytes: Bytes)
     -> BlobFuture<'a, Blob>;
 
-    /// Store `bytes` under `key` only when `key` is free.
+    /// Store `bytes` under `key` only when `key` is free, in one atomic step.
     ///
-    /// Returns `None` and writes nothing when `key` exists. The default
-    /// checks with [`head`](BlobStore::head) and then calls
-    /// [`put`](BlobStore::put), so another writer can still take the key
-    /// between the two calls. A backend with a conditional write overrides
-    /// it. [`LocalBlobStore`] does.
+    /// Returns `None` and writes nothing when `key` exists. A check and a
+    /// write in two steps can replace a blob of another writer, so the
+    /// default returns [`BlobStoreError::Unsupported`]. [`LocalBlobStore`]
+    /// and the S3 backend override it with a conditional create.
     fn put_if_absent<'a>(
         &'a self,
         key: &'a str,
         content_type: &'a str,
         bytes: Bytes,
     ) -> BlobFuture<'a, Option<Blob>> {
-        Box::pin(async move {
-            match self.head(key).await {
-                Ok(Some(_)) => Ok(None),
-                Ok(None) | Err(BlobStoreError::NotFound(_)) => {
-                    self.put(key, content_type, bytes).await.map(Some)
-                }
-                Err(err) => Err(err),
-            }
+        let _ = (key, content_type, bytes);
+        Box::pin(async {
+            Err(BlobStoreError::Unsupported(
+                "this storage backend has no conditional create (put_if_absent)".into(),
+            ))
         })
     }
 
@@ -926,6 +922,48 @@ mod tests {
         fn presigned_url<'a>(&'a self, _: &'a str, _: Duration) -> BlobFuture<'a, String> {
             Box::pin(async { Err(BlobStoreError::Unsupported("noop".into())) })
         }
+    }
+
+    /// A store whose `put` must not run.
+    struct NoConditionalStore;
+    impl BlobStore for NoConditionalStore {
+        fn provider_id(&self) -> &'static str {
+            "plain"
+        }
+        fn put<'a>(&'a self, _: &'a str, _: &'a str, _: bytes::Bytes) -> BlobFuture<'a, Blob> {
+            panic!("put_if_absent must not fall back to an overwriting put")
+        }
+        fn put_stream<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: ByteStream<'a>,
+        ) -> BlobFuture<'a, Blob> {
+            panic!("not used")
+        }
+        fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, bytes::Bytes> {
+            Box::pin(async move { Err(BlobStoreError::NotFound(key.to_owned())) })
+        }
+        fn delete<'a>(&'a self, _: &'a str) -> BlobFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn head<'a>(&'a self, _: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn presigned_url<'a>(&'a self, _: &'a str, _: Duration) -> BlobFuture<'a, String> {
+            Box::pin(async { Err(BlobStoreError::Unsupported("plain".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_default_refuses_instead_of_overwriting() {
+        // A check and a write in two steps can replace a blob of another
+        // writer, so the default does not try.
+        let err = NoConditionalStore
+            .put_if_absent("a/b.png", "image/png", bytes::Bytes::from_static(b"x"))
+            .await
+            .expect_err("no conditional create");
+        assert!(matches!(err, BlobStoreError::Unsupported(_)), "{err:?}");
     }
 
     #[tokio::test]

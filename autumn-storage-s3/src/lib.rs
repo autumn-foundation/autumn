@@ -262,6 +262,48 @@ impl BlobStore for S3BlobStore {
         })
     }
 
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        content_type: &'a str,
+        bytes: Bytes,
+    ) -> BlobFuture<'a, Option<Blob>> {
+        let byte_size = bytes.len() as u64;
+        Box::pin(async move {
+            validate_key(key)?;
+            // `If-None-Match: *` makes S3 refuse the write (412) when the key
+            // exists, so a blob of another writer is never replaced. A 409
+            // means a parallel conditional write: the key is taken too.
+            let result = self
+                .client
+                .put_object()
+                .bucket(&self.options.bucket)
+                .key(key)
+                .content_type(content_type)
+                .if_none_match("*")
+                .body(bytes.into())
+                .send()
+                .await;
+            match result {
+                Ok(output) => {
+                    let mut blob =
+                        Blob::new(&self.options.provider_id, key, content_type, byte_size);
+                    if let Some(etag) = output.e_tag() {
+                        blob = blob.with_etag(etag.to_owned());
+                    }
+                    Ok(Some(blob))
+                }
+                Err(e)
+                    if e.raw_response()
+                        .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
+                {
+                    Ok(None)
+                }
+                Err(e) => Err(BlobStoreError::backend(e.to_string())),
+            }
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn put_stream<'a>(
         &'a self,
@@ -627,6 +669,87 @@ mod tests {
                 bucket: "test-bucket".to_owned(),
             }),
         }
+    }
+
+    /// Serve one HTTP request on a local port and answer with `status`.
+    /// The task gives back the request head, in lower case.
+    async fn serve_one(status: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut buf, mut chunk) = (Vec::new(), [0_u8; 4096]);
+            let head = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "the request ended early");
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                if buf.len() >= end + 4 + body_len {
+                    break head;
+                }
+            };
+            let body = if status.starts_with("412") {
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>PreconditionFailed</Code>\
+                 <Message>At least one of the pre-conditions you specified did not hold</Message>\
+                 </Error>"
+            } else {
+                ""
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\netag: \"e1\"\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            head
+        });
+        (endpoint, task)
+    }
+
+    fn store_at(endpoint: &str) -> S3BlobStore {
+        let client = test_client(endpoint);
+        S3BlobStore {
+            client: client.clone(),
+            presign_client: client,
+            options: Arc::new(S3Options {
+                provider_id: "s3".to_owned(),
+                bucket: "test-bucket".to_owned(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_asks_s3_to_refuse_a_taken_key() {
+        let (endpoint, server) = serve_one("412 Precondition Failed").await;
+        let result = store_at(&endpoint)
+            .put_if_absent("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .expect("412 means the key is taken");
+        assert!(result.is_none(), "{result:?}");
+        let head = server.await.unwrap();
+        assert!(head.starts_with("put /test-bucket/a/b.png"), "{head}");
+        assert!(head.contains("\r\nif-none-match: *"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_creates_a_free_key() {
+        let (endpoint, server) = serve_one("200 OK").await;
+        let blob = store_at(&endpoint)
+            .put_if_absent("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .expect("created")
+            .expect("the key was free");
+        assert_eq!(blob.byte_size, 3);
+        assert!(server.await.unwrap().contains("\r\nif-none-match: *"));
     }
 
     fn assert_invalid_input<T: std::fmt::Debug>(result: Result<T, BlobStoreError>) {

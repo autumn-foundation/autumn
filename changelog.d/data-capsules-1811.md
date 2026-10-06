@@ -13,6 +13,6 @@
 - **security:** `SigningSecretConfig` is now re-exported from
   `autumn_web::security`.
 - **storage:** `BlobStore::put_if_absent` writes a blob only when its key is
-  free. The default checks with `head` and then calls `put`.
-  `LocalBlobStore` does it in one step, so it never replaces a blob that
-  another writer made.
+  free, in one atomic step, so it never replaces a blob that another writer
+  made. `LocalBlobStore` and `S3BlobStore` (`If-None-Match: *`) implement it.
+  The default returns `BlobStoreError::Unsupported`.

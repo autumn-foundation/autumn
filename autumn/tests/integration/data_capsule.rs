@@ -813,11 +813,20 @@ mod blobs {
     }
 
     /// A blob store where another writer takes `raced` just before the
-    /// conditional write, and where `loses_mime` keeps no MIME type.
-    struct OddStore {
-        inner: LocalBlobStore,
+    /// conditional write, `loses_mime` keeps no MIME type, `vanishing` reports
+    /// a taken key that is gone again, and `plain` has no conditional create.
+    #[derive(Default)]
+    struct Odd {
         raced: Option<&'static str>,
         loses_mime: Option<&'static str>,
+        vanishing: Option<&'static str>,
+        replaced_after: Option<&'static str>,
+        plain: bool,
+    }
+
+    struct OddStore {
+        inner: LocalBlobStore,
+        odd: Odd,
     }
 
     impl BlobStore for OddStore {
@@ -839,12 +848,24 @@ mod blobs {
             bytes: Bytes,
         ) -> BlobFuture<'a, Option<Blob>> {
             Box::pin(async move {
-                if Some(key) == self.raced {
+                if self.odd.plain {
+                    return Err(BlobStoreError::Unsupported("plain".into()));
+                }
+                if Some(key) == self.odd.vanishing {
+                    return Ok(None);
+                }
+                if Some(key) == self.odd.raced {
                     self.inner
                         .put(key, "text/plain", Bytes::from_static(b"theirs"))
                         .await?;
                 }
-                self.inner.put_if_absent(key, content_type, bytes).await
+                let created = self.inner.put_if_absent(key, content_type, bytes).await?;
+                if Some(key) == self.odd.replaced_after {
+                    self.inner
+                        .put(key, "text/plain", Bytes::from_static(b"theirs"))
+                        .await?;
+                }
+                Ok(created)
             })
         }
         fn put_stream<'a>(
@@ -865,7 +886,7 @@ mod blobs {
             Box::pin(async move {
                 let meta = self.inner.head(key).await?;
                 Ok(meta.map(|mut meta| {
-                    if Some(key) == self.loses_mime {
+                    if Some(key) == self.odd.loses_mime {
                         "application/octet-stream".clone_into(&mut meta.content_type);
                     }
                     meta
@@ -904,8 +925,10 @@ mod blobs {
         // second key before the import writes it.
         let target = OddStore {
             inner: blob_store(&tmp.path().join("b")),
-            raced: Some("docs/ada-cv.txt"),
-            loses_mime: None,
+            odd: Odd {
+                raced: Some("docs/ada-cv.txt"),
+                ..Odd::default()
+            },
         };
         let err = restore_blobs(&capsule, &target)
             .await
@@ -943,8 +966,10 @@ mod blobs {
 
         let target = OddStore {
             inner: blob_store(&tmp.path().join("b")),
-            raced: None,
-            loses_mime: Some("docs/ada-cv.txt"),
+            odd: Odd {
+                loses_mime: Some("docs/ada-cv.txt"),
+                ..Odd::default()
+            },
         };
         let err = restore_blobs(&capsule, &target)
             .await
@@ -957,6 +982,87 @@ mod blobs {
                 "{key}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rollback_keeps_a_blob_that_another_writer_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source_blobs).await.unwrap();
+
+        // The import writes the avatar, another writer replaces it, then the
+        // second blob fails and the import rolls back.
+        let target = OddStore {
+            inner: blob_store(&tmp.path().join("b")),
+            odd: Odd {
+                replaced_after: Some("avatars/ada.png"),
+                loses_mime: Some("docs/ada-cv.txt"),
+                ..Odd::default()
+            },
+        };
+        restore_blobs(&capsule, &target)
+            .await
+            .expect_err("second blob fails");
+        assert_eq!(
+            target.get("avatars/ada.png").await.unwrap(),
+            Bytes::from_static(b"theirs"),
+            "rollback must not delete a blob that is not this import's"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_needs_a_store_with_a_conditional_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source_blobs).await.unwrap();
+
+        let plain = OddStore {
+            inner: blob_store(&tmp.path().join("b")),
+            odd: Odd {
+                plain: true,
+                ..Odd::default()
+            },
+        };
+        let err = restore_blobs(&capsule, &plain)
+            .await
+            .expect_err("no conditional create");
+        assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
+
+        // A store that says "taken" for a key that is free again: the blob
+        // is not there, so the import must not report success.
+        let vanishing = OddStore {
+            inner: blob_store(&tmp.path().join("c")),
+            odd: Odd {
+                vanishing: Some("avatars/ada.png"),
+                ..Odd::default()
+            },
+        };
+        let err = restore_blobs(&capsule, &vanishing)
+            .await
+            .expect_err("blob is not there");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
     }
 
     #[tokio::test]

@@ -397,6 +397,10 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
         .batch_execute(
             "CREATE TABLE accounts (code VARCHAR(5) PRIMARY KEY, note TEXT); \
              CREATE TABLE codes (code CHAR(5) PRIMARY KEY, note TEXT); \
+             CREATE DOMAIN inner_code AS VARCHAR(5); \
+             CREATE DOMAIN outer_code AS inner_code; \
+             CREATE TABLE nested (code outer_code PRIMARY KEY, note TEXT); \
+             INSERT INTO nested VALUES ('ab123', 'mine'); \
              CREATE TABLE fees (id INT PRIMARY KEY, amount NUMERIC(6, 2), note TEXT); \
              INSERT INTO accounts VALUES ('ab123', 'mine'); \
              INSERT INTO codes VALUES ('ab123', 'mine'); \
@@ -418,6 +422,11 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
             "ab123-extra",
         ),
         (CapsuleModel::new("fees", "amount"), "1.234"),
+        // A domain over a domain over `varchar(5)` cuts the value too.
+        (
+            CapsuleModel::new("nested", "code").primary_key("code"),
+            "ab123-extra",
+        ),
     ] {
         let err = export_subject(std::slice::from_ref(&model), &store, subject)
             .await
@@ -450,6 +459,10 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one schema, five target databases, checked step by step"
+)]
 async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success() {
     const LEDGER: &str = "
         CREATE TABLE ledger (
@@ -466,7 +479,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
-    for db in ["target", "busy", "deferred"] {
+    for db in ["target", "busy", "deferred", "capped", "cached"] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
             .expect("create db");
@@ -478,7 +491,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
              INSERT INTO notes (id, owner, body) VALUES (500, 1, 'mine');"
         ))
         .expect("source");
-    for db in ["target", "busy", "deferred"] {
+    for db in ["target", "busy", "deferred", "capped", "cached"] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
             .batch_execute(LEDGER)
@@ -549,6 +562,42 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     )
     .await;
     assert_eq!(last, "unused");
+
+    // A later sequence that cannot take its key must stop the import before
+    // the first `setval`: `notes` gets key 500, but its sequence stops at 100.
+    let capped = pool(&format!("{base}/capped"));
+    PgConnection::establish(&format!("{base}/capped"))
+        .expect("connect")
+        .batch_execute("ALTER SEQUENCE notes_id_seq MAXVALUE 100")
+        .expect("cap");
+    let err = import_capsule(&capsule, &models, &PgCapsuleStore::new(capped.clone()))
+        .await
+        .expect_err("key above MAXVALUE");
+    assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+    let last = text(
+        &capped,
+        "SELECT COALESCE(pg_sequence_last_value(pg_get_serial_sequence('ledger', 'id'))::text, \
+         'unused') AS value",
+    )
+    .await;
+    assert_eq!(last, "unused");
+
+    // Other sessions can hold cached values of a `CACHE 10` sequence, and
+    // `setval` does not take them back. Import refuses such a sequence.
+    let cached = pool(&format!("{base}/cached"));
+    PgConnection::establish(&format!("{base}/cached"))
+        .expect("connect")
+        .batch_execute("ALTER TABLE ledger ALTER COLUMN id SET CACHE 10")
+        .expect("cache");
+    let err = import_capsule(&capsule, &models, &PgCapsuleStore::new(cached.clone()))
+        .await
+        .expect_err("cached sequence");
+    assert!(matches!(err, DataCapsuleError::NotConfigured(_)), "{err:?}");
+    assert_eq!(
+        count(&cached, "SELECT COUNT(*) AS count FROM ledger").await,
+        0,
+        "the import rolls back"
+    );
 
     drop(container);
 }
