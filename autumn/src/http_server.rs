@@ -41,7 +41,7 @@ use axum::serve::Listener;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::time::Instant;
 
 use crate::config::HttpServerConfig;
@@ -133,9 +133,81 @@ impl<L: Listener> IncomingStream<'_, L> {
 ///
 /// Never returns an error today. The `io::Result` matches `axum::serve`.
 pub async fn serve<L, M, S, F>(
+    listener: L,
+    make_service: M,
+    limits: HttpLimits,
+    signal: F,
+) -> io::Result<()>
+where
+    L: Listener,
+    L::Addr: Debug,
+    M: for<'a> tower::Service<IncomingStream<'a, L>, Error = Infallible, Response = S>
+        + Send
+        + 'static,
+    for<'a> <M as tower::Service<IncomingStream<'a, L>>>::Future: Send,
+    S: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    serve_with_handoff(listener, make_service, limits, None, signal).await
+}
+
+/// Where a listener that accepts in the background (TLS) puts the
+/// `max_connections` slot of the stream it returns. The listener takes the
+/// slot before TCP accept, so the serve loop does not take one.
+pub(crate) type SlotHandoff = Arc<Mutex<Option<Slot>>>;
+
+/// A held `max_connections` slot. Dropping it frees the slot. The permit
+/// type is hidden, so a type that holds a slot is not a "significant drop"
+/// type for clippy in user code (for example `TlsListener`).
+pub(crate) type Slot = Box<dyn Send + Sync>;
+
+impl HttpLimits {
+    /// The `max_connections` slots, unless the listener takes them.
+    fn slots(&self, listener_takes_slots: bool) -> Option<Arc<Semaphore>> {
+        self.max_connections
+            .filter(|_| !listener_takes_slots)
+            .map(|n| Arc::new(Semaphore::new(n)))
+    }
+}
+
+/// Wait for a free connection slot. `None` when `closed` resolves first.
+async fn wait_for_slot(
+    permits: Option<&Arc<Semaphore>>,
+    closed: impl std::future::Future<Output = ()>,
+) -> Option<Option<Slot>> {
+    let Some(permits) = permits else {
+        return Some(None);
+    };
+    tokio::select! {
+        permit = Arc::clone(permits).acquire_owned() => {
+            Some(permit.ok().map(|permit| Box::new(permit) as Slot))
+        }
+        () = closed => None,
+    }
+}
+
+/// The slot the listener put in `handoff` for the stream it returned.
+fn take_handoff(handoff: Option<&SlotHandoff>) -> Option<Slot> {
+    handoff?
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// [`serve`], with the connection slots taken by the listener when
+/// `handoff` is set.
+pub(crate) async fn serve_with_handoff<L, M, S, F>(
     mut listener: L,
     mut make_service: M,
     limits: HttpLimits,
+    handoff: Option<SlotHandoff>,
     signal: F,
 ) -> io::Result<()>
 where
@@ -157,7 +229,7 @@ where
 {
     use tower::ServiceExt as _;
 
-    let permits = limits.max_connections.map(|n| Arc::new(Semaphore::new(n)));
+    let permits = limits.slots(handoff.is_some());
     let builder = limits.builder();
     let (signal_tx, signal_rx) = watch::channel(());
     tokio::spawn(async move {
@@ -169,17 +241,18 @@ where
     loop {
         // At the cap, wait for a free slot before `accept`. The kernel queues
         // new connections meanwhile.
-        let permit = match &permits {
-            Some(permits) => tokio::select! {
-                permit = Arc::clone(permits).acquire_owned() => permit.ok(),
-                () = signal_tx.closed() => break,
-            },
-            None => None,
+        #[allow(
+            clippy::significant_drop_tightening,
+            reason = "the slot must live as long as the connection"
+        )]
+        let Some(permit) = wait_for_slot(permits.as_ref(), signal_tx.closed()).await else {
+            break;
         };
         let (io, remote_addr) = tokio::select! {
             conn = listener.accept() => conn,
             () = signal_tx.closed() => break,
         };
+        let permit = permit.or_else(|| take_handoff(handoff.as_ref()));
 
         make_service
             .ready()
@@ -829,7 +902,7 @@ impl ConnTimers {
 struct ConnIo<I> {
     inner: I,
     timers: Option<Arc<ConnTimers>>,
-    _permit: Option<OwnedSemaphorePermit>,
+    _permit: Option<Slot>,
 }
 
 impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {

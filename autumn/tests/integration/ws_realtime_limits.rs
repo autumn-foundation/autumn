@@ -44,7 +44,11 @@ async fn split_writer() -> impl WsHandler {
             let _sink = sink;
             std::future::pending::<()>().await;
         });
-        while let Some(Ok(_)) = stream.next().await {}
+        while let Some(Ok(msg)) = stream.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
     }
 }
 
@@ -275,4 +279,33 @@ async fn a_receive_error_releases_a_split_socket() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(bad);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_close_releases_a_split_socket() {
+    let addr = serve_with(|c| c.realtime.max_connections = Some(1)).await;
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
+        .await
+        .expect("first socket");
+    client.send(TMessage::Close(None)).await.unwrap();
+    // The server answers the close although its reader stopped at once.
+    let reply = tokio::time::timeout(Duration::from_secs(5), client.next())
+        .await
+        .expect("close reply in time");
+    assert!(matches!(reply, Some(Ok(TMessage::Close(_)))), "{reply:?}");
+    // The slot comes free, although the writer half lives on.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio_tungstenite::connect_async(format!("ws://{addr}/split"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the closed socket still holds the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

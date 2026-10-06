@@ -405,10 +405,12 @@ impl std::fmt::Debug for ConnectionHold {
 /// What the stream yields after the close frame is sent.
 enum AfterClose {
     Error(axum::Error),
+    /// The peer's close frame. The reply is already queued.
+    Message(Message),
     End,
 }
 
-/// A close frame waiting to be sent.
+/// A close frame waiting to be sent (or, for a peer close, only flushed).
 struct Closing {
     frame: Option<Message>,
     then: Option<AfterClose>,
@@ -571,9 +573,9 @@ impl WebSocket {
         self.wake_writer();
     }
 
-    fn start_close(&mut self, frame: Message, then: AfterClose) {
+    fn start_close(&mut self, frame: Option<Message>, then: AfterClose) {
         self.closing = Some(Closing {
-            frame: Some(frame),
+            frame,
             then: Some(then),
             deadline: Box::pin(tokio::time::sleep(CLOSE_FLUSH_TIMEOUT)),
         });
@@ -627,6 +629,7 @@ impl WebSocket {
         self.finish();
         Poll::Ready(match then {
             Some(AfterClose::Error(error)) => Some(Err(error)),
+            Some(AfterClose::Message(msg)) => Some(Ok(msg)),
             Some(AfterClose::End) | None => None,
         })
     }
@@ -679,11 +682,18 @@ impl futures::Stream for WebSocket {
                     if matches!(&msg, Message::Pong(payload) if payload.as_ref() == PING_PAYLOAD) {
                         continue;
                     }
+                    if matches!(msg, Message::Close(_)) {
+                        // A peer close ends the socket. Flush the reply that
+                        // tungstenite queued, release the socket, then yield
+                        // the frame: a handler that stops here leaks nothing.
+                        this.start_close(None, AfterClose::Message(msg));
+                        continue;
+                    }
                     return Poll::Ready(Some(Ok(msg)));
                 }
                 Poll::Ready(Some(Err(error))) if is_message_too_big(&error) => {
                     this.start_close(
-                        close_frame(close_code::SIZE, "message too big"),
+                        Some(close_frame(close_code::SIZE, "message too big")),
                         AfterClose::Error(error),
                     );
                     continue;
@@ -704,7 +714,7 @@ impl futures::Stream for WebSocket {
                 && sleep.as_mut().poll(cx).is_ready()
             {
                 this.start_close(
-                    close_frame(close_code::AWAY, "idle timeout"),
+                    Some(close_frame(close_code::AWAY, "idle timeout")),
                     AfterClose::End,
                 );
                 continue;

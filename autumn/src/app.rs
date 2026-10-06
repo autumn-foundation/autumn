@@ -5599,7 +5599,12 @@ impl AppBuilder {
             // shutdown wiring all behave exactly as on plain TCP. Only the
             // rustls handshake inside the listener's `accept` differs.
             #[cfg(feature = "tls")]
-            BoundListener::Tls(listener) => {
+            BoundListener::Tls(mut listener) => {
+                // The listener takes the `max_connections` slots before TCP
+                // accept, so a connection counts during its TLS handshake too.
+                let handoff = http_limits
+                    .max_connections
+                    .map(|max| listener.limit_connections(max));
                 // Applied inside the connect-info layer (which
                 // `into_make_service_with_connect_info` installs outermost), so
                 // this sees `ConnectInfo<TlsConnectInfo>` and everything below
@@ -5619,13 +5624,14 @@ impl AppBuilder {
                         crate::tls::TlsConnectInfo,
                     >(service);
                 Box::pin(async move {
-                    crate::http_server::serve(
+                    crate::http_server::serve_with_handoff(
                         crate::accept_drain::StopAcceptingOnShutdown::new(
                             listener,
                             server_shutdown_wait.clone(),
                         ),
                         make_service,
                         http_limits,
+                        handoff,
                         crate::accept_drain::drain_signal(server_shutdown_wait),
                     )
                     .await
