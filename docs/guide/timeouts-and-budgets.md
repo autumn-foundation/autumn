@@ -78,6 +78,11 @@ header. The value is in milliseconds, relative to now. It is not a timestamp,
 so clock skew between hosts has no effect. The client sends it only when a
 deadline is set, and it sends it to every host, third-party APIs too.
 
+Each attempt and each redirect hop gets a new value. Under a deadline the
+client follows a redirect itself, not inside the HTTP stack, so the next host
+gets the time left at that hop. It follows at most 10 hops, then returns
+`ClientError::TooManyRedirects`.
+
 The server can read the header from its callers. This is off by default:
 
 ```toml

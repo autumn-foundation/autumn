@@ -1238,6 +1238,7 @@ impl Client {
     pub fn with_timeout(timeout: Duration) -> Self {
         let inner = reqwest::ClientBuilder::new()
             .timeout(timeout)
+            .redirect(pooled_redirect_policy())
             .build()
             .expect("failed to build reqwest client");
         Self {
@@ -1269,6 +1270,7 @@ impl Client {
     pub(crate) fn build_inner(config: &crate::config::HttpClientConfig) -> reqwest::Client {
         reqwest::ClientBuilder::new()
             .timeout(Duration::from_secs(config.timeout_secs))
+            .redirect(pooled_redirect_policy())
             .build()
             .expect("failed to build reqwest client")
     }
@@ -1602,6 +1604,35 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
 
 /// Type alias for a redirect-`Location` validator.
 type RedirectValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The hop limit of the plain send path, as in reqwest's default policy.
+const PLAIN_MAX_REDIRECTS: usize = 10;
+
+/// The redirect policy of the pooled client: reqwest's default of
+/// [`PLAIN_MAX_REDIRECTS`] hops, but no automatic hop while a request
+/// deadline is set. The plain send path then follows the redirect itself, so
+/// each hop sends the time left at that hop in [`DEADLINE_HEADER`] (issue
+/// #3058).
+fn pooled_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if Deadline::current().is_some() {
+            attempt.stop()
+        } else if attempt.previous().len() >= PLAIN_MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// The client of one hop of [`RequestBuilder::follow_loop`].
+#[derive(Clone, Copy)]
+enum HopClient<'a> {
+    /// The pooled client of the plain path.
+    Pooled(&'a reqwest::Client),
+    /// A new client per hop, with this timeout.
+    OneShot(Duration),
+}
 
 /// Per-request redirect handling.
 ///
@@ -2118,6 +2149,9 @@ impl RequestBuilder {
         let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
         let mut gate = self.retry_gate(url_host(&self.url).as_deref());
+        if gate.deadline.is_some() {
+            return self.follow_pooled(suppress_retries, &gate).await;
+        }
         let mut last_retry = None;
         let mut delay = Duration::ZERO;
 
@@ -2229,6 +2263,25 @@ impl RequestBuilder {
             host,
             self.retry.send_deadline_header,
         )
+    }
+
+    /// The plain path under a request deadline. The pooled client does not
+    /// follow a redirect then (see `pooled_redirect_policy`), so this follows
+    /// it, and each hop sends the time left at that hop.
+    async fn follow_pooled(
+        self,
+        suppress_retries: bool,
+        gate: &RetryGate,
+    ) -> Result<Response, ClientError> {
+        let client = self.client.clone();
+        self.follow_loop(
+            PLAIN_MAX_REDIRECTS,
+            Arc::new(|_: &str| true),
+            HopClient::Pooled(&client),
+            suppress_retries,
+            gate,
+        )
+        .await
     }
 
     /// Add an `Idempotency-Key` header when this request can retry a
@@ -2493,7 +2546,13 @@ impl RequestBuilder {
         };
         if let Some((max, validator)) = follow {
             return self
-                .follow_loop(max, validator, timeout, is_half_open, &gate)
+                .follow_loop(
+                    max,
+                    validator,
+                    HopClient::OneShot(timeout),
+                    is_half_open,
+                    &gate,
+                )
                 .await;
         }
 
@@ -2539,7 +2598,7 @@ impl RequestBuilder {
         self,
         max: usize,
         validator: RedirectValidator,
-        timeout: Duration,
+        hop_client: HopClient<'_>,
         is_half_open: bool,
         gate: &RetryGate,
     ) -> Result<Response, ClientError> {
@@ -2566,7 +2625,12 @@ impl RequestBuilder {
             if hop > 0 {
                 strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
             }
-            let client = build_oneshot_client(resolve, reqwest::redirect::Policy::none(), timeout)?;
+            let client = match hop_client {
+                HopClient::Pooled(client) => client.clone(),
+                HopClient::OneShot(timeout) => {
+                    build_oneshot_client(resolve, reqwest::redirect::Policy::none(), timeout)?
+                }
+            };
             // Each hop uses the retry budget of its own host.
             let hop_gate;
             let hop_gate = if hop == 0 {
@@ -6176,6 +6240,70 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::circuit_breaker::global_registry().clear();
             guard
+        }
+
+        /// A server where `/r` waits `delay`, then redirects to `/t`. Both
+        /// record the deadline header they get.
+        async fn redirecting(delay: Duration) -> (String, Arc<Mutex<Vec<(String, u64)>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let record = |path: &'static str, seen: Arc<Mutex<Vec<(String, u64)>>>| {
+                move |headers: HeaderMap| {
+                    let millis = headers
+                        .get(DEADLINE_HEADER)
+                        .and_then(|value| value.to_str().ok()?.parse().ok())
+                        .unwrap_or(u64::MAX);
+                    seen.lock().unwrap().push((path.to_owned(), millis));
+                }
+            };
+            let at_r = record("/r", Arc::clone(&seen));
+            let at_t = record("/t", Arc::clone(&seen));
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        at_r(headers);
+                        tokio::time::sleep(delay).await;
+                        axum::response::Redirect::temporary("/t")
+                    }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        at_t(headers);
+                        "done"
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (format!("http://127.0.0.1:{}/r", addr.port()), seen)
+        }
+
+        #[tokio::test]
+        async fn plain_path_sends_a_fresh_deadline_header_after_a_redirect() {
+            let (url, seen) = redirecting(Duration::from_millis(500)).await;
+            let response = with_deadline(Duration::from_secs(3), Client::new().get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let seen = seen.lock().unwrap().clone();
+            let [(first, at_origin), (second, at_target)] = seen.as_slice() else {
+                panic!("two hops: {seen:?}");
+            };
+            assert_eq!((first.as_str(), second.as_str()), ("/r", "/t"));
+            assert!(*at_origin <= 3_000, "{seen:?}");
+            assert!(
+                *at_target + 400 <= *at_origin,
+                "the target gets the time left after the redirect: {seen:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn plain_path_follows_a_redirect_without_a_deadline() {
+            let (url, seen) = redirecting(Duration::ZERO).await;
+            let response = Client::new().get(&url).send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(seen.lock().unwrap().len(), 2);
         }
 
         #[tokio::test]
