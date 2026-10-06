@@ -264,6 +264,93 @@ async fn signal_follows_runtime_config_without_redeploy() {
     assert!(signal.is_high());
 }
 
+// ── Background work (slice 2) ───────────────────────────────────────
+
+/// The ambient tenant that the job handler saw. `None` until the job runs.
+static JOB_SAW_TENANT: std::sync::Mutex<Option<Ambient>> = std::sync::Mutex::new(None);
+
+#[derive(Debug, PartialEq, Eq)]
+struct Ambient(Option<String>);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ReportArgs {}
+
+#[job(name = "cost_metering_report")]
+async fn cost_metering_report(_state: AppState, _args: ReportArgs) -> AutumnResult<()> {
+    let ambient = autumn_web::tenancy::CURRENT_TENANT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten();
+    *JOB_SAW_TENANT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Ambient(ambient));
+    Ok(())
+}
+
+#[post("/report")]
+async fn report() -> AutumnResult<&'static str> {
+    CostMeteringReportJob::enqueue(ReportArgs {}).await?;
+    Ok("queued")
+}
+
+/// A local job's cost goes to the tenant that enqueued it. The handler still
+/// runs with no ambient tenant: the tenant is used only to attribute cost.
+#[tokio::test]
+async fn local_job_cost_goes_to_the_enqueuing_tenant() {
+    let _guard = autumn_web::job::global_job_runtime_test_lock().lock().await;
+    autumn_web::job::clear_global_job_client();
+    *JOB_SAW_TENANT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+    let client = TestApp::new()
+        .config(metered_config())
+        .routes(routes![report])
+        .jobs(jobs![cost_metering_report])
+        .build();
+    client
+        .post("/report")
+        .header("x-tenant-id", "acme")
+        .send()
+        .await
+        .assert_ok();
+
+    let accountant = accountant(&client);
+    for _ in 0..200 {
+        if accountant.snapshot().jobs.total.runs > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let snapshot = accountant.snapshot();
+    assert_eq!(
+        snapshot.jobs.tenants.get("acme").map(|c| c.runs),
+        Some(1),
+        "{snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.tenants["acme"].requests, 1,
+        "the request is separate"
+    );
+    assert_eq!(
+        *JOB_SAW_TENANT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        Some(Ambient(None)),
+        "the job handler has no ambient tenant"
+    );
+
+    let body: serde_json::Value = client.get("/actuator/cost").send().await.json();
+    assert_eq!(body["jobs"]["tenants"]["acme"]["runs"], 1, "{body}");
+    assert!(body["jobs"]["shift"]["ratio"].is_null(), "{body}");
+
+    let scrape = client.get("/actuator/prometheus").send().await.text();
+    assert!(
+        scrape.contains("autumn_cost_work_runs_total{kind=\"job\",tenant=\"acme\"} 1"),
+        "{scrape}"
+    );
+}
+
 #[cfg(all(feature = "db", feature = "test-support"))]
 mod db_queries {
     use super::*;
