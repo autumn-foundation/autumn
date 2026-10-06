@@ -104,6 +104,24 @@ pub fn log_delivery_ignores(stored: &WebhookDeliveryLog, new: &WebhookDeliveryLo
     is_success(stored) || (!is_success(new) && (repeat || stale))
 }
 
+/// `true` when `new` is a failure that `stored` already counted: `stored` has
+/// an outcome for the same attempt. A DLQ move of a failed attempt is stored,
+/// but it is not a new failure.
+#[must_use]
+pub fn log_delivery_repeats_failure(
+    stored: Option<&WebhookDeliveryLog>,
+    new: &WebhookDeliveryLog,
+) -> bool {
+    let is_success = new
+        .response_status
+        .is_some_and(|status| (200..300).contains(&status));
+    !is_success
+        && stored.is_some_and(|stored| {
+            (stored.response_status.is_some() || stored.last_error.is_some())
+                && stored.attempt == new.attempt
+        })
+}
+
 /// Pluggable handler interface for outbound webhook subscriptions and delivery logs.
 pub trait OutboundWebhookHandler: Send + Sync + 'static {
     /// Retrieve active subscriptions registered for a specific event topic.
@@ -117,7 +135,8 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
     /// Two jobs can send one delivery (an outbox re-send). Ignore a write
     /// that [`log_delivery_ignores`] names: a write to a 2xx log, or a repeated
     /// or stale failure. Then a late duplicate job cannot
-    /// overwrite a success or count one failure twice.
+    /// overwrite a success or count one failure twice. Do not count a failure
+    /// that [`log_delivery_repeats_failure`] names, for example a DLQ move.
     fn log_delivery(
         &self,
         log: WebhookDeliveryLog,
@@ -275,6 +294,7 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         {
             return Box::pin(async { Ok(()) });
         }
+        let counted = log_delivery_repeats_failure(logs.get(&log.id), &log);
         logs.insert(log.id.clone(), log.clone());
 
         // Manage subscription consecutive failures and auto-disabling state
@@ -282,25 +302,20 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
             .subscriptions
             .write()
             .expect("subscriptions write lock poisoned");
-        if let Some(sub) = subs.get_mut(&log.subscription_id) {
-            let is_active = sub.status == WebhookSubscriptionStatus::Active;
-            if is_active {
-                if let Some(status) = log.response_status {
-                    if (200..300).contains(&status) {
-                        sub.consecutive_failures = 0;
-                    } else {
-                        sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
-                        if sub.consecutive_failures >= 50 {
-                            sub.status = WebhookSubscriptionStatus::Failed;
-                            tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
-                        }
-                    }
-                } else if log.last_error.is_some() {
-                    sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
-                    if sub.consecutive_failures >= 50 {
-                        sub.status = WebhookSubscriptionStatus::Failed;
-                        tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
-                    }
+        if let Some(sub) = subs.get_mut(&log.subscription_id)
+            && sub.status == WebhookSubscriptionStatus::Active
+        {
+            let is_success = log
+                .response_status
+                .is_some_and(|status| (200..300).contains(&status));
+            let is_failure = log.response_status.is_some() || log.last_error.is_some();
+            if is_success {
+                sub.consecutive_failures = 0;
+            } else if is_failure && !counted {
+                sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
+                if sub.consecutive_failures >= 50 {
+                    sub.status = WebhookSubscriptionStatus::Failed;
+                    tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
                 }
             }
         }
@@ -1342,6 +1357,11 @@ mod tests {
         store.log_delivery(failed).await.unwrap();
         let log = store.get_delivery_log("log").await.unwrap().unwrap();
         assert!(log.is_dlq, "the DLQ move is stored");
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(
+            sub.consecutive_failures, 1,
+            "a DLQ move is not a new failure"
+        );
 
         // A 2xx of the same attempt replaces a failure.
         let mut lost = sample_log("other", "sub");

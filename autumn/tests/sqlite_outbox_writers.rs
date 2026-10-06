@@ -461,6 +461,11 @@ mod sql_webhook_store {
             store.get_delivery_log("l").await.unwrap().unwrap().is_dlq,
             "the DLQ move is stored"
         );
+        let sub = store.get_subscription("sub-1").await.unwrap().unwrap();
+        assert_eq!(
+            sub.consecutive_failures, 1,
+            "a DLQ move is not a new failure"
+        );
 
         // A 2xx of the same attempt replaces a failure.
         store

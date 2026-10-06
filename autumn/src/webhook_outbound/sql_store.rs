@@ -431,6 +431,16 @@ async fn log_with_outcome(
     use scoped_futures::ScopedFutureExt as _;
     crate::db::scoped_transaction(conn, |conn| {
         async move {
+            let stored = diesel::sql_query(sql(&format!(
+                "SELECT {LOG_COLUMNS} FROM autumn_webhook_deliveries WHERE id = $1"
+            )))
+            .bind::<Text, _>(&log.id)
+            .get_result::<LogRow>(&mut *conn)
+            .await
+            .optional()?
+            .map(LogRow::into_log)
+            .transpose()?;
+            let counted = super::log_delivery_repeats_failure(stored.as_ref(), log);
             let upsert = format!("{UPSERT_LOG_SQL}{SKIP_IGNORED_SQL}");
             if write_log_on(conn, log, &upsert).await? == 0 {
                 return Ok(false); // a final log, or a duplicate outcome
@@ -445,6 +455,8 @@ async fn log_with_outcome(
                         .await?;
                     false
                 }
+                // A DLQ move of a counted failure is not a new failure.
+                Outcome::Failure if counted => false,
                 Outcome::Failure => {
                     let changed = diesel::sql_query(sql(FAILURE_SQL))
                         .bind::<Integer, _>(FAILURE_LIMIT)

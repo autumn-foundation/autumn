@@ -31,4 +31,5 @@
   response no longer sends the webhook again. `log_delivery` ignores a write
   to a `2xx` log and a repeated or stale (older attempt) failure
   (`webhook_outbound::log_delivery_ignores`), so a late duplicate job cannot
-  overwrite a success or count one failure twice.
+  overwrite a success or count one failure twice. A DLQ move of a failed
+  attempt is not a new failure (`log_delivery_repeats_failure`).
