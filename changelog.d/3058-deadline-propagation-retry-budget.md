@@ -11,7 +11,8 @@
   Each attempt of the outbound `Client` uses `min(timeout_secs, time left)`.
   The client does not start a retry or a wait that the time left cannot hold.
   `ClientError::DeadlineExceeded` (`504`) tells you that the deadline stopped
-  the call; the circuit breaker does not count it. See
+  the call; the circuit breaker counts it as a cancelled call, not as a
+  failure. See
   [the guide](docs/guide/timeouts-and-budgets.md).
 - **http:** `autumn_web::deadline::Deadline::current()` gives a handler the
   time left. `Deadline::scope` and `deadline::bounded` carry and apply it to

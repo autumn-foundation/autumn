@@ -30,7 +30,8 @@
 // The durable Postgres job backend (queue claiming, worker/maintenance loops,
 // lifecycle recording, admin paging — everything reachable only from the
 // `start_postgres_runtime` entry point) is Postgres-only and is refused under
-// the `sqlite` feature (SQLite has no LISTEN/NOTIFY or advisory-lock queue).
+// the `sqlite` feature (SQLite has no `FOR UPDATE SKIP LOCKED` or advisory
+// locks).
 // Those helpers therefore become dead in a `--features sqlite` build while the
 // local/redis backends stay live; silence dead-code just for that build rather
 // than cfg-gating dozens of individual pg-only items. No effect on the default
@@ -4076,78 +4077,80 @@ impl JobClient {
                     // shared health signal, for every other enqueuer to
                     // read.
                     let breaker = self.job_queue_breaker();
-                    if breaker.before_call().is_err() {
-                        for row in batch {
-                            if row.due_at.is_some() {
-                                self.registry.record_cancel_scheduled(name);
-                            } else {
-                                self.registry.record_cancel(name);
-                            }
-                            self.registry.forget_pg_job_mark(&row.id);
-                            self.job_admin.record_cancelled(&row.id);
-                            let row_error = AutumnError::service_unavailable(
-                                std::io::Error::other("job queue circuit breaker is open"),
-                            );
-                            fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
-                            resolved.push((row.result_index, Err(row_error)));
-                        }
-                    } else {
-                        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
-                        let insert_result = pg_insert_jobs_many(
-                            pool,
-                            name,
-                            &job_queue,
-                            job_max_attempts,
-                            job_backoff_ms,
-                            unique_window_tag,
-                            concurrency_limit,
-                            &batch,
-                        )
-                        .await;
-                        if insert_result.is_ok() {
-                            guard.success();
-                        } else {
-                            guard.failure();
-                        }
-                        match insert_result {
-                            Ok(inserted_ids) => {
-                                let inserted: std::collections::HashSet<&str> =
-                                    inserted_ids.iter().map(String::as_str).collect();
-                                for row in batch {
-                                    let outcome = if inserted.contains(row.id.as_str()) {
-                                        EnqueueOutcome::Queued
-                                    } else {
-                                        self.record_deduplicated_enqueue(
-                                            name,
-                                            &row.id,
-                                            row.due_at.is_some(),
-                                        );
-                                        EnqueueOutcome::Deduplicated
-                                    };
-                                    fill_enqueue(row.slot, name, row.due_at, row.now, None);
-                                    resolved.push((row.result_index, Ok(outcome)));
+                    match breaker.admit() {
+                        Err(_) => {
+                            for row in batch {
+                                if row.due_at.is_some() {
+                                    self.registry.record_cancel_scheduled(name);
+                                } else {
+                                    self.registry.record_cancel(name);
                                 }
+                                self.registry.forget_pg_job_mark(&row.id);
+                                self.job_admin.record_cancelled(&row.id);
+                                let row_error = AutumnError::service_unavailable(
+                                    std::io::Error::other("job queue circuit breaker is open"),
+                                );
+                                fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
+                                resolved.push((row.result_index, Err(row_error)));
                             }
-                            Err(error) => {
-                                let message = error.to_string();
-                                for row in batch {
-                                    if row.due_at.is_some() {
-                                        self.registry.record_cancel_scheduled(name);
-                                    } else {
-                                        self.registry.record_cancel(name);
+                        }
+                        Ok(guard) => {
+                            let insert_result = pg_insert_jobs_many(
+                                pool,
+                                name,
+                                &job_queue,
+                                job_max_attempts,
+                                job_backoff_ms,
+                                unique_window_tag,
+                                concurrency_limit,
+                                &batch,
+                            )
+                            .await;
+                            if insert_result.is_ok() {
+                                guard.success();
+                            } else {
+                                guard.failure();
+                            }
+                            match insert_result {
+                                Ok(inserted_ids) => {
+                                    let inserted: std::collections::HashSet<&str> =
+                                        inserted_ids.iter().map(String::as_str).collect();
+                                    for row in batch {
+                                        let outcome = if inserted.contains(row.id.as_str()) {
+                                            EnqueueOutcome::Queued
+                                        } else {
+                                            self.record_deduplicated_enqueue(
+                                                name,
+                                                &row.id,
+                                                row.due_at.is_some(),
+                                            );
+                                            EnqueueOutcome::Deduplicated
+                                        };
+                                        fill_enqueue(row.slot, name, row.due_at, row.now, None);
+                                        resolved.push((row.result_index, Ok(outcome)));
                                     }
-                                    self.registry.forget_pg_job_mark(&row.id);
-                                    self.job_admin.record_cancelled(&row.id);
-                                    let row_error =
-                                        AutumnError::internal_server_error_msg(message.clone());
-                                    fill_enqueue(
-                                        row.slot,
-                                        name,
-                                        row.due_at,
-                                        row.now,
-                                        Some(&row_error),
-                                    );
-                                    resolved.push((row.result_index, Err(row_error)));
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    for row in batch {
+                                        if row.due_at.is_some() {
+                                            self.registry.record_cancel_scheduled(name);
+                                        } else {
+                                            self.registry.record_cancel(name);
+                                        }
+                                        self.registry.forget_pg_job_mark(&row.id);
+                                        self.job_admin.record_cancelled(&row.id);
+                                        let row_error =
+                                            AutumnError::internal_server_error_msg(message.clone());
+                                        fill_enqueue(
+                                            row.slot,
+                                            name,
+                                            row.due_at,
+                                            row.now,
+                                            Some(&row_error),
+                                        );
+                                        resolved.push((row.result_index, Err(row_error)));
+                                    }
                                 }
                             }
                         }
@@ -4410,12 +4413,11 @@ impl JobClient {
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.job_queue_breaker();
 
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(AutumnError::service_unavailable(std::io::Error::other(
                 "job queue circuit breaker is open",
             )));
-        }
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+        };
 
         let res = self
             .enqueue_durable_inner(
@@ -4697,12 +4699,11 @@ impl JobClient {
                 },
             );
 
-            if breaker.before_call().is_err() {
+            let Ok(guard) = breaker.admit() else {
                 return Err(AutumnError::service_unavailable(std::io::Error::other(
                     "job queue circuit breaker is open",
                 )));
-            }
-            let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+            };
 
             let id_for_enqueue = id.clone();
             let payload_for_enqueue = payload.clone();
@@ -9017,6 +9018,10 @@ fn record_pg_row_cancel_after_ack(
     record_pg_cancel_after_ack(ack_result, &row.name, &row.id, state)
 }
 
+/// How long an idle Postgres worker waits before it polls for a job again.
+///
+/// The Postgres runtime has no `LISTEN`/`NOTIFY` wake-up. A new job waits
+/// for the next poll. `docs/guide/jobs.md` states this value.
 #[cfg(feature = "db")]
 const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(feature = "db")]
@@ -11113,8 +11118,8 @@ async fn pg_enqueued_and_scheduled_pages(
 
 /// `SQLite` stub for the Postgres job runtime.
 ///
-/// The durable Postgres job backend uses `LISTEN`/`NOTIFY`, `FOR UPDATE SKIP
-/// LOCKED` claiming, and advisory locks — none of which `SQLite` provides — so
+/// The durable Postgres job backend uses `FOR UPDATE SKIP LOCKED` claiming
+/// and advisory locks — `SQLite` provides neither — so
 /// under the `sqlite` feature the runtime pool (`RuntimeConnection`) is a
 /// `SQLite` pool that cannot drive the Postgres worker loops. Refuse a
 /// `jobs.backend = "postgres"` configuration with a clear message instead of
@@ -11132,7 +11137,7 @@ fn start_postgres_runtime(
     let _ = (jobs, state, shutdown, config, run_workers);
     Err(AutumnError::internal_server_error(std::io::Error::other(
         "jobs.backend=postgres is unsupported under the sqlite feature; SQLite has no \
-         LISTEN/NOTIFY or advisory-lock queue. Use jobs.backend=sqlite for a durable queue \
+         FOR UPDATE SKIP LOCKED or advisory locks. Use jobs.backend=sqlite for a durable queue \
          in your own SQLite file, or jobs.backend=local (the default) for the in-process \
          queue.",
     )))
@@ -17938,8 +17943,8 @@ mod tests {
         }
 
         // The sqlite arm of the same call. `start_postgres_runtime` is a stub
-        // under the backend flip — SQLite has no LISTEN/NOTIFY and no
-        // advisory-lock queue — so it refuses regardless of what is configured,
+        // under the backend flip — SQLite has no `FOR UPDATE SKIP LOCKED` and
+        // no advisory locks — so it refuses regardless of what is configured,
         // and this is the only coverage of that refusal.
         #[cfg(feature = "sqlite")]
         #[tokio::test]
@@ -18359,6 +18364,7 @@ mod tests {
                 minimum_sample_count: 3,
                 open_duration: Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             };
             let breaker =
                 crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
@@ -20230,6 +20236,7 @@ mod tests {
             minimum_sample_count: 3,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..crate::circuit_breaker::CircuitBreakerPolicy::default()
         };
         let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
 

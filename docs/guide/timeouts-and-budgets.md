@@ -48,7 +48,7 @@ These framework calls use the deadline:
 
 | Call | What it does with the time left |
 |---|---|
-| Outbound `Client` | Each attempt uses `min(timeout_secs, time left)`. It does not start a retry, a backoff or a `Retry-After` wait that the time left cannot hold. When the deadline stops the call, it returns `ClientError::DeadlineExceeded` (`504` through `?`). The circuit breaker does not count this as an upstream failure. |
+| Outbound `Client` | Each attempt uses `min(timeout_secs, time left)`. It does not start a retry, a backoff or a `Retry-After` wait that the time left cannot hold. When the deadline stops the call, it returns `ClientError::DeadlineExceeded` (`504` through `?`). The circuit breaker counts it as a cancelled call, not a failure: nothing, unless the call ran past the slow-call threshold. |
 | `Db` extractor | The wait for a pool connection stops at the deadline (`503`). `statement_timeout` does not change, because it stays on the pooled connection. |
 
 A task that you start with `tokio::spawn` does not get the deadline. Give it
