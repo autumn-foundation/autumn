@@ -431,8 +431,11 @@ const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 ///   then yields the error and ends. Any other receive error also ends it.
 /// - Every `ping_interval_ms` the socket sends a ping while the handler
 ///   reads. The pong is not given to the handler.
-/// - When no frame arrives for `idle_timeout_ms`, the socket sends close code
-///   `1001` and the stream ends.
+/// - When no complete message arrives for `idle_timeout_ms`, the socket
+///   sends close code `1001` and the stream ends. Pings, pongs and close
+///   frames count. The fragments of one message count only when the message
+///   is complete, so a client that sends a long message slowly must also send
+///   pings.
 ///
 /// The timers run only while the handler reads (`recv` or `next`). A
 /// handler that never reads gets no pings and no idle timeout.

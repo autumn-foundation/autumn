@@ -2499,8 +2499,8 @@ pub struct RealtimeConfig {
     #[serde(default)]
     pub ping_interval_ms: Option<u64>,
 
-    /// Close a socket with code `1001` when no frame arrives for this long.
-    /// Pongs count as frames. `None` or `0` disables it.
+    /// Close a socket with code `1001` when no complete message arrives for
+    /// this long. Pings and pongs count. `None` or `0` disables it.
     #[serde(default)]
     pub idle_timeout_ms: Option<u64>,
 }

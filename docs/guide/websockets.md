@@ -152,7 +152,7 @@ idle_timeout_ms = 120_000        # close code 1001 after 120 s of silence
 | `max_connections` | An upgrade above the limit gets `503` and `Retry-After: 1`. The count is per app. | unset or `0` |
 | `max_message_bytes` | A larger received message closes the socket with code `1009`. `recv()` then returns the error, and then `None`. A single frame over 16 MiB also gets `1009`. | unset (64 MiB) |
 | `ping_interval_ms` | The server sends a ping at this interval. The handler does not see the pong. | unset or `0` |
-| `idle_timeout_ms` | When no frame arrives for this long, the server sends close code `1001`. `recv()` then returns `None`. Pongs count as frames. The time counts from the last received frame. | unset or `0` |
+| `idle_timeout_ms` | When no complete message arrives for this long, the server sends close code `1001`. `recv()` then returns `None`. Pings, pongs and close frames count. The fragments of one message count only when the message is complete, so a client that sends a long message slowly must also send pings. | unset or `0` |
 
 The `prod` profile sets `max_message_bytes`, `ping_interval_ms` and
 `idle_timeout_ms` to the values above. It does not set `max_connections`.

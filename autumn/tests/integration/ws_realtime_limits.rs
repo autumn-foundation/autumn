@@ -309,3 +309,50 @@ async fn a_peer_close_releases_a_split_socket() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// Write a raw masked client frame (mask key 0, so the payload is plain).
+async fn raw_frame(client: &mut Client, first_byte: u8, payload: &[u8]) {
+    use tokio::io::AsyncWriteExt as _;
+    let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = client.get_mut() else {
+        panic!("plain TCP");
+    };
+    let len = u8::try_from(payload.len()).expect("short payload");
+    let mut frame = vec![first_byte, 0x80 | len, 0, 0, 0, 0];
+    frame.extend_from_slice(payload);
+    tcp.write_all(&frame).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unfinished_fragmented_message_hits_the_idle_timeout() {
+    let addr = serve_with(|c| c.realtime.idle_timeout_ms = Some(300)).await;
+    let mut client = connect(addr).await;
+    raw_frame(&mut client, 0x01, b"hel").await; // text, not final
+    let (code, _) = next_close(&mut client)
+        .await
+        .expect("close frame has a code");
+    assert_eq!(code, CloseCode::Away, "only a complete message counts");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pings_between_fragments_keep_the_socket_open() {
+    let addr = serve_with(|c| c.realtime.idle_timeout_ms = Some(300)).await;
+    let mut client = connect(addr).await;
+    raw_frame(&mut client, 0x01, b"hel").await; // text, not final
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        raw_frame(&mut client, 0x89, b"").await; // ping
+    }
+    raw_frame(&mut client, 0x80, b"lo").await; // final continuation
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .expect("echo in time");
+        match frame {
+            Some(Ok(TMessage::Text(t))) if t.as_str() == "hello" => break,
+            // The handler reports each ping; the server answers with pongs.
+            Some(Ok(TMessage::Text(t))) if t.starts_with("unexpected: Ping") => {}
+            Some(Ok(TMessage::Pong(_))) => {}
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+}
