@@ -2377,6 +2377,8 @@ impl Analyzer {
                 .map(|name| self.env.binding(&name).referents)
                 .unwrap_or_default(),
             Expr::Cast(c) => self.referents_of(&c.expr),
+            // `*boxed` on a `Box<&mut slot>` moves out the borrow.
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => self.referents_of(&u.expr),
             // `pick(&mut slots)?`, `pick(&mut slots).await`.
             Expr::Try(t) => self.referents_of(&t.expr),
             Expr::Await(a) => self.referents_of(&a.base),
@@ -3340,13 +3342,7 @@ impl Analyzer {
             Expr::RawAddr(r) => self.expr(&r.expr),
             Expr::Reference(r) => self.expr(&r.expr),
             Expr::Repeat(r) => self.expr(&r.expr).then(self.expr(&r.len)),
-            Expr::Struct(s) => {
-                let mut flow = self.each(s.fields.iter().map(|f| &f.expr));
-                if let Some(rest) = &s.rest {
-                    flow = flow.then(self.expr(rest));
-                }
-                flow
-            }
+            Expr::Struct(s) => self.each(s.fields.iter().map(|f| &f.expr).chain(s.rest.as_deref())),
             Expr::Unary(u) => self.expr(&u.expr),
             Expr::Yield(y) => y.expr.as_deref().map_or(Flow::ZERO, |e| self.expr(e)),
 
@@ -3482,11 +3478,18 @@ impl Analyzer {
     }
 
     fn each<'a>(&mut self, exprs: impl Iterator<Item = &'a Expr>) -> Flow {
+        // A later part may change what an earlier part read:
+        // `(source.take(), { source = None; })`.
         let mut flow = Flow::ZERO;
-        for expr in exprs {
+        let mut reads = Vec::new();
+        for (i, expr) in exprs.enumerate() {
+            if i > 0 {
+                reads.push(self.env.clone());
+            }
             let next = self.expr(expr);
             flow = flow.then(next);
         }
+        self.keep_reads(reads);
         flow
     }
 
@@ -13047,6 +13050,35 @@ mod tests {
                 "guard: an async block's local borrow is kept",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = None; let target = async { let r = &mut slot; r }.await; \
+                 *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn aggregate_reads_and_moved_borrows() {
+        check_handlers(&[
+            (
+                "guard: a later tuple element does not erase an earlier one",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); \
+                 let wrapped = (source.take().unwrap(), { source = None; 0 }); \
+                 wrapped.0.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a later struct field does not erase an earlier one",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); \
+                 let wrapped = Ctx { db: source.take().unwrap(), n: { source = None; 0 } }; \
+                 wrapped.db.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a borrow moved out by a dereference keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let boxed = Box::new(&mut slot); let target = *boxed; \
                  *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
