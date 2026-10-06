@@ -1448,6 +1448,20 @@ impl Flow {
         taken
     }
 
+    /// `cost` on every path that leaves early. The path that falls through
+    /// does not change.
+    fn charge_exits(self, cost: &Cost) -> Self {
+        Self {
+            ret: self.ret.map(|c| c.then(cost.clone())),
+            exits: self
+                .exits
+                .into_iter()
+                .map(|(exit, c)| (exit, c.then(cost.clone())))
+                .collect(),
+            ..self
+        }
+    }
+
     /// The same exits, with `cost` on the path that falls through, if any.
     fn with_fall(self, cost: Cost) -> Self {
         Self {
@@ -4024,11 +4038,18 @@ impl Analyzer {
     fn chain_args(&mut self, methods: &[&ExprMethodCall]) -> Flow {
         let mut cost = Flow::ZERO;
         let mut reads = Vec::new();
-        for method in methods {
+        for (i, method) in methods.iter().enumerate() {
             if !method.args.is_empty() {
                 reads.push(self.env.clone());
             }
-            cost = cost.then(self.method_args(method));
+            let mut args = self.method_args(method);
+            // `ctx.refresh_all().get(return …)`: the methods before this one
+            // ran before an argument left early.
+            if i > 0 && (args.ret.is_some() || !args.exits.is_empty()) {
+                let ran = self.probe().chain_cost(methods[i - 1], false, Cost::ZERO);
+                args = args.charge_exits(&ran);
+            }
+            cost = cost.then(args);
             let args: Vec<&Expr> = method.args.iter().collect();
             self.store_into(&method.receiver, &method.method.to_string(), &args);
         }
@@ -13873,6 +13894,24 @@ mod tests {
                 "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
                  let r = ids.iter().fold(repo, |acc, _| acc); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+            (
+                "an earlier method in a chain runs before an argument returns",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let ctx = Ctx { repo }; ctx.refresh_all().get(return Ok(0)); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "an earlier query in a chain runs before an argument returns",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let _ = repo.find_all().await?.get(if flag { return Ok(0) } else { 0 }); repo.b().await?; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
+                "guard: a method whose argument returns does not run",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let _ = repo.find(return Ok(0)).await?; Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
