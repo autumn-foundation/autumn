@@ -7673,7 +7673,7 @@ async fn update_redis_queue_depth_gauges(
 /// Fold the jobs parked for the cost signal (the blocked zset band above
 /// `REDIS_DEFERRED_SCORE_BASE`) into the per-queue and per-name tallies. Their
 /// oldest age is their enqueue time. The scan stops at
-/// `REDIS_QUEUE_DEPTH_DUE_SCAN_CAP`.
+/// `REDIS_QUEUE_DEPTH_DUE_SCAN_CAP` and logs a warning.
 #[cfg(feature = "redis")]
 async fn survey_cost_parked_gauges(
     connection: &mut redis::aio::ConnectionManager,
@@ -7711,7 +7711,17 @@ async fn survey_cost_parked_gauges(
             fold_due_delayed_records(records, per_queue, per_name);
         }
         scanned = scanned.saturating_add(page_len);
-        if page_len < page_size || scanned >= REDIS_QUEUE_DEPTH_DUE_SCAN_CAP {
+        if page_len < page_size {
+            break;
+        }
+        // Full final page at the safety bound: stop, and say the depth can be
+        // low, as the due-delayed scan does.
+        if scanned >= REDIS_QUEUE_DEPTH_DUE_SCAN_CAP {
+            tracing::warn!(
+                scanned,
+                cap = REDIS_QUEUE_DEPTH_DUE_SCAN_CAP,
+                "cost-parked queue-depth scan truncated at cap; reported depth may under-count"
+            );
             break;
         }
         offset = offset.saturating_add(REDIS_QUEUE_DEPTH_SAMPLE);
