@@ -2473,10 +2473,15 @@ impl AppBuilder {
     /// in production use the Postgres-backed
     /// `autumn_web::feature_flags::pg::PgFlagStore`.
     ///
+    /// When the app installs the service, it calls
+    /// [`FlagStore::preload`](crate::feature_flags::FlagStore::preload) once and
+    /// waits up to 10 seconds for it, before job workers, startup hooks and
+    /// requests. A failed preload logs a warning; it does not stop startup.
+    ///
     /// # Sharing the store with the poll listener
     ///
     /// When using `PgFlagStore` in a multi-replica deployment, pass an `Arc`
-    /// clone so the app service and the poll listener share the **same** cache:
+    /// clone so the app service and the poll listener share the **same** snapshot:
     ///
     /// ```rust,ignore
     /// use std::sync::Arc;
@@ -2492,7 +2497,7 @@ impl AppBuilder {
     /// ```
     ///
     /// `Arc<PgFlagStore>` implements `FlagStore`, so the same `Arc` is
-    /// accepted directly without creating a separate cache instance.
+    /// accepted directly without creating a separate snapshot.
     ///
     /// # Basic example
     ///
@@ -2511,7 +2516,28 @@ impl AppBuilder {
         S: crate::feature_flags::FlagStore,
     {
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.with_flag_service(service)
+    }
+
+    /// Register a configured [`FeatureFlagService`](crate::feature_flags::FeatureFlagService),
+    /// for example one with declared defaults.
+    ///
+    /// Like [`with_flag_store`](Self::with_flag_store), it preloads the store
+    /// at startup.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::feature_flags::{FeatureFlagService, InMemoryFlagStore};
+    /// use std::sync::Arc;
+    ///
+    /// let flags = FeatureFlagService::new(Arc::new(InMemoryFlagStore::new()))
+    ///     .with_default("checkout_v2", true);
+    /// autumn_web::app().with_flag_service(flags).run().await;
+    /// ```
+    #[must_use]
+    pub fn with_flag_service(self, service: crate::feature_flags::FeatureFlagService) -> Self {
         self.state_initializer(move |state| {
+            // Load flags before anything that reads them runs (#3063).
+            crate::feature_flags::preload_blocking(&service, crate::feature_flags::PRELOAD_WAIT);
             state.insert_extension(service);
         })
     }
@@ -2548,9 +2574,7 @@ impl AppBuilder {
     {
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>)
             .with_group_resolver(resolver);
-        self.state_initializer(move |state| {
-            state.insert_extension(service);
-        })
+        self.with_flag_service(service)
     }
 
     /// Register an experiment store, enabling the [`Experiments`] extractor.
@@ -16046,6 +16070,23 @@ mod tests {
     }
 
     #[test]
+    fn flag_service_preloads_before_later_state_initializers() {
+        // Every mode runs state initializers in order, before job workers,
+        // startup hooks and routing. So a preload here covers them all.
+        let store = Arc::new(PreloadProbe::default());
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let (seen_in, probe) = (Arc::clone(&seen), Arc::clone(&store));
+        let builder = app()
+            .with_flag_store(Arc::clone(&store))
+            .state_initializer(move |_| {
+                let preloads = probe.preloads.load(std::sync::atomic::Ordering::SeqCst);
+                seen_in.store(preloads, std::sync::atomic::Ordering::SeqCst);
+            });
+        run_state_initializers(builder.state_initializers, &AppState::for_test());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn static_builds_run_state_initializers_before_router_build() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let build_mode_start = source
@@ -18054,6 +18095,126 @@ mod tests {
 
         let recorded_events = events.lock().expect("events lock poisoned").clone();
         assert_eq!(recorded_events, vec!["start", "stop-b", "stop-a"]);
+    }
+
+    /// Counts `preload` calls. `fail` makes `preload` return an error.
+    #[derive(Default)]
+    struct PreloadProbe {
+        inner: crate::feature_flags::InMemoryFlagStore,
+        preloads: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    impl crate::feature_flags::FlagStore for PreloadProbe {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<crate::feature_flags::FlagConfig>, crate::feature_flags::FlagStoreError>
+        {
+            self.inner.get(key)
+        }
+        fn list(
+            &self,
+        ) -> Result<Vec<crate::feature_flags::FlagConfig>, crate::feature_flags::FlagStoreError>
+        {
+            self.inner.list()
+        }
+        fn enable(
+            &self,
+            key: &str,
+            actor: Option<&str>,
+        ) -> Result<(), crate::feature_flags::FlagStoreError> {
+            self.inner.enable(key, actor)
+        }
+        fn disable(
+            &self,
+            key: &str,
+            actor: Option<&str>,
+        ) -> Result<(), crate::feature_flags::FlagStoreError> {
+            self.inner.disable(key, actor)
+        }
+        fn set_rollout(
+            &self,
+            key: &str,
+            pct: u8,
+            actor: Option<&str>,
+        ) -> Result<(), crate::feature_flags::FlagStoreError> {
+            self.inner.set_rollout(key, pct, actor)
+        }
+        fn allow_actor(
+            &self,
+            key: &str,
+            actor_id: &str,
+            actor: Option<&str>,
+        ) -> Result<(), crate::feature_flags::FlagStoreError> {
+            self.inner.allow_actor(key, actor_id, actor)
+        }
+        fn add_group(
+            &self,
+            key: &str,
+            group: &str,
+            actor: Option<&str>,
+        ) -> Result<(), crate::feature_flags::FlagStoreError> {
+            self.inner.add_group(key, group, actor)
+        }
+        fn history(
+            &self,
+            key: &str,
+            limit: usize,
+        ) -> Result<Vec<crate::feature_flags::FlagChangeRecord>, crate::feature_flags::FlagStoreError>
+        {
+            self.inner.history(key, limit)
+        }
+        fn preload(&self) -> Result<(), crate::feature_flags::FlagStoreError> {
+            self.preloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(crate::feature_flags::FlagStoreError::Backend(
+                    "brownout".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn with_flag_store_preloads_the_store_at_startup() {
+        for fail in [false, true] {
+            let store = Arc::new(PreloadProbe {
+                fail,
+                ..PreloadProbe::default()
+            });
+            let builder = app().with_flag_store(Arc::clone(&store));
+            let state = AppState::for_test();
+            run_state_initializers(builder.state_initializers, &state);
+
+            // The state initializer preloaded; a failure only warns.
+            assert_eq!(
+                store.preloads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "fail = {fail}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_flag_service_keeps_declared_defaults() {
+        let service = crate::feature_flags::FeatureFlagService::new(Arc::new(
+            crate::feature_flags::InMemoryFlagStore::new(),
+        ))
+        .with_default("checkout_v2", true);
+        let builder = app().with_flag_service(service);
+        let state = AppState::for_test();
+        run_state_initializers(builder.state_initializers, &state);
+
+        let installed = state
+            .extension::<crate::feature_flags::FeatureFlagService>()
+            .expect("service registered");
+        assert!(installed.is_enabled("checkout_v2", None));
+        assert!(
+            builder.startup_hooks.is_empty(),
+            "the state initializer preloads flags; no startup hook does"
+        );
     }
 
     fn startup_noop_job_handler(

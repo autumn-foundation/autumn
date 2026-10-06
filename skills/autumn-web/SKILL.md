@@ -1879,6 +1879,13 @@ backend-conditionally rather than assuming Postgres.
   `from_database_config(&config.database)` returns `None` unless the configured
   primary names Postgres. `.expect()` on it fails at BOOT on a `sqlite://`
   target — pick `InMemoryFlagStore` / `InMemoryConfigStore` on that arm instead.
+- `PgFlagStore` reads an in-memory snapshot and never connects on a Tokio
+  worker (issue #3063). Run `PgFlagStore::spawn_poll_listener` so replicas see
+  changes (they poll; there is no `LISTEN`). Before its first load, `get` on a
+  runtime returns an error: call `refresh()` before you seed flags, and seed
+  only on `Ok(None)`. A store error serves last-known values; set a fallback
+  with `FeatureFlagService::with_default` and register it with
+  `AppBuilder::with_flag_service`.
 - `DatabaseConfig::effective_primary_postgres_url()` is the screen to branch on
   (`effective_primary_url()` returns the target whatever backend it names).
 - `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite`
